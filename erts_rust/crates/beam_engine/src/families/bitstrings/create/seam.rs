@@ -46,10 +46,11 @@
 //!   through `raw::write_bit_field`, whose per-bit body is also
 //!   `raw::InPlace::push_bit`'s).
 //!
-//! [`append_plan`] answers the first, [`open_append`] / [`open_append_any`] the second and
+//! [`append_plan`] answers the first, [`open_append_any`] (and, as the byte-aligned door's
+//! reference answer, [`open_append`]) the second and
 //! [`write_bit_field`] the third. The queries are pure: they read, they allocate nothing,
 //! they mutate nothing, and they are safe to call speculatively (a speculative
-//! [`open_append`] on a shape the family never enters is exactly as harmless as a
+//! [`open_append_any`] on a shape the family never enters is exactly as harmless as a
 //! speculative read).
 //!
 //! # Two-level gating — neither side decides for the other
@@ -114,19 +115,25 @@
 //!
 //! # The two run-time doors
 //!
-//! The doors are split by **alignment**, not loosened into one, because the tier's
-//! straight-line lowering addresses field `i` at `cursor + byte_offset` — sound only
-//! while the window end is byte-aligned.
+//! The doors are split by **alignment**, not loosened into one, because a lowering that
+//! addresses field `i` at `cursor + byte_offset` is sound only while the window end is
+//! byte-aligned.
 //!
-//! * [`open_append`] is the **byte-aligned** door: it refuses unless the accumulator's
-//!   window end is on a byte boundary (`append_unit_allows(end_bits, 8)`). The tier's
-//!   byte-aligned route — every field a whole number of bytes, addressed at
-//!   `cursor + byte_offset_i` — uses it.
-//! * [`open_append_any`] is the **general** door: it accepts any alignment (a bit-granular
+//! * **The byte-aligned door lives in the JIT tier**, not here: `Route::Aligned` proves the
+//!   accumulator's `ErlSubBits`/`BinRef` shape inline as refusal-only branches and then calls
+//!   [`crate::jit::baseline::runtime::jit_append_cursor`] for the machine-private half (the
+//!   writable-payload registry lookup, the room rule and the byte cursor `base + end_bits/8`),
+//!   re-checking C's `unit == 8` position gate itself.
+//!   [`open_append`] is that door's **reference answer**: it spells the same three clauses out
+//!   in one place, is `#[cfg(test)]`, and is the oracle the tier's door is pinned against —
+//!   every answer of the two must agree, which is what keeps an inline-proof mistake a
+//!   refusal (one interpreter step) instead of a wrong result.
+//! * [`open_append_any`] is the **general** door and stays production: the tier's bit-granular
+//!   route calls it through `jit_open_append_bin_any`/`jit_open_append_bin_any_y`. It accepts
+//!   any alignment (a bit-granular
 //!   field leaves the window ending mid-byte) and applies the plan's own unit gate
 //!   instead — `end_bits % unit == 0` for `unit > 1`, `unit <= 1` ungated — so the shape it
-//!   accepts is exactly the shape the family appends in place at. A byte-aligned route may
-//!   use either door (the two agree whenever `unit` divides 8 and the end is byte-aligned).
+//!   accepts is exactly the shape the family appends in place at.
 //!
 //! The general door is the one a bit-granular lowering pairs with [`write_bit_field`],
 //! since only that writer can place bits at a non-byte-aligned position.

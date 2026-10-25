@@ -276,7 +276,7 @@ pub(super) fn exec(
 /// caller returns it verbatim.
 ///
 /// `pub(super)` — this walk stays inside the family. What a native tier consumes is the
-/// [`seam`]: [`seam::append_plan`] for the static shape and [`seam::open_append`] for the
+/// [`seam`]: [`seam::append_plan`] for the static shape and [`seam::open_append_any`] for the
 /// writable payload's room, so a lowering never re-derives either from this walk's
 /// arguments (and never reaches the [`Built`] form, which is family-private).
 #[allow(clippy::type_complexity)]

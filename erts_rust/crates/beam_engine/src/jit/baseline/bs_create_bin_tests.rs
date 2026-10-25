@@ -30,7 +30,8 @@
 //!   <dst's frame-window guard>                           ; a rejected slot writes nothing
 //!   <the accumulator's frame-window guard, if Y>         ; guard ONLY, BEFORE any write
 //!   <one guarded load + is_small guard per Field::Bits>  ; a non-integer field is the family's badarg
-//!   <the helper call>                                    ; jit_open_append_bin (X) | jit_open_append_bin_y (Y)
+//!   <the append door>                                    ; Aligned: inline shape proof + jit_append_cursor (X or Y)
+//!                                                        ; BitGranular: jit_open_append_bin_any[_y](slot, tail, unit)
 //!   test rax, rax ; je fallback                          ; the LAST guard, still before every write
 //!   <the field byte stores at the cursor in rax>         ; a Y field value is re-read (unguarded) per field
 //!   <the accumulator re-read (unguarded), the end commit>; THE ONLY MUTATION, last
@@ -68,8 +69,9 @@
 //!   `bs_get_integer2` / `bs_test_tail2` pass over it, which fails unless `end` — and
 //!   therefore the window — was committed exactly once).
 //! * **the `Y` forms are lowered too, and their one up-front guard is what makes them
-//!   sound.** Section A′ covers a frame-resident accumulator (the term crosses the block ABI
-//!   to `jit_open_append_bin_y` as its **slot index**), a frame-resident field value, and a
+//!   sound.** Section A′ covers a frame-resident accumulator (the block loads the term out of
+//!   the slot itself — a `Y` field value is the one that still crosses to a helper as its
+//!   **slot index**), a frame-resident field value, and a
 //!   `Y` accumulator with two `Y` field values beside a `string` constant; section C(9) pins
 //!   an **out-of-frame destination** slot, which the predicate accepts and the emitted guard
 //!   rejects into the interpreter's own typed error; section E(c) pins the `Y`-accumulator
@@ -814,9 +816,9 @@ fn every_in_scope_construction_shape_stays_native_on_a_cache_free_compile() {
 // ---------------------------------------------------------------------------
 /// **A′(1) A `Y`-slot accumulator — lowered, byte-exact, and the family never runs.**
 ///
-/// The accumulator crosses the block ABI as its **slot index**, not a word
-/// (`emit_helper_invoke` can only add `movabs` immediates), so the arm carries it to
-/// `jit_open_append_bin_y` and re-reads the slot behind the one up-front frame guard. This
+/// The arm loads the accumulator term out of its `Y` slot inline (a whole-byte plan is
+/// `Route::Aligned`, so the block proves the shape itself and no slot index crosses to a
+/// helper) and re-reads the slot behind the one up-front frame guard. This
 /// row is the shape's whole justification: the bytes must be the interpreter's, and the
 /// `bs_create_bin` must **not** reach the family.
 ///
@@ -2644,8 +2646,9 @@ fn a_one_byte_short_capacity_declines_and_is_idempotent() {
 /// **(c) The one-byte-short capacity with a `Y`-slot accumulator, as an idempotency row.**
 ///
 /// The `Y` form of C(6)/(b), and the row that pins the *frame* half of the mutation order:
-/// the arm hands `jit_open_append_bin_y` the accumulator's **slot index**, the helper reads
-/// `Machine::y` and answers `0` because the tail does not fit, and the emitted `je fallback`
+/// the arm loads the term out of the accumulator's `Y` slot inline, the capacity lookup the
+/// inline proof then makes answers `0` because the tail does not fit, and the emitted
+/// `je fallback`
 /// takes exactly one interpreter step — which re-executes the whole instruction against an
 /// accumulator whose window end (and payload) are untouched, because nothing the sequence
 /// emits before that test writes anything.

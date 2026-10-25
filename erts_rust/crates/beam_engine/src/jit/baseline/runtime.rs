@@ -1477,8 +1477,8 @@ pub(crate) extern "C" fn jit_append_cursor(
 }
 
 /// The decision body of [`jit_append_cursor`], split out so a test can pin it against
-/// `seam::open_append` (the byte-aligned door the aligned route used to call) without a
-/// `JitRuntime`.
+/// `seam::open_append` (the seam's byte-aligned door, `#[cfg(test)]` and kept as that door's
+/// reference answer) without a `JitRuntime`.
 pub(crate) fn append_cursor(
     machine: &Machine,
     base: usize,
@@ -1509,7 +1509,7 @@ pub(crate) fn append_cursor(
 }
 
 /// The **general** in-place append precondition helper: the bit-granular twin of
-/// [`jit_open_append_bin`], asking the construction seam's general door
+/// [`jit_append_cursor`], asking the construction seam's general door
 /// ([`open_append_any`]) whether `machine.x[src_reg]` is a writable accumulator this
 /// instruction may append `tail_bits` more bits to at the plan's own append **unit**.
 ///

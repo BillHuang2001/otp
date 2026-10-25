@@ -1249,9 +1249,11 @@ fn function_index(staged: &Staged, program: &Program, function: &str, arity: u32
 ///   **different** field variant from every `Field::Bits` the other clauses use, so a row
 ///   that only ever saw integer fields would not cover the constant-bytes store path at all;
 /// * the other **two** are the `<< Acc/binary, C >>` clauses, whose accumulator is a **`Y`
-///   slot** (`Typed { reg: Y(1), .. }`) — the `Y` form the arm lowers through
-///   `jit_open_append_bin_y`, with its one up-front frame-window guard and its unguarded
-///   post-helper slot re-reads. Asserting the accumulator's `Loc` per build is what keeps
+///   slot** (`Typed { reg: Y(1), .. }`) — the `Y` form the arm lowers by loading the term out
+///   of the slot inline in its aligned route's shape proof (`create_door.rs`, one
+///   `jit_append_cursor` call for the capacity), behind its one up-front frame-window guard
+///   and its unguarded post-helper slot re-reads. Asserting the accumulator's `Loc` per build
+///   is what keeps
 ///   "three lowered" from meaning "three x-register builds": the two `Y` builds are the
 ///   evidence that this kernel exercises the `Y` form at run time.
 ///
@@ -1364,8 +1366,9 @@ fn the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted() {
 /// `<< <<(char_to_lower(C))>> || <<C>> <= B >>` is `bs_init_writable` plus a `CallLast` into the
 /// generated loop `-to_lower/1-lbc$^0/2-0-/2`, and *that* is where the one accumulator build
 /// lives. Its accumulator is a **`Y` slot** — the compiler `move`s the writable binary into
-/// the frame before the loop's `call_last` — which the arm lowers through
-/// `jit_open_append_bin_y` (`Machine::y` behind one up-front frame-window guard).
+/// the frame before the loop's `call_last` — which the arm lowers by loading the term out of
+/// that slot inline in its aligned route's shape proof (`Machine::y` behind one up-front
+/// frame-window guard).
 ///
 /// The row pins that positively and from three sides, because no single one of them is
 /// load-bearing on its own: the build's accumulator is a `Y` slot, the shape is in the

@@ -39,9 +39,11 @@
 //! by **bit alignment**:
 //!
 //! * [`Route::Aligned`] — every field is a whole number of bytes. Field `i` is addressed as
-//!   `cursor + byte_offset` from the byte cursor [`jit_open_append_bin`] /
-//!   [`jit_open_append_bin_y`] returns, and its bytes are extracted with an arithmetic
-//!   shift (see *The byte extraction is exact* below).
+//!   `cursor + byte_offset` from the byte cursor [`create_door::emit_append_cursor`] leaves
+//!   in `rax` — the accumulator's shape proved **inline**, then one
+//!   [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor) call for the
+//!   machine-private half — and its bytes are extracted with an arithmetic shift (see *The
+//!   byte extraction is exact* below).
 //! * [`Route::BitGranular`] — at least one field is **not** a whole number of bytes (the
 //!   `integer 6` of a base62 decoder's per-character append, say). Each field is written by
 //!   one call to [`jit_write_bit_field`], which re-derives the payload base and the window
@@ -65,8 +67,11 @@
 //!   <the destination's Y-window guard>             ; a rejected destination writes nothing
 //!   <the accumulator's Y-window guard, if Y>       ; guard only, still before every write
 //!   <one guarded load + is_small guard per Field::Bits>  ; a non-integer field is the family's badarg
-//!   <the append-door helper call>                  ; x-register | Y-slot door; a refusal is the family's path
-//!   test rax, rax ; je fallback                     ; the LAST guard, still before every write
+//!   <the append door, by route>                     ; a refusal is the family's path
+//!     Aligned:     <the inline refusal-only shape proof, then one jit_append_cursor call>
+//!                  <test rax, rax ; je fallback>     ; the LAST guard, still before every write
+//!     BitGranular: <one positioned jit_open_append_bin_any[_y] call>
+//!                  <test rax, rax ; je fallback>     ; the LAST guard, still before every write
 //!   <the field writes>                             ; the only payload writes
 //!   <the accumulator re-read>                       ; re-read: the helper clobbered every scratch
 //!   mov rcx, [boxed_val(rdx) + SUB_BITS_END_DISP]   ; the old window end
@@ -87,20 +92,27 @@
 //!                         test rax, rax ; je fallback      ; a refusal is the family's path
 //! ```
 //!
-//! `jit_open_append_bin` (the x-register door), `jit_open_append_bin_y` (the `Y`-slot door)
-//! and their general twins `jit_open_append_bin_any` / `_any_y` themselves **mutate
-//! nothing** (they are `&Machine` throughout), so every guard that can reach `fallback` runs
-//! against the machine state the interpreter step will see. The payload bytes are the one
+//! [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor) (the aligned
+//! route's machine-private half, a read-only `&Machine` query) and the general doors
+//! `jit_open_append_bin_any` / `_any_y` themselves **mutate nothing** (they are `&Machine`
+//! throughout), and the aligned route's inline proof stores nothing either, so every guard
+//! that can reach `fallback` runs against the machine state the interpreter step will see.
+//! The payload bytes are the one
 //! thing written before the `end` commit, and they are written at the same offsets with the
 //! same values on every attempt, so even a deopt after them re-produces them — never a
 //! duplicated field.
 //!
-//! # The `Y` forms: two doors, and why the re-reads need no second guard
+//! # The `Y` forms: the accumulator's slot, and why the re-reads need no second guard
 //!
-//! The block ABI cannot carry a run-time *word* into a helper — `emit_helper_invoke` adds
-//! every argument as a `movabs` immediate — so a `Y` accumulator crosses as its **slot
-//! index** and [`jit_open_append_bin_y`] re-reads it through `Machine::y`'s bounds check.
-//! The emitted code, however, re-reads that slot **directly** (`y_base + k*8`) after the
+//! Where a helper needs an operand the block cannot compute, the block ABI makes it a slot
+//! **index**: `emit_helper_invoke` adds every argument as a `movabs` immediate, so the
+//! bit-granular door takes a `Y` accumulator as its slot index and reads it through
+//! `Machine::y`'s bounds check, and `jit_write_bit_field` takes a `Y` field value the same
+//! way. The aligned route needs no index at all — [`create_door::emit_append_cursor`] loads
+//! the term out of the slot itself (`emit_y_slot_value`) and passes the door the payload base
+//! and the window end it read out of that term, with only the compile-time `tail_bits` as an
+//! immediate.
+//! The emitted code re-reads a `Y` slot **directly** (`y_base + k*8`) after the
 //! call, because the helper clobbers every caller-saved register and the window-end commit
 //! and the `Dst` store both need the term again. That direct read is unguarded, and the
 //! **once-up-front guard** is what makes it sound: the frame cannot change between the
@@ -112,15 +124,21 @@
 //! (`mov scratch,[rsp+RUNTIME_SLOT_DISP]` ; `mov scratch,[scratch+RUNTIME_YBASE_DISP]` ;
 //! `lea scratch,[scratch+y_offset(k)]` ; `mov dst,[scratch]`) and nothing more.
 //!
-//! # The argument channel forces slot indices (both routes)
+//! # The argument channel: slot indices where a helper needs one
 //!
-//! Neither route can hand a helper a **word**. [`emit_positioned_helper_call`] admits at
-//! most five arguments and materialises each as a `movabs` immediate, which is why every
-//! helper in this arm takes **slot indices** — the accumulator as an x-register or `Y`-slot
-//! index, and (on the general route) the field value the same way plus one flags word
+//! Neither route can hand a helper a **word** it must interpret as a term.
+//! [`emit_positioned_helper_call`] admits at
+//! most five arguments and materialises each as a `movabs` immediate, which is why the
+//! helpers here take either slot indices or a value the block has already proved: the
+//! bit-granular door takes the accumulator as an x-register or `Y`-slot
+//! index, and `jit_write_bit_field` takes the field value the same way plus one flags word
 //! ([`WRITE_ACC_IN_Y`] / [`WRITE_VALUE_IN_Y`]) naming which machine file holds each. The
 //! block's spill before every helper call makes `machine.x` authoritative, and a `Y` slot is
-//! reached through `Machine::y`, so an index is all a helper needs.
+//! reached through `Machine::y`, so an index is all such a helper needs.
+//! The aligned route's call is the exception the block can afford: it passes the payload base
+//! and the window end it has just loaded from the accumulator's own block, in the ABI's own
+//! argument registers (`rsi`/`rdx`), and writes only the plan's `tail_bits` as an immediate —
+//! a payload pointer the block has already proved is not a term the helper must re-derive.
 //!
 //! # The general route re-derives the door per field, and why that is inexpensive
 //!
@@ -203,9 +221,11 @@
 //! and `unit <= 1` is ungated — so a window end the plan's own unit does not accept is that
 //! door's `0` refusal, i.e. the same one interpreter step every compile-time refusal above
 //! takes. The general door [`jit_open_append_bin_any`] / [`jit_open_append_bin_any_y`] is
-//! handed the plan's `unit` for exactly this test; the byte-aligned pair
-//! [`jit_open_append_bin`] / [`jit_open_append_bin_y`] applies the `unit == 8` form, because a
-//! byte cursor needs a byte-aligned window end.
+//! handed the plan's `unit` for exactly this test; the aligned route
+//! ([`create_door::emit_append_cursor`]) refuses unless `end_bits % 8 == 0` — the `unit == 8`
+//! form of the same gate, because a byte cursor needs a byte-aligned window end — and
+//! [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor) re-checks it so the
+//! machine-private half agrees with the seam on every input.
 //!
 //! The `fail` arm is deliberately **not** part of this shape: `bs_create_bin`'s
 //! `NO_FAIL`-vs-label discrimination stays in the family, and every refusal above (and

@@ -269,9 +269,12 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     `crate::families::bitstrings::create::seam`):
     `append_plan` (static decidability → `AppendPlan`), the two run-time doors
     `open_append`/`open_append_any`, and the family's single bit-granular write
-    `write_bit_field`. Its production consumers are the baseline tier's `bs_create_bin`
+    `write_bit_field`. `open_append` is `#[cfg(test)]`: it is the byte-aligned door's
+    **reference answer**, kept as the oracle the tier's own byte-aligned door is pinned
+    against. The production consumers are the baseline tier's `bs_create_bin`
     inline arm (`src/jit/baseline/emit/bitstr_inline/create.rs`) and its run-time helpers
-    (`src/jit/baseline/runtime.rs`'s `jit_open_append_bin*`/`jit_write_bit_field`), so the
+    (`src/jit/baseline/runtime.rs`'s `jit_append_cursor` and
+    `jit_open_append_bin_any*`/`jit_write_bit_field`), so the
     module needs no `#[allow(dead_code)]`. Contract below.
   - `seam_tests.rs` → `#[cfg(test)]` the seam's accept and decline sets, the two doors'
     run-time answers (including the unit gate), the word-identity/no-growth pin, and the
@@ -305,11 +308,13 @@ in the family, the emission rules stay in the tier.
   field wider than 64 bits, a signed/little/native field, and a first segment that is not a
   `private_append`.
 - `pub(crate) fn open_append(machine: &Machine, src: Eterm, tail_bits: u32) -> Option<(usize, usize)>`
-  — the **byte-aligned** door: `(payload base, window end)` when the accumulator is a
-  writable payload this machine owns, the window ends on a **byte** boundary and the
-  payload holds `tail_bits` more bits.
-  A tier that addresses field `i` as `cursor + byte_offset_i` uses this one, because that
-  addressing is sound only while the window end is byte-aligned.
+  — the **byte-aligned** door's **reference answer**, `#[cfg(test)]`: `(payload base, window
+  end)` when the accumulator is a writable payload this machine owns, the window ends on a
+  **byte** boundary and the payload holds `tail_bits` more bits.
+  The byte-aligned route that addresses field `i` as `cursor + byte_offset_i` is the tier's
+  own (`jit/baseline/emit/bitstr_inline/create_door.rs` proves the term shape inline and calls
+  `jit/baseline/runtime.rs`'s `jit_append_cursor` for the machine-private half); this function
+  spells the same clauses out in one place and is the oracle that door is pinned against.
 - `pub(crate) fn open_append_any(machine: &Machine, src: Eterm, tail_bits: u32, unit: usize) -> Option<(usize, usize)>`
   — the **general** door for a plan carrying any bit-granular field: any alignment, gated on
   C's append-**position** unit rule instead (`append_unit_allows`,
@@ -561,7 +566,7 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   `create/mod.rs` in turn declares `pub(crate) mod seam;` / `pub(crate) mod prepared;`. That is the
   enclosure chain `src/jit/**` resolves the construction seam through — the baseline tier's
   `bs_create_bin` inline arm (`jit/baseline/emit/bitstr_inline/create.rs`) and its run-time helpers
-  (`jit/baseline/runtime.rs`'s `jit_open_append_bin*`/`jit_write_bit_field`) call
+  (`jit/baseline/runtime.rs`'s `jit_append_cursor` and `jit_open_append_bin_any*`/`jit_write_bit_field`) call
   `crate::families::bitstrings::create::seam::*` directly, which is why `seam` needs no
   `#[allow(dead_code)]`. What stays private is `mod matching;` and `mod raw;`, and a private `mod` makes
   every body inside it unreachable regardless of the item's own visibility — so these are still
