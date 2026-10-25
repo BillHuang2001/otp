@@ -507,10 +507,15 @@ enum Route {
     /// The process-wide content-keyed [`crate::jit::cache::CodeCache`] serves a warmed
     /// artifact and re-emits nothing, so a normal tier run reads `0 -> 0` and proves nothing.
     Inline(&'static [usize]),
-    /// At least one executed instruction has no inline arm (`bs_get_tail`,
-    /// `bs_match_string`, `bs_create_bin`, a >32-bit `bs_match` field), so the family helper
-    /// really does run and its run-time counter is the proof.
+    /// At least one executed instruction has no inline arm (`bs_get_tail`, a `get_tail`
+    /// **`bs_match` command**, `bs_create_bin`'s non-construction shapes, a >32-bit `bs_match`
+    /// field), so the family helper really does run and its run-time counter is the proof.
     Helper,
+    /// The row executes **both kinds**: at least one instruction is on the family (so the
+    /// helper's run-time counter moves), *and* `shapes` were natively emitted — the honest
+    /// classification for a body that mixes an inlined arm with a family-only instruction, and
+    /// the one that keeps the inlined half pinned instead of hiding it behind the helper half.
+    Mixed(&'static [usize]),
 }
 
 /// **The owning arm executes every claimed shape on the real fixtures, and is interpreter-identical.**
@@ -525,8 +530,12 @@ enum Route {
 /// * `head16/1` — the exhaustive `<<X:16>>` form, same four inlined shapes, same proof;
 /// * `bssmall:u64/1` — its `bs_match` reads 64 bits, outside the arm's width set, so the
 ///   **helper** runs and its counter is the proof;
-/// * `bsmatch:strlong/1` — `bs_match_string` has no inline arm ⇒ **helper**;
-/// * `bscreate:u8/1` — `bs_create_bin` has no inline arm ⇒ **helper**.
+/// * `bsmatch:strlong/1` — **both**: its `bs_match_string` (the 80-bit literal) is natively
+///   inlined, while the `bs_match` that reads the tail does so through a `get_tail` **command**,
+///   which allocates and therefore stays on the family, so the helper's run-time counter moves
+///   *and* the `bs_match_string` arm's emission counter does;
+/// * `bscreate:u8/1` — its `bs_create_bin` is not the private-append construction shape ⇒
+///   **helper**.
 ///
 /// Every row asserts tier agreement with [`Tier::Interpreter`] on the same input **and** the
 /// returned value's identity, so a wrong extraction inside an agreeing outcome still fails.
@@ -545,6 +554,8 @@ fn every_claimed_shape_runs_through_its_owning_arm_and_agrees_with_the_interpret
         super::emit::bitstr_inline::SHAPE_START_MATCH3,
         super::emit::bitstr_inline::SHAPE_BS_MATCH,
     ];
+    // The one shape `bsmatch:strlong/1` executes natively on its success path.
+    let inlined_string: &'static [usize] = &[super::emit::bitstr_inline::SHAPE_BS_MATCH_STRING];
     // (fixture, function, argument, the expected small-int result — `None` for a binary
     // result, which the bit-exact cross-tier comparison covers on its own — and the owner).
     let cases: [(&str, &str, Arg, Option<i64>, Route); 5] = [
@@ -564,7 +575,7 @@ fn every_claimed_shape_runs_through_its_owning_arm_and_agrees_with_the_interpret
             Route::Helper,
         ),
         // `strlong/1` returns the tail **binary** after the 10-byte literal.
-        ("bsmatch", "strlong", Arg::Bytes(literal), None, Route::Helper),
+        ("bsmatch", "strlong", Arg::Bytes(literal), None, Route::Mixed(inlined_string)),
         ("bscreate", "u8", Arg::Int(65), None, Route::Helper),
     ];
     for (fixture_name, function, arg, expected, route) in cases {
@@ -607,37 +618,58 @@ fn every_claimed_shape_runs_through_its_owning_arm_and_agrees_with_the_interpret
                      not run (counter {before} -> {after})"
                 );
                 // The positive half: on a **cache-free** compile its own inline arms emitted.
-                let index = module
-                    .functions
-                    .iter()
-                    .position(|f| f.name == atom)
-                    .unwrap_or_else(|| {
-                        panic!("{fixture_name}: no compiled function named {function}/1")
-                    }) as u32;
-                let (emitted, snapshot) = super::bitstr_inline_tests::emitted_shapes_for(
-                    &module, index,
+                assert_shapes_inlined(fixture_name, function, &module, atom, shapes);
+            }
+            Route::Mixed(shapes) => {
+                // The family half: an instruction with no inline arm really did run.
+                assert!(
+                    after > before,
+                    "{fixture_name}:{function}/1 executes an instruction that has no inline \
+                     arm, so the family helper must run (counter {before} -> {after})"
                 );
-                for shape in shapes {
-                    assert!(
-                        emitted.contains(shape),
-                        "{fixture_name}:{function}/1 must inline shape {shape} \
-                         (emitted {emitted:?})"
-                    );
-                }
-                for variant in [
-                    "BsGetPosition",
-                    "BsSetPosition",
-                    "BsStartMatch3",
-                    "BsMatch",
-                ] {
-                    assert_eq!(
-                        super::bitstr_inline_tests::static_deopts(&snapshot, variant),
-                        0,
-                        "{fixture_name}:{function}/1 must not deopt `{variant}`"
-                    );
-                }
+                // The inlined half, pinned rather than hidden behind the helper's counter.
+                assert_shapes_inlined(fixture_name, function, &module, atom, shapes);
             }
         }
+    }
+}
+
+/// **The shape's arm emitted, and its instruction stayed native**, for a row of the pin above:
+/// a cache-free compile of `function` must move `inlined(shape)` and record **zero** static
+/// deopts for the shape's own `Instr` variant (whose name is resolved through the one
+/// [`shape_variant`](super::bitstr_inline_tests::shape_variant) table, and whose **visits** are
+/// asserted so a misnamed variant cannot make the deopt assertion vacuous).
+fn assert_shapes_inlined(
+    fixture_name: &str,
+    function: &str,
+    module: &Module,
+    atom: Atom,
+    shapes: &[usize],
+) {
+    let index = module
+        .functions
+        .iter()
+        .position(|f| f.name == atom)
+        .unwrap_or_else(|| panic!("{fixture_name}: no compiled function named {function}/1"))
+        as u32;
+    let (emitted, snapshot) = super::bitstr_inline_tests::emitted_shapes_for(module, index);
+    for shape in shapes {
+        assert!(
+            emitted.contains(shape),
+            "{fixture_name}:{function}/1 must inline shape {shape} (emitted {emitted:?})"
+        );
+        let variant = super::bitstr_inline_tests::shape_variant(*shape);
+        assert!(
+            super::bitstr_inline_tests::visited_instances(&snapshot, variant) >= 1,
+            "{fixture_name}:{function}/1 must execute `{variant}`, so the deopt assertion is \
+             not vacuous (visited {:?})",
+            snapshot.instr_instances,
+        );
+        assert_eq!(
+            super::bitstr_inline_tests::static_deopts(&snapshot, variant),
+            0,
+            "{fixture_name}:{function}/1 must not deopt `{variant}`"
+        );
     }
 }
 

@@ -721,7 +721,7 @@ fn dynamic_execution_census() -> crate::exec_census::Snapshot {
 //   `gc_bif` fast path is present to measure and is out of this table's scope.
 // * every row is a shape the tier **does** lower (`deopts == 0` is asserted per row): a
 //   body that fell through to the family helper or to `jit_step_one` would measure the
-//   deopt sequence plus the helper call, not the inline arm. The eight bitstring arms
+//   deopt sequence plus the helper call, not the inline arm. The bitstring arms
 //   ([`super::super::emit::bitstr_inline`]) each carry a small shared prologue (the
 //   match-context guard and, where they can fail, an exit to the fail label), which is
 //   why their deltas are *positive* against the `func_info` reference: an inlined

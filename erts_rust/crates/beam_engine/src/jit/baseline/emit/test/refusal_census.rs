@@ -285,10 +285,10 @@ fn already_inlined(module: &Module, instr: &Instr) -> bool {
 // ---------------------------------------------------------------------------
 // Bitstring inline refusals
 //
-// The tier natively lowers nine `Bs*` shapes (`emit/bitstr_inline/`, `bs_create_bin`
-// included); every other `Bs*` instruction goes to the family arm, and every one of the
-// nine can still be *refused* by its own shape predicate. This section attributes those
-// refusals.
+// The tier natively lowers the `Bs*` shapes `emit/bitstr_inline/` claims
+// (`bs_create_bin` included); every other `Bs*` instruction goes to the family arm, and
+// every claimed shape can still be *refused* by its own shape predicate. This section
+// attributes those refusals.
 //
 // The vocabulary is closed: each reason string below is emitted from exactly one
 // place, so the table cannot grow an unlisted bucket, and every `Bs*` instruction the
@@ -657,16 +657,129 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
         }
         // The remaining `Bs*` variants have no inline arm at all — reported so the corpus
         // view is complete, never silently dropped.
-        Instr::BsMatchString { .. } => BsVerdict::NoArm("bs_match_string"),
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => {
+            const OP: &str = "bs_match_string";
+            if bitstr_inline::match_string_shape(labels, module, *fail, ctx, *bits, *offset)
+                .is_some()
+            {
+                return BsVerdict::Inlined(OP);
+            }
+            let reason = fail_refusal(labels, *fail).unwrap_or_else(|| {
+                "pattern not lowered (offset, length cap or bit width)".to_string()
+            });
+            BsVerdict::Refused(OP, reason)
+        }
         Instr::BsGetTail { .. } => BsVerdict::NoArm("bs_get_tail"),
         Instr::BsGetFloat2(_) => BsVerdict::NoArm("bs_get_float2"),
         Instr::BsGetBinary2(_) => BsVerdict::NoArm("bs_get_binary2"),
-        Instr::BsGetUtf8 { .. } => BsVerdict::NoArm("bs_get_utf8"),
-        Instr::BsGetUtf16 { .. } => BsVerdict::NoArm("bs_get_utf16"),
-        Instr::BsGetUtf32 { .. } => BsVerdict::NoArm("bs_get_utf32"),
-        Instr::BsSkipUtf8 { .. } => BsVerdict::NoArm("bs_skip_utf8"),
-        Instr::BsSkipUtf16 { .. } => BsVerdict::NoArm("bs_skip_utf16"),
-        Instr::BsSkipUtf32 { .. } => BsVerdict::NoArm("bs_skip_utf32"),
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => {
+            const OP: &str = "bs_skip_utf32";
+            if bitstr_inline::skip_utf32_shape(labels, *fail, ctx, *flags).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The shape's two refusals, in its own precedence: the endianness flag word is
+            // static, so it is decidable before the fail operand is; then the shared fail
+            // half; anything else is the operand form.
+            let reason = if bitstr_inline::field_is_little(*flags) {
+                BS_REASON_FIELD.to_string()
+            } else {
+                fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx]))
+            };
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsGetUtf32 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => {
+            const OP: &str = "bs_get_utf32";
+            if bitstr_inline::get_utf32_shape(labels, *fail, ctx, *flags, dst).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The shape's refusals in its own precedence — the skip twin's, plus the
+            // destination's: the endianness flag word is static, so it is decidable before
+            // the fail operand is; then the shared fail half; anything else is the operand
+            // form (`ctx` or `dst`).
+            let reason = if bitstr_inline::field_is_little(*flags) {
+                BS_REASON_FIELD.to_string()
+            } else {
+                fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx, dst]))
+            };
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsSkipUtf8 { fail, ctx, .. } => {
+            const OP: &str = "bs_skip_utf8";
+            if bitstr_inline::skip_utf8_shape(labels, *fail, ctx).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The shape has no field rule to report: UTF-8 has no endianness, so the family's
+            // `decode_utf8` takes no flags and the arm accepts every flags word. That leaves the
+            // shared fail half and the context operand's form.
+            let reason = fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx]));
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => {
+            const OP: &str = "bs_get_utf8";
+            if bitstr_inline::get_utf8_shape(labels, *fail, ctx, dst).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The skip twin's refusals plus the destination's — and again no field rule: UTF-8
+            // has no endianness, so the family's `decode_utf8` takes no flags and the arm
+            // accepts every flags word, which leaves the shared fail half and the operand form
+            // (`ctx` or `dst`).
+            let reason = fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx, dst]));
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsSkipUtf16 {
+            fail, ctx, flags, ..
+        } => {
+            const OP: &str = "bs_skip_utf16";
+            if bitstr_inline::skip_utf16_shape(labels, *fail, ctx, *flags).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The shape's two refusals, in its own precedence: the endianness flag word is
+            // static, so it is decidable before the fail operand is; then the shared fail
+            // half; anything else is the operand form.
+            let reason = if bitstr_inline::field_is_little(*flags) {
+                BS_REASON_FIELD.to_string()
+            } else {
+                fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx]))
+            };
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsGetUtf16 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => {
+            const OP: &str = "bs_get_utf16";
+            if bitstr_inline::get_utf16_shape(labels, *fail, ctx, *flags, dst).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The shape's refusals in its own precedence — the skip twin's, plus the
+            // destination's: the endianness flag word is static, so it is decidable before
+            // the fail operand is; then the shared fail half; anything else is the operand
+            // form (`ctx` or `dst`).
+            let reason = if bitstr_inline::field_is_little(*flags) {
+                BS_REASON_FIELD.to_string()
+            } else {
+                fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx, dst]))
+            };
+            BsVerdict::Refused(OP, reason)
+        }
         Instr::BsInitWritable => BsVerdict::NoArm("bs_init_writable"),
         _ => BsVerdict::NotBitstring,
     }

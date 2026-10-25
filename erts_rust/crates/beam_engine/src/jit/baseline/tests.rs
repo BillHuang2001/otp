@@ -2581,8 +2581,8 @@ fn the_bitstring_arm_stores_the_instruction_position_inline() {
     // One `bs_get_tail` at pc 1 of the block that starts at pc 0, so the instruction's
     // packed word (`pack_current_code(0, 1)`) is distinguishable from the prologue's
     // (`pack_current_code(0, 0)`). `bs_get_tail` is one of the twenty variants the arm
-    // itself lowers: the six match-context shapes (`bs_start_match3`/`4`,
-    // `bs_get_position`, `bs_set_position`, `bs_test_tail2`, `bs_skip_bits2`) have their
+    // itself lowers: the match-context shapes (`bs_start_match3`/`4`,
+    // `bs_get_position`, `bs_set_position`, `bs_test_tail2`, `bs_skip_bits2`, …) have their
     // own in-block lowerings ([`super::emit::bitstr_inline`]) and never reach the arm, so
     // the arm's own store is pinned on a variant it still emits the helper for.
     let module = build_module(

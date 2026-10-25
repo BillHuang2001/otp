@@ -17,10 +17,12 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Per-shape pins for the **nine native bitstring inline arms** in
+//! Per-shape pins for the **sixteen native bitstring inline arms** in
 //! [`super::emit::bitstr_inline`]: `bs_get_position`, `bs_set_position`,
 //! `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`,
-//! `bs_get_integer2`, `bs_match` and `bs_create_bin`.
+//! `bs_get_integer2`, `bs_match`, `bs_create_bin`, `bs_match_string`,
+//! `bs_skip_utf32`, `bs_get_utf32`, `bs_skip_utf16`, `bs_get_utf16`,
+//! `bs_skip_utf8` and `bs_get_utf8`.
 //!
 //! `bitstr_tests` pins the *family route* (the `jit_bitstr` helper and the predicate
 //! that claims the whole `Bs*` set). This node pins the **inline** route, one claim per
@@ -63,9 +65,10 @@ use super::bitstr::bitstr_calls;
 use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
 use super::counters;
 use super::emit::bitstr_inline::{
-    self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_COUNT, SHAPE_CREATE_BIN, SHAPE_GET_INTEGER2,
-    SHAPE_GET_POSITION, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_START_MATCH3,
-    SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
+    self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_BS_MATCH_STRING, SHAPE_COUNT, SHAPE_CREATE_BIN,
+    SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_GET_UTF16, SHAPE_GET_UTF32, SHAPE_GET_UTF8,
+    SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF16, SHAPE_SKIP_UTF32, SHAPE_SKIP_UTF8,
+    SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
 use super::tests::{assemble_function, assert_same_outcome, function_code_bytes};
@@ -149,7 +152,7 @@ pub(crate) fn sentinel_block(label: Label) -> Vec<Instr> {
 }
 
 // ---------------------------------------------------------------------------
-// The nine hand-built shape modules
+// The hand-built shape modules
 // ---------------------------------------------------------------------------
 /// `bs_get_position`: read 8 bits, then report the context position — `8`.
 fn module_get_position() -> Module {
@@ -500,6 +503,238 @@ fn module_create_bin() -> Module {
         },
     )
 }
+
+/// `bs_match_string`: a nine-byte (72-bit) pattern compare out of the context — the shape the
+/// system compiler emits for a binary literal **longer than 64 bits** in a pattern
+/// (`tests/fixtures/bsmatch.erl`'s `strlong/1`), and well under the shape's own
+/// `MAX_MATCH_BYTES` cap (64 bytes).
+///
+/// `strings` is installed **after** the code is assembled because it is what the *compiler*
+/// reads (the shape predicate's pattern source), not something the instruction stream
+/// carries; the pattern is the subject's own first nine bytes, so a compile that emits the arm
+/// and a run of this module both succeed.
+fn module_match_string() -> Module {
+    let mut module = bitstr_module("inline_bs_match_string", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsMatchString {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                bits: 72,
+                offset: 0,
+            },
+            Instr::Move {
+                src: Operand::Integer(72),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    });
+    module.strings = b"ABCDEFGHItail".to_vec();
+    module
+}
+
+/// `bs_skip_utf32`: consume one 32-bit big-endian scalar out of the context and report the
+/// context's **new position** — the character `<<_/utf32, _/binary>>` skips without binding.
+///
+/// The answer is `bs_get_position`'s, i.e. `32` on success and `-1` (the sentinel block) when
+/// the fail label is taken, so "did the commit run" and "did the fail branch run" are both
+/// observable through the returned value.
+fn module_skip_utf32() -> Module {
+    bitstr_module("inline_bs_skip_utf32", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsSkipUtf32 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+            },
+            Instr::BsGetPosition {
+                ctx: Operand::X(1),
+                dst: Operand::X(0),
+                live: 2,
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
+/// `bs_get_utf32`: read one UTF-32 character and **return the scalar**, so the arm's bind
+/// (not just its commit) is observable through the answer — the skip twin returns the
+/// position instead. The fail label answers [`sentinel_block`]'s `-1`, which no Unicode scalar
+/// can be, so "took the fail branch" stays distinguishable.
+fn module_get_utf32() -> Module {
+    bitstr_module("inline_bs_get_utf32", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsGetUtf32 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
+/// `bs_skip_utf16`: consume one **variable-width** UTF-16 character out of the context and
+/// report the context's **new position** — the character `<<_/utf16, _/binary>>` skips without
+/// binding.
+///
+/// The answer is `bs_get_position`'s, i.e. `16` for a BMP character, `32` for a surrogate pair
+/// and `-1` (the sentinel block) when the fail label is taken — so "which width did the commit
+/// advance by" and "did the fail branch run" are both observable through the returned value,
+/// and a character consumed twice (or not at all) is visible too.
+fn module_skip_utf16() -> Module {
+    bitstr_module("inline_bs_skip_utf16", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsSkipUtf16 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+            },
+            Instr::BsGetPosition {
+                ctx: Operand::X(1),
+                dst: Operand::X(0),
+                live: 2,
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
+/// `bs_get_utf16`: read one **variable-width** UTF-16 character and **return the decoded
+/// scalar** — so the arm's bind (not just its commit) is observable through the answer, the
+/// way `module_get_utf32` makes its own bind observable. The fail label answers
+/// [`sentinel_block`]'s `-1`, which no Unicode scalar can be, so "took the fail branch" stays
+/// distinguishable from a decoded `0`.
+fn module_get_utf16() -> Module {
+    bitstr_module("inline_bs_get_utf16", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsGetUtf16 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
+/// `bs_get_utf8`: read one **self-describing** UTF-8 character and **return the decoded
+/// scalar** — so the arm's bind (not just its commit) is observable through the answer, the way
+/// `module_get_utf16` makes its own bind observable. The fail label answers
+/// [`sentinel_block`]'s `-1`, which no Unicode scalar can be, so "took the fail branch" stays
+/// distinguishable from a decoded `0`.
+fn module_get_utf8() -> Module {
+    bitstr_module("inline_bs_get_utf8", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsGetUtf8 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
+/// `bs_skip_utf8`: consume one **self-describing** UTF-8 character out of the context and
+/// report the context's **new position** — the character `<<_/utf8, _/binary>>` skips without
+/// binding.
+///
+/// The answer is `bs_get_position`'s, i.e. `8` for an ASCII character, `16`/`24`/`32` for the
+/// three wider forms and `-1` (the sentinel block) when the fail label is taken — so "which of
+/// the four static paths ran" and "did the fail branch run" are both observable through the
+/// returned value, and a character consumed twice (or not at all) is visible too.
+fn module_skip_utf8() -> Module {
+    bitstr_module("inline_bs_skip_utf8", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsSkipUtf8 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+            },
+            Instr::BsGetPosition {
+                ctx: Operand::X(1),
+                dst: Operand::X(0),
+                live: 2,
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
 // ---------------------------------------------------------------------------
 // The instrument: a cache-free compile per shape
 // ---------------------------------------------------------------------------
@@ -553,27 +788,87 @@ pub(crate) fn visited_instances(snapshot: &counters::Counters, variant: &str) ->
     snapshot.instr_instances.get(variant).copied().unwrap_or(0)
 }
 
+/// One row of the emission instrument: a shape's name, its index in the `inlined` counter, the
+/// `Instr` variant the **static-deopt** census keys it by, and the fixture builder whose
+/// cache-free compile must emit it.
+pub(crate) type ShapeCase = (&'static str, usize, &'static str, fn() -> Module);
+
+/// **Every** in-block bitstring shape, one row each — the table
+/// [`every_inline_shape_emits_on_a_cache_free_compile`] sweeps and [`shape_variant`] resolves.
+///
+/// The array's length is [`SHAPE_COUNT`], so adding a shape to the emission instrument without
+/// a row here is a compile error rather than a silently uncovered shape (the failure mode this
+/// table exists to prevent).
+pub(crate) const INLINE_SHAPE_CASES: [ShapeCase; SHAPE_COUNT] = [
+    (
+        "bs_get_position",
+        SHAPE_GET_POSITION,
+        "BsGetPosition",
+        module_get_position,
+    ),
+    (
+        "bs_set_position",
+        SHAPE_SET_POSITION,
+        "BsSetPosition",
+        module_set_position,
+    ),
+    ("bs_test_tail2", SHAPE_TEST_TAIL2, "BsTestTail2", module_test_tail2),
+    ("bs_skip_bits2", SHAPE_SKIP_BITS2, "BsSkipBits2", module_skip_bits2),
+    (
+        "bs_start_match3",
+        SHAPE_START_MATCH3,
+        "BsStartMatch3",
+        module_start_match3,
+    ),
+    (
+        "bs_start_match4",
+        SHAPE_START_MATCH4,
+        "BsStartMatch4",
+        module_start_match4_label,
+    ),
+    (
+        "bs_get_integer2",
+        SHAPE_GET_INTEGER2,
+        "BsGetInteger2",
+        module_get_integer2,
+    ),
+    ("bs_match", SHAPE_BS_MATCH, "BsMatch", module_bs_match),
+    ("bs_create_bin", SHAPE_CREATE_BIN, "BsCreateBin", module_create_bin),
+    (
+        "bs_match_string",
+        SHAPE_BS_MATCH_STRING,
+        "BsMatchString",
+        module_match_string,
+    ),
+    ("bs_skip_utf32", SHAPE_SKIP_UTF32, "BsSkipUtf32", module_skip_utf32),
+    ("bs_get_utf32", SHAPE_GET_UTF32, "BsGetUtf32", module_get_utf32),
+    ("bs_skip_utf16", SHAPE_SKIP_UTF16, "BsSkipUtf16", module_skip_utf16),
+    ("bs_get_utf16", SHAPE_GET_UTF16, "BsGetUtf16", module_get_utf16),
+    ("bs_skip_utf8", SHAPE_SKIP_UTF8, "BsSkipUtf8", module_skip_utf8),
+    ("bs_get_utf8", SHAPE_GET_UTF8, "BsGetUtf8", module_get_utf8),
+];
+
+/// The `Instr` variant the static-deopt census keys `shape` by — the **one** mapping, so a
+/// sibling's `static_deopts` assertion cannot name a variant the census never records (see
+/// [`visited_instances`], which makes that vacuity impossible to hide).
+pub(crate) fn shape_variant(shape: usize) -> &'static str {
+    INLINE_SHAPE_CASES
+        .iter()
+        .find(|(_, index, _, _)| *index == shape)
+        .unwrap_or_else(|| panic!("no emission-instrument row for shape {shape}"))
+        .2
+}
+
 /// **Every arm emits and stays native — the mandatory instrument.**
 ///
-/// For each of the nine shapes: a cache-free [`super::emit::compile_function`] moves that
-/// shape's `inlined(SHAPE_*)` counter, visits the variant (so the name is real), and
-/// records **zero** static deopts for it. Without this a fully-deopting "implementation"
-/// would pass every tier-agreement test in this file.
+/// For each of the sixteen shapes ([`INLINE_SHAPE_CASES`]): a cache-free
+/// [`super::emit::compile_function`] moves that shape's `inlined(SHAPE_*)` counter, visits the
+/// variant (so the name is real), and records **zero** static deopts for it. Without this a
+/// fully-deopting "implementation" would pass every tier-agreement test in this file.
 #[test]
 fn every_inline_shape_emits_on_a_cache_free_compile() {
-    let cases: [(&str, usize, &str, fn() -> Module); 9] = [
-        ("bs_get_position", SHAPE_GET_POSITION, "BsGetPosition", module_get_position),
-        ("bs_set_position", SHAPE_SET_POSITION, "BsSetPosition", module_set_position),
-        ("bs_test_tail2", SHAPE_TEST_TAIL2, "BsTestTail2", module_test_tail2),
-        ("bs_skip_bits2", SHAPE_SKIP_BITS2, "BsSkipBits2", module_skip_bits2),
-        ("bs_start_match3", SHAPE_START_MATCH3, "BsStartMatch3", module_start_match3),
-        ("bs_start_match4", SHAPE_START_MATCH4, "BsStartMatch4", module_start_match4_label),
-        ("bs_get_integer2", SHAPE_GET_INTEGER2, "BsGetInteger2", module_get_integer2),
-        ("bs_match", SHAPE_BS_MATCH, "BsMatch", module_bs_match),
-        ("bs_create_bin", SHAPE_CREATE_BIN, "BsCreateBin", module_create_bin),
-    ];
     let mut covered = 0usize;
-    for (shape_name, index, variant, build) in cases {
+    for (shape_name, index, variant, build) in INLINE_SHAPE_CASES {
         let module = build();
         let (emitted, snapshot) = emitted_shapes(&module);
         assert!(
@@ -1144,7 +1439,7 @@ fn a_no_fail_shape_still_goes_through_the_family() {
 // ---------------------------------------------------------------------------
 // The refusal rules, shape by shape
 // ---------------------------------------------------------------------------
-/// **Every deliberate refusal of the nine arms, classified at the predicate.**
+/// **Every deliberate refusal of the arms, classified at the predicate.**
 ///
 /// A refused shape is not a bug: it is the family's general path, which is why each of
 /// these must answer `None`. The list is the same one

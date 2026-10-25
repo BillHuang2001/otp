@@ -881,9 +881,10 @@ pub(crate) fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
-            // The bitstring family's **small, allocation-free match-context shapes**
-            // (see [`bitstr_inline`]): `bs_get_position`, `bs_set_position`,
-            // `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3` and `bs_start_match4`.
+            // The bitstring family's **native, allocation-free shapes** (see
+            // [`bitstr_inline`]): the match-context shapes (the position/tail/start-match/
+            // integer extractors, the static `bs_match`, `bs_match_string` and the UTF
+            // skip/get pairs) plus the `bs_create_bin` construction build.
             // Each has its own guarded native sequence with its own compile-time shape
             // predicate, which **refuses** (emitting zero bytes) exactly the shapes whose
             // run-time behaviour is not provable — an un-addressable operand, a `NO_FAIL`
@@ -893,7 +894,7 @@ pub(crate) fn emit_block(
             // `_ if bitstrings::claimed(instr)` arm: a `match` arm after a `_ if` guard
             // arm is unreachable.
             //
-            // None of the six terminates the block. A shape's hit path continues in-block;
+            // None of these arms terminates the block. A shape's hit path continues in-block;
             // its miss/fail/fallback paths leave through an exit that always transfers
             // control (the linker's `emit_exit`, or `emit_step_and_continue`), so the
             // block's own fall-through after the arm is still reachable and `terminated`
@@ -1078,6 +1079,249 @@ pub(crate) fn emit_block(
                     module,
                     dst,
                     segments,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            // `bs_match_string` — the compiler's spelling of a **binary literal inside a
+            // match** (`<<"GET ", Rest/binary>>`, `<<"ok\n">>`): the pattern is a
+            // compile-time constant out of the module's string table, so its bytes are
+            // emitted as immediates and the compare is straight-line byte code (see
+            // [`bitstr_inline::match_string`]). Every guard — the match-context guard, the
+            // remaining-window check, the byte-alignment guard, the subject classification
+            // and the readable-bounds guard — runs before the **single** commit of the
+            // context's `start` word, so a `fallback` deopt re-executes the instruction
+            // against an untouched context. A pattern longer than
+            // `match_string::MAX_MATCH_BYTES`, a `NO_FAIL` fail code that raises and an
+            // unresolvable label emit **zero bytes** and take the family's own arm below.
+            //
+            // Like the shapes around it this never terminates the block: the hit path
+            // continues in-block and the fail/fallback paths always transfer control.
+            Instr::BsMatchString {
+                fail,
+                ctx,
+                bits,
+                offset,
+            } => {
+                if !bitstr_inline::try_inline_bs_match_string(
+                    buffer,
+                    labels,
+                    &linker,
+                    module,
+                    *fail,
+                    ctx,
+                    *bits,
+                    *offset,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            // `bs_skip_utf32` — one 32-bit big-endian field that must be a Unicode scalar
+            // (`decode_utf32`, `crate::families::bitstrings::matching::reads`), the
+            // character a `<<C/utf32>>` pattern consumes without binding. The sequence
+            // validates the scalar in registers and commits the advanced `start` word
+            // **once**, after every guard, so a `fallback` deopt re-executes the instruction
+            // against an untouched context. A truncated field, a value past `0x10FFFF` and a
+            // surrogate all take the **fail label** (the family's `fail_step`, which writes
+            // nothing); a `-little`/`-native` flags word, a `NO_FAIL` fail code that raises
+            // and an unresolvable label emit **zero bytes** and take the family's arm below.
+            // See [`bitstr_inline::utf32`].
+            Instr::BsSkipUtf32 {
+                fail,
+                ctx,
+                live: _,
+                flags,
+            } => {
+                if !bitstr_inline::try_inline_bs_skip_utf32(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *flags,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            // `bs_get_utf32` — the same character, **bound**: identical validation and the
+            // same fail label, plus the destination store. The destination's frame-window
+            // guard is emitted first and the bind follows the single `start` commit, because
+            // `Dst` may be `Ctx` (`beam_asm:filter_essentials/1` compiles that) and the commit
+            // goes through the block pointer the match-context guard left in `r11` rather than
+            // re-reading the operand. Refusals are the skip twin's — a `-little`/`-native`
+            // flags word, a `NO_FAIL` fail code, an unresolvable label — plus an
+            // un-addressable `Dst`; each emits **zero bytes** and takes the family's arm below.
+            Instr::BsGetUtf32 {
+                fail,
+                ctx,
+                live: _,
+                flags,
+                dst,
+            } => {
+                if !bitstr_inline::try_inline_bs_get_utf32(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *flags,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            // `bs_skip_utf16` — the **variable-width** character: one 16-bit word for a BMP
+            // scalar, two for a surrogate pair. The sequence reads the first word, and only
+            // a **high** surrogate (`0xD800..=0xDBFF`) goes on to read a second one; the
+            // shared commit both mutually exclusive paths reach advances `start` by 16 or 32
+            // exactly once, after every guard, so a `fallback` deopt re-executes the
+            // instruction against an untouched context. Each of `decode_utf16`'s four
+            // malformed characters — fewer than 16 bits remaining, a **lone low** surrogate,
+            // a high surrogate with fewer than 32 bits remaining, and a high surrogate not
+            // followed by a low one — takes the **fail label** (the family's `fail_step`,
+            // which writes nothing), never a trap. The pair's second over-read guard and its
+            // `remaining < 32` test live on the surrogate path only, so a BMP character at
+            // the very end of a subject is not forced to deopt. A `-little`/`-native` flags
+            // word, a `NO_FAIL` fail code that raises and an unresolvable label emit **zero
+            // bytes** and take the family's arm below. See [`bitstr_inline::utf16`].
+            Instr::BsSkipUtf16 {
+                fail,
+                ctx,
+                live: _,
+                flags,
+            } => {
+                if !bitstr_inline::try_inline_bs_skip_utf16(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *flags,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            // `bs_get_utf16` — the same variable-width character, **bound**: identical word
+            // reads, guards, malformed-character transfers and the same one merged commit,
+            // plus the destination store. The destination's frame-window guard is emitted
+            // first and the bind follows the single `start` commit, because `Dst` may be `Ctx`
+            // (`beam_asm:filter_essentials/1` compiles that) and the commit goes through the
+            // block pointer the match-context guard left in `r11` rather than re-reading the
+            // operand. Refusals are the skip twin's — a `-little`/`-native` flags word, a
+            // `NO_FAIL` fail code, an unresolvable label — plus an un-addressable `Dst`; each
+            // emits **zero bytes** and takes the family's arm below. See
+            // [`bitstr_inline::utf16`].
+            Instr::BsGetUtf16 {
+                fail,
+                ctx,
+                live: _,
+                flags,
+                dst,
+            } => {
+                if !bitstr_inline::try_inline_bs_get_utf16(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *flags,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            // `bs_skip_utf8` — the **self-describing** character: the lead byte announces how
+            // many continuation bytes follow (`0x00..=0x7F` none, `0xC0..=0xDF` one,
+            // `0xE0..=0xEF` two, `0xF0..=0xF4` three), so the length is decided at run time and
+            // the sequence classifies the lead byte into one of **four static paths**, each with
+            // its own window check, its own over-read guard and its own fixed continuation reads
+            // with static shift amounts. All four converge on **one** commit that advances
+            // `start` by the character's own bit length exactly once, after every guard, so a
+            // `fallback` deopt re-executes the instruction against an untouched context. Each of
+            // `decode_utf8`'s malformed characters — fewer than 8 bits remaining, a continuation
+            // byte as the lead, a byte above `0xF4`, a truncated 2/3/4-byte form, a
+            // non-continuation byte where one is required, an overlong form, a surrogate code
+            // point and a value above `0x10FFFF` — takes the **fail label** (the family's
+            // `fail_step`, which writes nothing), never a trap. UTF-8 has **no** endianness, so
+            // the family ignores `flags` (`decode_utf8` takes none) and this arm accepts every
+            // flags word; a `NO_FAIL` fail code that raises and an unresolvable label emit
+            // **zero bytes** and take the family's arm below. See [`bitstr_inline::utf8`].
+            Instr::BsSkipUtf8 {
+                fail,
+                ctx,
+                live: _,
+                flags: _,
+            } => {
+                if !bitstr_inline::try_inline_bs_skip_utf8(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            // `bs_get_utf8` — the same self-describing character, **bound**: identical lead-byte
+            // classification, identical four static paths, identical malformed-character
+            // transfers and the same one merged commit, plus the destination store. The
+            // destination's frame-window guard is emitted first and the bind follows the single
+            // `start` commit, because `Dst` may be `Ctx` (`beam_asm:filter_essentials/1`
+            // compiles that) and the commit goes through the block pointer the match-context
+            // guard left in `r11` rather than re-reading the operand. Refusals are the skip
+            // twin's — a `NO_FAIL` fail code, an unresolvable label — plus an un-addressable
+            // `Dst`; each emits **zero bytes** and takes the family's arm below. UTF-8 has no
+            // endianness, so `flags` is accepted as it is for the skip form. See
+            // [`bitstr_inline::utf8`].
+            Instr::BsGetUtf8 {
+                fail,
+                ctx,
+                live: _,
+                flags: _,
+                dst,
+            } => {
+                if !bitstr_inline::try_inline_bs_get_utf8(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    dst,
                     allocation,
                     done,
                     func,

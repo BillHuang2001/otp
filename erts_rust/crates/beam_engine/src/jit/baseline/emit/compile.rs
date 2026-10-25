@@ -589,6 +589,10 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
     let mut bs_paths = 0usize;
     let mut bs_match_commands = 0usize;
     let mut create_bin_paths = 0usize;
+    let mut match_string_paths = 0usize;
+    let mut utf32_paths = 0usize;
+    let mut utf16_paths = 0usize;
+    let mut utf8_paths = 0usize;
     for instr in code {
         match instr {
             Instr::Bif { .. } => cmp_bifs += 1,
@@ -601,9 +605,10 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             Instr::SetTupleElement { .. } => tuple_paths += 1,
             Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
             // Every bitstring-path instruction the tier inlines *in addition to* the
-            // per-instruction budget below: all nine shapes — the six guarded
-            // match-context ones, `bs_get_integer2`, `bs_match` and `bs_create_bin` —
-            // reserve their own guarded sequence ([`BS_PATH_BYTES`]), `bs_match`
+            // per-instruction budget below: the guarded match-context shapes — the six
+            // position/tail/start-match ones, `bs_get_integer2`, `bs_match`,
+            // `bs_create_bin`, `bs_match_string` and the UTF-8/16/32 get/skip pairs — reserve their own
+            // guarded sequence ([`BS_PATH_BYTES`]), `bs_match`
             // additionally charges one [`BS_MATCH_COMMAND_BYTES`] per command, because its
             // whole static command list is lowered inline, and `bs_create_bin` charges one
             // [`CREATE_BIN_PATH_BYTES`] because its field writes are emitted one byte (aligned
@@ -616,6 +621,39 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
                 bs_match_commands += commands.len();
             }
             Instr::BsCreateBin { .. } => create_bin_paths += 1,
+            // Every other bitstring-path instruction charges the generic
+            // [`BS_PATH_BYTES`]; `bs_match_string` additionally charges one
+            // [`BS_MATCH_STRING_PATH_BYTES`] because its compare is one emitted
+            // triple per pattern byte, bounded by
+            // `match_string::MAX_MATCH_BYTES`.
+            Instr::BsMatchString { .. } => match_string_paths += 1,
+            // The UTF-32 shapes charge their own sequence ([`UTF32_PATH_BYTES`]) on top of
+            // the generic [`BS_PATH_BYTES`]: the four byte loads and the two validity tests
+            // are wider than the shared match-context guards this otherwise reuses, and the
+            // get form adds its destination guard and its bind.
+            Instr::BsSkipUtf32 { .. } | Instr::BsGetUtf32 { .. } => {
+                bs_paths += 1;
+                utf32_paths += 1;
+            }
+            // The UTF-16 shapes charge their own sequence ([`UTF16_PATH_BYTES`]) on top of the
+            // generic [`BS_PATH_BYTES`]: it is the *variable-width* character, so it carries
+            // a second big-endian word read, its own pair-window test and its own second
+            // over-read guard, plus the branch structure that routes a BMP word and a
+            // surrogate pair to one shared commit — and the get form adds its destination
+            // guard, the decoded scalar on both paths and the bind.
+            Instr::BsSkipUtf16 { .. } | Instr::BsGetUtf16 { .. } => {
+                bs_paths += 1;
+                utf16_paths += 1;
+            }
+            // The UTF-8 shape charges its own sequence ([`UTF8_PATH_BYTES`]) on top of the
+            // generic [`BS_PATH_BYTES`]: the character is **self-describing**, so the sequence
+            // carries a lead-byte classification and then **four** static paths, each with its
+            // own window check, its own over-read guard and its own fixed continuation reads —
+            // the widest of the whole bitstring set.
+            Instr::BsSkipUtf8 { .. } | Instr::BsGetUtf8 { .. } => {
+                bs_paths += 1;
+                utf8_paths += 1;
+            }
             Instr::BsGetInteger2(_)
             | Instr::BsGetPosition { .. }
             | Instr::BsSetPosition { .. }
@@ -635,6 +673,10 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + BS_PATH_BYTES * bs_paths
         + BS_MATCH_COMMAND_BYTES * bs_match_commands
         + CREATE_BIN_PATH_BYTES * create_bin_paths
+        + BS_MATCH_STRING_PATH_BYTES * match_string_paths
+        + UTF32_PATH_BYTES * utf32_paths
+        + UTF16_PATH_BYTES * utf16_paths
+        + UTF8_PATH_BYTES * utf8_paths
 }
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
@@ -742,6 +784,53 @@ const BS_MATCH_COMMAND_BYTES: usize = 320;
 /// instruction's own [`INSTRUCTION_BYTES`]. Deliberately loose: under-estimating would turn a
 /// large module into a `SystemLimit` compile error.
 const CREATE_BIN_PATH_BYTES: usize = 16_384;
+/// The code-size budget one `bs_match_string` adds on top of its own
+/// [`INSTRUCTION_BYTES`] (see [`code_capacity_estimate`]).
+///
+/// The compared pattern is emitted as one `movabs`–`movabs`–`cmp`–`jcc` triple per
+/// byte, so the budget is sized on the widest accepted pattern
+/// (`match_string::MAX_MATCH_BYTES` = 64 bytes: 64 × ~26 B ≈ 1.7 KiB) plus the
+/// guards (the context guard, the remaining-window check, the alignment guard, the
+/// subject classification and the bounds guard ≈ 220 B) and the commit. An
+/// under-estimate is a `SystemLimit` compile error, so the slack is deliberate.
+const BS_MATCH_STRING_PATH_BYTES: usize = 2_304;
+/// The code-size budget one UTF-32 shape adds **on top of** its own [`BS_PATH_BYTES`] and
+/// [`INSTRUCTION_BYTES`] (see [`code_capacity_estimate`]).
+///
+/// The sequence is one fixed length — the destination guard, the match-context guard, the
+/// `remaining` computation, the subject classification, the alignment guard, the
+/// readable-bounds guard, four `movzx`-based byte loads with three `shl`/`or` pairs, two
+/// validity tests, the single commit and the three exits — i.e. ≈ 60 + 40 + 60 + 130 + 30 +
+/// 40 + 4 × 30 + 60 + 40 ≈ 580 B, in front of the `emit_step_and_continue` fallback that
+/// [`INSTRUCTION_BYTES`] already covers. An under-estimate is a `SystemLimit` compile error,
+/// so the figure is deliberately loose.
+const UTF32_PATH_BYTES: usize = 1_024;
+/// The code-size budget reserved for one UTF-16 character sequence, on top of the generic
+/// [`BS_PATH_BYTES`] (see [`code_capacity_estimate`]).
+///
+/// The sequence is one fixed length — the match-context guard, the `remaining` computation
+/// and its `< 16` test, the subject classification, the alignment guard, the first word's
+/// over-read guard, two `movzx`-based byte loads with one `shl`/`or` pair, the two BMP range
+/// compares, the high-surrogate test, the pair-window test, the second over-read guard, the
+/// second word's two byte loads, the low-surrogate range test, the two `len` constants, the
+/// branch to the shared commit and the commit itself — i.e. roughly the UTF-32 sequence plus
+/// four compares and one more pair of byte loads, so the same order of magnitude. An
+/// under-estimate is a `SystemLimit` compile error, so the figure is deliberately loose.
+const UTF16_PATH_BYTES: usize = 1_024;
+/// The code-size budget reserved for one UTF-8 character sequence, on top of the generic
+/// [`BS_PATH_BYTES`] (see [`code_capacity_estimate`]).
+///
+/// This is the widest bitstring lowering: the match-context guard, the `remaining`
+/// computation and its `< 8` test, the subject classification, the alignment guard, the lead
+/// byte's over-read guard and its load, the five-compare classification, and then **four**
+/// static paths — the ASCII one (its payload mask and length only) and the 2-, 3- and 4-byte
+/// ones, each with its own window check, its own over-read guard, its own fixed continuation
+/// reads (each a `movzx` plus a `movabs`-constant tag test and a static shift) and its own
+/// three scalar-validity tests — then the single shared commit. Measured against the encoder's
+/// closed-form sequence sizes that is ≈ 1.3 kB for the widest (three-continuation) path on top
+/// of ≈ 260 B of shared prologue, so this figure is deliberately loose: an under-estimate is
+/// a `SystemLimit` compile error.
+const UTF8_PATH_BYTES: usize = 2_048;
 
 #[cfg(test)]
 mod tests {

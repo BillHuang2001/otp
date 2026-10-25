@@ -101,8 +101,10 @@ use super::aggregate::{
 use super::arith::{fast_arith, uses_y};
 use super::bif::bif_shape;
 use super::bitstr_inline::{
-    bs_match_shape, get_integer2_shape, get_position_shape, set_position_shape, skip_bits2_shape,
-    start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
+    match_string_shape,
+    bs_match_shape, get_integer2_shape, get_position_shape, get_utf16_shape, get_utf32_shape,
+    get_utf8_shape, set_position_shape, skip_bits2_shape, skip_utf16_shape, skip_utf32_shape,
+    skip_utf8_shape, start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
 };
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
@@ -476,9 +478,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
-        // The nine bitstring shapes the emitter lowers natively
-        // ([`super::bitstr_inline`]: the six match-context ones, plus
-        // `bs_get_integer2`, `bs_match` and `bs_create_bin`). Each is classified by the
+        // The bitstring shapes the emitter lowers natively
+        // ([`super::bitstr_inline`]: the match-context shapes, plus
+        // `bs_create_bin`'s construction build). Each is classified by the
         // **same** shape predicate its `try_inline_*` entry consults — those predicates
         // already refuse a `NO_FAIL` fail code, an unresolvable fail label, an undecodable
         // fail atom and an un-addressable operand, i.e. exactly the emitter's own
@@ -515,6 +517,36 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::BsCreateBin { dst, segments, .. } => {
             CreateBinShape::of(module, dst, segments).is_some()
         }
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => match_string_shape(labels, module, *fail, ctx, *bits, *offset).is_some(),
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => skip_utf32_shape(labels, *fail, ctx, *flags).is_some(),
+        Instr::BsGetUtf32 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => get_utf32_shape(labels, *fail, ctx, *flags, dst).is_some(),
+        Instr::BsSkipUtf16 {
+            fail, ctx, flags, ..
+        } => skip_utf16_shape(labels, *fail, ctx, *flags).is_some(),
+        Instr::BsGetUtf16 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => get_utf16_shape(labels, *fail, ctx, *flags, dst).is_some(),
+        Instr::BsSkipUtf8 { fail, ctx, .. } => skip_utf8_shape(labels, *fail, ctx).is_some(),
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => get_utf8_shape(labels, *fail, ctx, dst).is_some(),
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
         // call at all, so the label test is the honest classification.)
@@ -693,7 +725,7 @@ pub(crate) fn cacheable_touches(
                 }
             }
         }
-        // The nine bitstring shapes are charged the x-registers their own
+        // The bitstring shapes are charged the x-registers their own
         // native lowering references — and only when their `*_shape` claims them (an
         // un-addressable operand keeps the whole instruction on the family arm, which
         // contributes no native touch). A `Y` operand is a stack slot, **not** an
@@ -748,6 +780,64 @@ pub(crate) fn cacheable_touches(
         }
         Instr::BsCreateBin { dst, segments, .. } => {
             if let Some(shape) = CreateBinShape::of(module, dst, segments) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => {
+            if let Some((shape, _)) = match_string_shape(labels, module, *fail, ctx, *bits, *offset) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => {
+            if let Some((shape, _)) = skip_utf32_shape(labels, *fail, ctx, *flags) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsGetUtf32 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => {
+            if let Some((shape, _)) = get_utf32_shape(labels, *fail, ctx, *flags, dst) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsSkipUtf16 {
+            fail, ctx, flags, ..
+        } => {
+            if let Some((shape, _)) = skip_utf16_shape(labels, *fail, ctx, *flags) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsGetUtf16 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => {
+            if let Some((shape, _)) = get_utf16_shape(labels, *fail, ctx, *flags, dst) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsSkipUtf8 { fail, ctx, .. } => {
+            if let Some((shape, _)) = skip_utf8_shape(labels, *fail, ctx) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => {
+            if let Some((shape, _)) = get_utf8_shape(labels, *fail, ctx, dst) {
                 touches.extend(shape.registers());
             }
         }
@@ -847,7 +937,7 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
                 }
             }
         }
-        // The nine bitstring shapes read the x-registers their own native
+        // The bitstring shapes read the x-registers their own native
         // lowering loads (a match context, a subject, a saved position, a field's
         // source, a private-append accumulator) and only when
         // their `*_shape` claims them.
@@ -901,6 +991,64 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
         }
         Instr::BsCreateBin { dst, segments, .. } => {
             if let Some(shape) = CreateBinShape::of(module, dst, segments) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => {
+            if let Some((shape, _)) = match_string_shape(labels, module, *fail, ctx, *bits, *offset) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => {
+            if let Some((shape, _)) = skip_utf32_shape(labels, *fail, ctx, *flags) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsGetUtf32 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => {
+            if let Some((shape, _)) = get_utf32_shape(labels, *fail, ctx, *flags, dst) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsSkipUtf16 {
+            fail, ctx, flags, ..
+        } => {
+            if let Some((shape, _)) = skip_utf16_shape(labels, *fail, ctx, *flags) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsGetUtf16 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => {
+            if let Some((shape, _)) = get_utf16_shape(labels, *fail, ctx, *flags, dst) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsSkipUtf8 { fail, ctx, .. } => {
+            if let Some((shape, _)) = skip_utf8_shape(labels, *fail, ctx) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => {
+            if let Some((shape, _)) = get_utf8_shape(labels, *fail, ctx, dst) {
                 reads.extend(shape.reads());
             }
         }
@@ -1006,7 +1154,7 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         }
         // `Test`/`SelectVal` branch but write no x-register.
         Instr::Test { .. } | Instr::SelectVal { .. } => Vec::new(),
-        // The six bitstring match-context shapes: only `bs_get_position` and the two
+        // The bitstring match-context shapes: only `bs_get_position` and the two
         // `bs_start_match*` forms have an x-register destination, and each is charged
         // exactly when its `*_shape` claims the instruction. Charging it is **mandatory**:
         // a `bs_start_match*` hit stores the reused context word into `Dst`'s cache
@@ -1066,6 +1214,69 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
                 .map(|shape| shape.writes())
                 .unwrap_or_default()
         }
+        // `bs_match_string` binds nothing: its only mutation is the context's `start`
+        // heap word, so its write set is empty (charged anyway, so the four regalloc
+        // mirrors stay one decision — see `MatchStringShape::writes`).
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => match_string_shape(labels, module, *fail, ctx, *bits, *offset)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_skip_utf32` binds nothing either: its only mutation is the context's `start`
+        // heap word, so its write set is empty (charged anyway, so the four regalloc mirrors
+        // stay one decision — see `Utf32Shape::writes`).
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => skip_utf32_shape(labels, *fail, ctx, *flags)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_get_utf32`'s destination **is** an x-register write and must be charged: a
+        // dropped write lets a stale cache register survive a block exit — a wrong value
+        // rather than a redundant store (`Utf32Shape::writes` is the one definition).
+        Instr::BsGetUtf32 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => get_utf32_shape(labels, *fail, ctx, *flags, dst)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_skip_utf16` binds nothing either: its only mutation is the context's `start`
+        // heap word, so its write set is empty (charged anyway, so the four regalloc mirrors
+        // stay one decision — see `Utf16Shape::writes`).
+        Instr::BsSkipUtf16 {
+            fail, ctx, flags, ..
+        } => skip_utf16_shape(labels, *fail, ctx, *flags)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_get_utf16`'s destination **is** an x-register write and must be charged, for the
+        // same reason as `bs_get_utf32`'s above (`Utf16Shape::writes` is the one definition).
+        Instr::BsGetUtf16 {
+            fail,
+            ctx,
+            flags,
+            dst,
+            ..
+        } => get_utf16_shape(labels, *fail, ctx, *flags, dst)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_skip_utf8` binds nothing either: its only mutation is the context's `start`
+        // heap word, so its write set is empty (charged anyway, so the four regalloc mirrors
+        // stay one decision — see `Utf8Shape::writes`).
+        Instr::BsSkipUtf8 { fail, ctx, .. } => skip_utf8_shape(labels, *fail, ctx)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_get_utf8`'s destination **is** an x-register write and must be charged, for the
+        // same reason as `bs_get_utf16`'s above (`Utf8Shape::writes` is the one definition).
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => get_utf8_shape(labels, *fail, ctx, dst)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
         // Everything else deopts.
         _ => Vec::new(),
     }

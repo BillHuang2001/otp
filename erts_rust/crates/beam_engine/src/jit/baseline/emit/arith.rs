@@ -398,7 +398,7 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
         // frame window the aggregate readers use, so a `Y` operand of one makes the
         // block publish it ([`super::bif::bif_uses_y`], purely syntactic).
         Instr::Bif { .. } => super::bif::bif_uses_y(module, instr),
-        // The six bitstring match-context shapes ([`super::bitstr_inline`]) read their
+        // The bitstring family's in-block shapes ([`super::bitstr_inline`]) read their
         // operands through the same guarded frame window, so a `Y` operand of one makes
         // the block publish it. Every one is classified through its shape's **label-free**
         // constructor (`*Shape::of`), which is what the emitter's own predicate starts
@@ -442,6 +442,39 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             super::bitstr_inline::CreateBinShape::of(module, dst, segments)
                 .map_or(false, |shape| shape.uses_y())
         }
+        Instr::BsMatchString {
+            ctx,
+            bits,
+            offset,
+            ..
+        } => super::bitstr_inline::MatchStringShape::of(module, ctx, *bits, *offset)
+            .map_or(false, |shape| shape.uses_y()),
+        Instr::BsSkipUtf32 { ctx, flags, .. } => {
+            super::bitstr_inline::Utf32Shape::of(ctx, *flags)
+                .map_or(false, |shape| shape.uses_y())
+        }
+        // The get form reads its context **and** writes its destination through the same
+        // guarded frame window, so either one being a `Y` slot arms the block's publish.
+        Instr::BsGetUtf32 {
+            ctx, flags, dst, ..
+        } => super::bitstr_inline::Utf32Shape::of_get(ctx, *flags, dst)
+            .map_or(false, |shape| shape.uses_y()),
+        Instr::BsSkipUtf16 { ctx, flags, .. } => {
+            super::bitstr_inline::Utf16Shape::of(ctx, *flags)
+                .map_or(false, |shape| shape.uses_y())
+        }
+        // The get form reads its context **and** writes its destination through the same
+        // guarded frame window, so either one being a `Y` slot arms the block's publish.
+        Instr::BsGetUtf16 {
+            ctx, flags, dst, ..
+        } => super::bitstr_inline::Utf16Shape::of_get(ctx, *flags, dst)
+            .map_or(false, |shape| shape.uses_y()),
+        Instr::BsSkipUtf8 { ctx, .. } => super::bitstr_inline::Utf8Shape::of(ctx)
+            .map_or(false, |shape| shape.uses_y()),
+        // The get form reads its context **and** writes its destination through the same
+        // guarded frame window, so either one being a `Y` slot arms the block's publish.
+        Instr::BsGetUtf8 { ctx, dst, .. } => super::bitstr_inline::Utf8Shape::of_get(ctx, dst)
+            .map_or(false, |shape| shape.uses_y()),
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }
