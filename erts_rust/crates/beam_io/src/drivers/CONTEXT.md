@@ -139,6 +139,31 @@ A command on a `Closing` port is the C's `badarg` (`io.c:1440-1441`, `ERTS_PORT_
   A datagram port's queued commands are therefore written by the port layer's `Closing` drain and never thrown away at a close, which is the C's own asymmetry: `packet_inet_ctl`'s `INET_REQ_CLOSE` (`:14701`) discards nothing either, because a datagram write cannot block on a peer's window the way a stream write can.
   `UdpInetDriver::stop` is the C's `packet_inet_stop` (`:14533`-`:14549`): answer every pending operation with `{error, closed}`, then `release_socket`.
 
+## The inet write path — the answer matrix and the accounting invariant
+The **shutdown ladder**: `gen_tcp:shutdown(S, write)` is the `TCP_REQ_SHUTDOWN`(44) control verb and it only **records the intent**: the socket is not closed, its state stays `{ok,[connected,open]}` and `GETFD` still answers the descriptor.
+What the next operations answer is `PeerClose`'s two one-shot ladders (`drivers/inet/mod.rs`), armed by the **first failing write**, never by the shutdown itself:
+
+| step | answer |
+|---|---|
+| `shutdown(S, write)` | `ok`, and again `ok` while no write has failed yet (idempotent) |
+| any number of **zero-length** `send` (`<<>>`, `[]`, `[<<>>,[]]`) | `ok` for ever (the write-shutdown arm of `TcpInetDriver::write_command` in `drivers/inet/async.rs` answers them without writing) |
+| the **first non-empty** `send` | `{error, closed}` (`TCP_ADDF_DELAYED_CLOSE_SEND`, `inet_drv.c:12681`-`:12692`) |
+| **every later** `send` (non-empty *or* zero-length) | `{error, enotconn}` (the one-shot spent) |
+| `shutdown(S, write)` **after** a failed write | `{error, enotconn}` |
+| `shutdown(S, read)` after the write latch | `{error, enotconn}` |
+| `recv` after a **write**-latched close | the first `{error, closed}`, later ones `{error, enotconn}` — a write discovery arms the receive one-shot too (`tcp_send_or_shutdown_error`, `inet_drv.c:13660`-`:13685`), so the read path needs nothing extra |
+| the peer | receives every pre-shutdown byte, then `{tcp_closed, S}` |
+
+`shutdown(S, read_write)` is **racy on the oracle** and is deliberately not pinned.
+
+The **command accounting invariant (zero-length commands included)**: `InetStat::output(len)` counts a **command**, not a write: every command reaching `TcpInetDriver::write_command` advances `send_cnt` by one and adds `payload + h_len` to `send_oct`, so a **zero-length** command advances `send_cnt` and adds nothing — `inet_output_count` (`inet_drv.c:11560`-`:11582`) runs *before* `tcp_sendv`'s `(h_len == 0 && len == 0)` shortcut (`:13736`), which is why the write-shutdown arm calls `self.stat.output(0)` before returning.
+`send_pend` is **not** the driver's: it is the port's own output-queue depth, rendered from `ctx.output().len()` at `inet:getstat/1` time.
+The `usize` a command returns is what `Port` charges against that queue (`check_write_accounting`, `../port.rs`) — a zero-length command consumes only its stripped caller tag, so the arm returns the same figure the normal path's net shrinkage would.
+
+The **pins**: `inet/write_shutdown_matrix_tests.rs` (the answer matrix over a `Rig`), `inet/stat_send_tests.rs`'s `RAW_ROWS` (the oracle-measured counter rows, zero-length rows included), and end to end the differential corpus's `inet_write` group — `shutdown_write_then_send_closes_the_writer`, `repeated_write_shutdown_keeps_the_writer_closed`, `empty_payload_after_write_shutdown_is_a_noop_success`, `send_counters_advance_with_the_writes`, `both_directions_of_the_stream_write`, `write_answer_matrix`, `empty_payload_is_a_successful_noop`.
+
+The **crate root keeps only the summary** (`../CONTEXT.md` › *The inet write path after `gen_tcp:shutdown(S, write)`*); the per-opcode surface, the guard order (`!IS_CONNECTED => enotconn` before `len != 1 => einval`) and the `TCP_ADDF_SHUTDOWN_WR_DONE` latch sites are `inet/CONTEXT.md`'s.
+
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only (`BadArg`/`Io`/`SystemLimit`, or `Raise` for the
   spawn errno atom). Never panic/`unwrap`/`todo!` on runtime data; all `unsafe` (raw syscalls) lives in
@@ -172,7 +197,7 @@ A command on a `Closing` port is the C's `badarg` (`io.c:1440-1441`, `ERTS_PORT_
 - **The C `ram_file_drv` answers its two reply families through two different output calls.** `OK`/`ERROR`/`NUMBER` go through `driver_output2` (a plain byte list) while `DATA` goes through `driver_output_binary` (an improper `[header | binary]` iolist on a `[binary]` port), so an oracle probe that reads the raw port message must normalise with `binary_to_list(iolist_to_binary(D))` before comparing — and `io:format("~p", [D])` on the raw term raises. This crate keeps that split: `RamReply { header, body }` is delivered through [`DriverContext::deliver_read`](crate::DriverContext::deliver_read), so `OK`/`ERROR`/`NUMBER` are header-only (`body: None`) and a `DATA` reply is the 5-byte `[RESP_DATA, len:i32be]` header plus `Some(payload)` — an empty payload included (`Some(vec![])`, the C's `driver_output_binary(port, hdr, 5, bin, 0, 0)`).
 - **`ram_file_drv` is a registered built-in with a live runtime path.** `DriverRegistry::with_builtins()`
   (in `../driver.rs`) registers `"fd"`/`"efile"`/`"tcp_inet"`/`"udp_inet"`/`"ram_file_drv"`, and
-  `beam_rt` opens a port on it through `open_port({spawn_driver,"ram_file_drv"}, …)` (its
+  `beam_rt` opens a port on it through `open_port({spawn_driver,"ram_file_drv"}, …)` (`beam_rt`'s
   `src/port/ram_file_matrix_tests.rs` cross-checks this driver's whole command/reply matrix against the
   live oracle). The port's reserved `"close"` is the teardown op for a raw `open_port` port; the
   driver's own `"close"` verb exists for a direct caller (it resets the file and answers the C's `OK`),
@@ -271,7 +296,7 @@ children for `spawn`, loopback TCP/UDP + `erl`-oracle cross-checks for `inet`. B
 against the C `read_linebuf` cases in `line_buffer.rs`'s in-module suite. The `spawn` suite's
 child-exit and end-of-file waits are **condition-based under a 60 s hang guard**, never a wall-clock
 budget tuned for an idle host (see *Notes for Agents*).
-**Per-module in-module counts (`-p beam_io --lib`): `drivers` 726** — `inet` 602 (per-suite breakdown in `src/drivers/inet/CONTEXT.md`), `ram_file` 34 (23 + the 6 in `ram_file_split_tests.rs` + the 5 in `ram_file_close_tests.rs`), `spawn` 27 (23 + the 4 in `spawn_teardown_tests.rs`), `line_buffer` 24, `fd` 17 (14 + the 3 in `fd_close_tests.rs`), `efile` 13, `binary_io` 9; the crate-wide gate is **1325 passed / 0 failed / 2 ignored over 28 binaries**.
+**Per-module in-module counts (`-p beam_io --lib`): `drivers` 727** — `inet` 603 (per-suite breakdown in `src/drivers/inet/CONTEXT.md`), `ram_file` 34 (23 + the 6 in `ram_file_split_tests.rs` + the 5 in `ram_file_close_tests.rs`), `spawn` 27 (23 + the 4 in `spawn_teardown_tests.rs`), `line_buffer` 24, `fd` 17 (14 + the 3 in `fd_close_tests.rs`), `efile` 13, `binary_io` 9; the crate-wide gate is **1328 passed / 0 failed / 2 ignored over 28 binaries**.
 Each driver's **close-path half is a sibling test module of its own source half** (`super` is the driver module) so the source file stays near its size target:
 - `spawn_teardown_tests.rs` (4) pins the **teardown ordering** over real children and a payload larger than a pipe buffer (512 KiB): `stop` gives the child end of file before anything is killed, a closed port's whole queued command really reaches the child, a child that never reads stdin does not hang the close (the bound, the documented divergence), and the same row cross-checked against the system `erl` (`erl` absent ⇒ skips **loudly**); every wait polls a condition under the 60 s hang guard.
 - `fd_close_tests.rs` (3) pins an `FdDriver` close over a real `UnixStream::pair`: a short write parks the close **before** `stop` (the parked port still owns its write fd), the parked remainder is delivered in full by the rounds, and `a_command_queued_before_a_close_is_written_by_the_close` pins the writing that the inherited default `flush` leaves alone. Hermetic (no `cc`, no `erl`, no child).

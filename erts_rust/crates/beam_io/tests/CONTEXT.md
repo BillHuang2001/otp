@@ -88,9 +88,9 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
 bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **251
-passing / 0 failing**; the whole `-p beam_io` run is **1325 passed / 0 failed / 2 ignored** over **28
-test binaries** (1 lib + 26 integration + 1 doctest binary), i.e. **1071** lib tests + 251
-integration tests + 3 doctests, with 2 more doctests `#[ignore]`d (5 doctests in all). Per file:
+passing / 0 failing**; the whole `-p beam_io` run is **1328 passed / 0 failed / 2 ignored** over **28
+test binaries** (1 lib + 26 integration + 1 doctest binary), i.e. **1074** lib tests + 251
+integration tests + 5 doctests (3 passing, 2 `#[ignore]`d). Per file:
 
 | Suite | Tests | Suite | Tests |
 |---|---|---|---|
@@ -234,7 +234,17 @@ rot.
   `PortRegistry` (numeric opcodes, the single receive slot, the caller tag, the accept hand-off and
   its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
-  (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
+  (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle).
+  `inet.rs`'s `a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed` is the
+  reactor-level pin of the **read-selection** rule (`src/drivers/inet/CONTEXT.md` › *The
+  read-selection invariant*): the edge-triggered poller does read a passive socket's end-of-file, but
+  that read is `ReadReport::Unselected`, so it owes the owner **no** notification, leaves
+  `port_closed` `false` and `INET_REQ_GETSTATUS`(16) reporting `INET_STATE_CONNECTED` (`5`), and the
+  reactor settles (five consecutive empty bounded polls — a dead descriptor would report every poll).
+  The next `recv` is the read the C would have made: it answers `closed` on its first call then
+  `enotconn`, and only there does the registration go (`poller.is_empty()`, `INET_STATE_CLOSED` = `0`,
+  the default `{exit_on_close,true}`). The opcode is sent as `16 + CONTROL_MAGIC`; a bare `16` wraps
+  unsigned and is the oracle's `[0]exbadport`.
 - `spawn.rs`'s `a_stalled_write_stays_queued_and_arms_write_readiness` is the integration-level pin of
   the C's **deferred port close** (`io.c:3946-3956` + `flush_port` `io.c:3659-3700`): a `sleep` child
   never reads its stdin, so the write stalls with the unwritable remainder still queued and write

@@ -5170,14 +5170,14 @@ impl RuntimeContext<'_> {
 /// is alive deep-clones the whole shared table — one `Arc<str>` per name (~9 500 once the runtime
 /// is booted) plus the index map — and the copy is dropped as soon as the borrow ends. The clone is
 /// a pure cost and never an observable difference (a clone preserves every index), and the
-/// port-message vocabulary is the workload shape that pays it over and over: exactly two holders
-/// live long enough to still be alive whenever a port message is built — a loaded NIF library's
-/// stored host (`crate::nif`'s `NifEntry::host`, one per `erlang:load_nif/2`) and a `dlopen`ed
-/// `{spawn_driver, Name}` port's host (`crate::port::driver`'s `DriverPort`, for the port's whole
-/// life). Meanwhile `data`, `eol`, `noeol`, `exit_status`, `notify`, `select`, `system`,
-/// `inet_reply`, `inet_async`, `ok`, `error`, the socket tags and the rest are landed by the
-/// **first** message of their kind, so on every later message the write finds the name already
-/// present and the clone buys nothing.
+/// port-message vocabulary is the workload shape that pays it over and over: exactly one holder
+/// lives long enough to still be alive whenever a port message is built — a loaded NIF library's
+/// stored host (`crate::nif`'s `NifEntry::host`, one per `erlang:load_nif/2`). A `dlopen`ed
+/// `{spawn_driver, Name}` port is not such a holder: it holds nothing between its drive windows,
+/// its view of the table being a lease. Meanwhile `data`, `eol`, `noeol`, `exit_status`, `notify`,
+/// `select`, `system`, `inet_reply`, `inet_async`, `ok`, `error`, the socket tags and the rest are
+/// landed by the **first** message of their kind, so on every later message the write finds the
+/// name already present and the clone buys nothing.
 ///
 /// # What it does not change
 ///

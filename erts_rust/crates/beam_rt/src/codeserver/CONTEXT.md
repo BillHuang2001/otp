@@ -186,17 +186,20 @@ reader, so the guard is what makes those cheap.
   and `../tests/code_add_path.rs` for the mutators); the boot gates are
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test boot`
   and `beam_rt -noshell -boot bootstrap/bin/start` (exit 0, empty stdout/stderr).
-- **The full crate gate is `-p beam_rt --lib --no-fail-fast`**: 1981 passed / 6 failed / 7 ignored.
-  Four are the inventorial `src/runner/` *measured-table* pins
+- **The full crate gate is `-p beam_rt --no-fail-fast`**, and it is green: 2883 passed / 0 failed /
+  63 ignored (the `--lib` slice 2001 / 0 / 7). Nothing in the crate is red, so no figure is a
+  baseline to expect and `../TEST_STRATEGY.md` carries no known-red list (its *Test status: no
+  known-red tests*: a red test is a defect or a stale pin, never an expectation). Six of the crate's
+  number-sensitive pins belong to another node's row, so a drift in one of them is that node's
+  re-pin, never a `codeserver::path` regression: the four inventorial `src/runner/`
+  *measured-table* pins
   (`a_process_never_hands_out_off_heap_slots_across_slices`, `boundary_cost`, `reds_door`,
-  `slice_charging`) — number-drift pins owned by that node, not this one. The other two are
-  `context::calls`'s collection-cadence pins
+  `slice_charging`) — number-drift pins owned by that node — and `context::calls`'s two
+  collection-cadence pins
   (`a_collecting_default_process_copies_every_result_without_refusing`,
-  `without_the_learned_hint_the_same_cadence_refuses_again`), which reproduce identically on an
-  unmodified tree at this commit and are *not* in `../TEST_STRATEGY.md`'s known-red inventory
-  (same class — they assert `collections * 4 > OPS` for a heap-policy-driven cadence). The
-  `codeserver::` slice is green on its own (`--lib -- codeserver`, 35 passed, the marker's two
-  cases included).
+  `without_the_learned_hint_the_same_cadence_refuses_again`, which assert `collections * 4 > OPS`
+  for a heap-policy-driven cadence). The `codeserver::` slice is green on its own (`--lib --
+  codeserver`, 35 passed, the marker's two cases included).
 - `system_path` reads the **ambient** `$ERL_LIBS`, so a test that manipulates it must be
   serialized by the caller (the crate's env discipline).
 - **The cheapest end-to-end parity check of this module's output** (seconds, no differential

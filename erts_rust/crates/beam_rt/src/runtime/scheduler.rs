@@ -1030,6 +1030,29 @@ impl Runtime {
             // the request set is pruned to the pass's live processes here, where the table
             // holds exactly them.
             self.prune_gc_requests(&table);
+            // A process that died in the slices just run (or at their schedule-in, or inside
+            // `exit(Pid, kill)` while it sat parked) can never run again, so its **engine** goes
+            // with it: `RunnerState::engines` is the only holder of the process's machine, and
+            // the machine is the only holder of its off-heap refc-binary reservoir, so an engine
+            // left behind keeps every off-heap payload that process built — its virtual-heap
+            // reserve included — for the runtime's whole life. A live parked engine is untouched
+            // (that is the resume protocol), and the process's recorded outcome (`results`/
+            // `exits`/`errors`) is a separate map the CLI still reads after the death.
+            //
+            // The prune runs against the **pass's** table, which holds exactly the live
+            // processes (the runtime's own `processes` is a placeholder while the pass holds it),
+            // and it is safe with respect to spawns: `RunnerState::spawn*` is only ever reached
+            // with a pid already in this table (`absorb_pending_spawns` looks the child up
+            // first; `Runtime::spawn_process*` spawns into the table before registering the
+            // engine), so a just-noted-but-not-yet-absorbed spawn has no engine to drop.
+            let dropped = state.prune_dead(|pid| table.contains(pid), &mut |handle| {
+                self.cancel_receive_timeout(handle)
+            });
+            if dropped > 0 && crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "pass boundary: dropped {dropped} engine(s) of terminated process(es)"
+                ));
+            }
             // The **async-completion half** of `erlang:garbage_collect/2`: an
             // `{async, ReqId}` request (`Runtime::request_gc_async`) owes its requester
             // `{garbage_collect, ReqId, Result}`, and this pass boundary is where the runtime
@@ -1291,6 +1314,16 @@ impl Runtime {
                 None => break Ok(()),
             }
         };
+        // The **tail** half of the engine prune: the per-round call above runs right after the
+        // slices, but the pass's own non-slice steps can also kill a process — a driver that
+        // closes its port terminates its owner (`src/port/exit.rs`), and that runs *after* the
+        // round's prune — and the pass may then leave the loop without another round (a bounded
+        // pass's exhausted budget breaks at the top of the next iteration). A pid this table no
+        // longer holds can never be scheduled again, so its engine is dropped here, in the same
+        // pass that observed the death.
+        state.prune_dead(|pid| table.contains(pid), &mut |handle| {
+            self.cancel_receive_timeout(handle)
+        });
         self.runner_state = state;
         self.scheduler = scheduler;
         self.put_processes(table);

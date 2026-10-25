@@ -31,15 +31,15 @@
 //! [`default_registry`]. The numeric pins below are therefore *witnesses* of the
 //! partition the code produces, and a failing count names the direction that drifted.
 //!
-//! The four derived quantities (after the `FUN_CALLER_BIFS` fix in `src/hook_sets.rs`):
+//! The derived quantities:
 //!
 //! | quantity | value | how it is derived |
 //! |---|---|---|
 //! | declared (`bif.tab`) | 556 | `bif 476 + ubif 73 + hbif 7` |
 //! | registry | 667 | 556 declared + 111 stdlib fast paths |
-//! | seam union | 219 | the 14 tables, deduped (`223 raw − 4 shared`) |
-//! | declared seam-backed | 186 | union members the table declares |
-//! | declared in-crate | 370 | `556 − 186`, no table lists them |
+//! | seam union | 222 | the 14 tables, deduped (`226 raw − 4 shared`) |
+//! | declared seam-backed | 189 | union members `bif.tab` declares (`222 − 33`) |
+//! | declared in-crate | 367 | `556 − 189` (a **disjoint** partition) |
 //! | undeclared seam members | 33 | the union members registered as stdlib fast paths |
 //!
 //! "Adopted" is *not* the same as "registered": a union member returns the typed
@@ -189,7 +189,7 @@ fn census_or_skip() -> Option<(BifTab, Census)> {
     Some((tab, census))
 }
 
-/// The deduped seam union, sorted — built by iterating the 13 public tables, never
+/// The deduped seam union, sorted — built by iterating the 14 public tables, never
 /// hard-coded.
 fn union_keys() -> Vec<(String, String, u32)> {
     let mut set: BTreeSet<(String, String, u32)> = BTreeSet::new();

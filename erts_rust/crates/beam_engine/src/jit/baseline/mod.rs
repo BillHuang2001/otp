@@ -247,6 +247,9 @@ mod bs_match_deopt_tests;
 #[path = "bs_create_bin_tests.rs"]
 mod bs_create_bin_tests;
 #[cfg(test)]
+#[path = "bitstr_shapes_deopt_tests.rs"]
+mod bitstr_shapes_deopt_tests;
+#[cfg(test)]
 #[path = "foreign_kernel_tests.rs"]
 mod foreign_kernel_tests;
 

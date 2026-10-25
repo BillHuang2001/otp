@@ -2042,9 +2042,9 @@ impl<'a> RuntimeContext<'a> {
         // table deep-clones it. `atoms` is not read after this point (the outcome below is a term
         // built on the heap), so dropping it lets `CodeServer::intern_pending` take its
         // `Rc::get_mut` append-only fast path; a genuinely outstanding handle (a loaded NIF
-        // library's stored host -- a *different* host from this per-call one -- or an open driver
-        // port) still falls back to the correct copy-on-write, merely unoptimized. Only a NIF that
-        // actually interned a name reaches any of this.
+        // library's stored host -- a *different* host from this per-call one) still falls back to
+        // the correct copy-on-write, merely unoptimized. Only a NIF that actually interned a name
+        // reaches any of this.
         drop(atoms);
         if !interner.is_empty() {
             self.runtime.code_server.intern_pending(&interner);

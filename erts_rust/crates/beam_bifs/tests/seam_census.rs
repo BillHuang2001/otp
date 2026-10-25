@@ -54,10 +54,13 @@
 //!   `notsup`/constant stubs (`interpreter_size/0`, `lcnt_*`, `disassemble/1`, the
 //!   `available_internal_state` gate) and the two collector RPCs that are restricted
 //!   to the emulator's own processes. Each carries the one precise sentence of why.
-//! * **D — documented defaults (8 rows).** Keys that *do* read a seam but whose
+//! * **D — documented defaults (11 rows).** Keys that *do* read a seam but whose
 //!   uninstalled default is a documented value rather than the gap: `LocalNode`
-//!   falls back to `(nonode@nohost, 0)`, `LocalFunIdentity`/`RecordSource` answer
-//!   `Ok(None)`, `ExportGate` is simply skipped. Pinning these separately is what
+//!   falls back to `(nonode@nohost, 0)` (`node/0,1`), `LocalFunIdentity` answers
+//!   `Ok(None)` (`term_to_binary/1,2`, `external_size/1,2` and the three legacy hash
+//!   ports `phash/2`, `phash2/1,2`), `RecordSource`'s `Ok(None)` is the `badarg`
+//!   `records:get_definition/2` renders, and `ExportGate` is simply skipped
+//!   (`binary_to_term/2`). Pinning these separately is what
 //!   lets the class-B equation stay exact instead of "everything minus a hand list".
 //!
 //! # What is *not* claimed here
