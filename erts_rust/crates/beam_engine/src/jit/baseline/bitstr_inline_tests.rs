@@ -1383,6 +1383,77 @@ fn every_deliberate_refusal_is_refused_by_the_shape_predicate() {
 }
 
 // ---------------------------------------------------------------------------
+// `bs_create_bin`'s route predicate: which width takes which sequence
+// ---------------------------------------------------------------------------
+/// **The `bs_create_bin` route is a function of the widths alone.**
+///
+/// One sequence per width class, decided at the predicate (so the emitter emits zero bytes
+/// for a declined one):
+///
+/// * a field below one byte (`1..8`) is [`bitstr_inline::Route::BitGranular`] -- the byte
+///   stores of the aligned sequence have no whole byte to write;
+/// * a width above a byte that is not a multiple of 8 (`9`, `20`, `63`) is
+///   `BitGranular` too, so "aligned" is never decided by `> 8` alone;
+/// * an exact byte multiple (`8`, `16`, `64`) stays on [`bitstr_inline::Route::Aligned`];
+/// * `0` and anything above `64` are refused outright (`None`): a zero-width field moves no
+///   cursor and a wider one exceeds the one-word value the writer masks into the field.
+///
+/// The mixed-plan rule -- `BitGranular` plus a `ConstBytes` field is refused -- needs a
+/// literal-area string, so it is pinned where that fixture lives:
+/// `bs_create_bin_tests::a_bit_granular_plan_with_a_constant_bytes_field_is_refused`.
+#[test]
+fn the_create_bin_route_predicate_follows_the_width_class() {
+    let module = bitstr_module(
+        "inline_create_bin_route",
+        &["private_append", "integer", "all"],
+        2,
+        |_| vec![Instr::Label(Label(1)), Instr::Label(Label(2)), Instr::Return],
+    );
+    let dst = Operand::X(0);
+    let shape_for = |width: i64| {
+        let mut segments = vec![
+            Operand::Atom(atom(&module, "private_append")),
+            Operand::Integer(1),
+            Operand::Integer(8),
+            Operand::Nil,
+            Operand::X(0),
+            Operand::Atom(atom(&module, "all")),
+        ];
+        segments.extend([
+            Operand::Atom(atom(&module, "integer")),
+            Operand::Integer(0),
+            Operand::Integer(1),
+            Operand::Nil,
+            Operand::X(1),
+            Operand::Integer(width),
+        ]);
+        bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+    };
+    for width in [1i64, 7, 9, 12, 20, 63] {
+        assert_eq!(
+            shape_for(width).map(|shape| shape.route()),
+            Some(bitstr_inline::Route::BitGranular),
+            "{width} bits: a non-multiple of 8 must take the bit-granular route"
+        );
+    }
+    for width in [8i64, 16, 24, 64] {
+        assert_eq!(
+            shape_for(width).map(|shape| shape.route()),
+            Some(bitstr_inline::Route::Aligned),
+            "{width} bits: an exact byte multiple must stay on the aligned route"
+        );
+    }
+    assert!(
+        shape_for(0).is_none(),
+        "a zero-width field must be refused by the predicate"
+    );
+    assert!(
+        shape_for(65).is_none(),
+        "a field wider than one word must be refused by the predicate"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The register cache: every written register is charged, and a `Y` never is
 // ---------------------------------------------------------------------------
 /// **`regalloc::cacheable_writes` charges every x-register an arm writes.**

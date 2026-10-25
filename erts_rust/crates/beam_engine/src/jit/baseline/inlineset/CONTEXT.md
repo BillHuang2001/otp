@@ -128,7 +128,7 @@ The emitter-side detail lives one level down in `../emit/CONTEXT.md` and `../emi
 
 
 ## The bitstring inline set (nine shapes)
-Nine `Bs*` shapes are lowered **natively in-block, with no interpreter step**, by the shape module `../emit/bitstr_inline/` (`../emit/bitstr_inline/CONTEXT.md` owns its file layout and its shared emitters): eight match-context shapes that emit no helper call at all, plus the `bs_create_bin` construction shape, which emits one positioned helper call and then straight-line byte stores.
+Nine `Bs*` shapes are lowered **natively in-block, with no interpreter step**, by the shape module `../emit/bitstr_inline/` (`../emit/bitstr_inline/CONTEXT.md` owns its file layout and its shared emitters): eight match-context shapes that emit no helper call at all, plus the `bs_create_bin` construction shape, which emits one positioned helper call and then, per field, either straight-line byte stores (the byte-aligned route) or one bit-write helper call (the bit-granular route) -- see the authoritative `bs_create_bin` section below.
 Each `try_inline_bs_*` entry answers `Ok(false)` having emitted **zero bytes** when its `*_shape` predicate declines, and `emit/block.rs`'s nine arms sit **above** the `_ if bitstrings::claimed(instr) => emit_bitstr(...)` guard arm, so a decline falls through to `bitstr.rs::jit_bitstr` — the family's `jit_bitstr` helper, i.e. the behaviour every other `Bs*` variant keeps.
 No shape's sequence allocates and none raises, so no moving collection can interleave inside one; the eight match-context shapes carry no `emit_position_store` and read the context block base once and reuse it, while the construction shape publishes its own instruction position through `emit_positioned_helper_call` because it calls a helper that may be entered.
 Every guard that can reject a destination write (`Loc::guard_store` for a `Y` destination, the match-context guard) is emitted **before** that write, and a single-instruction shape commits its context `start` word **before** the destination register, because `Dst` may be the context register itself (`beam_asm:filter_essentials/1` compiles `ctx == dst == x(3)`); `bs_match` commits `start` once after its whole command list instead, so it accepts an aliasing destination only as that list's **last** command, and `bs_create_bin` commits its accumulator's window end after every payload byte store.
@@ -183,7 +183,7 @@ The shape predicates are the single decision: `emit/block.rs`, `emit/regalloc.rs
 - Fallback: one interpreter step for the whole instruction, which is why no command may mutate the context before the last fallback-capable guard; `fail_arm` is the resolved label's linker exit.
 
 ### `bs_create_bin { dst, segments }` — `create.rs::try_inline_bs_create_bin`
-- Predicate `CreateBinShape::of(module, dst, segments)`: **label-free** (it takes no `LabelMap` and no fail label) and purely syntactic, over the construction seam's `seam::append_plan`. The shape IS the compiler's linear accumulator build — the first segment a `private_append` of the accumulator itself, the remaining segments whole-byte constant-width unsigned big-endian `integer` fields (`bits` a positive multiple of 8 in `8..=64`) and/or `string` constants — and the plan's byte offsets must sum exactly to `tail_bits / 8`. `dst`, `source` and every `Field::Bits` value resolve to a `Loc`: an in-bound x-register **or an addressable `Y` slot** (`operands.rs::y_addressable`), so `uses_y()` is `source.is_y() || dst.is_y() || any field value is a Y Loc`; a plan with more than `MAX_FIELDS = 16` fields or more than `MAX_TAIL_BYTES = 256` tail bytes refuses, the sequence being straight-line code.
+- Predicate `CreateBinShape::of(module, dst, segments)`: **label-free** (it takes no `LabelMap` and no fail label) and purely syntactic, over the construction seam's `seam::append_plan`. The shape IS the compiler's linear accumulator build — the first segment a `private_append` of the accumulator itself, the remaining segments whole-byte constant-width unsigned big-endian `integer` fields (`bits` in `1..=64`) and/or `string` constants — and the plan's field bit offsets must sum exactly to `tail_bits`. `dst`, `source` and every `Field::Bits` value resolve to a `Loc`: an in-bound x-register **or an addressable `Y` slot** (`operands.rs::y_addressable`), so `uses_y()` is `source.is_y() || dst.is_y() || any field value is a Y Loc`; a plan with more than `MAX_FIELDS = 16` fields or more than `MAX_TAIL_BYTES = 256` tail bytes refuses, the sequence being straight-line code.
 - Run-time guards, in order: (1) `dst`'s frame-window guard (`Loc::guard_store`) — a rejected destination writes nothing; (2) the `Y` accumulator's frame-window guard (`Loc::guard_load`), **guard only** and before every write, because the post-helper re-reads of that slot address `y_base + k*8` directly; (3) one guarded load plus one `is_small` guard per `Field::Bits` value (`and` with `IMMED1_MASK`, `cmp` to `SMALL_TAG`) — a bignum is legal in a wide field and a non-integer is the family's `badarg`, so a non-small value must deopt, and every such guard runs before any write; (4) the one positioned helper call (`emit_positioned_helper_call`, so the pre-call spill happens and the instruction's own `(func, pc)` is published) — `jit_open_append_bin` for an x-register accumulator, `jit_open_append_bin_y` for a `Y` slot, the accumulator crossing the block ABI as a **slot index** because `emit_helper_invoke` adds `movabs` immediates only — then `test rax, rax; jz fallback` — the **last** guard.
 - Lowering: field byte stores at `cursor + field_offset` — a `Field::Bits` field is `nbytes` stores of `sar_ri(value_re_read, 4 + 8*(nbytes-1-i))` then `mov_mr8`; a `Field::ConstBytes` field is 8-byte `mov_ri` + `mov_mr` chunks then a `mov_ri` + `mov_mr8` byte tail, the bytes being **copies** of compile-time constants, never a `StrT` pointer (a cached module's string area may be a different allocation). Every value is re-read after the helper, because the helper clobbers every caller-saved register: an x-register from `machine.x`, a `Y` slot through its **unguarded** four-instruction address re-derivation (once per field, not per byte) — sound because the up-front guard already proved the slot in frame and nothing between can move the frame. Then the single window-end commit (`mov_mr` of `old_end + tail_bits` into `SUB_BITS_END_DISP`), emitted **inline**, after which nothing may fail; then the accumulator word (re-read the same way) into `dst` (its cache register, charged in `cacheable_writes`) and the in-block continue.
 - **The mutation order is the whole correctness argument.** The family's build performs exactly one mutation beyond the field bytes, C's `sb->end = new_position`; committing that word *before* the payload stores would make the `fallback` (one whole-instruction interpreter step) append the tail a **second** time, because the window would already cover the bytes — a wrong result. So the commit is last, and both append doors **mutate nothing** (`&Machine` throughout), so every guard that can reach `fallback` runs against the state the interpreter step will see; the payload bytes are written at the same offsets with the same values on every attempt, so a post-payload deopt re-produces them.
@@ -217,3 +217,51 @@ Each shape also has a `#[cfg(test)]` compile-time counter — `inlined(SHAPE_*)`
 - `../emit/CONTEXT.md` → the emitter contract; `../emit/shapes/CONTEXT.md` → the shape predicates.
 - `../runtime/CONTEXT.md` → the helpers each arm calls and the block-ABI words they answer.
 - `../testing/CONTEXT.md` → the suites that pin each shape's tier agreement and its no-deopt claim.
+
+## `bs_create_bin` -- two routes, one predicate (authoritative)
+
+The arm lowers the compiler's linear accumulator build (`bs_init_writable` + a single
+`bs_create_bin` whose first segment is `private_append`, i.e. the writable accumulator and
+`binary all`). Its shape is `CreateBinShape`, whose `route()` picks one of two emitted
+sequences; both share the guard prefix and the single commit, and neither allocates.
+
+- **The picking rule, exactly.** `Route::Aligned` iff `tail_bits % 8 == 0` **and** every
+  field's width is a multiple of 8 (`ConstBytes` fields always are). Everything else --
+  including a width below one byte and a non-multiple above one byte -- is
+  `Route::BitGranular`. The route is a function of the widths alone, so an exact
+  byte-multiple width provably never leaves the aligned sequence.
+- **The predicate's width range is `1..=64` bits** (`bits == 0` and `bits > 64` are refused:
+  a zero-width field moves no cursor, and a wider value exceeds the one word the writer masks
+  into the field). There is no "whole-byte only" rule any more.
+- **The two helper sets.** `Aligned`: `jit_open_append_bin` / `jit_open_append_bin_y` (the
+  cursor is `payload base + tail_bits/8`; `0` = refuse). `BitGranular`: the same two openers
+  as `jit_open_append_bin_any` / `jit_open_append_bin_any_y` (they return the payload base and
+  ignore the end) plus one `jit_write_bit_field(src_slot, field_offset_bits, value_slot,
+  nbits, flags) -> 1/0` per field, which asks the seam once for room for
+  `field_offset_bits + nbits` bits and then writes exactly those bits. Every helper takes
+  `&Machine`, mutates nothing, and reports contention as `0`.
+- **The guard order**: (1) the destination's frame window, (2) the source's frame window when
+  the accumulator is a `Y` slot, (3) per bit field one guarded load + `is_small` (`IMMED1_MASK`
+  vs `SMALL_TAG`), (4) the open call, whose `test rax,rax; je fallback` is the last up-front
+  guard, then (5) per bit field a write whose own `test rax,rax; je fallback` re-checks the
+  room the seam just granted (a defensive duplicate for a consistent plan, kept because the
+  helper is the only authority on writability). Every guard precedes every mutation, and the
+  only mutation is the single window-end commit after all fields.
+- **`BitGranular` + `ConstBytes` is refused** by the predicate: there is no constant-bytes
+  store on the bit-granular sequence, and mixing one would commit a window end from the
+  aligned half before the bit fields' room check.
+- **Refusal vocabulary is unchanged**: a refused plan emits zero bytes and is the family's
+  own path, exactly as before the second route existed; no new typed error exists on this arm.
+
+### Deliberate refusals
+
+- **`binary all`** builds (`emqx_base62:encode/2`, 4/0/0 executions per call) stay on the
+  family: a run-time length fixes no static offset for itself or any later field, so the only
+  lowering is the family's own copy (`BitWriter::push_bits_from` -> `raw::InPlace::copy_bytes`,
+  `raw::InPlace::push_bit` for the non-aligned case) -- no new invariant -- and it drops the
+  "one single last commit" property, since a run-time length cannot be checked before the
+  write without a length-dependent branch after the first payload byte.
+- **A fresh non-append `[integer 8]`** (`emqx_base62:decode/2`'s temp `<<DecodeChar>>`,
+  14x/call) stays on `jit_bitstr`: `raw::make_binary` **allocates** a fresh result (an on-heap
+  `ErlHeapBits` or the refc pair) through the rooted seam, which a straight-line helper-free
+  sequence cannot do without an admission point.

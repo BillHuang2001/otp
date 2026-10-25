@@ -2705,3 +2705,37 @@ fn a_y_slot_accumulator_one_byte_short_declines_and_is_idempotent() {
     assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
     assert_construction_row("capacity 1, Y accumulator, integer 16", &module, &args, &expected);
 }
+// ---------------------------------------------------------------------------
+// A‴(6). The route's one interaction with a `ConstBytes` field
+// ---------------------------------------------------------------------------
+/// **A‴(6) A bit-granular plan carrying a `ConstBytes` field is refused at the predicate, and
+/// the same plan at a whole-byte width is not.**
+///
+/// The aligned sequence writes a constant field with one `mov` per byte at a static offset, so
+/// an exact-byte-multiple plan keeps it. The bit-granular sequence has no constant-bytes store,
+/// and mixing the two inside one instruction would mean committing a window end from the
+/// aligned half before the bit fields have passed their own room check -- so the whole plan is
+/// refused and the family builds it (`bs_create_bin`'s general path). `CreateBinShape::of`
+/// is the only place this is decided, i.e. the emitter emits zero bytes for the refused ones.
+#[test]
+fn a_bit_granular_plan_with_a_constant_bytes_field_is_refused() {
+    for (width, expected) in [
+        (8i64, Some(bitstr_inline::Route::Aligned)),
+        (6, None),
+        (12, None),
+        (20, None),
+    ] {
+        let module = accumulator_module("bscb_mixed_plan", b"ab", |module| {
+            let mut fields = int_seg(module, Operand::X(1), width);
+            fields.extend(str_seg(module, 0, 2));
+            fields
+        });
+        let (dst, segments) = create_bin_operands(&module);
+        assert_eq!(
+            bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+                .map(|shape| shape.route()),
+            expected,
+            "an integer {width} field beside a 2-byte string field"
+        );
+    }
+}
