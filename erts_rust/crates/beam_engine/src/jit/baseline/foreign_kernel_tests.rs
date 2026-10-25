@@ -1105,15 +1105,19 @@ fn the_base62_decode_match_arm_is_emitted_and_not_deopted() {
 }
 
 /// A `bs_create_bin` of a staged function, as the construction arm sees it.
-struct AppendBuild {
+///
+/// `pub(super)` — with the two gate verdicts — because the sibling suites
+/// (`bs_create_bin_tests`) pin their own fixtures' builds through this same classification
+/// instead of re-deriving it.
+pub(super) struct AppendBuild {
     /// The accumulator register the first (`private_append`) segment names, with the
     /// compiler's `Typed` wrapper peeled off — `None` for an instruction that is not a
     /// private-append accumulator build at all.
     accumulator: Option<Reg>,
     /// Whether `seam::append_plan` (the family side's compile-time half) accepts it.
-    planned: bool,
+    pub(super) planned: bool,
     /// Whether [`CreateBinShape::of`] (the inline arm's own predicate) accepts it.
-    lowered: bool,
+    pub(super) lowered: bool,
     /// The route the arm emits an accepted build with — `None` exactly when the arm
     /// declines it, so this is the per-build form of the two-route split (below).
     route: Option<Route>,
@@ -1147,7 +1151,7 @@ struct AppendBuild {
 /// as bit-granular writes, and the kernels below are the reason the second route exists at all
 /// (`emqx_base62` appends **6-bit** fields). A row that only counted `lowered` would pass for a
 /// build the arm happened to emit down the wrong route.
-fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild> {
+pub(super) fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild> {
     code.iter()
         .filter_map(|instr| {
             let Instr::BsCreateBin { dst, segments, .. } = instr else {

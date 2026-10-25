@@ -2356,16 +2356,31 @@ fn the_binary_all_shape_is_planned_and_routed_aligned() {
     );
 }
 
-/// **The `binary all` route's success path runs entirely natively.** Two writable
-/// accumulators: `A` is given one byte by an integer field, then `B` appends `A` whole, so the
-/// door's copy really moves a byte and the build never reaches the family (`bitstr_calls == 0`).
-    // UNVERIFIED ROW (left `#[ignore]`d rather than weakened): the shape DOES lower -- the
-    // `emqx_base62:encode/2` fixture asserts `lowered builds = 3, declined = 0` and agrees with
-    // the interpreter and the live `erl`. This hand-built fixture still observes two deopts from
-    // instructions other than the `bs_create_bin` arm, so its `deopts == 0` expectation below
-    // has never been pinned down. Do not delete: it is the row that must become green.
-    #[ignore = "deopt counter attribution unfinished; the lowering itself is proven by the encode/2 row"]
-    #[test]
+/// How many **run-time** deopts the baseline tier attributed to the `Instr` variant `variant` —
+/// the per-instruction twin of [`static_deopts`] (`counters::Counters::deopts_by_variant`, moved
+/// by `jit_step_one`/`jit_step_ext`), so a row can pin "**this** instruction never deopted"
+/// rather than "nothing in this run deopted", which a run total cannot tell from the former.
+fn runtime_deopts(snapshot: &counters::Counters, variant: &str) -> u64 {
+    snapshot.deopts_by_variant.get(variant).copied().unwrap_or(0)
+}
+
+/// **The `binary all` route's success path runs entirely natively.** Two writable accumulators:
+/// `A` is given one byte by an integer field, then `B` appends `A` whole, so the door's copy
+/// really moves a byte — and the copy, the payload write and the build's single `ErlSubBits.end`
+/// commit are the machine's, from one positioned helper call per build.
+///
+/// Every claim is scoped to **this arm**, never to the run total: the fixture's two
+/// `bs_init_writable`s have no native arm, so each is one steady `jit_bitstr` call
+/// (`bitstr_calls == 2` by construction) and a run-total figure cannot tell those from a
+/// construction that deopted. What is pinned instead:
+///
+/// * both builds are planned by the seam and lowered by the arm, and the cache-free compile
+///   emits the shape with **zero** static deopts;
+/// * the counted run's per-variant deopt map holds no `BsCreateBin` entry and `jit_step_one`
+///   never ran, i.e. the one door call per build served it instead of falling back;
+/// * the value, the payload bytes and the accumulator's window (its `start` bit and its
+///   `end - start`) are the interpreter's — a second `end` commit would widen the window here.
+#[test]
 fn a_binary_all_append_of_a_writable_refc_source_runs_natively() {
     let module = bin_module("bscb_bin_all_native", 2, &[], move |module| {
         let mut first = append_seg(module, Operand::X(0));
@@ -2396,9 +2411,89 @@ fn a_binary_all_append_of_a_writable_refc_source_runs_natively() {
             create_bin(Operand::X(0), second, 4),
         ]
     });
+
+    // (1) Both builds are planned by the seam and lowered by the arm — the first as an aligned
+    //     append over an integer field, the second as an `AppendPlan::binary_all` tail — and the
+    //     cache-free compile emits the shape twice with zero static deopts.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    let planned: Vec<bool> = builds.iter().map(|build| build.planned).collect();
+    assert_eq!(
+        builds.len(),
+        2,
+        "the fixture holds exactly two `bs_create_bin`s (found {})",
+        builds.len()
+    );
+    assert_eq!(
+        (lowered, declined),
+        (2, 0),
+        "both builds must be lowered (planned per build: {planned:?}): the first is an aligned \
+         append over one integer field, the second an `AppendPlan::binary_all` tail"
+    );
+    assert_eq!(
+        planned,
+        vec![true, true],
+        "the seam must plan both builds, the second as its `binary_all` member"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(
+        visited_instances(&snapshot, "BsCreateBin"),
+        2,
+        "the emitter must visit both `bs_create_bin`s under that name (visited {:?})",
+        snapshot.instr_instances
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "neither build may be statically deopted (deopts {:?})",
+        snapshot.instr_deopts
+    );
+
+    // (2) The value, the payload bytes and the accumulator's window, per tier.
     let name = atom(&module, "f");
     let args = [ArgKind::Int(64), ArgKind::Int(0x5A)];
-    assert_construction_row("binary all, writable refc source", &module, &args, &[0x5A]);
+    with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+        assert_same_outcome(
+            "binary all, writable refc source",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        let mut windows = Vec::new();
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            let value = returned("binary all, writable refc source", tier, outcome);
+            assert_eq!(
+                bit_size(value),
+                Some(8),
+                "{tier}: the append must publish exactly the one byte the first build wrote"
+            );
+            // SAFETY: `value` is the live bitstring term this run just returned and the run's
+            // heap (which owns the payload) is alive for the whole closure; `bitstring_parts`
+            // only reads the term's own frozen `ErlSubBits`/`BinRef` words.
+            let (_, offset, size) = unsafe { beam_term::bitstring::bitstring_parts(value) };
+            windows.push((offset, size));
+            assert_eq!(
+                returned_storage_bytes("binary all, writable refc source", tier, value),
+                vec![0x5A],
+                "{tier}: the payload the door's copy moved"
+            );
+        }
+        assert_eq!(
+            windows[0], windows[1],
+            "the accumulator's window (start bit, `end - start`) must be the interpreter's \
+             (interpreter {windows:?}, baseline {windows:?}): a second `end` commit would widen \
+             it here"
+        );
+    });
+
+    // (3) The counted run: the door served both builds, so nothing deopted — in particular not
+    //     the `bs_create_bin` instruction itself — and the only family calls are the two
+    //     `bs_init_writable`s, which have no native arm.
     let report = run_counting(&module, name, &args, Tier::BaselineJit);
     assert_eq!(
         report.bytes.as_deref(),
@@ -2406,9 +2501,21 @@ fn a_binary_all_append_of_a_writable_refc_source_runs_natively() {
         "the baseline tier's payload"
     );
     assert_eq!(
-        report.bitstr_calls, 0,
-        "the whole build must run natively: the `binary all` door performs the copy, so neither \
-         an interpreter step nor the family helper runs"
+        report.counters.step_one, 0,
+        "neither door call may fall back (`jit_step_one` ran {} times): a fallback here would \
+         mean the door refused a shape it must serve",
+        report.counters.step_one
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        0,
+        "the arm's own instruction must never deopt at run time (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+    assert_eq!(
+        report.bitstr_calls, 2,
+        "one `jit_bitstr` call per `bs_init_writable` (that instruction has no native arm) and \
+         none for either `bs_create_bin`: the door performed both copies itself"
     );
 }
 
