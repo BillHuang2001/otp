@@ -134,14 +134,14 @@
 //! a linked tail exit charges no reduction, so a tail-call-only build-and-drop loop runs its whole
 //! computation inside one slice. Measured `nonpreempt(20 000, 1 024)` = `{1 072, 21 440 000, -1, 0}`
 //! — exactly `N × (1 024 + 48)`, no trough anywhere, every payload of the run retained. The same
-//! program under `BEAM_RT_TIER=interpreter` (one reduction per instruction) is
-//! `{1 072, 418 080, 391 280, 19 610}` — bounded. The repair is a reduction charge on the linked
-//! tail-exit path (`jit/baseline/runtime.rs::jit_tail_call`, plus `emit/link.rs`'s `call_only`/
-//! `jump` arm), a `beam_engine` change and **not** one here: no host-side charge can end such a
-//! slice, because the engine's position store parks at block granularity. This suite therefore
-//! keeps every fixture on a body with one non-tail call per iteration (`lists:seq/2` +
-//! `length/1`), which is what makes a park reachable at all, and it does not assert the unbounded
-//! shape.
+//! program under `BEAM_RT_TIER=interpreter` is bounded: that tier charges one reduction per
+//! instruction, so the process really pre-empts and its parks prune. The repair is a reduction
+//! charge on the linked tail-exit path (`jit/baseline/runtime.rs::jit_tail_call`, plus
+//! `emit/link.rs`'s `call_only`/`jump` arm), a `beam_engine` change and **not** one here: no
+//! host-side charge can end such a slice, because the engine's position store parks at block
+//! granularity. This suite therefore keeps every fixture on a body with one non-tail call per
+//! iteration (`lists:seq/2` + `length/1`), which is what makes a park reachable at all, and it
+//! does not assert the unbounded shape.
 //!
 //! # What each test pins
 //!

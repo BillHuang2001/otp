@@ -111,9 +111,10 @@ const PAYLOAD_ROUNDS: i64 = 200;
 /// about once per five rounds and the slice-end occupancy is normally the low figure an admission
 /// collection just left — below the seven-eighths watermark that is the door's occupancy trigger
 /// (a growth's collection debt being the other one). The door's own module docs measure that
-/// rationing at one firing in 8.50–8.61 boundary checks and 2.221–2.239 % of the run's
-/// collections; one collection in ten is a 4.5× allowance over the measured share, while still
-/// failing by ~10× if the door starts collecting on every pre-emption. The companion ceiling —
+/// rationing at one firing in 8.86 / 9.40 / 9.96 boundary checks and 0.83 / 0.77 / 0.72 % of the
+/// run's collections; one collection in ten is a 12–14× allowance over the measured share and
+/// still fails if the door collects on every pre-emption (this workload takes ~5.5–6 collections
+/// per pre-emption). The companion ceiling —
 /// at most one boundary collection per pre-emption (`REDS_BOUNDARY_MIN_REDS` is one slice budget,
 /// accumulated per pid) — and the derivation of both are at the assertion in
 /// [`a_live_payload_survives_a_fullsweep_on_the_immix_path`].
@@ -605,10 +606,10 @@ fn a_live_payload_survives_a_fullsweep_on_the_immix_path() {
     //    `young_minor_target_words` of the words the round itself promoted
     //    (`HeapPolicy::young_after_collection`), so the checks after it start from a live-set-sized
     //    space that has to fill to seven eighths before the door may fire again. That is the
-    //    rationing its own module docs measure as one firing in 8.50–8.61 boundary checks and
-    //    2.221–2.239 % of the run's collections, and [`BOUNDARY_MINOR_SHARE_DEN`] is a 4.5×
-    //    allowance over that measured share: it still fails by ~10× if the door starts collecting
-    //    on every pre-emption.
+    //    rationing its own module docs measure as one firing in 8.86 / 9.40 / 9.96 boundary checks
+    //    and 0.83 / 0.77 / 0.72 % of the run's collections, and [`BOUNDARY_MINOR_SHARE_DEN`] is a
+    //    12–14× allowance over that measured share: it still fails if the door collects on every
+    //    pre-emption (this workload takes ~5.5–6 collections per pre-emption).
     //
     // What the surplus does **not** obey is a constant of one per mature region, and this fixture
     // measures why: a successful minor's promotion does need mature room that only a fullsweep
