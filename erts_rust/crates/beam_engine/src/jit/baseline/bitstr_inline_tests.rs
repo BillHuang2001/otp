@@ -149,7 +149,7 @@ pub(crate) fn sentinel_block(label: Label) -> Vec<Instr> {
 }
 
 // ---------------------------------------------------------------------------
-// The eight hand-built shape modules
+// The nine hand-built shape modules
 // ---------------------------------------------------------------------------
 /// `bs_get_position`: read 8 bits, then report the context position — `8`.
 fn module_get_position() -> Module {
@@ -555,7 +555,7 @@ pub(crate) fn visited_instances(snapshot: &counters::Counters, variant: &str) ->
 
 /// **Every arm emits and stays native — the mandatory instrument.**
 ///
-/// For each of the eight shapes: a cache-free [`super::emit::compile_function`] moves that
+/// For each of the nine shapes: a cache-free [`super::emit::compile_function`] moves that
 /// shape's `inlined(SHAPE_*)` counter, visits the variant (so the name is real), and
 /// records **zero** static deopts for it. Without this a fully-deopting "implementation"
 /// would pass every tier-agreement test in this file.
@@ -1040,7 +1040,7 @@ fn a_refused_shape_still_runs_through_the_bitstring_helper() {
         ("bssmall", "u64le", subject, "little-endian field"),
         ("bssmall", "u36", subject, "width rule: 36 bits"),
         ("vb_bitstr", "flat", &[0, 1, 0, 2, 9], "a `get_tail` command"),
-        ("bscreate", "u8", &[], "`bs_create_bin` (not one of the eight shapes)"),
+        ("bscreate", "u8", &[], "`bs_create_bin` with a `utf8` segment — not the construction shape"),
     ];
     for (fixture_name, function, _subject, reason) in cases {
         let module = fixture(fixture_name);
@@ -1144,7 +1144,7 @@ fn a_no_fail_shape_still_goes_through_the_family() {
 // ---------------------------------------------------------------------------
 // The refusal rules, shape by shape
 // ---------------------------------------------------------------------------
-/// **Every deliberate refusal of the eight arms, classified at the predicate.**
+/// **Every deliberate refusal of the nine arms, classified at the predicate.**
 ///
 /// A refused shape is not a bug: it is the family's general path, which is why each of
 /// these must answer `None`. The list is the same one
