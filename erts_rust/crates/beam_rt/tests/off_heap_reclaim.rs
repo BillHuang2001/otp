@@ -64,9 +64,9 @@
 //! | `discard(1 000)` / `discard(10 000)`, one read after the loop | 1 072 / 1 072 | 4 144 / 4 144 |
 //! | `ladder(10 000, 1 000)`, a rung every 1 000 iterations | `[1 072 000, 1 072, 1 073 072, 1 072, …]` | `[4 144, 8 288, …, 41 440]` |
 //!
-//! The ladder is the phase in its clearest form. A slice of the churn body is ≈999 iterations at
-//! 4 KiB payloads (≈444 at 1 KiB, where the sampler's own `erlang:memory/1` call charges four more
-//! reductions an iteration), so a 1 000-iteration rung is *one* iteration longer than a slice and
+//! The ladder is the phase in its clearest form. A slice of the churn body is ≈999 iterations — the
+//! same at every payload size, because the reduction cost per iteration does not depend on the
+//! payload — so a 1 000-iteration rung is *one* iteration longer than a slice and
 //! the read advances one iteration deeper into the next window at every rung: rung `k` is `k`
 //! payloads, for ever, without the reservoir ever exceeding one slice. **A fixed-offset ladder's
 //! monotonicity is therefore not an assertion** — it is a property of the sampling offset, and the
