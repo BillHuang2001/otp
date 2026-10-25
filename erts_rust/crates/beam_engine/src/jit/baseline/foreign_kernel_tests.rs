@@ -1009,8 +1009,8 @@ const SEGMENT_OPERANDS: usize = 6;
 ///
 /// The rows need this to tell the two refusals apart: "not a private-append accumulator build"
 /// (nothing for the arm to lower) versus "an accumulator the arm cannot address" (the documented
-/// non-x-register refusal). Without it a declined row would pass just as well for an instruction
-/// the shape never even considered.
+/// un-addressable-`Loc` refusal). Without it a declined row would pass just as well for an
+/// instruction the shape never even considered.
 fn accumulator_operand<'a>(module: &Module, segments: &'a [Operand]) -> Option<&'a Operand> {
     let group = segments.get(..SEGMENT_OPERANDS)?;
     let Operand::Atom(kind) = &group[0] else {
