@@ -116,10 +116,10 @@ only mutation the build performs is `ErlSubBits.end += tail_bits`.
 
 ```
   <dst.guard_store(Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2, fallback)>   ; a rejected dst writes nothing
-  <for each Field::Bits: is_small guard on its value>             ; load, and 0xF / cmp 0xB / jcc(Ne, fallback)
+  <for each Field::Bits: is_small guard on its value>             ; `mov_rm(rdx, rbx, x_off)`; mask the low 4 bits and compare with TAG_IMMED1_SMALL (0xF), `jcc(Ne, fallback)`
   emit_positioned_helper_call(jit_open_append_bin, &[src_reg, tail_bits], func, pc)  ; spills first, publishes the position
   test_rr(Rax, Rax) ; jcc(Cond::E, fallback)                      ; the only guard after the call, and it precedes every write
-  <per field at rax + field_offset: bits/8 byte stores MSB-first>  ; `mov_rm(rcx, rbx, x_off); mov_rr(rdx, rcx); shr_ri(rdx, 8*(n-1-i)); mov_mr8(rax, off+i, rdx)`
+  <per field at rax + field_offset: bits/8 byte stores MSB-first>  ; `mov_rm(rdx, rbx, x_off); shr_ri(rdx, 4 + 8*(n-1-i)); mov_mr8(rax, off+i, rdx)`
   <load source into rdx ; re-derive a Y dst's address ; dst.store_at(...)>
   jmp fast_done
 fallback: emit_step_and_continue(...)
@@ -131,6 +131,16 @@ fast_done:
   field value from `machine.x` through `rbx` (the helper preserves the callee-saved
   registers, and the pre-call spill already made `machine.x` authoritative), and the
   source term likewise.
+- **The field-value extraction is a `push_uint` reproduction, not a guess.** A small int is
+  `make_small(i).raw() == (i << 4) | 0xF` (`beam_term`'s `TAG_IMMED1_SMALL = 0xF`, mask `0xF`;
+  `0xB` is `TAG_IMMED1_IMMEDIATE`, not a small int), so byte `i` of an `n`-byte field is
+  `raw >> (4 + 8*(n-1-i))` with a **logical** shift, and `mov_mr8` stores the low byte — which
+  masks implicitly. That reproduces `push_uint`'s `unsigned_value(t) = (v as u64) & ((1 <<
+  SMALL_BITS) - 1)` byte-for-byte for negative values too (all-ones `>> 4` is the two's-complement
+  `u64`), including the truncation an 8-bit field of `0x1FF` needs (`0xFF`).
+- **The `is_small` guard stays before the commit** because a *bignum* is legal in a wide field
+  (`integer_non_small`) and a non-integer is the family's `badarg`; both must reach the
+  interpreter, and reaching it after the commit would double-append.
 - **A `Y` destination's address must be re-derived after the call, not re-guarded.**
   `Loc::guard_store` leaves the address in `Y_ADDR_SCRATCH` (`r9`), which the call
   destroys, and `Loc::store_at` consumes the address that guard produced — so the store
@@ -140,9 +150,6 @@ fast_done:
   `end`, i.e. a double append.
 - **No fail arm.** `bs_create_bin`'s `fail`-vs-`NO_FAIL` discrimination stays in the family;
   never branch to a natively-resolved `fail` label.
-- The `is_small` guard must stay **before** the helper: a non-small field value is legal (a
-  bignum fits an 8-byte field via `integer_non_small`), so it must reach the interpreter,
-  and reaching it after the commit would double-append.
 - `emit_ctx_guard` is **not** required: `open_append` itself declines a non-accumulator
   (`is_refc_binary` + `start == 0` + the writable-capacity registry), so the helper's zero
   return covers it.
