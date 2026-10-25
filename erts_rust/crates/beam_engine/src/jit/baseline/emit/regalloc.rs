@@ -478,9 +478,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
-        // The ten bitstring shapes the emitter lowers natively
-        // ([`super::bitstr_inline`]: the six match-context ones, plus
-        // `bs_get_integer2`, `bs_match` and `bs_create_bin`). Each is classified by the
+        // The bitstring shapes the emitter lowers natively
+        // ([`super::bitstr_inline`]: the match-context shapes, plus
+        // `bs_create_bin`'s construction build). Each is classified by the
         // **same** shape predicate its `try_inline_*` entry consults — those predicates
         // already refuse a `NO_FAIL` fail code, an unresolvable fail label, an undecodable
         // fail atom and an un-addressable operand, i.e. exactly the emitter's own
@@ -725,7 +725,7 @@ pub(crate) fn cacheable_touches(
                 }
             }
         }
-        // The nine bitstring shapes are charged the x-registers their own
+        // The bitstring shapes are charged the x-registers their own
         // native lowering references — and only when their `*_shape` claims them (an
         // un-addressable operand keeps the whole instruction on the family arm, which
         // contributes no native touch). A `Y` operand is a stack slot, **not** an
@@ -937,7 +937,7 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
                 }
             }
         }
-        // The ten bitstring shapes read the x-registers their own native
+        // The bitstring shapes read the x-registers their own native
         // lowering loads (a match context, a subject, a saved position, a field's
         // source, a private-append accumulator) and only when
         // their `*_shape` claims them.
@@ -1154,7 +1154,7 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         }
         // `Test`/`SelectVal` branch but write no x-register.
         Instr::Test { .. } | Instr::SelectVal { .. } => Vec::new(),
-        // The six bitstring match-context shapes: only `bs_get_position` and the two
+        // The bitstring match-context shapes: only `bs_get_position` and the two
         // `bs_start_match*` forms have an x-register destination, and each is charged
         // exactly when its `*_shape` claims the instruction. Charging it is **mandatory**:
         // a `bs_start_match*` hit stores the reused context word into `Dst`'s cache

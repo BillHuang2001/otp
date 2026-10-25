@@ -285,10 +285,10 @@ fn already_inlined(module: &Module, instr: &Instr) -> bool {
 // ---------------------------------------------------------------------------
 // Bitstring inline refusals
 //
-// The tier natively lowers nine `Bs*` shapes (`emit/bitstr_inline/`, `bs_create_bin`
-// included); every other `Bs*` instruction goes to the family arm, and every one of the
-// nine can still be *refused* by its own shape predicate. This section attributes those
-// refusals.
+// The tier natively lowers the `Bs*` shapes `emit/bitstr_inline/` claims
+// (`bs_create_bin` included); every other `Bs*` instruction goes to the family arm, and
+// every claimed shape can still be *refused* by its own shape predicate. This section
+// attributes those refusals.
 //
 // The vocabulary is closed: each reason string below is emitted from exactly one
 // place, so the table cannot grow an unlisted bucket, and every `Bs*` instruction the

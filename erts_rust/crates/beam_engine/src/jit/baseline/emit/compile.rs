@@ -607,7 +607,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             // Every bitstring-path instruction the tier inlines *in addition to* the
             // per-instruction budget below: the guarded match-context shapes — the six
             // position/tail/start-match ones, `bs_get_integer2`, `bs_match`,
-            // `bs_create_bin`, `bs_match_string` and the UTF-32 shapes — reserve their own
+            // `bs_create_bin`, `bs_match_string` and the UTF-8/16/32 get/skip pairs — reserve their own
             // guarded sequence ([`BS_PATH_BYTES`]), `bs_match`
             // additionally charges one [`BS_MATCH_COMMAND_BYTES`] per command, because its
             // whole static command list is lowered inline, and `bs_create_bin` charges one
