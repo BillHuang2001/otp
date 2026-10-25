@@ -153,7 +153,7 @@ Additionally provable per-call redundancy, worth naming but not worth a lever: `
 - **A census row exists only for a module's FIRST case** (the pass runs once per loaded artifact), so `capitalize_token` and `decode` have no per-call driver/block census row.
 - **The growth-shape probe prints rather than asserts** and is tree-aware: on a tree that took the copy-rebuild route it reports one payload per append with all-zero growth counters instead of failing.
 - **`perf` cannot price the boot phase**: `gc_walk`'s share of samples moves inversely with N while its absolute time stays flat, so a `perf` profile of a short run over-attributes it. Never read a short run's `perf` shares as per-element costs.
-- **Wall-clock rows are load-sensitive**: min-of-7 spreads ±29–51 % on the tighter legs and individual per-round marginals can invert sign or spike, so only ratios and deterministic counters are quotable.
+- **Wall-clock rows are load-sensitive**: on a shared host the per-round min still spreads tens of percent and individual per-round marginals can invert sign or spike, so only ratios and deterministic counters are quotable.
 - **Real fixtures need the system toolchain** (`erlc`, and for the foreign cases the checkouts): absent them every workload SKIPs loudly rather than failing — a green run without `erlc` proves nothing about any figure here.
 
 ## Constraints / Notes for Agents
