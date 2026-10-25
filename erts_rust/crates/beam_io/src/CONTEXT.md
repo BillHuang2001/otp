@@ -375,17 +375,17 @@ of `drv->stop` (`io.c:3752`).
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
 integration-test node, and the crate-level policy (real fds, loud skips, oracle cross-checks) is in
 `../CONTEXT.md`.
-**Gate: `-p beam_io` = 1071 lib + 251 integration over 26 binaries + 3 doctests ⇒ 1325 passed, 0
+**Gate: `-p beam_io` = 1074 lib + 251 integration over 26 binaries + 3 doctests ⇒ 1328 passed, 0
 failed, 2 `#[ignore]`d, over 28 test binaries.**
-**Per-module in-module counts (`-p beam_io --lib` = 1071 passed):**
-`drivers` **726** — of which `inet` **602** (per-suite breakdown in `drivers/inet/CONTEXT.md`),
+**Per-module in-module counts (`-p beam_io --lib` = 1074 passed):**
+`drivers` **727** — of which `inet` **603** (per-suite breakdown in `drivers/inet/CONTEXT.md`),
 `line_buffer` 24, `spawn` 27 (23 + the 4 in `spawn_teardown_tests.rs`), `ram_file` 34
 (`ram_file_tests` 23 + `ram_file_split_tests` 6 + `ram_file_close_tests` 5), `fd` 17 (14 + the 3 in
 `fd_close_tests.rs`), `efile` 13, `binary_io` 9 — then
 `registry` 71 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
 `registry_downcast_tests.rs` + the 9 in `active_mode_tests.rs` + the 4 in `awaits_callers_tests.rs`
-+ the 7 in `closing_tests.rs`), `io_device` 41, `abi` 46 (`host` 23 = 18 + the 5 in
-`host_output_tests.rs`, `port` 13 = 8 + the 5 in `flush_tests.rs`, `table` 7, `job` 3), `port` 36 (12 + the 12 in
++ the 7 in `closing_tests.rs`), `io_device` 41, `abi` 48 (`host` 25 = 18 + the 5 in
+`host_output_tests.rs` + the 2 in `host_aliasing_tests.rs`, `port` 13 = 8 + the 5 in `flush_tests.rs`, `table` 7, `job` 3), `port` 36 (12 + the 12 in
 `active_input_tests.rs` + the 8 in `port_command_tests.rs` + the 4 in `port_control_reply_tests.rs`),
 `port_task` 22, `signal` 20, `poller` 17, `driver` 13, `timer` 12, `ddll` 11, `completion` 11,
 `fs_access` 10, `queue` 8, `error` 8, `port_failure` 7, `cpu_time` 6, `close_fd` 6.

@@ -204,9 +204,10 @@
 //! completing. A fully drained queue drops writability again so the port cannot spin.
 //!
 //! `read(2) == 0` is end-of-file, and a connection reset (`ECONNRESET`/`ECONNABORTED` on a
-//! read, `ECONNRESET`/`EPIPE` on a write) is the same event: the peer's close is **latched**
-//! ([`TcpInetDriver::peer_closed`]), the socket's poller registration is released so a dead
-//! descriptor cannot keep producing readiness, and the socket is not touched again. Every
+//! read, `ECONNRESET`/`EPIPE` on a write) is the same event once a read the C **selects** makes
+//! the discovery: the peer's close is **latched** ([`TcpInetDriver::peer_closed`]), the socket's
+//! poller registration is released so a dead descriptor cannot keep producing readiness, and the
+//! socket is not touched again. Every
 //! later `recv`/`send` then answers the C's `[0] ++ "closed"` **once** and `[0] ++ "enotconn"`
 //! after that — the C's `TCP_ADDF_DELAYED_CLOSE_RECV`/`TCP_ADDF_DELAYED_CLOSE_SEND`
 //! bookkeeping (`inet_drv.c:855`-`:856`, `:12279`, `:12682`), which is how a caller that
