@@ -1679,7 +1679,7 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
 /// second half of the same fact — the family route is a `claimed` helper arm, not a deopt, so
 /// "not lowered" and "deopted" are different statements.
 #[test]
-fn the_base62_encode_append_builds_stay_on_the_family() {
+fn the_base62_encode_append_builds_lower_on_the_binary_all_route() {
     let Some(staged) = stage_or_skip("base62_encode_create_bin", &EMQX) else {
         return;
     };
@@ -1702,9 +1702,9 @@ fn the_base62_encode_append_builds_stay_on_the_family() {
     let runtime_widened = builds.iter().filter(|build| !build.literal_width).count();
     println!(
         "create_bin_arm[encode/2] = {emitted:?}, BsCreateBin visited = {visited}, lowered \
-         instances = {lowered_instances}, lowered builds = {lowered} (all `binary all`, so they \
-         stay on the family), declined = {declined}, accumulator builds = {appends}, \
-         non-literal-width builds = {runtime_widened}, deopts = {deopts}"
+         instances = {lowered_instances}, lowered builds = {lowered} (all `binary all`, lowered \
+         natively on the `binary all` route), declined = {declined}, accumulator builds = \
+         {appends}, non-literal-width builds = {runtime_widened}, deopts = {deopts}"
     );
     assert_eq!(
         (visited, builds.len()),
@@ -1715,9 +1715,10 @@ fn the_base62_encode_append_builds_stay_on_the_family() {
         builds.len()
     );
     assert!(
-        !emitted.contains(&SHAPE_CREATE_BIN),
-        "encode/2's builds all carry a `binary`/`all` segment, so the arm must emit nothing \
-         for them (emitted: {emitted:?})"
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "encode/2's builds are `private_append` + one `binary all` each, which the seam plans and \
+         the arm lowers on the `binary all` route — so it must emit that shape (emitted: \
+         {emitted:?})"
     );
     assert_eq!(
         deopts, 0,
@@ -1727,13 +1728,13 @@ fn the_base62_encode_append_builds_stay_on_the_family() {
     );
     assert_eq!(
         (lowered, declined),
-        (0, 3),
-        "none of encode/2's builds may be lowered: every one of them appends a run-time-width \
-         binary"
+        (3, 0),
+        "every one of encode/2's builds is lowered natively: the whole-binary tail is planned as \
+         `AppendPlan::binary_all` and emitted as one append-binary-all helper call"
     );
     assert_eq!(
-        lowered_instances, 0,
-        "the cache-free compile must inline no `SHAPE_CREATE_BIN` for encode/2 (`inlined` delta \
+        lowered_instances, 3,
+        "the cache-free compile must inline one `SHAPE_CREATE_BIN` per build (`inlined` delta \
          {lowered_instances})"
     );
     assert_eq!(
@@ -1754,17 +1755,19 @@ fn the_base62_encode_append_builds_stay_on_the_family() {
             build.accumulator
         );
         assert!(
-            !build.planned,
-            "`seam::append_plan` must refuse a `binary`/`all` segment (accumulator: {:?})",
+            build.planned,
+            "`seam::append_plan` must plan the `binary all` tail (accumulator: {:?})",
             build.accumulator
         );
         assert!(
-            !build.lowered && build.route.is_none(),
-            "`CreateBinShape::of` must return `None` for every one of encode/2's builds"
+            build.lowered && build.route == Some(Route::Aligned),
+            "`CreateBinShape::of` must accept every one of encode/2's builds, on the aligned route \
+             (`binary all` has no field phase)"
         );
         assert!(
-            build.field_bits.is_empty() && build.unit.is_none() && build.const_bytes == 0,
-            "a refused plan carries no fields, no unit and no constant bytes"
+            build.field_bits.is_empty() && build.unit == Some(8) && build.const_bytes == 0,
+            "a `binary all` plan carries no static field width, the unit-8 accumulator and no \
+             constant bytes"
         );
     }
 }

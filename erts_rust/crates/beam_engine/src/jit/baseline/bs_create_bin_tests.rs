@@ -2308,6 +2308,152 @@ fn an_out_of_frame_destination_slot_rejects_and_raises_the_interpreters_error() 
 // ---------------------------------------------------------------------------
 // D. Declined shapes — zero bytes emitted, the family's exact result
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// D0. The `binary all` route — planned, lowered natively, tier-equivalent
+// ---------------------------------------------------------------------------
+/// **The `binary all` shape is planned and lowered**, on the aligned route (it has no field
+/// phase: it is branched on before the route is consulted), and a source operand that cannot
+/// cross the block ABI as a slot index refuses the shape at compile time.
+#[test]
+fn the_binary_all_shape_is_planned_and_routed_aligned() {
+    let module = bin_module("bscb_bin_all_shape", 2, &[], move |module| {
+        let mut segments = append_seg(module, Operand::X(0));
+        segments.extend(bin_seg_all(module, Operand::X(1)));
+        vec![
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), segments, 2),
+        ]
+    });
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("the `binary all` shape must be lowered");
+    assert_eq!(
+        shape.route(),
+        bitstr_inline::Route::Aligned,
+        "a `binary all` build has no field phase"
+    );
+    assert_eq!(
+        shape.reads().len(),
+        2,
+        "the accumulator and the `binary all` source are both read"
+    );
+    assert!(!shape.uses_y(), "both operands are x-registers here");
+
+    // A literal-area source refuses the shape: the term cannot cross the block ABI as a slot
+    // index, so no byte may be emitted for it.
+    let literal = bin_module("bscb_bin_all_literal", 1, &[], move |module| {
+        let mut segments = append_seg(module, Operand::X(0));
+        segments.extend(bin_seg_all(module, Operand::Literal(0)));
+        vec![
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), segments, 1),
+        ]
+    });
+    let (dst, segments) = create_bin_operands(&literal);
+    assert!(
+        bitstr_inline::CreateBinShape::of(&literal, &dst, &segments).is_none(),
+        "a literal-area `binary all` source must refuse the shape"
+    );
+}
+
+/// **The `binary all` route's success path runs entirely natively.** Two writable
+/// accumulators: `A` is given one byte by an integer field, then `B` appends `A` whole, so the
+/// door's copy really moves a byte and the build never reaches the family (`bitstr_calls == 0`).
+#[test]
+fn a_binary_all_append_of_a_writable_refc_source_runs_natively() {
+    let module = bin_module("bscb_bin_all_native", 2, &[], move |module| {
+        let mut first = append_seg(module, Operand::X(0));
+        first.extend(int_seg(module, Operand::X(3), 8));
+        let mut second = append_seg(module, Operand::X(0));
+        second.extend(bin_seg_all(module, Operand::X(2)));
+        vec![
+            // x(1) keeps the capacity hint so the second `bs_init_writable` can be built.
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(3),
+            },
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), first, 4),
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), second, 4),
+        ]
+    });
+    let name = atom(&module, "f");
+    let args = [ArgKind::Int(64), ArgKind::Int(0x5A)];
+    assert_construction_row("binary all, writable refc source", &module, &args, &[0x5A]);
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&[0x5A][..]),
+        "the baseline tier's payload"
+    );
+    assert_eq!(
+        report.bitstr_calls, 0,
+        "the whole build must run natively: the `binary all` door performs the copy, so neither \
+         an interpreter step nor the family helper runs"
+    );
+}
+
+/// **A source the door refuses is one interpreter step, and the family's own build answers.**
+/// An on-heap (`ErlHeapBits`) source is not an off-heap refc binary, so the door answers `0`;
+/// the arm deopts, the family builds exactly once, and both tiers agree byte for byte — which
+/// is also the idempotence pin: the interpreter never attempted an arm, the baseline attempted
+/// one and re-executed the instruction.
+#[test]
+fn a_binary_all_append_of_a_heap_source_deopts_to_the_family() {
+    let module = accumulator_module("bscb_bin_all_heap", &[], |module| {
+        bin_seg_all(module, Operand::X(1))
+    });
+    let name = atom(&module, "f");
+    let args = [ArgKind::Int(64), ArgKind::Bytes(b"hi")];
+    assert_construction_row("binary all over a heap binary", &module, &args, b"hi");
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&b"hi"[..]),
+        "the deopt's payload"
+    );
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "a refused door call is one interpreter step running the family's build exactly once"
+    );
+}
+
+/// **The `Y`-slot accumulator form** of the same refusal: both terms cross the door as slot
+/// indices with `WRITE_ACC_IN_Y` set for the accumulator, so the `Y` flag wiring is exercised
+/// end to end.
+#[test]
+fn a_binary_all_append_with_a_y_slot_accumulator_deopts_on_a_heap_source() {
+    let module = frame_module("bscb_bin_all_y", &[], 2, true, 0, |module| {
+        bin_seg_all(module, Operand::X(1))
+    });
+    let name = atom(&module, "f");
+    let args = [ArgKind::Int(64), ArgKind::Bytes(b"hi")];
+    assert_construction_row("binary all, Y accumulator", &module, &args, b"hi");
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&b"hi"[..]),
+        "the deopt's payload"
+    );
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "one refused door call, then the family's single build"
+    );
+}
+
 /// A declined shape's row: its module plus the arguments it needs.
 struct DeclinedRow {
     label: &'static str,
@@ -2328,21 +2474,10 @@ struct DeclinedRow {
 /// cannot pass on an arm that silently started lowering a shape it must not.
 #[test]
 fn declined_shapes_emit_nothing_and_run_on_the_family() {
-    let subject: &[u8] = b"hi";
-
     let mut rows = vec![
-        // `binary all` — a `PreparedSeg::Binary` with an `All` width: no static field list.
-        DeclinedRow {
-            label: "binary all",
-            module: bin_module("bscb_dec_binary", 2, &[], move |module| {
-                let mut segments = append_seg(module, Operand::X(0));
-                segments.extend(bin_seg_all(module, Operand::X(1)));
-                vec![Instr::BsInitWritable, create_bin(Operand::X(0), segments, 2)]
-            }),
-            args: vec![ArgKind::Int(64), ArgKind::Bytes(subject)],
-            bits: 16,
-            bytes: Some(subject.to_vec()),
-        },
+        // A `binary all` segment is deliberately **not** here: as the plan's last and only field
+        // it is planned and lowered (section D0 below). What stays here is every shape the
+        // *seam* still declines.
         // A float segment.
         DeclinedRow {
             label: "float 64",
