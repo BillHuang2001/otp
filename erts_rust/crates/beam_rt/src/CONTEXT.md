@@ -204,6 +204,19 @@ Binding for anyone reading a `erlang:memory(binary)` figure or touching `context
   bounded by the **slice length**, never by the configured budget, and a process whose own reservoir
   stays under the trigger releases nothing between its parks (a bounded per-process residue, freed at
   process death).
+- **A dead parked process keeps its reservoir: a death-drain gap, not a prune gap.** A receive/BIF
+  park puts the engine back into `RunnerState::engines` (`runner/run.rs`'s `Wait`/`Yield` arms), and
+  the only removal in the workspace is that slice's take-out, so a process killed while parked never
+  runs its own `Yield` arm again and its machine (with `Machine::refc_binaries`) lives for the
+  runtime's life — measured `82 880 000` B retained after `exit(Child, kill)` of a child that had
+  built 20 000 × 4 144 B, unchanged across 300 further scheduler passes and RSS-confirmed
+  (`VmHWM` 186 216 kB flat, against 112 540 kB resident for the same child woken into a normal exit,
+  whose figure is `0`). The residue is exactly that process's **last slice** (≈2 payloads on the
+  interpreter tier), so it is linear in the number of such deaths rather than a fixed capacity. The
+  mailbox stores' retained families (`mailbox.rs`) are a *separate* store and are not the holder
+  here. The drop belongs at the pass boundary's exit drain (`runtime/scheduler.rs` →
+  `runtime/ets_owner.rs::drain_ets_owner_exits`, which already holds the dead pids) and needs a
+  `RunnerState`-side prune; `runner/CONTEXT.md` records the mechanism.
 - **The one unbounded shape is a slice that never ends, and no heap switch can see it.** On the default
   native baseline tier reductions are charged by a `call`/`call_ext` instruction and by the
   heap-admission doors; a **linked** tail exit charges nothing (`Linker::emit_tail_exit` jumps to the
