@@ -17,10 +17,10 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Per-shape pins for the **nine native bitstring inline arms** in
+//! Per-shape pins for the **ten native bitstring inline arms** in
 //! [`super::emit::bitstr_inline`]: `bs_get_position`, `bs_set_position`,
 //! `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`,
-//! `bs_get_integer2`, `bs_match` and `bs_create_bin`.
+//! `bs_get_integer2`, `bs_match`, `bs_create_bin` and `bs_match_string`.
 //!
 //! `bitstr_tests` pins the *family route* (the `jit_bitstr` helper and the predicate
 //! that claims the whole `Bs*` set). This node pins the **inline** route, one claim per
@@ -63,9 +63,9 @@ use super::bitstr::bitstr_calls;
 use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
 use super::counters;
 use super::emit::bitstr_inline::{
-    self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_COUNT, SHAPE_CREATE_BIN, SHAPE_GET_INTEGER2,
-    SHAPE_GET_POSITION, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_START_MATCH3,
-    SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
+    self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_BS_MATCH_STRING, SHAPE_COUNT, SHAPE_CREATE_BIN,
+    SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2,
+    SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
 use super::tests::{assemble_function, assert_same_outcome, function_code_bytes};
@@ -500,6 +500,45 @@ fn module_create_bin() -> Module {
         },
     )
 }
+
+/// `bs_match_string`: a nine-byte (72-bit) pattern compare out of the context — the shape the
+/// system compiler emits for a binary literal **longer than 64 bits** in a pattern
+/// (`tests/fixtures/bsmatch.erl`'s `strlong/1`), and well under the shape's own
+/// `MAX_MATCH_BYTES` cap (64 bytes).
+///
+/// `strings` is installed **after** the code is assembled because it is what the *compiler*
+/// reads (the shape predicate's pattern source), not something the instruction stream
+/// carries; the pattern is the subject's own first nine bytes, so a compile that emits the arm
+/// and a run of this module both succeed.
+fn module_match_string() -> Module {
+    let mut module = bitstr_module("inline_bs_match_string", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsMatchString {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                bits: 72,
+                offset: 0,
+            },
+            Instr::Move {
+                src: Operand::Integer(72),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    });
+    module.strings = b"ABCDEFGHItail".to_vec();
+    module
+}
 // ---------------------------------------------------------------------------
 // The instrument: a cache-free compile per shape
 // ---------------------------------------------------------------------------
@@ -553,27 +592,81 @@ pub(crate) fn visited_instances(snapshot: &counters::Counters, variant: &str) ->
     snapshot.instr_instances.get(variant).copied().unwrap_or(0)
 }
 
+/// One row of the emission instrument: a shape's name, its index in the `inlined` counter, the
+/// `Instr` variant the **static-deopt** census keys it by, and the fixture builder whose
+/// cache-free compile must emit it.
+pub(crate) type ShapeCase = (&'static str, usize, &'static str, fn() -> Module);
+
+/// **Every** in-block bitstring shape, one row each — the table
+/// [`every_inline_shape_emits_on_a_cache_free_compile`] sweeps and [`shape_variant`] resolves.
+///
+/// The array's length is [`SHAPE_COUNT`], so adding a shape to the emission instrument without
+/// a row here is a compile error rather than a silently uncovered shape (the failure mode this
+/// table exists to prevent).
+pub(crate) const INLINE_SHAPE_CASES: [ShapeCase; SHAPE_COUNT] = [
+    (
+        "bs_get_position",
+        SHAPE_GET_POSITION,
+        "BsGetPosition",
+        module_get_position,
+    ),
+    (
+        "bs_set_position",
+        SHAPE_SET_POSITION,
+        "BsSetPosition",
+        module_set_position,
+    ),
+    ("bs_test_tail2", SHAPE_TEST_TAIL2, "BsTestTail2", module_test_tail2),
+    ("bs_skip_bits2", SHAPE_SKIP_BITS2, "BsSkipBits2", module_skip_bits2),
+    (
+        "bs_start_match3",
+        SHAPE_START_MATCH3,
+        "BsStartMatch3",
+        module_start_match3,
+    ),
+    (
+        "bs_start_match4",
+        SHAPE_START_MATCH4,
+        "BsStartMatch4",
+        module_start_match4_label,
+    ),
+    (
+        "bs_get_integer2",
+        SHAPE_GET_INTEGER2,
+        "BsGetInteger2",
+        module_get_integer2,
+    ),
+    ("bs_match", SHAPE_BS_MATCH, "BsMatch", module_bs_match),
+    ("bs_create_bin", SHAPE_CREATE_BIN, "BsCreateBin", module_create_bin),
+    (
+        "bs_match_string",
+        SHAPE_BS_MATCH_STRING,
+        "BsMatchString",
+        module_match_string,
+    ),
+];
+
+/// The `Instr` variant the static-deopt census keys `shape` by — the **one** mapping, so a
+/// sibling's `static_deopts` assertion cannot name a variant the census never records (see
+/// [`visited_instances`], which makes that vacuity impossible to hide).
+pub(crate) fn shape_variant(shape: usize) -> &'static str {
+    INLINE_SHAPE_CASES
+        .iter()
+        .find(|(_, index, _, _)| *index == shape)
+        .unwrap_or_else(|| panic!("no emission-instrument row for shape {shape}"))
+        .2
+}
+
 /// **Every arm emits and stays native — the mandatory instrument.**
 ///
-/// For each of the nine shapes: a cache-free [`super::emit::compile_function`] moves that
-/// shape's `inlined(SHAPE_*)` counter, visits the variant (so the name is real), and
-/// records **zero** static deopts for it. Without this a fully-deopting "implementation"
-/// would pass every tier-agreement test in this file.
+/// For each of the ten shapes ([`INLINE_SHAPE_CASES`]): a cache-free
+/// [`super::emit::compile_function`] moves that shape's `inlined(SHAPE_*)` counter, visits the
+/// variant (so the name is real), and records **zero** static deopts for it. Without this a
+/// fully-deopting "implementation" would pass every tier-agreement test in this file.
 #[test]
 fn every_inline_shape_emits_on_a_cache_free_compile() {
-    let cases: [(&str, usize, &str, fn() -> Module); 9] = [
-        ("bs_get_position", SHAPE_GET_POSITION, "BsGetPosition", module_get_position),
-        ("bs_set_position", SHAPE_SET_POSITION, "BsSetPosition", module_set_position),
-        ("bs_test_tail2", SHAPE_TEST_TAIL2, "BsTestTail2", module_test_tail2),
-        ("bs_skip_bits2", SHAPE_SKIP_BITS2, "BsSkipBits2", module_skip_bits2),
-        ("bs_start_match3", SHAPE_START_MATCH3, "BsStartMatch3", module_start_match3),
-        ("bs_start_match4", SHAPE_START_MATCH4, "BsStartMatch4", module_start_match4_label),
-        ("bs_get_integer2", SHAPE_GET_INTEGER2, "BsGetInteger2", module_get_integer2),
-        ("bs_match", SHAPE_BS_MATCH, "BsMatch", module_bs_match),
-        ("bs_create_bin", SHAPE_CREATE_BIN, "BsCreateBin", module_create_bin),
-    ];
     let mut covered = 0usize;
-    for (shape_name, index, variant, build) in cases {
+    for (shape_name, index, variant, build) in INLINE_SHAPE_CASES {
         let module = build();
         let (emitted, snapshot) = emitted_shapes(&module);
         assert!(
