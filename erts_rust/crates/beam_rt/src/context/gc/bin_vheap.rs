@@ -486,10 +486,44 @@ pub(crate) fn reclaim(
             reclaimer.limit_words(),
         ));
     }
+    // TEMP INSTRUMENTATION (investigation only): the binary-allocator live figure around the
+    // retain, plus the escaped runtime store's own refc-binary contents.
+    let live_bin_bytes = || -> u64 {
+        beam_alloc::registry::all_stats()
+            .into_iter()
+            .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
+            .map(|(_, stats)| stats.live_bytes as u64)
+            .sum()
+    };
+    let before_bytes = live_bin_bytes();
+    let store_handles: Vec<(usize, u32)> = runtime
+        .eval_off_heap
+        .binaries()
+        .iter()
+        .map(|b| (b.data_ptr() as usize, b.refcount()))
+        .collect();
     let released = machine.retain_refc_binaries(|payload| {
         let payload = payload as usize;
         live.binary_search(&payload).is_ok() || shared.contains(&payload)
     });
+    {
+        let after_bytes = live_bin_bytes();
+        let store_bytes: usize = runtime
+            .eval_off_heap
+            .binaries()
+            .iter()
+            .map(beam_alloc::RefcBinary::reserved_bytes)
+            .sum();
+        static PARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let park = PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::debug_trace::trace(format_args!(
+            "PROBE2 park={park} pid={pid:?} released={released} bin_live_before={before_bytes} \
+             bin_live_after={after_bytes} delta={} store_handles={} store_bytes={store_bytes} \
+             store_ptrs={store_handles:?}",
+            after_bytes as i64 - before_bytes as i64,
+            store_handles.len(),
+        ));
+    }
     // Re-size the budget from what survived and re-prime the observation pair (the C
     // `p->bin_vheap_sz = next_vheap_size(...)` / `MSO(p).overhead = bin_vheap` pair), then
     // republish the process's off-heap byte figure from the same reading.
