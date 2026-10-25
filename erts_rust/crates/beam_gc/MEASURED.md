@@ -1208,7 +1208,8 @@ arena), and the noise floor's bit-identity. **Wall time and every RSS figure are
 
 **Sizes.** Release: `churn` N = 2 048, `growth` N = 1 024, `copy_out` N = 2 048; debug runs a quarter of each
 (every assertion is a function of the geometry and N, so both sizes are checked identically). Release profile,
-two independent sessions, 14-core host.
+one session of three strictly interleaved rounds per class plus a three-repeat noise floor on the copying arm,
+14-core host, 1-minute loadavg **0.42 / 0.41 / 1.33** read before and after every round.
 
 ### C1 — allocation-churn, low live set (`churn`)
 32 persistent 4-word tuples (128 words live) plus, per round, 128 transients (3 words) that are reachable at
@@ -1227,8 +1228,8 @@ garbage tuples (1 728 words). `fullsweep_after = 2`; nursery 4 096 and mature 4 
 | nursery capacity (settled) | 4 096 | 4 096 | 1.000 |
 | `HeapFootprint` capacity | 86 944 B | 88 064 B | 1.013 |
 | `HeapFootprint` used | 10 240 B | 20 480 B | **2.000×** |
-| peak RSS | 3 452–3 564 kB | 3 520–3 544 kB | 1.013–1.018 (image-dominated; the ranges overlap) |
-| wall (child's measured window) | 15.5–15.9 ms | 34.7–38.1 ms | **2.234–2.417×** |
+| peak RSS (`VmHWM`) | 3 484–3 488 kB | 3 520–3 596 kB | 1.010–1.032 (median paired 1.014; image-dominated) |
+| wall (child's measured window) | 14.6–20.0 ms | 34.6–40.4 ms | **2.029×** (paired +19.2 … +20.4 ms) |
 
 The 1 280 promoted words are exactly the 128 live words plus the `fullsweep_after + 1 = 3` dead promoted
 batches of 128 transients × 3 words; the mark region's 416 lines are the same `32 + 3 × 128` objects with each
@@ -1253,8 +1254,8 @@ unreferenced garbage tuples (750 words). N = 1 024 rounds leaves **49 152 roots 
 | live set at the end | 49 152 roots / 147 456 words | identical | 1.000 |
 | `HeapFootprint` capacity | 2 547 360 B | 6 676 000 B | 2.621 |
 | `HeapFootprint` used | 1 179 648 B | 6 291 456 B | **5.333×** |
-| peak RSS | 11 068–11 200 kB | 26 084–26 204 kB | **2.338–2.340×** |
-| wall (child's measured window) | 209.0–209.9 ms | 356.7–358.5 ms | **1.711–1.721×** |
+| peak RSS (`VmHWM`) | 11 096–11 156 kB | 27 012–27 104 kB | **2.430×** (paired +15.9 … +16.0 MB) |
+| wall (child's measured window) | 201.5–210.0 ms | 340.7–343.2 ms | **1.681×** (paired +130.7 … +141.7 ms) |
 
 The copying arm's 25.3 M words are ≈ `341 fullsweeps × the average live set` (the live set grows linearly to
 147 456 words, so its mean is ≈ half), i.e. every fullsweep re-copies the entire live set into a fresh space;
@@ -1276,22 +1277,24 @@ per round: the `ets_copy` allocation shape with no runtime, message layer or ETS
 | peak mature occupancy | 768 **promoted object words** | 4 096 **line-words** (256 lines) | 5.333× |
 | mature / nursery capacity | 4 096 / 987 | 4 096 / 987 | 1.000 / 1.000 |
 | `HeapFootprint` capacity / used | 40 664 B / 6 144 B | 40 664 B / 32 768 B | 1.000 / **5.333×** |
-| peak RSS | 3 436–3 476 kB | 3 476–3 488 kB | 1.007–1.009 |
-| wall | 11.2–12.5 ms | 21.7–21.8 ms | **1.742–1.940×** |
+| peak RSS (`VmHWM`) | 3 428–3 448 kB | 3 476–3 480 kB | 1.009–1.015 |
+| wall | 7.8–15.8 ms | 20.7–26.0 ms | **1.641×** (paired +7.2 … +13.3 ms) |
 
 ### The noise floor, and the load
-The copying arm on `churn` at N = 2 048, three times, in each of the two release sessions plus the debug pass:
+The copying arm on `churn` at N = 2 048, three times within the release session:
 **every deterministic counter is bit-identical** (`words_copied` 873 856, `objects_copied` 284 000,
 `mature_peak_words` 1 280, `footprint` 86 944 B / 10 240 B, and the other 16 fields) — spread **1.000×**
-everywhere, exactly as a count must be. Peak RSS spread **1.001–1.003×**; wall spread **1.191×** and
-**1.400×** in the two release sessions (18.6–26.0 ms windows) and **1.057×** in debug.
-
-That wide relative wall band is a property of the window, not of the arms: at these N the child measures
+everywhere, exactly as a count must be. Peak RSS spread **1.003×** (3 484 / 3 496 / 3 496 kB); wall spread
+**1.163×** (19.459 / 21.287 / 22.632 ms).
+That relative wall band is a property of the window, not of the arms: at these N the child measures
 10–40 ms for `churn`/`copy_out`, so page faults and process scheduling dominate a single sample. The **paired
-difference** is what carries the signal, and it reproduces in every round of both sessions (session B /
-session A): **+19.2 / +20.8 ms** on `churn` and **+10.9 / +11.5 ms** on `copy_out`, with `growth` at
-**+150.8 / +149.2 ms** on a ≈210 ms base
-(per-round spread ±5 %). Both sessions ran at 1-minute loadavg **0.28–0.61** on 14 cores.
+difference** is what carries the signal, and it reproduces in every round: **+19.952 ms** on `churn`
+(+19.219 … +20.411 across the three paired rounds) and **+10.142 ms** on `copy_out` (+7.154 … +13.332), with
+`growth` at **+138.854 ms** on a ≈204 ms base (+130.686 … +141.718). The session ran at 1-minute loadavg
+**0.42** (0.42 / 0.41 / 1.33) on 14 cores, steady before and after every round.
+Absolute wall and RSS are **session figures, not arm properties**: a run at a heavier background load reports
+the same deterministic counters and a wider wall band. Read a ratio against its paired difference and the
+recorded load, never as a fixed constant.
 
 ## The four-class record and the standing decision
 One row per workload class: **C1** and **C2** from the collector-level sweep above, **C3** and **C4** from
@@ -1301,9 +1304,9 @@ not duplicated. Every ratio is `Immix ÷ Copying`.
 
 | class | copy work (`words_copied`) | footprint | peak RSS | wall | loadavg | verdict |
 |---|---|---|---|---|---|---|
-| **C1** allocation-churn, low live (collector) | **0.900×** (objects 0.923×) | used **2.000×**, capacity 1.013× | 1.013–1.018× (image-dominated) | **2.234–2.417×** | 0.28–0.61 | Does not win: a 10 % copy saving for 2× the payload footprint and ~2.3× the wall. |
-| **C2** heap-growth, high live growing (collector) | **0.020×** (objects 0.020×) | used **5.333×**, capacity 2.621× | **2.338–2.340×** | **1.711–1.721×** | 0.28–0.61 | Wins copy work 50× and pays 5.3× payload footprint and 1.7× wall — a copy-work win that is not a wall win. |
-| **C3** messaging / copy-bound (runtime: `send_recv` / `ets_copy`) | **1.462×** / 1.010× | mature occupancy 14.476× / 5.333× | **0.520×** / 1.001× | **0.863×** / 1.119× | 1.60–7.63 | `send_recv` wins time and footprint while moving *more* words; `ets_copy` wins nothing. The collector-level `copy_out` shape above reaches the same verdict without a runtime (0.750× words, 5.333× payload footprint, 1.742–1.940× wall). |
+| **C1** allocation-churn, low live (collector) | **0.900×** (objects 0.923×) | used **2.000×**, capacity 1.013× | 1.010–1.032× (image-dominated) | **2.029×** | 0.42 | Does not win: a 10 % copy saving for 2× the payload footprint and ~2× the wall. |
+| **C2** heap-growth, high live growing (collector) | **0.020×** (objects 0.020×) | used **5.333×**, capacity 2.621× | **2.430×** | **1.681×** | 0.42 | Wins copy work 50× and pays 5.3× payload footprint and 1.7× wall — a copy-work win that is not a wall win. |
+| **C3** messaging / copy-bound (runtime: `send_recv` / `ets_copy`) | **1.462×** / 1.010× | mature occupancy 14.476× / 5.333× | **0.520×** / 1.001× | **0.863×** / 1.119× | 1.60–7.63 | `send_recv` wins time and footprint while moving *more* words; `ets_copy` wins nothing. The collector-level `copy_out` shape above reaches the same verdict without a runtime (0.750× words, 5.333× payload footprint, 1.641× wall). |
 | **C4** a real in-process compile (runtime) | **0.473×** (objects 0.486×) | mature capacity 11.097×, occupancy 40.305× | 1.044× | **1.145×** | 1.60–7.63 | Wins copy work 2.1× and pays 11.1× mature capacity, 4.4 % peak RSS and 14.5 % wall. |
 
 **No class wins on all three axes** (copy work, footprint, pause/wall), and no two classes agree on which axis
