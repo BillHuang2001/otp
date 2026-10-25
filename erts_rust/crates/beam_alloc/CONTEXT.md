@@ -106,6 +106,26 @@ exercisable there).
   peak_live_bytes, carriers, carrier_bytes, peak_carrier_bytes, sbc_carriers, mbc_carriers, mseg,
   types: [TypeCounters; STATS_TYPE_SLOTS] }` — `Copy` (inline type table ⇒ ~12 KiB snapshot; taken by
   introspection, never on the fast path). `AllocStats::type_stats(slot)` is bounds-safe.
+- **Live-byte accounting model — what `erlang:memory(binary)` measures.** `AllocStats::live_bytes` is the
+  **aggregate** figure of one allocator instance (`binary_alloc` for off-heap binaries), moved only by
+  `Counters::{note_alloc_typed,note_free_typed}` (`src/stats.rs:353-373`, reached through
+  `AllocatorState::{note_alloc_for,note_free_for}`, `src/allocator/state.rs:193-207`). It is *live block
+  extents currently held by the allocator* — never "bytes ever requested" — and it is **not** the
+  per-type slot (`types[BINARY].bytes`). The charged amount is the block's own recorded extent, not the
+  request: `BLOCK_HEADER_SIZE` (16) + payload, a slab block charged at its whole class width. A
+  `RefcBinary` payload of `n` bytes charges `16 + 32 + n` (4096 data bytes ⇒ **4144 B**, served from the
+  MBC pool since 4128 > the 1024 B ladder and < `sbct`). Every free the allocator *performs* decrements
+  exactly the extent it incremented — all three carrier paths, and `RefcBinary::relocate`'s
+  allocate-before-free move. A free it **refuses** (unrecognised header, unregistered carrier,
+  out-of-range class, failed free-list reserve, missing dedicated carrier —
+  `src/allocator/core.rs:486-491,538-541,546-570`) returns the block to no list and decrements nothing,
+  so it leaks the memory *and* the counter together. Both free counters are `saturating_sub`, so an
+  over-free **clamps to 0** — the only way the figure drops in a step; nothing in this crate re-derives
+  or resets it (no reset API, no `malloc_trim`; `mseg`'s reuse cache and carrier release move
+  `carrier_bytes` only). `Heap`/`ReservedHeap` allocate through the **untyped** path on
+  `default_allocator()` (`std_alloc`), so process heaps never enter `binary_alloc`'s figure. There is
+  exactly one off-heap payload representation (`RefcBinary`; the on-heap small-binary variant is
+  `beam_term::refc`'s `ErlHeapBits`), and `Clone` is accounting-neutral (refcount only).
 - `pub struct AllocatorInfoItem { key, value }`, `pub enum InfoValue`,
   `pub struct AllocatorInfo` — `from_stats(name, &AllocStats)`, `push_policy(&CarrierPolicy)` (the 12
   legacy items in oracle order), `push_type(name, TypeStats)`.
