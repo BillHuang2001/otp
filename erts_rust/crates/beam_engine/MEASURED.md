@@ -209,6 +209,29 @@ The harness is `src/bench/` (`#[cfg(test)]`-only, in-process — no `beam_rt` bo
 - The other three foreign workloads, same harness (per call): `emqx_base62:encode/1` **244** instructions, **4** `+/1` BIFs on the JIT tier (**20** on the interpreter, where `+` is not inlined), 1 `iolist_to_binary/1`, **18** rooted calls / **45** words, **7** round-trips / **16** in-block calls; `emqx_base62:decode/1` **531** instructions, **17** BIFs on the JIT tier (32 `-/2` + 32 `bit_size/1` + 1 `rem/2` on the interpreter), **32** rooted calls / **133** words; `cowboy_bstr:capitalize_token/1` **660** instructions, **57** local-call-seam requests, **2** rooted calls / **13** words.
 Caveat: the absolute ns are opt-level-3 shared-host figures; only the ratios and the deterministic counters are signal.
 
+## Measured (baseline-JIT bitstring inline set — the `foreign` kernels, paired same-session A/B)
+Two levers on one workload family: the `bs_*` match/position inline set (`bs_match` with a fully static command list, `bs_get_integer2`, `bs_get_position`/`bs_set_position`, `bs_test_tail2`/`bs_skip_bits2`, `bs_start_match3` / `bs_start_match4`-reuse) and, on top of it, the `bs_create_bin` construction arm that writes an append accumulator's field bytes in-block.
+Each is a **paired A/B inside one session**: two `beam_rt` release binaries from the same tree, only `src/jit` reverted on the "no-inline" leg, `$BEAM_RT` selecting the binary (the bench records it in `runtimes[].program`), the legs interleaved round by round with the order rotated, `taskset -c 3` + `setsid -w`, `BENCH_TIER=baseline BEAM_RT_TIER=baseline`, `tools/bench run --quick --runtime {rust,sys} --workloads foreign`, one process at a time.
+The match/position lever is 3 rounds (`/proc/loadavg` 1.92–3.74); the construction lever is 5 rounds (`/proc/loadavg` 2.38–5.56, recorded before and after every ≈8 s leg).
+| case (matched N) | lever | sys ns | no-inline ns | inline ns | A/B | rust/sys inline |
+|---|---|---|---|---|---|---|
+| `bstr_capitalize_token` (40 000) | match/position | 336.7 | 3 739.2 | **2 834.9** | **1.319×** | 8.42× |
+| `bstr_to_lower` (50 000) | match/position | 326.0 | 2 825.2 | **2 718.0** | **1.039×** | 8.34× |
+| `emqx_base62_decode` (60 000) | match/position | 284.0 | 4 746.4 | **4 318.0** | **1.099×** | 15.21× |
+| `emqx_base62_encode` (60 000) | match/position | 209.2 | 2 931.5 | **2 736.3** | **1.071×** | 13.08× |
+| `bstr_to_lower` (50 000) | `bs_create_bin` | 327.4 | 2 726.3 | **2 160.2** | **1.2621×** | 6.63× |
+| `bstr_capitalize_token` (40 000) | `bs_create_bin` | 326.0 | 2 853.1 | **2 216.7** | **1.2839×** | 6.89× |
+| `emqx_base62_decode` (60 000) | `bs_create_bin` | 283.4 | 4 382.1 | **3 998.4** | **1.0896×** | 14.08× |
+| `emqx_base62_encode` (60 000) | `bs_create_bin` | 210.0 | 2 742.5 | 2 778.9 | **0.9857×** | 13.24× |
+The two levers are separate sessions, so their absolute ns and ratio columns are not comparable across the blocks — only each block's own A/B means anything.
+- The A/B is **same-session and paired**, the only load-robust figure on this host; a cross-session pair of ratios is not evidence (the match/position round's own cross-session read gets three cases right and `encode` wrong because the oracle leg itself moved 32 % with the load).
+- Round reproducibility: match/position ≤0.6 % spread on every case; construction ≤1.9 / 2.2 / 0.9 / 4.4 % (`to_lower` / `capitalize_token` / `encode` / `decode`).
+- `to_lower` and `capitalize_token` gain from the construction arm because their per-element `bs_create_bin` (a **`Y`-slot** accumulator) now runs in-block; `decode` gains from the bit-granular `integer 6` append. `encode`'s whole build is a `binary all` segment, which stays on the family by design, so its consistent ≈1.4 % slowdown is a code-layout effect with no shape change for that kernel — recorded as an honest negative rather than hidden.
+- **The construction sites each kernel actually lowers** (deterministic, from `src/jit/baseline/foreign_kernel_tests.rs`'s cache-free compile of the staged upstream source — `SHAPE_CREATE_BIN`'s `inlined` delta plus the static-deopt census): `cowboy_bstr:capitalize_token/3` **3 of 3** (`x` accumulators 1, `y` accumulators 2, const-bytes fields 1), declined 0, deopts 0; `cowboy_bstr:to_lower/1`'s comprehension loop **1 of 1** (the `Y`-slot accumulator), deopts 0; `emqx_base62:decode/2` **2 of 6**, both bit-granular, declined 4, deopts 0; `emqx_base62:encode/2` **0 of 3** (all `binary all`), deopts 0.
+- Shapes deliberately left on `bitstr.rs::jit_bitstr`: `bs_create_bin`'s `binary all` segment (a run-time length fixes no static offset for itself or any later field, and its only lowering is the family's own copy) and its fresh non-append `[integer 8]` (it allocates through `raw::make_binary`, so no helper-free admission point); `bs_start_match3/4` on a fresh context; `bs_match_string`, `bs_get_binary2`, `bs_get_tail`, `bs_init_writable`, the UTF and float opcodes.
+- Method caveat: the bench's Rust-side `case_*_ns_per_call` is **N-dependent**, so only same-N comparisons are valid — every row above held one fixed N per case on both legs.
+Per-round A/B vectors, the binary selection, the interleaving protocol and the shape predicates: `src/jit/baseline/measure/CONTEXT.md`; the per-shape guards/fallbacks: `src/jit/baseline/inlineset/CONTEXT.md`.
+
 ## Cross-runtime record and the binary A/B (per-call dispatch cost)
 Two instruments, both pinned `taskset -c 3` under `setsid -w`, one process at a time, `/proc/loadavg` recorded at every leg. **No wall clock is primary evidence** — the ratio is the figure; the deterministic counters below are the structural evidence.
 - **Matched cross-runtime rounds** (3 rounds, alternating `--runtime sys` / `--runtime rust` per round, `--quick`; 1-min load 1.02–2.37). `sys` = system OTP 29.1.1 / erts-17.1, `rust` = `beam_rt` at its default baseline tier.
