@@ -103,7 +103,7 @@ use super::bif::bif_shape;
 use super::bitstr_inline::{
     match_string_shape,
     bs_match_shape, get_integer2_shape, get_position_shape, set_position_shape, skip_bits2_shape,
-    start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
+    skip_utf32_shape, start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
 };
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
@@ -522,6 +522,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
             bits,
             offset,
         } => match_string_shape(labels, module, *fail, ctx, *bits, *offset).is_some(),
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => skip_utf32_shape(labels, *fail, ctx, *flags).is_some(),
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
         // call at all, so the label test is the honest classification.)
@@ -768,6 +771,13 @@ pub(crate) fn cacheable_touches(
                 touches.extend(shape.registers());
             }
         }
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => {
+            if let Some((shape, _)) = skip_utf32_shape(labels, *fail, ctx, *flags) {
+                touches.extend(shape.registers());
+            }
+        }
         _ => {}
     }
     touches
@@ -928,6 +938,13 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
             offset,
         } => {
             if let Some((shape, _)) = match_string_shape(labels, module, *fail, ctx, *bits, *offset) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => {
+            if let Some((shape, _)) = skip_utf32_shape(labels, *fail, ctx, *flags) {
                 reads.extend(shape.reads());
             }
         }
@@ -1102,6 +1119,14 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
             bits,
             offset,
         } => match_string_shape(labels, module, *fail, ctx, *bits, *offset)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_skip_utf32` binds nothing either: its only mutation is the context's `start`
+        // heap word, so its write set is empty (charged anyway, so the four regalloc mirrors
+        // stay one decision — see `Utf32Shape::writes`).
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => skip_utf32_shape(labels, *fail, ctx, *flags)
             .map(|(shape, _)| shape.writes())
             .unwrap_or_default(),
         // Everything else deopts.

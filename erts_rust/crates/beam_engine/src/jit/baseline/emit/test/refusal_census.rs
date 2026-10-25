@@ -679,10 +679,26 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
         Instr::BsGetBinary2(_) => BsVerdict::NoArm("bs_get_binary2"),
         Instr::BsGetUtf8 { .. } => BsVerdict::NoArm("bs_get_utf8"),
         Instr::BsGetUtf16 { .. } => BsVerdict::NoArm("bs_get_utf16"),
+        Instr::BsSkipUtf32 {
+            fail, ctx, flags, ..
+        } => {
+            const OP: &str = "bs_skip_utf32";
+            if bitstr_inline::skip_utf32_shape(labels, *fail, ctx, *flags).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The shape's two refusals, in its own precedence: the endianness flag word is
+            // static, so it is decidable before the fail operand is; then the shared fail
+            // half; anything else is the operand form.
+            let reason = if bitstr_inline::field_is_little(*flags) {
+                BS_REASON_FIELD.to_string()
+            } else {
+                fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx]))
+            };
+            BsVerdict::Refused(OP, reason)
+        }
         Instr::BsGetUtf32 { .. } => BsVerdict::NoArm("bs_get_utf32"),
         Instr::BsSkipUtf8 { .. } => BsVerdict::NoArm("bs_skip_utf8"),
         Instr::BsSkipUtf16 { .. } => BsVerdict::NoArm("bs_skip_utf16"),
-        Instr::BsSkipUtf32 { .. } => BsVerdict::NoArm("bs_skip_utf32"),
         Instr::BsInitWritable => BsVerdict::NoArm("bs_init_writable"),
         _ => BsVerdict::NotBitstring,
     }

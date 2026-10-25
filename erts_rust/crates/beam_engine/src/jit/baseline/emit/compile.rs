@@ -590,6 +590,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
     let mut bs_match_commands = 0usize;
     let mut create_bin_paths = 0usize;
     let mut match_string_paths = 0usize;
+    let mut utf32_paths = 0usize;
     for instr in code {
         match instr {
             Instr::Bif { .. } => cmp_bifs += 1,
@@ -602,9 +603,10 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             Instr::SetTupleElement { .. } => tuple_paths += 1,
             Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
             // Every bitstring-path instruction the tier inlines *in addition to* the
-            // per-instruction budget below: all nine shapes — the six guarded
-            // match-context ones, `bs_get_integer2`, `bs_match` and `bs_create_bin` —
-            // reserve their own guarded sequence ([`BS_PATH_BYTES`]), `bs_match`
+            // per-instruction budget below: the guarded match-context shapes — the six
+            // position/tail/start-match ones, `bs_get_integer2`, `bs_match`,
+            // `bs_create_bin`, `bs_match_string` and the UTF-32 shapes — reserve their own
+            // guarded sequence ([`BS_PATH_BYTES`]), `bs_match`
             // additionally charges one [`BS_MATCH_COMMAND_BYTES`] per command, because its
             // whole static command list is lowered inline, and `bs_create_bin` charges one
             // [`CREATE_BIN_PATH_BYTES`] because its field writes are emitted one byte (aligned
@@ -623,6 +625,13 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             // triple per pattern byte, bounded by
             // `match_string::MAX_MATCH_BYTES`.
             Instr::BsMatchString { .. } => match_string_paths += 1,
+            // The UTF-32 shapes charge their own sequence ([`UTF32_PATH_BYTES`]) on top of
+            // the generic [`BS_PATH_BYTES`]: the four byte loads and the two validity tests
+            // are wider than the shared match-context guards this otherwise reuses.
+            Instr::BsSkipUtf32 { .. } => {
+                bs_paths += 1;
+                utf32_paths += 1;
+            }
             Instr::BsGetInteger2(_)
             | Instr::BsGetPosition { .. }
             | Instr::BsSetPosition { .. }
@@ -643,6 +652,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + BS_MATCH_COMMAND_BYTES * bs_match_commands
         + CREATE_BIN_PATH_BYTES * create_bin_paths
         + BS_MATCH_STRING_PATH_BYTES * match_string_paths
+        + UTF32_PATH_BYTES * utf32_paths
 }
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
@@ -760,6 +770,17 @@ const CREATE_BIN_PATH_BYTES: usize = 16_384;
 /// subject classification and the bounds guard ≈ 220 B) and the commit. An
 /// under-estimate is a `SystemLimit` compile error, so the slack is deliberate.
 const BS_MATCH_STRING_PATH_BYTES: usize = 2_304;
+/// The code-size budget one UTF-32 shape adds **on top of** its own [`BS_PATH_BYTES`] and
+/// [`INSTRUCTION_BYTES`] (see [`code_capacity_estimate`]).
+///
+/// The sequence is one fixed length — the destination guard, the match-context guard, the
+/// `remaining` computation, the subject classification, the alignment guard, the
+/// readable-bounds guard, four `movzx`-based byte loads with three `shl`/`or` pairs, two
+/// validity tests, the single commit and the three exits — i.e. ≈ 60 + 40 + 60 + 130 + 30 +
+/// 40 + 4 × 30 + 60 + 40 ≈ 580 B, in front of the `emit_step_and_continue` fallback that
+/// [`INSTRUCTION_BYTES`] already covers. An under-estimate is a `SystemLimit` compile error,
+/// so the figure is deliberately loose.
+const UTF32_PATH_BYTES: usize = 1_024;
 
 #[cfg(test)]
 mod tests {

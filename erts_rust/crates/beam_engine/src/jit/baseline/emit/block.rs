@@ -1125,6 +1125,38 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // `bs_skip_utf32` — one 32-bit big-endian field that must be a Unicode scalar
+            // (`decode_utf32`, `crate::families::bitstrings::matching::reads`), the
+            // character a `<<C/utf32>>` pattern consumes without binding. The sequence
+            // validates the scalar in registers and commits the advanced `start` word
+            // **once**, after every guard, so a `fallback` deopt re-executes the instruction
+            // against an untouched context. A truncated field, a value past `0x10FFFF` and a
+            // surrogate all take the **fail label** (the family's `fail_step`, which writes
+            // nothing); a `-little`/`-native` flags word, a `NO_FAIL` fail code that raises
+            // and an unresolvable label emit **zero bytes** and take the family's arm below.
+            // See [`bitstr_inline::utf32`].
+            Instr::BsSkipUtf32 {
+                fail,
+                ctx,
+                live: _,
+                flags,
+            } => {
+                if !bitstr_inline::try_inline_bs_skip_utf32(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *flags,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

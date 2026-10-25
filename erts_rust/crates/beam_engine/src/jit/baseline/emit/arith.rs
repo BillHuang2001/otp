@@ -449,6 +449,10 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             ..
         } => super::bitstr_inline::MatchStringShape::of(module, ctx, *bits, *offset)
             .map_or(false, |shape| shape.uses_y()),
+        Instr::BsSkipUtf32 { ctx, flags, .. } => {
+            super::bitstr_inline::Utf32Shape::of(ctx, *flags)
+                .map_or(false, |shape| shape.uses_y())
+        }
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }

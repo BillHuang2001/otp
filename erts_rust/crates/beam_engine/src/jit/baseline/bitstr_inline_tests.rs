@@ -17,10 +17,11 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Per-shape pins for the **ten native bitstring inline arms** in
+//! Per-shape pins for the **eleven native bitstring inline arms** in
 //! [`super::emit::bitstr_inline`]: `bs_get_position`, `bs_set_position`,
 //! `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`,
-//! `bs_get_integer2`, `bs_match`, `bs_create_bin` and `bs_match_string`.
+//! `bs_get_integer2`, `bs_match`, `bs_create_bin`, `bs_match_string` and
+//! `bs_skip_utf32`.
 //!
 //! `bitstr_tests` pins the *family route* (the `jit_bitstr` helper and the predicate
 //! that claims the whole `Bs*` set). This node pins the **inline** route, one claim per
@@ -64,7 +65,7 @@ use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
 use super::counters;
 use super::emit::bitstr_inline::{
     self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_BS_MATCH_STRING, SHAPE_COUNT, SHAPE_CREATE_BIN,
-    SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2,
+    SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF32,
     SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
@@ -149,7 +150,7 @@ pub(crate) fn sentinel_block(label: Label) -> Vec<Instr> {
 }
 
 // ---------------------------------------------------------------------------
-// The nine hand-built shape modules
+// The ten hand-built shape modules
 // ---------------------------------------------------------------------------
 /// `bs_get_position`: read 8 bits, then report the context position — `8`.
 fn module_get_position() -> Module {
@@ -539,6 +540,41 @@ fn module_match_string() -> Module {
     module.strings = b"ABCDEFGHItail".to_vec();
     module
 }
+
+/// `bs_skip_utf32`: consume one 32-bit big-endian scalar out of the context and report the
+/// context's **new position** — the character `<<_/utf32, _/binary>>` skips without binding.
+///
+/// The answer is `bs_get_position`'s, i.e. `32` on success and `-1` (the sentinel block) when
+/// the fail label is taken, so "did the commit run" and "did the fail branch run" are both
+/// observable through the returned value.
+fn module_skip_utf32() -> Module {
+    bitstr_module("inline_bs_skip_utf32", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsSkipUtf32 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+            },
+            Instr::BsGetPosition {
+                ctx: Operand::X(1),
+                dst: Operand::X(0),
+                live: 2,
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
 // ---------------------------------------------------------------------------
 // The instrument: a cache-free compile per shape
 // ---------------------------------------------------------------------------
@@ -644,6 +680,7 @@ pub(crate) const INLINE_SHAPE_CASES: [ShapeCase; SHAPE_COUNT] = [
         "BsMatchString",
         module_match_string,
     ),
+    ("bs_skip_utf32", SHAPE_SKIP_UTF32, "BsSkipUtf32", module_skip_utf32),
 ];
 
 /// The `Instr` variant the static-deopt census keys `shape` by — the **one** mapping, so a
@@ -659,7 +696,7 @@ pub(crate) fn shape_variant(shape: usize) -> &'static str {
 
 /// **Every arm emits and stays native — the mandatory instrument.**
 ///
-/// For each of the ten shapes ([`INLINE_SHAPE_CASES`]): a cache-free
+/// For each of the eleven shapes ([`INLINE_SHAPE_CASES`]): a cache-free
 /// [`super::emit::compile_function`] moves that shape's `inlined(SHAPE_*)` counter, visits the
 /// variant (so the name is real), and records **zero** static deopts for it. Without this a
 /// fully-deopting "implementation" would pass every tier-agreement test in this file.
