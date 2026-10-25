@@ -99,16 +99,25 @@ const PAYLOAD_LENGTH: i64 = 64;
 /// nursery, with `fullsweep_after(0)` making every cadence collection a fullsweep.
 const PAYLOAD_ROUNDS: i64 = 200;
 
-/// How many collections under `fullsweep_after = 0` may be **not** fullsweeps: exactly the
-/// reduction/yield-boundary door's **successful** kind-pinned young-only minors
-/// (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`), the one collection site that is not a
-/// cadence collection and whose refused minors are the door's own escalating `collect()` — a
-/// fullsweep — in that same call. A minor's promotion needs mature room that only a fullsweep
-/// installs (`HeapPolicy::mature_after_fullsweep`), and the door fires at most once per
-/// pre-emption and only where a park has crossed its seven-eighths occupancy watermark; the
-/// derivation for the figure this workload reaches is at the assertion in
+/// How many collections under `fullsweep_after = 0` may be **not** fullsweeps, as an inverse
+/// share of the run's collections: exactly the reduction/yield-boundary door's **successful**
+/// kind-pinned young-only minors (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`), the one
+/// collection site that is not a cadence collection and whose refused minors are the door's own
+/// escalating `collect()` — a fullsweep — in that same call.
+///
+/// The surplus is a *rate*, not a count, because the door's premise is absent from this workload:
+/// it exists for a loop that reaches **no** heap-admission door (BIF-only allocation), while this
+/// fixture takes a `test_heap` admission on nearly every round, so its admission door collects
+/// about once per five rounds and the slice-end occupancy is normally the low figure an admission
+/// collection just left — below the seven-eighths watermark that is the door's occupancy trigger
+/// (a growth's collection debt being the other one). The door's own module docs measure that
+/// rationing at one firing in 8.50–8.61 boundary checks and 2.221–2.239 % of the run's
+/// collections; one collection in ten is a 4.5× allowance over the measured share, while still
+/// failing by ~10× if the door starts collecting on every pre-emption. The companion ceiling —
+/// at most one boundary collection per pre-emption (`REDS_BOUNDARY_MIN_REDS` is one slice budget,
+/// accumulated per pid) — and the derivation of both are at the assertion in
 /// [`a_live_payload_survives_a_fullsweep_on_the_immix_path`].
-const BOUNDARY_MINOR_COLLECTIONS: u64 = 1;
+const BOUNDARY_MINOR_SHARE_DEN: u64 = 10;
 
 /// The emulator's default initial mature-generation size in words — the `beam_gc` default
 /// [`HeapOptions::default`] carries, and a value far below the break-even.
@@ -458,8 +467,9 @@ fn the_config_implied_strategy_runs_a_fullsweep_workload() {
 /// Asserted: the process's own collector really is the mark-region one while it runs; the
 /// workload returned its payload; **every element of that payload is intact**; the run drove
 /// collections and fullsweeps (`gc_stats().collections > 0`, and every cadence collection among
-/// them a fullsweep — the yield-boundary door's young-only minor is the one collection that is
-/// not, see [`BOUNDARY_MINOR_COLLECTIONS`]); and no collection failed, halted a process or
+/// them a fullsweep — the yield-boundary door's young-only minor is the only collection that is
+/// not, and it is rationed to at most one per pre-emption and to a small share of the run's
+/// collections, see [`BOUNDARY_MINOR_SHARE_DEN`]); and no collection failed, halted a process or
 /// tripped a valve.
 ///
 /// The payload check is deliberately structural rather than `x(0) == N`: a collection that
@@ -493,8 +503,17 @@ fn a_live_payload_survives_a_fullsweep_on_the_immix_path() {
     // The strategy is fixed at spawn time; the collection counters are cumulative, so the
     // last sample taken **while the process is still in the table** (the scheduler removes a
     // terminated process at once) reports the whole run.
+    //
+    // `run_one_slice` runs at most one slice, and a slice **is** one boundary check (the
+    // yield-boundary door is reached from the runner's pre-emption arm only), so the loop counts
+    // the run's pre-emptions — the quantity the surplus is bounded against — and attributes every
+    // collection to the slice that ran it.
     let mut kind = None;
     let mut fullsweeps = 0u64;
+    let mut slices = 0u64;
+    let mut sampled_surplus = 0u64;
+    let mut max_slice_surplus = 0u64;
+    let mut prev = before;
     let deadline = Instant::now() + WORKLOAD_DEADLINE;
     while rt.process_result(pid).is_none() {
         assert!(
@@ -502,12 +521,29 @@ fn a_live_payload_survives_a_fullsweep_on_the_immix_path() {
             "gc_payload:run/1 with N={PAYLOAD_ROUNDS} did not terminate within {}s",
             WORKLOAD_DEADLINE.as_secs()
         );
-        rt.run_one_slice().expect("a scheduler slice runs");
+        let ran = rt.run_one_slice().expect("a scheduler slice runs");
+        slices += ran;
         if let Some(process) = rt.processes().get(pid) {
             let collector = process.collector();
             kind = Some(collector.kind());
             fullsweeps = collector.stats().major_collections;
         }
+        // This iteration's non-fullsweep collections, bounded by the slices it actually ran: the
+        // door's reduction interval is one slice budget accumulated per pid, so a slice carries at
+        // most one boundary collection — and an iteration that ran no slice (the run queue was
+        // momentarily empty) can have collected nothing at all.
+        let now = rt.gc_stats();
+        let slice_surplus =
+            (now.collections - prev.collections).saturating_sub(now.major - prev.major);
+        prev = now;
+        max_slice_surplus = max_slice_surplus.max(slice_surplus);
+        sampled_surplus += slice_surplus;
+        assert!(
+            slice_surplus <= ran,
+            "the yield-boundary door collects at most once per pre-emption \
+             (REDS_BOUNDARY_MIN_REDS is one slice budget, accumulated per pid), but one pass of \
+             {ran} slice(s) produced {slice_surplus} non-fullsweep collections; {now:?}"
+        );
     }
 
     // 1. The mark-region strategy really ran the process.
@@ -533,40 +569,69 @@ fn a_live_payload_survives_a_fullsweep_on_the_immix_path() {
         fullsweeps <= collections,
         "a fullsweep is one of the collections, never more; {after:?}"
     );
+    let surplus = collections - fullsweeps;
+    assert_eq!(
+        surplus, sampled_surplus,
+        "the loop's per-slice accounting must cover every collection the run made; {after:?}"
+    );
+    // The figures every ceiling below is derived from, so the pin is re-derivable from a run
+    // without archaeology.
+    eprintln!(
+        "gc_strategy: gc_payload N={PAYLOAD_ROUNDS}: slices={slices} collections={collections} \
+         fullsweeps={fullsweeps} surplus={surplus} max-per-slice={max_slice_surplus} \
+         ceilings: surplus<={slices} (slices), surplus*{BOUNDARY_MINOR_SHARE_DEN}<={collections} \
+         (collections)"
+    );
     // Every collection the **cadence** reaches is a fullsweep (`fullsweep_due(0)` holds for every
     // `minor_gcs`, so the collector's `collect` picks `CollectionKind::Major`), and the one site
     // that can produce anything else — the reduction/yield-boundary door — runs a **kind-pinned
     // young-only minor** (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`) and escalates
     // *that same call* to `collect()` when the minor refuses, so a refused minor is no collection
     // of its own: the excess `collections - fullsweeps` counts exactly the boundary minors that
-    // **succeeded**.
-    // A boundary minor may keep, shrink, or **grow** the nursery:
-    // `HeapPolicy::young_after_collection` keeps a capacity inside
-    // `[target, YOUNG_SHRINK_FACTOR × target]`, installs that target above the band, and installs
-    // it below the band too — the target being
-    // `young_minor_target_words` of the words the round itself promoted, i.e. a capacity derived
-    // from that round's live set and never from the fill it reached or the capacity it collected,
-    // which is what makes the installed figure a fixed point rather than a ratchet.
-    // A minor sizes only its own nursery, never its destination: the whole promotion must fit the
-    // mature region's free room (`collect_minor`'s up-front `free_lines() < needed` check, then
-    // the contiguous-run refusal of the atomic promotion), and only a **fullsweep** re-sizes that
-    // region (`mature_after_fullsweep` → `mature_target_words` = `MATURE_TARGET_LIVE_MULTIPLE` ×
-    // `need_after_fullsweep`, the multiple being the number of nursery-sized promotions one region
-    // is sized for).
-    // A successful minor therefore spends room a fullsweep installed, and once that room is gone
-    // the door's next collection is the escalating fullsweep — the region has to be re-sized by a
-    // fullsweep before another minor can be promoted out of it.
-    // The door also runs at most once per pre-emption (`REDS_BOUNDARY_MIN_REDS` is one slice
-    // budget) and only where a park has crossed the seven-eighths occupancy watermark or carries a
-    // growth's collection debt, so it is not a site every collection round reaches: after the one
-    // boundary minor here the nursery is collapsed onto that minor's own live-set target, and the
-    // run's remaining pre-emptions all park below the watermark — so the whole non-fullsweep count
-    // is that one minor (42 collections, 41 of them fullsweeps).
+    // **succeeded**. Two of the door's own mechanisms bound that count, and neither is a figure
+    // read off one run:
+    //
+    // 1. **At most one per pre-emption.** `REDS_BOUNDARY_MIN_REDS` is one slice budget
+    //    (`beam_common::CONTEXT_REDS`) accumulated **per pid**, and the door is reached only from
+    //    the runner's park arm, so a slice can carry at most one boundary collection — asserted
+    //    per slice in the loop above, with the slices that pass actually ran as the ceiling.
+    //    Summed over the run, `surplus <= slices`.
+    // 2. **Rationed to a small share of the run's collections.** The door exists for the shape
+    //    that reaches no heap-admission door at all; this workload takes a `test_heap` admission on
+    //    nearly every round, so the cadence collects about once per five rounds and the occupancy a
+    //    slice ends on is usually the low figure an admission collection just left — below the
+    //    seven-eighths watermark that is the door's occupancy trigger, and with no growth debt to
+    //    take the other arm. A boundary minor does its part too: it collapses the nursery onto
+    //    `young_minor_target_words` of the words the round itself promoted
+    //    (`HeapPolicy::young_after_collection`), so the checks after it start from a live-set-sized
+    //    space that has to fill to seven eighths before the door may fire again. That is the
+    //    rationing its own module docs measure as one firing in 8.50–8.61 boundary checks and
+    //    2.221–2.239 % of the run's collections, and [`BOUNDARY_MINOR_SHARE_DEN`] is a 4.5×
+    //    allowance over that measured share: it still fails by ~10× if the door starts collecting
+    //    on every pre-emption.
+    //
+    // What the surplus does **not** obey is a constant of one per mature region, and this fixture
+    // measures why: a successful minor's promotion does need mature room that only a fullsweep
+    // installs (`HeapPolicy::mature_after_fullsweep` → `mature_target_words` =
+    // `MATURE_TARGET_LIVE_MULTIPLE` × `need_after_fullsweep`, the multiple being the number of
+    // nursery-sized promotions one region is sized for), and a minor that does not fit refuses into
+    // that same call's fullsweep, which then re-installs the room — so the multiple bounds the
+    // promotions one *installed region* absorbs, not a whole run's total. It is why a boundary
+    // minor succeeds here instead of escalating, not a ceiling on how many a long run may make.
+    // Measured: 2 of 42 collections over 7 pre-emptions at N = 200, 17 of 580 over 105 at
+    // N = 3 200, 65 of 2 308 over 417 at N = 12 800 — one boundary minor per 6 to 7 pre-emptions in
+    // the steady state, and never more than one in a single slice.
     assert!(
-        collections - fullsweeps <= BOUNDARY_MINOR_COLLECTIONS,
+        surplus <= slices,
         "every cadence collection under fullsweep_after 0 is a fullsweep, and the only other \
-         collection site is the yield-boundary door's kind-pinned young-only minor (at most \
-         {BOUNDARY_MINOR_COLLECTIONS} of them); {after:?}"
+         collection site is the yield-boundary door's kind-pinned young-only minor, which collects \
+         at most once per pre-emption ({slices} slices here); {after:?}"
+    );
+    assert!(
+        surplus * BOUNDARY_MINOR_SHARE_DEN <= collections,
+        "the yield-boundary door's minors are a rationed share of the run's collections — its \
+         premise (no heap-admission door on the process's path) is absent here, so it may serve at \
+         most one collection in {BOUNDARY_MINOR_SHARE_DEN}; {after:?}"
     );
     assert_eq!(after.errors, 0, "no collection failed; {after:?}");
     assert_eq!(after.halted, 0, "no process halted its collection; {after:?}");
