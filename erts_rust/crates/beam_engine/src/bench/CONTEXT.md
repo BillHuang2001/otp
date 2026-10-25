@@ -85,12 +85,14 @@ Every shape is a real `erlc`-compiled fixture staged at test time; all are BIF-f
 ## Measurement method
 This node owns the discipline; every figure lives in `../../MEASURED.md`, `../../PERF.md` and `../../../../tools/bench/RESULTS.md`.
 - **Paired, interleaved marginal.** Each round samples the N-op pass and the 0-op pass back to back and takes the median paired difference `(c[N] − c[0]) / N`. A non-interleaved schedule is the WRONG estimator: it attributes host drift and load to the workload and can overstate a gap by up to ~56×.
+- **The deterministic slope is measured on hardware counters, not a wall clock**: `perf stat -e cpu_core/cycles/u,cpu_core/instructions/u` under `taskset -c 3`, using the SAME paired interleaved schedule (each round samples the N-op pass and the 0-op pass back to back and takes the median paired difference `(c[N] − c[0]) / N`), so absolute wall time never enters a cycles-per-element or instructions-per-element figure.
 - **A per-element figure is a marginal** `walk(K) − walk(0)`: one `build/2` in both phases, so the shared build cancels; it inherits both phases' noise, so always quote it with the round it came from, never as an absolute per-element time.
 - **A phase is `SUB_RUNS = 5` timed sub-runs** of `ceil(iters / SUB_RUNS)` calls each; `Measurement` keeps one ns sample per sub-run and reports their `min`/`median`, and the counters are tallied once over the whole phase, so a counter is exact while a nanosecond is a sample.
 - **`instr_per_call` is the INTERPRETER's `reduce`-hook count** (one charge per interpreted instruction) and is reported for **both** tiers, because the instruction count is a property of the code, not of the tier; the native tier offers the same hook once per driver-loop iteration (a block entry), which is why its own counter is driver iterations, not instructions.
   A `BENCH_TIER=baseline` run therefore performs one extra interpreter pass purely to derive the instruction figure.
 - **Price the default tier** (native baseline JIT) on `list_walk`: BIF-free there (the small-int `+` is inlined), `call_only` linked in-block, no heap-admission point ⇒ the pure dispatch floor. The interpreter tier's per-element cost is BIF-dominated (~42 % of its cycles are `call_bif`), so it is not part of that record.
 - The default tier's **A/A noise floor is ±1.3 %** on cycles.
+- The slope is reported for the **default tier only** (the interpreter's per-element cost is BIF-dominated, so it is not part of that record), and the default tier's A/A noise floor of ±1.3 % on cycles is what makes a small slope difference quotable.
 - **The host is SHARED.** Quote ratios plus the deterministic counters, never an absolute wall time; record `/proc/loadavg` 1-min before and after every run and state it.
   `ns per instruction` is the discriminating column across a loaded host — the bitstring-heavy foreign cases sit an order above `list_walk` — so a per-call wall time alone misattributes the difference to dispatch.
 - **Deterministic counters are the primary evidence** (identical round to round; only nanoseconds move): instructions/call, driver round-trips, in-block calls/declines, block-entry lookups/misses, rooted calls/words, heap-door calls, BIF calls + histogram, local-call requests, refc payloads.
@@ -168,8 +170,17 @@ Additionally provable per-call redundancy, worth naming but not worth a lever: `
 - **Batch lifecycle is load-bearing.** `Machine::refc_binaries` and the `MinimalContext` region heap grow monotonically within a batch and are never pruned here (only a host reachability sweep, `Machine::retain_refc_binaries`, or dropping the machine releases them), so every batch builds a fresh `Machine` + context (500 calls by default for the foreign cases, 5 for `long_append`, 10 for `list_walk`) and drops both at batch end.
 - **The census pass reloads the module** (a second `load_file`): the per-thread compiled-block cache would otherwise answer the pass from an artifact compiled while recording was off, leaving `instr_instances` empty.
 - **Never edit the foreign sources or copy them in.** Both are staged read-only from their checkouts at test time (`cowboy_bstr.erl` is ISC © Loïc Hoguin; `emqx_base62.erl` is EMQ copyright).
-- **Do not re-investigate the `foreign` regression.** The Θ(N³) reservoir re-registration is gone, and `../../../../tools/bench/RESULTS.md` §8 withdraws the pre-m15 `foreign` figures (different `N`, estimator fix).
+- **Do not re-investigate the `foreign` regression.** `../../../../tools/bench/RESULTS.md` §8 withdraws the pre-m15 `foreign` figures (different `N`, estimator fix); do not reintroduce them.
 - Run everything through `erts_rust/scripts/cargo.sh` (`$HOME` is read-only); never `cd`, and never touch the read-only siblings (`../../../../tools/**`, the foreign checkouts).
+
+## Test Strategy
+This node's suites are **measurements, not gates**: the six `#[ignore]`d entry points (`foreign_bstr_to_lower_decomposition`, `foreign_long_append_decomposition`, `list_walk_decomposition`, `foreign_cowboy_bstr_decomposition`, `foreign_emqx_base62_decomposition`, `send_recv_split_decomposition`) run only on request and assert no timing.
+Two NON-`#[ignore]`d structural gates run in the normal `cargo test` run: `the_two_legs_of_the_copy_bound_split_agree` (in `send_split.rs`) and `every_bstr_select_val_pair_is_decided_without_a_general_compare` (in `mod.rs`).
+Both assert only cheap invariants — correct bytes on both tiers, the tiers agreeing, `floor_declines == 0`, the expected BIF-call count, `cmp_pairs == 0`, and `bytes_copied < 8 × n` — never a speed claim.
+Both gates and every measurement **skip loudly** when `erlc` (or, for the foreign cases, the checkout) is absent, so a green run without `erlc` proves nothing about any figure here.
+The per-crate gate command remains `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --no-fail-fast`; this node adds nothing blocking to it.
+**Compatibility/behaviour parity is NOT this node's job**: the oracle comparison belongs to the sibling differential gate (`../../../../tools/differential/`), which is read-only here.
+Never claim a parity result from a bench run, and never write into that directory.
 
 ## Routing Table
 - `mod.rs` → the shared harness (`compile_fixture`/`compile_staged`, `Prepare`, `run_calls`, `measure`/`measure_result`, `Measurement` + `ResultSnapshot`, `instr_per_call`, `ns_per_call`, `env_usize`, `selected_tiers`, `ReportSpec`/`report_generic`), the `cowboy_bstr` fixture, its `#[ignore]`d entry point `foreign_bstr_to_lower_decomposition`, and `baseline_census`/`print_census` (the per-thread `../jit/baseline/counters.rs` snapshot pass, with an optional `&Unit` for per-unit rows).
@@ -181,7 +192,7 @@ Additionally provable per-call redundancy, worth naming but not worth a lever: `
 
 ## See Also
 - `../../MEASURED.md` (static/dynamic census, `engine_bench`, `bif_cost`, `jit_bench`, the lever figures) and `../../PERF.md` (tier snapshots) → every measured figure this harness produces.
-- `../../../../tools/bench/RESULTS.md` → the project-level record whose per-case ratios these in-crate figures decompose; the harness' runtime-route cross-checks were a decomposition at a different N/session, never a replacement for that record.
+- `../../../../tools/bench/RESULTS.md` → the project-level record whose per-case ratios these in-crate figures decompose; never substitute an in-crate figure for its per-case ratio, because the two are measured at a different N and in a different session.
 - `../../INSTRUCTION_SURFACE.md` → the per-opcode/per-family semantics these figures price.
 - `../CONTEXT.md` → the crate's frozen seams (`ExecutionContext`, `Mailbox`, the JIT tier seam) — the harness drives exactly those doors and counts nothing else.
 - `../../../../crates/beam_rt/src/context/gc_walk.rs` + `src/context/gc/reds_door.rs` → the one place `gc_walk` is driven from.
