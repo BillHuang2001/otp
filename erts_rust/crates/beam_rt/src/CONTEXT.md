@@ -203,7 +203,11 @@ Binding for anyone reading a `erlang:memory(binary)` figure or touching `context
   nothing consults it to *ask* for a reclaim. One slice's worth of dead off-heap garbage is therefore
   bounded by the **slice length**, never by the configured budget, and a process whose own reservoir
   stays under the trigger releases nothing between its parks (a bounded per-process residue, freed at
-  process death).
+  process death). Because the bound is a slice, it is a count of iterations and its **bytes are
+  payload-size proportional**: the dense fixture peaks at 475 968 / 930 624 / 1 839 936 / 29 119 296
+  bytes for 1 024/2 048/4 096/65 536-byte payloads (≈444 payloads each, N = 20 000) where the oracle
+  on the identical source stays at 20 176 / 23 176 / 33 504 / 213 776 — flat in N at every size, so a
+  capacity residual, not a leak.
 - **A dead parked process keeps its reservoir: a death-drain gap, not a prune gap.** A receive/BIF
   park puts the engine back into `RunnerState::engines` (`runner/run.rs`'s `Wait`/`Yield` arms), and
   the only removal in the workspace is that slice's take-out, so a process killed while parked never
