@@ -58,7 +58,8 @@
 //! +deterministic`, so what runs is exactly the upstream code and no copy of it is stored here
 //! (which would silently drift). The checkouts are located through an env override first, then
 //! the documented default root (`BENCH_COWBOY_REPO` / `BENCH_EMQX_REPO`, the same two the bench
-//! harness honours).
+//! harness honours). Every staging call gets a directory of its own (the [`STAGE_SEQ`] tag), so
+//! the rows can run in parallel without overwriting each other's artifact.
 //!
 //! A missing checkout, a missing source and an unusable `erlc`/`erl` are all **loud skips**: the
 //! row prints `SKIP <name>: <reason>` and returns — it never fails, and it never silently passes
@@ -75,14 +76,26 @@
 //! modelled exactly and every other dispatch keeps the inner context's typed refusal, so a
 //! kernel that needed an unmodelled BIF reports a loud skip instead of a figure (or a value).
 //!
-//! # The inline arm is proved to be exercised
+//! # The inline arms are proved to be exercised
 //!
 //! Tier agreement alone would also hold for an "implementation" that deopted the whole bitstring
-//! family to the interpreter. [`the_base62_decode_match_arm_is_emitted_and_not_deopted`] closes
-//! that hole with the sibling harness' **compile-time** instrument
-//! (`super::bitstr_inline_tests::emitted_shapes_for`): a cache-free compile of the decode
-//! function must emit the `bs_match` / `bs_start_match4` arms and record **zero** static deopts
-//! for them, so the divergence the output rows now catch cannot be deopted away again.
+//! family to the interpreter. Three rows close that hole with the sibling harness' **compile-time**
+//! instrument (`super::bitstr_inline_tests::emitted_shapes_for`), which is a cache-free compile:
+//!
+//! * [`the_base62_decode_match_arm_is_emitted_and_not_deopted`] — a cache-free compile of
+//!   `decode/2` and `encode/2` must emit the `bs_match` / `bs_start_match4` **matching** arms and
+//!   record **zero** static deopts for them, so the divergence the output rows now catch cannot be
+//!   deopted away again.
+//! * [`the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted`] — the bitstring
+//!   family's ninth inline shape is the **constructing** one, `bs_create_bin` over the compiler's
+//!   `bs_init_writable` private-append accumulator. `capitalize_token/3`'s `<< Acc/binary, $- >>`
+//!   clause must emit it with zero deopts, and the row additionally pins **how many** of the
+//!   clause's builds lower and that the lowered one carries the `string "-"`
+//!   (`Field::ConstBytes`) segment.
+//! * [`the_to_lower_append_construction_stays_on_the_family`] — the honest negative twin:
+//!   `to_lower/1`'s comprehension build keeps its accumulator in a **`Y` slot**, which
+//!   `CreateBinShape::of` refuses by design, so that kernel's construction stays on the family.
+//!   The row pins the refusal *and its reason*, and the output rows above pin the value.
 //!
 //! # Where this module sits in the node's harness
 //!
@@ -98,17 +111,21 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
+use std::sync::atomic::{AtomicU64, Ordering};
 use beam_common::{BeamError, Result};
-use beam_loader::{load_file, Module};
+use beam_loader::{load_file, Instr, Module, Operand, Reg};
 use beam_term::{is_small, make_small, signed_value, Atom, AtomTable, Eterm, MAX_SMALL, MIN_SMALL};
 
 use super::bitstr_inline_tests::{emitted_shapes_for, static_deopts, visited_instances};
 use super::bitstr_tests::export;
-use super::emit::bitstr_inline::{SHAPE_BS_MATCH, SHAPE_START_MATCH3, SHAPE_START_MATCH4};
+use super::emit::bitstr_inline::{
+    inlined, CreateBinShape, SHAPE_BS_MATCH, SHAPE_CREATE_BIN, SHAPE_START_MATCH3,
+    SHAPE_START_MATCH4,
+};
 use super::tests::{assert_same_outcome, error_reason};
 use crate::context::{ExecutionContext, MinimalContext};
 use crate::families::bitstrings::bit_size;
+use crate::families::bitstrings::create::seam::{self, Field};
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
 use crate::terms::{binary_bytes, list_elements, make_heap_binary};
@@ -543,6 +560,16 @@ struct Staged {
     dir: PathBuf,
 }
 
+/// A per-call sequence number, so two rows staging the **same** program concurrently each get
+/// their own directory.
+///
+/// The rows run in parallel and several of them stage the same checkout, so a directory keyed
+/// only by `(tag, pid)` would have one row's `erlc` overwrite another's `.beam` mid-run — which
+/// showed up as a *loud but spurious* `SKIP` (a rename failing, or a `.beam` vanishing between
+/// the compile and the load) rather than a failure. Isolating every staging call makes the
+/// oracle legs deterministic.
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Stage `program`'s source into a temp directory, compile it with the system `erlc
 /// +deterministic` and load the artifact.
 ///
@@ -563,9 +590,10 @@ fn stage(program: &Program) -> std::result::Result<Staged, String> {
         ));
     }
     let dir = std::env::temp_dir().join(format!(
-        "beam_engine_{}_{}",
+        "beam_engine_{}_{}_{}",
         program.tag,
-        std::process::id()
+        std::process::id(),
+        STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("create {}: {error}", dir.display()))?;
@@ -965,8 +993,44 @@ fn the_whole_bench_input_vector_set_agrees_on_both_tiers_and_with_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------
-// The instrument: the inline arms the decode body needs really are emitted
+// The instrument: the inline arms the kernels need really are emitted
 // ---------------------------------------------------------------------------
+
+/// The number of operands one `bs_create_bin` segment occupies — `[Type, Index, Unit, Flags,
+/// Value, Size]`, the group order `families::bitstrings::create::prepared` decodes.
+///
+/// Mirrored here (rather than shared) because the tests below read the accumulator operand out
+/// of a staged artifact's own instruction, and the family's constant is private to it.
+const SEGMENT_OPERANDS: usize = 6;
+
+/// The accumulator operand of a `bs_create_bin` whose **first** segment is the compiler's
+/// `private_append`, or `None` when the instruction is not that form at all.
+///
+/// The rows need this to tell the two refusals apart: "not a private-append accumulator build"
+/// (nothing for the arm to lower) versus "an accumulator the arm cannot address" (the documented
+/// non-x-register refusal). Without it a declined row would pass just as well for an instruction
+/// the shape never even considered.
+fn accumulator_operand<'a>(module: &Module, segments: &'a [Operand]) -> Option<&'a Operand> {
+    let group = segments.get(..SEGMENT_OPERANDS)?;
+    let Operand::Atom(kind) = &group[0] else {
+        return None;
+    };
+    if module.atom_name(*kind)? != "private_append" {
+        return None;
+    }
+    // `[Type, Index, Unit, Flags, Value, Size]` — the value is the accumulator operand.
+    Some(&group[4])
+}
+
+/// The register `operand` names, with the compiler's `Typed` (`z,5` `tr`) wrapper peeled off.
+fn named_register(operand: Option<&Operand>) -> Option<Reg> {
+    match operand? {
+        Operand::X(slot) => Some(Reg::X(*slot)),
+        Operand::Y(slot) => Some(Reg::Y(*slot)),
+        Operand::Typed { reg, .. } => Some(*reg),
+        _ => None,
+    }
+}
 
 /// **The `bs_match` arm the base62 decode body runs is emitted, not deopted** — taken through a
 /// cache-free compile (`super::bitstr_inline_tests::emitted_shapes_for`) so the process-wide
@@ -1037,4 +1101,290 @@ fn the_base62_decode_match_arm_is_emitted_and_not_deopted() {
             );
         }
     }
+}
+
+/// A `bs_create_bin` of a staged function, as the construction arm sees it.
+struct AppendBuild {
+    /// The accumulator register the first (`private_append`) segment names, with the
+    /// compiler's `Typed` wrapper peeled off — `None` for an instruction that is not a
+    /// private-append accumulator build at all.
+    accumulator: Option<Reg>,
+    /// Whether `seam::append_plan` (the family side's compile-time half) accepts it.
+    planned: bool,
+    /// Whether [`CreateBinShape::of`] (the inline arm's own predicate) accepts it.
+    lowered: bool,
+    /// The constant-bytes (`string` segment) field count of an accepted field list, `0` when
+    /// the plan was refused.
+    const_bytes: usize,
+}
+
+/// Every `bs_create_bin` in `code`, in instruction order, with both gates' verdicts.
+///
+/// The rows below read a staged artifact's own operands so they can tell the two refusals
+/// apart: "not a private-append accumulator build" (nothing for the arm to lower) versus "an
+/// accumulator the arm cannot address" (the documented non-x-register refusal). Without that a
+/// declined row would pass just as well for an instruction the shape never even considered.
+fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild> {
+    code.iter()
+        .filter_map(|instr| {
+            let Instr::BsCreateBin { dst, segments, .. } = instr else {
+                return None;
+            };
+            let accumulator = named_register(accumulator_operand(module, segments));
+            let plan = seam::append_plan(module, segments);
+            let const_bytes = plan
+                .as_ref()
+                .map(|plan| {
+                    plan.fields
+                        .iter()
+                        .filter(|field| matches!(field, Field::ConstBytes { .. }))
+                        .count()
+                })
+                .unwrap_or(0);
+            Some(AppendBuild {
+                accumulator,
+                planned: plan.is_some(),
+                lowered: CreateBinShape::of(module, dst, segments).is_some(),
+                const_bytes,
+            })
+        })
+        .collect()
+}
+
+/// The index of exported `function/arity` in `program`'s staged artifact.
+///
+/// Panics — naming the upstream project — when the staged source no longer defines it, so a
+/// shape change upstream fails the row loudly instead of silently pinning another function.
+fn function_index(staged: &Staged, program: &Program, function: &str, arity: u32) -> usize {
+    let name = export_atom(&staged.module, function);
+    let Some(index) = staged
+        .module
+        .functions
+        .iter()
+        .position(|candidate| candidate.arity == arity && candidate.name == name)
+    else {
+        panic!(
+            "{} must define {function}/{arity}: the staged upstream source changed shape",
+            program.module
+        );
+    };
+    index
+}
+
+/// **The `bs_create_bin` private-append construction arm `cowboy_bstr:capitalize_token/1` runs
+/// is emitted, not deopted** — the construction-side twin of
+/// [`the_base62_decode_match_arm_is_emitted_and_not_deopted`], taken through the same
+/// **cache-free** compile (`super::bitstr_inline_tests::emitted_shapes_for`) so the
+/// process-wide content-keyed [`crate::jit::cache::CodeCache`] cannot answer from a warmed
+/// artifact that re-emits nothing.
+///
+/// Without this row the four output rows above would also pass for an "implementation" that
+/// left the whole construction family on the helper path: an accumulator build that deopted
+/// per field still returns the right bytes, so tier agreement is *vacuously* satisfied. The
+/// row is what makes the native lowering load-bearing.
+///
+/// The function is `capitalize_token/`**`3`**, not the exported `capitalize_token/1`: the
+/// export is a one-line wrapper and the recursion that rebuilds the accumulator lives in the
+/// `/3` clauses. That recursion carries **three** `bs_create_bin` builds, and the row pins all
+/// three rather than only the emitted shape:
+///
+/// * exactly **one** lowers — the `<< Acc/binary, $- >>` clause, the one that *additionally*
+///   carries the **`string "-"`** segment. The seam models that as
+///   `seam::Field::ConstBytes`, a **different** field variant from every `Field::Bits` the
+///   other clauses use, so a row that only ever saw integer fields would not cover the
+///   constant-bytes store path at all;
+/// * the other **two** are the documented non-x-register refusal: their accumulator operand is
+///   a **`Y` slot** (`Typed { reg: Y(1), .. }`), which `seam::append_plan`'s first post-unit
+///   check (`x_register`) refuses, and which [`CreateBinShape::of`] would refuse anyway (the
+///   emitted store sequence re-reads the accumulator from `machine.x` after the
+///   `jit_open_append_bin` helper call, so a `Y` accumulator would need its frame-window guard
+///   repeated there). Asserting *that* is what stops the row from passing on an unrelated
+///   decline.
+///
+/// The negative twin for the other `cowboy_bstr` builder is
+/// [`the_to_lower_append_construction_stays_on_the_family`].
+#[test]
+fn the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted() {
+    let Some(staged) = stage_or_skip("cowboy_create_bin_arm", &COWBOY) else {
+        return;
+    };
+    let index = function_index(&staged, &COWBOY, "capitalize_token", 3);
+    let index32 = u32::try_from(index)
+        .unwrap_or_else(|_| panic!("capitalize_token/3's function index must fit a u32"));
+    let before = inlined(SHAPE_CREATE_BIN);
+    let (emitted, snapshot) = emitted_shapes_for(&staged.module, index32);
+    let lowered_instances = usize::try_from(inlined(SHAPE_CREATE_BIN) - before)
+        .unwrap_or_else(|_| panic!("the lowered-instance count must fit a usize"));
+    let visited = visited_instances(&snapshot, "BsCreateBin");
+    let deopts = static_deopts(&snapshot, "BsCreateBin");
+    let builds = append_builds(&staged.module, &staged.module.functions[index].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    let const_bytes: usize = builds.iter().map(|build| build.const_bytes).sum();
+    println!(
+        "create_bin_arm[capitalize_token/3] = {emitted:?}, BsCreateBin visited = {visited}, \
+         lowered instances = {lowered_instances}, lowered builds = {lowered}, declined = \
+         {declined}, const-bytes fields = {const_bytes}, deopts = {deopts}"
+    );
+    // The census name first: a `static_deopts == 0` assertion against a variant name the
+    // emitter never visits would hold trivially.
+    assert_eq!(
+        visited, 3,
+        "capitalize_token/3 carries three `bs_create_bin` builds (the `<< Acc/binary, $- >>` \
+         clause and the two `<< Acc/binary, C >>` clauses) and the emitter must visit all \
+         three; a different count means the staged upstream source changed shape"
+    );
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "capitalize_token/3: the `bs_create_bin` private-append arm must emit \
+         (emitted: {emitted:?})"
+    );
+    assert_eq!(
+        deopts, 0,
+        "capitalize_token/3: `BsCreateBin` must be lowered, not statically deopted \
+         (deopts: {:?})",
+        snapshot.instr_deopts,
+    );
+    assert_eq!(
+        (lowered, declined),
+        (1, 2),
+        "capitalize_token/3: exactly one build is the arm's shape and two stay on the family"
+    );
+    assert_eq!(
+        lowered, lowered_instances,
+        "the builds `CreateBinShape::of` accepts and the instances the emitter actually lowered \
+         must be the same set (accepted {lowered}, lowered {lowered_instances})"
+    );
+    for build in &builds {
+        if build.lowered {
+            assert!(
+                matches!(build.accumulator, Some(Reg::X(_))),
+                "a lowered build's accumulator must be an x-register (accumulator: {:?})",
+                build.accumulator
+            );
+            assert!(
+                build.planned,
+                "a lowered build must have an append plan: `CreateBinShape::of` starts from it"
+            );
+        } else {
+            assert!(
+                matches!(build.accumulator, Some(Reg::Y(_))),
+                "a declined build must be declined because its accumulator is a `Y` slot, not \
+                 for an unrelated reason (accumulator: {:?})",
+                build.accumulator
+            );
+            assert!(
+                !build.planned,
+                "a `Y`-slot accumulator already fails `append_plan`'s first post-unit check \
+                 (`x_register`), so no plan may exist"
+            );
+        }
+    }
+    // The `string "-"` segment: exactly one `Field::ConstBytes`, i.e. the store path an
+    // all-integer build list never reaches.
+    assert_eq!(
+        const_bytes, 1,
+        "capitalize_token/3's lowered clause carries `<< Acc/binary, $- >>`, whose `string` \
+         segment is exactly one `Field::ConstBytes`"
+    );
+}
+
+/// **`cowboy_bstr:to_lower/1`'s construction stays on the family — and the row pins why.** The
+/// honest negative twin of
+/// [`the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted`].
+///
+/// The exported `to_lower/1` holds no `bs_create_bin` at all: the binary comprehension
+/// `<< <<(char_to_lower(C))>> || <<C>> <= B >>` is `bs_init_writable` plus a `CallLast` into the
+/// generated loop `-to_lower/1-lbc$^0/2-0-/2`, and *that* is where the one accumulator build
+/// lives. Its accumulator is a **`Y` slot**, which [`CreateBinShape::of`] refuses by design (the
+/// emitted store sequence re-reads the accumulator from `machine.x` after the
+/// `jit_open_append_bin` helper call, so a `Y` accumulator would need its frame-window guard
+/// repeated there) — so this kernel's construction runs on the family helper, exactly as it did
+/// before the arm landed.
+///
+/// That is not a licence to assert nothing. The row pins the loop's build count, its zero
+/// static deopts, the **absent** shape, the zero emission count and the refusal *reason*, so it
+/// fails loudly in either direction: if an arm that does accept this shape silently stopped
+/// being emitted, or if a `Y`-capable lowering landed without this row's counters being updated
+/// to its new (positive) expectation.
+#[test]
+fn the_to_lower_append_construction_stays_on_the_family() {
+    let Some(staged) = stage_or_skip("cowboy_to_lower_create_bin", &COWBOY) else {
+        return;
+    };
+    // The build lives in the comprehension's generated loop, not in the export, so locating it
+    // by its compiler-generated prefix is what makes "one `bs_create_bin` in the loop" a
+    // statement about the loop rather than about the `bs_init_writable` wrapper.
+    let prefix = "-to_lower/1-";
+    let loops: Vec<usize> = staged
+        .module
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            staged
+                .module
+                .atom_name(candidate.name)
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        loops.len(),
+        1,
+        "cowboy_bstr must hold exactly one `{prefix}…` comprehension loop (found {}); a \
+         different count means the staged upstream source changed shape",
+        loops.len()
+    );
+    let index = loops[0];
+    let index32 = u32::try_from(index)
+        .unwrap_or_else(|_| panic!("the `{prefix}…` loop's function index must fit a u32"));
+    let before = inlined(SHAPE_CREATE_BIN);
+    let (emitted, snapshot) = emitted_shapes_for(&staged.module, index32);
+    let lowered_instances = usize::try_from(inlined(SHAPE_CREATE_BIN) - before)
+        .unwrap_or_else(|_| panic!("the lowered-instance count must fit a usize"));
+    let visited = visited_instances(&snapshot, "BsCreateBin");
+    let deopts = static_deopts(&snapshot, "BsCreateBin");
+    let builds = append_builds(&staged.module, &staged.module.functions[index].code);
+    println!(
+        "create_bin_arm[to_lower loop] = {emitted:?}, BsCreateBin visited = {visited}, lowered \
+         instances = {lowered_instances}, builds = {}, deopts = {deopts}",
+        builds.len()
+    );
+    assert_eq!(
+        (visited, builds.len()),
+        (1, 1),
+        "the `{prefix}…` loop carries exactly one `bs_create_bin` (idle: visited {visited}, \
+         found {}); a different count means the staged upstream source changed shape",
+        builds.len()
+    );
+    assert_eq!(
+        deopts, 0,
+        "the loop's `BsCreateBin` must not be statically deopted (deopts: {:?})",
+        snapshot.instr_deopts,
+    );
+    assert!(
+        !emitted.contains(&SHAPE_CREATE_BIN),
+        "to_lower's build has a `Y`-slot accumulator, which the arm refuses, so the shape must \
+         not be emitted (emitted: {emitted:?})"
+    );
+    assert_eq!(
+        lowered_instances, 0,
+        "no `bs_create_bin` in the `{prefix}…` loop may lower"
+    );
+    let build = &builds[0];
+    assert!(
+        matches!(build.accumulator, Some(Reg::Y(_))),
+        "to_lower's accumulator must be the documented `Y`-slot refusal (accumulator: {:?})",
+        build.accumulator
+    );
+    assert!(
+        !build.planned,
+        "a `Y`-slot accumulator already fails `append_plan`'s first post-unit check \
+         (`x_register`), so no plan may exist"
+    );
+    assert!(
+        !build.lowered,
+        "`CreateBinShape::of` must refuse a `Y`-slot accumulator"
+    );
 }
