@@ -3,106 +3,94 @@
 ## Intent
 The **implementation** node of the ETF codec. Owns the wire bytes, the tag set, the
 `Encoder`/`Decoder` state machines and the term-materialization layer that forwards to
-`beam_term`. The crate-level intent, the frozen wire rules, the tag coverage, the
-decode/encode contracts and the C ground-truth citations live in the parent
-[`../CONTEXT.md`](../CONTEXT.md) — **do not restate, obey**. This file is the routing
-map for the source subtree and the notes the child nodes inherit.
+`beam_term`. The crate-level intent, the frozen API surface, the tag inventory and the residual
+gaps live in the parent [`../CONTEXT.md`](../CONTEXT.md) — **do not restate, obey**.
+This file is the routing map for the source subtree plus the notes its children inherit; the
+per-rule wire detail lives one level down in
+[`decode/CONTEXT.md`](./decode/CONTEXT.md) / [`encode/CONTEXT.md`](./encode/CONTEXT.md) /
+[`term/CONTEXT.md`](./term/CONTEXT.md).
 
 ## API Surface (routes — see `../CONTEXT.md` for the full frozen surface)
-- Root re-exports (`lib.rs`): the `Encoder`/`Decoder` entry points, `decode_term`,
-  `Tag` constants, `VERSION_MAGIC`, the `error` surface, the `term` fun accessors, and
-  the reference wire mapping. `prelude.rs` mirrors them for `use beam_codec::prelude::*;`.
-- **Reference wire mapping (this node, public API).** `ref_wire.rs` maps a 60-bit
-  internal-reference `id` ↔ the 3 wire numbers of a `REFERENCE_EXT` /
-  `NEW_REFERENCE_EXT` / `NEWER_REFERENCE_EXT` image (`ref_id_to_numbers` /
-  `ref_numbers_to_id` — the C's `erts_set_ref_numbers` pack, `num[0]` = bits 0..17,
-  `num[1]` = bits 18..31, `num[2]` = bits 32..63, emitted in that wire order),
-  `representable_ref_id` (the "fits the internal id slot" decode gate the local-node
-  demotion consults), the checked packer `representable_ref_numbers` (the same id-slot
-  bound as a typed `BeamError::SystemLimit` refusal) and `REF_MASK`/`REF1_NUM_MASK`/
-  `REF_NUMBERS`. All of it is re-exported at the crate root and in `prelude`; a
-  dependent crate writing or reading a wire reference uses it rather than mirroring the
-  bit layout (a different pack makes the same reference come back as a different id).
-  `term::ref` (`internal_ref_id`/`make_internal_ref`) is the safe wrapper over
-  `beam_term::boxed`'s frozen M1 block. The single place either mapping is written —
-  both children and every dependant crate must route through it, never re-derive it.
+- Root re-exports (`lib.rs`): the `Encoder`/`Decoder` entry points, `decode_term*`/`encode_term*`,
+  the `Tag` constants + `VERSION_MAGIC`, the `error` surface, the `term` fun accessors, the
+  reference wire mapping. `prelude.rs` mirrors them for `use beam_codec::prelude::*;`.
+- **Reference wire mapping (public API).** `ref_wire.rs` maps a 60-bit internal-reference `id` ↔
+  the 3 wire numbers of a `REFERENCE_EXT` / `NEW_REFERENCE_EXT` / `NEWER_REFERENCE_EXT` image
+  (`ref_id_to_numbers` / `ref_numbers_to_id`), `representable_ref_id` (the "fits the internal id
+  slot" decode gate the local-node demotion consults), the checked packer
+  `representable_ref_numbers` (the same bound as a typed `BeamError::SystemLimit` refusal) and
+  `REF_MASK`/`REF1_NUM_MASK`/`REF_NUMBERS`. All of it is re-exported at the crate root and in
+  `prelude`; a dependent crate writing or reading a wire reference uses it rather than mirroring
+  the bit layout (a different pack makes the same reference come back as a different id).
+  `term/ref.rs` (`internal_ref_id`/`make_internal_ref`) is the safe wrapper over
+  `beam_term::boxed`'s frozen M1 block. The single place either mapping is written — both children
+  and every dependent crate must route through it, never re-derive it.
 
 ## Constraints
 - Inherited from [`../CONTEXT.md`](../CONTEXT.md) §Constraints (errors only through
-  `beam_common::{Result, BeamError}`; additive + inert seams; `.rs` files carry the
-  OTP `// %CopyrightBegin% … // %CopyrightEnd%` Apache-2.0 header; ~1000 lines/file).
-- `#![deny(unsafe_code)]` crate-wide, with exactly **one** exception: `#[allow(unsafe_code)] mod term;`
-  in `lib.rs`. `decode/` and `encode/` are safe Rust and must reach raw heap words only
-  through the `term/` safe wrappers (each with a `// SAFETY:` rationale).
-- The boxed interior layout of every term kind (`term/`, `ref_wire`'s identity) is
-  `beam_term`'s — never redefine a layout here.
-- Every identity-gated change must stay **additive and inert** with no local node
-  installed (the distribution path is untouched).
-- Same rule for the **active-export gate**: it is consulted only under the `[safe]`
-  flag and only by `decode_export`, and with no `ExportGate` installed the check is
-  skipped — so every pre-existing entry point is byte-for-byte unchanged. The
-  registry (loaded modules + their exports) is the host's (`beam_rt`), never this
-  crate's.
+  `beam_common::{Result, BeamError}`; additive + inert seams; `.rs` files carry the OTP
+  `// %CopyrightBegin% … // %CopyrightEnd%` Apache-2.0 header; ~1000 lines/file).
+- `#![deny(unsafe_code)]` crate-wide, with exactly **one** exception:
+  `#[allow(unsafe_code)] pub mod term;` in `lib.rs`. `decode/` and `encode/` are safe Rust and must
+  reach raw heap words only through the `term/` safe wrappers (each with a `// SAFETY:` rationale).
+- The boxed interior layout of every term kind (`term/`, `ref_wire`'s identity) is `beam_term`'s —
+  never redefine a layout here.
+- Every identity-gated or gate-gated change must stay **additive and inert** with nothing installed
+  (no local node, no `ExportGate`, no `OffHeapBinaries`) — the distribution path (`flags = 0`) and
+  every pre-existing entry point stay byte-for-byte unchanged.
 
 ## Notes for Agents
 - Oracle: the system `erl`/`erlc` on `$PATH` (skip loudly if absent).
-- Build/test with the wrapper: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast` (`$HOME` is read-only). Never `cd`.
-- Sibling `../tests/` (integration binaries) is **read-only** for this node — escalate
-  test changes to `..`.
-- Local-node identifier round-trip: a local-node pid/port/ref demotes to this
-  runtime's internal form on decode (when an identity is installed) and an internal
-  ref encodes as a 3-number `NEWER_REFERENCE_EXT` (when an identity is installed);
-  both are inert with no identity (the distribution path is untouched). A **reference**
-  demotes only when its packed id fits the internal id slot, else it stays the faithful
-  external reference. `decode_term` stays identity-free — use
-  `decode_term_with_local_node` for `binary_to_term`.
-- The runtime seam is wired for the identity: `beam_bifs::binconv::decode_term_bif`
-  installs `Decoder::with_local_node` (via `BifContext::local_node`) and the
-  identity-aware entry point for the compressed path, so `binary_to_term` demotes a
-  local identifier end-to-end. The `LOCAL_EXT` node hash is still not installed by any
-  host (consumed unchecked) — a `beam_rt`/`beam_bifs` call. Likewise the `[safe]`
-  active-export check: the codec's half (the seam + the `safe`-gated call site in
-  `decode_export`) is complete and the gate-aware entry points exist, but no host
-  installs an `ExportGate` yet — `beam_bifs::binconv::decode_term_bif` /
-  `beam_rt`'s loaded-module registry still owe that wiring.
+- Build/test with the wrapper: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
+  -p beam_codec --no-fail-fast` (`$HOME` is read-only). Never `cd`.
+- Sibling `../tests/` (integration binaries) is **read-only** for this node — escalate test changes
+  to `..`.
+- Local-node identifier round-trip: a local-node pid/port/ref demotes to this runtime's internal
+  form on decode (when an identity is installed) and an internal ref encodes as a 3-number
+  `NEWER_REFERENCE_EXT` (when an identity is installed); both are inert with no identity.
+  `decode_term` stays identity-free — use `decode_term_with_local_node` for `binary_to_term`.
+- Runtime wiring that exists: `beam_bifs::binconv::decode_term_bif` installs `Decoder::with_local_node`
+  (via `BifContext::local_node`) plus the identity-aware compressed path, and routes
+  `binary_to_term/2` through `decode_term_with_options_and_gate_used`;
+  `beam_rt::context::ExportGateBridge` is the `ExportGate` implementation. Still uninstalled by any
+  host: the `LOCAL_EXT` node hash (`DecodeOptions.local_hash` stays `None`) and the
+  `OffHeapBinaries` payload host.
 
 ## Known Issues
-- **A foreign local reference can exceed the M1 id space.** The packed id is 18+14+32
-  bits (`ref_wire`), but the frozen M1 internal-reference thing stores it in one 60-bit
-  small, so only ids `< 2^59` are representable. A reference **this** runtime produced
-  always fits and round-trips exactly; an arbitrary *oracle* `make_ref()` carries a
-  nonzero scheduler `thr_id` in `num[1]` bits 0..15 (dropped by the `REF1_NUM_MASK`
-  unpack) and a 30-bit `num[1]` field, so its packed id can exceed the small range. The
-  local-node demotion is **representability-gated** (`ref_wire::representable_ref_id`):
-  a local reference past the small range keeps the faithful **external** reference form
-  (never a truncated id, never a wrong term, never an error), so even such an image
-  round-trips byte-exactly — only the *internal* shape is out of reach; and a
-  representable foreign id loses the `num[1]` `thr_id`/marker bits the unpack masks, so
-  its internal re-encode need not be byte-identical. Widening the id
-  slot is a `beam_term` layout decision (**owner: `beam_term`**). This is a documented,
-  honest limitation, not a bug.
-
 - **Two source files sit over the ~1000-line target:** `decode/mod.rs` (~1485) and
-  `encode/mod.rs` (~1393). Each is a single state machine — the whole `match tag`
-  dispatch plus its per-tag emitters — and neither has accrued a second
-  responsibility. A future split should move arms by tag family into `decode/`/
-  `encode/` submodules, leaving `Decoder`/`Encoder` as the only state.
+  `encode/mod.rs` (~1393). Each is a single state machine — the whole `match tag` dispatch plus its
+  per-tag emitters — and neither has accrued a second responsibility. A future split should move
+  arms by tag family into `decode/`/`encode/` submodules, leaving `Decoder`/`Encoder` as the only
+  state.
+- The 60-bit internal-reference id slot (a `beam_term` layout limit that keeps a non-representable
+  foreign reference external) is documented in [`decode/CONTEXT.md`](./decode/CONTEXT.md)
+  §Known Issues.
 
 ## Routing Table
-- `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] mod term;`
-- `ref_wire.rs` → the **public** internal-reference `id` ↔ wire-number mapping (`REF_MASK`/`REF1_NUM_MASK`/`REF_NUMBERS`, pack/unpack, the `representable_ref_id` decode gate and the `representable_ref_numbers` checked packer); its unit suite pins the C goldens, the word boundaries and the typed refusal
-- `tag.rs` → wire-frozen tag constants + the `Tag` enum
-- `reader.rs`/`writer.rs` → bounds-checked BE cursor / growable sink (safe Rust)
+- `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] pub mod term;`
+- `tag.rs` → `VERSION_MAGIC` + the wire-frozen tag constants + the `Tag` enum (37 variants, 34
+  covered)
+- `ref_wire.rs` → the **public** internal-reference `id` ↔ wire-number mapping (pack/unpack, the
+  `representable_ref_id` decode gate, the `representable_ref_numbers` checked packer); its unit
+  suite pins the C goldens, the word boundaries and the typed refusal
+- `reader.rs`/`writer.rs` → bounds-checked BE cursor / growable sink (safe Rust), incl.
+  `Reader::u24be` and the crate-internal `patch_u32be`/`mask_last_byte` backward writes
 - `atom_cache.rs` → `AtomCache` + the `AtomCacheWriter` hook trait
 - `off_heap.rs` → `OffHeapBinaries` host trait
-- `decode/export_gate.rs` → the `ExportGate` host trait (the `[safe]` active-export predicate)
-- `compress.rs` → the `COMPRESSED` plumbing, delegated to **`beam_deflate`** (the workspace's
-  zlib 1.3.2 port, so the streams are the oracle's bytes): `compress`/`decompress`/
-  `decompress_bounded`/`decompress_bounded_used` + the level bounds; the wrapper rule
-  (`Z <= body - 5`, equality COMPRESSED, level 0 never) lives on the encode side in
-  `encode/mod.rs::compress_if_smaller`
-- `error.rs` → `bad_arg`/`system_limit`, the `unsupported*` reason atoms
+- `compress.rs` → the `COMPRESSED` plumbing, delegated to **`beam_deflate`** (the workspace's zlib
+  1.3.2 port, so the streams are the oracle's bytes): `compress`/`decompress`/
+  `decompress_bounded`/`decompress_bounded_used` + the level bounds; the wrapper rule lives on the
+  encode side in `encode/mod.rs::compress_if_smaller`
+- `error.rs` → the `unsupported*` reason atoms (`UNSUPPORTED_REASON`, `LOCAL_FUN_REASON`)
 - `prelude.rs` → the downstream glob-import surface
-- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, the active-export gate (`export_gate.rs`), `decode_atom_strict` (the C `dec_atom`: no `NIL_EXT` marker, used by `EXPORT_EXT`'s module/function, `NEW_FUN_EXT`'s module and `RECORD_EXT`'s module/name/key atoms) vs `decode_node_atom` (the C `dec_sysname`: marker allowed, used for identifier node fields), `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound
-- `encode/` → the `Encoder` state machine, the tag emitters (incl. the internal pid/port/**ref** branches), `encode_term*`
-- `term/` → the **only** `unsafe` subtree: safe forwarding/allocation wrappers over `beam_term` (`binary`/`fun`/`record`/`ref`)
+- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam and demotion,
+  the `[safe]` flag + `ExportGate`, the `[used]` count, off-heap binaries, `decode_atom_strict`
+  (the C `dec_atom`: no `NIL_EXT` marker) vs `decode_node_atom` (the C `dec_sysname`: marker
+  allowed), `MAX_DECODE_DEPTH` — [`decode/CONTEXT.md`](./decode/CONTEXT.md)
+- `encode/` → the `Encoder` state machine, the tag emitters (incl. the internal pid/port/**ref**
+  branches), the fun/record/map/float emitters, `FunIdentity`, the flavours, `encode_term*` —
+  [`encode/CONTEXT.md`](./encode/CONTEXT.md)
+- `term/` → the **only** `unsafe` subtree: safe forwarding/allocation wrappers over `beam_term`
+  (`binary`/`fun`/`record`/`ref`), the record definition hash, the oversized-flatmap writer —
+  [`term/CONTEXT.md`](./term/CONTEXT.md)
+- `../tests/` → the integration binaries (sibling — read-only, escalate writes to `..`)
