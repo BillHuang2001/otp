@@ -212,9 +212,8 @@ own `file:read_file_info(Name)` ⇒ `{error,enoent}` self-check passes (`rambenc
   known-red tests in `crates/beam_rt/TEST_STRATEGY.md` — the four `src/runner/` lib tests plus
   `foreign_root_loop`, `gc_immix_payload`, `gc_strategy`, `off_heap_reclaim`. **No new red**
   (lib: 1986 passed / 4 failed, exactly the inventoried four).
-* `cargo test -p beam_io --no-fail-fast`: green except the known-red
-  `tests/inet.rs::a_reactor_observed_peer_close_releases_the_registration_and_reports_closed`
-  (lib 1072 passed / 0 failed).
+* `cargo test -p beam_io --no-fail-fast`: **fully green** — whole crate 1328 passed / 0 failed /
+  2 ignored over 28 binaries (lib 1074 passed / 0 failed). No red target.
 * Differential, 404 `driver*`/`port*`/`file*`/`inet*`/`spawn*` cases run individually at 16-way and
   merged with `--allowlist tools/differential/known-gaps.txt`: `total 3439 / agree 3438 /
   mismatch 0 / unsupported 1 / skipped 0`, ratchet `allowed 1 / unauthorized 0 / stale 0` — the
