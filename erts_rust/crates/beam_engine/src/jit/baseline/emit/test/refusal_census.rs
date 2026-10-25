@@ -315,7 +315,7 @@ const BS_REASON_Y_DST: &str = ">1 Y destination";
 const BS_REASON_FIELD: &str = "signed/little/native field";
 /// The explicit catch-all: everything the nine rules above do not name (an unmodelled flag
 /// atom, a truncated command group, a non-`Loc` destination that is not a literal, and
-/// every `bs_create_bin` refusal the seam's single `None` cannot discriminate).
+/// every `bs_create_bin` refusal `CreateBinShape::of`'s single `None` cannot discriminate).
 const BS_REASON_OTHER: &str = "other";
 
 /// What the bitstring inline set does with one instruction.
@@ -687,14 +687,28 @@ fn runtime_size_refusal(size: &Operand, unit: u32) -> Option<String> {
 
 /// (b)/(j) — the `bs_create_bin` refusal.
 ///
-/// The seam's [`append_plan`](crate::families::bitstrings::create::seam::append_plan)
-/// answers a single `None` for every shape it does not accept, so the report can name
-/// exactly one of the closed buckets: a **literal-area operand** anywhere in the
-/// instruction (a destination, an accumulator or a field value), else `other` — the
-/// honest catch-all for a plain/absent `private_append`, a `binary`/`float`/`utf*`/`all`
-/// segment, a `little`/`signed`/`native` flag, a partial-byte or wider-than-a-word field,
-/// a `Y` value operand and the tier's own two shape caps (`MAX_FIELDS` /
-/// `MAX_TAIL_BYTES`). Guessing among those would be a fabricated attribution.
+/// The predicate that answers the `None` is
+/// [`CreateBinShape::of`](super::super::bitstr_inline::CreateBinShape::of) — a strict
+/// **superset** of the seam's
+/// [`append_plan`](crate::families::bitstrings::create::seam::append_plan), which it calls
+/// first. So the refusal can be any of the plan's own declines (a plain or
+/// later-position append, an append unit that does not divide 8, a
+/// `binary`/`float`/`utf*`/`all` segment, a `little`/`signed`/`native` flag, a
+/// partial-byte or wider-than-a-word field), or one of the shape's own, additional ones:
+///
+/// * an accumulator or a field **value** that is not an `x` register — the sequence
+///   re-reads it from `machine.x` after the helper call, so a `Y` slot (a
+///   `cowboy_bstr:to_lower/1`-style accumulator, say) stays on the family;
+/// * a `dst` [`Loc::of`] cannot address (a literal-area operand, an out-of-bound register);
+/// * a `bits` width that is not a positive whole-byte multiple in `8..=64`;
+/// * a field byte-offset sum that does not land on the plan's tail;
+/// * its two shape caps, more than `MAX_FIELDS` fields or more than `MAX_TAIL_BYTES` tail
+///   bytes.
+///
+/// That single `None` covers all of them, so the report can name exactly one of the closed
+/// buckets: a **literal-area operand** anywhere in the instruction (a destination, an
+/// accumulator or a field value), else `other` — the honest catch-all. Guessing among the
+/// rest would be a fabricated attribution.
 fn create_bin_refusal(dst: &Operand, segments: &[Operand]) -> String {
     let mut operands: Vec<&Operand> = Vec::with_capacity(1 + segments.len());
     operands.push(dst);
