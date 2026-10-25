@@ -104,8 +104,9 @@ const VH_DEFAULT_SIZE_WORDS: usize = 32768;
 /// measurement of the *current* geometry rather than part of the contract.
 /// For the current geometry, the dependent `beam_rt` `boundary_cost` churn fixture holds one
 /// **2 585**-word young space and a **4 185**-word mature region at **2.6522 / 2.6861 / 2.7109
-/// collections per call** over its N = 2 000 / 4 000 / 10 000 calls (its heap-admission and
-/// boundary doors together), the boundary door firing one collection per **8.86 / 9.40 / 9.96**
+/// collections per call** over its **2 001 / 4 001 / 10 001** calls (N = 2 000 / 4 000 / 10 000; its
+/// heap-admission and boundary doors together), the boundary door firing one collection per
+/// **8.86 / 9.40 / 9.96**
 /// checks at **0.1949 / 0.1950 / 0.1952 checks per call**.
 /// The young figure is a **chain sum materialised into a single young space** by
 /// [`HeapPolicy::young_after_collection`]'s keep branch, and not a growth-table entry — nor is it
