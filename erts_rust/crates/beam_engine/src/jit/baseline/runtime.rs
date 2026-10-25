@@ -590,6 +590,15 @@ pub(crate) type PositionHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32,
 /// nothing — re-publishing the frame's Y window cannot fail.
 pub(crate) type RefreshHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>);
 
+/// The `jit_open_append_bin` helper's native signature (the block ABI plus the
+/// accumulator's x-register **index** and the plan's tail width in bits).
+///
+/// The accumulator is passed as an index, not as a word, because the block's spill has
+/// already made `machine.x` authoritative for it — and because the block ABI admits only
+/// `movabs` immediates in [`super::emit::emit_helper_invoke`], so a run-time value can
+/// only cross as an index the helper re-reads from the machine.
+pub(crate) type OpenAppendHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64) -> i64;
+
 /// The byte offset of [`JitRuntime::machine`] — the field the helper scaffolding is
 /// handed; generated code reads [`JitRuntime::x_regs`] instead.
 pub(crate) const RUNTIME_MACHINE_DISP: i32 = 0;
@@ -1400,6 +1409,59 @@ pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
     // blocked in the block call that reached us).
     let runtime = unsafe { &mut *rt };
     runtime.refresh_y_base();
+}
+
+/// The **in-place append precondition** helper behind the native `bs_create_bin`
+/// construction arm: ask the family's construction seam whether `machine.x[src_reg]` is a
+/// writable accumulator this instruction may append `tail_bits` more bits to, and hand the
+/// block the **write cursor** (payload base + the accumulator's whole-byte window end).
+///
+/// Returns `0` for every refusal — an out-of-range register index, a negative argument, a
+/// source term that is not an off-heap refc binary this machine registered as writable, a
+/// window that is not whole-byte aligned, or a payload without room for `tail_bits`. `0`
+/// is the universal decline signal: a real payload base is a live allocation address and
+/// can never be null. The emitted sequence tests the word and branches to its one-interpreter-
+/// step `fallback`, so a refusal is the family's own behaviour, never an error of this
+/// helper's.
+///
+/// **It mutates nothing.** The `ErlSubBits.end` advance the family's build performs is
+/// emitted **inline** by the block ([`super::emit::bitstr_inline`]'s `create` shape) as the
+/// last store before the destination is written, precisely so that a later `fallback`
+/// (one whole interpreter step re-executing this very instruction) sees an accumulator the
+/// block's prefix has not touched. Committing `end` here would put the mutation before the
+/// field stores, and a deopt would then append the tail twice — a wrong result.
+pub(crate) extern "C" fn jit_open_append_bin(
+    rt: *mut JitRuntime<'_>,
+    src_reg: i64,
+    tail_bits: i64,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is
+    // blocked in the block call that reached us).
+    let runtime = unsafe { &*rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
+    // this helper only **reads** through it — the seam's two queries (`writable_append_target`,
+    // `open_append`) allocate nothing and mutate nothing — so a shared borrow cannot alias a
+    // `&mut Machine` (the driver holds none while the block runs).
+    let machine = unsafe { &*runtime.machine };
+    let Ok(src_reg) = u32::try_from(src_reg) else {
+        return 0;
+    };
+    let Ok(tail_bits) = u32::try_from(tail_bits) else {
+        return 0;
+    };
+    let Some(src) = machine.x(src_reg) else {
+        return 0;
+    };
+    let Some((base, end_bits)) =
+        crate::families::bitstrings::create::seam::open_append(machine, src, tail_bits)
+    else {
+        return 0;
+    };
+    // The payload base plus the whole-byte window end — `open_append` guarantees
+    // `end_bits % 8 == 0`, so this is the exact byte offset of the first byte the
+    // instruction's fields occupy.
+    (base + end_bits / 8) as i64
 }
 
 /// The **local tail-call** helper: pop the current frame with the interpreter's

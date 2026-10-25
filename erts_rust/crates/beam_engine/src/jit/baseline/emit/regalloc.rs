@@ -102,7 +102,7 @@ use super::arith::{fast_arith, uses_y};
 use super::bif::bif_shape;
 use super::bitstr_inline::{
     bs_match_shape, get_integer2_shape, get_position_shape, set_position_shape, skip_bits2_shape,
-    start_match3_shape, start_match4_shape, test_tail2_shape,
+    start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
 };
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
@@ -476,17 +476,17 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
-        // The eight bitstring shapes the emitter lowers natively
+        // The nine bitstring shapes the emitter lowers natively
         // ([`super::bitstr_inline`]: the six match-context ones, plus
-        // `bs_get_integer2` and `bs_match`). Each is classified by the **same** shape predicate
-        // its `try_inline_*` entry consults — those predicates already refuse a
-        // `NO_FAIL` fail code, an unresolvable fail label, an undecodable fail atom and
-        // an un-addressable operand, i.e. exactly the emitter's own compile-time
-        // decision — so this mirror is exact rather than merely biased. The emitted
-        // sequence is fully inline: a shape's *hit* path continues in-block, and only
-        // its miss/fail/fallback *exit* leaves the block (the linker's `emit_exit`, or
-        // `emit_step_and_continue`), which is the same shape `Instr::Jump`'s resolved
-        // arm and the `jit_test` helper route already have.
+        // `bs_get_integer2`, `bs_match` and `bs_create_bin`). Each is classified by the
+        // **same** shape predicate its `try_inline_*` entry consults — those predicates
+        // already refuse a `NO_FAIL` fail code, an unresolvable fail label, an undecodable
+        // fail atom and an un-addressable operand, i.e. exactly the emitter's own
+        // compile-time decision — so this mirror is exact rather than merely biased. The
+        // emitted sequence is fully inline: a shape's *hit* path continues in-block, and
+        // only its miss/fail/fallback *exit* leaves the block (the linker's `emit_exit`, or
+        // `emit_step_and_continue`), which is the same shape `Instr::Jump`'s resolved arm
+        // and the `jit_test` helper route already have.
         Instr::BsGetPosition { ctx, dst, .. } => get_position_shape(ctx, dst).is_some(),
         Instr::BsSetPosition { ctx, pos } => set_position_shape(ctx, pos).is_some(),
         Instr::BsTestTail2 { fail, ctx, bits } => {
@@ -511,6 +511,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         .is_some(),
         Instr::BsMatch { fail, ctx, commands } => {
             bs_match_shape(labels, module, *fail, ctx, commands).is_some()
+        }
+        Instr::BsCreateBin { dst, segments, .. } => {
+            CreateBinShape::of(module, dst, segments).is_some()
         }
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
@@ -690,7 +693,7 @@ pub(crate) fn cacheable_touches(
                 }
             }
         }
-        // The eight bitstring shapes are charged the x-registers their own
+        // The nine bitstring shapes are charged the x-registers their own
         // native lowering references — and only when their `*_shape` claims them (an
         // un-addressable operand keeps the whole instruction on the family arm, which
         // contributes no native touch). A `Y` operand is a stack slot, **not** an
@@ -740,6 +743,11 @@ pub(crate) fn cacheable_touches(
         }
         Instr::BsMatch { fail, ctx, commands } => {
             if let Some((shape, _)) = bs_match_shape(labels, module, *fail, ctx, commands) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsCreateBin { dst, segments, .. } => {
+            if let Some(shape) = CreateBinShape::of(module, dst, segments) {
                 touches.extend(shape.registers());
             }
         }
@@ -839,9 +847,9 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
                 }
             }
         }
-        // The eight bitstring shapes read the x-registers their own native
+        // The nine bitstring shapes read the x-registers their own native
         // lowering loads (a match context, a subject, a saved position, a field's
-        // source) and only when
+        // source, a private-append accumulator) and only when
         // their `*_shape` claims them.
         Instr::BsGetPosition { ctx, dst, .. } => {
             if let Some(shape) = get_position_shape(ctx, dst) {
@@ -888,6 +896,11 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
         }
         Instr::BsMatch { fail, ctx, commands } => {
             if let Some((shape, _)) = bs_match_shape(labels, module, *fail, ctx, commands) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsCreateBin { dst, segments, .. } => {
+            if let Some(shape) = CreateBinShape::of(module, dst, segments) {
                 reads.extend(shape.reads());
             }
         }
@@ -1044,6 +1057,13 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         Instr::BsMatch { fail, ctx, commands } => {
             bs_match_shape(labels, module, *fail, ctx, commands)
                 .map(|(shape, _)| shape.writes())
+                .unwrap_or_default()
+        }
+        // `bs_create_bin` writes its destination (the accumulator term — the instruction's
+        // own value on the in-place route). Charged for the same reason as the shapes above.
+        Instr::BsCreateBin { dst, segments, .. } => {
+            CreateBinShape::of(module, dst, segments)
+                .map(|shape| shape.writes())
                 .unwrap_or_default()
         }
         // Everything else deopts.

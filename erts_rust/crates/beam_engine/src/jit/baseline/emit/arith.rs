@@ -438,6 +438,10 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             super::bitstr_inline::BsMatchShape::of(module, ctx, commands)
                 .map_or(false, |shape| shape.uses_y())
         }
+        Instr::BsCreateBin { dst, segments, .. } => {
+            super::bitstr_inline::CreateBinShape::of(module, dst, segments)
+                .map_or(false, |shape| shape.uses_y())
+        }
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }

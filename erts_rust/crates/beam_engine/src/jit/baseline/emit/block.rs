@@ -1057,6 +1057,32 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // `bs_create_bin` over the **private-append accumulator** — the compiler's
+            // `<<Acc/binary, C:8>>` linear-accumulator shape, one instruction per appended
+            // field. Only whole-byte constant-width big-endian integer segments and
+            // string-constant segments lower here; everything else (a runtime width or
+            // unit, a little-endian/signed/native field, a nested match context, a
+            // non-x accumulator, more than `MAX_FIELDS` fields or `MAX_TAIL_BYTES` bytes)
+            // emits **zero bytes** and takes the family's own arm below.
+            // The `fallback` is ONE interpreter step for the whole instruction. Every guard
+            // that can take it runs before the first payload store, and the accumulator's
+            // window-end commit is the last fallible-free store, so a deopt re-executes
+            // against an untouched accumulator.
+            Instr::BsCreateBin { dst, segments, .. } => {
+                if !bitstr_inline::try_inline_bs_create_bin(
+                    buffer,
+                    module,
+                    dst,
+                    segments,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

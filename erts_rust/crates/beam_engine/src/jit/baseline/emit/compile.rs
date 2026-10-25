@@ -555,11 +555,13 @@ fn emit_function(
 /// costs its guarded sequence plus the helper fallback it may still branch to
 /// ([`LIST_PATH_BYTES`]), a `get_tuple_element`/`set_tuple_element`/
 /// `select_tuple_arity` its own guarded sequence plus one spill-and-return stub per
-/// arity alternative ([`TUPLE_PATH_BYTES`]), and a bitstring-path instruction its own
-/// guarded match-context sequence ([`BS_PATH_BYTES`]).
+/// arity alternative ([`TUPLE_PATH_BYTES`]), a bitstring-path instruction its own
+/// guarded match-context sequence ([`BS_PATH_BYTES`]), and a natively-lowered
+/// `bs_create_bin` its own straight-line field-store sequence ([`CREATE_BIN_PATH_BYTES`]).
 /// Under-estimating would turn a large module into a `SystemLimit` compile error,
 /// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
-/// *every* `gc_bif`, [`LIST_PATH_BYTES`] for every cons-cell read and
+/// *every* `gc_bif`, [`LIST_PATH_BYTES`] for every cons-cell read,
+/// [`CREATE_BIN_PATH_BYTES`] for every `bs_create_bin`, and
 /// [`BS_PATH_BYTES`] for every bitstring-path instruction, whether or
 /// not the shape predicate claims it, and [`CodeBuffer::with_capacity`] rounds the total
 /// up to whole pages.
@@ -586,6 +588,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
     let mut tuple_paths = 0usize;
     let mut bs_paths = 0usize;
     let mut bs_match_commands = 0usize;
+    let mut create_bin_paths = 0usize;
     for instr in code {
         match instr {
             Instr::Bif { .. } => cmp_bifs += 1,
@@ -598,17 +601,20 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             Instr::SetTupleElement { .. } => tuple_paths += 1,
             Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
             // Every bitstring-path instruction the tier inlines *in addition to* the
-            // per-instruction budget below: all eight shapes — the six guarded
-            // match-context ones, `bs_get_integer2` and `bs_match` — reserve their own
-            // guarded sequence ([`BS_PATH_BYTES`]), and `bs_match` additionally charges
-            // one [`BS_MATCH_COMMAND_BYTES`] per command, because its whole static
-            // command list is lowered inline. A shape the emitter's predicate declines
+            // per-instruction budget below: all nine shapes — the six guarded
+            // match-context ones, `bs_get_integer2`, `bs_match` and `bs_create_bin` —
+            // reserve their own guarded sequence ([`BS_PATH_BYTES`]), `bs_match`
+            // additionally charges one [`BS_MATCH_COMMAND_BYTES`] per command, because its
+            // whole static command list is lowered inline, and `bs_create_bin` charges one
+            // [`CREATE_BIN_PATH_BYTES`] because its field stores are emitted one byte at a
+            // time. A shape the emitter's predicate declines
             // emits zero bytes and falls through to `emit_bitstr`, so these budgets
             // over-estimate for it — the safe direction for a capacity estimate.
             Instr::BsMatch { commands, .. } => {
                 bs_paths += 1;
                 bs_match_commands += commands.len();
             }
+            Instr::BsCreateBin { .. } => create_bin_paths += 1,
             Instr::BsGetInteger2(_)
             | Instr::BsGetPosition { .. }
             | Instr::BsSetPosition { .. }
@@ -627,6 +633,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + TUPLE_PATH_BYTES * tuple_paths
         + BS_PATH_BYTES * bs_paths
         + BS_MATCH_COMMAND_BYTES * bs_match_commands
+        + CREATE_BIN_PATH_BYTES * create_bin_paths
 }
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
@@ -702,6 +709,19 @@ const BS_PATH_BYTES: usize = 448;
 /// and the commit plus the tagged destination store (~45 B), i.e. ~300 B; `ensure_*`/`skip`
 /// are under 60 B. Deliberately loose (under-estimating is a `SystemLimit` compile error).
 const BS_MATCH_COMMAND_BYTES: usize = 320;
+/// The code-size budget reserved for one natively-lowered `bs_create_bin` construction arm
+/// (see [`code_capacity_estimate`]).
+///
+/// The emitted sequence is straight-line code whose length grows with the shape's fields
+/// and tail bytes, so its budget is one flat figure rather than [`BS_PATH_BYTES`]'s
+/// per-instruction one. Closed-form worst case: the shape caps at `MAX_FIELDS` (16) fields
+/// and `MAX_TAIL_BYTES` (256) tail bytes, so 16 × 33 B of `is_small` guards + 256 × (7 load
+/// + 4 shift + 7 store) B of field stores + the base sequence (the destination guard, the
+/// helper call — `7 + 8 + 20 + 13` B — the cursor test, the `end` commit ≈ 59 B, the
+/// destination store ≤ 12 B and the fallback interpreter step ≈ 150 B) ≈ 7.3 kB. Also
+/// added to each instruction's own [`INSTRUCTION_BYTES`]. Deliberately loose: under-estimating
+/// would turn a large module into a `SystemLimit` compile error.
+const CREATE_BIN_PATH_BYTES: usize = 16_384;
 
 #[cfg(test)]
 mod tests {

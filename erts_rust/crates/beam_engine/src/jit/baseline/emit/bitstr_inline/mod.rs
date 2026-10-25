@@ -60,6 +60,7 @@
 //! * [`start_match`] — `bs_start_match3` + `bs_start_match4`
 //! * [`integer`] — `bs_get_integer2`, and the tier's one width/flag rule
 //! * [`bs_match`] — `bs_match` over a fully static command list
+//! * [`create`] — `bs_create_bin` over the private-append accumulator
 //! * [`tests`] — the in-crate unit suite
 //!
 //! This file owns the frozen layout constants ([`SUB_BITS_START_DISP`] and friends), the
@@ -81,6 +82,7 @@ use super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 use super::operands::Loc;
 
 mod bs_match;
+mod create;
 mod integer;
 mod position;
 mod start_match;
@@ -92,6 +94,8 @@ pub(super) use bs_match::try_inline_bs_match;
 pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 #[cfg(test)]
 pub(crate) use bs_match::{bs_match_group_len, bs_match_integer_flags, bs_match_static_size};
+pub(super) use create::try_inline_bs_create_bin;
+pub(crate) use create::CreateBinShape;
 pub(super) use integer::try_inline_bs_get_integer2;
 pub(crate) use integer::{
     field_is_unsupported, field_width_supported, get_integer2_shape, GetInteger2Shape,
@@ -188,7 +192,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 8;
+pub(crate) const SHAPE_COUNT: usize = 9;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -213,6 +217,9 @@ pub(crate) const SHAPE_GET_INTEGER2: usize = 6;
 /// The `bs_match` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_BS_MATCH: usize = 7;
+/// The `bs_create_bin` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_CREATE_BIN: usize = 8;
 
 #[cfg(test)]
 thread_local! {

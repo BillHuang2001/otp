@@ -285,9 +285,10 @@ fn already_inlined(module: &Module, instr: &Instr) -> bool {
 // ---------------------------------------------------------------------------
 // Bitstring inline refusals
 //
-// The tier natively lowers eight `Bs*` shapes (`emit/bitstr_inline/`); every other
-// `Bs*` instruction goes to the family arm, and every one of the eight can still be
-// *refused* by its own shape predicate. This section attributes those refusals.
+// The tier natively lowers nine `Bs*` shapes (`emit/bitstr_inline/`, `bs_create_bin`
+// included); every other `Bs*` instruction goes to the family arm, and every one of the
+// nine can still be *refused* by its own shape predicate. This section attributes those
+// refusals.
 //
 // The vocabulary is closed: each reason string below is emitted from exactly one
 // place, so the table cannot grow an unlisted bucket, and every `Bs*` instruction the
@@ -312,8 +313,9 @@ const BS_REASON_LABEL: &str = "unresolved fail label";
 const BS_REASON_Y_DST: &str = ">1 Y destination";
 /// (i) — a signed, little-endian or native-endian field.
 const BS_REASON_FIELD: &str = "signed/little/native field";
-/// The explicit catch-all: everything the nine rules above do not name (an unmodelled
-/// flag atom, a truncated command group, a non-`Loc` destination that is not a literal).
+/// The explicit catch-all: everything the nine rules above do not name (an unmodelled flag
+/// atom, a truncated command group, a non-`Loc` destination that is not a literal, and
+/// every `bs_create_bin` refusal the seam's single `None` cannot discriminate).
 const BS_REASON_OTHER: &str = "other";
 
 /// What the bitstring inline set does with one instruction.
@@ -646,6 +648,13 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
             }
             BsVerdict::Refused(OP, match_refusal(module, labels, *fail, ctx, commands))
         }
+        Instr::BsCreateBin { dst, segments, .. } => {
+            const OP: &str = "bs_create_bin";
+            if bitstr_inline::CreateBinShape::of(module, dst, segments).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            BsVerdict::Refused(OP, create_bin_refusal(dst, segments))
+        }
         // The remaining `Bs*` variants have no inline arm at all — reported so the corpus
         // view is complete, never silently dropped.
         Instr::BsMatchString { .. } => BsVerdict::NoArm("bs_match_string"),
@@ -659,7 +668,6 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
         Instr::BsSkipUtf16 { .. } => BsVerdict::NoArm("bs_skip_utf16"),
         Instr::BsSkipUtf32 { .. } => BsVerdict::NoArm("bs_skip_utf32"),
         Instr::BsInitWritable => BsVerdict::NoArm("bs_init_writable"),
-        Instr::BsCreateBin { .. } => BsVerdict::NoArm("bs_create_bin"),
         _ => BsVerdict::NotBitstring,
     }
 }
@@ -675,6 +683,23 @@ fn runtime_size_refusal(size: &Operand, unit: u32) -> Option<String> {
         Some(nbits) if nbits <= i64::MAX as usize => None,
         _ => Some(BS_REASON_OTHER.to_string()),
     }
+}
+
+/// (b)/(j) — the `bs_create_bin` refusal.
+///
+/// The seam's [`append_plan`](crate::families::bitstrings::create::seam::append_plan)
+/// answers a single `None` for every shape it does not accept, so the report can name
+/// exactly one of the closed buckets: a **literal-area operand** anywhere in the
+/// instruction (a destination, an accumulator or a field value), else `other` — the
+/// honest catch-all for a plain/absent `private_append`, a `binary`/`float`/`utf*`/`all`
+/// segment, a `little`/`signed`/`native` flag, a partial-byte or wider-than-a-word field,
+/// a `Y` value operand and the tier's own two shape caps (`MAX_FIELDS` /
+/// `MAX_TAIL_BYTES`). Guessing among those would be a fabricated attribution.
+fn create_bin_refusal(dst: &Operand, segments: &[Operand]) -> String {
+    let mut operands: Vec<&Operand> = Vec::with_capacity(1 + segments.len());
+    operands.push(dst);
+    operands.extend(segments.iter());
+    operand_refusal(&operands)
 }
 
 /// Every committed `*.beam` fixture (no hardcoded names).

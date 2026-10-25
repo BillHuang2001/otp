@@ -17,10 +17,10 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Per-shape pins for the **eight native bitstring inline arms** in
+//! Per-shape pins for the **nine native bitstring inline arms** in
 //! [`super::emit::bitstr_inline`]: `bs_get_position`, `bs_set_position`,
 //! `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`,
-//! `bs_get_integer2` and `bs_match`.
+//! `bs_get_integer2`, `bs_match` and `bs_create_bin`.
 //!
 //! `bitstr_tests` pins the *family route* (the `jit_bitstr` helper and the predicate
 //! that claims the whole `Bs*` set). This node pins the **inline** route, one claim per
@@ -63,8 +63,9 @@ use super::bitstr::bitstr_calls;
 use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
 use super::counters;
 use super::emit::bitstr_inline::{
-    self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_COUNT, SHAPE_GET_INTEGER2, SHAPE_GET_POSITION,
-    SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
+    self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_COUNT, SHAPE_CREATE_BIN, SHAPE_GET_INTEGER2,
+    SHAPE_GET_POSITION, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_START_MATCH3,
+    SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
 use super::tests::{assemble_function, assert_same_outcome, function_code_bytes};
@@ -455,6 +456,50 @@ fn module_bs_match() -> Module {
     })
 }
 
+/// `bs_create_bin`: the private-append accumulator plus one `integer 8` field — the
+/// compiler's `<<Acc/binary, C:8>>` linear-accumulator shape.
+///
+/// A **compile-only** fixture: the instrument below only needs the emitter's decision,
+/// never a run (the constructed value is pinned by the family's own end-to-end suite).
+fn module_create_bin() -> Module {
+    bitstr_module(
+        "inline_bs_create_bin",
+        &["private_append", "integer", "all"],
+        2,
+        |module| {
+            let mut segments = vec![
+                Operand::Atom(atom(module, "private_append")),
+                Operand::Integer(1),
+                Operand::Integer(8),
+                Operand::Nil,
+                Operand::X(0),
+                Operand::Atom(atom(module, "all")),
+            ];
+            segments.extend([
+                Operand::Atom(atom(module, "integer")),
+                Operand::Integer(0),
+                Operand::Integer(1),
+                Operand::Nil,
+                Operand::X(1),
+                Operand::Integer(8),
+            ]);
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::BsInitWritable,
+                Instr::BsCreateBin {
+                    fail: NO_FAIL,
+                    alloc: 0,
+                    live: 2,
+                    unit: 1,
+                    dst: Operand::X(0),
+                    segments,
+                },
+                Instr::Return,
+            ]
+        },
+    )
+}
 // ---------------------------------------------------------------------------
 // The instrument: a cache-free compile per shape
 // ---------------------------------------------------------------------------
@@ -516,7 +561,7 @@ pub(crate) fn visited_instances(snapshot: &counters::Counters, variant: &str) ->
 /// would pass every tier-agreement test in this file.
 #[test]
 fn every_inline_shape_emits_on_a_cache_free_compile() {
-    let cases: [(&str, usize, &str, fn() -> Module); 8] = [
+    let cases: [(&str, usize, &str, fn() -> Module); 9] = [
         ("bs_get_position", SHAPE_GET_POSITION, "BsGetPosition", module_get_position),
         ("bs_set_position", SHAPE_SET_POSITION, "BsSetPosition", module_set_position),
         ("bs_test_tail2", SHAPE_TEST_TAIL2, "BsTestTail2", module_test_tail2),
@@ -525,6 +570,7 @@ fn every_inline_shape_emits_on_a_cache_free_compile() {
         ("bs_start_match4", SHAPE_START_MATCH4, "BsStartMatch4", module_start_match4_label),
         ("bs_get_integer2", SHAPE_GET_INTEGER2, "BsGetInteger2", module_get_integer2),
         ("bs_match", SHAPE_BS_MATCH, "BsMatch", module_bs_match),
+        ("bs_create_bin", SHAPE_CREATE_BIN, "BsCreateBin", module_create_bin),
     ];
     let mut covered = 0usize;
     for (shape_name, index, variant, build) in cases {
