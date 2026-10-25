@@ -59,14 +59,53 @@
 //!   the process (`publish_parked_roots`, `RootSet::ALL_LIVE`), so the process's root set really is
 //!   the machine's. That is exactly the pair a reachability question needs.
 //!
-//! # The residual: a process that never runs again
+//! # The residual: a slice that never ends cannot reach this point
 //!
-//! Only the **`Yield`** (pre-emption) arm calls this; the `Wait` arm does not, so a
-//! `receive`-parked process reaches no prune at all — a live-FR window publishes nothing (the
-//! machine stays the authoritative root set, which is gate 2 below), and a publishing window's
-//! roots would be readable but no caller asks. The consequence is a **leak, never a dangle**: a
-//! process that parks on `receive` and is never scheduled again keeps its reservoir until its
-//! machine drops with the process. A process that wakes up and pre-empts again reclaims then.
+//! This is a **`Yield`-arm-only** reclamation point, and that is the whole limit of it.
+//!
+//! * The **`Wait`** arm does not call it, so a `receive`-parked process reaches no prune at all —
+//!   a live-FR window publishes nothing (the machine stays the authoritative root set, which is
+//!   gate 2 below), and a publishing window's roots would be readable but no caller asks. A
+//!   process that parks on `receive` and is never scheduled again keeps its reservoir until its
+//!   machine drops with the process (a leak, never a dangle). A process that wakes up and
+//!   pre-empts again reclaims then.
+//! * A slice that **never pre-empts** reaches neither arm, and that is the unbounded case. On the
+//!   default native baseline tier a linked chain charges **no reduction per link**
+//!   (`Linker::emit_tail_exit` jumps straight to the successor entry and
+//!   `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop), so a BIF-free
+//!   self-recursive tail loop — `f(N) -> _ = <<0:(B*8)>>, f(N-1).` — runs its **whole**
+//!   computation inside one slice: no park, no prune, and the reservoir grows **linearly with the
+//!   loop count**. Measured on this tree: 1.31 GB of dead `binary_alloc` payloads after 20 000
+//!   iterations of a 64 KiB binary, with `erlang:memory(binary)` reporting every byte of it; the
+//!   same program under `BEAM_RT_TIER=interpreter` (which charges one reduction per instruction)
+//!   is a bounded sawtooth of ≤ 203 payloads. That contrast pins the mechanism to the **linked
+//!   tail exit**, not to this point: nothing here is skipped, the point is simply never reached.
+//!   The repair is a charge on the linked-exit path — a `beam_engine` change
+//!   (`jit/baseline/runtime.rs::jit_tail_call`, plus `emit/link.rs`'s `call_only`/`jump` arm for
+//!   the complete form) — and `crate::runner::budget`'s *Why a native baseline-JIT block is only
+//!   priced, never pre-empted at a call* records the same conclusion for the sibling seams. It is
+//!   deliberately **not** repaired here: a host-side charge at an admission door cannot end such a
+//!   slice (the engine's position store parks at block granularity, so a mid-block refusal would
+//!   re-execute the block's prefix — a wrong result, not a pre-emption), and pruning mid-slice is
+//!   unsound outright because a running machine's roots are unpublished (see the two bullets
+//!   above).
+//!
+//! # Reading `erlang:memory(binary)` against this point: the figure is a slice phase, not a leak
+//!
+//! A dead payload is freed only here, so between two parks `erlang:memory(binary)` reports exactly
+//! the payloads the slice has built since the last park, and a read taken at a **fixed iteration
+//! offset** therefore always samples the same point of the slice cycle. Measured on this tree with
+//! a 4 KiB payload and a 1 000-iteration block: the block reads `0` at **every** rung when it is
+//! `999` iterations (the read lands exactly on a park), `k` payloads at rung `k` for `1 000`,
+//! `2k` for `1 001` and `3k` for `1 002`. A 2 000-rung `1 000`-iteration ladder is hard-capped at
+//! **999 payloads** (one slice) with a reset to `0` every 1 000 rungs, identically at
+//! 1 024/2 048/4 096-byte payloads — and the allocator's own block census agrees: after every park
+//! `alloc_calls - free_calls == ` the number of payloads still live, i.e. the whole reservoir was
+//! released. So a monotonically rising ladder is **not** by itself evidence of a leak. The two
+//! tests of a real leak are: does the peak exceed one slice's worth
+//! (`DEFAULT_REDUCTIONS_PER_SLICE / this loop's reductions per iteration` payloads), and does it
+//! rise with the **rung count** at a fixed total iteration count. A fixed-offset read of a
+//! bounded reservoir fails both.
 //!
 //! # Why this is its own file
 //!
@@ -362,41 +401,16 @@ pub(crate) fn reclaim(
     machine: &mut Machine,
     slot: &mut Option<OffHeapReclaimer>,
 ) -> Result<usize> {
-    let gate_probe = |tag: &str, machine: &Machine, runtime: &Runtime| {
-        static PARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let park = PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let bin_live: u64 = beam_alloc::registry::all_stats()
-            .into_iter()
-            .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
-            .map(|(_, stats)| stats.live_bytes as u64)
-            .sum();
-        let store_handles = runtime.eval_off_heap.binaries().len();
-        let store_bytes: usize = runtime
-            .eval_off_heap
-            .binaries()
-            .iter()
-            .map(beam_alloc::RefcBinary::reserved_bytes)
-            .sum();
-        crate::debug_trace::trace(format_args!(
-            "GATE park={park} pid={pid:?} tag={tag} reservoir={} overhead={} bin_live={bin_live} \
-             store_handles={store_handles} store_bytes={store_bytes}",
-            machine.refc_binaries().len(),
-            machine.off_heap_overhead_bytes(),
-        ));
-    };
     let Some(process) = table.get_mut(pid) else {
-        gate_probe("no-process", machine, runtime);
         return Ok(0);
     };
     // An exempt window published nothing: the parked machine is the authoritative root set, so the
     // process's registers are not this walk's business (and relocating against them would be the
     // very move the exemption declines).
     if process.is_relocation_exempt() {
-        gate_probe("exempt", machine, runtime);
         return Ok(0);
     }
     if !runtime.gc_process_enabled(pid) {
-        gate_probe("gc-disabled", machine, runtime);
         return Ok(0);
     }
     if slot.is_none() {
@@ -409,7 +423,6 @@ pub(crate) fn reclaim(
     };
     reclaimer.observe(machine);
     if !reclaimer.triggered() {
-        gate_probe("not-triggered", machine, runtime);
         return Ok(0);
     }
     // The process's **complete** root set, gathered exactly as
@@ -443,7 +456,6 @@ pub(crate) fn reclaim(
         descend,
     );
     if verdict.declined {
-        gate_probe("valve-declined", machine, runtime);
         runtime.note_foreign_reachable(pid);
         return Ok(0);
     }
@@ -462,7 +474,6 @@ pub(crate) fn reclaim(
         roots.iter(),
     );
     if unscanned {
-        gate_probe("unscanned", machine, runtime);
         runtime.note_foreign_reachable(pid);
         return Ok(0);
     }
@@ -489,99 +500,51 @@ pub(crate) fn reclaim(
         .filter(|binary| binary.refcount() > 1)
         .map(|binary| binary.data_ptr() as usize)
         .collect();
-    // TEMP INSTRUMENTATION (investigation only)
-    {
-        let mut by_live = 0usize;
-        let mut by_shared_only = 0usize;
-        let mut dropped = 0usize;
-        for binary in machine.refc_binaries() {
-            let p = binary.data_ptr() as usize;
-            if live.binary_search(&p).is_ok() {
-                by_live += 1;
-            } else if shared.contains(&p) {
-                by_shared_only += 1;
-            } else {
-                dropped += 1;
-            }
-        }
-        crate::debug_trace::trace(format_args!(
-            "PROBE pid={pid:?} reservoir={} live={} shared={} retained_by_live={by_live} \
-             retained_by_shared_only={by_shared_only} dropped={dropped} overhead={} limit_words={}",
-            machine.refc_binaries().len(),
-            live.len(),
-            shared.len(),
-            machine.off_heap_overhead_bytes(),
-            reclaimer.limit_words(),
-        ));
-    }
-    // TEMP INSTRUMENTATION (investigation only): the binary-allocator live figure around the
-    // retain, plus the escaped runtime store's own refc-binary contents.
-    let live_bin_bytes = || -> u64 {
-        beam_alloc::registry::all_stats()
-            .into_iter()
-            .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
-            .map(|(_, stats)| stats.live_bytes as u64)
-            .sum()
-    };
-    // The allocator's own block census: `live_blocks` is the number of `RefcBinary` blocks
-    // currently allocated, so "one per park" is either a live handle somewhere or a
-    // counter/layout asymmetry.
-    let bin_blocks = || -> (u64, u64, u64) {
-        beam_alloc::registry::all_stats()
-            .into_iter()
-            .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
-            .fold((0u64, 0u64, 0u64), |acc, (_, stats)| {
-                (
-                    acc.0 + stats.live_blocks,
-                    acc.1 + stats.alloc_calls,
-                    acc.2 + stats.free_calls,
-                )
-            })
-    };
-    let before_bytes = live_bin_bytes();
-    let before_blocks = bin_blocks();
-    let store_handles: Vec<(usize, usize)> = runtime
-        .eval_off_heap
-        .binaries()
-        .iter()
-        .map(|b| (b.data_ptr() as usize, b.refcount()))
-        .collect();
+    // The released set is decided once, here, so the census below and the release itself can
+    // never disagree (the module docs' *Reading `erlang:memory(binary)`* explains why the
+    // reservoir must be empty of dead payloads after this call, and why that is the property
+    // to assert rather than the absolute figure).
     let released = machine.retain_refc_binaries(|payload| {
         let payload = payload as usize;
         live.binary_search(&payload).is_ok() || shared.contains(&payload)
     });
-    {
-        let after_bytes = live_bin_bytes();
-        let after_blocks = bin_blocks();
-        let store_bytes: usize = runtime
-            .eval_off_heap
-            .binaries()
-            .iter()
-            .map(beam_alloc::RefcBinary::reserved_bytes)
-            .sum();
-        static PARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let park = PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::debug_trace::trace(format_args!(
-            "PROBE2 park={park} pid={pid:?} released={released} bin_live_before={before_bytes} \
-             bin_live_after={after_bytes} delta={} blocks_before={:?} blocks_after={:?} \
-             store_handles={} store_bytes={store_bytes} store_ptrs={store_handles:?}",
-            after_bytes as i64 - before_bytes as i64,
-            before_blocks,
-            after_blocks,
-            store_handles.len(),
-        ));
-    }
     // Re-size the budget from what survived and re-prime the observation pair (the C
     // `p->bin_vheap_sz = next_vheap_size(...)` / `MSO(p).overhead = bin_vheap` pair), then
     // republish the process's off-heap byte figure from the same reading.
     let surviving = reclaimer.record_collection(process.collector().policy(), machine);
     process.set_off_heap_binary_bytes(surviving);
     if released > 0 {
-        crate::debug_trace::trace(format_args!(
-            "off-heap reclamation for {pid:?}: released {released} handle(s), {surviving} bytes \
-             left, binary-vheap limit now {} words",
-            reclaimer.limit_words()
-        ));
+        if crate::debug_trace::enabled() {
+            // The census that makes a *leak* distinguishable from a *slice phase* without a
+            // second run: `retained_live + retained_shared` is every handle this park kept, so
+            // `released + retained_live + retained_shared` is the whole reservoir the walk
+            // examined. Built only when tracing is on (`all_stats` allocates).
+            let retained_live = machine
+                .refc_binaries()
+                .iter()
+                .filter(|binary| live.binary_search(&(binary.data_ptr() as usize)).is_ok())
+                .count();
+            let retained_shared = machine.refc_binaries().len() - retained_live;
+            let binary_live_bytes: u64 = beam_alloc::registry::all_stats()
+                .into_iter()
+                .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
+                .map(|(_, stats)| stats.live_bytes as u64)
+                .sum();
+            crate::debug_trace::trace(format_args!(
+                "off-heap reclamation for {pid:?}: released {released} handle(s), {surviving} \
+                 bytes left, binary-vheap limit now {} words, retained_by_live={retained_live} \
+                 retained_by_shared={retained_shared} binary_alloc_live={binary_live_bytes} \
+                 escaped_store_handles={}",
+                reclaimer.limit_words(),
+                runtime.eval_off_heap.binaries().len(),
+            ));
+        } else {
+            crate::debug_trace::trace(format_args!(
+                "off-heap reclamation for {pid:?}: released {released} handle(s), {surviving} bytes \
+                 left, binary-vheap limit now {} words",
+                reclaimer.limit_words()
+            ));
+        }
     }
     Ok(released)
 }

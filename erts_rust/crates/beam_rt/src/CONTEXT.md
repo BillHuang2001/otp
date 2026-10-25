@@ -162,6 +162,33 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   none of those three can name a `[BinRef][ErlSubBits]` payload (the simple copy flattens it) —
   whereas `seq_trace`'s `set_label` (`seq_trace.rs:324-329`, reached from `seq_trace_2:461`) stores
   the raw term **unstabilized**, and `eval_closures`' env can name one.
+## The off-heap refc-binary reclamation loop — where it runs, and what `erlang:memory(binary)` means
+Binding for anyone reading a `erlang:memory(binary)` figure or touching `context/gc/bin_vheap.rs`
+(the full argument is that file's module docs and `context/gc/CONTEXT.md`; this is the rule).
+
+- **The prune has exactly one caller**, the `Yield` (pre-emption) arm at `runner/run.rs` →
+  `RuntimeRunner::reclaim_off_heap_binaries` → `context::gc::bin_vheap::reclaim`. The `Wait` arm does
+  not call it, and a **slice that never pre-empts** reaches neither.
+- **A monotone `erlang:memory(binary)` ladder is a slice phase, not a leak.** A dead payload is freed
+  only at that point, so the figure is exactly the payloads the current slice has built since the last
+  park; a read at a fixed iteration offset samples the same point of the cycle every time. Measured
+  with a 4 KiB payload and a 1 000-iteration block: `0` at every rung at `999` iterations, `k` payloads
+  at rung `k` for `1 000`, `2k` for `1 001`, `3k` for `1 002`; a 2 000-rung ladder is hard-capped at
+  one slice's worth (999) and resets every 1 000 rungs, identically at 1 024/2 048/4 096 B. The two
+  tests of a real leak are therefore: does the peak exceed one slice's worth, and does it rise with the
+  **rung count** at a fixed total iteration count. A fixed-offset read of a bounded reservoir fails both.
+- **The one unbounded shape is a slice that never ends.** On the default native baseline tier a linked
+  chain charges **no reduction per link** (`Linker::emit_tail_exit` jumps to the successor entry;
+  `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop), so a BIF-free self-recursive
+  tail loop — `f(N) -> _ = <<0:(B*8)>>, f(N-1).` — runs its whole computation inside one slice: no
+  park, no prune, reservoir linear in the loop count. Measured 1.31 GB of dead `binary_alloc` payloads
+  after 20 000 iterations of a 64 KiB binary; the same source under `BEAM_RT_TIER=interpreter` (one
+  charge per instruction) is a bounded sawtooth of ≤ 203 payloads. The repair is a charge on the
+  linked-exit path — a `beam_engine` change this crate cannot make — and neither substitute works: a
+  host-side charge cannot end such a slice (the engine parks at block granularity, so a mid-block
+  refusal re-executes the block's prefix), and a mid-slice prune is unsound because a running machine's
+  roots are unpublished.
+
 ## The debt gate on the fun-applying stdlib fast paths (cross-cutting: execution · bridges · gc)
 Binding facts for anyone touching `RuntimeContext::resolve_external_call`, `FunBridge` or the collection doors.
 - **What it gates:** `lists`/`maps` keys whose `beam_bifs` implementation applies a fun argument back into the runtime — the roster is **not** restated in `beam_rt`: it is `beam_bifs::needs_fun_caller(module, function, arity)` (the registry's own allocation-free binary-search answer, backed by `FUN_CALLER_BIFS`' pinned 18 `lists` + 4 `maps` + 2 `ets` keys), narrowed to `module` ∈ {`lists`, `maps`} by `execution.rs`'s `nests_a_fun_apply`.
