@@ -1058,12 +1058,15 @@ pub(crate) fn emit_block(
                 }
             }
             // `bs_create_bin` over the **private-append accumulator** — the compiler's
-            // `<<Acc/binary, C:8>>` linear-accumulator shape, one instruction per appended
-            // field. Only whole-byte constant-width big-endian integer segments and
-            // string-constant segments lower here; everything else (a runtime width or
-            // unit, a little-endian/signed/native field, a nested match context, a
-            // non-x accumulator, more than `MAX_FIELDS` fields or `MAX_TAIL_BYTES` bytes)
-            // emits **zero bytes** and takes the family's own arm below.
+            // `<<Acc/binary, C:6>>` linear-accumulator shape, one instruction per appended
+            // field. Only constant-width unsigned big-endian integer segments and (on the
+            // byte-aligned route) string-constant segments lower here; the shape picks one
+            // of two sequences, byte stores when every field is whole-byte and one bit-granular
+            // write helper per field otherwise (`bitstr_inline::Route`). Everything else (a
+            // runtime width or unit, a little-endian/signed/native field, a nested match
+            // context, a non-x accumulator, more than `MAX_FIELDS` fields or `MAX_TAIL_BYTES`
+            // bytes, a bit-granular plan carrying a string constant) emits **zero bytes** and
+            // takes the family's own arm below.
             // The `fallback` is ONE interpreter step for the whole instruction. Every guard
             // that can take it runs before the first payload store, and the accumulator's
             // window-end commit is the last fallible-free store, so a deopt re-executes
