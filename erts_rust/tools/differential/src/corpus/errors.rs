@@ -96,6 +96,44 @@ pub(crate) const CLAUSE_FAILURE_SOURCE: &str = "-module(errs_fc).\n\
      g(X) when is_integer(X), X > 0 -> X.\n\
      guard() -> try g(a) catch Class:Reason -> classify(Class, Reason) end.\n";
 
+/// The embedded module the zero-divisor [`CaseKind::Module`] case compiles and runs: a *run-time*
+/// zero divisor through `slash/1`, `rem_zero/1` and `div_zero/1`.
+///
+/// Every divisor is the function's own argument `Z`, never a literal, so the compiler cannot fold
+/// the operation away: the `arith`/`gc_bif` instruction really **executes** on the compiled path.
+/// That is what the case pins — a `badarith` raise on the compiled (baseline-JIT) path, never a
+/// host `#DE` trap and never a silent wrong value. (`all(2)` answers `505.0` on both runtimes, so
+/// the operations demonstrably execute and yield their value when the divisor is non-zero.)
+///
+/// `all/1` reduces each operation's outcome to a positional base-10 digit — `1` for
+/// `error:badarith`, `2`/`3`/`4`/`5` for any other error/throw/exit class — so the printed total is
+/// `111` only while *all three* of `/`, `rem` and `div` raise `error:badarith`. Erlang has `div`
+/// and `rem` as its only integer division operators (there is no `mod` operator), so `div` is the
+/// truncating-division leg here.
+///
+/// The golden is the oracle's own line: `erl -noshell -pa <dir> -eval
+/// 'io:format("~w~n",[errs_zar:all(0)]), halt(0).'` prints `111` and exits `0` (OTP 29.1.1).
+/// Measured out of corpus: `beam_rt run <dir>/errs_zar.beam errs_zar:all/1 0` prints `111` with
+/// exit `0` on the default tier (the native baseline JIT — the tier this case runs at), on
+/// `BEAM_RT_TIER=interpreter`, on `BEAM_RT_TIER=baseline`, and — with `-p beam_rt --features
+/// cranelift` built — on `BEAM_RT_TIER=cranelift`; without that feature the Cranelift tier answers
+/// the typed `unsupported` capability gap (exit `3`), so it is not on `beam_rt`'s default path.
+pub(crate) const ZERO_DIVISOR_SOURCE: &str = "-module(errs_zar).\n\
+     -export([all/1]).\n\
+     classify(error, badarith) -> 1;\n\
+     classify(error, _) -> 2;\n\
+     classify(throw, _) -> 3;\n\
+     classify(exit, _) -> 4;\n\
+     classify(_, _) -> 5.\n\
+     slash(Z) -> try 10 / Z catch Class:Reason -> classify(Class, Reason) end.\n\
+     rem_zero(Z) -> try 10 rem Z catch Class:Reason -> classify(Class, Reason) end.\n\
+     div_zero(Z) -> try 10 div Z catch Class:Reason -> classify(Class, Reason) end.\n\
+     all(Z) ->\n\
+     \x20   A = slash(Z),\n\
+     \x20   B = rem_zero(Z),\n\
+     \x20   C = div_zero(Z),\n\
+     \x20   A + 10 * B + 100 * C.\n";
+
 /// The A.1 exception cases: class + reason for `error`, `exit` and `throw`.
 pub(crate) fn group() -> Vec<Case> {
     vec![
@@ -466,6 +504,26 @@ pub(crate) fn group() -> Vec<Case> {
             }),
             golden: Golden {
                 stdout: Some("1"),
+                exit_code: 0,
+            },
+        },
+        // The zero-divisor guard on the *compiled* path: `/`, `rem` and `div` by a run-time zero
+        // each raise `error:badarith` (never a host `#DE` trap, never a silent wrong value), the
+        // raise is caught, and the module returns a marker integer instead of dying.
+        Case {
+            id: "errors/module_zero_divisor_badarith",
+            description: "compiled integer /, rem and div by a run-time zero raise error:badarith",
+            contracts: &[Contract::BeamAsm, Contract::LanguageSemantics],
+            kind: CaseKind::Module(ModuleRun {
+                source: ZERO_DIVISOR_SOURCE,
+                module: "errs_zar",
+                function: "all",
+                arity: 1,
+                args: &[0],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("111"),
                 exit_code: 0,
             },
         },
@@ -1060,5 +1118,60 @@ mod tests {
             assert_eq!(case.golden.stdout, Some("1"), "case {id}");
             assert_eq!(case.golden.exit_code, 0, "case {id}");
         }
+    }
+
+    /// The zero-divisor *module* case: the embedded module is compiled and run under both
+    /// runtimes at the default (baseline-JIT) tier, and its `classify/2` maps
+    /// `error:badarith` to the digit `1` for `/`, `rem` and `div` — so the printed total is
+    /// `111` only while all three guards hold.
+    #[test]
+    fn zero_divisor_module_case_runs_the_embedded_module() {
+        const ID: &str = "errors/module_zero_divisor_badarith";
+        let cases = group();
+        let case = find(&cases, ID);
+        let CaseKind::Module(run) = case.kind else {
+            panic!("case {ID} must be a module-run case");
+        };
+        assert_eq!(
+            run,
+            ModuleRun {
+                source: super::ZERO_DIVISOR_SOURCE,
+                module: "errs_zar",
+                function: "all",
+                arity: 1,
+                args: &[0],
+                nif: None,
+            },
+            "case {ID}: the embedded module invocation (the divisor is a run-time argument)"
+        );
+        assert!(
+            case.contracts.contains(&Contract::BeamAsm)
+                && case.contracts.contains(&Contract::LanguageSemantics),
+            "case {ID}: a module-run case evidences the .beam and semantics contracts"
+        );
+        // The raise is caught (a marker integer, exit 0), so a host trap or a silent wrong
+        // value shows up as a differing observable instead of a killed process.
+        assert_eq!(case.golden.stdout, Some("111"), "case {ID}");
+        assert_eq!(case.golden.exit_code, 0, "case {ID}");
+        // Every divisor is the argument, so no operation can be constant-folded away; and the
+        // class/reason discriminator is the badarith clause itself.
+        for op in ["10 / Z", "10 rem Z", "10 div Z"] {
+            assert!(
+                run.source.contains(op),
+                "case {ID}: the guard must execute `{op}` against the run-time divisor"
+            );
+            assert!(
+                !run.source.contains(&op.replace('Z', "0")),
+                "case {ID}: a literal zero divisor would let the compiler fold `{op}`"
+            );
+        }
+        assert!(
+            run.source.contains("classify(error, badarith) -> 1"),
+            "case {ID}: the module distinguishes the exact class and reason"
+        );
+        assert!(
+            !run.source.contains(" mod "),
+            "case {ID}: Erlang has no `mod` operator (`div`/`rem` are its integer division)"
+        );
     }
 }
