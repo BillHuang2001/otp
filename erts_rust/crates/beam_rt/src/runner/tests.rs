@@ -4207,12 +4207,25 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 ///   collections is that one plus one at every `K`-th iteration — measured `1 + N / K` exactly
 ///   from N = 1 to N = 10 (1, 2, 2, 3, 3, 4, 4, 5, 5, 6) as well as on the five rows below.
 ///
-/// The **boundary door adds nothing to the count**: a slice prices exactly 800 iterations
-/// (`reductions == 5N + 5` against a 4 000-unit budget) and 800 is a multiple of `K`, so each
-/// slice-end boundary falls on a cycle boundary and any collection it takes is one the following
-/// admission would have taken anyway. Measured (this host, debug build) at N = 5 000 / 10 000 /
-/// 25 000 / 50 000 / 100 000: `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against
-/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 0 and
+/// The **boundary door adds nothing to the count**, and slice length is not what makes that true:
+/// a slice prices at most `4 000 / 3 = 1 333` iterations (`reductions == 3N + 5` plus one unit per
+/// pre-emption, against a 4 000-unit budget) and 1 333 is **not** a multiple of `K`, so a slice-end
+/// boundary lands mid-cycle on roughly half the rows. What keeps the cadence exact is the door's
+/// own **occupancy watermark**: it may only collect once seven eighths of the settled capacity is
+/// used (`BOUNDARY_OCCUPANCY_NUM`/`_DEN` in `../context/gc/reds_door.rs`), so a boundary needs at
+/// least `7/8 x K` iterations of a cycle already allocated in the space. For any capacity carrying
+/// fewer than eight iterations that rounds up to the **whole** cycle — here `7/8 x 2 = 1.75`, i.e.
+/// both of the cycle's 401-word iterations (`7/8 x 843 = 737.6` words, cleared by the 802 words two
+/// iterations fill and not by the 401 one iteration fills). A boundary offered after one iteration
+/// therefore declines, and one offered after the cycle's two is exactly the state in which the
+/// **next** admission request would have collected: a firing takes that collection instead of
+/// adding one, and the space it leaves behind restarts the cycle from the same point, so the count
+/// stays `1 + N/K` whatever phase the boundaries land on. (Where a row settles on the 987-word
+/// capacity its one fullsweep installed, the two-iteration fill of 802 words stays below
+/// `987 x 7/8 = 863.6`, so no boundary fires at all there — the other way the count is preserved.)
+/// Measured (this host, debug build) at N = 5 000 / 10 000 / 25 000 / 50 000 / 100 000:
+/// `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against `yields` = 3 / 7 / 18 / 37 /
+/// 75, at an 843-word nursery capacity (987 after the fullsweep) with `major` 0 or 1 and
 /// `debt_boundaries` 0 on every row.
 ///
 /// # What would make it regress
@@ -4224,9 +4237,12 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 ///   collecting): the retired chain would rise above one space and a boundary would observe
 ///   collection debt;
 /// * a change to the fixture's `test_heap` request: `K` moves with the footprint;
-/// * a slice-granularity change (`RUN_STEP_SLICES`, `DEFAULT_REDUCTIONS_PER_SLICE`) that made a
-///   slice price a non-multiple of `K` iterations — a boundary collection would then land
-///   mid-cycle and add to the count.
+/// * a slice-granularity change (`RUN_STEP_SLICES`, `DEFAULT_REDUCTIONS_PER_SLICE`): harmless on
+///   its own — every boundary's *phase* moves with the slice length, and the watermark is what
+///   keeps a mid-cycle firing impossible for a capacity carrying fewer than eight iterations —
+///   but a settled nursery carrying eight or more of them would let a boundary collect with the
+///   cycle only part-used, and that collection is then additional to the admission's instead of
+///   taking its place.
 #[test]
 fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
     // Five N, spanning a slice boundary count from 2 to 26: the relation is checked on every row
