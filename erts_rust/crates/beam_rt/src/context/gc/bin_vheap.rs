@@ -461,6 +461,31 @@ pub(crate) fn reclaim(
         .filter(|binary| binary.refcount() > 1)
         .map(|binary| binary.data_ptr() as usize)
         .collect();
+    // TEMP INSTRUMENTATION (investigation only)
+    {
+        let mut by_live = 0usize;
+        let mut by_shared_only = 0usize;
+        let mut dropped = 0usize;
+        for binary in machine.refc_binaries() {
+            let p = binary.data_ptr() as usize;
+            if live.binary_search(&p).is_ok() {
+                by_live += 1;
+            } else if shared.contains(&p) {
+                by_shared_only += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        crate::debug_trace::trace(format_args!(
+            "PROBE pid={pid:?} reservoir={} live={} shared={} retained_by_live={by_live} \
+             retained_by_shared_only={by_shared_only} dropped={dropped} overhead={} limit_words={}",
+            machine.refc_binaries().len(),
+            live.len(),
+            shared.len(),
+            machine.off_heap_overhead_bytes(),
+            reclaimer.limit_words(),
+        ));
+    }
     let released = machine.retain_refc_binaries(|payload| {
         let payload = payload as usize;
         live.binary_search(&payload).is_ok() || shared.contains(&payload)
