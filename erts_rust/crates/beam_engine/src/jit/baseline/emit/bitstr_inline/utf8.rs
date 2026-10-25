@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! The `bs_skip_utf8` shape.
+//! The UTF-8 shapes: `bs_skip_utf8` and its value-binding twin `bs_get_utf8`.
 //!
 //! A UTF-8 character is **one to four bytes**, and the lead byte says how many
 //! (`decode_utf8`, `families::bitstrings::matching::reads.rs`): `0x00..=0x7F` is ASCII
@@ -91,9 +91,26 @@
 //! All four paths converge on **one** commit block, so "commits exactly once" is
 //! structural rather than an argument about four sequences happening to be exclusive:
 //! each path materialises its own bit length into `rcx` and jumps there, and no path can
-//! reach another's arithmetic. Because the commit goes through the block pointer the
-//! match-context guard left in [`MOVE_SCRATCH`], it is already sound for a
-//! `bs_get_utf8` whose destination **is** the context operand.
+//! reach another's arithmetic.
+//!
+//! # The get form's commit precedes the destination store
+//!
+//! Both opcodes share one shape type ([`Utf8Shape`], whose `dst` is `None` for the skip
+//! form) and one emitted body ([`emit_utf8`], whose [`Utf8Mode`] selects whether the decoded
+//! scalar is bound), exactly as the [`super::utf16`] pair does: they read the same bytes,
+//! carry the same guards and transfer to the same fail label, and differ **only** in whether
+//! the scalar is bound.
+//!
+//! The get form's destination frame-window guard is emitted **first** — before the
+//! match-context guard, the window check and every load — so the guard phase is complete
+//! before anything can be written, and the destination store lives **inside** the single
+//! `commit` block, after the `start` write. That order is what makes the sequence sound for a
+//! `bs_get_utf8` whose destination **is** the context operand (`beam_asm:filter_essentials/1`
+//! compiles that): the commit goes through the block pointer the match-context guard left in
+//! [`MOVE_SCRATCH`], so the context is never re-read from an operand the store has
+//! overwritten. There is still exactly one commit site and one store site per execution, and
+//! the bound value is a bare `make_small` (at most `21` bits), so nothing allocates on any
+//! path.
 //!
 //! # No helper, and no position store
 //!
@@ -103,8 +120,9 @@
 //! body re-entered from the driver needs, and the only exits here are the in-block
 //! `fast_done` continuation, the linker's fail-label exit (`Linker::emit_exit`, which
 //! carries the `pc` it stores) and the `fallback`'s own `emit_step_and_continue`, which
-//! stores the position itself. Nothing allocates either — the shape materialises no term
-//! at all — so no moving collection can run part-way through.
+//! stores the position itself. Nothing allocates either — the skip form materialises no term
+//! at all and the get form's bound value is a bare `make_small` (at most `21` bits), so no
+//! moving collection can run part-way through.
 
 use beam_common::Result;
 use beam_loader::{Label, Operand, NO_FAIL};
@@ -113,14 +131,14 @@ use crate::interpreter::LabelMap;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::link::{ExitSpill, Linker};
-use super::super::operands::Loc;
+use super::super::operands::{Loc, Y_ADDR_SCRATCH};
 use super::{
     emit_ctx_guard, emit_step_and_continue, emit_subject_view, Allocation, MOVE_SCRATCH,
-    SUB_BITS_END_DISP, SUB_BITS_START_DISP,
+    MOVE_SCRATCH_2, SMALL_TAG, SUB_BITS_END_DISP, SUB_BITS_START_DISP,
 };
 
 #[cfg(test)]
-use super::{record_inlined, SHAPE_SKIP_UTF8};
+use super::{record_inlined, SHAPE_GET_UTF8, SHAPE_SKIP_UTF8};
 /// The number of bits a UTF-8 character's **lead** byte occupies — `decode_utf8`'s
 /// `end < start + 8` truncation test, and the width of the one read every path makes.
 const UTF8_LEAD_BITS: u32 = 8;
@@ -173,23 +191,27 @@ const SURROGATE_SPAN: u32 = 0x7FF;
 const UNICODE_MAX: u32 = 0x10_FFFF;
 
 // ---------------------------------------------------------------------------
-// The shape: `bs_skip_utf8 { fail, ctx, live, flags }`
+// The shapes: `bs_skip_utf8 { fail, ctx, live, flags }` and
+// `bs_get_utf8 { fail, ctx, live, flags, dst }`
 // ---------------------------------------------------------------------------
 
 /// The operands of a UTF-8 shape the tier lowers natively.
 ///
-/// Only the match-context operand: the skip form binds nothing, so there is no second
-/// operand to record, and `flags` is not part of the shape at all (the family ignores it
-/// — see the module docs).
+/// One type for both opcodes: the bytes they read, the guards they carry and the fail label
+/// they transfer to are identical, and the only difference is whether the decoded scalar is
+/// bound — which is exactly what [`Utf8Shape::dst`] records (`None` for the skip form).
+/// `flags` is not part of the shape at all (the family ignores it — see the module docs).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Utf8Shape {
     /// The match-context operand's location.
     ctx: Loc,
+    /// The get form's destination, or `None` for the skip form.
+    dst: Option<Loc>,
 }
 
 impl Utf8Shape {
-    /// The [`Utf8Shape`] the instruction's `ctx` names, or `None` when the whole
-    /// instruction must stay on the family.
+    /// The [`Utf8Shape`] the instruction's `ctx` names for the **skip** form, or `None` when
+    /// the whole instruction must stay on the family.
     ///
     /// Purely syntactic and **label-free** — the fail-label resolution is the caller's — so
     /// the block's Y gate ([`super::super::arith::uses_y`]) derives the same answer as the
@@ -197,30 +219,57 @@ impl Utf8Shape {
     /// rather than an approximation: `ctx` is an in-bound x-register or an addressable `Y`
     /// slot ([`Loc::of`]).
     pub(crate) fn of(ctx: &Operand) -> Option<Utf8Shape> {
-        Some(Utf8Shape { ctx: Loc::of(ctx)? })
+        Self::with_dst(ctx, None)
     }
 
-    /// The x-register indices the shape touches — the context only.
+    /// [`Utf8Shape::of`] for the **get** form, whose [`Utf8Shape::dst`] is `dst`.
+    ///
+    /// The get form adds one compile-time condition: `dst` must be an in-bound x-register or
+    /// an addressable `Y` slot, because the scalar is bound with a plain register/heap store
+    /// and no allocation (it is at most `21` bits, so a bare `make_small`). Also label-free,
+    /// for the same reason as [`Utf8Shape::of`].
+    pub(crate) fn of_get(ctx: &Operand, dst: &Operand) -> Option<Utf8Shape> {
+        Self::with_dst(ctx, Some(Loc::of(dst)?))
+    }
+
+    /// The one body both constructors share, so the two cannot disagree about the context
+    /// operand's addressability.
+    fn with_dst(ctx: &Operand, dst: Option<Loc>) -> Option<Utf8Shape> {
+        Some(Utf8Shape {
+            ctx: Loc::of(ctx)?,
+            dst,
+        })
+    }
+
+    /// The x-register indices the shape touches — the context and, for the get form, the
+    /// destination.
     pub(crate) fn registers(&self) -> Vec<u32> {
-        self.ctx.register().into_iter().collect()
+        let mut registers = Vec::with_capacity(2);
+        registers.extend(self.ctx.register());
+        registers.extend(self.dst.and_then(Loc::register));
+        registers
     }
 
-    /// The x-register indices the shape **writes**: none. Its only mutation is the
-    /// context's `start` **heap** word, not an x-register store, so a block that lowers it
-    /// leaves `machine.x`'s cached registers untouched. (Charged anyway — an empty set —
-    /// so the four regalloc mirrors stay one decision.)
+    /// The x-register indices the shape **writes**: the get form's destination, and nothing
+    /// for the skip form. Charging a bound destination is **mandatory** — the scalar lands in
+    /// its cache register, so an uncharged write would let a stale cache register survive a
+    /// block exit: a wrong value rather than a redundant store. (The context's `start` word is
+    /// a *heap* store, not an x-register write, so it is charged through neither.)
     pub(crate) fn writes(&self) -> Vec<u32> {
-        Vec::new()
+        self.dst.and_then(Loc::register).into_iter().collect()
     }
 
-    /// The x-register indices the shape **reads** — the context only.
+    /// The x-register indices the shape **reads** — the context only. Split from
+    /// [`Utf8Shape::registers`] for the get form, whose destination is written and never
+    /// read: the prologue's entry-load decision ([`super::super::liveness::fill_sets`]) must
+    /// not load a register the instruction only writes.
     pub(crate) fn reads(&self) -> Vec<u32> {
         self.ctx.register().into_iter().collect()
     }
 
     /// Whether the lowering reads the current frame's Y window.
     pub(crate) fn uses_y(&self) -> bool {
-        self.ctx.is_y()
+        self.ctx.is_y() || self.dst.is_some_and(Loc::is_y)
     }
 }
 
@@ -240,6 +289,19 @@ pub(crate) fn skip_utf8_shape(
     utf8_fail_target(labels, fail).map(|target| (shape, target))
 }
 
+/// The inlinable shape of a `bs_get_utf8` — [`skip_utf8_shape`]'s twin, with the bound
+/// destination and the same fail half (and therefore the same two refusals plus the
+/// destination's addressability).
+pub(crate) fn get_utf8_shape(
+    labels: &LabelMap,
+    fail: Label,
+    ctx: &Operand,
+    dst: &Operand,
+) -> Option<(Utf8Shape, (u32, u32))> {
+    let shape = Utf8Shape::of_get(ctx, dst)?;
+    utf8_fail_target(labels, fail).map(|target| (shape, target))
+}
+
 /// The `(function, code)` target a fail-carrying UTF-8 shape transfers to, or `None` when
 /// the fail operand is one this tier cannot inline.
 ///
@@ -256,9 +318,11 @@ fn utf8_fail_target(labels: &LabelMap, fail: Label) -> Option<(u32, u32)> {
 /// it (see [`super::try_inline_bs_get_position`] for the return convention).
 ///
 /// The guarded sequence, in this order — every guard first, then the loads and the validity
-/// tests, then the one commit:
+/// tests, then the one commit (the get form adds its destination's frame-window guard first
+/// and the bound-scalar store last; see [`try_inline_bs_get_utf8`]):
 ///
 /// ```text
+///   [get only] <the destination's frame-window guard>  ; not addressable -> fallback; r9 = addr
 ///   <the match-context guard>            ; not a context -> fallback; r11 = the block base
 ///   mov  rsi, [ctx + 16]                 ; start
 ///   mov  r8,  [ctx + 24]                 ; end
@@ -295,6 +359,8 @@ fn utf8_fail_target(labels: &LabelMap, fail: Label) -> Option<(u32, u32)> {
 /// commit:
 ///   add  rsi, rcx
 ///   mov  [r11 + 16], rsi                 ; THE COMMIT, after every guard, reached ONCE
+///   [get only] r8 = (r8 << 4) | SMALL_TAG ; make_small, zero allocation
+///   [get only] mov  <Dst>, r8            ; the bind, AFTER the commit
 ///   jmp  fast_done
 /// fail_arm:
 ///   <the linker's exit to the fail label>     ; a terminator on that path only
@@ -335,6 +401,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_skip_utf8(
         buffer,
         linker,
         shape,
+        Utf8Mode::Skip,
         target,
         allocation,
         done,
@@ -343,6 +410,64 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_skip_utf8(
         highest_touched,
     )?;
     Ok(true)
+}
+
+/// Emit `bs_get_utf8 Fail Ctx Live Flags Dst` natively — [`try_inline_bs_skip_utf8`]'s
+/// value-binding twin.
+///
+/// One shape predicate differs (the destination's addressability) and one part of the body,
+/// which is why both entries funnel into [`emit_utf8`]: the get form emits its destination's
+/// frame-window guard **before** anything else, and binds the decoded scalar **after** the
+/// context commit. The two orders are not interchangeable in the sequence even though they
+/// reach the same state, because `Dst` may **be** `Ctx` (`beam_asm:filter_essentials/1`
+/// compiles that): the commit goes through the pointer the match-context guard left in
+/// [`MOVE_SCRATCH`], so the context is never re-read from an operand the bind has overwritten.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::jit::baseline::emit) fn try_inline_bs_get_utf8(
+    buffer: &mut CodeBuffer,
+    labels: &LabelMap,
+    linker: &Linker<'_>,
+    fail: Label,
+    ctx: &Operand,
+    dst: &Operand,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Some((shape, target)) = get_utf8_shape(labels, fail, ctx, dst) else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    record_inlined(SHAPE_GET_UTF8);
+
+    emit_utf8(
+        buffer,
+        linker,
+        shape,
+        Utf8Mode::Get,
+        target,
+        allocation,
+        done,
+        func,
+        pc,
+        highest_touched,
+    )?;
+    Ok(true)
+}
+
+/// Whether [`emit_utf8`] is emitting the skip form or the get form.
+///
+/// The **only** difference between the two bodies: the get form carries a destination, whose
+/// frame-window guard is emitted first, whose decoded scalar is left in `r8` by all four
+/// successful paths, and whose bind follows the commit.
+#[derive(Clone, Copy, Debug)]
+enum Utf8Mode {
+    /// `bs_skip_utf8`: the character is validated and discarded.
+    Skip,
+    /// `bs_get_utf8`: the decoded scalar is bound to the shape's destination.
+    Get,
 }
 
 /// One of [`emit_utf8`]'s four static paths: everything about the character that the lead
@@ -370,17 +495,19 @@ struct Utf8Path {
     minimum: u32,
 }
 
-/// The emitted body: the classification, the four static paths, the single commit and the
-/// three exits.
+/// The emitted body both UTF-8 entries share: the whole guarded sequence, the single commit,
+/// the (get-only) bind, and the three exits.
 ///
-/// `target` is the already-resolved fail label and the shape's own operand is already a
-/// [`Loc`], so this body makes no decision the shape predicate did not — which is what keeps
-/// the predicate (and the block's Y gate) in lockstep with what is emitted.
+/// `target` is the already-resolved fail label, `mode` names which of the two opcodes this is
+/// and the shape's own operands are already `Loc`s, so this body makes no decision the shape
+/// predicates did not — which is what keeps the two entries (and the block's Y gate) in
+/// lockstep.
 #[allow(clippy::too_many_arguments)]
 fn emit_utf8(
     buffer: &mut CodeBuffer,
     linker: &Linker<'_>,
     shape: Utf8Shape,
+    mode: Utf8Mode,
     target: (u32, u32),
     allocation: &Allocation,
     done: CodeLabel,
@@ -393,6 +520,21 @@ fn emit_utf8(
     let fast_done: CodeLabel = buffer.label();
     let sat: CodeLabel = buffer.label();
     let commit: CodeLabel = buffer.label();
+
+    // The get form's destination guard first — the guard phase of a lowering that writes a
+    // destination is complete before anything can be written, so a rejection leaves the
+    // register/heap untouched. It leaves an addressable `Y` slot's address in
+    // [`Y_ADDR_SCRATCH`], which the whole sequence below leaves alone (it works in
+    // `rsi`/`r8`/`rcx`/`rdx`/`rdi`/`rax`/`r10`/`r11`), so the bind can store through it
+    // without a second guard — and, for an x-register destination, it emits nothing.
+    // `MOVE_SCRATCH_2` is the window-bound scratch here, never `Y_ADDR_SCRATCH_2`: `r8` is
+    // this shape's `end`, then its decoded scalar.
+    if let Utf8Mode::Get = mode {
+        let dst = shape
+            .dst
+            .expect("the get form's shape always carries a destination");
+        dst.guard_store(buffer, Y_ADDR_SCRATCH, MOVE_SCRATCH_2, fallback)?;
+    }
 
     emit_ctx_guard(buffer, shape.ctx, allocation, fallback, highest_touched)?;
 
@@ -508,11 +650,26 @@ fn emit_utf8(
     // after every guard and after the loads and validity tests (which mutate nothing), so a
     // `fallback` anywhere above re-executes the instruction against an untouched context. It
     // goes through the pointer `emit_ctx_guard` left in `MOVE_SCRATCH`, never a re-read of
-    // the context operand — which is what makes it sound for a `bs_get_utf8`'s `Dst == Ctx`
-    // case, whose bind will follow it.
+    // the context operand — which is what makes it sound for the get form's `Dst == Ctx`
+    // case, whose bind follows it.
     buffer.bind(commit)?;
     buffer.add_rr(Reg::Rsi, Reg::Rcx)?;
     buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)?;
+
+    // The get form's bind, **after** the commit: `make_small(raw)` — `(raw << 4) |
+    // TAG_IMMED1_SMALL`, zero allocation, the same two instructions `bs_get_integer2`,
+    // `bs_get_utf32` and `bs_get_utf16` emit. `rcx`'s bit length is already consumed by the
+    // `add` above, and all four paths leave the decoded scalar in `r8`. Inside this one
+    // block, so there is still exactly ONE commit site and one bind site per execution.
+    if let Utf8Mode::Get = mode {
+        let dst = shape
+            .dst
+            .expect("the get form's shape always carries a destination");
+        buffer.shl_ri(Reg::R8, 4)?;
+        buffer.mov_ri(Reg::Rcx, SMALL_TAG)?;
+        buffer.or_rr(Reg::R8, Reg::Rcx)?;
+        dst.store_at(buffer, Y_ADDR_SCRATCH, Reg::R8, allocation, highest_touched)?;
+    }
     buffer.jmp(fast_done)?;
 
     buffer.bind(fail_arm)?;

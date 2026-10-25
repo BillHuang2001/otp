@@ -22,8 +22,8 @@
 //! match-context shapes (the seven position/tail/start-match/integer extractors, the static
 //! `bs_match` and `bs_match_string` compares, and the `bs_skip_utf32`/`bs_get_utf32`
 //! character pair) plus the variable-width character groups
-//! `bs_skip_utf16`/`bs_get_utf16` and `bs_skip_utf8` and the `bs_create_bin` private-append
-//! construction shape.
+//! `bs_skip_utf16`/`bs_get_utf16` and `bs_skip_utf8`/`bs_get_utf8` and the `bs_create_bin`
+//! private-append construction shape.
 //!
 //! Every lowering here is allocation-free and raises nothing of its own: the match-context
 //! shapes read the `ErlSubBits` words and (for the mutating ones) write one word back, while
@@ -137,6 +137,11 @@ mod utf16_get_tests;
 /// oracle cross-check).
 #[cfg(test)]
 mod utf8_tests;
+/// The `bs_get_utf8` arm's own suite (the value/position rows for all four widths, the malformed
+/// characters binding nothing, the `dst == ctx` hazard, `Y` slots, the exactly-once
+/// character-consumption pin, the compile-time refusals and the live `erl` oracle cross-check).
+#[cfg(test)]
+mod utf8_get_tests;
 pub(super) use bs_match::try_inline_bs_match;
 pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 #[cfg(test)]
@@ -172,8 +177,8 @@ pub(super) use utf32::{try_inline_bs_get_utf32, try_inline_bs_skip_utf32};
 pub(crate) use utf32::{get_utf32_shape, skip_utf32_shape, Utf32Shape};
 pub(super) use utf16::{try_inline_bs_get_utf16, try_inline_bs_skip_utf16};
 pub(crate) use utf16::{get_utf16_shape, skip_utf16_shape, Utf16Shape};
-pub(super) use utf8::try_inline_bs_skip_utf8;
-pub(crate) use utf8::{skip_utf8_shape, Utf8Shape};
+pub(super) use utf8::{try_inline_bs_get_utf8, try_inline_bs_skip_utf8};
+pub(crate) use utf8::{get_utf8_shape, skip_utf8_shape, Utf8Shape};
 
 // ---------------------------------------------------------------------------
 // Constants (derived from the frozen layout owners, never re-derived)
@@ -256,7 +261,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 15;
+pub(crate) const SHAPE_COUNT: usize = 16;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -302,6 +307,9 @@ pub(crate) const SHAPE_GET_UTF16: usize = 13;
 /// The `bs_skip_utf8` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_SKIP_UTF8: usize = 14;
+/// The `bs_get_utf8` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_GET_UTF8: usize = 15;
 #[cfg(test)]
 thread_local! {
     /// How often each shape's native lowering was **emitted** (a compile-time count, so it
@@ -315,10 +323,12 @@ thread_local! {
 /// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
 /// entries. The two kinds of shape here need that count for different reasons.
 ///
-/// For the **fifteen helper-free** shapes — the eleven small match-context shapes plus the
-/// variable-width `bs_skip_utf16`/`bs_get_utf16` pair and `bs_skip_utf8` — the emission is the
-/// only observable
-/// there can be: such a shape calls no helper at all, so
+/// For the **fifteen helper-free** shapes — every shape in the roster except
+/// [`SHAPE_CREATE_BIN`], i.e. the eleven match-context shapes (the seven
+/// position/tail/start-match/integer extractors, the static `bs_match`, `bs_match_string` and
+/// `bs_skip_utf32`/`bs_get_utf32`) plus the variable-width `bs_skip_utf16`/`bs_get_utf16` and
+/// `bs_skip_utf8`/`bs_get_utf8` pairs — the emission is the only observable there can be:
+/// such a shape calls no helper at all, so
 /// [`super::super::bitstr::bitstr_calls`] never moves for it and "the inline arm ran" *is*
 /// the decision to emit.
 ///

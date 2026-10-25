@@ -471,6 +471,10 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             .map_or(false, |shape| shape.uses_y()),
         Instr::BsSkipUtf8 { ctx, .. } => super::bitstr_inline::Utf8Shape::of(ctx)
             .map_or(false, |shape| shape.uses_y()),
+        // The get form reads its context **and** writes its destination through the same
+        // guarded frame window, so either one being a `Y` slot arms the block's publish.
+        Instr::BsGetUtf8 { ctx, dst, .. } => super::bitstr_inline::Utf8Shape::of_get(ctx, dst)
+            .map_or(false, |shape| shape.uses_y()),
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }

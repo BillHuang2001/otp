@@ -103,8 +103,8 @@ use super::bif::bif_shape;
 use super::bitstr_inline::{
     match_string_shape,
     bs_match_shape, get_integer2_shape, get_position_shape, get_utf16_shape, get_utf32_shape,
-    set_position_shape, skip_bits2_shape, skip_utf16_shape, skip_utf32_shape, skip_utf8_shape,
-    start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
+    get_utf8_shape, set_position_shape, skip_bits2_shape, skip_utf16_shape, skip_utf32_shape,
+    skip_utf8_shape, start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
 };
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
@@ -544,6 +544,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
             ..
         } => get_utf16_shape(labels, *fail, ctx, *flags, dst).is_some(),
         Instr::BsSkipUtf8 { fail, ctx, .. } => skip_utf8_shape(labels, *fail, ctx).is_some(),
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => get_utf8_shape(labels, *fail, ctx, dst).is_some(),
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
         // call at all, so the label test is the honest classification.)
@@ -831,6 +834,13 @@ pub(crate) fn cacheable_touches(
                 touches.extend(shape.registers());
             }
         }
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => {
+            if let Some((shape, _)) = get_utf8_shape(labels, *fail, ctx, dst) {
+                touches.extend(shape.registers());
+            }
+        }
         _ => {}
     }
     touches
@@ -1032,6 +1042,13 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
         }
         Instr::BsSkipUtf8 { fail, ctx, .. } => {
             if let Some((shape, _)) = skip_utf8_shape(labels, *fail, ctx) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => {
+            if let Some((shape, _)) = get_utf8_shape(labels, *fail, ctx, dst) {
                 reads.extend(shape.reads());
             }
         }
@@ -1251,6 +1268,13 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         // heap word, so its write set is empty (charged anyway, so the four regalloc mirrors
         // stay one decision — see `Utf8Shape::writes`).
         Instr::BsSkipUtf8 { fail, ctx, .. } => skip_utf8_shape(labels, *fail, ctx)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // `bs_get_utf8`'s destination **is** an x-register write and must be charged, for the
+        // same reason as `bs_get_utf16`'s above (`Utf8Shape::writes` is the one definition).
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => get_utf8_shape(labels, *fail, ctx, dst)
             .map(|(shape, _)| shape.writes())
             .unwrap_or_default(),
         // Everything else deopts.

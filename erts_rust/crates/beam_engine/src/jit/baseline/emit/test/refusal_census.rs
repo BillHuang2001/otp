@@ -677,7 +677,6 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
         Instr::BsGetTail { .. } => BsVerdict::NoArm("bs_get_tail"),
         Instr::BsGetFloat2(_) => BsVerdict::NoArm("bs_get_float2"),
         Instr::BsGetBinary2(_) => BsVerdict::NoArm("bs_get_binary2"),
-        Instr::BsGetUtf8 { .. } => BsVerdict::NoArm("bs_get_utf8"),
         Instr::BsSkipUtf32 {
             fail, ctx, flags, ..
         } => {
@@ -726,6 +725,20 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
             // `decode_utf8` takes no flags and the arm accepts every flags word. That leaves the
             // shared fail half and the context operand's form.
             let reason = fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx]));
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsGetUtf8 {
+            fail, ctx, dst, ..
+        } => {
+            const OP: &str = "bs_get_utf8";
+            if bitstr_inline::get_utf8_shape(labels, *fail, ctx, dst).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The skip twin's refusals plus the destination's — and again no field rule: UTF-8
+            // has no endianness, so the family's `decode_utf8` takes no flags and the arm
+            // accepts every flags word, which leaves the shared fail half and the operand form
+            // (`ctx` or `dst`).
+            let reason = fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx, dst]));
             BsVerdict::Refused(OP, reason)
         }
         Instr::BsSkipUtf16 {

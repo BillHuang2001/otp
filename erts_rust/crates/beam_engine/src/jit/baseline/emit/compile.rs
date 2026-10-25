@@ -650,7 +650,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             // carries a lead-byte classification and then **four** static paths, each with its
             // own window check, its own over-read guard and its own fixed continuation reads —
             // the widest of the whole bitstring set.
-            Instr::BsSkipUtf8 { .. } => {
+            Instr::BsSkipUtf8 { .. } | Instr::BsGetUtf8 { .. } => {
                 bs_paths += 1;
                 utf8_paths += 1;
             }
