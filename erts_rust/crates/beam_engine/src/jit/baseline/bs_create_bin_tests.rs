@@ -383,8 +383,6 @@ fn assert_construction_row(
 /// What one counted run of a row reported, extracted into owned data so it can outlive the
 /// run's heap.
 struct RunReport {
-    /// The returned term reinterpreted as an integer (`signed_value`).
-    value: i64,
     /// The returned binary's payload, when the result is a byte-aligned binary.
     bytes: Option<Vec<u8>>,
     /// The returned term's bit size, when it is a bitstring.
@@ -415,10 +413,6 @@ fn run_counting(
     counters::set_enabled(false);
     let snapshot = counters::snapshot();
     // Extract everything the assertions need into owned data while the heap is still alive.
-    let value = match &outcome {
-        Ok(RunOutcome::Returned(term)) => beam_term::signed_value(*term),
-        _ => 0,
-    };
     let bytes = match &outcome {
         Ok(RunOutcome::Returned(term)) => crate::terms::binary_bytes(*term).ok().map(<[u8]>::to_vec),
         _ => None,
@@ -428,7 +422,6 @@ fn run_counting(
         _ => None,
     };
     RunReport {
-        value,
         bytes,
         bits,
         counters: snapshot,
@@ -957,7 +950,7 @@ fn the_built_binary_is_usable_as_a_heap_term_afterwards() {
         |interpreter, baseline| {
             assert_same_outcome("reuse as a heap term", interpreter, baseline, &module.atom_table);
             for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
-                let tuple = *returned("reuse as a heap term", tier, outcome);
+                let tuple = returned("reuse as a heap term", tier, outcome);
                 assert_eq!(
                     crate::terms::tuple_arity(tuple)
                         .unwrap_or_else(|error| panic!("{tier}: not a tuple: {error:?}")),
