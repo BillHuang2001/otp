@@ -125,6 +125,35 @@ fn read_words_at(rt: &mut Runtime, address: usize, count: usize) -> Option<Vec<E
     found
 }
 
+/// Reads `count` words starting at `address` back out of the engine **arena**, without ever
+/// dereferencing a pointer.
+///
+/// This is the arena's counterpart to [`read_words_at`]: that one scans the runtime's *own* store
+/// regions ([`Runtime::for_each_off_heap_region`]) and deliberately not the arena, while a term
+/// built through [`Runtime::alloc_words`] stands in the arena's ladder — which is exactly the set
+/// of regions the pass's Tier A rewind drops. Asking the arena for the region whose address span
+/// contains `address` (never a fabricated extent) makes "the region holding this term survived"
+/// observable directly, at the term's own address.
+///
+/// [`Runtime::for_each_off_heap_region`]: crate::runtime::Runtime::for_each_off_heap_region
+/// [`Runtime::alloc_words`]: crate::runtime::Runtime::alloc_words
+fn read_arena_words_at(rt: &mut Runtime, address: usize, count: usize) -> Option<Vec<Eterm>> {
+    let width = size_of::<Eterm>();
+    let mut found: Option<Vec<Eterm>> = None;
+    rt.arena.for_each_heap_region(|words| {
+        if found.is_some() {
+            return;
+        }
+        let base = words.as_mut_ptr() as usize;
+        let end = base + words.len() * width;
+        if address >= base && address + count * width <= end {
+            let start = (address - base) / width;
+            found = Some(words[start..start + count].to_vec());
+        }
+    });
+    found
+}
+
 /// Asserts a decline was recorded with `reason` and that the pass moved no counter.
 fn assert_declined(rt: &Runtime, before: RegionReclaimStats, reason: &'static str) {
     let after = rt.region_reclaim_stats();
@@ -732,16 +761,46 @@ fn a_move_keeps_the_stores_capacity_and_the_headroom_the_growth_policy_gave_it()
         payload_words <= capacity_before - used_before,
         "the premise: {payload_words} words fit the store before the move"
     );
+    // The payload stands in the **arena**, above the window's mark — i.e. inside exactly the range
+    // the pass's Tier A rewind drops when nothing reachable stands in it. A term held only in a
+    // Rust local is reachable from no root family, so the caller must hand it over as a value root:
+    // `PassInput::value_roots` is the caller's half of the pass's root set, and the pass cannot see
+    // a local. Without the hand-over the rewind fires (correctly — nothing the runtime can
+    // enumerate names the list) and the copy below reads a **released** region, which is sound only
+    // by luck: the words usually still hold the list, and a concurrent test thread that reuses the
+    // freed carrier makes the copy silently truncated.
+    let payload_address = beam_term::list::ptr_val(payload) as usize;
+    let payload_in_arena = read_arena_words_at(&mut rt, payload_address, 2)
+        .expect("the payload's first cons cell stands in an arena region above the mark");
+    let arena_live_before = rt.arena.heap_stats().live_words;
+    let arena_reclaims_before = rt.region_reclaim_stats().arena_reclaims;
 
     move_pass(
         &mut rt,
-        &[],
+        &[payload],
         &mut MoveSlots::new(vec![&mut a, &mut b, &mut c]),
     );
     let stats = rt.region_reclaim_stats();
     assert_eq!(stats.store_compactions, 1, "the move fired");
     assert_eq!(stats.store_move_declines, 0, "and declined nothing");
-
+    // The rooted payload really does hold the arena's rewind, and it says so the way the descent
+    // decided it: the region the list stands in survives, so the source of the copy below is live
+    // at its own address. No counter and no timing is involved — the same address reads back
+    // word-for-word.
+    assert_eq!(
+        stats.arena_reclaims, arena_reclaims_before,
+        "a value root standing above the mark declines the arena rewind"
+    );
+    assert_eq!(
+        rt.arena.heap_stats().live_words,
+        arena_live_before,
+        "so the arena is untouched"
+    );
+    assert_eq!(
+        read_arena_words_at(&mut rt, payload_address, 2),
+        Some(payload_in_arena),
+        "and the payload still reads back word-for-word where it stands"
+    );
     // ---- 1. headroom: the same live volume in the same store must have the same room -----------
     let live_after = rt.eval_heap.used();
     assert!(
