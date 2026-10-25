@@ -37,13 +37,13 @@
 //! words one iteration reserves on the process heap therefore went from **13** (`junk/1` alone,
 //! when the tuple stayed on the pool) to **17** — `junk/1`'s 13 plus the tuple's 4 (1 header + 3
 //! small integers) — and, one nursery space being 233 words, the fill period went from 17
-//! iterations (`233 / 13`) to **13** (`233 / 17`). The measured collection counts moved with it
-//! (385 at N = 5 000 where the old tree reported 294), and — the direct statement that the tuple
+//! iterations (`233 / 13`) to **13** (`233 / 17`). The measured collection counts followed
+//! (384 at `N = 5 000`), and — the direct statement that the tuple
 //! costs the process heap exactly what the `junk/1` beside it costs — `vp:hold/1` and
-//! `vp:control/1` now report the **identical** collection count on every measured row (601
-//! consecutive rows at `N = 0 … 600` plus the wide ladder `collections_law` tabulates, up to
-//! `N = 1 000 000`). [`WORDS_PER_ITERATION`] is where that 17 lives, and [`collections_law`]
-//! derives the rate from it.
+//! `vp:control/1` report the **identical** collection count on every measured row (the wide ladder
+//! `collections_law` tabulates, `N = 5 000 … 1 000 000`, and the 601-row low-law sweep
+//! `N = 0 … 600`, both driven by the tests below). [`WORDS_PER_ITERATION`] is where that 17 lives,
+//! and [`collections_law`] derives the rate from it.
 //!
 //! # What the tests below pin
 //!
@@ -53,8 +53,9 @@
 //!    count at every `N`.
 //! 2. **The count is a derived quantity, not a range.** The fill law ([`collections_law`]) is an
 //!    exact **floor** — every nursery fill is collected — and the run may exceed it only by
-//!    [`SURPLUS_BOUND`], a single phase-shifting cycle. Both halves are measured, and the surplus
-//!    bound is a constant `1`, not a rate.
+//!    [`surplus_bound`]`(law)`: one count for the entry frame's phase plus one per
+//!    [`COLLECTIONS_PER_SURPLUS_COUNT`] fills for the pre-emption's phase shifts. Both halves are
+//!    measured, and the surplus is a bounded **rate in the law**, not a constant.
 //! 3. **The phase is the entry frame.** The loop's *first* collection lands on iteration 8 rather
 //!    than 9 (`the_fill_law_holds_and_its_phase_is_the_entry_frame` pins both sides of every early
 //!    boundary), because the spawned process arrives with its entry frame already in the space.
@@ -107,9 +108,7 @@
 //!
 //! What this file still pins end to end is the *reason* the valve has nothing to decline here: a
 //! container result held across every admission point is an ordinary scanned root, so the counts
-//! follow the fill law exactly and the heap stays on its plateau (assertions 2–5). No assertion was
-//! dropped in the re-derivation; the two that described the old root shape were replaced by
-//! stronger ones (the exact fill law, and the identical `hold`/`control` counts).
+//! follow the fill law exactly and the heap stays on its plateau (assertions 2–5).
 //!
 //! # Recording discipline
 //!
@@ -139,23 +138,32 @@ use beam_term::{is_small, make_small, signed_value};
 /// The committed fixture: `hold/1` (the loop that keeps the BIF-specific result tuple live) and
 /// `control/1` (the same loop with an integer accumulator).
 const VP_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vp.beam");
-/// The iteration counts each measured shape is driven at, in the order the docs quote them. A 40×
+/// The iteration counts each measured shape is driven at, in the order the docs quote them. A 200×
 /// span, so a count that is *constant* in `N` (the frozen pre-fix behaviour) cannot be mistaken for
-/// a count that grows; every row is a **multi-slice** run (9, 13, 18, 35, 53, 88, 175, 263 and 350
-/// scheduler slices as measured), so the sample-based heap assertions below always have a live
-/// process to read; and the rows whose iteration count is `8` modulo
-/// [`ITERATIONS_PER_COLLECTION`] (`5 000`, `200 000`) are exactly the ones where the phase term is
-/// load-bearing rather than absorbed by the floor — they are the [`SURPLUS_BOUND`] = 1 rows of
-/// [`collections_law`]'s measured ladder.
-const COUNTS: [i64; 9] = [
-    5_000, 7_000, 10_000, 20_000, 30_000, 50_000, 100_000, 150_000, 200_000,
+/// a count that grows, and long enough that [`surplus_bound`]'s rate term is exercised well past
+/// its own denominator (the last four rows carry a non-zero surplus). Every row is a
+/// **multi-slice** run (7, 9, 13, 26, 38, 63, 126, 188, 251, 376, 626 and 1 251 scheduler slices
+/// as measured), so the sample-based heap assertions below always have a live process to read.
+const COUNTS: [i64; 12] = [
+    5_000, 7_000, 10_000, 20_000, 30_000, 50_000, 100_000, 150_000, 200_000, 300_000, 500_000,
+    1_000_000,
 ];
-/// What a release build's `process_info(P, heap_size)` may report over a whole run: the
-/// collector's two nursery-capacity plateaus, 233 words (the emulator's `min_heap_size`) and
-/// 843 words (that plus a grown space), measured at every slice boundary of every run below.
-/// It is a **constant** — the point of the assertion is that it does not move with `N`. (The
-/// sampled peak is 233 on every multi-slice row; the 843 appears only in the process's *exit-time*
-/// reading, on the rows whose last iteration lands on the grown space.)
+/// The last iteration count of the **low-law regime** sweep, `N = 0 … LOW_LAW_SWEEP_LAST`, one
+/// fresh runtime per row: the region where [`surplus_bound`]'s rate term is `0`, so its base term is
+/// the only allowance and [`SURPLUS_BASE`] is measured directly. 600 iterations is 46 nursery fills
+/// at every phase alignment the fill law has (each `N mod ITERATIONS_PER_COLLECTION` occurs 46
+/// times), and it is one of the lengths within which a single-slice run stays single-slice (the
+/// first slice covers ~1 400 iterations), so no boundary collection can be involved.
+const LOW_LAW_SWEEP_LAST: i64 = 600;
+/// What a release build's `process_info(P, heap_size)` — the summed capacity of the process's
+/// nursery chain — may report over a whole run: two plateaus, both arithmetic. **233** words is
+/// the emulator's `min_heap_size`, the single space a fresh process is created with; **609** is
+/// that space plus the 376-word one a `grow_nursery` adds (`HeapPolicy::young_minor_target_words
+/// (233) = 376`). The bound is 843, the growth table's step above 610, i.e. one step of headroom
+/// over the largest reading this shape produces.
+/// It is a **constant** — the point of the assertion is that it does not move with `N`. (Measured:
+/// the peak sampled at a slice boundary is 233 on every multi-slice row; 609 shows up only in the
+/// loop's own last reading, on the rows whose final iteration lands in the grown-chain phase.)
 const HEAP_SIZE_BOUND_WORDS: usize = 843;
 /// A generous wall-clock safety net for one measured run (the loops are pure interpreter work
 /// and finish well inside it; this only bounds a pathological hang, it is never measured).
@@ -185,6 +193,11 @@ struct LoopRun {
     peak_heap_size: usize,
     /// The largest young-heap occupancy (words) observed at a slice boundary.
     peak_used: usize,
+    /// The largest **mature-generation capacity** (words) observed at a slice boundary — the
+    /// region [`MAX_MINORS_PER_MAJOR`] divides, so the per-fullsweep room rule is read from the
+    /// run's own geometry rather than assumed. `0` on a single-slice run, where no boundary is
+    /// sampled before the process terminates.
+    peak_mature: usize,
     /// Scheduler slices the run took.
     slices: usize,
 }
@@ -221,6 +234,7 @@ fn run_loop(rt: &mut Runtime, function: &str, n: i64) -> LoopRun {
         .unwrap_or_else(|err| panic!("vp:{function}/1 must spawn: {err}"));
     let mut peak_heap_size = 0usize;
     let mut peak_used = 0usize;
+    let mut peak_mature = 0usize;
     let mut slices = 0usize;
     let deadline = Instant::now() + RUN_DEADLINE;
     while rt.process_result(pid).is_none() {
@@ -234,6 +248,7 @@ fn run_loop(rt: &mut Runtime, function: &str, n: i64) -> LoopRun {
         if let Some(process) = rt.processes().get(pid) {
             peak_heap_size = peak_heap_size.max(process.collector().heap_size_words());
             peak_used = peak_used.max(process.heap_used_words());
+            peak_mature = peak_mature.max(process.collector().mature_capacity_words());
         }
     }
     let value = rt.process_result(pid).expect("the loop returned a value");
@@ -248,6 +263,7 @@ fn run_loop(rt: &mut Runtime, function: &str, n: i64) -> LoopRun {
         returned_heap_size,
         peak_heap_size,
         peak_used,
+        peak_mature,
         slices,
     }
 }
@@ -270,12 +286,13 @@ fn decode_result(value: beam_term::Eterm, function: &str, n: i64) -> (i64, i64) 
     }
     (ints[0], ints[1])
 }
-/// Runs one shape at each iteration count in `counts` (a **fresh** runtime each time, so every row
-/// is a per-run delta) and prints the counter table; every counter is reported — including the
-/// fill law's prediction and the measured surplus over it — so a reader needs no access to this
-/// source to read the numbers.
-fn counter_table(function: &str, counts: &[i64]) -> Vec<(i64, LoopRun)> {
-    let rows: Vec<(i64, LoopRun)> = counts
+/// Runs one shape at each iteration count in `counts` — a **fresh** runtime each time, so every row
+/// is a per-run delta — asserting the two invariants that hold on every row whatever its `N`: no
+/// collection may fail, and the global GC valve must stay closed. Returns the rows unprinted, so a
+/// caller that does not want a 600-line table ([`the_fill_law_holds_and_its_phase_is_the_entry_frame`]'s
+/// low-law sweep) shares the measurement rather than growing its own.
+fn measure_rows(function: &str, counts: &[i64]) -> Vec<(i64, LoopRun)> {
+    counts
         .iter()
         .map(|n| {
             let mut rt = runtime_with_fixture().expect("the fixture runtime");
@@ -287,15 +304,22 @@ fn counter_table(function: &str, counts: &[i64]) -> Vec<(i64, LoopRun)> {
             );
             (*n, row)
         })
-        .collect();
+        .collect()
+}
+/// [`measure_rows`] plus the printed counter table; every counter is reported — including the
+/// fill law's prediction and the measured surplus over it — so a reader needs no access to this
+/// source to read the numbers.
+fn counter_table(function: &str, counts: &[i64]) -> Vec<(i64, LoopRun)> {
+    let rows = measure_rows(function, counts);
     eprintln!(
         "counter_table vp:{function} (N : collections major fallbacks errors slices \
-         peak_heap peak_used returned | law surplus)"
+         peak_heap peak_used peak_mature returned | law surplus)"
     );
     for (n, row) in &rows {
         eprintln!(
             "counter_table vp:{function} N={n} : collections={} major={} fallbacks={} \
-             errors={} slices={} peak_heap={} peak_used={} returned={:?} | law={} surplus={}",
+             errors={} slices={} peak_heap={} peak_used={} peak_mature={} returned={:?} | law={} \
+             surplus={}",
             row.collections,
             row.major,
             row.fallbacks,
@@ -303,12 +327,34 @@ fn counter_table(function: &str, counts: &[i64]) -> Vec<(i64, LoopRun)> {
             row.slices,
             row.peak_heap_size,
             row.peak_used,
+            row.peak_mature,
             (row.returned_collections, row.returned_heap_size),
             collections_law(*n),
             row.collections as i64 - collections_law(*n) as i64,
         );
     }
     rows
+}
+/// Asserts [`collections_law`]'s two-sided bracket on one measured row: the law is an exact
+/// **floor** (every nursery fill is collected, so a run whose root set pinned the collector breaks
+/// it outright), and the run may exceed it only by [`surplus_bound`].
+fn assert_law_bracket(n: i64, row: &LoopRun) {
+    let law = collections_law(n);
+    assert!(
+        row.collections >= law,
+        "collections must be at least (N + {FILL_OFFSET}) / {ITERATIONS_PER_COLLECTION} at N={n} \
+         ({EMULATOR_MIN_HEAP_WORDS} nursery words / {WORDS_PER_ITERATION} words per iteration): \
+         {row:?}"
+    );
+    let surplus = row.collections - law;
+    let bound = surplus_bound(law);
+    assert!(
+        surplus <= bound,
+        "the surplus over the fill law must stay within {bound} (= {SURPLUS_BASE} + {law} / \
+         {COLLECTIONS_PER_SURPLUS_COUNT}) at N={n} (measured {surplus} over {law} in {} slices): \
+         {row:?}",
+        row.slices
+    );
 }
 /// The words `vp:junk/1` allocates per iteration — **13**, and this half is unchanged by the
 /// copy-out rework.
@@ -358,7 +404,7 @@ const ITERATIONS_PER_COLLECTION: u64 = EMULATOR_MIN_HEAP_WORDS / WORDS_PER_ITERA
 /// `N = 8`), and thereafter one lands every 13 iterations (`22`, `35`, `48`, `61`, …). The value 4
 /// is what makes the floor hold at **every** measured row — the first cycle is one iteration
 /// shorter than the offset alone leaves room for, so that row carries a surplus of 1 (see
-/// [`SURPLUS_BOUND`]).
+/// [`SURPLUS_BASE`]).
 const FILL_OFFSET: u64 = 4;
 /// The iteration the loop's **first** collection lands on — measured, not derived: `vp:hold(7)`
 /// collects `0` times and `vp:hold(8)` collects once, and this is where the entry frame's size is
@@ -368,10 +414,11 @@ const FILL_OFFSET: u64 = 4;
 /// It is one iteration earlier than the steady cycle would suggest, which is why the first row of
 /// the law's measured ladder carries a surplus of 1 rather than 0.
 const FIRST_FILL_ITERATION: u64 = 8;
-/// The largest **pre-emption surcharge** a run over [`collections_law`] may carry: **1**, one
-/// phase-shifting cycle, wherever in `N` it lands and however many slices the run took.
+/// The largest **pre-emption surcharge** a run over [`collections_law`] may carry, as a function of
+/// the law it is measured against: [`SURPLUS_BASE`] plus one count per
+/// [`COLLECTIONS_PER_SURPLUS_COUNT`] nursery fills, i.e. `1 + law / 5 000`.
 ///
-/// # The mechanism, and why the bound is a constant
+/// # The mechanism: a surplus count is a phase shift, and a phase shift is a rate
 ///
 /// The law counts nursery *fills*. A fill is `ceil((233 − L) / 17)` iterations long, where `L` is
 /// the live set the previous collection left in the space (the retained accumulator tuple, the
@@ -379,27 +426,65 @@ const FIRST_FILL_ITERATION: u64 = 8;
 /// and `L ≥ 30` gives 12. `L` moves by a few words between cycles — the accumulator's elements
 /// become bignums, `heap()/0`'s `process_info` result lands differently — so a cycle now and then
 /// runs one iteration long or short, and the run's total ends up **one count** off the law and
-/// stays there (the phase is shifted for the rest of the run). A single cycle of ±1 iteration can
-/// never move the total by a second count, because that would take a whole 13-iteration fill of
-/// shortening, i.e. ~13 unlucky cycles in a row — which the measured corpus never shows.
+/// stays there (the phase is shifted for the rest of the run).
 ///
-/// # Measured (deterministic; three identical repetitions of the whole table)
+/// What makes that happen at all is the pre-emption: the reduction/yield-boundary door
+/// (`src/context/gc/reds_door.rs`) collects at a slice boundary when the allocation area is past
+/// its occupancy watermark, and such a collection empties a space that has not *quite* filled — one
+/// count the law never charged. Every slice boundary is one such opportunity, so the number of
+/// phase shifts is proportional to the **slice count**, and the slice count is proportional to `N`.
+/// The surplus is therefore a *rate in the law*, not a constant: `1` catches the entry-frame phase
+/// offset (the one count [`FILL_OFFSET`] leaves room for), and the rate term catches the boundary
+/// shifts. It is also a **linear** rate — the property the assertion exists to hold: an
+/// accumulating root would make the gap superlinear, and 9 counts at `N = 1 000 000` is nowhere
+/// near that.
 ///
-/// Over **601 consecutive rows** (`N = 0 … 600`, one fresh runtime each) the surplus from the law
-/// is `0` in 598 rows and `1` in exactly three (`N = 8`, `580`, `593`); it is never negative — the
-/// law is a floor. Over the wide ladder behind [`collections_law`]'s table (`N = 5 000 … 1 000 000`
-/// / up to 1 749 slices) it is `0`, except `1` at `N = 5 000` and `N = 200 000`, the two
-/// rows where `N ≡ 8 (mod 13)`. It is a **constant** bound, not a rate: this replaced the old
-/// `SURPLUS_FLOOR + slices / 50` (which at 1 749 slices allowed 35 extra counts) because the
-/// measured surplus no longer grows with the slice count — with 17 words per iteration the
-/// reduction/yield-boundary door (`src/context/gc/reds_door.rs`) reaches its 7/8 watermark
-/// (`204` words, iteration 12 of a 13-iteration fill) too late in the fill to waste a whole cycle,
-/// where the old 13-word shape left ~2 iterations of slack per firing.
+/// # Measured (deterministic; the whole ladder reproduced identically by consecutive runs)
 ///
-/// **Re-derive it** if [`WORDS_PER_ITERATION`], the door's 7/8 watermark or the collector's
+/// The wide ladder behind [`collections_law`]'s table, as `surplus / law`:
+///
+/// | N | slices | surplus | law | surplus per collection |
+/// |---|---|---|---|---|
+/// | 5 000 … 50 000 | 7 … 63 | 0 | 384 … 3 846 | — |
+/// | 100 000 | 126 | 1 | 7 692 | 1 in 7 692 |
+/// | 150 000 | 188 | 2 | 11 538 | 1 in 5 769 |
+/// | 200 000 | 251 | 2 | 15 384 | 1 in 7 692 |
+/// | 300 000 | 376 | 2 | 23 077 | 1 in 11 538 |
+/// | 500 000 | 626 | 5 | 38 461 | 1 in 7 692 |
+/// | 1 000 000 | 1 251 | 9 | 76 923 | 1 in 8 547 |
+///
+/// The worst row is `N = 150 000` at 1 in 5 769 — 0.017 % of the law — and the long rows settle at
+/// 1 in 7 700 … 8 500, so [`COLLECTIONS_PER_SURPLUS_COUNT`] = 5 000 is ~1.15× the worst rate and
+/// still ~2× the asymptotic one: a bound that a superlinear surplus leaves in a few hundred
+/// thousand iterations, and that the measured ladder sits inside with margin ≥ 1 count on every
+/// row. In slice terms the same figure reads ~1 shift per 80 slices (the loops run ~61 collections
+/// per slice: 1 251 slices / 76 932 collections at `N = 1 000 000`), against a measured 1 per
+/// 94 … 190.
+///
+/// Over the **low-law regime** (`N = 0 … 600`, i.e. every phase alignment of the first 46 fills,
+/// where the rate term is `0` and only [`SURPLUS_BASE`] applies) the surplus is `0` in 600 of the
+/// 601 rows and `1` in exactly one — `N = 8`, the entry-frame row. That sweep is run by
+/// `the_fill_law_holds_and_its_phase_is_the_entry_frame`, so the base term is measured, not
+/// asserted from memory.
+///
+/// **Re-derive it** if [`WORDS_PER_ITERATION`], the door's occupancy watermark or the collector's
 /// growth policy changes: print the table (every test that drives [`COUNTS`] prints it) and take
-/// the largest surplus over a long ladder.
-const SURPLUS_BOUND: u64 = 1;
+/// the largest `surplus / law` over a long ladder.
+fn surplus_bound(law: u64) -> u64 {
+    SURPLUS_BASE + law / COLLECTIONS_PER_SURPLUS_COUNT
+}
+/// How many nursery fills one surplus count over [`collections_law`] may be charged for — the
+/// denominator of [`surplus_bound`]'s rate term, derived from the measured ladder in its own docs:
+/// 5 000 sits ~1.15× above the worst measured rate (1 surplus count per 5 769 collections, at
+/// `N = 150 000`) and ~2× above the asymptotic one (1 per ~8 500).
+const COLLECTIONS_PER_SURPLUS_COUNT: u64 = 5_000;
+/// The fixed part of [`surplus_bound`]: the one count the **entry frame**'s phase offset buys.
+///
+/// [`FILL_OFFSET`] is the constant that makes the law a floor at every measured row, and it is one
+/// count *short* of the measured phase: the first collection lands on iteration
+/// [`FIRST_FILL_ITERATION`] = 8 while the law charges nothing until `N = 12`, so that row carries a
+/// surplus of 1 — the only surplus the low-law regime ever shows (600 of its 601 rows carry 0).
+const SURPLUS_BASE: u64 = 1;
 /// The mature space a `vp:hold/1` fullsweep installs, in words — the budget every minor
 /// collection between two fullsweeps draws on.
 ///
@@ -412,6 +497,18 @@ const SURPLUS_BOUND: u64 = 1;
 /// WORDS_PER_ITERATION`, the nursery's fill) ⇒ `next_words(2 × 289 = 578)` = **610** words, the
 /// growth table's step above 376. Every later fullsweep re-derives the same 610 from the same live
 /// set, so it is a fixed point rather than a ratchet.
+///
+/// # Measured
+///
+/// [`LoopRun::peak_mature`] samples `AnyCollector::mature_capacity_words()` at every slice boundary
+/// of every run: on **every** multi-slice `vp:hold/1` row it reads 610 at every boundary — the space
+/// neither grows past its target nor shrinks back — and it is the figure that run's `major` counter
+/// is divided by. `vp:control/1` reads 233 (the emulator `min_heap_size` floor, the region a fresh
+/// process is created with) on the rows where none of its one-to-three fullsweeps has been sampled
+/// yet, and 610 on the rows where one has — the target such a fullsweep re-derives from the live
+/// set that survived it. `a_loop_holding_the_statistics_result_keeps_collecting` and
+/// `the_held_loop_collects_exactly_as_its_control_does_and_only_promotes_more` assert both figures,
+/// so this constant is a measurement of the run, not a quotation.
 const MATURE_CAPACITY_WORDS: u64 = 610;
 /// The smallest number of minor collections one fullsweep must be able to cost in the
 /// `vp:hold/1` shape — the **pessimistic** end of the mature generation's own room rule.
@@ -434,23 +531,52 @@ const MATURE_CAPACITY_WORDS: u64 = 610;
 ///
 /// # Measured
 ///
-/// The room rule bounds one fullsweep at 122 … 152 minors (`610 / 5` … `610 / 4`: `L` moves by a
-/// word between cycles), and whole-run `collections / major` reads 128 (N = 5 000, where the short
-/// start-up interval is amortised over only three fullsweeps), 135 (N = 7 000) and 140 … 144 from
-/// N = 20 000 on (141 at N = 1 000 000). What the assertion pins is the order of magnitude: the
-/// fullsweep count is **hundreds** of minors, never the `collections / 1 923` the
-/// integer-accumulator control reads at N = 200 000 — i.e. the held BIF result really is a live,
-/// promoted heap object.
+/// A **single** interval between two fullsweeps is [`FIRST_SWEEP_MINORS`] = **56** minors for the
+/// run's first one (the region it draws down is the 233-word floor, not the 610-word target) and
+/// then 151 … 152, the optimistic end of the `610 / L` rule with `L` moving by a word between
+/// cycles — the whole-run average at `N = 1 000 000` is 76 932 / 509 = 151.1. What the
+/// assertion pins is the order of magnitude: the fullsweep count is **hundreds** of minors, never
+/// the 15 386 minors the integer-accumulator control's single fullsweep sits behind at
+/// `N = 200 000` — i.e. the held BIF result really is a live, promoted heap object.
 const MINORS_PER_MAJOR: u64 = MATURE_CAPACITY_WORDS / WORDS_PER_ITERATION;
 /// The largest number of minor collections one fullsweep may cost in the `vp:hold/1` shape — the
 /// **optimistic** end of the same room rule (`MATURE_CAPACITY_WORDS / STATS_TUPLE_WORDS` = `610 /
 /// 4` = 152: a minor that promotes only the held 4-word accumulator).
 ///
-/// See [`MINORS_PER_MAJOR`] for the derivation and the 122 … 152 interval the rule permits. The
-/// first fullsweep is shorter than both ends because the victim's *first* mature region is the
-/// 233-word floor rather than the 610-word target (`floor(233 / 4) = 58` minors; measured: `major`
-/// is still `0` at collection 47 and `1` by collection 66), which only ever lowers a run's ratio.
+/// See [`MINORS_PER_MAJOR`] for the derivation and the 122 … 152 interval the rule permits
+/// (`610 / 5` … `610 / 4`: `L` moves by a word between cycles). The first fullsweep comes sooner
+/// than both ends because the victim's *first* mature region is the 233-word floor rather than the
+/// 610-word target — [`FIRST_SWEEP_MINORS`] = 56 minors, which
+/// `a_loop_holding_the_statistics_result_keeps_collecting` measures from either side of the
+/// boundary — which only ever lowers a run's ratio.
+///
+/// This bounds **one interval**, not a whole-run average: a run's `collections` also contain the
+/// interval that is still open at its last iteration — the minors after the final fullsweep, which
+/// no fullsweep has closed — so the average `collections / major` can sit *above* 152 (measured 154
+/// at `N = 10 000 … 30 000`, where that tail is a large fraction of a short run) while every closed
+/// interval stays inside the band. `a_loop_holding_the_statistics_result_keeps_collecting` charges
+/// that one open interval explicitly.
 const MAX_MINORS_PER_MAJOR: u64 = MATURE_CAPACITY_WORDS / STATS_TUPLE_WORDS;
+/// How many minor collections the victim's **first** mature region absorbs before its first
+/// fullsweep — measured at **56**, two short of the `floor(233 / 4)` = 58 an accumulator-only
+/// promotion stream would allow.
+///
+/// # Why it is shorter than that ideal
+///
+/// A fullsweep is what installs the [`MATURE_CAPACITY_WORDS`]-word target; before it the region is
+/// the [`EMULATOR_MIN_HEAP_WORDS`]-word `min_heap_size` floor a fresh process is created with, and
+/// each minor draws it down by the words it promotes. In the steady state that is
+/// [`STATS_TUPLE_WORDS`] = 4 words (the held accumulator alone: `610 / 152` = 4.01 words per
+/// minor), but the run's *first* minor also promotes the live part of the entry-frame-loaded space,
+/// so the floor is drawn down faster at the start: `233 / 56` = 4.16 words per minor. Both figures
+/// are measurements of this fixture.
+///
+/// # Measured
+///
+/// `a_loop_holding_the_statistics_result_keeps_collecting` brackets the boundary from either side
+/// with [`n_for_law`]: at [`FIRST_SWEEP_MINORS`] − 1 = 55 collections the run has swept **0**
+/// times, and by 56 collections it has swept once.
+const FIRST_SWEEP_MINORS: u64 = 56;
 /// The collection count one measured run of either shape must report at `N`, before the
 /// pre-emption surcharge — the **fill law**, `(N + FILL_OFFSET) / ITERATIONS_PER_COLLECTION` (see
 /// [`FILL_OFFSET`] and [`ITERATIONS_PER_COLLECTION`]), the exact number of nursery fills, and
@@ -469,36 +595,44 @@ const MAX_MINORS_PER_MAJOR: u64 = MATURE_CAPACITY_WORDS / STATS_TUPLE_WORDS;
 ///   (`the_fill_law_holds_and_its_phase_is_the_entry_frame` pins both sides of every early
 ///   boundary): the first collection lands on **iteration 8**, which is what the
 ///   `+ FILL_OFFSET` term ([`FILL_OFFSET`]) encodes.
-/// * **On top sits a surplus of at most [`SURPLUS_BOUND`]** — one phase-shifting cycle whose
-///   mechanism and measured distribution are [`SURPLUS_BOUND`]'s.
+/// * **On top sits a surplus of at most [`surplus_bound`]`(law)`** — the entry-frame count plus the
+///   pre-emption rate, whose mechanism and measured ladder are [`surplus_bound`]'s.
 ///
-/// # Measured (deterministic; every row printed by the tests that drive [`COUNTS`], three
-/// identical repetitions of the whole table)
+/// # Measured (deterministic; every row printed by the tests that drive [`COUNTS`])
 ///
 /// `vp:hold/1`:
 ///
-/// | N | slices | collections | law | surplus | major |
-/// |---|---|---|---|---|---|
-/// | 5 000 | 9 | 385 | 384 | 1 | 3 |
-/// | 7 000 | 13 | 538 | 538 | 0 | 4 |
-/// | 10 000 | 18 | 769 | 769 | 0 | 6 |
-/// | 20 000 | 35 | 1 538 | 1 538 | 0 | 11 |
-/// | 30 000 | 53 | 2 308 | 2 308 | 0 | 16 |
-/// | 50 000 | 88 | 3 846 | 3 846 | 0 | 27 |
-/// | 100 000 | 175 | 7 692 | 7 692 | 0 | 55 |
-/// | 150 000 | 263 | 11 538 | 11 538 | 0 | 82 |
-/// | 200 000 | 350 | 15 385 | 15 384 | 1 | 109 |
+/// | N | slices | collections | law | surplus | major | peak mature |
+/// |---|---|---|---|---|---|---|
+/// | 5 000 | 7 | 384 | 384 | 0 | 3 | 610 |
+/// | 7 000 | 9 | 538 | 538 | 0 | 4 | 610 |
+/// | 10 000 | 13 | 769 | 769 | 0 | 5 | 610 |
+/// | 20 000 | 26 | 1 538 | 1 538 | 0 | 10 | 610 |
+/// | 30 000 | 38 | 2 308 | 2 308 | 0 | 15 | 610 |
+/// | 50 000 | 63 | 3 846 | 3 846 | 0 | 26 | 610 |
+/// | 100 000 | 126 | 7 693 | 7 692 | 1 | 51 | 610 |
+/// | 150 000 | 188 | 11 540 | 11 538 | 2 | 76 | 610 |
+/// | 200 000 | 251 | 15 386 | 15 384 | 2 | 102 | 610 |
+/// | 300 000 | 376 | 23 079 | 23 077 | 2 | 153 | 610 |
+/// | 500 000 | 626 | 38 466 | 38 461 | 5 | 254 | 610 |
+/// | 1 000 000 | 1 251 | 76 932 | 76 923 | 9 | 509 | 610 |
 ///
-/// `vp:control/1` reports the **same** collections at every row (385 / 538 / 769 / 1 538 / 2 308 /
-/// 3 846 / 7 692 / 11 538 / 15 385) with `major` = 0 / 0 / 0 / 1 / 1 / 2 / 4 / 6 / 8 — the only
-/// counter that differs between the two shapes.
+/// `vp:control/1` reports the **same** collections and the same heap plateaus at every row, with
+/// `major` = 0 / 0 / 0 / 0 / 0 / 0 / 0 / 1 / 1 / 1 / 1 / 3 and a peak mature capacity of 233 on
+/// its first eight rows and 610 on the last four — 233 is the floor it is created with, 610 the
+/// target one of its rare fullsweeps re-derives once one has been sampled. The matures, and the
+/// fullsweeps, are therefore the only counters that differ between the two shapes.
 ///
-/// Three more figures from the same measurement, so the bound can be read at its extremes: `N =
-/// 300 000` (525 slices) reports `23 077` collections against a law of `23 077` and `164`
-/// fullsweeps, `N = 500 000` (875 slices) reports `38 461` against `38 461` with `273`, and
-/// `N = 1 000 000` (1 749 slices) reports `76 923` against `76 923` with `546` fullsweeps — the
-/// same ~141 minors per fullsweep as the ladder (`15 385 / 109`), inside the 122 … 153 interval
-/// [`MINORS_PER_MAJOR`] derives.
+/// The surplus column is the ladder [`surplus_bound`] is fitted to: `0` up to `N = 50 000`, then a
+/// bounded rate (1 in 7 692 … 1 in 11 538 collections), never a constant and never superlinear.
+/// The `major` column is `collections / 128 … 154` (a whole-run average, which includes the one
+/// interval that is still open at the last iteration — see [`MAX_MINORS_PER_MAJOR`]).
+/// The iteration count at which [`collections_law`] first returns `law` — the law inverted, for
+/// assertions whose subject is naturally a collection count rather than an iteration count.
+fn n_for_law(law: u64) -> i64 {
+    (law * ITERATIONS_PER_COLLECTION - FILL_OFFSET) as i64
+}
+
 fn collections_law(n: i64) -> u64 {
     (n as u64 + FILL_OFFSET) / ITERATIONS_PER_COLLECTION
 }
@@ -537,24 +671,8 @@ fn a_loop_holding_the_statistics_result_keeps_collecting() {
     // FILL_OFFSET iterations short because the spawned process's entry frame is already in the
     // space (see `collections_law` for the measured ladder).
     for (n, row) in &rows {
-        let law = collections_law(*n);
-        // The fill law is an exact **floor**: every nursery fill must be collected, so a run whose
-        // root set pinned the collector breaks it outright.
-        assert!(
-            row.collections >= law,
-            "collections must be at least (N + {FILL_OFFSET}) / {ITERATIONS_PER_COLLECTION} at \
-             N={n} ({EMULATOR_MIN_HEAP_WORDS} nursery words / {WORDS_PER_ITERATION} words per \
-             iteration): {row:?}"
-        );
-        // ... and the run may exceed it only by the phase shift `SURPLUS_BOUND` derives (measured
-        // `1` at N = 5 000 and 200 000, `0` on every other row here).
-        let surplus = row.collections - law;
-        assert!(
-            surplus <= SURPLUS_BOUND,
-            "the surplus over the fill law must stay within {SURPLUS_BOUND} at N={n} (measured \
-             {surplus} over {law} in {} slices): {row:?}",
-            row.slices
-        );
+        // The fill law is an exact floor and the surplus over it is a bounded rate.
+        assert_law_bracket(*n, row);
     }
     // The heap stays bounded: a flat capacity, never a curve in N. (The pre-fix run's `heap_size`
     // climbed to 318 037 words at N = 10 000 and 2 032 432 at N = 100 000.)
@@ -588,17 +706,61 @@ fn a_loop_holding_the_statistics_result_keeps_collecting() {
             row.returned_collections as u64 <= row.collections,
             "the loop's reading is a snapshot of this run's count at N={n}: {row:?}"
         );
+        // The mature generation absorbs at most MAX_MINORS_PER_MAJOR minors between two
+        // fullsweeps — and a whole-run count is those closed intervals plus the one interval still
+        // open at the last iteration, which no fullsweep has closed yet (so it is shorter than a
+        // full one and the average `collections / major` may sit just above the per-interval band).
         assert!(
-            row.major * MAX_MINORS_PER_MAJOR >= row.collections,
+            row.collections <= row.major * MAX_MINORS_PER_MAJOR + (MAX_MINORS_PER_MAJOR - 1),
             "at most {MAX_MINORS_PER_MAJOR} minor collections may pass between two fullsweeps at \
-             N={n} (the held 4-word accumulator is promoted on every one): {row:?}"
+             N={n}, plus the one interval still open at the run's last iteration (the held 4-word \
+             accumulator is promoted on every one): {row:?}"
         );
         assert!(
             row.major * MINORS_PER_MAJOR <= row.collections,
             "the mature generation must absorb at least {MINORS_PER_MAJOR} of those promotions \
              before a fullsweep at N={n}: {row:?}"
         );
+        // ... and the mature region the band divides is the one the policy derives: every fullsweep
+        // re-derives MATURE_CAPACITY_WORDS from this shape's live set, a fixed point rather than a
+        // ratchet, so the sampled capacity sits on that figure at every boundary.
+        assert_eq!(
+            row.peak_mature, MATURE_CAPACITY_WORDS as usize,
+            "the mature generation's capacity is the one the policy derives at N={n} \
+             ({MATURE_CAPACITY_WORDS} words): {row:?}"
+        );
     }
+    // The first fullsweep's position, measured from both sides: the region it replaces is the
+    // EMULATOR_MIN_HEAP_WORDS floor rather than the steady target, and each minor draws it down by
+    // the live young words it promotes (FIRST_SWEEP_MINORS).
+    let first_sweep = measure_rows(
+        "hold",
+        &[
+            n_for_law(FIRST_SWEEP_MINORS - 1),
+            n_for_law(FIRST_SWEEP_MINORS),
+        ],
+    );
+    let (n_before, before) = first_sweep[0];
+    let (n_at, at) = first_sweep[1];
+    assert_eq!(
+        before.collections,
+        FIRST_SWEEP_MINORS - 1,
+        "the bracket is measured in collection counts: vp:hold({n_before}): {before:?}"
+    );
+    assert_eq!(
+        before.major, 0,
+        "no fullsweep may have run by {FIRST_SWEEP_MINORS} - 1 collections \
+         (vp:hold({n_before})): {before:?}"
+    );
+    assert_eq!(
+        at.collections, FIRST_SWEEP_MINORS,
+        "the bracket is measured in collection counts: vp:hold({n_at}): {at:?}"
+    );
+    assert_eq!(
+        at.major, 1,
+        "the first fullsweep lands on collection {FIRST_SWEEP_MINORS}, which is what the \
+         {EMULATOR_MIN_HEAP_WORDS}-word floor's room rule allows (vp:hold({n_at})): {at:?}"
+    );
 }
 
 /// **The fill law's phase, pinned directly: the first collection lands on iteration 8, then one
@@ -616,7 +778,12 @@ fn a_loop_holding_the_statistics_result_keeps_collecting() {
 /// The first cycle is short because the process arrives with its entry frame already in the
 /// space: with 17 words per iteration and a 233-word space, `u0 + 8 × 17 > 233 ≥ u0 + 7 × 17`
 /// puts that frame at 98 … 114 words. The second boundary is one iteration *late* (14 instead of
-/// 13) — one of the phase-shifting cycles [`SURPLUS_BOUND`] bounds.
+/// 13) — one of the phase-shifting cycles [`surplus_bound`] bounds.
+///
+/// The test then walks the whole **low-law regime** (`N = 0 … 600`, every phase alignment of the
+/// first 46 fills) to pin [`SURPLUS_BASE`] where it is the only term of [`surplus_bound`]: the
+/// surplus is `0` in 600 of those 601 rows and `1` in exactly one — this ladder's entry-frame row,
+/// `N = 8` — so the base term is one count of measured headroom, not a fitted slack.
 #[test]
 fn the_fill_law_holds_and_its_phase_is_the_entry_frame() {
     // The rate really is the space's capacity divided by the iteration's use, not a fitted rate.
@@ -657,14 +824,41 @@ fn the_fill_law_holds_and_its_phase_is_the_entry_frame() {
              iteration {FIRST_FILL_ITERATION}, then every {ITERATIONS_PER_COLLECTION} iterations: \
              {row:?}",
         );
-        // The law holds underneath it everywhere, with at most the one-cycle surplus.
-        let law = collections_law(n);
-        assert!(
-            row.collections >= law && row.collections - law <= SURPLUS_BOUND,
-            "the fill law must bracket the measured count at N={n} (law {law}, bound \
-             {SURPLUS_BOUND}): {row:?}"
-        );
+        // The law holds underneath it everywhere, with at most [`surplus_bound`]'s allowance.
+        assert_law_bracket(n, row);
     }
+    // ... and the low-law regime's whole surplus ledger is the base term: over `N = 0 … 600`
+    // (every phase alignment of the first 46 fills, so the rate term of `surplus_bound` is 0 in
+    // every one of them) the surplus is 0 in all rows but the entry-frame one, which carries
+    // exactly `SURPLUS_BASE`.
+    let sweep = measure_rows("hold", &(0..=LOW_LAW_SWEEP_LAST).collect::<Vec<i64>>());
+    assert_eq!(sweep.len(), LOW_LAW_SWEEP_LAST as usize + 1);
+    let mut surplus_histogram = [0usize; 4];
+    for (n, row) in &sweep {
+        assert_law_bracket(*n, row);
+        let surplus = (row.collections - collections_law(*n)) as usize;
+        assert!(
+            surplus < surplus_histogram.len(),
+            "a low-law row may not carry {surplus} surplus counts at N={n}: {row:?}"
+        );
+        surplus_histogram[surplus] += 1;
+    }
+    eprintln!(
+        "low_law_sweep vp:hold N=0..={LOW_LAW_SWEEP_LAST} : surplus histogram \
+         {surplus_histogram:?} (index = surplus count, value = rows; bound {})",
+        surplus_bound(collections_law(LOW_LAW_SWEEP_LAST))
+    );
+    assert_eq!(
+        surplus_histogram,
+        [
+            LOW_LAW_SWEEP_LAST as usize,
+            SURPLUS_BASE as usize,
+            0,
+            0
+        ],
+        "in the low-law regime the surplus is SURPLUS_BASE ({SURPLUS_BASE}) in exactly the \
+         entry-frame row and 0 everywhere else"
+    );
 }
 
 /// **The control: the held BIF result costs no collection, and shows up only as promotion.**
@@ -676,11 +870,12 @@ fn the_fill_law_holds_and_its_phase_is_the_entry_frame() {
 /// changed the collector's behaviour.
 ///
 /// `major` is the one counter that **must** differ: `hold`'s 4-word accumulator survives every
-/// minor collection and is promoted, so its mature generation fills after 122 … 153 minors (the
-/// measured steady interval; see [`MINORS_PER_MAJOR`] and [`MAX_MINORS_PER_MAJOR`]), while
-/// `control` retains an immediate and sweeps after ~1 923 (`15 385 / 8` at `N = 200 000`). That is
-/// the positive evidence that the statistics tuple is a live heap object — and the band the
-/// assertions below pin is [`MINORS_PER_MAJOR`] … [`MAX_MINORS_PER_MAJOR`].
+/// minor collection and is promoted, so its mature generation fills after 151 … 152 minors (the
+/// measured steady interval — see [`MINORS_PER_MAJOR`] and [`MAX_MINORS_PER_MAJOR`]), while
+/// `control` retains an immediate, promotes nothing and sweeps 0 … 3 times over the whole ladder
+/// (once in 15 386 collections at `N = 200 000`, once in 25 644 at `N = 1 000 000`). That is the
+/// positive evidence that the statistics tuple is a live heap object — and the band the assertions
+/// below pin is [`MINORS_PER_MAJOR`] … [`MAX_MINORS_PER_MAJOR`].
 #[test]
 fn the_held_loop_collects_exactly_as_its_control_does_and_only_promotes_more() {
     let held = counter_table("hold", &COUNTS);
@@ -711,6 +906,24 @@ fn the_held_loop_collects_exactly_as_its_control_does_and_only_promotes_more() {
             "holding the statistics tuple must cost fullsweeps (it is promoted on every minor \
              collection, the control's integer accumulator is not) at N={n}: hold={held:?} \
              control={control:?}"
+        );
+        // The mature geometry is where that promotion lands. `hold`'s fullsweeps install the
+        // 610-word target this shape derives at every one. `control` starts on the 233-word floor a
+        // fresh process is created with, and its rare fullsweep re-derives the *same* 610 from the
+        // live set that survived it (the loop's frame and stack — an immediate accumulator adds
+        // nothing to a promotion), so a sampled boundary sees one figure or the other and never a
+        // third: which of the two depends only on whether a fullsweep has been sampled yet.
+        assert_eq!(
+            held.peak_mature, MATURE_CAPACITY_WORDS as usize,
+            "hold's mature generation is the {MATURE_CAPACITY_WORDS}-word target its own live set \
+             derives at N={n}: hold={held:?}"
+        );
+        assert!(
+            control.peak_mature == EMULATOR_MIN_HEAP_WORDS as usize
+                || control.peak_mature == MATURE_CAPACITY_WORDS as usize,
+            "the control's mature generation is the {EMULATOR_MIN_HEAP_WORDS}-word floor it was \
+             created with, or the same {MATURE_CAPACITY_WORDS}-word target once one of its rare \
+             fullsweeps has re-derived it, at N={n}: control={control:?}"
         );
     }
 }
