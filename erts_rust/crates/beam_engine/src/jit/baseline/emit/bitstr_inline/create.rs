@@ -81,7 +81,8 @@
 //!
 //! Every post-helper re-read is therefore four instructions into a caller-saved scratch
 //! (`mov scratch,[rsp+RUNTIME_SLOT_DISP]` ; `mov scratch,[scratch+RUNTIME_YBASE_DISP]` ;
-//! `lea scratch,[scratch+y_offset(k)]` ; `mov dst,[scratch]`) and nothing more.//!
+//! `lea scratch,[scratch+y_offset(k)]` ; `mov dst,[scratch]`) and nothing more.
+//!
 //! # The byte extraction is exact, not approximate
 //!
 //! A whole-byte big-endian integer field of `nbytes` bytes is the value's low

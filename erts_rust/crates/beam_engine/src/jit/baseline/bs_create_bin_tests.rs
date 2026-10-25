@@ -77,7 +77,7 @@
 
 use std::cell::Cell;
 
-use beam_loader::{BsGetArgs, Instr, Label, Module, Operand, Reg, NO_FAIL};
+use beam_loader::{BsGetArgs, HeapNeed, Instr, Label, Module, Operand, Reg, NO_FAIL};
 use beam_term::{Atom, Eterm};
 
 use super::bitstr::bitstr_calls;
@@ -260,6 +260,67 @@ fn accumulator_module(name: &str, strings: &[u8], fields: impl FnOnce(&Module) -
     module.functions[0].arity = arity;
     module.exports[0].arity = arity;
     module
+}
+
+/// `bs_init_writable` + one `bs_create_bin` whose accumulator — and optionally whose field
+/// values — live in the current frame's **`Y` area**, the frame-resident shape a real
+/// accumulator loop reaches once its accumulator has been `move`d into the frame (a
+/// `call_last` callee's `{tr,{y,0},{t_bitstring,8,true}}`).
+///
+/// `f/<arity>`'s `x(0)` is the capacity hint `bs_init_writable` reads (and replaces with the
+/// writable binary); `acc_in_y` decides whether that binary is then moved into `Y(0)` (or
+/// stays in `x(0)`), and `slot_values` is how many of `x(1..)` the row also copies into
+/// `Y(1..=slot_values)` so a field-value operand can name a stack slot. The frame is
+/// `1 + slot_values` words (slot `Y(0)` is reserved for the accumulator even when the row
+/// leaves it in `x(0)`, which keeps every row's value slots at the same indices).
+///
+/// The build is `fields`, whose `private_append` group names the accumulator's slot and
+/// whose destination is that same slot; the accumulator is copied back into `x(0)` before
+/// the frame is dropped, so the exported function returns the built binary.
+fn frame_module(
+    name: &str,
+    strings: &[u8],
+    arity: u32,
+    acc_in_y: bool,
+    slot_values: u32,
+    fields: impl FnOnce(&Module) -> Vec<Operand>,
+) -> Module {
+    let slots = 1 + slot_values;
+    bin_module(name, arity, strings, move |module| {
+        let acc = if acc_in_y {
+            Operand::Y(0)
+        } else {
+            Operand::X(0)
+        };
+        let mut segments = append_seg(module, acc.clone());
+        segments.extend(fields(module));
+        let mut code = vec![
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(slots),
+                live: arity,
+            },
+            Instr::BsInitWritable,
+        ];
+        if acc_in_y {
+            code.push(Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::Y(0),
+            });
+        }
+        for slot in 1..=slot_values {
+            code.push(Instr::Move {
+                src: Operand::X(slot),
+                dst: Operand::Y(slot),
+            });
+        }
+        code.push(create_bin(acc.clone(), segments, arity));
+        code.push(Instr::Move {
+            src: acc,
+            dst: Operand::X(0),
+        });
+        code.push(Instr::Deallocate(slots));
+        code
+    })
 }
 
 /// The module's single `bs_create_bin` operands — the shape predicate's own input.
@@ -722,9 +783,205 @@ fn every_in_scope_construction_shape_stays_native_on_a_cache_free_compile() {
 }
 
 // ---------------------------------------------------------------------------
-// C. Boundaries
+// A′. The Y forms: a frame-resident accumulator and frame-resident field values
 // ---------------------------------------------------------------------------
-/// **C(1) An empty result.** A `string` field of length zero appends no bytes, so the
+/// **A′(1) A `Y`-slot accumulator — lowered, byte-exact, and the family never runs.**
+///
+/// The accumulator crosses the block ABI as its **slot index**, not a word
+/// (`emit_helper_invoke` can only add `movabs` immediates), so the arm carries it to
+/// `jit_open_append_bin_y` and re-reads the slot behind the one up-front frame guard. This
+/// row is the shape's whole justification: the bytes must be the interpreter's, and the
+/// `bs_create_bin` must **not** reach the family.
+///
+/// The family-helper counter is asserted at its exact figure rather than at zero:
+/// `bs_init_writable` has no native arm, so it contributes exactly one `jit_bitstr` call per
+/// baseline run, and the construction must contribute **none**. A run of the interpreter
+/// tier never enters the tier helper at all, which is the pair that makes the figure
+/// meaningful.
+#[test]
+fn a_y_slot_accumulator_is_lowered_and_writes_the_same_bytes() {
+    let module = frame_module("bscb_y_acc", &[], 2, true, 0, |module| {
+        int_seg(module, Operand::X(1), 16)
+    });
+
+    // (1) The shape predicate accepts it, and the compile-time addressability gate is what
+    // it went through (a `Y` slot is not an x-register, so `registers()` must not charge it).
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("a Y-slot accumulator must be an inlinable shape");
+    assert!(shape.uses_y(), "the shape must declare its Y access");
+    assert_eq!(
+        shape.registers(),
+        vec![1],
+        "only the field value is an x-register; the accumulator's Y slot must never reach the \
+         register cache"
+    );
+
+    for value in [0i64, 0x0102, 0xFFFF] {
+        assert_construction_row(
+            &format!("Y accumulator, integer 16 of {value:#x}"),
+            &module,
+            &[ArgKind::Int(64), ArgKind::Int(value)],
+            &big_endian(value, 2),
+        );
+    }
+
+    // (2) The arm emitted, exactly once, and records no static deopt.
+    let name = atom(&module, "f");
+    let report = run_counting(
+        &module,
+        name,
+        &[ArgKind::Int(64), ArgKind::Int(0xBEEF)],
+        Tier::BaselineJit,
+    );
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&big_endian(0xBEEF, 2)[..]),
+        "the Y-slot accumulator must build the interpreter's exact bytes"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the Y-slot shape must emit (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "the Y-slot shape is lowered at compile time, never deopted"
+    );
+    // The non-vacuity pin: exactly the one `bs_init_writable` helper step, nothing for the
+    // construction itself. A construction that silently fell to `jit_bitstr` would read 2.
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "only `bs_init_writable` (which has no native arm) may reach the family helper; the \
+         `bs_create_bin` itself must be the emitted arm"
+    );
+    let interpreter = run_counting(
+        &module,
+        name,
+        &[ArgKind::Int(64), ArgKind::Int(0xBEEF)],
+        Tier::Interpreter,
+    );
+    assert_eq!(
+        interpreter.bitstr_calls, 0,
+        "the interpreter tier never enters the tier helper, so the figure above is the tier's"
+    );
+    assert_eq!(
+        interpreter.bytes, report.bytes,
+        "the two tiers must build the same bytes"
+    );
+}
+
+/// **A′(2) A `Y`-slot field value — the value's guard is its guarded load, its byte stores
+/// re-read the slot.**
+///
+/// The accumulator stays in `x(0)`, so this row isolates the *value* half of the widening: a
+/// non-integer in the slot must reach the family's `badarg` through the `fallback` (the
+/// `Loc::load` guard), never a fabricated byte.
+#[test]
+fn a_y_slot_field_value_is_lowered_and_writes_the_same_bytes() {
+    let module = frame_module("bscb_y_field", &[], 2, false, 1, |module| {
+        int_seg(module, Operand::Y(1), 16)
+    });
+
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("a Y-slot field value must be an inlinable shape");
+    assert!(shape.uses_y(), "the shape must declare its Y access");
+    assert_eq!(
+        shape.registers(),
+        vec![0],
+        "only the accumulator is an x-register; the field value's Y slot is not charged"
+    );
+
+    for value in [0i64, 0x0102, 0xABCD] {
+        assert_construction_row(
+            &format!("X accumulator, Y field value, integer 16 of {value:#x}"),
+            &module,
+            &[ArgKind::Int(64), ArgKind::Int(value)],
+            &big_endian(value, 2),
+        );
+    }
+
+    let name = atom(&module, "f");
+    let report = run_counting(
+        &module,
+        name,
+        &[ArgKind::Int(64), ArgKind::Int(0x1234)],
+        Tier::BaselineJit,
+    );
+    assert_eq!(report.bytes.as_deref(), Some(&big_endian(0x1234, 2)[..]));
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "the construction must not reach the family helper (only `bs_init_writable` does)"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(emitted.contains(&SHAPE_CREATE_BIN));
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+}
+
+/// **A′(3) A `Y` accumulator AND two `Y` field values plus a `string` constant** — every
+/// offset form at once, so an offset that ignored a `Y` field's width shows up.
+///
+/// The three fields land at byte offsets `0`, `1` and `3` from the cursor the helper
+/// returns; a re-read that used the wrong slot or a store that used the wrong offset
+/// produces a payload this row's own Rust-computed expectation rejects.
+#[test]
+fn a_y_accumulator_with_two_y_field_values_writes_every_field_in_order() {
+    let literal: &[u8] = b"xyz";
+    let module = frame_module("bscb_y_both", literal, 3, true, 2, |module| {
+        let mut fields = int_seg(module, Operand::Y(1), 8);
+        fields.extend(int_seg(module, Operand::Y(2), 16));
+        fields.extend(str_seg(module, 0, literal.len() as i64));
+        fields
+    });
+
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("a Y accumulator with Y field values must be an inlinable shape");
+    assert!(shape.uses_y());
+    assert!(
+        shape.registers().is_empty(),
+        "no operand of this shape is an x-register (registers were {:?})",
+        shape.registers()
+    );
+
+    for (head, tail) in [(0i64, 0i64), (0x5Ai64, 0xBEEF), (0xFF, 0x0102)] {
+        let mut expected = big_endian(head, 1);
+        expected.extend(big_endian(tail, 2));
+        expected.extend_from_slice(literal);
+        assert_construction_row(
+            &format!("Y accumulator, integer 8 of {head:#x} + integer 16 of {tail:#x} + \"xyz\""),
+            &module,
+            &[ArgKind::Int(64), ArgKind::Int(head), ArgKind::Int(tail)],
+            &expected,
+        );
+    }
+
+    let name = atom(&module, "f");
+    let report = run_counting(
+        &module,
+        name,
+        &[ArgKind::Int(64), ArgKind::Int(0x11), ArgKind::Int(0x2233)],
+        Tier::BaselineJit,
+    );
+    let mut expected = big_endian(0x11, 1);
+    expected.extend(big_endian(0x2233, 2));
+    expected.extend_from_slice(literal);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&expected[..]),
+        "every field must land at its own offset"
+    );
+    assert_eq!(report.bitstr_calls, 1);
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(emitted.contains(&SHAPE_CREATE_BIN));
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// C. Boundaries
+// ---------------------------------------------------------------------------/// **C(1) An empty result.** A `string` field of length zero appends no bytes, so the
 /// accumulator's window commits `end += 0` and the answer is `<<>>`.
 ///
 /// The zero-length `string` field is load-bearing, not decoration: the truly **zero-field**
@@ -1030,6 +1287,92 @@ fn the_built_binary_is_usable_as_a_heap_term_afterwards() {
             }
         },
     );
+}
+
+/// **C(9) A destination slot outside the published frame: the arm's first guard rejects, and
+/// the answer is the interpreter's own error — never a partially built binary.**
+///
+/// The shape predicate *accepts* it (a `Y` index the `disp32` can address is a compile-time
+/// fact; whether the **frame** holds that slot is a run-time one), so the arm emits and its
+/// destination guard — the very first thing the sequence emits — is what refuses. The
+/// refusal is the `fallback`, i.e. exactly one interpreter step, which re-runs the whole
+/// instruction and reports `bad_register(64)`.
+///
+/// The observable claims, all of them load-bearing: the shape predicate answers `Some` and
+/// the arm emitted with zero static deopts (so the rejection really is a **run-time** guard);
+/// the baseline run took the fallback (`jit_step_one` moved) instead of writing the field
+/// bytes into a slot it could not address; and both tiers raised the **same** typed reason
+/// and neither returned bytes. The accumulator's window is not observable after a raise, so
+/// what stands in for "wrote nothing" is that last pair — a run that produced bytes would
+/// have had to write them somewhere.
+#[test]
+fn an_out_of_frame_destination_slot_rejects_and_raises_the_interpreters_error() {
+    const FAR_SLOT: u32 = 64;
+    let module = bin_module("bscb_y_oob_dst", 2, &[], |module| {
+        let mut segments = append_seg(module, Operand::X(0));
+        segments.extend(int_seg(module, Operand::X(1), 16));
+        vec![
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 2,
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::Y(FAR_SLOT), segments, 2),
+            Instr::Deallocate(1),
+        ]
+    });
+
+    // (1) Compile time: accepted, and emitted.
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("an addressable-but-out-of-frame Y destination is a compile-time-valid shape");
+    assert!(shape.uses_y());
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the out-of-frame destination is a run-time guard, so the arm must still emit \
+         (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "the shape must not be statically deopted: the rejection is the emitted guard's"
+    );
+
+    // (2) Run time: the guard rejects, so the fallback interpreter step runs the whole
+    // instruction and raises with the interpreter's exact reason.
+    let name = atom(&module, "f");
+    let args = [ArgKind::Int(64), ArgKind::Int(0xBEEF)];
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert!(
+        report.bytes.is_none(),
+        "a rejected destination must not produce a binary (got {:?})",
+        report.bytes
+    );
+    assert!(
+        report.counters.step_one >= 1,
+        "the destination guard must really take the fallback (jit_step_one ran {} times); \
+         without that this row does not exercise the guard it exists to pin",
+        report.counters.step_one
+    );
+    with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+        assert_same_outcome(
+            "out-of-frame destination",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        assert!(
+            matches!(interpreter, Err(_)),
+            "the interpreter itself must raise here (got {interpreter:?}); the row's premise \
+             is that the arm reproduces the interpreter's own error"
+        );
+        assert!(
+            matches!(baseline, Err(_)),
+            "the baseline tier must raise, never return a partially built binary (got \
+             {baseline:?})"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,4 +1707,69 @@ fn a_one_byte_short_capacity_declines_and_is_idempotent() {
         &[ArgKind::Int(3), ArgKind::Int(value)],
         &expected,
     );
+}
+
+/// **(c) The one-byte-short capacity with a `Y`-slot accumulator, as an idempotency row.**
+///
+/// The `Y` form of C(6)/(b), and the row that pins the *frame* half of the mutation order:
+/// the arm hands `jit_open_append_bin_y` the accumulator's **slot index**, the helper reads
+/// `Machine::y` and answers `0` because the tail does not fit, and the emitted `je fallback`
+/// takes exactly one interpreter step — which re-executes the whole instruction against an
+/// accumulator whose window end (and payload) are untouched, because nothing the sequence
+/// emits before that test writes anything.
+///
+/// What the row proves, and what would fail without it:
+///
+/// * the payload is the family's **exact** bytes — a losing order that committed the window
+///   and then fell back would append the tail twice (`BE EF BE EF`);
+/// * the result's bit size is the expected figure, not twice it — a doubled commit also
+///   publishes a window over bytes nobody wrote;
+/// * the fallback really happened (`jit_step_one` moved) while the arm was still **emitted**
+///   (`emitted_shapes` + zero static deopts), so this is a run-time guard on a lowered
+///   sequence and not a compile-time refusal;
+/// * the family helper counter stays at exactly the one `bs_init_writable` step that has no
+///   native arm — the re-execution goes through `jit_step_one`, never `jit_bitstr`, which is
+///   how the row distinguishes "the arm's guard rejected" from "the shape was never lowered".
+#[test]
+fn a_y_slot_accumulator_one_byte_short_declines_and_is_idempotent() {
+    let module = frame_module("bscb_y_deopt_shortcap", &[], 2, true, 0, |module| {
+        int_seg(module, Operand::X(1), 16)
+    });
+    let name = atom(&module, "f");
+    let value: i64 = 0xBEEF;
+    let expected = big_endian(value, 2);
+    // Capacity 1 for a 2-byte tail: `open_append`'s room check refuses, so the `Y` door
+    // answers 0 and the fallback runs.
+    let args = [ArgKind::Int(1), ArgKind::Int(value)];
+
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&expected[..]),
+        "the tail must be appended exactly once, to the family's bytes"
+    );
+    assert_eq!(
+        report.bits,
+        Some(16),
+        "a doubled window commit would publish a 32-bit window here"
+    );
+    assert!(
+        report.counters.step_one >= 1,
+        "the short capacity must really take the fallback (jit_step_one ran {} times)",
+        report.counters.step_one
+    );
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "only `bs_init_writable` may reach the family helper: the re-execution is the \
+         fallback's own interpreter step, so a construction that had silently stayed on the \
+         family would read 2"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the capacity refusal is a run-time guard, so the arm must still emit (emitted \
+         {emitted:?})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    assert_construction_row("capacity 1, Y accumulator, integer 16", &module, &args, &expected);
 }
