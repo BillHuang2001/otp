@@ -17,11 +17,12 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Per-shape pins for the **thirteen native bitstring inline arms** in
+//! Per-shape pins for the **fifteen native bitstring inline arms** in
 //! [`super::emit::bitstr_inline`]: `bs_get_position`, `bs_set_position`,
 //! `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`,
 //! `bs_get_integer2`, `bs_match`, `bs_create_bin`, `bs_match_string`,
-//! `bs_skip_utf32`, `bs_get_utf32` and `bs_skip_utf16`.
+//! `bs_skip_utf32`, `bs_get_utf32`, `bs_skip_utf16`, `bs_get_utf16` and
+//! `bs_skip_utf8`.
 //!
 //! `bitstr_tests` pins the *family route* (the `jit_bitstr` helper and the predicate
 //! that claims the whole `Bs*` set). This node pins the **inline** route, one claim per
@@ -66,8 +67,8 @@ use super::counters;
 use super::emit::bitstr_inline::{
     self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_BS_MATCH_STRING, SHAPE_COUNT, SHAPE_CREATE_BIN,
     SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_GET_UTF16, SHAPE_GET_UTF32, SHAPE_SET_POSITION,
-    SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF16, SHAPE_SKIP_UTF32, SHAPE_START_MATCH3, SHAPE_START_MATCH4,
-    SHAPE_TEST_TAIL2,
+    SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF16, SHAPE_SKIP_UTF32, SHAPE_SKIP_UTF8, SHAPE_START_MATCH3,
+    SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
 use super::tests::{assemble_function, assert_same_outcome, function_code_bytes};
@@ -669,6 +670,42 @@ fn module_get_utf16() -> Module {
         code
     })
 }
+/// `bs_skip_utf8`: consume one **self-describing** UTF-8 character out of the context and
+/// report the context's **new position** — the character `<<_/utf8, _/binary>>` skips without
+/// binding.
+///
+/// The answer is `bs_get_position`'s, i.e. `8` for an ASCII character, `16`/`24`/`32` for the
+/// three wider forms and `-1` (the sentinel block) when the fail label is taken — so "which of
+/// the four static paths ran" and "did the fail branch run" are both observable through the
+/// returned value, and a character consumed twice (or not at all) is visible too.
+fn module_skip_utf8() -> Module {
+    bitstr_module("inline_bs_skip_utf8", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsSkipUtf8 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+            },
+            Instr::BsGetPosition {
+                ctx: Operand::X(1),
+                dst: Operand::X(0),
+                live: 2,
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
 // ---------------------------------------------------------------------------
 // The instrument: a cache-free compile per shape
 // ---------------------------------------------------------------------------
@@ -778,6 +815,7 @@ pub(crate) const INLINE_SHAPE_CASES: [ShapeCase; SHAPE_COUNT] = [
     ("bs_get_utf32", SHAPE_GET_UTF32, "BsGetUtf32", module_get_utf32),
     ("bs_skip_utf16", SHAPE_SKIP_UTF16, "BsSkipUtf16", module_skip_utf16),
     ("bs_get_utf16", SHAPE_GET_UTF16, "BsGetUtf16", module_get_utf16),
+    ("bs_skip_utf8", SHAPE_SKIP_UTF8, "BsSkipUtf8", module_skip_utf8),
 ];
 
 /// The `Instr` variant the static-deopt census keys `shape` by — the **one** mapping, so a
@@ -793,7 +831,7 @@ pub(crate) fn shape_variant(shape: usize) -> &'static str {
 
 /// **Every arm emits and stays native — the mandatory instrument.**
 ///
-/// For each of the fourteen shapes ([`INLINE_SHAPE_CASES`]): a cache-free
+/// For each of the fifteen shapes ([`INLINE_SHAPE_CASES`]): a cache-free
 /// [`super::emit::compile_function`] moves that shape's `inlined(SHAPE_*)` counter, visits the
 /// variant (so the name is real), and records **zero** static deopts for it. Without this a
 /// fully-deopting "implementation" would pass every tier-agreement test in this file.

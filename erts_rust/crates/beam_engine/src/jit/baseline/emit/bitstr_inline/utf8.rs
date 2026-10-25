@@ -119,6 +119,8 @@ use super::{
     SUB_BITS_END_DISP, SUB_BITS_START_DISP,
 };
 
+#[cfg(test)]
+use super::{record_inlined, SHAPE_SKIP_UTF8};
 /// The number of bits a UTF-8 character's **lead** byte occupies — `decode_utf8`'s
 /// `end < start + 8` truncation test, and the width of the one read every path makes.
 const UTF8_LEAD_BITS: u32 = 8;
@@ -326,6 +328,8 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_skip_utf8(
     let Some((shape, target)) = skip_utf8_shape(labels, fail, ctx) else {
         return Ok(false);
     };
+    #[cfg(test)]
+    record_inlined(SHAPE_SKIP_UTF8);
 
     emit_utf8(
         buffer,

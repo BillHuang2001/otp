@@ -134,10 +134,9 @@ mod utf16_tests;
 mod utf16_get_tests;
 /// The `bs_skip_utf8` arm's own suite (the four character widths, the malformed characters,
 /// the exactly-once character-consumption pin, the compile-time refusals and the live `erl`
-/// oracle cross-check) — NOT YET WRITTEN: the arm is wired and exercised end to end, but the
-/// shape has no `SHAPE_*` instrument slot yet, so it is deliberately absent from
-/// [`super::super::bitstr_inline_tests::INLINE_SHAPE_CASES`] (whose length is tied to
-/// `SHAPE_COUNT` at compile time) until the suite lands with it.
+/// oracle cross-check).
+#[cfg(test)]
+mod utf8_tests;
 pub(super) use bs_match::try_inline_bs_match;
 pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 #[cfg(test)]
@@ -257,7 +256,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 14;
+pub(crate) const SHAPE_COUNT: usize = 15;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -300,7 +299,9 @@ pub(crate) const SHAPE_SKIP_UTF16: usize = 12;
 /// The `bs_get_utf16` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_UTF16: usize = 13;
-
+/// The `bs_skip_utf8` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_SKIP_UTF8: usize = 14;
 #[cfg(test)]
 thread_local! {
     /// How often each shape's native lowering was **emitted** (a compile-time count, so it
@@ -314,7 +315,7 @@ thread_local! {
 /// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
 /// entries. The two kinds of shape here need that count for different reasons.
 ///
-/// For the **fourteen helper-free** shapes — the eleven small match-context shapes plus the
+/// For the **fifteen helper-free** shapes — the eleven small match-context shapes plus the
 /// variable-width `bs_skip_utf16`/`bs_get_utf16` pair and `bs_skip_utf8` — the emission is the
 /// only observable
 /// there can be: such a shape calls no helper at all, so
