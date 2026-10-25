@@ -22,6 +22,18 @@ API and its honest limits.
   `first`/`last`/`next`/`prev`, `slot(slot: i64, atoms) -> Result<Option<Vec<Eterm>>>` (0-based;
   `Ok(None)` ⇒ `'$end_of_table'`; an out-of-range or negative slot ⇒ `badarg`), `take`,
   `size`/`is_empty`/`tab2list`/`memory`.
+  `slot` is one contract over three decompositions, and the slot count is always the index's, never
+  the object count: the defaulted `Interior::slot` is a one-object-per-slot partition (both
+  `ordered_set` interiors — slot `n` is the `(n+1)`-th smallest key, so `nactive == size`),
+  `HashInterior` overrides it with its bucket array (`nactive` = the bucket count, which grows and
+  shrinks with the load) and `ChampInterior` with its root index space (`2^WIDTH = 32` slots, a
+  key's slot being `root_slot(term_hash(key))`).
+  A hash-kind slot may therefore hold several objects or none, so a **free slot answers the empty
+  list** — a hash kind must never use the size-based default, which would answer
+  `'$end_of_table'` at slot 1 of a one-object `set`.
+  The slot count and contents are the interior's own; only the relation is contract (`0..N-1` are
+  lists, `N` is the single `'$end_of_table'`, `N+1`/negative/ill-typed are `badarg`, and every
+  slot's objects partition `tab2list/1`) — `tests/ets_slot.rs` + `tests/ets_slot_oracle.rs`.
 - `rename.rs` — `Table::rename` + `RenameOutcome` (checked name write; registry rekey is the host's).
 - `shared.rs` — `SharedTable` (`Arc<RwLock<Table>>`): `read`/`write`/`with_read`/`with_write`/
   `try_into_inner`; a poisoned lock is the typed `unsupported_ets: table lock poisoned`.
