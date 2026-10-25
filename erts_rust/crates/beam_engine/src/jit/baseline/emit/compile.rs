@@ -718,7 +718,13 @@ const BS_MATCH_COMMAND_BYTES: usize = 320;
 /// and `MAX_TAIL_BYTES` (256) tail bytes, so 16 × 33 B of `is_small` guards + 256 × (7 load
 /// + 4 shift + 7 store) B of field stores + the base sequence (the destination guard, the
 /// helper call — `7 + 8 + 20 + 13` B — the cursor test, the `end` commit ≈ 59 B, the
-/// destination store ≤ 12 B and the fallback interpreter step ≈ 150 B) ≈ 7.3 kB. Also
+/// destination store ≤ 12 B and the fallback interpreter step ≈ 150 B) ≈ 7.3 kB.
+///
+/// The `Y` forms add one **unguarded** address re-derivation (3 instructions ≈ 24 B) plus a
+/// load per post-helper use: at most `1 accumulator × 2 uses + MAX_FIELDS (16) field values ×
+/// 1 use + 1 destination × 1 use = 19` sites × 4 instructions ≈ 19 × 30 B ≈ 0.6 kB, against an
+/// up-front guard of ≈ 40 B per `Y` slot, so the `Y` increment stays under 1.6 kB. The total
+/// closed-form worst case is therefore ≈ 9 kB, still comfortably inside this figure. Also
 /// added to each instruction's own [`INSTRUCTION_BYTES`]. Deliberately loose: under-estimating
 /// would turn a large module into a `SystemLimit` compile error.
 const CREATE_BIN_PATH_BYTES: usize = 16_384;
