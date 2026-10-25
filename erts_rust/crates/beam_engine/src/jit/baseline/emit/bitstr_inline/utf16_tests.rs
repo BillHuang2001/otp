@@ -461,7 +461,7 @@ fn field_bits(subject: &[u8], start: u32, nbits: u32) -> u32 {
 fn a_non_byte_aligned_start_deopts_to_exactly_one_interpreter_step() {
     // `U+0041` at bits 4..20.
     let mut bmp = [0u8; 5];
-    bmp[1] = 0x41;
+    bmp[1] = 0x04;
     bmp[2] = 0x10;
     assert_eq!(
         field_bits(&bmp, 4, 16),
@@ -473,7 +473,8 @@ fn a_non_byte_aligned_start_deopts_to_exactly_one_interpreter_step() {
     let mut pair = [0u8; 5];
     pair[0] = 0x0D;
     pair[1] = 0x83;
-    pair[2] = 0xDE;
+    pair[2] = 0xDD;
+    pair[3] = 0xE0;
     assert_eq!(
         field_bits(&pair, 4, 16),
         0xD83D,
