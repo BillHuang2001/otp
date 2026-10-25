@@ -1189,6 +1189,42 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // `bs_skip_utf16` — the **variable-width** character: one 16-bit word for a BMP
+            // scalar, two for a surrogate pair. The sequence reads the first word, and only
+            // a **high** surrogate (`0xD800..=0xDBFF`) goes on to read a second one; the
+            // shared commit both mutually exclusive paths reach advances `start` by 16 or 32
+            // exactly once, after every guard, so a `fallback` deopt re-executes the
+            // instruction against an untouched context. Each of `decode_utf16`'s four
+            // malformed characters — fewer than 16 bits remaining, a **lone low** surrogate,
+            // a high surrogate with fewer than 32 bits remaining, and a high surrogate not
+            // followed by a low one — takes the **fail label** (the family's `fail_step`,
+            // which writes nothing), never a trap. The pair's second over-read guard and its
+            // `remaining < 32` test live on the surrogate path only, so a BMP character at
+            // the very end of a subject is not forced to deopt. A `-little`/`-native` flags
+            // word, a `NO_FAIL` fail code that raises and an unresolvable label emit **zero
+            // bytes** and take the family's arm below. See [`bitstr_inline::utf16`].
+            Instr::BsSkipUtf16 {
+                fail,
+                ctx,
+                live: _,
+                flags,
+            } => {
+                if !bitstr_inline::try_inline_bs_skip_utf16(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *flags,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

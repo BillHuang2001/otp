@@ -21,7 +21,8 @@
 //! The baseline JIT's native lowerings for the bitstring family: eleven **small, safe**
 //! match-context shapes (the seven position/tail/start-match/integer extractors, the static
 //! `bs_match` and `bs_match_string` compares, and the `bs_skip_utf32`/`bs_get_utf32`
-//! character pair) plus the `bs_create_bin` private-append construction shape.
+//! character pair) plus `bs_skip_utf16` — the variable-width character — and the
+//! `bs_create_bin` private-append construction shape.
 //!
 //! Every lowering here is allocation-free and raises nothing of its own: the match-context
 //! shapes read the `ErlSubBits` words and (for the mutating ones) write one word back, while
@@ -75,6 +76,7 @@
 //! * [`bs_match`] — `bs_match` over a fully static command list
 //! * [`match_string`] — `bs_match_string`
 //! * [`utf32`] — `bs_skip_utf32` + `bs_get_utf32`
+//! * [`utf16`] — `bs_skip_utf16`
 //! * [`create`] — `bs_create_bin` over the private-append accumulator
 //! * [`tests`] — the in-crate unit suite
 //!
@@ -105,6 +107,7 @@ mod start_match;
 mod tail;
 #[cfg(test)]
 mod tests;
+mod utf16;
 mod utf32;
 
 /// The `bs_match_string` arm's own suite (boundaries, the legitimate-deopt idempotency pin,
@@ -116,6 +119,11 @@ mod match_string_tests;
 /// cross-check).
 #[cfg(test)]
 mod utf32_tests;
+/// The `bs_skip_utf16` arm's own suite (the BMP and surrogate-pair rows, the four malformed
+/// characters, the exactly-once character-consumption pin and the live `erl` oracle
+/// cross-check).
+#[cfg(test)]
+mod utf16_tests;
 pub(super) use bs_match::try_inline_bs_match;
 pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 #[cfg(test)]
@@ -149,6 +157,8 @@ pub(super) use tail::{try_inline_bs_skip_bits2, try_inline_bs_test_tail2};
 pub(crate) use tail::{skip_bits2_shape, test_tail2_shape, SkipBits2Shape, TestTail2Shape};
 pub(super) use utf32::{try_inline_bs_get_utf32, try_inline_bs_skip_utf32};
 pub(crate) use utf32::{get_utf32_shape, skip_utf32_shape, Utf32Shape};
+pub(super) use utf16::try_inline_bs_skip_utf16;
+pub(crate) use utf16::{skip_utf16_shape, Utf16Shape};
 
 // ---------------------------------------------------------------------------
 // Constants (derived from the frozen layout owners, never re-derived)
@@ -231,7 +241,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 12;
+pub(crate) const SHAPE_COUNT: usize = 13;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -268,6 +278,9 @@ pub(crate) const SHAPE_SKIP_UTF32: usize = 10;
 /// The `bs_get_utf32` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_UTF32: usize = 11;
+/// The `bs_skip_utf16` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_SKIP_UTF16: usize = 12;
 
 #[cfg(test)]
 thread_local! {

@@ -591,6 +591,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
     let mut create_bin_paths = 0usize;
     let mut match_string_paths = 0usize;
     let mut utf32_paths = 0usize;
+    let mut utf16_paths = 0usize;
     for instr in code {
         match instr {
             Instr::Bif { .. } => cmp_bifs += 1,
@@ -633,6 +634,15 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
                 bs_paths += 1;
                 utf32_paths += 1;
             }
+            // The UTF-16 shape charges its own sequence ([`UTF16_PATH_BYTES`]) on top of the
+            // generic [`BS_PATH_BYTES`]: it is the *variable-width* character, so it carries
+            // a second big-endian word read, its own pair-window test and its own second
+            // over-read guard, plus the branch structure that routes a BMP word and a
+            // surrogate pair to one shared commit.
+            Instr::BsSkipUtf16 { .. } => {
+                bs_paths += 1;
+                utf16_paths += 1;
+            }
             Instr::BsGetInteger2(_)
             | Instr::BsGetPosition { .. }
             | Instr::BsSetPosition { .. }
@@ -654,6 +664,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + CREATE_BIN_PATH_BYTES * create_bin_paths
         + BS_MATCH_STRING_PATH_BYTES * match_string_paths
         + UTF32_PATH_BYTES * utf32_paths
+        + UTF16_PATH_BYTES * utf16_paths
 }
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
@@ -782,6 +793,18 @@ const BS_MATCH_STRING_PATH_BYTES: usize = 2_304;
 /// [`INSTRUCTION_BYTES`] already covers. An under-estimate is a `SystemLimit` compile error,
 /// so the figure is deliberately loose.
 const UTF32_PATH_BYTES: usize = 1_024;
+/// The code-size budget reserved for one UTF-16 character sequence, on top of the generic
+/// [`BS_PATH_BYTES`] (see [`code_capacity_estimate`]).
+///
+/// The sequence is one fixed length — the match-context guard, the `remaining` computation
+/// and its `< 16` test, the subject classification, the alignment guard, the first word's
+/// over-read guard, two `movzx`-based byte loads with one `shl`/`or` pair, the two BMP range
+/// compares, the high-surrogate test, the pair-window test, the second over-read guard, the
+/// second word's two byte loads, the low-surrogate range test, the two `len` constants, the
+/// branch to the shared commit and the commit itself — i.e. roughly the UTF-32 sequence plus
+/// four compares and one more pair of byte loads, so the same order of magnitude. An
+/// under-estimate is a `SystemLimit` compile error, so the figure is deliberately loose.
+const UTF16_PATH_BYTES: usize = 1_024;
 
 #[cfg(test)]
 mod tests {
