@@ -130,11 +130,16 @@
 //! * twelve consecutive reads after one `churn(2 000)` are flat (`[4144 × 12]`, and
 //!   `[65584 × 12]` at 65 536-byte payloads) — a read is not what leaks;
 //! * one `churn` block of 1 000 000 iterations read once is flat at 4 144, like every other
-//!   `discard(N)`.
+//!   `discard(N)`;
+//! * an explicit `erlang:garbage_collect()` before each read does **not** clear the residue — it
+//!   doubles the increment to two payloads per rung (`[4144, 12432, 20720, …]`), because a forced
+//!   collection is itself another collection point. The retained payloads are therefore immortal
+//!   to a full GC, which rules out a stale heap word as their owner and points at the
+//!   reservoir-side retention instead.
 //!
-//! So one park is closed and each further park retains exactly one more payload: the retained set
-//! is monotone in the number of pre-emptions, and its size is payload-size proportional (capped at
-//! 999 payloads — 4.1 MB at 4 KiB, ~65 MB at 64 KiB).
+//! So one park is closed and each further collection retains exactly one more payload: the
+//! retained set is monotone in the number of pre-emptions, and its size is payload-size
+//! proportional (capped at 999 payloads — 4.1 MB at 4 KiB, ~65 MB at 64 KiB).
 //!
 //! The seam the law points at is the retention predicate of the prune,
 //! `src/context/gc/bin_vheap.rs`'s `live ∪ shared` pair. `shared` is derived **from the reservoir
