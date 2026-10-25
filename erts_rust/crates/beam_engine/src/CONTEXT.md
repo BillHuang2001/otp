@@ -192,9 +192,9 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   `exceptions`, `floats`, `maps`, `bitstrings`), incl. each family's rooted tests
 - `jit/` → the tier seam (`Tier`/`JitBackend`), the cross-run `CodeCache`, the emitter, the native
   baseline tier and the feature-gated Cranelift hot tier — `jit/CONTEXT.md`, `jit/baseline/CONTEXT.md`,
-  `jit/baseline/emit/CONTEXT.md` (its `bitstr_inline/` node owns the nine native `Bs*` shapes and the
+  `jit/baseline/emit/CONTEXT.md` (its `bitstr_inline/` node owns the sixteen native `Bs*` shapes and the
   `bs_create_bin` construction sequences), `jit/baseline/inlineset/CONTEXT.md` (the authoritative inline
-  set: which groups lower in-block, every run-time guard, and the two `bs_create_bin` construction
+  set: which groups lower in-block, every run-time guard, and the three `bs_create_bin` construction
   routes with their structural refusals), `jit/cranelift/CONTEXT.md`, `jit/bench/CONTEXT.md`
 - Other top-level files: `step.rs` (`Step`), `operand.rs`, `predicates.rs`, `error.rs`
   (`unsupported`/`blocked`/…), `generic.rs` (the `Instr::Generic` sentinel)
