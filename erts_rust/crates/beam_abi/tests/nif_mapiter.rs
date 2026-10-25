@@ -254,9 +254,9 @@ fn forward_walk_reports_the_storage_order_and_runs_off_into_the_tail() {
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let list = key_list(&mut host, &FLAT_KEYS);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = lib.call(&mut env, "forward", 1, &[list]).expect("forward/1");
+    let got = lib.call(&env, "forward", 1, &[list]).expect("forward/1");
     let walk = Walk::of(got);
     let want = expected_pairs(&FLAT_KEYS);
     assert_eq!(walk.created, 1, "create(FIRST) on a map succeeds");
@@ -281,9 +281,9 @@ fn backward_walk_from_last_is_the_exact_reverse_order() {
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let list = key_list(&mut host, &FLAT_KEYS);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = lib.call(&mut env, "backward", 1, &[list]).expect("backward/1");
+    let got = lib.call(&env, "backward", 1, &[list]).expect("backward/1");
     let walk = Walk::of(got);
     let mut want = expected_pairs(&FLAT_KEYS);
     want.reverse();
@@ -305,9 +305,9 @@ fn empty_map_reports_head_and_tail_without_yielding_a_pair() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = lib.call(&mut env, "empty", 0, &[]).expect("empty/0");
+    let got = lib.call(&env, "empty", 0, &[]).expect("empty/0");
     let elems = tuple_of(got, 10);
     // {Created1, Head1, Tail1, PairRet1, PairKeyKept1, Created2, Head2, Tail2, PairRet2, PairKeyKept2}
     assert_eq!(
@@ -333,9 +333,9 @@ fn a_non_map_is_refused() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = lib.call(&mut env, "nonmap", 0, &[]).expect("nonmap/0");
+    let got = lib.call(&env, "nonmap", 0, &[]).expect("nonmap/0");
     let elems = tuple_of(got, 2);
     // {CreateRet, PairRet} — the C's `0` for a non-map, and `get_pair` on the untouched, zeroed
     // iterator is the index guard's `0`. Reaching this assertion proves the read path refused
@@ -356,9 +356,9 @@ fn hash_map_walk_matches_the_rust_storage_order() {
     // iterator takes the hash arm (which caches the storage order at `create`).
     let keys: Vec<i64> = (0..40).rev().collect();
     let list = key_list(&mut host, &keys);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = lib.call(&mut env, "forward", 1, &[list]).expect("forward/1");
+    let got = lib.call(&env, "forward", 1, &[list]).expect("forward/1");
     let walk = Walk::of(got);
     let want = expected_pairs(&keys);
     assert_eq!(want.len(), 40);
@@ -512,8 +512,8 @@ fn the_oracle_agrees_on_the_flat_map_key_order() {
 
     let (mut host, lib) = loaded(&path);
     let list = key_list(&mut host, &FLAT_KEYS);
-    let mut env = NifEnv::new(&mut host);
-    let got = lib.call(&mut env, "forward", 1, &[list]).expect("forward/1");
+    let env = NifEnv::new(&mut host);
+    let got = lib.call(&env, "forward", 1, &[list]).expect("forward/1");
     let walk = Walk::of(got);
 
     // The oracle's own canonical order is sorted for a small flat map; assert that too, so the

@@ -235,22 +235,22 @@ fn loads_and_calls_a_real_c_nif_library() {
     }
     assert!(lib.priv_data().is_null(), "the fixture's `load` stores no priv");
 
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // add/2 -> 5.
     assert_eq!(
-        lib.call(&mut env, "add", 2, &[make_small(2), make_small(3)])
+        lib.call(&env, "add", 2, &[make_small(2), make_small(3)])
             .expect("add/2"),
         make_small(5)
     );
 
     // hello/0 -> the atom `hello` (atoms are immediates and interned once, so `==` is exact).
     let hello = env.host().intern_atom("hello").expect("interns");
-    assert_eq!(lib.call(&mut env, "hello", 0, &[]).expect("hello/0"), hello);
+    assert_eq!(lib.call(&env, "hello", 0, &[]).expect("hello/0"), hello);
 
     // reverse/1 of [1,2,3] -> [3,2,1] (structurally — the cells are freshly allocated).
     let input = int_list(env.heap(), &[1, 2, 3]);
-    let reversed = lib.call(&mut env, "reverse", 1, &[input]).expect("reverse/1");
+    let reversed = lib.call(&env, "reverse", 1, &[input]).expect("reverse/1");
     let expected = int_list(env.heap(), &[3, 2, 1]);
     assert!(
         compare::eq(reversed, expected, &AtomTable::new()),
@@ -263,7 +263,7 @@ fn loads_and_calls_a_real_c_nif_library() {
         .tuple(&[make_small(1), make_small(2)])
         .expect("the test heap has room for a 2-tuple");
     let got_tuple = lib
-        .call(&mut env, "make_tuple", 2, &[make_small(1), make_small(2)])
+        .call(&env, "make_tuple", 2, &[make_small(1), make_small(2)])
         .expect("make_tuple/2");
     assert!(
         compare::eq(got_tuple, expected_tuple, &AtomTable::new()),
@@ -272,7 +272,7 @@ fn loads_and_calls_a_real_c_nif_library() {
 
     // raise/0 -> the NIF's `enif_make_badarg` surfaces as a raised exception.
     let badarg = env.host().intern_atom("badarg").expect("interns");
-    match lib.call(&mut env, "raise", 0, &[]) {
+    match lib.call(&env, "raise", 0, &[]) {
         Err(NifCallError::Raised(reason)) => assert_eq!(reason, badarg),
         other => panic!("expected NifCallError::Raised(badarg), got {other:?}"),
     }
@@ -285,10 +285,10 @@ fn call_reports_unknown_functions_and_wrong_types_without_panicking() {
 
     let mut host = TestHost::new();
     let lib = load(&path, "test_nif", &mut host, Eterm::nil()).expect("the fixture must load");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // A bogus name.
-    match lib.call(&mut env, "does_not_exist", 3, &[]) {
+    match lib.call(&env, "does_not_exist", 3, &[]) {
         Err(NifCallError::UnknownFunction { name, arity }) => {
             assert_eq!(name, "does_not_exist");
             assert_eq!(arity, 3);
@@ -297,13 +297,13 @@ fn call_reports_unknown_functions_and_wrong_types_without_panicking() {
     }
     // A real name with the wrong arity.
     assert!(matches!(
-        lib.call(&mut env, "add", 1, &[make_small(1)]),
+        lib.call(&env, "add", 1, &[make_small(1)]),
         Err(NifCallError::UnknownFunction { .. })
     ));
 
     // A real NIF with a wrong-typed argument: the fixture's `enif_make_badarg` is surfaced.
     let not_an_int = env.host().intern_atom("not_an_int").expect("interns");
-    match lib.call(&mut env, "add", 2, &[not_an_int, make_small(3)]) {
+    match lib.call(&env, "add", 2, &[not_an_int, make_small(3)]) {
         Err(NifCallError::Raised(reason)) => {
             assert_eq!(reason, env.host().intern_atom("badarg").expect("interns"))
         }
@@ -312,7 +312,7 @@ fn call_reports_unknown_functions_and_wrong_types_without_panicking() {
 
     // reverse/1 of a non-list raises the same way (the fixture vetoes a non-list).
     assert!(matches!(
-        lib.call(&mut env, "reverse", 1, &[make_small(7)]),
+        lib.call(&env, "reverse", 1, &[make_small(7)]),
         Err(NifCallError::Raised(_))
     ));
 }

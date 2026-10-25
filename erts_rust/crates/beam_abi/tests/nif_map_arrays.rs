@@ -165,10 +165,10 @@ fn render(term: Eterm, atoms: &AtomTable) -> String {
 fn run_all(lib: &NifLibrary, host: &mut TestHost) -> Vec<String> {
     let mut raws = Vec::with_capacity(CASES.len());
     {
-        let mut env = NifEnv::new(host);
+        let env = NifEnv::new(host);
         for (name, _) in CASES {
             let term = lib
-                .call(&mut env, name, 0, &[])
+                .call(&env, name, 0, &[])
                 .unwrap_or_else(|err| panic!("{name}/0 must be callable: {err:?}"));
             raws.push(term);
         }

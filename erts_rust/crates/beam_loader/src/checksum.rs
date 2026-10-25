@@ -45,143 +45,20 @@
 //! `4 + 24n` bytes is the C's `BEAMFILE_READ_CORRUPT_LAMBDA_TABLE`
 //! (`beam_file.c:1799-1801`) — a typed [`BeamError::BadArg`].
 //!
-//! ## Why an in-tree MD5
+//! ## The MD5 implementation
 //!
-//! Following the crate-layer layering contract, `beam_loader` must not gain a
-//! `beam_dist` dependency edge (a same-wave edge) and no new external crate is
-//! allowed, so this module carries a self-contained RFC 1321 MD5. It is byte-for-byte
-//! the algorithm [`crate::checksum`]'s sibling implementations use (`beam_dist`'s
-//! `auth::md5`, `beam_rt`'s `module_md5`) and is pinned by the RFC 1321 test vectors
-//! below plus an oracle cross-check in `tests/checksum.rs`.
-//!
-//! **Structural debt:** an MD5 is needed by `beam_dist` (distribution auth) and
-//! `beam_rt` (the fun-identity derivation) as well, so this implementation belongs at
-//! a lowest-common-ancestor crate (`beam_common`) rather than duplicated per crate;
-//! de-duplicating it is a repo-root-owned follow-up (never copy-paste a third copy).
+//! The digest is [`beam_common::md5::digest`] — the workspace's **single** RFC 1321
+//! implementation, shared by every contract that needs one (A.2 here, A.5 in
+//! `beam_dist`, A.7's `erlang:md5/1` family). This module therefore owns only the
+//! chunk walk and the `FunT'` filtering described above, never the algorithm. The
+//! digest is pinned by the RFC 1321 test vectors below and by the live
+//! `beam_lib:md5/1` oracle cross-check in `tests/checksum.rs`.
 //!
 //! [`beam_lib:md5/1`]: https://www.erlang.org/doc/apps/stdlib/beam_lib.html#md5-1
 
 use beam_common::{BeamError, Result};
 
 use crate::container::{ChunkId, RawChunk};
-
-/// The MD5 per-round left-rotation amounts (RFC 1321 §3.4), four 16-step rounds.
-const MD5_SHIFTS: [u32; 64] = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, //
-    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, //
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, //
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-];
-
-/// The MD5 additive constants `K[i] = floor(2^32 * abs(sin(i + 1)))` (RFC 1321 §3.4).
-const MD5_K: [u32; 64] = [
-    0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, //
-    0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501, //
-    0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be, //
-    0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821, //
-    0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa, //
-    0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8, //
-    0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed, //
-    0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a, //
-    0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c, //
-    0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70, //
-    0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05, //
-    0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665, //
-    0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039, //
-    0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1, //
-    0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1, //
-    0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
-];
-
-/// The MD5 initial state words (RFC 1321 §3.3).
-const MD5_INIT: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-
-/// Runs the 64-step MD5 compression function over one 512-bit block.
-///
-/// The block length is not re-checked: every caller passes exactly one `[u8; 64]`
-/// chunk, so an out-of-range index would be a logic bug (never reachable from input
-/// data), not an input error.
-fn md5_compress(state: &mut [u32; 4], block: &[u8; 64]) {
-    let mut m = [0u32; 16];
-    for (i, word) in m.iter_mut().enumerate() {
-        let o = i * 4;
-        *word = u32::from_le_bytes([block[o], block[o + 1], block[o + 2], block[o + 3]]);
-    }
-
-    let mut a = state[0];
-    let mut b = state[1];
-    let mut c = state[2];
-    let mut d = state[3];
-
-    for i in 0..64 {
-        let (f, g) = match i {
-            0..=15 => ((b & c) | (!b & d), i),
-            16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-            32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
-            _ => (c ^ (b | !d), (7 * i) % 16),
-        };
-        let rotated = a
-            .wrapping_add(f)
-            .wrapping_add(MD5_K[i])
-            .wrapping_add(m[g])
-            .rotate_left(MD5_SHIFTS[i]);
-        a = d;
-        d = c;
-        c = b;
-        b = b.wrapping_add(rotated);
-    }
-
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-}
-
-/// Computes the MD5 message digest (RFC 1321) of `data`.
-///
-/// Fully safe Rust; no allocation, no `unsafe`, and it never panics — any byte
-/// string (including the empty one) is valid input.
-///
-/// ```
-/// use beam_loader::checksum::md5;
-/// assert_eq!(
-///     md5(b"abc"),
-///     [
-///         0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0,
-///         0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72,
-///     ]
-/// );
-/// ```
-pub fn md5(data: &[u8]) -> [u8; 16] {
-    let mut state = MD5_INIT;
-
-    // Full 512-bit blocks straight from the input.
-    let (blocks, remainder) = data.as_chunks::<64>();
-    for block in blocks {
-        md5_compress(&mut state, block);
-    }
-
-    // RFC 1321 §3.1/§3.2 padding: a single `1` bit, zeros up to the 56-byte
-    // boundary, then the 64-bit little-endian *bit* length. A tail of 56..=63 bytes
-    // needs a second block, hence the 128-byte scratch buffer.
-    let rem = remainder;
-    let mut tail = [0u8; 128];
-    tail[..rem.len()].copy_from_slice(rem);
-    tail[rem.len()] = 0x80;
-    let tail_len = if rem.len() <= 55 { 64 } else { 128 };
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_le_bytes());
-
-    for block in tail[..tail_len].as_chunks::<64>().0 {
-        md5_compress(&mut state, block);
-    }
-
-    let mut digest = [0u8; 16];
-    for (i, word) in state.iter().enumerate() {
-        digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
-    }
-    digest
-}
 
 /// The chunk ids digested in the fixed order described in the module docs, *excluding*
 /// the specially-handled `FunT` (which is filtered through [`digest_funtab`]). The
@@ -207,6 +84,9 @@ const DIGEST_CHUNKS_AFTER_FUNT: [ChunkId; 4] =
 /// keep the first occurrence, matching [`crate::container::Container::find`]. Pass
 /// [`crate::chunk::Chunks::raw`], which `chunk::parse` retains for exactly this purpose.
 ///
+/// The MD5 arithmetic is [`beam_common::md5::digest`] — the workspace's one RFC 1321
+/// implementation; this function owns only the chunk walk and the `FunT'` filtering.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`] for a `FunT` chunk that is not `4 + 24n` bytes (the C's
@@ -231,7 +111,7 @@ pub fn module_md5(raw: &[RawChunk<'_>]) -> Result<[u8; 16]> {
     for id in DIGEST_CHUNKS_AFTER_FUNT {
         input.extend_from_slice(chunk(id));
     }
-    Ok(md5(&input))
+    Ok(beam_common::md5::digest(&input))
 }
 
 /// Appends a `FunT` chunk's digest input — the 4-byte entry count followed by each
@@ -267,9 +147,12 @@ fn digest_funtab(funtab: &[u8], input: &mut Vec<u8>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The workspace's single RFC 1321 MD5 — imported so the vectors/padding and
+    /// chunk-order tests below can pin the exact bytes this module's digest feeds.
+    use beam_common::md5::digest;
+
     use super::*;
     use crate::container::ChunkId;
-
     /// Renders a digest as lowercase hex (the form the oracle test compares against).
     fn hex(bytes: &[u8]) -> String {
         use std::fmt::Write;
@@ -290,7 +173,10 @@ mod tests {
             (b"a", "0cc175b9c0f1b6a831c399e269772661"),
             (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
             (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
-            (b"abcdefghijklmnopqrstuvwxyz", "c3fcd3d76192e4007dfb496cca67e13b"),
+            (
+                b"abcdefghijklmnopqrstuvwxyz",
+                "c3fcd3d76192e4007dfb496cca67e13b",
+            ),
             (
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
                 "d174ab98d277d9f5a5611c2c9f419d9f",
@@ -301,7 +187,12 @@ mod tests {
             ),
         ];
         for (input, expected) in vectors {
-            assert_eq!(hex(&md5(input)), expected, "input {:?}", String::from_utf8_lossy(input));
+            assert_eq!(
+                hex(&digest(input)),
+                expected,
+                "input {:?}",
+                String::from_utf8_lossy(input)
+            );
         }
     }
 
@@ -327,7 +218,7 @@ mod tests {
         ];
         for (len, expected) in pinned {
             let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
-            assert_eq!(hex(&md5(&data)), expected, "length {len}");
+            assert_eq!(hex(&digest(&data)), expected, "length {len}");
         }
     }
 
@@ -391,7 +282,10 @@ mod tests {
             expected.extend_from_slice(&base[off..off + 20]);
             expected.extend_from_slice(&[0u8; 4]);
         }
-        assert_eq!(md5(&expected), module_md5(&chunks(&[(ChunkId::FUNT, &base)])).unwrap());
+        assert_eq!(
+            digest(&expected),
+            module_md5(&chunks(&[(ChunkId::FUNT, &base)])).unwrap()
+        );
     }
 
     #[test]
@@ -401,7 +295,7 @@ mod tests {
         let present_empty = module_md5(&chunks(&[(ChunkId::FUNT, empty)])).unwrap();
         assert_eq!(absent, present_empty);
         // Which is just the MD5 of nothing.
-        assert_eq!(absent, md5(b""));
+        assert_eq!(absent, digest(b""));
     }
 
     #[test]
@@ -430,7 +324,7 @@ mod tests {
         let zero_entries = 0u32.to_be_bytes();
         let with = module_md5(&chunks(&[(ChunkId::FUNT, &zero_entries)])).unwrap();
         let without = module_md5(&chunks(&[])).unwrap();
-        assert_eq!(with, md5(&zero_entries));
+        assert_eq!(with, digest(&zero_entries));
         assert_ne!(with, without);
     }
 
@@ -452,7 +346,7 @@ mod tests {
             let data = [1u8, 2, 3, 4, 5];
             assert_eq!(
                 module_md5(&chunks(&[(id, &data)])).unwrap(),
-                md5(b""),
+                digest(b""),
                 "chunk {:?} must not be digested",
                 id
             );
@@ -468,12 +362,15 @@ mod tests {
         let code = [0xBBu8; 5];
         let forward = chunks(&[(ChunkId::ATOM, &atu8), (ChunkId::CODE, &code)]);
         let reversed = chunks(&[(ChunkId::CODE, &code), (ChunkId::ATOM, &atu8)]);
-        assert_eq!(module_md5(&forward).unwrap(), module_md5(&reversed).unwrap());
+        assert_eq!(
+            module_md5(&forward).unwrap(),
+            module_md5(&reversed).unwrap()
+        );
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&atu8);
         expected.extend_from_slice(&code);
-        assert_eq!(md5(&expected), module_md5(&forward).unwrap());
+        assert_eq!(digest(&expected), module_md5(&forward).unwrap());
     }
 
     #[test]
@@ -490,8 +387,8 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&obsolete);
         expected.extend_from_slice(&[0xAA]);
-        assert_eq!(with, md5(&expected));
-        assert_eq!(without, md5(&[0xAA]));
+        assert_eq!(with, digest(&expected));
+        assert_eq!(without, digest(&[0xAA]));
         assert_ne!(with, without);
     }
 
@@ -501,7 +398,7 @@ mod tests {
         let first = [0x11u8; 4];
         let second = [0x22u8; 4];
         let dup = chunks(&[(ChunkId::ATOM, &first), (ChunkId::ATOM, &second)]);
-        assert_eq!(module_md5(&dup).unwrap(), md5(&first));
+        assert_eq!(module_md5(&dup).unwrap(), digest(&first));
     }
 
     #[test]
@@ -514,6 +411,6 @@ mod tests {
         let a = module_md5(&container.chunks).unwrap();
         let b = module_md5(&container.chunks).unwrap();
         assert_eq!(a, b);
-        assert_ne!(a, md5(b""));
+        assert_ne!(a, digest(b""));
     }
 }

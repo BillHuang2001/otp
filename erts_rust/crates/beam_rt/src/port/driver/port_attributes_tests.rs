@@ -59,7 +59,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use beam_alloc::Heap;
@@ -68,7 +67,6 @@ use beam_io::registry::PortRegistry;
 // `Driver` is the trait `DriverPortAdapter::flags` is reached through (`beam_io::Driver::flags`).
 use beam_io::{Driver as _, DriverFlags, Poller, PortCommandOptions, PortCommandOutcome};
 use beam_process::{PortId, ProcessId};
-use beam_term::AtomTable;
 
 use super::{DriverPort, DriverPortAdapter, OsPidFlag};
 
@@ -464,7 +462,7 @@ fn build_fixture(stem: &str, driver_flags: &str) -> Option<Fixture> {
 fn host() -> DriverPort {
     DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        super::hooks_tests::leak_table(),
         ProcessId::new(1, 0),
     )
 }
@@ -559,7 +557,7 @@ fn open_port(stem: &str, driver_flags: &str, mode: &str) -> Option<Open> {
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
     let port_host = DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        super::hooks_tests::leak_table(),
         ProcessId::new(1, 0),
     );
     // Seized before the host is consumed by `load`, exactly as the runtime's `open_port/2` does: the

@@ -266,10 +266,10 @@ fn render(term: Eterm) -> String {
 fn run_all<H: NifHost>(lib: &NifLibrary, host: &mut H) -> Vec<String> {
     let mut raws = Vec::with_capacity(ENTRIES.len());
     {
-        let mut env = NifEnv::new(host);
+        let env = NifEnv::new(host);
         for name in ENTRIES {
             let term = lib
-                .call(&mut env, name, 0, &[])
+                .call(&env, name, 0, &[])
                 .unwrap_or_else(|err| panic!("{name}/0 must be callable: {err:?}"));
             raws.push(term);
         }
@@ -395,7 +395,7 @@ fn the_armed_holder_carries_the_reference_block() {
 
     // A monitor-capable type of this test's own (`members = 3`, `down` present, no destructor).
     let (obj, pid) = {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let name =
             std::ffi::CString::new("nif_monitor_codes_test_with_down").expect("no interior NUL");
         let init = ErlNifResourceTypeInit {
@@ -431,7 +431,7 @@ fn the_armed_holder_carries_the_reference_block() {
         data: [0u8; MONITOR_BYTES],
     };
     let code = {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live, `obj` is a live payload pointer of a monitor-capable type, `pid` is
         // an initialised local and `holder` is writable.
         unsafe { enif_monitor_process(env.as_ptr(), obj, &pid, &mut holder) }

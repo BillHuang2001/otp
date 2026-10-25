@@ -255,7 +255,7 @@ pub unsafe extern "C" fn enif_convert_time_unit(
 }
 
 /// Build the C's `{MegaSecs, Secs, MicroSecs}` triple on `env`.
-fn time_tuple(env: &mut NifEnv, megasec: i64, sec: i64, microsec: i64) -> ERL_NIF_TERM {
+fn time_tuple(env: &NifEnv, megasec: i64, sec: i64, microsec: i64) -> ERL_NIF_TERM {
     let parts = [
         prelude::make_small(megasec),
         prelude::make_small(sec),
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn now_time_and_cpu_time_are_three_tuples_of_smalls() {
         let mut host = Host::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live.
         let now = unsafe { enif_now_time(env.as_ptr()) };
         let term = t(now);
@@ -955,13 +955,13 @@ mod tests {
     #[test]
     fn unique_integers_honour_the_property_bits() {
         let mut host = Host::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let flags = |p: bool, m: bool| {
             let bits = (if p { ErlNifUniqueInteger::POSITIVE.bits() } else { 0 })
                 | (if m { ErlNifUniqueInteger::MONOTONIC.bits() } else { 0 });
             ErlNifUniqueInteger::from_bits(bits)
         };
-        let call = |env: &mut NifEnv, f: ErlNifUniqueInteger| {
+        let call = |env: &NifEnv, f: ErlNifUniqueInteger| {
             // SAFETY: `env` is live.
             let term = unsafe { enif_make_unique_integer(env.as_ptr(), f) };
             let value = t(term);
@@ -970,31 +970,31 @@ mod tests {
         };
 
         // `[positive]` values are positive and strictly increasing.
-        let p1 = call(&mut env, flags(true, false));
-        let p2 = call(&mut env, flags(true, false));
+        let p1 = call(&env, flags(true, false));
+        let p2 = call(&env, flags(true, false));
         assert!(p1 > 0 && p2 > p1, "{p1} -> {p2}");
 
         // `[monotonic]` values are negative (the ERTS base) and strictly increasing.
-        let m1 = call(&mut env, flags(false, true));
-        let m2 = call(&mut env, flags(false, true));
+        let m1 = call(&env, flags(false, true));
+        let m2 = call(&env, flags(false, true));
         assert!(m1 < 0 && m2 > m1, "{m1} -> {m2}");
         assert_eq!(m1, UNIQUE_MONOTONIC_BASE);
 
         // `[positive, monotonic]` is positive and increasing, from its own counter.
-        let pm1 = call(&mut env, flags(true, true));
-        let pm2 = call(&mut env, flags(true, true));
+        let pm1 = call(&env, flags(true, true));
+        let pm2 = call(&env, flags(true, true));
         assert_eq!(pm1, UNIQUE_POSITIVE_MONOTONIC_BASE);
         assert!(pm2 > pm1);
 
         // No flags: the negative non-monotonic sequence.
-        let n1 = call(&mut env, flags(false, false));
+        let n1 = call(&env, flags(false, false));
         assert_eq!(n1, UNIQUE_NEGATIVE_BASE);
     }
 
     #[test]
     fn consume_timeslice_delegates_and_clamps() {
         let mut host = Host::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live.
         assert_eq!(unsafe { enif_consume_timeslice(env.as_ptr(), 50) }, 1);
         // SAFETY: as above.

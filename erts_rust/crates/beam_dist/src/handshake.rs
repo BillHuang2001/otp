@@ -702,9 +702,10 @@ pub fn check_mandatory(flags: DistFlags) -> Result<DistFlags> {
 
 /// Computes the 16-byte challenge digest `MD5(cookie ++ decimal(challenge))`.
 ///
-/// This is the pluggable seam that stands in for the missing in-tree MD5: the
-/// message codecs treat the digest opaquely and comparison goes through this
-/// trait.
+/// This is the pluggable seam over the digest provider: the message codecs treat
+/// the digest opaquely and comparison goes through this trait. The concrete
+/// provider is [`crate::auth::Md5Digest`], i.e. `beam_common::md5` over the
+/// cookie-then-decimal-challenge framing.
 pub trait ChallengeDigest {
     /// Returns the digest for `cookie` and `challenge`.
     fn digest(&self, cookie: &[u8], challenge: u32) -> [u8; 16];

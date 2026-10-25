@@ -76,7 +76,7 @@ use beam_io::registry::PortRegistry;
 use beam_io::{Poller, PortCommandOptions};
 use beam_process::{PortId, ProcessId};
 use beam_term::prelude::is_internal_port;
-use beam_term::{AtomTable, NIL};
+use beam_term::NIL;
 
 use super::{DriverPort, DriverPortAdapter, PortTerms, TermQueue};
 
@@ -424,7 +424,7 @@ fn build_fixture(stem: &str) -> Option<Fixture> {
 fn host() -> DriverPort {
     DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        super::hooks_tests::leak_table(),
         ProcessId::new(1, 0),
     )
 }
@@ -592,7 +592,7 @@ fn open_port(stem: &str) -> Option<Open> {
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
     let port_host = DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        super::hooks_tests::leak_table(),
         ProcessId::new(1, 0),
     );
     // Seized before the host is consumed by `load`, and shared with the boxed host by `Rc`, so this

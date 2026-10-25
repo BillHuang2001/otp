@@ -18,7 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! Integration tests for the `beam_dist::auth` seam: the RFC 1321 MD5, the
+//! Integration tests for the `beam_dist::auth` seam: the workspace's RFC 1321 MD5
+//! (`beam_common::md5::digest`, exercised through this crate's digest framing), the
 //! distribution challenge digest `md5(cookie ++ decimal(challenge))`, the
 //! [`Md5Digest`]/[`SystemChallengeSource`] providers, and their wiring into the
 //! `beam_dist::handshake` `ChallengeDigest`/`ChallengeSource` seam.
@@ -37,8 +38,9 @@
 //! cookie first, then the unsigned decimal challenge).
 
 use beam_common::Result;
+use beam_common::md5::digest as md5;
 
-use beam_dist::auth::{gen_challenge, gen_digest, md5, verify, Md5Digest, SystemChallengeSource};
+use beam_dist::auth::{gen_challenge, gen_digest, verify, Md5Digest, SystemChallengeSource};
 use beam_dist::handshake::{verify_digest, ChallengeDigest, ChallengeReply, ChallengeSource};
 use beam_dist::transport::Write;
 

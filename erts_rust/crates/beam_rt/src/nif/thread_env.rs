@@ -320,7 +320,7 @@ impl NifHost for ForeignHost {
     /// `None` is never answered here: an env allocates no arena (it is pushed onto this host's
     /// `envs`), so the trait's "unsupported" answer would be a lie about a hook this host does serve.
     fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
-        let mut env = Box::new(NifEnv::new(self));
+        let env = Box::new(NifEnv::new(self));
         let ptr = env.as_ptr();
         self.envs.push(env);
         Some(ptr)

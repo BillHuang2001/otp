@@ -47,7 +47,7 @@ pub use crate::handshake::*;
 pub use crate::transport::{MemoryTransport, Transport};
 
 pub use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
-pub use crate::auth::{gen_challenge, gen_digest, md5, Md5Digest};
+pub use crate::auth::{gen_challenge, gen_digest, Md5Digest};
 pub use crate::connection::{
     accept_server, accept_server_with_decision, connect_client, connect_client_with_creation,
     connect_to_node, connect_to_node_with_creation, Connection, TcpListener, TcpTransport,

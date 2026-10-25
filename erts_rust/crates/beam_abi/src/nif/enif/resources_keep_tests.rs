@@ -83,7 +83,7 @@ impl NifHost for KeepHost {
 /// Open a resource type called `name` with `dtor` — each test uses its own name (types are keyed by
 /// name and never freed, and the registry is process-wide).
 fn open_type(
-    env: &mut NifEnv,
+    env: &NifEnv,
     name: &str,
     dtor: Option<ErlNifResourceDtor>,
 ) -> *mut ErlNifResourceType {
@@ -140,7 +140,7 @@ fn is_registered(obj: *mut c_void) -> bool {
 /// # Safety
 ///
 /// `env` must be live and `obj` a live payload pointer (see [`alloc_object`]).
-unsafe fn make_resource_term(env: &mut NifEnv, obj: *mut c_void) -> Eterm {
+unsafe fn make_resource_term(env: &NifEnv, obj: *mut c_void) -> Eterm {
     // SAFETY: forwarded from the caller's contract.
     t(unsafe { enif_make_resource(env.as_ptr(), obj) })
 }
@@ -151,7 +151,7 @@ unsafe fn make_resource_term(env: &mut NifEnv, obj: *mut c_void) -> Eterm {
 ///
 /// `env` must be live and `ty` a type from [`open_type`] (or null).
 unsafe fn get_resource(
-    env: &mut NifEnv,
+    env: &NifEnv,
     term: Eterm,
     ty: *mut ErlNifResourceType,
 ) -> (i32, *mut c_void) {
@@ -183,8 +183,8 @@ fn a_keep_holds_the_object_past_the_owners_release() {
     }
 
     let mut host = KeepHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "keep_holds", Some(counting_dtor));
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "keep_holds", Some(counting_dtor));
     // SAFETY: `ty` just opened; the payload is one word (this test's own size class).
     let obj = unsafe { alloc_object(ty, 8) };
     // SAFETY: the payload is eight bytes, as allocated.
@@ -252,8 +252,8 @@ fn an_unknown_pointer_is_refused_without_dereferencing_it() {
     // A pointer *inside* a real block is still not the payload pointer the registry knows, so it is
     // refused too — the object keeps its single reference and is released normally afterwards.
     let mut host = KeepHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "keep_unknown", None);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "keep_unknown", None);
     // SAFETY: `ty` just opened; 64 bytes is this test's own size class.
     let obj = unsafe { alloc_object(ty, 64) };
     // SAFETY: `obj` points at a 64-byte payload, so eight bytes in is still inside the block.
@@ -284,8 +284,8 @@ fn an_unknown_pointer_is_refused_without_dereferencing_it() {
 #[test]
 fn a_dying_object_is_not_resurrected() {
     let mut host = KeepHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "keep_dying", None);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "keep_dying", None);
     // SAFETY: `ty` just opened; 200 bytes is this test's own size class.
     let obj = unsafe { alloc_object(ty, 200) };
 
@@ -341,8 +341,8 @@ fn an_unkeep_after_destruction_answers_false_and_runs_no_second_destructor() {
     }
 
     let mut host = KeepHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "keep_after_destroy", Some(counting_dtor));
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "keep_after_destroy", Some(counting_dtor));
     // SAFETY: `ty` just opened; 512 bytes is this test's own size class, so no other test can be handed
     // this freed chunk.
     let obj = unsafe { alloc_object(ty, 512) };
@@ -385,12 +385,12 @@ fn a_keep_and_unkeep_round_trip_leaves_term_resolution_intact() {
     }
 
     let mut host = KeepHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "keep_roundtrip", Some(counting_dtor));
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "keep_roundtrip", Some(counting_dtor));
     // SAFETY: `ty` just opened; 1000 bytes is this test's own size class.
     let obj = unsafe { alloc_object(ty, 1000) };
     // SAFETY: `obj` is a live payload pointer and `env` is live; the mint takes its own reference.
-    let term = unsafe { make_resource_term(&mut env, obj) };
+    let term = unsafe { make_resource_term(&env, obj) };
 
     assert!(keep_resource(obj), "the keep takes a reference");
     // Drop the allocator's reference: the term's and the keep's references remain.
@@ -402,7 +402,7 @@ fn a_keep_and_unkeep_round_trip_leaves_term_resolution_intact() {
         "two references still stand"
     );
     // SAFETY: `env` is live; `term` is the term just minted; `ty` is the object's type.
-    let (matched, objp) = unsafe { get_resource(&mut env, term, ty) };
+    let (matched, objp) = unsafe { get_resource(&env, term, ty) };
     assert_eq!(matched, 1, "the term resolves before the unkeep");
     assert_eq!(objp, obj, "to the very payload it was minted for");
 
@@ -413,7 +413,7 @@ fn a_keep_and_unkeep_round_trip_leaves_term_resolution_intact() {
         "the term's own reference still holds the object"
     );
     // SAFETY: `env` is live; `term` is still minted; `ty` is the object's type.
-    let (matched, objp) = unsafe { get_resource(&mut env, term, ty) };
+    let (matched, objp) = unsafe { get_resource(&env, term, ty) };
     assert_eq!(
         matched, 1,
         "the term still resolves after the keep/unkeep round trip"

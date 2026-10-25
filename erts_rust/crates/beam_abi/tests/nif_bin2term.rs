@@ -287,7 +287,7 @@ fn load_path(so: &Path) -> Option<String> {
 
 /// A binary term carrying `bytes`, built with the `Some` slot `enif_make_new_binary` on `env`'s heap
 /// (the fixture inspects it with `enif_inspect_binary`).
-fn binary_term(env: &mut NifEnv, bytes: &[u8]) -> Eterm {
+fn binary_term(env: &NifEnv, bytes: &[u8]) -> Eterm {
     let mut term = ERL_NIF_TERM::default();
     // SAFETY: `env` is live, `term` is a live writable local, and the returned pointer heads exactly
     // `bytes.len()` writable payload bytes of the freshly written heap binary.
@@ -338,11 +338,11 @@ fn render(term: Eterm, atoms: &AtomTable) -> String {
 fn run_all<H: NifHost>(lib: &NifLibrary, host: &mut H, atoms: fn(&H) -> &AtomTable) -> Vec<String> {
     let mut raws = Vec::with_capacity(CASES.len());
     {
-        let mut env = NifEnv::new(host);
+        let env = NifEnv::new(host);
         for case in CASES.iter() {
-            let arg = binary_term(&mut env, case.bytes);
+            let arg = binary_term(&env, case.bytes);
             let term = lib
-                .call(&mut env, case.entry, 1, &[arg])
+                .call(&env, case.entry, 1, &[arg])
                 .unwrap_or_else(|err| panic!("{}/1 must be callable: {err:?}", case.entry));
             raws.push(term);
         }

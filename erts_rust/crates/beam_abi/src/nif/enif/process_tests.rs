@@ -266,7 +266,7 @@ fn send_reports_one_when_sent_and_zero_otherwise() {
     let (live, dead) = (pid(1), pid(2));
     host.self_pid = Some(live);
     host.live_pids = vec![live];
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let (to_live, to_dead) = (ErlNifPid { pid: n(live) }, ErlNifPid { pid: n(dead) });
     let msg = n(make_small(7));
     // SAFETY: `env` is live and both ids are initialised locals.
@@ -288,7 +288,7 @@ fn port_command_reports_one_for_a_live_port_and_zero_otherwise() {
     let mut host = ProcHost::new(false);
     let (live, dead) = (port_term(1), port_term(2));
     host.live_ports = vec![live];
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let to_live = ErlNifPort { port_id: n(live) };
     let to_dead = ErlNifPort { port_id: n(dead) };
     let data = make_small(3);
@@ -319,7 +319,7 @@ fn whereis_answers_the_hit_and_the_miss() {
         ("registered".to_string(), live),
         ("registered_port".to_string(), a_port),
     ];
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let mut out = ErlNifPid { pid: n(pid(0)) };
     // SAFETY: `env` is live and `out` is writable.
     let hit = unsafe { enif_whereis_pid(env.as_ptr(), n(reg), &mut out) };
@@ -362,7 +362,7 @@ fn liveness_predicates_report_the_hosts_answer() {
     host.self_pid = Some(live);
     host.live_pids = vec![live];
     host.live_ports = vec![a_port];
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let mut live_pid = ErlNifPid { pid: n(live) };
     let mut dead_pid = ErlNifPid { pid: n(dead) };
     let mut live_port = ErlNifPort {
@@ -392,7 +392,7 @@ fn monitors_round_trip_and_follow_the_c_codes() {
     let (live, dead) = (pid(1), pid(2));
     host.self_pid = Some(live);
     host.live_pids = vec![live];
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let live_pid = ErlNifPid { pid: n(live) };
     let dead_pid = ErlNifPid { pid: n(dead) };
     let mut mon = zero_monitor();
@@ -470,7 +470,7 @@ fn monitors_round_trip_and_follow_the_c_codes() {
 #[test]
 fn an_unknown_monitor_is_reported_not_found() {
     let mut host = ProcHost::new(false);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let mut bogus = zero_monitor();
     bogus.data[0] = 0x7f; // a payload no `monitor_process` call ever handed out
     // SAFETY: `env` is live and `bogus` is an initialised local.
@@ -514,7 +514,7 @@ fn schedule_runs_the_continuation_and_never_consults_the_legacy_hook() {
     // continuation's value become the call's result (`erl_nif.c:3512-3558`).
     for hook_supported in [false, true] {
         let mut host = ProcHost::new(hook_supported);
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let name = c"reschedule";
         // SAFETY: `env` is live, `name` is NUL-terminated and `scheduled_nif` is a valid entry
         // point with no arguments.
@@ -560,7 +560,7 @@ fn schedule_runs_the_continuation_and_never_consults_the_legacy_hook() {
 #[test]
 fn schedule_enforces_the_cs_rules_before_it_runs_anything() {
     let mut host = ProcHost::new(true);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let name = c"reschedule";
     let argv = [n(make_small(2)), n(make_small(3))];
     // The rules the C enforces before anything is scheduled (`erl_nif.c:3569,3584-3598,3571`), plus
@@ -804,7 +804,7 @@ fn a_c_layout_arm_is_established_and_stores_its_three_words() {
     };
     let mut holder = filled_monitor(0xCC);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live and the locals are initialised and writable.
         let code = unsafe {
             enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
@@ -854,7 +854,7 @@ unsafe extern "C" fn unused_down(
 /// The type carries **no destructor**, so releasing one of its objects never builds an environment
 /// (this crate runs the destructor synchronously; the test host is already borrowed by `env`).
 fn open_test_type(
-    env: &mut NifEnv,
+    env: &NifEnv,
     name: &str,
     with_down: bool,
 ) -> *mut crate::nif::types::ErlNifResourceType {
@@ -988,7 +988,7 @@ fn the_three_way_hook_arms_and_writes_the_reference_block() {
     let mut holder = filled_monitor(0xAA);
     let (code, null_holder_code);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live and every local below is initialised and writable.
         code = unsafe {
             enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
@@ -1034,7 +1034,7 @@ fn the_three_way_hook_reports_not_alive_and_no_down_callback() {
     };
     let mut holder = filled_monitor(0x5A);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live and the locals are initialised and writable.
         let code = unsafe {
             enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
@@ -1053,7 +1053,7 @@ fn the_three_way_hook_reports_not_alive_and_no_down_callback() {
     host.result = Some(NifMonitorResult::NoDownCallback);
     let mut holder = filled_monitor(0x77);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: as above.
         let code = unsafe {
             enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
@@ -1080,7 +1080,7 @@ fn an_undefined_or_null_target_answers_one_and_never_touches_the_holder() {
     let undefined = ErlNifPid { pid: UNDEFINED_PID };
     let mut holder = filled_monitor(0x11);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; the locals are initialised, and the null pid is explicitly handled.
         let (undef, null_pid) = unsafe {
             (
@@ -1114,7 +1114,7 @@ fn a_non_reference_arm_is_refused_rather_than_stored() {
     };
     let mut holder = filled_monitor(0x22);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live and the locals are initialised and writable.
         let code = unsafe {
             enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
@@ -1146,10 +1146,10 @@ fn a_resource_without_a_down_callback_answers_minus_one_before_looking_at_the_pi
     let undefined = ErlNifPid { pid: UNDEFINED_PID };
     let mut holder = filled_monitor(0x33);
     let (no_down, with_down) = {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // Distinct names per test: the resource registry is process-wide and keyed by name.
-        let no_down = open_test_type(&mut env, "monitor_rt_no_down", false);
-        let with_down = open_test_type(&mut env, "monitor_rt_with_down", true);
+        let no_down = open_test_type(&env, "monitor_rt_no_down", false);
+        let with_down = open_test_type(&env, "monitor_rt_with_down", true);
         assert!(!no_down.is_null() && !with_down.is_null(), "both types open");
         // SAFETY: both handles are live types from the open calls above.
         let obj_no_down = unsafe { enif_alloc_resource(no_down, 4) };
@@ -1223,7 +1223,7 @@ fn a_legacy_only_host_keeps_its_single_outcome_behaviour() {
     let mut holder = filled_monitor(0x44);
     let stored;
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live and the locals are initialised and writable.
         let code = unsafe {
             enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
@@ -1244,7 +1244,7 @@ fn a_legacy_only_host_keeps_its_single_outcome_behaviour() {
     host.legacy = false;
     let mut holder = filled_monitor(0x55);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live and the locals are initialised and writable.
         let code = unsafe {
             enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)

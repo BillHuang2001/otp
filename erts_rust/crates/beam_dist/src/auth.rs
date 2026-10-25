@@ -18,22 +18,19 @@
 //
 // %CopyrightEnd%
 
-//! The distribution challenge/response authentication: MD5 digest and nonce.
+//! The distribution challenge/response authentication: digest framing and nonce.
 //!
-//! Owns the concrete, byte-exact implementation of the handshake digest
+//! Owns the concrete, byte-exact framing of the handshake digest
 //! `md5(cookie ++ decimal(challenge))` (ground truth: `dist.c` `gen_digest`,
 //! `lib/kernel/src/dist_util.erl` `gen_digest/2`, `lib/erl_interface/src/connect/ei_connect.c`
 //! `gen_digest`) behind the [`crate::handshake::ChallengeDigest`] seam, plus the
 //! challenge nonce source.
 //!
-//! # Why an in-tree MD5
-//!
-//! `beam_dist` is deliberately dependency-light: the handshake only ever needs
-//! `MD5(cookie ++ decimal(challenge))` and a nonce. Pulling in the `md-5` crate
-//! would drag `digest` + `generic-array` + `typenum` + `block-buffer` into the
-//! build and churn the workspace-wide `Cargo.lock`. RFC 1321 is ~120 lines of
-//! safe integer arithmetic, so it lives here instead — fully safe Rust, no
-//! `unsafe`, and no external dependency.
+//! The RFC 1321 core itself is [`beam_common::md5::digest`] — the workspace's single MD5
+//! implementation, hosted by the lowest common ancestor because the same arithmetic serves
+//! several contracts (A.2 module checksums, A.5 handshake digests, A.7 `erlang:md5/1`). This
+//! module owns only the handshake-specific framing: the cookie-then-decimal-challenge
+//! concatenation, and the nonce source.
 //!
 //! # Digest formula (wire-frozen, contract Part I §A.5)
 //!
@@ -60,139 +57,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::handshake::{ChallengeDigest, ChallengeSource};
 
-/// The MD5 per-round left-rotation amounts (RFC 1321 §3.4), four 16-step rounds.
-const MD5_SHIFTS: [u32; 64] = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, //
-    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, //
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, //
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-];
-
-/// The MD5 additive constants `K[i] = floor(2^32 * abs(sin(i + 1)))` (RFC 1321 §3.4).
-const MD5_K: [u32; 64] = [
-    0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, //
-    0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501, //
-    0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be, //
-    0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821, //
-    0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa, //
-    0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8, //
-    0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed, //
-    0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a, //
-    0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c, //
-    0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70, //
-    0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05, //
-    0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665, //
-    0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039, //
-    0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1, //
-    0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1, //
-    0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
-];
-
-/// The MD5 initial state words (RFC 1321 §3.3).
-const MD5_INIT: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-
-/// Runs the 64-step MD5 compression function over one 512-bit block.
-///
-/// The block length is not re-checked: every caller passes exactly one
-/// `chunks_exact(64)` slice, and out-of-range indexing would be a logic bug
-/// (never reachable from wire data), not an input error.
-fn md5_compress(state: &mut [u32; 4], block: &[u8]) {
-    let mut m = [0u32; 16];
-    for (i, word) in m.iter_mut().enumerate() {
-        let o = i * 4;
-        *word = u32::from_le_bytes([block[o], block[o + 1], block[o + 2], block[o + 3]]);
-    }
-
-    let mut a = state[0];
-    let mut b = state[1];
-    let mut c = state[2];
-    let mut d = state[3];
-
-    for i in 0..64 {
-        let (f, g) = match i {
-            0..=15 => ((b & c) | (!b & d), i),
-            16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-            32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
-            _ => (c ^ (b | !d), (7 * i) % 16),
-        };
-        let rotated = a
-            .wrapping_add(f)
-            .wrapping_add(MD5_K[i])
-            .wrapping_add(m[g])
-            .rotate_left(MD5_SHIFTS[i]);
-        a = d;
-        d = c;
-        c = b;
-        b = b.wrapping_add(rotated);
-    }
-
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-}
-
-/// Computes the MD5 message digest (RFC 1321) of `data`.
-///
-/// Fully safe Rust; no allocation, no `unsafe`, and it never panics — any byte
-/// string (including the empty one; `data.len()` is only ever converted with a
-/// wrapping multiply) is valid input.
-///
-/// (The RFC 1321 `"abc"` vector:)
-///
-/// ```
-/// use beam_dist::auth::md5;
-/// assert_eq!(
-///     md5(b"abc"),
-///     [
-///         0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0,
-///         0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72,
-///     ]
-/// );
-/// ```
-pub fn md5(data: &[u8]) -> [u8; 16] {
-    let mut state = MD5_INIT;
-
-    // Full 512-bit blocks straight from the input.
-    let mut blocks = data.chunks_exact(64);
-    for block in &mut blocks {
-        md5_compress(&mut state, block);
-    }
-
-    // RFC 1321 §3.1/§3.2 padding: a single `1` bit, zeros up to the 56-byte
-    // boundary, then the 64-bit little-endian *bit* length. A tail of 56..=63
-    // bytes needs a second block, hence the 128-byte scratch buffer.
-    let rem = blocks.remainder();
-    let mut tail = [0u8; 128];
-    tail[..rem.len()].copy_from_slice(rem);
-    tail[rem.len()] = 0x80;
-    let tail_len = if rem.len() <= 55 { 64 } else { 128 };
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_le_bytes());
-
-    for block in tail[..tail_len].chunks_exact(64) {
-        md5_compress(&mut state, block);
-    }
-
-    let mut digest = [0u8; 16];
-    for (i, word) in state.iter().enumerate() {
-        digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
-    }
-    digest
-}
-
 /// Computes the v6 distribution challenge digest `md5(cookie ++ decimal(challenge))`.
 ///
 /// The cookie bytes are used verbatim (no NUL terminator, no length prefix) and
 /// the challenge is rendered as its **unsigned decimal** string
 /// (`challenge.to_string()`, equivalent to C's `sprintf("%u", …)`) — see the
-/// module docs for the ground truth.
+/// module docs for the ground truth. The RFC 1321 core is [`beam_common::md5::digest`].
+///
+/// An oracle-derived known answer (`erlang:md5(<<"COOKIE","12345">>)`):
+///
+/// ```
+/// use beam_dist::auth::gen_digest;
+/// assert_eq!(
+///     gen_digest(b"COOKIE", 12345),
+///     [
+///         0xe8, 0x32, 0x6b, 0xad, 0x89, 0x67, 0x6c, 0xda,
+///         0xdf, 0x29, 0xfb, 0x53, 0x8c, 0x8f, 0x2b, 0x0c,
+///     ]
+/// );
+/// ```
 pub fn gen_digest(cookie: &[u8], challenge: u32) -> [u8; 16] {
     let decimal = challenge.to_string();
     let mut buf = Vec::with_capacity(cookie.len() + decimal.len());
     buf.extend_from_slice(cookie);
     buf.extend_from_slice(decimal.as_bytes());
-    md5(&buf)
+    beam_common::md5::digest(&buf)
 }
 
 /// Verifies a received digest against the one computed over `challenge`.
@@ -215,7 +104,7 @@ pub fn verify(cookie: &[u8], challenge: u32, got: &[u8; 16]) -> bool {
 /// `unsigned char c[16]` / `unsigned int x[4]`, returned as
 /// `x[0] ^ x[1] ^ x[2] ^ x[3]`), used for the [`gen_challenge`] nonce.
 fn md_32(data: &[u8]) -> u32 {
-    let d = md5(data);
+    let d = beam_common::md5::digest(data);
     u32::from_le_bytes([d[0], d[1], d[2], d[3]])
         ^ u32::from_le_bytes([d[4], d[5], d[6], d[7]])
         ^ u32::from_le_bytes([d[8], d[9], d[10], d[11]])
@@ -279,6 +168,11 @@ impl ChallengeSource for SystemChallengeSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The RFC 1321 core is the workspace's single implementation, `beam_common::md5`;
+    /// the assertions below exercise it through this crate's digest framing.
+    use beam_common::md5::digest as md5;
+
     use crate::handshake::verify_digest;
 
     /// Renders a digest as lowercase hex (test-only, mirrors `ei_connect.c:hex`).

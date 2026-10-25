@@ -57,7 +57,7 @@ fn int_round_trip_through_the_c_abi() {
         heap: Heap::new(256).expect("heap"),
         atoms: AtomTable::new(),
     };
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live for the whole test.
     let term = unsafe { enif_make_int(env.as_ptr(), 5) };
     assert_eq!(t(term), make_small(5));

@@ -353,7 +353,7 @@ fn enif_schedule_nif_runs_its_continuation_to_completion() {
     SUM_RUNS.with(|c| c.set(0));
     SUM_SEEN.with(|c| c.set((0, 0, 0, 0)));
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let argv = [nif_from_eterm(make_small(2)), nif_from_eterm(make_small(3))];
     let argv_ptr = argv.as_ptr();
     // SAFETY: `env` is live, `fun_name` is NUL-terminated (and names nothing, which is legal: the C
@@ -413,7 +413,7 @@ fn enif_schedule_nif_runs_its_continuation_to_completion() {
     OUTER_SEEN.with(|c| c.set((usize::MAX, false, 0)));
     NESTED_SEEN.with(|c| c.set((0, 0, i64::MIN)));
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let outer_argv = [nif_from_eterm(make_small(7))];
     // SAFETY: as above — live env, NUL-terminated name, real entry point, 1 readable term.
     let returned = unsafe {
@@ -455,7 +455,7 @@ fn enif_schedule_nif_runs_its_continuation_to_completion() {
     // -----------------------------------------------------------------------------------------
     CHAIN_ENTRIES.with(|c| c.set(0));
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let chain_argv = [nif_from_eterm(make_small(4))];
     // SAFETY: as above.
     let returned = unsafe {
@@ -496,7 +496,7 @@ fn enif_schedule_nif_runs_its_continuation_to_completion() {
     TAIL_RUNS.with(|c| c.set(0));
     RAISE_SEEN.with(|c| c.set((usize::MAX, usize::MAX)));
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live, the name is NUL-terminated, `argc` is 0 so a null `argv` is the legal
     // "no arguments" form.
     let returned = unsafe {
@@ -550,7 +550,7 @@ fn enif_schedule_nif_runs_its_continuation_to_completion() {
         "this file never runs on an enif_thread_create'd thread, so the baseline is the C's 0"
     );
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live, the name is NUL-terminated, `argc` is 0 with a null `argv`.
     let cpu = unsafe {
         enif_schedule_nif(
@@ -596,7 +596,7 @@ fn enif_schedule_nif_runs_its_continuation_to_completion() {
     // -----------------------------------------------------------------------------------------
     SUM_RUNS.with(|c| c.set(0));
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let badarg = host
         .intern_atom("badarg")
         .expect("the test host interns unconditionally");

@@ -224,7 +224,7 @@ fn compile_fixture() -> Option<PathBuf> {
 #[test]
 fn a_null_resource_type_never_matches() {
     let mut host = ResourceHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let mut objp: *mut c_void = std::ptr::null_mut();
     let term = nif_from_eterm(make_small(1));
     // SAFETY: `env` is live; a null `type` is explicitly handled by the implementation; `objp` is a
@@ -253,10 +253,10 @@ fn resource_family_end_to_end() {
     // the types' captured host pointer require.
     let lib = load(&path, "nif_resource", &mut host, NIL)
         .expect("a real NIF library must load: its enif_* imports resolve from the test binary");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // --- the three open functions and the `*tried` contract -------------------------------
-    let status = lib.call(&mut env, "load_status", 0, &[]).expect("load_status/0");
+    let status = lib.call(&env, "load_status", 0, &[]).expect("load_status/0");
     assert_eq!(
         tuple_ints(status),
         vec![
@@ -271,13 +271,13 @@ fn resource_family_end_to_end() {
 
     // Re-opening an existing name with TAKEOVER only: `*tried` agrees with the oracle; the
     // non-NULL-ness does not (there is no load-session boundary here — see the module docs).
-    let reopened = lib.call(&mut env, "reopen_main", 0, &[]).expect("reopen_main/0");
+    let reopened = lib.call(&env, "reopen_main", 0, &[]).expect("reopen_main/0");
     assert_eq!(tuple_ints(reopened), vec![1, 2]);
 
     // Re-opening an existing name with CREATE only: not taken over, so NULL and `*tried == flags`.
     // This agrees with the oracle.
     let created = lib
-        .call(&mut env, "create_only_existing", 0, &[])
+        .call(&env, "create_only_existing", 0, &[])
         .expect("create_only_existing/0");
     assert_eq!(tuple_ints(created), vec![0, 1]);
 
@@ -285,7 +285,7 @@ fn resource_family_end_to_end() {
     // Oracle value (measured against OTP 29.1.1 / erts-17.1): {13,1,1,1,1,0,0,-1,1,1,0,0,0,1,9,0}.
     // The final element is the one documented timing divergence: the oracle's `x_dtor_runs` is `0`
     // because the C only *schedules* the destructor off-thread; this runtime runs it synchronously.
-    let rt = lib.call(&mut env, "roundtrip", 0, &[]).expect("roundtrip/0");
+    let rt = lib.call(&env, "roundtrip", 0, &[]).expect("roundtrip/0");
     assert_eq!(
         tuple_ints(rt),
         vec![
@@ -307,7 +307,7 @@ fn resource_family_end_to_end() {
     // `enif_make_resource` + `enif_get_resource` round-trip the payload a NIF wrote.
     // Oracle: {1,42,0,1,0}.
     let rtv = lib
-        .call(&mut env, "roundtrip_value", 0, &[])
+        .call(&env, "roundtrip_value", 0, &[])
         .expect("roundtrip_value/0");
     assert_eq!(tuple_ints(rtv), vec![1, 42, 0, 1, 0]);
 
@@ -316,7 +316,7 @@ fn resource_family_end_to_end() {
     // Oracle: {1,42,0} — the term holds its own reference, so the release only drops the
     // allocator's, the payload stays readable and no destructor runs.
     let post = lib
-        .call(&mut env, "post_release", 0, &[])
+        .call(&env, "post_release", 0, &[])
         .expect("post_release/0");
     assert_eq!(
         tuple_ints(post),
@@ -328,7 +328,7 @@ fn resource_family_end_to_end() {
     );
 
     // --- enif_dynamic_resource_call -------------------------------------------------------
-    let dynr = lib.call(&mut env, "dyn_call", 0, &[]).expect("dyn_call/0");
+    let dynr = lib.call(&env, "dyn_call", 0, &[]).expect("dyn_call/0");
     assert_eq!(
         tuple_ints(dynr),
         vec![
@@ -350,9 +350,9 @@ fn resource_family_end_to_end() {
     // `dtor_state/0` runs the count is complete: two runs, in probe order (`0x11` then `0x22`),
     // with the last payload byte `0x22`. (The oracle cannot run this probe: its C dereferences the
     // `NULL` keep/release and segfaults — see the fixture comment.)
-    let probe = lib.call(&mut env, "dtor_probe", 0, &[]).expect("dtor_probe/0");
+    let probe = lib.call(&env, "dtor_probe", 0, &[]).expect("dtor_probe/0");
     assert_eq!(tuple_ints(probe), vec![1, 2]);
-    let state = lib.call(&mut env, "dtor_state", 0, &[]).expect("dtor_state/0");
+    let state = lib.call(&env, "dtor_state", 0, &[]).expect("dtor_state/0");
     assert_eq!(
         tuple_ints(state),
         vec![

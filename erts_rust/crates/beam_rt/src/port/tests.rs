@@ -2046,7 +2046,7 @@ fn ids_reports_live_ports_across_a_released_lower_slot() {
 fn driver_term_host(atoms: &Rc<AtomTable>, owner: ProcessId) -> (driver::DriverPort, PortMeta) {
     let host = driver::DriverPort::new(
         Heap::new(64).expect("a driver heap"),
-        Rc::clone(atoms),
+        atoms,
         owner,
     );
     let queue = host.term_queue();
@@ -2074,6 +2074,18 @@ fn driver_term_fixture(
         )
         .expect("a registered driver port");
     (host, port)
+}
+
+/// Runs `f` inside a **drive window** over the runtime's shared atom table — the production shape
+/// every driver-callback site uses (see [`PortRegistry::open_driver_atom_view`]): the live ports
+/// hold a view of the table for the closure's duration, and nothing once it returns.
+fn drive_window<T>(rt: &Runtime, f: impl FnOnce(&mut PortRegistry) -> T) -> T {
+    let view = rt.code_server().atoms_handle();
+    let mut registry = rt.ports.borrow_mut();
+    registry.open_driver_atom_view(&view);
+    let out = f(&mut registry);
+    registry.close_driver_atom_view();
+    out
 }
 
 /// A term a C driver emitted is drained off the port's [`driver::TermQueue`] as a
@@ -2490,7 +2502,273 @@ fn a_port_message_build_does_not_clone_the_shared_atom_table_while_a_lease_is_he
     );
     drop(lease);
 }
+/// A live driver port holds a view of the shared atom table **only while a driver callback can
+/// run**: between rounds it holds nothing, so an intern taken anywhere appends in place.
+///
+/// The lease lives on the [`driver::DriverAtoms`] record the port layer shares with the host
+/// (`DriverPort::pending_atoms`), because the port layer can only reach a handle seized *before*
+/// the host was boxed into its port. Before the drive window every driver callback site opens
+/// ([`PortRegistry::open_driver_atom_view`]), that record held a strong `Rc<AtomTable>` for the
+/// port's **whole life** — and `CodeServer::atoms_mut`/`intern_pending` are `Rc::make_mut`, whose
+/// `Rc::get_mut` refuses while *any* other reference exists. So every intern taken anywhere while a
+/// `dlopen`ed driver port was open deep-cloned the entire shared table (every name `String` plus the
+/// index map) **and** left the host's copy stale — a later `intern_atom` for a name the real table
+/// already held then predicted an index past the end of its own copy, `AtomTable::intern` deduped it
+/// away, and the term the driver had already built named the **wrong atom**. The window is what
+/// makes both halves go away: no intern can happen while driver code runs, so scoping the lease to
+/// exactly that window costs nothing and can never cause a copy.
+///
+/// Four properties, none of them requiring allocation instrumentation (`Rc::as_ptr` is the clone
+/// itself — `Rc::make_mut` replaces the code server's `Rc` with a fresh allocation — and
+/// `Rc::strong_count`/`DriverAtoms::table` are the ownership claim; a counting
+/// `#[global_allocator]` would need `unsafe impl GlobalAlloc`, which this crate's
+/// `#![deny(unsafe_code)]` forbids):
+///
+/// * (a) between rounds the open driver port holds **nothing** — the code server is the table's
+///   only owner;
+/// * (b) a round that lands a genuinely new name leaves the code server's `Rc` at the same
+///   allocation, with the name at exactly its predicted index;
+/// * (c) a **plain intern between rounds** does not replace the table either — the property an open
+///   driver port used to destroy for everybody else;
+/// * (d) the host still resolves the committed name from **inside** a drive window.
+///
+/// The positive control at the end is what makes (b) and (c) discriminating rather than vacuous: a
+/// genuine append taken while a window *is* open still takes the copy-on-write route, so "the
+/// pointer did not move" means "no other holder existed", not "the probe is blind".
+#[test]
+fn a_driver_atom_commit_does_not_deep_copy_the_shared_atom_table() {
+    use beam_abi::DriverHost;
+    /// A name no boot seed and no builder spells, so the round really has a name to land.
+    const FRESH: &str = "driver_commit_pin_fresh_atom";
+    /// A name the *plain* intern between rounds appends — (c)'s probe.
+    const BETWEEN: &str = "driver_commit_pin_between_atom";
+    /// The positive control's own append, taken with a window open.
+    const CONTROL: &str = "driver_commit_pin_control_atom";
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+    let owner = table.spawn_default().expect("the port's owner");
+    // The production shape: the host is built over a **lease** of the runtime's table, and the
+    // test-side handle is dropped as soon as construction is done — a test-side `Rc` kept alive
+    // past this block would itself be a second strong reference, so the ownership assertion below
+    // would be about the test rather than about the driver port.
+    let (mut host, meta) = {
+        let atoms = rt.code_server().atoms_handle();
+        driver_term_host(&atoms, owner)
+    };
+    let pending = meta.driver_atoms.clone().expect("the pending handle");
+    // ...and the port is registered inside a drive window, which closes right after it, exactly as
+    // `RuntimePorts::open_port` does: `DriverPort::new` must adopt for the `start` callback, and the
+    // close is what keeps the newly opened port from holding the table between rounds.
+    drive_window(&rt, |registry| {
+        registry
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port")
+    });
 
+    // (a) Ownership between rounds: the code server's own field plus this assertion's temporary
+    // handle, and nothing else. An open driver port used to be the third.
+    assert!(
+        pending.table().is_none(),
+        "an open driver port holds no view of the shared table between rounds"
+    );
+    assert_eq!(
+        Rc::strong_count(&rt.code_server().atoms_handle()),
+        2,
+        "the code server + this assertion's temporary handle: the open driver port holds nothing"
+    );
+
+    // (b) The round with a genuine name to land: the commit appends **in place**.
+    assert!(
+        rt.atoms().lookup(FRESH).is_none(),
+        "`{FRESH}` must start absent, or the miss path is not under test"
+    );
+    // A driver intern happens *inside* a callback, so the prediction is taken inside a window too.
+    let fresh = drive_window(&rt, |_| host.intern_atom(FRESH)).expect("interning always answers");
+    let predicted = atom_val(fresh);
+    assert_eq!(
+        predicted,
+        beam_term::Atom::from_raw(rt.atoms().len() as u32),
+        "a fresh name is predicted at the live table's next index"
+    );
+    assert!(
+        rt.atoms().lookup(FRESH).is_none(),
+        "a predicted name is unresolvable until the round commits it"
+    );
+    assert!(
+        pending.table().is_none(),
+        "closing the window took the host's view away again"
+    );
+    let len_before = rt.atoms().len();
+    assert!(
+        !rt.ports.borrow().has_nothing_to_poll(),
+        "the round must not bail out before the commit site"
+    );
+    let before = Rc::as_ptr(&rt.code_server().atoms_handle());
+    rt.deliver_port_messages(&mut table, Duration::from_millis(1))
+        .expect("the round runs");
+    assert_eq!(
+        Rc::as_ptr(&rt.code_server().atoms_handle()),
+        before,
+        "a driver-atom commit must not replace the shared AtomTable with a clone of itself"
+    );
+    assert_eq!(
+        rt.atoms().name(predicted),
+        Some(FRESH),
+        "the commit lands the name at exactly its predicted index"
+    );
+    assert_eq!(rt.atoms().len(), len_before + 1, "exactly one name is appended");
+    assert!(pending.is_empty(), "the commit empties the prediction window");
+    // (a) Ownership **between rounds**: the open driver port holds nothing at all — not a view on
+    // the record the port layer shares with it, and not a strong reference anywhere else. The code
+    // server's own field plus this assertion's temporary handle are the only two owners.
+    assert!(
+        pending.table().is_none(),
+        "between rounds no driver port holds a view of the shared table"
+    );
+    assert_eq!(
+        Rc::strong_count(&rt.code_server().atoms_handle()),
+        2,
+        "between rounds the code server is the shared table's only owner: the open driver port \
+         holds nothing"
+    );
+
+    // (c) A **plain intern between rounds** appends in place: the open driver port forces no copy
+    // on anybody else's write. This is the property a whole-life lease destroyed.
+    assert!(
+        rt.atoms().lookup(BETWEEN).is_none(),
+        "`{BETWEEN}` must start absent, or the append is not an append"
+    );
+    rt.code_server_atoms_mut().intern(BETWEEN);
+    assert_eq!(
+        Rc::as_ptr(&rt.code_server().atoms_handle()),
+        before,
+        "an open driver port must not turn another party's intern into a copy of the whole table"
+    );
+
+    // (d) The host's view is taken and dropped with the window, and inside one it resolves the name
+    // it committed — the committed index, not a second prediction past the live table's end (the
+    // wrong-atom shape a stale copy produces).
+    assert_eq!(
+        drive_window(&rt, |_| host.intern_atom(FRESH)),
+        Some(fresh),
+        "inside a drive window the host resolves the committed name through the live table"
+    );
+    assert!(pending.is_empty(), "a resolved name records nothing");
+
+    // The discriminating positive control: with a window open, a genuine append really does take
+    // the copy-on-write route — so (b)'s and (c)'s equalities mean "no other holder", not "the
+    // probe is blind".
+    {
+        let mut registry = rt.ports.borrow_mut();
+        registry.open_driver_atom_view(&rt.code_server().atoms_handle());
+    }
+    let before_control = Rc::as_ptr(&rt.code_server().atoms_handle());
+    rt.code_server_atoms_mut().intern(CONTROL);
+    assert_ne!(
+        before_control,
+        Rc::as_ptr(&rt.code_server().atoms_handle()),
+        "a genuine append under an open drive window is the copy-on-write the closed window avoids"
+    );
+    rt.ports.borrow_mut().close_driver_atom_view();
+}/// A full `open_port` → `port_command` → `close_port` round does not clone the shared atom table:
+/// the port path is **lookup-only**.
+///
+/// The lease below stands in for the one durable holder a real runtime has (a loaded NIF library's
+/// stored host, `crate::nif`'s `NifEntry::host`), i.e. a strong reference that keeps
+/// `Rc::make_mut` off its in-place path for a whole workload. Under it, one complete
+/// `{spawn_driver, "ram_file_drv"}` round — open, command, the delivery pass that folds the reply,
+/// close, and the pass that reports the close — must leave the code server's `Rc` at the **same
+/// allocation**: every name this path resolves (`port_info`'s items, the port-message vocabulary)
+/// is a `lookup`, never an intern. The host is transient at each of those sites
+/// (`RuntimePorts` is a stack local built per command and per `port_info`), which is why the lease
+/// it takes is only a lease.
+///
+/// The positive control at the end is what makes the equality discriminating: a genuine append
+/// **does** take `Rc::make_mut`'s copy-on-write route while the lease is alive, so the assertion
+/// is not vacuous.
+#[test]
+fn a_port_open_command_close_round_does_not_clone_the_shared_atom_table() {
+    /// A name no boot seed and no builder spells — the control's append.
+    const FRESH: &str = "port_round_pin_fresh_atom";
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+    let owner = table.spawn_default().expect("the port's owner");
+    // Land the port-message vocabulary first: the *first* message of each kind is what appends its
+    // atoms (`intern_reuse`), so the round below is a pure lookup. A genuine miss here would be the
+    // other hazard in this neighbourhood and would mask the one under test.
+    build_every_port_message_shape(&mut rt, PortId::new(1));
+    // The name term is built against the **runtime's own** table, because the hook below resolves
+    // names against it — a fixture table's indices would name different atoms there.
+    let spawn_driver = rt.code_server_atoms_mut().intern("spawn_driver");
+    let ram_file = rt.code_server_atoms_mut().intern("ram_file_drv");
+    let mut scratch = Heap::new(16).expect("a scratch heap");
+    let name = scratch
+        .tuple(&[make_atom(spawn_driver), make_atom(ram_file)])
+        .expect("a `{spawn_driver, ram_file_drv}` name");
+    // The durable holder: taken after the last intern of this test, exactly as the crate's rule
+    // requires, so the seeding above never pays for it.
+    let lease = rt.code_server().atoms_handle();
+    let mut hook = RuntimePorts::new(Rc::clone(&rt.ports), Rc::clone(&lease), owner);
+    let before = Rc::as_ptr(&rt.code_server().atoms_handle());
+    let port = hook
+        .open_port(name, NIL)
+        .expect("open_port({spawn_driver, \"ram_file_drv\"}, [])");
+    assert_eq!(
+        hook.command_with_data(port, || Ok(RAM_FILE_OPEN_ABC.to_vec()), PortCommandOptions::EMPTY)
+            .expect("the command is written"),
+        PortCommandOutcome::Done,
+        "the open command is accepted and queued"
+    );
+    rt.deliver_port_messages(&mut table, Duration::from_millis(1))
+        .expect("the round that folds the open reply runs");
+    assert_eq!(
+        Rc::as_ptr(&rt.code_server().atoms_handle()),
+        before,
+        "an open/command port round must not replace the shared AtomTable with a clone of itself"
+    );
+    // The round really did run: the driver's reply was delivered to the owner as
+    // `{Port, {data, [3,0,0,0,0]}}`.
+    let received = table
+        .get(owner)
+        .expect("the owner")
+        .mailbox()
+        .peek()
+        .expect("the open reply is in the owner's mailbox")
+        .payload();
+    assert_eq!(
+        data_payload_bytes(received),
+        RAM_FILE_OPEN_REPLY.iter().map(|byte| i64::from(*byte)).collect::<Vec<i64>>(),
+        "ram_file_drv's OPEN reply reached the owner"
+    );
+    hook.close_port(port).expect("closing the driver port");
+    rt.deliver_port_messages(&mut table, Duration::from_millis(1))
+        .expect("the round that reports the close runs");
+    assert!(
+        !rt.ports.borrow().contains(port),
+        "the closed port is gone"
+    );
+    assert_eq!(
+        Rc::as_ptr(&rt.code_server().atoms_handle()),
+        before,
+        "closing a driver port must not replace the shared AtomTable with a clone of itself either"
+    );
+    // The discriminating positive control: under the same live lease, a genuine append takes the
+    // copy-on-write route, so the equalities above mean "no intern happened", not "the probe is
+    // blind".
+    let absent = rt.atoms().lookup(FRESH).is_none();
+    assert!(absent, "`{FRESH}` must start absent for the control to append");
+    rt.code_server_atoms_mut().intern(FRESH);
+    assert_ne!(
+        before,
+        Rc::as_ptr(&rt.code_server().atoms_handle()),
+        "a genuine append under a live lease is the copy-on-write the port round avoids"
+    );
+    drop(hook);
+    drop(lease);
+}
 /// A driver-emitted term is delivered into its recipient's mailbox by
 /// [`Runtime::deliver_port_messages`]: the term itself (never a `{Port, Term}` wrapper), to the
 /// port's owner for `erl_drv_output_term` and to the named pid for `erl_drv_send_term`.

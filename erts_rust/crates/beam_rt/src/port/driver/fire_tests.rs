@@ -447,7 +447,7 @@ fn load(stem: &str) -> Option<Loaded> {
     let atoms = Rc::new(AtomTable::new());
     let host = DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        atoms,
+        &atoms,
         ProcessId::new(1, 0),
     );
     // Seized before the host is consumed by `load`, and shared with the boxed host by `Rc`, so this

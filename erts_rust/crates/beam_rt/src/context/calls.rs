@@ -2026,8 +2026,8 @@ impl<'a> RuntimeContext<'a> {
         // before the interner is committed (which needs `&mut` on the code server).
         let outcome = {
             let reg = nifs.borrow();
-            let mut env = beam_abi::NifEnv::new(&mut host);
-            reg.call(module, function, arity, &mut env, args)
+            let env = beam_abi::NifEnv::new(&mut host);
+            reg.call(module, function, arity, &env, args)
         };
         // Consuming the host releases its borrow of `services`, and dropping `services` releases
         // the runtime field borrows before the heap/interner work below reuses `self.runtime`.

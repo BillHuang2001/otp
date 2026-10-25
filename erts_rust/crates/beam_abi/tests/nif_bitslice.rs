@@ -78,7 +78,7 @@ fn window_bytes(bytes: &[u8], offset: usize, size_bits: usize) -> Vec<u8> {
 /// returned term (and any view of it) is used; `offset + size_bits` must not exceed the payload's
 /// bit count.
 unsafe fn window_term(
-    env: &mut NifEnv,
+    env: &NifEnv,
     payload: &RefcBinary,
     offset: usize,
     size_bits: usize,
@@ -106,12 +106,12 @@ unsafe fn window_term(
 #[test]
 fn inspect_binary_copies_the_bits_of_a_bit_offset_window() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let bytes = payload();
     let bin = RefcBinary::new(&bytes).expect("an off-heap payload");
     // SAFETY: `env` is live for the whole test and `bin` outlives every term built from it.
     unsafe {
-        let term = window_term(&mut env, &bin, 5, 800);
+        let term = window_term(&env, &bin, 5, 800);
         // 800 % 8 == 0, so this *is* a binary — only its start (bit 5) is unaligned.
         assert!(is_binary(term), "a byte-sized window is a binary");
         let mut view = ErlNifBinary::default();
@@ -146,12 +146,12 @@ fn inspect_binary_copies_the_bits_of_a_bit_offset_window() {
 #[test]
 fn inspect_binary_keeps_the_zero_copy_view_for_a_byte_aligned_window() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let bytes = payload();
     let bin = RefcBinary::new(&bytes).expect("an off-heap payload");
     // SAFETY: `env` is live for the whole test and `bin` outlives every term built from it.
     unsafe {
-        let term = window_term(&mut env, &bin, 16, 800);
+        let term = window_term(&env, &bin, 16, 800);
         let mut view = ErlNifBinary::default();
         assert_eq!(
             enif_inspect_binary(env.as_ptr(), nif_from_eterm(term), &mut view),
@@ -183,14 +183,14 @@ fn inspect_binary_keeps_the_zero_copy_view_for_a_byte_aligned_window() {
 #[test]
 fn inspect_iolist_flattens_a_bit_offset_window() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let bytes = payload();
     let bin = RefcBinary::new(&bytes).expect("an off-heap payload");
     let want = window_bytes(&bytes, 5, 800);
     // SAFETY: `env` is live for the whole test; `bin` outlives every term built from it; the
     // out-structs are live locals and are released exactly once each.
     unsafe {
-        let term = window_term(&mut env, &bin, 5, 800);
+        let term = window_term(&env, &bin, 5, 800);
 
         // `[<window>]` — the window in head (element) position.
         let list = enif_make_list_cell(env.as_ptr(), nif_from_eterm(term), nif_from_eterm(NIL));
@@ -233,7 +233,7 @@ fn inspect_iolist_flattens_a_bit_offset_window() {
 #[test]
 fn non_byte_sized_bitstrings_are_still_refused() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live for the whole test; the out-struct is a live local.
     unsafe {
         // `<<1:3>>` — three bits stored in one byte (`0b0010_0000`).
@@ -277,12 +277,12 @@ fn non_byte_sized_bitstrings_are_still_refused() {
 #[test]
 fn the_window_expectation_matches_the_public_bit_reader() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let bytes = payload();
     let bin = RefcBinary::new(&bytes).expect("an off-heap payload");
     // SAFETY: `env` is live and `bin` outlives the term built from it.
     unsafe {
-        let term = window_term(&mut env, &bin, 5, 800);
+        let term = window_term(&env, &bin, 5, 800);
         let want = window_bytes(&bytes, 5, 800);
         for (k, reference) in want.iter().enumerate() {
             let mut built = 0u8;

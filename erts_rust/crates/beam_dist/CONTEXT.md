@@ -71,9 +71,8 @@ Lints: `#![deny(unsafe_code)]`, `#![warn(missing_docs)]`. Constants: `DIST_VERSI
 - The accept-policy seam: `enum AcceptDecision { Ok, Refuse(Status) }` (+ `is_ok()`); ground truth `dist_util.erl:318-368` (`mark_pending/1`).
 - Node visibility: `enum PeerVisibility { Normal, Hidden }`, `publish_type(flags) -> PeerVisibility` (reads `DFLAG_PUBLISHED`), `publish_flag(hidden: bool, published: bool) -> DistFlags`, `enum PublishKind { Normal, Hidden }` + `PublishKind::publish_flag(published)`; `struct Handshake { …, peer_visibility: PeerVisibility }`.
 
-### `src/auth.rs` — MD5 challenge/response authentication (safe, no external dep)
-- `pub fn md5(data: &[u8]) -> [u8; 16]` — self-contained RFC 1321.
-- `pub fn gen_digest(cookie: &[u8], challenge: u32) -> [u8; 16]` = `md5(cookie ++ decimal(challenge))`.
+### `src/auth.rs` — the handshake digest framing + nonce source (safe, no external dep)
+- `pub fn gen_digest(cookie: &[u8], challenge: u32) -> [u8; 16]` = `beam_common::md5::digest(cookie ++ decimal(challenge))` — the digest *core* is `beam_common::md5` (the workspace's single RFC 1321 implementation); this module owns only the handshake-specific framing.
 - `pub fn verify(cookie: &[u8], challenge: u32, got: &[u8; 16]) -> bool`.
 - `pub fn gen_challenge() -> u32` (nonce); `struct Md5Digest` (`ChallengeDigest`); `struct SystemChallengeSource` (`ChallengeSource`).
 
@@ -174,7 +173,7 @@ The control message is an ETF **tuple** `SMALL_TUPLE_EXT`/`LARGE_TUPLE_EXT + ari
 - **Errors**: only `beam_common::{Result, BeamError}`. Malformed/short/unknown wire data ⇒ `BadArg`; an advertised length/size beyond a wire/message ceiling ⇒ `SystemLimit`; transport failure ⇒ `Io`. **Never** panic on wire data, never `unwrap()` on decoded bytes.
 - **Big-endian** for every multi-byte field. Field order/exact byte counts are wire-frozen.
 - **No duplicated term codec** — all term encode/decode goes through `beam_codec`.
-- **No new external dependencies** (the in-tree MD5 stands in for the `md-5` crate).
+- **No new external dependencies** (the workspace's `beam_common::md5` stands in for the `md-5` crate).
 - **Bounded allocation**: validate advertised lengths/buffered fragments against a ceiling before allocating; oversize ⇒ `SystemLimit`.
 - Files target ~1000 lines; split by responsibility. Four files run over it today (`delivery.rs`, `connection.rs`, `epmd.rs`, `driver.rs`) — `connection.rs` keeps its size largely by path-including its unit tests from `connection_tests.rs`. Licensing: Apache-2.0.
 
@@ -183,7 +182,7 @@ The control message is an ETF **tuple** `SMALL_TUPLE_EXT`/`LARGE_TUPLE_EXT + ari
 - **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_dist` green, plus `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - What each suite proves (the claims, not a walkthrough):
   - `constants` — exact-value pins for `DFLAG_*`/`DOP_*`, the in-term flag vocabularies (incl. the shared bit 0 in distinct namespaces), handshake/epmd tags.
-  - `auth` — RFC 1321 KATs; `gen_digest` known answers derived from the system oracle (`erlang:md5/1` of `<<Cookie, Challenge>>`).
+  - `auth` — RFC 1321 KATs (exercising the workspace's single `beam_common::md5` through this crate's digest framing); `gen_digest` known answers derived from the system oracle (`erlang:md5/1` of `<<Cookie, Challenge>>`).
   - `handshake`/`framing`/`control`/`epmd` — round-trips, byte-exact vectors, negatives. `control` pins the wire tuple bytes (`DOP_SEND` args `[1,2]` ⇒ `[104,3,97,2,97,1,97,2]`) and proves `encode_control_cached` is byte-identical with no cache and writes `[82, index]` with one; `handshake` covers `Status::kind`/`error_kind`/`status_error`, the three refusal texts (`snok`/`snot_allowed`/`salive`), `AcceptDecision`; `epmd` the admin codecs + typed conflict accessors.
   - `dop_roundtrip` — the exhaustive 30/30 round-trip (arg table a wildcard-free `match`) + 30 oracle-cross-checked golden vectors.
   - `delivery` — `classify` over every opcode (arg-order pins, flag decoding incl. the out-of-range `BadArg`, `DOP_UNLINK` ⇒ `Other`) plus the validator's per-opcode reference guards built from heap terms (the only way to hand it an internal reference), and its per-opcode **unlink id** rule (a zero id is `BadArg` for `DOP_UNLINK_ID` and accepted for `DOP_UNLINK_ID_ACK`, a negative one refused for both, the shared `from`/`to` checks exercised on both forms); the strict arms stay strict.
@@ -200,7 +199,7 @@ The control message is an ETF **tuple** `SMALL_TUPLE_EXT`/`LARGE_TUPLE_EXT + ari
   - `dist_probe_cli` — the bin's CLI contract (§ `dist_probe` above), driven via `env!("CARGO_BIN_EXE_dist_probe")`.
 
 ## Design Decisions
-- **MD5 is implemented in-tree, not via a dependency.** One 16-byte hash is not worth `digest`/`generic-array`/`typenum`/`block-buffer` churning the shared `Cargo.lock`; a self-contained RFC 1321 implementation (KAT-verified) keeps the crate dependency-light, and the `ChallengeDigest` seam stays so a future provider can replace it.
+- **MD5 is the workspace's single `beam_common::md5`, not a crate-local copy.** `beam_common` is the lowest common ancestor (contracts A.2 module checksums, A.5 handshake digests and A.7 `erlang:md5/1` all need the same RFC 1321 arithmetic), so the core lives there once and `beam_dist` consumes `beam_common::md5::digest`, owning only the handshake-specific framing (cookie-then-decimal-challenge concatenation) plus the nonce source. The `ChallengeDigest` seam stays so the provider remains replaceable, and no `md-5`/`digest`/`generic-array` dependency is added.
 - **The digest is `md5(cookie ++ decimal(challenge))` — cookie first.** Ground truth: `dist_util.erl` `gen_digest/2` = `erlang:md5([atom_to_list(Cookie)|integer_to_list(Challenge)])`, `ei_connect.c` `gen_digest` = `md5(cookie)` then `sprintf("%u", challenge)`. The challenge is its **unsigned decimal** string (no leading zeros, no length prefix, cookie has no NUL).
 - **`DistFlags` newtype + raw `u64` consts** (ergonomic `contains`/bitops while value pins stay `u64`), chosen over `bitflags` (no new dep); `DistSpawnFlags`/`AltactSigFlags` mirror the shape over `u32` (the in-term field width).
 - **The outbound atom cache is threaded through a single `Encoder` per control message.** The trait hook lives in `beam_codec` (which must not depend on `beam_dist`); `encode_control_cached` builds the whole tuple body through one `Encoder::new_body(atoms).with_atom_cache(cache)`. Because the encoder interns atoms in payload order and `OutboundAtomCache` assigns ref positions in the same order (ERTS `insert_acache_map`), the payload's `82` index is exactly the header ref position. `send_payload` drains the cache with `take_header()`; the message-level ref list is consumed, the persistent per-connection cache survives to serve `Cached` refs on later messages.
@@ -275,7 +274,7 @@ The control message is an ETF **tuple** `SMALL_TUPLE_EXT`/`LARGE_TUPLE_EXT + ari
 - `src/transport.rs` → the `Read`/`Write`/`Transport` seam (incl. the defaulted `read_exact_or_eof`) + `MemoryTransport`
 - `src/framing.rs` → 2-/4-byte framing, tick, `PacketHeaderSize`, the EOF-aware `read_length_or_eof`/`read_packet_or_eof`
 - `src/handshake.rs` → the six handshake codecs, `preferred_flags`/`check_mandatory`, the `ChallengeDigest`/`ChallengeSource` seams, `StatusKind`/`kind`/`error_kind`/`status_error`, the refusal constructors, `AcceptDecision`, `publish_flag`/`publish_type`/`PublishKind`/`PeerVisibility`
-- `src/auth.rs` → in-tree MD5, `gen_digest`/`verify`/`gen_challenge`, `Md5Digest`/`SystemChallengeSource`
+- `src/auth.rs` → `gen_digest`/`verify`/`gen_challenge` + `Md5Digest`/`SystemChallengeSource` over `beam_common::md5` (the handshake digest formula and nonce source; the RFC 1321 core is `beam_common::md5::digest`, the workspace's single implementation)
 - `src/dist_header.rs` → the `'D'` header (`N`/`Flags`/`LongAtoms`/`AtomCacheRef`) + the `'E'` fragmented-header decode (`FragmentedHeader`)
 - `src/fragment.rs` → `'E'`/`'F'` codecs, `split` (sender), `FragmentAssembler` (receiver)
 - `src/atom_cache.rs` → `SegmentCache`/`ReceiveAtomCache`/`OutboundAtomCache`, `apply_header`, the `beam_codec::AtomCacheWriter` impl (outbound `intern`)

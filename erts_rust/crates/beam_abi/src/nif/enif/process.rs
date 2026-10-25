@@ -377,7 +377,7 @@ pub(super) fn ref_block_of(term: Eterm) -> Option<[u8; REF_THING_BYTES]> {
 /// # Safety
 ///
 /// `env` must be a live env (the returned term points into its host's heap).
-unsafe fn ref_term_from_block(env: &mut NifEnv, block: &[u8; REF_THING_BYTES]) -> Option<Eterm> {
+unsafe fn ref_term_from_block(env: &NifEnv, block: &[u8; REF_THING_BYTES]) -> Option<Eterm> {
     // SAFETY: a bump allocation of `REF_THING_WORDS` words; exhaustion is reported as `None`.
     let hp = unsafe { alloc(env, REF_THING_WORDS) }?;
     // SAFETY: `hp` addresses `REF_THING_WORDS` freshly reserved, exclusively owned words, and the
@@ -443,7 +443,7 @@ pub unsafe extern "C" fn enif_send(
     // SAFETY: `to_pid` is non-null and readable (caller contract).
     let receiver = t(unsafe { (*to_pid).pid });
     // One `env_mut` result at a time: `msg_env` is only consulted when `env` is not a live env (the
-    // `enif_send(NULL, &pid, msg_env, msg)` form), so no second `&mut NifEnv` is ever live here.
+    // `enif_send(NULL, &pid, msg_env, msg)` form), so no second `&NifEnv` is ever live here.
     let resolved = match unsafe { env_mut(env) } {
         Some(e) => Some(e),
         // SAFETY: `msg_env` must be null or a live env (caller contract); a null one answers `None`.

@@ -161,7 +161,7 @@ fn host_sysinfo() -> ErlDrvSysInfo {
 #[test]
 fn enif_get_atom_reads_an_atom_interned_earlier_in_the_same_call() {
     let mut host = DeferredCommitHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let name = CString::new("fresh").expect("no interior NUL");
 
     // SAFETY: `env` is live, `name` is NUL-terminated, `buf` is writable.
@@ -217,7 +217,7 @@ fn enif_get_atom_reads_an_atom_interned_earlier_in_the_same_call() {
 fn enif_get_atom_still_falls_back_to_the_host_hook() {
     let mut host = DeferredCommitHost::new();
     let committed = host.commit("already");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // SAFETY: `env` is live and `buf` is writable.
     unsafe {
@@ -243,7 +243,7 @@ fn enif_get_atom_still_falls_back_to_the_host_hook() {
 #[test]
 fn enif_make_existing_atom_finds_a_just_interned_atom() {
     let mut host = DeferredCommitHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let fresh = CString::new("fresh").expect("no interior NUL");
     let absent = CString::new("never_seen").expect("no interior NUL");
 
@@ -301,7 +301,7 @@ fn enif_make_existing_atom_finds_a_just_interned_atom() {
 fn enif_get_atom_refuses_an_unknown_term_without_writing() {
     let mut host = DeferredCommitHost::new();
     let _committed = host.commit("known");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // SAFETY: `env` is live and `buf` is writable.
     unsafe {
@@ -344,7 +344,7 @@ fn enif_get_atom_refuses_an_unknown_term_without_writing() {
 #[test]
 fn enif_clear_env_leaves_the_pending_exception() {
     let mut host = DeferredCommitHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let reason = nif_from_eterm(make_small(42));
     let mut got = ERL_NIF_TERM::default();
 
@@ -458,7 +458,7 @@ fn enif_system_info_falls_back_to_the_built_ins() {
 #[test]
 fn enif_term_to_binary_answers_0_without_a_host_hook() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let mut bin = ErlNifBinary::default();
     // SAFETY: `env` is live; `bin` is a live local; the null cases are explicitly allowed.
     unsafe {
@@ -484,7 +484,7 @@ fn enif_term_to_binary_answers_0_without_a_host_hook() {
 #[test]
 fn enif_binary_to_term_answers_0_without_a_host_hook() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
     let bytes = [131u8, 97, 0];
     // SAFETY: `env` is live; `bytes` has 3 readable bytes; `out` is writable; null cases allowed.
@@ -524,7 +524,7 @@ fn enif_binary_to_term_answers_0_without_a_host_hook() {
 fn enif_make_ref_raises_badarg_without_a_host_hook() {
     let mut host = common::TestHost::new();
     let badarg = host.atom("badarg");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live.
     unsafe {
         let term = enif_make_ref(env.as_ptr());
@@ -543,7 +543,7 @@ fn enif_make_ref_raises_badarg_without_a_host_hook() {
 fn enif_whereis_pid_answers_0_without_a_host_hook() {
     let mut host = common::TestHost::new();
     let name = host.atom("a_registered_name");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let mut pid = ErlNifPid::default();
     let sentinel = pid;
     // SAFETY: `env` is live; `pid` is a live local; the null cases are explicitly allowed.

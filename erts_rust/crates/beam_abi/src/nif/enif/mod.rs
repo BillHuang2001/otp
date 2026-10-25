@@ -119,12 +119,19 @@ const _: () = assert!(ERL_NIF_API_FIELD_COUNT == 176);
 
 /// Recover the live [`NifEnv`] behind an opaque pointer (`None` when null).
 ///
+/// A **shared** reference, as `NifEnv::from_opaque` and `DriverEnv::from_port` both are: the C entry
+/// point that called us may already have a live reference to this env (a nested `enif_*` call, a
+/// resource `stop`/`dtor` callback, a scheduled-NIF continuation), so an exclusive one would be a
+/// second `&mut` of the same object. Everything that has to change — the pending-exception slot, the
+/// per-call atom record — is interior-mutable, and the host is reached through the env's own raw
+/// pointer (see `crate::nif::host`'s *The aliasing contract*).
+///
 /// # Safety
 ///
 /// `env` must be null, or a pointer previously produced by `NifEnv::as_ptr` for an env that is still
 /// alive (with its host still alive).
 #[inline]
-pub(crate) unsafe fn env_mut<'a>(env: *mut crate::nif::types::ErlNifEnv) -> Option<&'a mut NifEnv> {
+pub(crate) unsafe fn env_mut<'a>(env: *mut crate::nif::types::ErlNifEnv) -> Option<&'a NifEnv> {
     // SAFETY: delegated to `NifEnv::from_opaque`, which checks for null and documents the same
     // contract (pointer from `as_ptr` of a live env, whose host outlives the borrow).
     unsafe { NifEnv::from_opaque(env) }
@@ -191,13 +198,13 @@ pub(crate) unsafe fn write_out<T>(ptr: *mut T, value: T) -> bool {
 ///
 /// The returned pointer is only valid while the env (and hence the host heap) is alive.
 #[inline]
-pub(crate) unsafe fn alloc(env: &mut NifEnv, words: usize) -> Option<*mut Eterm> {
+pub(crate) unsafe fn alloc(env: &NifEnv, words: usize) -> Option<*mut Eterm> {
     // SAFETY: a plain bump allocation of `words` words; exhaustion is reported as `None`.
     unsafe { env.heap().alloc_words(words) }.ok()
 }
 
 /// The `badarg` atom for `env`, or `NIL` when the host cannot intern atoms.
-pub(crate) fn badarg_atom(env: &mut NifEnv) -> Eterm {
+pub(crate) fn badarg_atom(env: &NifEnv) -> Eterm {
     env.host().intern_atom("badarg").unwrap_or(NIL)
 }
 

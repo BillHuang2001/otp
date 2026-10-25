@@ -359,7 +359,7 @@ mod tests {
     /// Call `enif_make_map_from_arrays` over `keys`/`values` from a sentinel-initialised out slot
     /// and return `(return code, out term)`.
     fn from_arrays(
-        env: &mut NifEnv,
+        env: &NifEnv,
         keys: &[ERL_NIF_TERM],
         values: &[ERL_NIF_TERM],
     ) -> (c_int, Eterm) {
@@ -383,7 +383,7 @@ mod tests {
 
     /// The map's key count through `enif_get_map_size`.
     #[track_caller]
-    fn size_of(env: &mut NifEnv, map: Eterm) -> usize {
+    fn size_of(env: &NifEnv, map: Eterm) -> usize {
         let mut size: size_t = 0;
         // SAFETY: `map` is a live map term and `size` is a live local.
         let ok = unsafe { enif_get_map_size(env.as_ptr(), n(map), &mut size) };
@@ -393,7 +393,7 @@ mod tests {
 
     /// The value bound to `key` through `enif_get_map_value`.
     #[track_caller]
-    fn value_of(env: &mut NifEnv, map: Eterm, key: Eterm) -> Eterm {
+    fn value_of(env: &NifEnv, map: Eterm, key: Eterm) -> Eterm {
         let mut value = ERL_NIF_TERM::default();
         // SAFETY: `map`/`key` are live terms and `value` is a live local.
         let ok = unsafe { enif_get_map_value(env.as_ptr(), n(map), n(key), &mut value) };
@@ -413,17 +413,17 @@ mod tests {
     #[test]
     fn unique_keys_build_the_map_and_answer_one() {
         let mut host = MapHost::new();
-        let mut env = NifEnv::new(&mut host);
-        let (code, map) = from_arrays(&mut env, &smalls([1, 2]), &smalls([100, 200]));
+        let env = NifEnv::new(&mut host);
+        let (code, map) = from_arrays(&env, &smalls([1, 2]), &smalls([100, 200]));
         assert_eq!(code, 1, "two distinct keys are accepted");
         assert!(!prelude::is_non_value(map), "the out term is a real map");
-        assert_eq!(size_of(&mut env, map), 2);
+        assert_eq!(size_of(&env, map), 2);
         assert_eq!(
-            prelude::signed_value(value_of(&mut env, map, make_small(1))),
+            prelude::signed_value(value_of(&env, map, make_small(1))),
             100
         );
         assert_eq!(
-            prelude::signed_value(value_of(&mut env, map, make_small(2))),
+            prelude::signed_value(value_of(&env, map, make_small(2))),
             200
         );
     }
@@ -431,15 +431,15 @@ mod tests {
     #[test]
     fn forty_unique_keys_build_the_hash_map_and_answer_one() {
         let mut host = MapHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // 40 > MAP_SMALL_MAP_LIMIT: the hash arm, which must not refuse a legitimate map.
         let keys = smalls(0..40);
         let values = smalls((0..40).map(|k| k * 10));
-        let (code, map) = from_arrays(&mut env, &keys, &values);
+        let (code, map) = from_arrays(&env, &keys, &values);
         assert_eq!(code, 1, "40 distinct keys are accepted");
-        assert_eq!(size_of(&mut env, map), 40);
+        assert_eq!(size_of(&env, map), 40);
         assert_eq!(
-            prelude::signed_value(value_of(&mut env, map, make_small(39))),
+            prelude::signed_value(value_of(&env, map, make_small(39))),
             390
         );
     }
@@ -447,19 +447,19 @@ mod tests {
     #[test]
     fn an_integer_and_a_float_of_the_same_value_are_distinct_keys() {
         let mut host = MapHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; `enif_make_double` only allocates on its heap.
         let one_float = t(unsafe { enif_make_double(env.as_ptr(), 1.0) });
         let keys = [n(make_small(1)), n(one_float)];
-        let (code, map) = from_arrays(&mut env, &keys, &smalls([100, 200]));
+        let (code, map) = from_arrays(&env, &keys, &smalls([100, 200]));
         assert_eq!(code, 1, "1 and 1.0 are different keys (`=:=`, not `==`)");
-        assert_eq!(size_of(&mut env, map), 2);
+        assert_eq!(size_of(&env, map), 2);
         assert_eq!(
-            prelude::signed_value(value_of(&mut env, map, make_small(1))),
+            prelude::signed_value(value_of(&env, map, make_small(1))),
             100
         );
         assert_eq!(
-            prelude::signed_value(value_of(&mut env, map, one_float)),
+            prelude::signed_value(value_of(&env, map, one_float)),
             200
         );
     }
@@ -469,7 +469,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[track_caller]
-    fn assert_refused(env: &mut NifEnv, keys: &[ERL_NIF_TERM], values: &[ERL_NIF_TERM]) {
+    fn assert_refused(env: &NifEnv, keys: &[ERL_NIF_TERM], values: &[ERL_NIF_TERM]) {
         let (code, map) = from_arrays(env, keys, values);
         assert_eq!(code, 0, "a duplicate key is refused (the C answers 0)");
         assert_eq!(
@@ -482,26 +482,26 @@ mod tests {
     #[test]
     fn duplicate_keys_in_the_flat_arm_are_refused() {
         let mut host = MapHost::new();
-        let mut env = NifEnv::new(&mut host);
-        assert_refused(&mut env, &smalls([7, 8, 7]), &smalls([10, 20, 30]));
+        let env = NifEnv::new(&mut host);
+        assert_refused(&env, &smalls([7, 8, 7]), &smalls([10, 20, 30]));
     }
 
     #[test]
     fn duplicate_keys_in_the_hash_arm_are_refused() {
         let mut host = MapHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // 34 pairs: 0..32 plus a second `5`, i.e. above MAP_SMALL_MAP_LIMIT so the hash arm's
         // `reject_dupkeys` does the refusing.
         let mut keys: Vec<i64> = (0..33).collect();
         keys.push(5);
         let values: Vec<i64> = (0..34).collect();
-        assert_refused(&mut env, &smalls(keys), &smalls(values));
+        assert_refused(&env, &smalls(keys), &smalls(values));
     }
 
     #[test]
     fn structurally_equal_keys_are_a_duplicate() {
         let mut host = MapHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // Two tuples with equal contents but distinct heap addresses: `=:=`-equal, so the C's
         // `erts_cmp_flatmap_keys` says 0 and the call is refused.
         let pair = smalls([1, 2]);
@@ -514,13 +514,13 @@ mod tests {
             enif_make_tuple_from_array(env.as_ptr(), pair.as_ptr(), pair.len() as libc::c_uint)
         });
         assert_ne!(tuple_a.raw(), tuple_b.raw(), "two distinct blocks");
-        assert_refused(&mut env, &[n(tuple_a), n(tuple_b)], &smalls([10, 20]));
+        assert_refused(&env, &[n(tuple_a), n(tuple_b)], &smalls([10, 20]));
     }
 
     #[test]
     fn a_refusal_with_a_null_out_slot_writes_nothing_and_still_answers_zero() {
         let mut host = MapHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut keys = smalls([7, 7]);
         let mut values = smalls([10, 20]);
         // SAFETY: both arrays hold two live term words; `map_out` is null, which the entry point

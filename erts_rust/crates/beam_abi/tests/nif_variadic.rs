@@ -115,8 +115,8 @@ fn call(name: &str, arity: u32, args: &[Eterm]) -> Option<Session> {
         .unwrap_or_else(|err| panic!("the variadic fixture must load ({err:?})"));
     // The env borrows the host, so it must not outlive the call that produced the term.
     let term = {
-        let mut env = NifEnv::new(&mut *host);
-        match library.call(&mut env, name, arity, args) {
+        let env = NifEnv::new(&mut *host);
+        match library.call(&env, name, arity, args) {
             Ok(term) => term,
             Err(err) => panic!("{MODULE}:{name}/{arity} must return a term ({err:?})"),
         }

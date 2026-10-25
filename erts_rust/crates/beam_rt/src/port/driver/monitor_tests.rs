@@ -67,7 +67,7 @@ use crate::port::ProcessLiveness;
 fn host() -> DriverPort {
     DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        super::hooks_tests::leak_table(),
         ProcessId::new(1, 0),
     )
     .with_has_process_exit(true)
@@ -158,7 +158,7 @@ fn an_identity_this_port_never_issued_is_unknown() {
 fn a_port_without_a_process_exit_slot_monitors_nothing() {
     let mut port = DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        super::hooks_tests::leak_table(),
         ProcessId::new(1, 0),
     );
     assert!(port.monitor_process(ProcessId::new(2, 0).to_eterm()).is_none());
@@ -427,7 +427,7 @@ fn a_port_without_a_process_exit_slot_is_an_error() {
 
     let mut port = DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        super::hooks_tests::leak_table(),
         ProcessId::new(1, 0),
     )
     .with_liveness(Rc::clone(&view));

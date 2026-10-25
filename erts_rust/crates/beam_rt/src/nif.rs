@@ -272,7 +272,7 @@ impl NifRegistry {
         module: &str,
         function: &str,
         arity: u32,
-        env: &mut NifEnv,
+        env: &NifEnv,
         args: &[Eterm],
     ) -> std::result::Result<Eterm, NifCallError> {
         match self.libs.get(module) {
@@ -562,7 +562,13 @@ impl NifHostServices for RuntimeNifServices<'_> {
             return Some(false);
         }
         let mut registry = self.runtime.ports.try_borrow_mut().ok()?;
-        Some(registry.write_command(id, &bytes).is_ok())
+        // The write runs the driver's `output` callback, so it is a drive window (see
+        // [`crate::port::PortRegistry::open_driver_atom_view`]).
+        let view = self.runtime.code_server.atoms_handle();
+        registry.open_driver_atom_view(&view);
+        let written = registry.write_command(id, &bytes).is_ok();
+        registry.close_driver_atom_view();
+        Some(written)
     }
 
     /// Delivers `msg` to `to` as `from` — the C's `enif_send` (`erl_nif.c:860-1093`) — through the
@@ -1434,6 +1440,12 @@ impl NifHost for NifHostImpl<'_> {
     /// same host**: its `intern_atom`/`heap` are the running runtime's, so an atom built on it is
     /// the same index the call env builds — never a wrong term.
     ///
+    /// A host's fields stay **plain** here (no `RefCell`) because nothing in this runtime holds a
+    /// `&`/`&mut` to a host across a call into NIF code: the per-call host is an owned local in
+    /// `context/calls.rs`, and the load/unload host is owned by `NifEntry`. If that ever changes,
+    /// the aliasing contract (`beam_abi::nif::host`) makes the callback-visible fields
+    /// (`heap`, `envs`, `load_sends`, `interner`) interior-mutable first.
+    ///
     /// `NifEnv::new` erases the host borrow into a raw pointer, so the env is lifetime-free and can
     /// be owned by this host (`envs`) until [`NifHost::free_env`] — or this host's drop — releases
     /// it. It is reached only via `enif_alloc_env`'s current-NIF-call host (`with_current_host`),
@@ -1444,7 +1456,7 @@ impl NifHost for NifHostImpl<'_> {
     /// allocation failure aborts the emulator). The `None` case belongs to a host that does not
     /// support the hook (the trait default) or a thread not inside a NIF call (no current host).
     fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
-        let mut env = Box::new(NifEnv::new(self));
+        let env = Box::new(NifEnv::new(self));
         let ptr = env.as_ptr();
         self.envs.push(env);
         Some(ptr)
@@ -1598,7 +1610,7 @@ mod tests {
             1,
             None,
         );
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
 
         let atom = env
             .host()
@@ -1647,8 +1659,8 @@ mod tests {
             1,
             None,
         );
-        let mut env = NifEnv::new(&mut host);
-        match registry.call("test_nif", "add", 2, &mut env, &[]) {
+        let env = NifEnv::new(&mut host);
+        match registry.call("test_nif", "add", 2, &env, &[]) {
             Err(NifCallError::UnknownFunction { name, arity }) => {
                 assert_eq!(name, "add");
                 assert_eq!(arity, 2);
@@ -1726,7 +1738,7 @@ mod tests {
 
         // A live env is exactly what publishes this host as "the NIF call this thread is inside" —
         // the only route by which an env-less entry point can reach it.
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let t_zzz = env.heap().tuple(&[zzz]).expect("a 1-tuple on the host heap");
         let t_aaa = env.heap().tuple(&[aaa]).expect("a 1-tuple on the host heap");
 

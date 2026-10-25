@@ -29,8 +29,8 @@
 //!
 //! [`NifHost`] is that seam: a small trait the runtime implements and hands to the `enif_*` layer.
 //! [`NifEnv`] is the concrete per-call environment behind the C-facing opaque `*mut ErlNifEnv`
-//! (`struct enif_environment_t`, deliberately opaque in [`super::types`]): it borrows the host for
-//! its lifetime and carries the pending-exception slot that mirrors the C
+//! (`struct enif_environment_t`, deliberately opaque in [`super::types`]): it reaches the host
+//! through its own pointer and carries the pending-exception slot that mirrors the C
 //! `enif_raise_exception` semantics.
 //!
 //! Besides the exception slot, [`NifEnv`] carries a small **per-call record of the atoms interned
@@ -44,13 +44,47 @@
 //! `enif_compare(ERL_NIF_TERM, ERL_NIF_TERM)` yet which must order two top-level atoms this call
 //! interned by their *names*. The record is therefore stored as `Rc<RefCell<…>>` and a handle to it
 //! is published on the same thread-local stack as the host ([`current_recorded_atom_name`] reads
-//! it back); the interior mutability is what lets it be read while the env is mutably borrowed by
-//! the call in progress.
+//! it back); the interior mutability is what lets it be read while the call in progress is using
+//! the env.
 //!
-//! `unsafe` is confined to [`NifEnv::host`] and [`NifEnv::from_opaque`], each documented with a
-//! `# Safety` section / `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
+//! # The aliasing contract (why every accessor here takes `&self`)
+//!
+//! A NIF callback is C: it reaches emulator state through the `ErlNifEnv` it was handed, and the
+//! Rust side reaches the *same* host at the same time. That is the C model, and it is **not**
+//! expressible with a Rust `&mut`: a live `&mut dyn NifHost` anywhere in the call graph (an
+//! argument of the enclosing Rust function, say) tells the optimiser that nothing else writes the
+//! host for the duration of that call, so the callback's stores through [`NifEnv`]'s own pointer
+//! become *unobservable* and are legally dropped. Measured consequence (release profile only): a
+//! host field written by an `enif_*` entry point read back as unchanged — a silent no-op, not a
+//! wrong value and not a crash (debug keeps the stores, because nothing is optimised). The guard
+//! that pins this behaviourally is `host_aliasing_tests`, whose `--release` run is the point; the
+//! identical defect and the identical guard exist on the driver side
+//! ([`crate::driver::host`] → *The aliasing contract*, `beam_io`'s `host_aliasing_tests`).
+//!
+//! The rule, therefore, and the reason [`NifEnv::host`], [`NifEnv::heap`], [`NifEnv::as_ptr`] and
+//! [`NifEnv::from_opaque`] all take `&self`:
+//!
+//! * **the environment's pointer is the one sanctioned route to the host** — reach it with
+//!   [`NifEnv::host`]/[`NifEnv::heap`] (or the bound [`NifEnv::with_host`], or
+//!   [`NifEnv::with_host_as`] for the caller's own concrete type) and treat the host as *interior
+//!   mutable* from then on;
+//! * **never hold a `&`/`&mut` to the host itself across a call into NIF code.** Hand the host to
+//!   [`NifEnv::new`], keep the env, and read host state back through the env (a `Box`ed host whose
+//!   *contents* the caller does not reference is fine, but the env route is the one that is sound by
+//!   construction);
+//! * the state a *callback* publishes must live behind interior mutability (`Cell`/`RefCell`/…);
+//!   plain fields mutated through the env's `&mut` view are visible to reads that also go through
+//!   the env, which is all [`NifEnv::new`] can promise.
+//!
+//! The exception slot is interior-mutable ([`core::cell::Cell`]) for the same reason: a raise is a
+//! *store* performed by an `enif_*` entry point that holds only a shared env reference, and the
+//! caller reads the slot back through that same shared reference.
+//!
+//! `unsafe` is confined to [`NifEnv::host`], [`NifEnv::from_opaque`] and the concrete-type slot
+//! [`NifEnv::new_typed`] fills ([`NifEnv::host_as`]), each documented with a `# Safety` section /
+//! `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 
@@ -473,8 +507,8 @@ pub trait NifHost {
 // Each entry also carries a handle to that env's **per-call atom record** ([`NifEnv::record_atom`]),
 // so the record is reachable from an `enif_*` entry point that takes no env argument
 // ([`current_recorded_atom_name`], used by `enif_compare`). Sharing it as an `Rc<RefCell<…>>` —
-// rather than moving a `&mut` borrow onto the stack — is what makes it readable *while* the env is
-// mutably borrowed by the call in progress; see [`RecordedAtoms`].
+// rather than moving a `&mut` borrow onto the stack — is what makes it readable *while* the call in
+// progress is using the env; see [`RecordedAtoms`].
 //
 // The store is **thread-local**, not global: a NIF call is made on one thread and [`NifEnv`] is not
 // `Send` (it holds a raw host pointer and an `Rc`), so the host a thread publishes is only ever read
@@ -483,13 +517,13 @@ pub trait NifHost {
 /// The shared per-call atom record of one [`NifEnv`] (see [`NifEnv::record_atom`]).
 ///
 /// `Rc<RefCell<…>>` rather than a plain `Vec` field, because the record must be readable from an
-/// entry point that takes **no env argument** while the env itself is mutably borrowed by the NIF
-/// call in progress: `enif_compare` (`nif::enif::pred`) is exactly that entry point — its C
+/// entry point that takes **no env argument** while the call in progress is using the env:
+/// `enif_compare` (`nif::enif::pred`) is exactly that entry point — its C
 /// signature is `enif_compare(ERL_NIF_TERM, ERL_NIF_TERM)` — and a top-level atom pair must be
 /// ordered by name, including two atoms interned moments earlier *in this call* (whose names the
 /// host has not committed yet, see [`NifEnv::record_atom`]). The env keeps one handle and the
-/// thread-local [`CURRENT_HOSTS`] entry keeps another, so the reader never needs a second
-/// `&mut NifEnv`; interior mutability supplies the shared access.
+/// thread-local [`CURRENT_HOSTS`] entry keeps another, so the reader never needs a second handle to
+/// the env; interior mutability supplies the shared access.
 ///
 /// The `Rc` is also what keeps [`NifEnv`] `!Send` (reinforcing the raw host pointer's own
 /// `!Send`/`!Sync`), and the record lives and dies with the env that owns it.
@@ -589,18 +623,31 @@ const MAX_RECORDED_ATOMS: usize = 256;
 /// from the opaque C pointer by [`NifEnv::from_opaque`]) plus the pending-exception slot and the
 /// per-call record of atoms interned through it.
 pub struct NifEnv {
-    /// The host, borrowed for the lifetime of this environment.
+    /// The host, reached through this pointer only.
     ///
     /// A raw fat pointer rather than `&'a mut dyn NifHost`: the C side only ever sees
     /// `*mut ErlNifEnv`, and the recover path ([`NifEnv::from_opaque`]) has no way to name the
     /// borrow's lifetime. The caller must keep the host alive for as long as the environment is.
     /// (The `'static` that a `*mut dyn Trait` spells by default is erased by the documented
     /// lifetime-erasing cast in [`NifEnv::new`].)
+    ///
+    /// The raw pointer is also what keeps the C's aliasing model intact: a NIF callback reaches the
+    /// host through **this** pointer, so no Rust reference to the host may be live while a callback
+    /// can run (module docs → *The aliasing contract*).
     host: *mut dyn NifHost,
     /// Identity of this env's [`CURRENT_HOSTS`] entry, so `Drop` removes exactly its own.
     token: u64,
     /// The exception reason recorded by a raise, if any (the C `enif_raise_exception` slot).
-    pending_exception: Option<Eterm>,
+    ///
+    /// A [`Cell`] because a raise stores through a **shared** env reference (module docs → *The
+    /// aliasing contract*): `enif_raise_exception` holds the `&NifEnv` recovered from the opaque
+    /// pointer, and the caller reads the slot back through that same shared reference.
+    pending_exception: Cell<Option<Eterm>>,
+    /// The caller's **concrete** host type, when the env was built by [`NifEnv::new_typed`].
+    ///
+    /// Empty for [`NifEnv::new`] — the constructor every borrowed per-call host uses — so
+    /// [`NifEnv::host_as`] is unavailable there rather than unsound (see [`NifEnv::new_typed`]).
+    typed: Option<*mut dyn core::any::Any>,
     /// Atoms interned **through this env** so far in the current call, most recent last; keyed by
     /// the raw term word. Consulted by the atom accessors *before* [`NifHost::atom_name`] /
     /// [`NifHost::existing_atom`] (see [`NifEnv::record_atom`] for why). It lives and dies with the
@@ -614,6 +661,15 @@ pub struct NifEnv {
 
 impl NifEnv {
     /// Wrap `host` in a fresh per-call environment (no pending exception).
+    ///
+    /// Handing the host over here is the **last** time it may be touched through a Rust reference:
+    /// from now on every access goes through the environment (module docs → *The aliasing
+    /// contract*). The borrow itself ends with this call (the environment is lifetime-free), which
+    /// is what lets a caller keep using `host` *after* the session — a plain read with no callback
+    /// in flight is ordinary raw-pointer laundering and is sound. What is **not** allowed is
+    /// holding a `&`/`&mut` to the host *while a NIF callback can run*: that is the aliasing hazard
+    /// this module's docs describe, and it is why the state a callback publishes must be
+    /// interior-mutable.
     ///
     /// The env also **publishes `host` — and a handle to this env's per-call atom record — as the
     /// current NIF call on this thread** (removed again by `Drop`) — the mechanism `enif_alloc_env`
@@ -630,37 +686,112 @@ impl NifEnv {
         // `&mut dyn NifHost` and `*mut dyn NifHost` are layout-identical (data word + vtable word),
         // and `mem::transmute` between them is a bit-preserving cast, so the caller's borrow is
         // reproduced exactly by `NifEnv::host`. The caller must keep the host alive for as long as
-        // the environment is used (`NifEnv` is not `Clone`, so there is exactly one handle).
+        // the environment is used (`NifEnv` is not `Clone`, so there is exactly one handle), and
+        // must not hold a reference to the host itself while a NIF callback can run.
         let host: *mut dyn NifHost = unsafe { core::mem::transmute(host) };
         let token = NEXT_ENV_TOKEN.fetch_add(1, Ordering::Relaxed);
         // One allocation per call, shared by this env and its `CURRENT_HOSTS` entry, so the record
-        // is readable through the thread-local while `self` is mutably borrowed by the call.
+        // is readable through the thread-local while the env is in use by the call in progress.
         let recorded_atoms: RecordedAtoms = Rc::new(RefCell::new(Vec::new()));
         push_current_host(token, host, Rc::clone(&recorded_atoms));
         NifEnv {
             host,
             token,
-            pending_exception: None,
+            pending_exception: Cell::new(None),
+            typed: None,
             recorded_atoms,
         }
     }
 
-    /// Reborrow the host (the env borrows the host for its lifetime).
-    pub fn host(&mut self) -> &mut dyn NifHost {
+    /// Wrap `host` in a fresh per-call environment that also remembers its **concrete** type, so
+    /// [`NifEnv::host_as`]/[`NifEnv::with_host_as`] can hand it back.
+    ///
+    /// Identical to [`NifEnv::new`] in every other respect (same publication, same `Drop`, same
+    /// aliasing contract), and the same rule applies: `host` must stay alive, and unreferenced, for
+    /// as long as the env is.
+    ///
+    /// # Why this exists instead of a `NifHost: AsAnyHost` supertrait
+    ///
+    /// The driver side recovers its concrete host through the object-safe
+    /// [`AsAnyHost`](crate::driver::host::AsAnyHost) upcast (`dyn DriverHost` → `dyn Any`), whose
+    /// blanket impl is over `T: core::any::Any` and therefore requires **`'static`**. The NIF side
+    /// cannot carry that bound: the runtime's per-call host is `beam_rt`'s `NifHostImpl<'a>`, which
+    /// *borrows* the runtime (`services: Option<&'a mut dyn NifHostServices>`, a borrow of
+    /// `RuntimeNifServices<'a>` that itself holds `&mut Runtime`), so `impl NifHost for
+    /// NifHostImpl<'_>` cannot satisfy a `'static` supertrait. Rather than erase that borrow with a
+    /// cast, the concrete type is captured here — at construction, where the caller's own `&mut H`
+    /// still carries it — and only where the caller asked for it. An env built by [`NifEnv::new`]
+    /// (every borrowed per-call host, including `beam_rt`'s) answers `None` from
+    /// [`NifEnv::host_as`], which is the honest answer: nothing was captured.
+    pub fn new_typed<H: NifHost + 'static>(host: &mut H) -> NifEnv {
+        // SAFETY: the unsizing coercion `*mut H → *mut dyn Any` is the compiler's own (`H: Any` via
+        // the `'static` bound); the pointer names the very object `NifEnv::new` erases into `host`,
+        // so it carries the same provenance and the same obligation — the caller keeps `host`
+        // alive, and unreferenced, for as long as the env.
+        let typed: *mut dyn core::any::Any = host;
+        let mut env = NifEnv::new(host);
+        env.typed = Some(typed);
+        env
+    }
+
+    /// Reborrow the host through the environment's own pointer — the one sanctioned route.
+    ///
+    /// Takes `&self` on purpose: a `&mut self` receiver would force every caller (and every test
+    /// session) to hold a `&mut NifEnv` across the NIF call, and the whole point of the raw pointer
+    /// is that nothing exclusive is outstanding while C is running (module docs → *The aliasing
+    /// contract*). The returned borrow is tied to `&self`, so it cannot outlive the env.
+    ///
+    /// Do not hold two of these at once, and do not hold one across a call into NIF code — use
+    /// [`NifEnv::with_host`] for everything scoped.
+    pub fn host(&self) -> &mut dyn NifHost {
         // SAFETY: `host` was produced from a live `&mut dyn NifHost` in `new` (or a previous
-        // `host`/`as_ptr`/`from_opaque` round-trip), and `NifEnv` is not `Clone`, so this is the
-        // only outstanding handle to it; the returned reborrow is tied to `&mut self`.
+        // `host`/`as_ptr`/`from_opaque` round-trip) and carries write provenance for that host, and
+        // `NifEnv` is not `Clone`, so this is the only outstanding handle to it. The borrow is
+        // tied to `&self`; the caller's contract (module docs) is that no *other* reference to the
+        // host is live at this point, which is exactly the condition for the reborrow to be sound.
         unsafe { &mut *self.host }
     }
 
+    /// Run `f` with exclusive access to the host, then drop the borrow.
+    ///
+    /// The sanctioned **scoped** form of [`NifEnv::host`] — the NIF analogue of
+    /// [`DriverEnv::with_host`](crate::driver::host::DriverEnv::with_host): the `&mut dyn NifHost`
+    /// never escapes the closure, so it cannot be held across a call into NIF code.
+    pub fn with_host<R>(&self, f: impl FnOnce(&mut dyn NifHost) -> R) -> R {
+        f(self.host())
+    }
+
     /// Convenience: `self.host().heap()`.
-    pub fn heap(&mut self) -> &mut Heap {
+    pub fn heap(&self) -> &mut Heap {
         self.host().heap()
     }
 
-    /// The C-facing opaque pointer. Casts `self as *mut NifEnv as *mut ErlNifEnv`.
-    pub fn as_ptr(&mut self) -> *mut ErlNifEnv {
-        self as *mut NifEnv as *mut ErlNifEnv
+    /// The caller's **concrete** host type, when the env was built by [`NifEnv::new_typed`].
+    ///
+    /// `None` for an env built by [`NifEnv::new`] — i.e. for every borrowed per-call host, because
+    /// no `'static` bound can be placed on one (see [`NifEnv::new_typed`]). This is the accessor a
+    /// session that must read host state *back* after a NIF callback uses: the read goes through
+    /// the same pointer the callback wrote through.
+    pub fn host_as<T: NifHost + 'static>(&self) -> Option<&mut T> {
+        let any = self.typed?;
+        // SAFETY: `typed` was produced in `new_typed` from a live `&mut H` that the caller keeps
+        // alive for as long as this env, and `NifEnv` is not `Clone`, so this is the only
+        // outstanding handle to it. The borrow is tied to `&self`; the caller's contract (module
+        // docs) is that no *other* reference to the host is live at this point.
+        unsafe { &mut *any }.downcast_mut::<T>()
+    }
+
+    /// Run `f` with the caller's concrete host type, then drop the borrow.
+    ///
+    /// The scoped form of [`NifEnv::host_as`]: the `&mut T` never escapes, so it also cannot be
+    /// held across a NIF call, and the alias-free window is the closure body.
+    pub fn with_host_as<T: NifHost + 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.host_as::<T>().map(f)
+    }
+
+    /// The C-facing opaque pointer. Casts `self as *const NifEnv as *mut ErlNifEnv`.
+    pub fn as_ptr(&self) -> *mut ErlNifEnv {
+        self as *const NifEnv as *mut ErlNifEnv
     }
 
     /// Recover the concrete env from an opaque pointer.
@@ -669,24 +800,34 @@ impl NifEnv {
     ///
     /// `ptr` must be a pointer previously returned by [`NifEnv::as_ptr`] for an env that is still
     /// alive (and whose host is still alive). Returns `None` for a null pointer.
-    pub unsafe fn from_opaque<'a>(ptr: *mut ErlNifEnv) -> Option<&'a mut NifEnv> {
+    ///
+    /// A **shared** reference is returned on purpose, exactly as
+    /// [`DriverEnv::from_port`](crate::driver::host::DriverEnv::from_port) returns `&DriverEnv`: a
+    /// NIF callback reaches the env through the C pointer while the Rust frame that built it is
+    /// still on the stack, and a resource `stop`/`dtor` callback or a scheduled-NIF continuation
+    /// re-enters it through a pointer that is already borrowed, so a `&mut NifEnv` here would be a
+    /// second exclusive borrow of a live object — the aliasing hazard the module docs describe, one
+    /// level down. Every mutating operation the entry points need goes through interior mutability
+    /// instead ([`NifEnv::pending_exception`]'s [`Cell`], [`NifEnv`]'s [`RecordedAtoms`]), and the
+    /// host is reached through [`NifEnv::host`]'s own raw pointer.
+    pub unsafe fn from_opaque<'a>(ptr: *mut ErlNifEnv) -> Option<&'a NifEnv> {
         if ptr.is_null() {
             return None;
         }
         // SAFETY: the caller guarantees `ptr` came from `NifEnv::as_ptr` on a live env, i.e. it is
         // a `*mut NifEnv` with the provenance required to reborrow the same allocation; `'a` is the
         // caller's promise that the env outlives the returned reference.
-        Some(unsafe { &mut *(ptr as *mut NifEnv) })
+        Some(unsafe { &*(ptr as *const NifEnv) })
     }
 
     /// The pending exception reason, if a raise is recorded.
     pub fn pending_exception(&self) -> Option<Eterm> {
-        self.pending_exception
+        self.pending_exception.get()
     }
 
     /// Record `reason` as the pending exception (C `enif_raise_exception` semantics).
-    pub fn set_exception(&mut self, reason: Eterm) {
-        self.pending_exception = Some(reason);
+    pub fn set_exception(&self, reason: Eterm) {
+        self.pending_exception.set(Some(reason));
     }
 
     /// Record that `atom` was interned under `name` through this env during the current call.
@@ -707,7 +848,7 @@ impl NifEnv {
     /// the `beam_abi` side; a host whose [`NifHost::atom_name`]/[`NifHost::existing_atom`] consult
     /// its own pending interner resolves the same divergence without it. The two mechanisms are
     /// complementary: the record is consulted first, and only a miss falls through to the host.
-    pub(crate) fn record_atom(&mut self, atom: Eterm, name: &str) {
+    pub(crate) fn record_atom(&self, atom: Eterm, name: &str) {
         let mut record = self.recorded_atoms.borrow_mut();
         if record.len() >= MAX_RECORDED_ATOMS {
             return;
@@ -752,8 +893,8 @@ impl NifEnv {
     /// `exception_thrown` flag alone** (only env setup clears that — `erl_nif.c:700-723`). This
     /// helper only exists so a caller can reset the slot explicitly; the C-facing `enif_clear_env`
     /// does not call it (see `nif::enif::exception`).
-    pub fn clear(&mut self) {
-        self.pending_exception = None;
+    pub fn clear(&self) {
+        self.pending_exception.set(None);
     }
 }
 
@@ -813,7 +954,7 @@ mod tests {
     fn as_ptr_round_trips_through_from_opaque() {
         let mut host = TestHost::new();
         let reason = host.intern_atom("boom").expect("interns unconditionally");
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         env.set_exception(reason);
         let ptr = env.as_ptr();
         assert!(!ptr.is_null(), "the env pointer is never null");
@@ -837,7 +978,7 @@ mod tests {
     fn clear_helper_empties_the_exception_slot_but_is_not_enif_clear_env() {
         let mut host = TestHost::new();
         let reason = host.intern_atom("boom").expect("interns unconditionally");
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert_eq!(env.pending_exception(), None);
         env.set_exception(reason);
         assert_eq!(env.pending_exception(), Some(reason));
@@ -859,7 +1000,7 @@ mod tests {
     fn enif_clear_env_survives_a_raise_and_has_pending_still_reports_it() {
         let mut host = TestHost::new();
         let reason = host.intern_atom("kaboom").expect("interns unconditionally");
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut got = ERL_NIF_TERM::default();
         // SAFETY: `env` is live; `got` is a live local and `enif_*` take a live env.
         unsafe {
@@ -880,7 +1021,7 @@ mod tests {
     fn the_atom_record_resolves_a_just_interned_atom() {
         let mut host = TestHost::new();
         let atom = host.intern_atom("just_now").expect("interns unconditionally");
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert_eq!(env.recorded_atom_name(atom), None, "nothing recorded yet");
         env.record_atom(atom, "just_now");
         assert_eq!(env.recorded_atom_name(atom).as_deref(), Some("just_now"));
@@ -894,7 +1035,7 @@ mod tests {
     fn the_atom_record_dedupes_and_stops_growing() {
         let mut host = TestHost::new();
         let atom = host.intern_atom("dup").expect("interns unconditionally");
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         for _ in 0..(MAX_RECORDED_ATOMS + 32) {
             env.record_atom(atom, "dup");
         }
@@ -918,7 +1059,7 @@ mod tests {
         // Outside any NIF call there is no current record...
         assert_eq!(current_recorded_atom_name(atom), None);
         {
-            let mut env = NifEnv::new(&mut host);
+            let env = NifEnv::new(&mut host);
             // ...the env publishes its record for as long as it is live (this is how the env-less
             // `enif_compare` resolves an atom interned earlier in the same call)...
             env.record_atom(atom, "reachable");
@@ -936,13 +1077,13 @@ mod tests {
     fn the_innermost_env_record_wins_over_an_enclosing_one() {
         let mut host = TestHost::new();
         let atom = host.intern_atom("shadowed").expect("interns unconditionally");
-        let mut outer = NifEnv::new(&mut host);
+        let outer = NifEnv::new(&mut host);
         outer.record_atom(atom, "outer");
         assert_eq!(current_recorded_atom_name(atom).as_deref(), Some("outer"));
         {
             // A nested call publishes its own (empty) record; a miss in the inner env's record does
             // not leak the outer name, matching `with_current_host`'s innermost-wins rule.
-            let mut inner = NifEnv::new(&mut host);
+            let inner = NifEnv::new(&mut host);
             inner.record_atom(atom, "inner");
             assert_eq!(current_recorded_atom_name(atom).as_deref(), Some("inner"));
         }
@@ -952,7 +1093,7 @@ mod tests {
     #[test]
     fn host_services_are_reachable_through_the_env() {
         let mut host = TestHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert!(env.heap().available() > 0, "the host heap is reachable");
         let atom = env.host().intern_atom("hello").expect("interns");
         assert!(is_atom(atom));
@@ -963,3 +1104,7 @@ mod tests {
         assert_eq!(env.host().atom_name(make_small(7)), None);
     }
 }
+
+#[cfg(test)]
+#[path = "host_aliasing_tests.rs"]
+mod host_aliasing_tests;

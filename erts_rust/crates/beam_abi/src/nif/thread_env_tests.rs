@@ -184,7 +184,7 @@ impl NifHost for FactoryHost {
         if !self.alloc_env {
             return None;
         }
-        let mut env = Box::new(NifEnv::new(self));
+        let env = Box::new(NifEnv::new(self));
         let ptr = env.as_ptr();
         self.envs.push(env);
         let handle = Arc::clone(&self.shared);
