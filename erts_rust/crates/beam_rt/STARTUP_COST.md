@@ -193,11 +193,13 @@ Nothing at or below 1 864 moves: the 233-word nursery floor, 843 (`heap_growth`)
 `{heap_size,233}`/`{total_heap_size,233}`.
 The two re-derivations the ask named are settled: `src/runner/tests/boundary_cost.rs`'s
 `MEASURED_YOUNG_CAPACITY = 2_585` is still the capacity this tree runs (its row dump reports
-`peak_young_capacity: 2 585`, so that assertion holds; the row's collection totals is what is red),
-and `src/context/tests.rs::the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve`
+`peak_young_capacity` 2 585, and the row's collection totals beside it are the same measured
+figure), and `src/context/tests.rs::the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve`
 is green.
-It is **not** the cause of the inherited reds: they fail identically with the floor live
-([`TEST_STRATEGY.md`](TEST_STRATEGY.md) *Known-red tests at this commit*).
+The floor is measurement-neutral for that row because it does not move the edge of the row's own
+keep band: at the shape's 376-word minor target the edge is `YOUNG_SHRINK_FACTOR × 376 = 3 008`
+either way, so 2 585 stays inside it and neither the capacity nor the collection cadence is the
+floor's to change.
 
 ## Measurement discipline
 
