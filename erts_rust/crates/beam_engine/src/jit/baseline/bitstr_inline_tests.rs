@@ -17,11 +17,11 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Per-shape pins for the **eleven native bitstring inline arms** in
+//! Per-shape pins for the **twelve native bitstring inline arms** in
 //! [`super::emit::bitstr_inline`]: `bs_get_position`, `bs_set_position`,
 //! `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`,
-//! `bs_get_integer2`, `bs_match`, `bs_create_bin`, `bs_match_string` and
-//! `bs_skip_utf32`.
+//! `bs_get_integer2`, `bs_match`, `bs_create_bin`, `bs_match_string`,
+//! `bs_skip_utf32` and `bs_get_utf32`.
 //!
 //! `bitstr_tests` pins the *family route* (the `jit_bitstr` helper and the predicate
 //! that claims the whole `Bs*` set). This node pins the **inline** route, one claim per
@@ -65,8 +65,8 @@ use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
 use super::counters;
 use super::emit::bitstr_inline::{
     self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_BS_MATCH_STRING, SHAPE_COUNT, SHAPE_CREATE_BIN,
-    SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF32,
-    SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
+    SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_GET_UTF32, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2,
+    SHAPE_SKIP_UTF32, SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
 use super::tests::{assemble_function, assert_same_outcome, function_code_bytes};
@@ -575,6 +575,34 @@ fn module_skip_utf32() -> Module {
         code
     })
 }
+/// `bs_get_utf32`: read one UTF-32 character and **return the scalar**, so the arm's bind
+/// (not just its commit) is observable through the answer — the skip twin returns the
+/// position instead. The fail label answers [`sentinel_block`]'s `-1`, which no Unicode scalar
+/// can be, so "took the fail branch" stays distinguishable.
+fn module_get_utf32() -> Module {
+    bitstr_module("inline_bs_get_utf32", &[], 1, |_| {
+        let mut code = vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsStartMatch3 {
+                fail: Label(3),
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            Instr::BsGetUtf32 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                live: 2,
+                flags: 0,
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
 // ---------------------------------------------------------------------------
 // The instrument: a cache-free compile per shape
 // ---------------------------------------------------------------------------
@@ -681,6 +709,7 @@ pub(crate) const INLINE_SHAPE_CASES: [ShapeCase; SHAPE_COUNT] = [
         module_match_string,
     ),
     ("bs_skip_utf32", SHAPE_SKIP_UTF32, "BsSkipUtf32", module_skip_utf32),
+    ("bs_get_utf32", SHAPE_GET_UTF32, "BsGetUtf32", module_get_utf32),
 ];
 
 /// The `Instr` variant the static-deopt census keys `shape` by — the **one** mapping, so a
@@ -696,7 +725,7 @@ pub(crate) fn shape_variant(shape: usize) -> &'static str {
 
 /// **Every arm emits and stays native — the mandatory instrument.**
 ///
-/// For each of the eleven shapes ([`INLINE_SHAPE_CASES`]): a cache-free
+/// For each of the twelve shapes ([`INLINE_SHAPE_CASES`]): a cache-free
 /// [`super::emit::compile_function`] moves that shape's `inlined(SHAPE_*)` counter, visits the
 /// variant (so the name is real), and records **zero** static deopts for it. Without this a
 /// fully-deopting "implementation" would pass every tier-agreement test in this file.

@@ -18,10 +18,10 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's native lowerings for the bitstring family: ten **small, safe**
+//! The baseline JIT's native lowerings for the bitstring family: eleven **small, safe**
 //! match-context shapes (the seven position/tail/start-match/integer extractors, the static
-//! `bs_match` and `bs_match_string` compares, and the `bs_skip_utf32` character skip) plus the
-//! `bs_create_bin` private-append construction shape.
+//! `bs_match` and `bs_match_string` compares, and the `bs_skip_utf32`/`bs_get_utf32`
+//! character pair) plus the `bs_create_bin` private-append construction shape.
 //!
 //! Every lowering here is allocation-free and raises nothing of its own: the match-context
 //! shapes read the `ErlSubBits` words and (for the mutating ones) write one word back, while
@@ -74,7 +74,7 @@
 //! * [`integer`] — `bs_get_integer2`, and the tier's one width/flag rule
 //! * [`bs_match`] — `bs_match` over a fully static command list
 //! * [`match_string`] — `bs_match_string`
-//! * [`utf32`] — `bs_skip_utf32` (+ `bs_get_utf32`)
+//! * [`utf32`] — `bs_skip_utf32` + `bs_get_utf32`
 //! * [`create`] — `bs_create_bin` over the private-append accumulator
 //! * [`tests`] — the in-crate unit suite
 //!
@@ -147,8 +147,8 @@ pub(crate) use start_match::{start_match3_shape, start_match4_shape, StartMatchS
 pub(crate) use start_match::MatchFail;
 pub(super) use tail::{try_inline_bs_skip_bits2, try_inline_bs_test_tail2};
 pub(crate) use tail::{skip_bits2_shape, test_tail2_shape, SkipBits2Shape, TestTail2Shape};
-pub(super) use utf32::try_inline_bs_skip_utf32;
-pub(crate) use utf32::{skip_utf32_shape, Utf32Shape};
+pub(super) use utf32::{try_inline_bs_get_utf32, try_inline_bs_skip_utf32};
+pub(crate) use utf32::{get_utf32_shape, skip_utf32_shape, Utf32Shape};
 
 // ---------------------------------------------------------------------------
 // Constants (derived from the frozen layout owners, never re-derived)
@@ -231,7 +231,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 11;
+pub(crate) const SHAPE_COUNT: usize = 12;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -265,6 +265,9 @@ pub(crate) const SHAPE_BS_MATCH_STRING: usize = 9;
 /// The `bs_skip_utf32` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_SKIP_UTF32: usize = 10;
+/// The `bs_get_utf32` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_GET_UTF32: usize = 11;
 
 #[cfg(test)]
 thread_local! {
@@ -279,7 +282,7 @@ thread_local! {
 /// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
 /// entries. The two kinds of shape here need that count for different reasons.
 ///
-/// For the **ten match-context shapes** the emission is the only observable there can
+/// For the **eleven match-context shapes** the emission is the only observable there can
 /// be: such a shape calls no helper at all, so
 /// [`super::super::bitstr::bitstr_calls`] never moves for it and "the inline arm ran" *is*
 /// the decision to emit.

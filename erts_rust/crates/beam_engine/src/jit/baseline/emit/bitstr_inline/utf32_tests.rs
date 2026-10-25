@@ -18,8 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! The `bs_skip_utf32` arm's own suite: the scalar/boundary rows, the legitimate-deopt
-//! idempotency pin, the compile-time refusals and the live `erl` oracle cross-check.
+//! The UTF-32 arms' own suite — `bs_skip_utf32` and its value-binding twin `bs_get_utf32`:
+//! the scalar/boundary rows, the destination hazards, the legitimate-deopt idempotency pins,
+//! the compile-time refusals and the live `erl` oracle cross-check.
 //!
 //! Every row drives the **same** input through [`Tier::Interpreter`] and [`Tier::BaselineJit`],
 //! asserts the two agree under `beam_term::cmp`, and then asserts *what* each tier answered —
@@ -36,9 +37,27 @@
 //! | a `Y`-slot context | the guarded frame-window load rejects an out-of-frame slot | both tiers raise the interpreter's own error |
 //! | a `NO_FAIL` fail code | the shape predicate refuses, **zero bytes** emitted | the family raises `{badmatch, _}` on both tiers |
 //!
-//! The arm's own emitted sequence is proved **non-vacuously** by [`assert_emitted`]: a
-//! cross-tier comparison alone also passes for an implementation that deopts every
-//! instruction (a deopt is executed by the interpreter on *both* sides).
+//! The **get** form adds one destination, and with it one ordering hazard — `beam_asm` may
+//! compile `Dst == Ctx`, so the context commit must precede the bind. Its rows reuse the
+//! harness above and answer a different question by construction: the modules in
+//! [`GetSpec`]'s section return either the **bound scalar** (`Answer::Value`) or the context's
+//! **position** (`Answer::Position`), so "did it bind" and "did it commit exactly once" are
+//! each observable through a returned number.
+//!
+//! | get row | what is proved |
+//! |---|---|
+//! | `U+0041` / `U+1F600` | the scalar is bound **and** the position advanced by `32` |
+//! | `U+10FFFF` / `U+D7FF` / `U+E000` | the boundary scalars are bound, not merely skipped |
+//! | `0x00110000` / `0xD800` / truncated | the fail label, with **nothing bound** |
+//! | `dst == ctx` (`x(1)` is both) | the commit reads the block pointer, never the overwritten operand — asserted through a `Y`-slot **alias** of the same context |
+//! | a `Y`-slot `dst`, and one past the frame | the guarded store publishes the window; an out-of-frame slot rejects to the fallback |
+//! | a non-byte-aligned `start` | the get form's own idempotency pin: emitted, deopted, `32` bits consumed **exactly once** |
+//! | `NO_FAIL` / `-little` / an un-addressable `dst` | the shape predicate refuses, **zero bytes** emitted |
+//!
+//! Neither arm's emitted sequence is proved **non-vacuously** by a cross-tier comparison alone,
+//! which also passes for an implementation that deopts every instruction (a deopt is executed by
+//! the interpreter on *both* sides): [`assert_emitted`] and [`assert_get_emitted`] add the
+//! cache-free compile's `inlined` counter, its census variant name and zero static deopts.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,7 +66,7 @@ use beam_common::Result as BeamResult;
 use beam_loader::{Instr, Label, Module, Operand};
 use beam_term::{Atom, Eterm};
 
-use super::{skip_utf32_shape, SHAPE_SKIP_UTF32};
+use super::{get_utf32_shape, skip_utf32_shape, SHAPE_GET_UTF32, SHAPE_SKIP_UTF32};
 use crate::context::MinimalContext;
 use crate::interpreter::build_label_map;
 use crate::jit::baseline::bitstr::bitstr_calls;
@@ -56,7 +75,7 @@ use crate::jit::baseline::bitstr_inline_tests::{
 };
 use crate::jit::baseline::tests::assert_same_outcome;
 use crate::jit::Tier;
-use crate::machine::{Machine, RunOutcome};
+use crate::machine::{Machine, RunOutcome, MAX_REGISTER};
 use crate::terms::make_heap_binary;
 
 // ---------------------------------------------------------------------------
@@ -250,31 +269,41 @@ fn returned_i64(label: &str, outcome: &BeamResult<RunOutcome>) -> i64 {
 /// A cross-tier comparison alone is vacuous for an inline arm. This is the non-vacuous half: a
 /// cache-free compile must move the shape's `inlined` counter, visit the census's variant name,
 /// and record **zero** static deopts for it.
-fn assert_emitted(label: &str, module: &Module) {
+fn assert_shape_emitted(label: &str, module: &Module, shape: usize, variant: &str) {
     let (emitted, snapshot) = emitted_shapes_for(module, 0);
     println!(
-        "{label}: inlined(bs_skip_utf32) emitted={} variant_instances={} static_deopts={}",
-        emitted.contains(&SHAPE_SKIP_UTF32),
-        visited_instances(&snapshot, "BsSkipUtf32"),
-        static_deopts(&snapshot, "BsSkipUtf32"),
+        "{label}: inlined({variant}) emitted={} variant_instances={} static_deopts={}",
+        emitted.contains(&shape),
+        visited_instances(&snapshot, variant),
+        static_deopts(&snapshot, variant),
     );
     assert!(
-        emitted.contains(&SHAPE_SKIP_UTF32),
-        "{label}: the cache-free compile must emit the `bs_skip_utf32` arm \
-         (emitted {emitted:?}, wanted {SHAPE_SKIP_UTF32})"
+        emitted.contains(&shape),
+        "{label}: the cache-free compile must emit the `{variant}` arm \
+         (emitted {emitted:?}, wanted {shape})"
     );
     assert!(
-        visited_instances(&snapshot, "BsSkipUtf32") >= 1,
-        "{label}: `BsSkipUtf32` must be the census's variant name, else the deopt assertion \
+        visited_instances(&snapshot, variant) >= 1,
+        "{label}: `{variant}` must be the census's variant name, else the deopt assertion \
          below is vacuous (visited {:?})",
         snapshot.instr_instances,
     );
     assert_eq!(
-        static_deopts(&snapshot, "BsSkipUtf32"),
+        static_deopts(&snapshot, variant),
         0,
         "{label}: the arm must lower the instruction, not statically deopt it ({:?})",
         snapshot.instr_deopts,
     );
+}
+
+/// [`assert_shape_emitted`] for the skip arm.
+fn assert_emitted(label: &str, module: &Module) {
+    assert_shape_emitted(label, module, SHAPE_SKIP_UTF32, "BsSkipUtf32");
+}
+
+/// [`assert_shape_emitted`] for the get arm.
+fn assert_get_emitted(label: &str, module: &Module) {
+    assert_shape_emitted(label, module, SHAPE_GET_UTF32, "BsGetUtf32");
 }
 
 /// One row: both tiers agree on `subject` and the baseline tier answers `expected`.
@@ -561,11 +590,14 @@ fn the_no_fail_code_and_the_little_endian_flag_word_are_refused() {
 // The live oracle cross-check
 // ---------------------------------------------------------------------------
 
-/// The oracle module: the same character skip written in Erlang source, plus a row that reports
-/// the **position** the skip left behind (`<<_/utf32>>`'s remaining bit count).
+/// The oracle module: the same character read/skip written in Erlang source, plus rows that
+/// report the **position** the match left behind (`<<_/utf32, Rest/binary>>`'s remaining bit
+/// count) and the **scalar** the value-binding form produces. `advance/1` is shared by both
+/// forms: the bit count a `utf32` match consumes does not depend on whether the scalar is
+/// bound, so one oracle function pins both arms' commits.
 const ORACLE_SRC: &str = "\
 -module(utf32match).
--export([skip/1, advance/1]).
+-export([skip/1, advance/1, get/1]).
 
 skip(Bin) ->
     case Bin of
@@ -576,6 +608,12 @@ skip(Bin) ->
 advance(Bin) ->
     case Bin of
         <<_/utf32, Rest/binary>> -> byte_size(Bin) * 8 - byte_size(Rest) * 8;
+        _ -> -1
+    end.
+
+get(Bin) ->
+    case Bin of
+        <<C/utf32, _/binary>> -> C;
         _ -> -1
     end.
 ";
@@ -675,6 +713,531 @@ fn every_row_agrees_with_the_live_erl_oracle() {
                             "{label}: a `{expected_kind}` answer is 32 or -1, got {theirs}"
                         );
                     }
+                    checked += 1;
+                }
+                None => {
+                    eprintln!("SKIP: no system `erl` on PATH -- {label} oracle value skipped");
+                    return;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 2 * rows.len(), "every oracle row must have been checked");
+}
+
+// ===========================================================================
+// The get form: `bs_get_utf32` and its destination
+// ===========================================================================
+
+/// What a get-form module answers.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    /// The bound scalar — exactly what `bs_get_utf32` wrote to its destination.
+    Value,
+    /// The context's position **after** the get (`bs_get_position`), so a commit that did not run
+    /// (or ran twice) answers a different number than the value rows do.
+    Position,
+}
+
+/// A get-form module's variable part.
+///
+/// `dst` is the whole point: it is a free operand, so the suite lowers an `x(0)` destination
+/// (the bound scalar is the answer), an **`x(1)`** destination — which *is* the context
+/// register, the `beam_asm:filter_essentials/1` shape that makes the commit-before-store order
+/// load-bearing — and a `Y` slot (inside the frame, and past it).
+struct GetSpec {
+    /// The `bs_get_utf32` destination operand.
+    dst: Operand,
+    /// What `f/1` answers.
+    answer: Answer,
+    /// A `bs_skip_bits2` emitted before the get (the misaligned-`start` rows).
+    skip_bits: Option<u32>,
+    /// The `flags` word handed to the instruction (the endianness refusal row varies it).
+    flags: u32,
+    /// The fail label (a sentinel block unless a row asks for `NO_FAIL`).
+    fail: Label,
+    /// The Y frame's slot count: `2` gives `y(0)` (the context alias) and `y(1)` (a `Y`
+    /// destination); an out-of-frame row lowers a **one-slot** frame and names `y(5)`.
+    frame: u32,
+    /// Copy the context into `y(0)` **before** the get. This is what makes a `dst == ctx` row's
+    /// commit observable: the bind overwrites the only register naming the context, so the
+    /// position it committed is read back through the alias (the same block, so the same
+    /// `start` word).
+    alias_in_y: bool,
+}
+
+impl GetSpec {
+    /// The plain form: `dst = x(0)`, the answer is the bound scalar, no frame at all (so the
+    /// block takes no Y-window publish).
+    fn plain() -> GetSpec {
+        GetSpec {
+            dst: Operand::X(0),
+            answer: Answer::Value,
+            skip_bits: None,
+            flags: 0,
+            fail: Label(3),
+            frame: 0,
+            alias_in_y: false,
+        }
+    }
+
+    /// `f/1` answers the bound scalar bound into `dst`.
+    fn value(dst: Operand) -> GetSpec {
+        GetSpec {
+            dst,
+            ..GetSpec::plain()
+        }
+    }
+
+    /// `f/1` answers the context position after a get into `x(0)`.
+    fn position() -> GetSpec {
+        GetSpec {
+            answer: Answer::Position,
+            ..GetSpec::plain()
+        }
+    }
+}
+
+/// The get-form module: `bs_start_match3` [`bs_skip_bits2`] -> `bs_get_utf32` -> the answer,
+/// with the fail label answering [`sentinel_block`]'s `-1`.
+fn get_module(name: &str, spec: GetSpec) -> Module {
+    bitstr_module(name, &[], 1, |_| {
+        let mut code = vec![Instr::Label(Label(1)), Instr::Label(Label(2))];
+        if spec.frame > 0 {
+            code.push(Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(spec.frame),
+                live: 2,
+            });
+        }
+        code.push(Instr::BsStartMatch3 {
+            fail: Label(3),
+            bin: Operand::X(0),
+            live: 1,
+            dst: Operand::X(1),
+        });
+        if spec.alias_in_y {
+            code.push(Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::Y(0),
+            });
+        }
+        if let Some(skip) = spec.skip_bits {
+            code.push(Instr::BsSkipBits2 {
+                fail: Label(3),
+                ctx: Operand::X(1),
+                size: Operand::Integer(i64::from(skip)),
+                unit: 1,
+                flags: 0,
+            });
+        }
+        code.push(Instr::BsGetUtf32 {
+            fail: spec.fail,
+            ctx: Operand::X(1),
+            live: 2,
+            flags: spec.flags,
+            dst: spec.dst.clone(),
+        });
+        match spec.answer {
+            Answer::Position => code.push(Instr::BsGetPosition {
+                ctx: if spec.alias_in_y {
+                    Operand::Y(0)
+                } else {
+                    Operand::X(1)
+                },
+                dst: Operand::X(0),
+                live: 2,
+            }),
+            Answer::Value => {
+                if !matches!(spec.dst, Operand::X(0)) {
+                    code.push(Instr::Move {
+                        src: spec.dst,
+                        dst: Operand::X(0),
+                    });
+                }
+            }
+        }
+        if spec.frame > 0 {
+            code.push(Instr::Deallocate(spec.frame));
+        }
+        code.push(Instr::Return);
+        code.extend(sentinel_block(Label(3)));
+        code
+    })
+}
+
+/// **A BMP and an astral scalar are bound to their own value *and* advance the position by
+/// `32` bits.**
+///
+/// Two modules per payload, because the two facts are two different numbers: the
+/// [`Answer::Value`] module answers what the bind wrote, and the [`Answer::Position`] module
+/// answers the context's `start` word afterwards. A lowering that committed without binding
+/// passes only the second; one that bound without committing passes only the first.
+#[test]
+fn a_bmp_and_an_astral_scalar_are_bound_and_advance_the_position_by_32_bits() {
+    for (name, subject, scalar) in [
+        ("bs_get_utf32/bmp", BMP, 0x41i64),
+        ("bs_get_utf32/astral", ASTRAL, 0x1F600),
+    ] {
+        let values = get_module("inline_bs_get_utf32", GetSpec::value(Operand::X(0)));
+        assert_get_emitted(name, &values);
+        one_row(name, &values, subject, scalar);
+
+        let positions = get_module("inline_bs_get_utf32", GetSpec::position());
+        assert_get_emitted(name, &positions);
+        one_row(name, &positions, subject, AFTER_ONE);
+    }
+}
+
+/// **The boundary scalars are bound to their own value**, so the two validity tests' edges are
+/// exercised on the *binding* path and not only on the skip path: `U+10FFFF` (the largest
+/// scalar) and `U+D7FF` / `U+E000` (immediately outside the surrogate range). A range test with
+/// an off-by-one at either edge answers `-1` here while the rows above would still pass.
+#[test]
+fn the_boundary_scalars_are_bound_to_their_own_value() {
+    let module = get_module("inline_bs_get_utf32", GetSpec::value(Operand::X(0)));
+    assert_get_emitted("bs_get_utf32/boundaries", &module);
+    for (name, subject, scalar) in [
+        ("bs_get_utf32/max scalar", &[0x00, 0x10, 0xFF, 0xFF, b'X'][..], 0x10FFFFi64),
+        ("bs_get_utf32/below surrogates", &[0x00, 0x00, 0xD7, 0xFF, b'X'][..], 0xD7FF),
+        ("bs_get_utf32/above surrogates", &[0x00, 0x00, 0xE0, 0x00, b'X'][..], 0xE000),
+    ] {
+        one_row(name, &module, subject, scalar);
+    }
+}
+
+/// **Every rejection takes the fail label with nothing bound** — never a trap, never a
+/// fabricated scalar.
+///
+/// The answer is the sentinel block's `-1` on both tiers, which is exactly what proves the
+/// destination was **not** written: a partially executed get would have left `x(0)` holding
+/// either the subject (no) or a stale word, and neither is `-1`.
+#[test]
+fn a_non_scalar_a_surrogate_and_a_truncated_field_take_the_fail_label_without_binding() {
+    let module = get_module("inline_bs_get_utf32", GetSpec::value(Operand::X(0)));
+    assert_get_emitted("bs_get_utf32/failures", &module);
+    for (name, subject) in [
+        ("bs_get_utf32/above-u10ffff", TOO_BIG),
+        ("bs_get_utf32/surrogate", SURROGATE),
+        ("bs_get_utf32/truncated", TRUNCATED),
+    ] {
+        one_row(name, &module, subject, -1);
+    }
+}
+
+/// **THE `Dst == Ctx` HAZARD — the commit runs through the block pointer, never a re-read of
+/// the overwritten operand.**
+///
+/// `beam_asm:filter_essentials/1` is free to compile a `bs_get_utf32` whose destination **is**
+/// the match context's own register (`x(1)` here). The bind therefore overwrites the only
+/// register naming the context, so the emitted sequence must commit *first* — through the
+/// pointer `emit_ctx_guard` left in `MOVE_SCRATCH` — and bind last. A sequence that re-read
+/// `x(1)` after storing would dereference a small integer: a wrong result or an abort, never a
+/// typed error.
+///
+/// Two rows: the bound scalar lands in the aliased register (the [`Answer::Value`] module moves
+/// `x(1)` out), and the commit really ran — observed as the position `32` read back through a
+/// **`y(0)` alias** of the same context block taken before the get.
+#[test]
+fn a_destination_that_is_the_context_binds_the_scalar_and_commits_through_the_block_pointer() {
+    let values = get_module(
+        "inline_bs_get_utf32_ctx",
+        GetSpec::value(Operand::X(1)),
+    );
+    assert_get_emitted("bs_get_utf32/dst == ctx (value)", &values);
+    one_row("bs_get_utf32/dst == ctx (value)", &values, BMP, 0x41);
+
+    let positions = get_module(
+        "inline_bs_get_utf32_ctx_alias",
+        GetSpec {
+            dst: Operand::X(1),
+            alias_in_y: true,
+            frame: 2,
+            ..GetSpec::position()
+        },
+    );
+    assert_get_emitted("bs_get_utf32/dst == ctx (position)", &positions);
+    one_row(
+        "bs_get_utf32/dst == ctx (position)",
+        &positions,
+        ASTRAL,
+        AFTER_ONE,
+    );
+}
+
+/// **A `Y`-slot destination lowers through the guarded frame window.**
+///
+/// The get form's `dst.guard_store` is emitted **first**, so an out-of-frame slot can only ever
+/// reject (to one interpreter step) and never leave a half-written frame behind. The in-frame
+/// row proves the published window is what the final store goes through.
+#[test]
+fn a_y_slot_destination_is_bound_through_the_frame_window() {
+    let module = get_module(
+        "inline_bs_get_utf32_y",
+        GetSpec {
+            dst: Operand::Y(1),
+            frame: 2,
+            ..GetSpec::plain()
+        },
+    );
+    assert_get_emitted("bs_get_utf32/Y dst", &module);
+    one_row("bs_get_utf32/Y dst", &module, BMP, 0x41);
+}
+
+/// **An out-of-frame `Y` destination rejects to the fallback and agrees on the error.**
+///
+/// The block allocates a **one-slot** frame and the instruction names `y(5)`, so the emitted
+/// destination guard fires on every execution. The interpreter's own `y(5)` bounds check then
+/// produces its exact error, which both tiers must report identically — never an out-of-frame
+/// write and never a fabricated value.
+#[test]
+fn an_out_of_frame_y_destination_rejects_to_the_fallback_and_agrees_on_the_error() {
+    let module = get_module(
+        "inline_bs_get_utf32_y_out",
+        GetSpec {
+            dst: Operand::Y(5),
+            frame: 1,
+            ..GetSpec::plain()
+        },
+    );
+    assert_get_emitted("bs_get_utf32/out-of-frame Y dst", &module);
+    let (interpreters, baselines) = with_both_tiers_bytes(&module, BMP, |interpreter, baseline| {
+        (interpreter.is_err(), baseline.is_err())
+    });
+    assert!(
+        interpreters && baselines,
+        "an out-of-frame `Y` destination must be the interpreter's own error on both tiers \
+         (interpreter err: {interpreters}, baseline err: {baselines})"
+    );
+    with_both_tiers_bytes(&module, BMP, |interpreter, baseline| {
+        assert_same_outcome(
+            "bs_get_utf32/out-of-frame Y dst",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+    });
+}
+
+/// **THE GET FORM'S IDEMPOTENCY PIN — the shape deopts and still consumes the character exactly
+/// once.**
+///
+/// A `fallback` is a *deopt*: `jit_step_one` re-executes the **whole** instruction in the
+/// interpreter against the machine's live state, so any state a partial execution committed is
+/// visible to that re-execution. The one mutation this shape makes is the context's `start`
+/// word, which the emitted sequence writes **last** — after the destination's frame-window
+/// guard, the match-context guard, the remaining-window check, the subject classification, the
+/// alignment guard and the readable-bounds guard, i.e. after every point that can reject — so a
+/// rejection taken anywhere above cannot double-advance the position.
+///
+/// A preceding 36-bit `bs_skip_bits2` leaves `start == 36`, so the emitted
+/// `test <start>, 7` / `jne fallback` guard fires on every execution and the family's own
+/// bit-by-bit reader answers instead. The subject carries `U+0041` at bits `36..68`, so the
+/// position afterwards must be `68` (a double commit would answer `100`, a missing one `36`)
+/// and the bound scalar must still be `0x41`.
+#[test]
+fn a_non_byte_aligned_start_deopts_the_get_form_to_exactly_one_interpreter_step() {
+    let mut subject = [0u8; 10];
+    subject[7] = 0x04;
+    subject[8] = 0x10;
+    assert_eq!(
+        field_bits(&subject, 36, 32),
+        0x41,
+        "the row's subject must carry U+0041 at bits 36..68"
+    );
+
+    // The arm still *emits* for this module — the alignment test is a run-time guard, not a
+    // compile-time predicate — which is what makes the row a deopt rather than a refusal.
+    let positions = get_module(
+        "inline_bs_get_utf32_misaligned",
+        GetSpec {
+            skip_bits: Some(36),
+            ..GetSpec::position()
+        },
+    );
+    assert_get_emitted("bs_get_utf32/misaligned start", &positions);
+    let observed = with_both_tiers_bytes(&positions, &subject, |interpreter, baseline| {
+        assert_same_outcome(
+            "bs_get_utf32/misaligned start",
+            interpreter,
+            baseline,
+            &positions.atom_table,
+        );
+        returned_i64("bs_get_utf32/misaligned start", baseline)
+    });
+    assert_eq!(
+        observed, 68,
+        "the character must be consumed exactly once from a bit offset of 36 (a double commit \
+         would answer 100, a missing one 36)"
+    );
+
+    let values = get_module(
+        "inline_bs_get_utf32_misaligned",
+        GetSpec {
+            skip_bits: Some(36),
+            ..GetSpec::value(Operand::X(0))
+        },
+    );
+    assert_get_emitted("bs_get_utf32/misaligned value", &values);
+    let scalar = with_both_tiers_bytes(&values, &subject, |interpreter, baseline| {
+        assert_same_outcome(
+            "bs_get_utf32/misaligned value",
+            interpreter,
+            baseline,
+            &values.atom_table,
+        );
+        returned_i64("bs_get_utf32/misaligned value", baseline)
+    });
+    assert_eq!(
+        scalar, 0x41,
+        "the deopted get must still bind the scalar the family's own reader produced"
+    );
+}
+
+/// **The get form's compile-time refusals emit zero bytes.**
+///
+/// The four conditions are the skip twin's plus the destination's addressability — the fail
+/// half is literally shared ([`skip_utf32_shape`] and [`get_utf32_shape`] funnel through one
+/// `utf32_fail_target`), so this row's job is to prove the *get* predicate carries it too:
+///
+/// * a `NO_FAIL` fail code — the miss path *raises* `{badmatch, Subject}`, which allocates;
+/// * a `-little` (`BSF_LITTLE`, `2`) or `-native` (`16`) flags word — the arm emits the
+///   big-endian read only;
+/// * an unresolved fail label — the family's exact `unknown_label` stays its own;
+/// * a destination past the register-file bound — no `Loc`, so no store.
+///
+/// Each refusal is total: the shape predicate is `None`, so the arm's counter cannot move and
+/// the instruction stays on the family's own byte-swapped/allocating reader.
+#[test]
+fn the_get_form_refuses_no_fail_a_little_endian_flag_word_an_unresolved_label_and_an_unaddressable_dst()
+{
+    let module = get_module("inline_bs_get_utf32", GetSpec::plain());
+    let labels = build_label_map(&module);
+    // The inlinable form, as the row's own control.
+    assert!(
+        get_utf32_shape(&labels, Label(3), &Operand::X(1), 0, &Operand::X(0)).is_some(),
+        "the plain big-endian form must be inlined"
+    );
+    assert!(
+        get_utf32_shape(&labels, beam_loader::NO_FAIL, &Operand::X(1), 0, &Operand::X(0)).is_none(),
+        "a NO_FAIL fail code allocates its raise, so it must be refused"
+    );
+    for (flags, what) in [(2u32, "BSF_LITTLE"), (16, "BSF_NATIVE"), (18, "both")] {
+        assert!(
+            get_utf32_shape(&labels, Label(3), &Operand::X(1), flags, &Operand::X(0)).is_none(),
+            "a {what} flags word must be refused (flags {flags})"
+        );
+    }
+    assert!(
+        get_utf32_shape(&labels, Label(9_999), &Operand::X(1), 0, &Operand::X(0)).is_none(),
+        "an unresolved fail label must be refused"
+    );
+    assert!(
+        get_utf32_shape(
+            &labels,
+            Label(3),
+            &Operand::X(1),
+            0,
+            &Operand::X(MAX_REGISTER)
+        )
+        .is_none(),
+        "a destination past the register-file bound has no `Loc` and must be refused"
+    );
+
+    // A `NO_FAIL` module emits **zero bytes** for the get shape and both tiers agree on the
+    // family's allocating raise.
+    let no_fail = get_module(
+        "inline_bs_get_utf32_no_fail",
+        GetSpec {
+            fail: beam_loader::NO_FAIL,
+            ..GetSpec::plain()
+        },
+    );
+    let (emitted, _) = emitted_shapes_for(&no_fail, 0);
+    assert!(
+        !emitted.contains(&SHAPE_GET_UTF32),
+        "a NO_FAIL get must not emit the arm (emitted {emitted:?})"
+    );
+    with_both_tiers_bytes(&no_fail, TRUNCATED, |interpreter, baseline| {
+        assert_same_outcome(
+            "bs_get_utf32/NO_FAIL raise",
+            interpreter,
+            baseline,
+            &no_fail.atom_table,
+        );
+        assert!(
+            interpreter.is_err(),
+            "a NO_FAIL miss must raise rather than take a fail label"
+        );
+    });
+
+    // A `-little` module emits zero bytes too, and both tiers agree on the family's own
+    // byte-swapped read: the little-endian value of `BMP`'s field is `0x41000000`, which is not
+    // a Unicode scalar, so the answer is the fail label's `-1`.
+    let little = get_module(
+        "inline_bs_get_utf32_little",
+        GetSpec {
+            flags: 2,
+            ..GetSpec::plain()
+        },
+    );
+    let (emitted, snapshot) = emitted_shapes_for(&little, 0);
+    assert!(
+        !emitted.contains(&SHAPE_GET_UTF32),
+        "a BSF_LITTLE get must not emit the arm (emitted {emitted:?})"
+    );
+    assert!(
+        visited_instances(&snapshot, "BsGetUtf32") >= 1,
+        "the refused instruction must still be the census's variant name (visited {:?})",
+        snapshot.instr_instances,
+    );
+    one_row("bs_get_utf32/little endian", &little, BMP, -1);
+}
+
+/// **Every get row agrees with the live `erl` oracle, on each tier.**
+///
+/// [`assert_same_outcome`] already proves the two tiers agree; this row proves both agree with
+/// the *language*: `utf32match:get/1` (the scalar, `-1` when no `utf32` matches) for the value
+/// module and `utf32match:advance/1` (the bit count the match consumed) for the position one,
+/// evaluated by the system `erl` on the same subject bytes.
+#[test]
+fn the_get_form_agrees_with_the_live_erl_oracle() {
+    let Some(dir) = compile_oracle("get") else {
+        eprintln!("SKIP: no usable `erlc` on PATH -- bs_get_utf32 oracle cross-check skipped");
+        return;
+    };
+    let values = get_module("inline_bs_get_utf32", GetSpec::value(Operand::X(0)));
+    let positions = get_module("inline_bs_get_utf32", GetSpec::position());
+    let rows: [&[u8]; 6] = [
+        BMP,
+        ASTRAL,
+        TOO_BIG,
+        SURROGATE,
+        TRUNCATED,
+        &[0x00, 0x10, 0xFF, 0xFF, b'X'],
+    ];
+
+    let mut checked = 0usize;
+    for (function, module) in [("get", &values), ("advance", &positions)] {
+        for subject in rows {
+            let label = format!("oracle utf32match:{function}/1 on {subject:?}");
+            let ours = with_both_tiers_bytes(module, subject, |interpreter, baseline| {
+                assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+                returned_i64(&label, baseline)
+            });
+            let eval = format!(
+                "io:format(\"~p\", [utf32match:{function}(<<{}>>)]), halt(0).",
+                byte_literal(subject)
+            );
+            match erl_eval(&dir, &eval) {
+                Some(out) => {
+                    let theirs: i64 = out
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{label}: oracle printed {out:?}"));
+                    assert_eq!(
+                        theirs, ours,
+                        "{label}: the tiers answered {ours} but the oracle answered {theirs}"
+                    );
                     checked += 1;
                 }
                 None => {

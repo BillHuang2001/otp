@@ -18,15 +18,16 @@
 //
 // %CopyrightEnd%
 
-//! The UTF-32 shapes: `bs_skip_utf32` (and, once `bs_get_utf32` lands, its
-//! value-binding twin).
+//! The UTF-32 shapes: `bs_skip_utf32` and its value-binding twin `bs_get_utf32`.
 //!
 //! A UTF-32 character is **one 32-bit big-endian field that must be a Unicode scalar**
 //! (`decode_utf32`, `families::bitstrings::matching::reads.rs`): read 32 bits, then reject
 //! `value > 0x10FFFF` and the surrogate range `0xD800..=0xDFFF`. `emu/ops.tab` rewrites both
 //! opcodes into `bs_get_integer2 … 32 1 Flags` plus `i_bs_validate_unicode_retract`, and the
 //! skip form is the same read with the value discarded — so the two differ **only** in
-//! whether the scalar is bound, never in what they consume or reject.
+//! whether the scalar is bound, never in what they consume or reject. Both therefore share
+//! one shape ([`Utf32Shape`], whose `dst` is `None` for the skip form) and one emitted body
+//! ([`emit_utf32`], whose [`Utf32Mode`] selects whether the validated scalar is bound).
 //!
 //! # The endianness flags are refused, not reimplemented
 //!
@@ -52,13 +53,23 @@
 //! A `fallback` is a **deopt**: `jit_step_one` re-executes the *whole* instruction in the
 //! interpreter with the same operand, so any state a partial execution committed is
 //! visible to that re-execution. The one mutation here is the context's `start` word, so
-//! the emitted order is: **every** guard (the match-context guard, the remaining-window
-//! check, the subject classification, the byte-alignment guard and the readable-bounds
-//! guard), then the four byte loads that compose the scalar (which mutate nothing), then
-//! the two validity tests (which mutate nothing), then the **single** `start` write. The
-//! fail arm writes nothing at all. That is the rule the `bs_match` arm's per-command commit
-//! broke once (see `../bs_match_deopt_tests.rs`); here it is trivially satisfiable and the
-//! arm's own suite pins it with a row that really deopts.
+//! the emitted order is: **every** guard (the destination's frame-window guard for the get
+//! form, the match-context guard, the remaining-window check, the subject classification,
+//! the byte-alignment guard and the readable-bounds guard), then the four byte loads that
+//! compose the scalar (which mutate nothing), then the two validity tests (which mutate
+//! nothing), then the **single** `start` write. The fail arm writes nothing at all. That is
+//! the rule the `bs_match` arm's per-command commit broke once (see
+//! `../bs_match_deopt_tests.rs`); here it is trivially satisfiable and both arms' suites pin
+//! it with a row that really deopts.
+//!
+//! The get form's **commit precedes the destination store**, for the same reason
+//! `bs_get_integer2`'s does: `beam_asm:filter_essentials/1` compiles `ctx == dst` (the
+//! compiler is free to reuse the context's own register for the bound scalar), and the
+//! context may therefore only be reached through the pointer the match-context guard left in
+//! [`MOVE_SCRATCH`] — never re-read from the now-overwritten operand. Both orders reach the
+//! same final state, because the commit writes into the context *block* while the
+//! destination store writes the *operand slot*, but the ordering is what makes the sequence
+//! independent of the aliasing.
 //!
 //! # No helper, and no position store
 //!
@@ -69,7 +80,9 @@
 //! `fast_done` continuation, the linker's fail-label exit (`Linker::emit_exit`, which
 //! carries the `pc` it stores) and the `fallback`'s own `emit_step_and_continue`, which
 //! stores the position itself. `super::tail`'s two shapes leave the block on exactly the
-//! same three edges and likewise emit none.
+//! same three edges and likewise emit none. Nothing allocates either — the scalar is at most
+//! 21 bits, so the bound value is a bare `make_small` and no moving collection can run
+//! part-way through.
 
 use beam_common::Result;
 use beam_loader::{Label, Operand, NO_FAIL};
@@ -78,14 +91,14 @@ use crate::interpreter::LabelMap;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::link::{ExitSpill, Linker};
-use super::super::operands::Loc;
+use super::super::operands::{Loc, Y_ADDR_SCRATCH};
 use super::{
     emit_ctx_guard, emit_step_and_continue, emit_subject_view, Allocation, MOVE_SCRATCH,
-    MOVE_SCRATCH_2, SUB_BITS_END_DISP, SUB_BITS_START_DISP,
+    MOVE_SCRATCH_2, SMALL_TAG, SUB_BITS_END_DISP, SUB_BITS_START_DISP,
 };
 
 #[cfg(test)]
-use super::{record_inlined, SHAPE_SKIP_UTF32};
+use super::{record_inlined, SHAPE_GET_UTF32, SHAPE_SKIP_UTF32};
 
 /// The number of bits one UTF-32 character occupies — `decode_utf32`'s fixed field width
 /// and the one compile-time constant the emitted sequence compares against.
@@ -110,19 +123,27 @@ const SURROGATE_BASE: u32 = 0xD800;
 const SURROGATE_SPAN: u32 = 0x7FF;
 
 // ---------------------------------------------------------------------------
-// The shape: `bs_skip_utf32 { fail, ctx, live, flags }`
+// The shapes: `bs_skip_utf32 { fail, ctx, live, flags }` and
+//             `bs_get_utf32 { fail, ctx, live, flags, dst }`
 // ---------------------------------------------------------------------------
 
-/// The operands of a `bs_skip_utf32` the tier lowers natively.
+/// The operands of a UTF-32 shape the tier lowers natively.
+///
+/// One type for both opcodes: the field they read, the guards they carry and the fail label
+/// they transfer to are identical, and the only difference is whether the validated scalar is
+/// bound — which is exactly [`Utf32Shape::dst`] being `Some`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Utf32Shape {
     /// The match-context operand's location.
     ctx: Loc,
+    /// The destination the validated scalar is bound to, or `None` for the skip form (which
+    /// binds nothing).
+    dst: Option<Loc>,
 }
 
 impl Utf32Shape {
-    /// The [`Utf32Shape`] the instruction's `ctx` names, or `None` when the whole
-    /// instruction must stay on the family.
+    /// The [`Utf32Shape`] the instruction's `ctx` names for the **skip** form, or `None` when
+    /// the whole instruction must stay on the family.
     ///
     /// Purely syntactic and **label-free** — the fail-label resolution is the caller's — so
     /// the block's Y gate ([`super::super::arith::uses_y`]) derives the same answer as the
@@ -133,32 +154,60 @@ impl Utf32Shape {
     /// * `flags` asks for **big-endian** order — a `-little`/`-native` field is the
     ///   family's byte-swapping reader (see the module docs).
     pub(crate) fn of(ctx: &Operand, flags: u32) -> Option<Utf32Shape> {
+        Self::with_dst(ctx, flags, None)
+    }
+
+    /// [`Utf32Shape::of`] for the **get** form, whose [`Utf32Shape::dst`] is `dst`.
+    ///
+    /// The get form adds one compile-time condition: `dst` must be an in-bound x-register or
+    /// an addressable `Y` slot, because the scalar is bound with a plain register/heap store
+    /// and no allocation (it is at most `21` bits, so a bare `make_small`). Also label-free,
+    /// for the same reason as [`Utf32Shape::of`].
+    pub(crate) fn of_get(ctx: &Operand, flags: u32, dst: &Operand) -> Option<Utf32Shape> {
+        Self::with_dst(ctx, flags, Some(Loc::of(dst)?))
+    }
+
+    /// The one body both constructors share, so the two cannot disagree about the endianness
+    /// refusal or the context operand's addressability.
+    fn with_dst(ctx: &Operand, flags: u32, dst: Option<Loc>) -> Option<Utf32Shape> {
         if super::integer::field_is_little(flags) {
             return None;
         }
-        Some(Utf32Shape { ctx: Loc::of(ctx)? })
+        Some(Utf32Shape {
+            ctx: Loc::of(ctx)?,
+            dst,
+        })
     }
 
-    /// The x-register indices the shape touches — the context only.
+    /// The x-register indices the shape touches — the context and, for the get form, the
+    /// destination.
     pub(crate) fn registers(&self) -> Vec<u32> {
-        self.ctx.register().into_iter().collect()
+        let mut registers = Vec::with_capacity(2);
+        registers.extend(self.ctx.register());
+        registers.extend(self.dst.and_then(Loc::register));
+        registers
     }
 
-    /// The x-register indices the shape **writes**: none. It binds nothing; the commit
-    /// stores into the context block's `start` word, which is a heap store, not an
-    /// x-register write.
+    /// The x-register indices the shape **writes**: the get form's destination, and nothing
+    /// for the skip form. Charging a bound destination is **mandatory** — the scalar lands in
+    /// its cache register, so an uncharged write would let a stale cache register survive a
+    /// block exit: a wrong value rather than a redundant store. (The context's `start` word is
+    /// a *heap* store, not an x-register write, so it is charged through neither.)
     pub(crate) fn writes(&self) -> Vec<u32> {
-        Vec::new()
+        self.dst.and_then(Loc::register).into_iter().collect()
     }
 
-    /// The x-register indices the shape **reads** — the context.
+    /// The x-register indices the shape **reads** — the context only. Split from
+    /// [`Utf32Shape::registers`] for the get form, whose destination is written and never
+    /// read: the prologue's entry-load decision ([`super::super::liveness::fill_sets`]) must
+    /// not load a register the instruction only writes.
     pub(crate) fn reads(&self) -> Vec<u32> {
-        self.registers()
+        self.ctx.register().into_iter().collect()
     }
 
     /// Whether the lowering reads the current frame's Y window.
     pub(crate) fn uses_y(&self) -> bool {
-        self.ctx.is_y()
+        self.ctx.is_y() || self.dst.is_some_and(Loc::is_y)
     }
 }
 
@@ -179,6 +228,20 @@ pub(crate) fn skip_utf32_shape(
     utf32_fail_target(labels, fail).map(|target| (shape, target))
 }
 
+/// The inlinable shape of a `bs_get_utf32` — [`skip_utf32_shape`]'s twin, with the bound
+/// destination and the same fail half (and therefore the same two refusals plus the
+/// destination's addressability).
+pub(crate) fn get_utf32_shape(
+    labels: &LabelMap,
+    fail: Label,
+    ctx: &Operand,
+    flags: u32,
+    dst: &Operand,
+) -> Option<(Utf32Shape, (u32, u32))> {
+    let shape = Utf32Shape::of_get(ctx, flags, dst)?;
+    utf32_fail_target(labels, fail).map(|target| (shape, target))
+}
+
 /// The `(function, code)` target a fail-carrying UTF-32 shape transfers to, or `None` when
 /// the fail operand is one this tier cannot inline.
 ///
@@ -195,7 +258,8 @@ fn utf32_fail_target(labels: &LabelMap, fail: Label) -> Option<(u32, u32)> {
 /// it (see [`super::try_inline_bs_get_position`] for the return convention).
 ///
 /// The guarded sequence, in this order — every guard first, then the loads, then the one
-/// commit:
+/// commit (the get form adds its destination's frame-window guard first and the bound-scalar
+/// store last; see [`try_inline_bs_get_utf32`]):
 ///
 /// ```text
 ///   <the match-context guard>            ; not a context -> fallback; r11 = the block base
@@ -213,7 +277,9 @@ fn utf32_fail_target(labels: &LabelMap, fail: Label) -> Option<(u32, u32)> {
 ///   cmp  r8, 0x10FFFF ; ja fail_arm       ; not a Unicode scalar
 ///   rcx = r8 - 0xD800 ; cmp rcx, 0x7FF ; jbe fail_arm     ; a surrogate code point
 ///   mov  rcx, 32 ; add rsi, rcx
-///   mov  [r11 + 16], rsi                  ; THE ONLY MUTATION, after every guard
+///   mov  [r11 + 16], rsi                  ; THE COMMIT, after every guard
+///   [get only] r8 = (r8 << 4) | SMALL_TAG ; make_small, zero allocation
+///   [get only] mov  <Dst>, r8             ; the bind, AFTER the commit
 ///   jmp  fast_done
 /// fail_arm:
 ///   <the linker's exit to the fail label>     ; a terminator on that path only
@@ -228,8 +294,8 @@ fn utf32_fail_target(labels: &LabelMap, fail: Label) -> Option<(u32, u32)> {
 /// [`super::emit_subject_view`]'s **word-padded** byte count. A field that would need a byte
 /// past that bound takes `fallback` — never an out-of-range read, never a fabricated value.
 ///
-/// Nothing allocates (the value is at most 20 bits and the sequence materialises no term at
-/// all), so no moving collection can run part-way through and the context operand is read
+/// Nothing allocates (the value is at most 21 bits and the sequence materialises no heap term
+/// at all), so no moving collection can run part-way through and the context operand is read
 /// exactly once, its block address in [`MOVE_SCRATCH`] reused for the commit.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::jit::baseline::emit) fn try_inline_bs_skip_utf32(
@@ -255,6 +321,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_skip_utf32(
         buffer,
         linker,
         shape,
+        Utf32Mode::Skip,
         target,
         allocation,
         done,
@@ -265,17 +332,77 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_skip_utf32(
     Ok(true)
 }
 
-/// The emitted body [`try_inline_bs_skip_utf32`] and `bs_get_utf32`'s arm share: the whole
-/// guarded sequence, the single commit, and the three exits.
+/// Emit `bs_get_utf32 Fail Ctx Live Flags Dst` natively — [`try_inline_bs_skip_utf32`]'s
+/// value-binding twin.
 ///
-/// `target` is the already-resolved fail label and the shape's own operands are already
-/// `Loc`s, so this body makes no decision the shape predicates did not — which is what keeps
-/// the two entries (and the block's Y gate) in lockstep.
+/// One shape predicate differs (the destination's addressability) and one part of the body,
+/// which is why both entries funnel into [`emit_utf32`]: the get form emits its destination's
+/// frame-window guard **before** anything else, and binds the validated scalar **after** the
+/// context commit. The two orders are not interchangeable in the sequence even though they
+/// reach the same state, because `Dst` may **be** `Ctx` (`beam_asm:filter_essentials/1`
+/// compiles that): the commit goes through the pointer the match-context guard left in
+/// [`MOVE_SCRATCH`], so the context is never re-read from an operand the bind has overwritten.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::jit::baseline::emit) fn try_inline_bs_get_utf32(
+    buffer: &mut CodeBuffer,
+    labels: &LabelMap,
+    linker: &Linker<'_>,
+    fail: Label,
+    ctx: &Operand,
+    flags: u32,
+    dst: &Operand,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Some((shape, target)) = get_utf32_shape(labels, fail, ctx, flags, dst) else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    record_inlined(SHAPE_GET_UTF32);
+
+    emit_utf32(
+        buffer,
+        linker,
+        shape,
+        Utf32Mode::Get,
+        target,
+        allocation,
+        done,
+        func,
+        pc,
+        highest_touched,
+    )?;
+    Ok(true)
+}
+
+/// Whether [`emit_utf32`] is emitting the skip form or the get form.
+///
+/// The **only** difference between the two bodies: the get form carries a destination, whose
+/// frame-window guard is emitted first and whose bind follows the commit.
+#[derive(Clone, Copy, Debug)]
+enum Utf32Mode {
+    /// `bs_skip_utf32`: the scalar is validated and discarded.
+    Skip,
+    /// `bs_get_utf32`: the validated scalar is bound to the shape's destination.
+    Get,
+}
+
+/// The emitted body both UTF-32 entries share: the whole guarded sequence, the single commit,
+/// the (get-only) bind, and the three exits.
+///
+/// `target` is the already-resolved fail label, `mode` names which of the two opcodes this is
+/// and the shape's own operands are already `Loc`s, so this body makes no decision the shape
+/// predicates did not — which is what keeps the two entries (and the block's Y gate) in
+/// lockstep.
 #[allow(clippy::too_many_arguments)]
 fn emit_utf32(
     buffer: &mut CodeBuffer,
     linker: &Linker<'_>,
     shape: Utf32Shape,
+    mode: Utf32Mode,
     target: (u32, u32),
     allocation: &Allocation,
     done: CodeLabel,
@@ -287,6 +414,19 @@ fn emit_utf32(
     let fail_arm: CodeLabel = buffer.label();
     let fast_done: CodeLabel = buffer.label();
     let sat: CodeLabel = buffer.label();
+
+    // The get form's destination guard first — the guard phase of a lowering that writes a
+    // destination is complete before anything can be written, so a rejection leaves the
+    // register/heap untouched. It leaves an addressable `Y` slot's address in
+    // [`Y_ADDR_SCRATCH`], which the whole sequence below leaves alone (it works in
+    // `rsi`/`rax`/`rcx`/`rdx`/`rdi`/`r8`/`r10`/`r11`), so the bind can store through it
+    // without a second guard.
+    if let Utf32Mode::Get = mode {
+        let dst = shape
+            .dst
+            .expect("the get form's shape always carries a destination");
+        dst.guard_store(buffer, Y_ADDR_SCRATCH, MOVE_SCRATCH_2, fallback)?;
+    }
 
     emit_ctx_guard(buffer, shape.ctx, allocation, fallback, highest_touched)?;
 
@@ -358,10 +498,24 @@ fn emit_utf32(
     // The commit: one word store, after every guard and after the loads and validity tests
     // (which mutate nothing), so a `fallback` anywhere above re-executes the instruction
     // against an untouched context. It goes through the pointer `emit_ctx_guard` left in
-    // `MOVE_SCRATCH`, never a re-read of the context operand.
+    // `MOVE_SCRATCH`, never a re-read of the context operand — which is what makes it sound
+    // for the get form's `Dst == Ctx` case.
     buffer.mov_ri(Reg::Rcx, i64::from(UTF32_BITS))?;
     buffer.add_rr(Reg::Rsi, Reg::Rcx)?;
     buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)?;
+
+    // The get form's bind, **after** the commit: `make_small(raw)` — `(raw << 4) |
+    // TAG_IMMED1_SMALL`, zero allocation, the same two instructions `bs_get_integer2` emits.
+    // The value is at most `0x10FFFF`, so the shift cannot overflow the 60-bit immediate.
+    if let Utf32Mode::Get = mode {
+        let dst = shape
+            .dst
+            .expect("the get form's shape always carries a destination");
+        buffer.shl_ri(Reg::R8, 4)?;
+        buffer.mov_ri(Reg::Rcx, SMALL_TAG)?;
+        buffer.or_rr(Reg::R8, Reg::Rcx)?;
+        dst.store_at(buffer, Y_ADDR_SCRATCH, Reg::R8, allocation, highest_touched)?;
+    }
     buffer.jmp(fast_done)?;
 
     buffer.bind(fail_arm)?;

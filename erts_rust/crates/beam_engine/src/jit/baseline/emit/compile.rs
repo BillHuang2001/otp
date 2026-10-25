@@ -627,8 +627,9 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             Instr::BsMatchString { .. } => match_string_paths += 1,
             // The UTF-32 shapes charge their own sequence ([`UTF32_PATH_BYTES`]) on top of
             // the generic [`BS_PATH_BYTES`]: the four byte loads and the two validity tests
-            // are wider than the shared match-context guards this otherwise reuses.
-            Instr::BsSkipUtf32 { .. } => {
+            // are wider than the shared match-context guards this otherwise reuses, and the
+            // get form adds its destination guard and its bind.
+            Instr::BsSkipUtf32 { .. } | Instr::BsGetUtf32 { .. } => {
                 bs_paths += 1;
                 utf32_paths += 1;
             }
