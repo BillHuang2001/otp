@@ -961,23 +961,7 @@ impl InPlace {
     #[inline]
     pub(super) fn push_bit(&mut self, bit: u8) {
         debug_assert!(self.cur < self.capacity, "the caller checked the capacity");
-        let byte = self.cur / 8;
-        let position = self.cur % 8;
-        // SAFETY: `cur < capacity`, so `byte = cur / 8 < ceil(capacity / 8)` — inside the
-        // payload, whose `capacity` bytes the machine allocated and keeps alive.
-        unsafe {
-            if position == 0 {
-                // A byte boundary: everything from here on is fresh.
-                *self.base.add(byte) = 0;
-            } else if self.cur == self.start {
-                // The accumulator's window ends inside this byte: keep its bits (the
-                // high `position` ones) and clear the fresh low bits first.
-                *self.base.add(byte) &= 0xFFu8 << (8 - position);
-            }
-            if bit & 1 != 0 {
-                *self.base.add(byte) |= 1 << (7 - position);
-            }
-        }
+        write_payload_bit(self.base, self.start, self.cur, bit);
         self.cur += 1;
     }
 
@@ -1108,6 +1092,93 @@ impl InPlace {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The bit-granular write rule — this node's ONE definition of it
+// ---------------------------------------------------------------------------
+
+/// Write **one bit** into the payload byte holding absolute bit `cur_bit`, MSB-first,
+/// applying the residue-clearing rule every bit-granular write in this node shares.
+///
+/// The rule, in the three cases it has:
+///
+/// * a write that **enters** a byte (`cur_bit % 8 == 0`) clears that byte first, so the
+///   bits this build writes never inherit what an earlier **failed** attempt at the same
+///   offset left behind (a failure leaves those bytes invisible, but not necessarily
+///   zero);
+/// * a write at the accumulator's own window end (`cur_bit == start_bit`) that lands
+///   *inside* a byte masks the fresh low bits away, keeping the window's high
+///   `cur_bit % 8` bits;
+/// * the bit itself is OR-ed in at `7 - cur_bit % 8`.
+///
+/// The three absolute cases make a re-write at the same position produce the same byte,
+/// which is what lets a lowering re-execute a parked instruction.
+///
+/// # Contract
+///
+/// `base` must be the first data byte of a live, writable payload whose capacity covers
+/// `cur_bit` (`cur_bit < capacity_bits`), and `start_bit <= cur_bit`. Both `InPlace::push_bit`
+/// (over its own `base`/`start`/`cur`, with `cur < capacity`) and
+/// [`write_bit_field`] (over a capacity a run-time door verified for the whole plan)
+/// establish exactly that.
+#[inline]
+fn write_payload_bit(base: *mut u8, start_bit: usize, cur_bit: usize, bit: u8) {
+    let byte = cur_bit / 8;
+    let position = cur_bit % 8;
+    // SAFETY: the caller guarantees `cur_bit < capacity_bits`, so `byte = cur_bit / 8` is
+    // inside the payload the owning machine allocated and keeps alive, and `base` is that
+    // payload's first data byte (`writable_append_target`). All three accesses land on
+    // that one byte.
+    unsafe {
+        if position == 0 {
+            *base.add(byte) = 0;
+        } else if cur_bit == start_bit {
+            *base.add(byte) &= 0xFFu8 << (8 - position);
+        }
+        if bit & 1 != 0 {
+            *base.add(byte) |= 1 << (7 - position);
+        }
+    }
+}
+
+/// Write the low `nbits` bits of `value`, **MSB-first**, into the payload starting at
+/// absolute bit `cur_bit` — one [`write_payload_bit`] per bit, so a bit-granular field and
+/// the family's own [`InPlace::push_bit`] loop cannot disagree about the bytes.
+///
+/// This is the body behind `create::seam::write_bit_field`, the safe door a native
+/// lowering calls; it is the same rule `BitWriter`'s bit loop runs
+/// ([`BitWriter::push_uint`](super::BitWriter)) because both end up here.
+///
+/// # Contract
+///
+/// * every bit in `[cur_bit, cur_bit + nbits)` is already verified inside the payload's
+///   capacity (`cur_bit + nbits <= capacity_bits`) and `start_bit <= cur_bit` — the room a
+///   run-time door checked for the whole plan;
+/// * `nbits <= 64`;
+/// * writes only the payload bytes the field spans: no term access, no `Machine`, no
+///   allocation.
+// The seam is the bitstring family's **exported** surface for a native lowering, and
+// nothing in a plain `--lib` build refers to the bit-field door yet (see `create/mod.rs`'s
+// `mod seam`): the reachability root is one level up, so the lint would fire here first.
+// The door is deliberately part of the contract, not dead weight.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn write_bit_field(
+    base: *mut u8,
+    start_bit: usize,
+    cur_bit: usize,
+    value: u64,
+    nbits: u32,
+) {
+    debug_assert!(nbits <= 64, "a machine-word field");
+    for k in (0..nbits).rev() {
+        write_payload_bit(
+            base,
+            start_bit,
+            cur_bit + (nbits - 1 - k) as usize,
+            ((value >> k) & 1) as u8,
+        );
+    }
+}
 #[cfg(test)]
 #[path = "raw_tests.rs"]
 mod tests;
