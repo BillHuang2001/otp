@@ -567,7 +567,8 @@ fn module_set_position_arity2() -> Module {
 /// * **in-block commit** — the context is advanced to 16 by a field read, then rewound to
 ///   `4`; the answer is `4`. A double application would also be `4`, so the *observable*
 ///   that separates the two is the negative row below (which must not have applied
-///   anything) plus the `0` rewind, whose double application is still `0`./// * **decline** — a **negative small** position trips `jcc(Cond::S, fallback)`, one
+///   anything) plus the `0` rewind, whose double application is still `0`.
+/// * **decline** — a **negative small** position trips `jcc(Cond::S, fallback)`, one
 ///   interpreter step re-executes the instruction, and the family raises
 ///   `bs_set_position: negative bit position`. Both tiers must report that exact
 ///   wording, so this row pins the committed value and the family's raise text — not the
@@ -576,7 +577,8 @@ fn module_set_position_arity2() -> Module {
 ///   re-executed instruction never reads it either (the family validates the
 ///   `HEADER_SUB_BITS` word alone), so a `mov_mr` hoisted above the guards leaves this
 ///   row green. Observing it would need a catch frame that reads the same context's
-///   position in its handler.#[test]
+///   position in its handler.
+#[test]
 fn bs_set_position_commits_once_and_declines_a_negative_position() {
     let module = module_set_position_arity2();
     let name = atom(&module, "f");
