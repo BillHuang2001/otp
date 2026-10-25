@@ -39,6 +39,34 @@
 //! it just evacuated, while this runtime's payloads live outside every heap the collector owns and
 //! so need a separate reachability question against the same roots.
 //!
+//! # The release is park-gated, whole, and never gate-triggered
+//!
+//! * **Park-gated.** [`reclaim`] runs at a **pre-emption** (`Yield`) park only — see *The residual*
+//!   below — so an idle process keeps every payload it built until it is next pre-empted.
+//! * **Whole.** A park that reaches the release clears every handle no root names: an
+//!   env-gated census of `released` / `retained_by_live` / `retained_by_shared` over every shape
+//!   measured (a plain `<<0:(B*8)>>` build, `binary:copy/2`, `base64:encode/1`,
+//!   `list_to_binary/1`, `binary:part/3`, a `<<Acc/binary, Chunk/binary>>` accumulator, an
+//!   ETS-inserted-then-dead payload, a `lists:foldl` lambda) reads `retained_by_live = 0` and
+//!   `retained_by_shared = 0` at **every** park, with `released` equal to the reservoir minus the
+//!   one term being returned. So the `refcount() > 1` belt is a belt, not a working set, and the
+//!   peak a park-reaching loop shows is one pre-emption window rather than a sum over parks:
+//!   `erlang:memory(binary)` after the last park is the same figure at N = 20 000 as at N = 40 000
+//!   while the park count doubles.
+//! * **Never gate-triggered.** Every gate in [`reclaim`] is a **decline**: none of them can ask
+//!   for, cause or widen a reclaim. `OffHeapReclaimer::triggered` in particular is the C's
+//!   `MSO(p).overhead > bin_vheap_sz`, consulted as a gate; nothing reads it to *request* a prune.
+//!   One slice's dead garbage is therefore bounded by the slice length, never by the configured
+//!   budget, and a process whose own reservoir stays under the trigger releases nothing between
+//!   its parks.
+//! * **The reference-thing exemption.** The prune-only valve's `Criterion::PayloadPrune` hit set
+//!   excludes an inert reference thing (`super::gc_walk::is_inert_reference`: an internal or
+//!   external reference block). That is the one narrowing of the valve, and it is sound because a
+//!   reference's payload words are terms or packed `u32` ids — never a term reference and never a
+//!   `BinRef.val` pointer — so such a word can name no payload. Excluding it keeps the residual a
+//!   **leak** and never a dangle; without it any process holding one live `make_ref/0`,
+//!   `monitor/2` or `alias/1` reference (or an unnamed ETS tid) declines the prune at every park.
+//!
 //! # Why the single reclamation point is the slice-boundary park
 //!
 //! A prune is only sound against the process's **complete** root set, and only one site has both
@@ -59,14 +87,61 @@
 //!   the process (`publish_parked_roots`, `RootSet::ALL_LIVE`), so the process's root set really is
 //!   the machine's. That is exactly the pair a reachability question needs.
 //!
-//! # The residual: a process that never runs again
+//! # The residual: a slice that never ends cannot reach this point
 //!
-//! Only the **`Yield`** (pre-emption) arm calls this; the `Wait` arm does not, so a
-//! `receive`-parked process reaches no prune at all — a live-FR window publishes nothing (the
-//! machine stays the authoritative root set, which is gate 2 below), and a publishing window's
-//! roots would be readable but no caller asks. The consequence is a **leak, never a dangle**: a
-//! process that parks on `receive` and is never scheduled again keeps its reservoir until its
-//! machine drops with the process. A process that wakes up and pre-empts again reclaims then.
+//! This is a **`Yield`-arm-only** reclamation point, and that is the whole limit of it.
+//!
+//! * The **`Wait`** arm does not call it, so a `receive`-parked process reaches no prune at all —
+//!   a live-FR window publishes nothing (the machine stays the authoritative root set, which is
+//!   gate 2 below), and a publishing window's roots would be readable but no caller asks. A
+//!   process that parks on `receive` and is never scheduled again keeps its reservoir until its
+//!   machine drops with the process (a leak, never a dangle). A process that wakes up and
+//!   pre-empts again reclaims then.
+//! * A slice that **never pre-empts** reaches neither arm, and that is the unbounded case. On the
+//!   default native baseline tier a linked chain charges **no reduction per link**
+//!   (`Linker::emit_tail_exit` jumps straight to the successor entry and
+//!   `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop) and a BIF dispatch or
+//!   `call_ext` only *spends* (`BudgetProbe::spend` prices, never refuses), so a self-recursive
+//!   tail loop whose body is a binary build — with or without BIF calls — runs its **whole**
+//!   computation inside one slice: no park, no prune, and the payload bytes grow **linearly with
+//!   the loop count**. Measured on this tree: exactly `N × 4 144` bytes of dead `binary_alloc`
+//!   payloads for a 4 096-byte build (`0 → 82 880 000` across N = 2 000 → 20 000) with
+//!   `erlang:memory(binary)` reporting every byte and **no trough anywhere**; the bytes do not come
+//!   back after the owning process is killed (the same reading 200 ms / 2 s / 8 s later), while a
+//!   child that exits normally leaves `0`. Earlier figures: 1.31 GB after 20 000 iterations of a
+//!   64 KiB binary. The same program under `BEAM_RT_TIER=interpreter` (which charges one reduction
+//!   per instruction) is a bounded sawtooth of ≤ 203 payloads. That contrast pins the mechanism to the **linked
+//!   tail exit**, not to this point: nothing here is skipped, the point is simply never reached.
+//!   The repair is a charge on the linked-exit path — a `beam_engine` change
+//!   (`jit/baseline/runtime.rs::jit_tail_call`, plus `emit/link.rs`'s `call_only`/`jump` arm for
+//!   the complete form) — and `crate::runner::budget`'s *Why a native baseline-JIT block is only
+//!   priced, never pre-empted at a call* records the same conclusion for the sibling seams. It is
+//!   deliberately **not** repaired here: a host-side charge at an admission door cannot end such a
+//!   slice (the engine's position store parks at block granularity, so a mid-block refusal would
+//!   re-execute the block's prefix — a wrong result, not a pre-emption), and pruning mid-slice is
+//!   unsound outright because a running machine's roots are unpublished (see the two bullets
+//!   above).
+//!
+//! # Reading `erlang:memory(binary)` against this point: a slice phase for a park-reaching loop,
+//! a real leak for a slice that never ends
+//!
+//! A dead payload is freed only here, so between two parks `erlang:memory(binary)` reports exactly
+//! the payloads the slice has built since the last park, and a read taken at a **fixed iteration
+//! offset** therefore always samples the same point of the slice cycle — **for a loop that
+//! pre-empts**. The framing does not transfer to the non-pre-empting shape of *The residual*
+//! below: there the figure has no trough at all and grows with the loop count, which is the real
+//! unbounded leak, and a fixed-offset read of it grows with N rather than sampling a phase. Measured on this tree with
+//! a 4 KiB payload and a 1 000-iteration block: the block reads `0` at **every** rung when it is
+//! `999` iterations (the read lands exactly on a park), `k` payloads at rung `k` for `1 000`,
+//! `2k` for `1 001` and `3k` for `1 002`. A 2 000-rung `1 000`-iteration ladder is hard-capped at
+//! **999 payloads** (one slice) with a reset to `0` every 1 000 rungs, identically at
+//! 1 024/2 048/4 096-byte payloads — and the allocator's own block census agrees: after every park
+//! `alloc_calls - free_calls == ` the number of payloads still live, i.e. the whole reservoir was
+//! released. So a monotonically rising ladder is **not** by itself evidence of a leak. The two
+//! tests of a real leak are: does the peak exceed one slice's worth
+//! (`DEFAULT_REDUCTIONS_PER_SLICE / this loop's reductions per iteration` payloads), and does it
+//! rise with the **rung count** at a fixed total iteration count. A fixed-offset read of a
+//! bounded reservoir fails both.
 //!
 //! # Why this is its own file
 //!
@@ -131,7 +206,10 @@
 //! [`reclaim`] therefore runs a **second, prune-only** valve
 //! ([`super::reaches_an_unscanned_word`]) after the collection one: it declines when *any* root
 //! word, or *any* child slot of any object reachable from the roots through the collector's
-//! scanned graph, is pointer-bearing and lies in a region the collector does not scan. That is a
+//! scanned graph, is pointer-bearing, lies in a region the collector does not scan, **and is not a
+//! reference thing** ([`super::is_inert_reference`] — an M1 `[header, node, serial, id]` block or a
+//! C-layout reference, whose payload words are terms or packed `u32` ids and never a `BinRef.val`
+//! pointer, so it can name no payload). That is a
 //! **strict superset** of the collection valve's decline set — dropping the forwarding test can
 //! only add declines — and the asymmetry is deliberate:
 //!
@@ -139,7 +217,14 @@
 //! > payload that is already garbage.
 //!
 //! A false accept is a leak; a false reject is a **dangling pointer**, read later through the
-//! frozen term layout. Every decline here opens the per-pid descent latch
+//! frozen term layout. The reference relaxation is the one narrowing, and it is not a weakening of
+//! that asymmetry: a reference block has no payload word that could be a term reference or a
+//! payload pointer, so excluding it can never reject a live payload. It is what makes the prune
+//! reachable at all — a process holding *any* live reference in its root set (every `gen_server`
+//! with a monitor, every process owning an unnamed ETS table, anything that called `make_ref/0`)
+//! would otherwise decline on every park for as long as it held it, retaining every payload the
+//! loop in between built, so `erlang:memory(binary)` would be exactly linear in the loop count.
+//! Every decline here opens the per-pid descent latch
 //! ([`Runtime::note_foreign_reachable`]) exactly as the collection valve's does, so a process that
 //! later drops the offending term also gets its collections back on the fast path.
 //!
@@ -338,7 +423,8 @@ impl OffHeapReclaimer {
 ///    reject here is a dangling pointer;
 /// 6. the **prune-only valve** ([`super::reaches_an_unscanned_word`]) — the strictly stronger
 ///    criterion this point needs: *any* pointer-bearing word a root or a scanned-graph child names
-///    in a region the collector does not scan (see the module docs' *the prune's own valve*);
+///    in a region the collector does not scan **that is not a reference thing** (a reference block
+///    has no payload word a `BinRef` could live in; see the module docs' *the prune's own valve*);
 /// 7. the **reachability walk** itself ([`beam_gc::for_each_reachable_binary_payload`]) — a walk
 ///    that cannot complete declines rather than reporting "nothing is live".
 ///
@@ -461,6 +547,10 @@ pub(crate) fn reclaim(
         .filter(|binary| binary.refcount() > 1)
         .map(|binary| binary.data_ptr() as usize)
         .collect();
+    // The released set is decided once, here, so the census below and the release itself can
+    // never disagree (the module docs' *Reading `erlang:memory(binary)`* explains why the
+    // reservoir must be empty of dead payloads after this call, and why that is the property
+    // to assert rather than the absolute figure).
     let released = machine.retain_refc_binaries(|payload| {
         let payload = payload as usize;
         live.binary_search(&payload).is_ok() || shared.contains(&payload)
@@ -471,11 +561,37 @@ pub(crate) fn reclaim(
     let surviving = reclaimer.record_collection(process.collector().policy(), machine);
     process.set_off_heap_binary_bytes(surviving);
     if released > 0 {
-        crate::debug_trace::trace(format_args!(
-            "off-heap reclamation for {pid:?}: released {released} handle(s), {surviving} bytes \
-             left, binary-vheap limit now {} words",
-            reclaimer.limit_words()
-        ));
+        if crate::debug_trace::enabled() {
+            // The census that makes a *leak* distinguishable from a *slice phase* without a
+            // second run: `retained_live + retained_shared` is every handle this park kept, so
+            // `released + retained_live + retained_shared` is the whole reservoir the walk
+            // examined. Built only when tracing is on (`all_stats` allocates).
+            let retained_live = machine
+                .refc_binaries()
+                .iter()
+                .filter(|binary| live.binary_search(&(binary.data_ptr() as usize)).is_ok())
+                .count();
+            let retained_shared = machine.refc_binaries().len() - retained_live;
+            let binary_live_bytes: u64 = beam_alloc::registry::all_stats()
+                .into_iter()
+                .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
+                .map(|(_, stats)| stats.live_bytes as u64)
+                .sum();
+            crate::debug_trace::trace(format_args!(
+                "off-heap reclamation for {pid:?}: released {released} handle(s), {surviving} \
+                 bytes left, binary-vheap limit now {} words, retained_by_live={retained_live} \
+                 retained_by_shared={retained_shared} binary_alloc_live={binary_live_bytes} \
+                 escaped_store_handles={}",
+                reclaimer.limit_words(),
+                runtime.eval_off_heap.binaries().len(),
+            ));
+        } else {
+            crate::debug_trace::trace(format_args!(
+                "off-heap reclamation for {pid:?}: released {released} handle(s), {surviving} bytes \
+                 left, binary-vheap limit now {} words",
+                reclaimer.limit_words()
+            ));
+        }
     }
     Ok(released)
 }

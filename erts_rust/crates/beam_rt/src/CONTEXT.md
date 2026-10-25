@@ -162,6 +162,83 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   none of those three can name a `[BinRef][ErlSubBits]` payload (the simple copy flattens it) —
   whereas `seq_trace`'s `set_label` (`seq_trace.rs:324-329`, reached from `seq_trace_2:461`) stores
   the raw term **unstabilized**, and `eval_closures`' env can name one.
+## The off-heap refc-binary reclamation loop — where it runs, and what `erlang:memory(binary)` means
+Binding for anyone reading a `erlang:memory(binary)` figure or touching `context/gc/bin_vheap.rs`
+(the full argument is that file's module docs and `context/gc/CONTEXT.md`; this is the rule).
+
+- **The prune has exactly one caller**, the `Yield` (pre-emption) arm at `runner/run.rs` →
+  `RuntimeRunner::reclaim_off_heap_binaries` → `context::gc::bin_vheap::reclaim`. Neither the `Wait`
+  arm nor a `BifOutcome::Suspend` park calls it, so a process that parks in a `receive` after building
+  payloads keeps every one of them until it is next **pre-empted** (measured across a receive park in
+  four places — the child's pre-park read, the parent's read while it is parked, the child's post-wake
+  read, the parent again — all four the *same* byte count with the dead bytes included, and zero prune
+  entries for the child).
+- **At a pre-emption the reservoir is pruned whole and nothing is retained.** The census line
+  (`released` / `retained_by_live` / `retained_by_shared` / `binary_alloc_live`, emitted only with
+  `BEAM_RT_BOOT_TRACE=1`) reports `retained_by_live = 0` and `retained_by_shared = 0` at every park of
+  every shape measured, so the `refcount() > 1` belt is a belt and not a working set: the peak a
+  park-reaching loop shows is **one pre-emption window**, not a sum over parks.
+- **A monotone `erlang:memory(binary)` ladder is a slice phase, not a leak.** A dead payload is freed
+  only at that point, so the figure is exactly the payloads the current slice has built since the last
+  park; a read at a fixed iteration offset samples the same point of the cycle every time. Measured
+  with a 4 KiB payload and a 1 000-iteration block: `0` at every rung at `999` iterations, `k` payloads
+  at rung `k` for `1 000`, `2k` for `1 001`, `3k` for `1 002`; a 2 000-rung ladder is hard-capped at
+  one slice's worth (999) and resets every 1 000 rungs, identically at 1 024/2 048/4 096 B. A dense
+  read (one sample per iteration) pins the trough at ~1 payload and the maximum at one window. The
+  **two tests of a real leak** are therefore: does the *trough* grow with the park count, and does the
+  peak grow with the iteration count at **zero** parks. A fixed-offset read of a bounded reservoir
+  fails both.
+- **The prune's valve is stronger than the collection valve's, with exactly one exemption.** A
+  pointer-bearing word in a region the collector does not scan declines the prune whether or not it
+  forwards anything — except a **reference thing** (`gc_walk.rs::is_inert_reference`: the M1
+  `[header, node, serial, id]` block or a C-layout reference), whose payload words are immediates or
+  packed `u32` ids, never a term reference and never a `BinRef.val` pointer, so it can name no payload.
+  That exemption is what keeps the point reachable in ordinary code: a process holding one live
+  reference in its root set — every `gen_server` with a monitor, every owner of an unnamed ETS table,
+  anything that called `make_ref/0` — reads the same flat figure as a reference-free one (measured
+  194 624 B at N=2 000 and 310 592 B at N=8 000 with 10 and 41 parks all releasing, identical for the
+  `make_ref` / ETS-tid / monitor-reference shapes and the plain / pid controls).
+- **The bin-vheap budget GATES the prune; it can never CAUSE one.** `OffHeapReclaimer::triggered` (the
+  C's `MSO(p).overhead > bin_vheap_sz`, 46 422 words by default) is one gate `reclaim` consults, and
+  nothing consults it to *ask* for a reclaim. One slice's worth of dead off-heap garbage is therefore
+  bounded by the **slice length**, never by the configured budget, and a process whose own reservoir
+  stays under the trigger releases nothing between its parks (a bounded per-process residue, freed at
+  process death). Because the bound is a slice, it is a count of iterations and its **bytes are
+  payload-size proportional**: the dense fixture peaks at 475 968 / 930 624 / 1 839 936 / 29 119 296
+  bytes for 1 024/2 048/4 096/65 536-byte payloads (≈444 payloads each, N = 20 000) where the oracle
+  on the identical source stays at 20 176 / 23 176 / 33 504 / 213 776 — flat in N at every size, so a
+  capacity residual, not a leak.
+- **A dead parked process keeps its reservoir: a death-drain gap, not a prune gap.** A receive/BIF
+  park puts the engine back into `RunnerState::engines` (`runner/run.rs`'s `Wait`/`Yield` arms), and
+  the only removal in the workspace is that slice's take-out, so a process killed while parked never
+  runs its own `Yield` arm again and its machine (with `Machine::refc_binaries`) lives for the
+  runtime's life — measured `82 880 000` B retained after `exit(Child, kill)` of a child that had
+  built 20 000 × 4 144 B, unchanged across 300 further scheduler passes and RSS-confirmed
+  (`VmHWM` 186 216 kB flat, against 112 540 kB resident for the same child woken into a normal exit,
+  whose figure is `0`). The residue is exactly that process's **last slice** (≈2 payloads on the
+  interpreter tier), so it is linear in the number of such deaths rather than a fixed capacity. The
+  mailbox stores' retained families (`mailbox.rs`) are a *separate* store and are not the holder
+  here. The drop belongs at the pass boundary's exit drain (`runtime/scheduler.rs` →
+  `runtime/ets_owner.rs::drain_ets_owner_exits`, which already holds the dead pids) and needs a
+  `RunnerState`-side prune; `runner/CONTEXT.md` records the mechanism.
+- **The one unbounded shape is a slice that never ends, and no heap switch can see it.** On the default
+  native baseline tier reductions are charged by a `call`/`call_ext` instruction and by the
+  heap-admission doors; a **linked** tail exit charges nothing (`Linker::emit_tail_exit` jumps to the
+  successor entry; `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop) and a BIF
+  dispatch only *spends* (never refuses). A self-recursive tail loop whose body is a binary build plus
+  BIF calls therefore runs its whole computation inside one slice: **no park, no prune, the reservoir
+  linear in the loop count**. Measured on `f(N) -> _ = <<0:(B*8)>>, f(N-1).` at 64 KiB — 500 →
+  32 792 000 B, 1 000 → 65 584 000, 2 000 → 131 168 000, 4 000 → 262 336 000 (exactly `N × 65 584`),
+  zero parks — and at 1 KiB, 2 000 → 2 144 000, 8 000 → 8 576 000. `max_heap_size` / `+hmax` charge
+  through `Process::set_off_heap_binary_bytes` **at the prune**, so with no prune they bound nothing
+  here. The repair is a reduction charge on the linked tail exit / block entry — a **`beam_engine`**
+  change this crate cannot make — and no host-side substitute works: a BIF-dispatch charge cannot end
+  such a slice (the engine parks at block granularity, so a mid-block refusal re-executes the block's
+  prefix), the `BifOutcome::Suspend` park it would map onto reaches **no** prune (measured: 100 such
+  parks at N=20 000 leave the figure at exactly `N × 1 072`, unchanged), and a mid-slice prune is
+  unsound because a running machine's roots are unpublished. `BEAM_RT_TIER=interpreter` (one charge
+  per instruction) bounds the same source — the honest user-visible mitigation, not the fix.
+
 ## The debt gate on the fun-applying stdlib fast paths (cross-cutting: execution · bridges · gc)
 Binding facts for anyone touching `RuntimeContext::resolve_external_call`, `FunBridge` or the collection doors.
 - **What it gates:** `lists`/`maps` keys whose `beam_bifs` implementation applies a fun argument back into the runtime — the roster is **not** restated in `beam_rt`: it is `beam_bifs::needs_fun_caller(module, function, arity)` (the registry's own allocation-free binary-search answer, backed by `FUN_CALLER_BIFS`' pinned 18 `lists` + 4 `maps` + 2 `ets` keys), narrowed to `module` ∈ {`lists`, `maps`} by `execution.rs`'s `nests_a_fun_apply`.
