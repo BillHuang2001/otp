@@ -37,34 +37,42 @@
 //! single-key maps are safe because `phash2/1` of a map hashes its key/value pairs in
 //! term order, never a `~w` rendering of the map itself.
 //!
-//! # A *fun*'s hash — the [`super::phash2`] case for a local closure
+//! # A *fun*'s hash — the three module-run cases for a local closure
 //!
-//! `phash2/1,2` of a fun hashes its **identity** (`module`, `index`/`new_index`, `uniq` and the
-//! free-variable environment). For a *compiled* fun that identity is stable across VM starts but
-//! **not** across compilations: `uniq` is folded into the module's CRC, which moves with the
-//! compile-time source path — and every module-run case is compiled into its own temp dir, so a
-//! hash *integer* golden would drift between two runs of the very same corpus. The Rust runtime
-//! serves the hash for an **imported** (`NEW_FUN_EXT`) fun but not for a `make_fun3` *local* one
-//! (`TermError::FunIdentityUnavailable` — the inlined 2-word descriptor carries no
-//! module/`old_uniq`), which `beam_rt` reports as its `unsupported: bif` capability gap rather
-//! than a wrong value. The case `phash2/local_fun_via_its_imported_image` therefore reaches the
-//! hash through the form both runtimes serve — `binary_to_term(term_to_binary(F))`, the imported
-//! closure the oracle hashes identically (`phash2(F) =:= phash2(binary_to_term(term_to_binary(F)))`
-//! is `true` on the oracle) — and pins the two compile-time identity items (`type`, `module`,
-//! `index`), the image size, and the **relations** a correct fun-identity hash must satisfy
-//! (stability, `is_integer`, a `Range` bound, a `Range` of 1, two distinct funs differ, and the
-//! round trip preserves the hash). It is a **module run**, since an `-eval` fun is an `erl_eval`
-//! closure whose image the runtime does not encode at all; it claims contract A.2 alongside A.7
-//! (the corpus registry only lets a module-run case claim the contracts it evidences directly).
-//! The direct `make_fun3` form stays an unpinned divergence — see the module docs of
-//! [`super::wire`] and the runtime handoff notes.
+//! `phash2/1,2` and `phash/2` of a fun hash its **identity** (`module`, `index`/`new_index`,
+//! `uniq`/`old_uniq` and the free-variable environment). For a *compiled* fun that identity is
+//! stable across VM starts but **not** across compilations: `uniq` is folded into the module's
+//! CRC, which moves with the compile-time source path — and every module-run case is compiled
+//! into its own temp dir, so a hash *integer* golden would drift between two runs of the very
+//! same corpus.
+//!
+//! All three cases are therefore **module runs** (an `-eval` fun is an `erl_eval` closure, a
+//! different identity) and they pin **relations and a 27-bit/1-based range mask**, never the
+//! integer:
+//!
+//! * `phash2/local_fun_make_fun3` — the direct `make_fun3` form through `phash2/1` and `phash2/2`:
+//!   `phash2/1` is the full 32-bit hash masked with `(1 bsl 27) - 1` and `phash2/2` is the full
+//!   hash modulo `Range` (which is why `phash2(F, 1000) =/= phash2(F) rem 1000`), so the
+//!   case pins that relation through the `Range` of `2^32` that asks for the unmasked hash, a
+//!   `Range` of 1, stability, the round-trip image identity and two distinct-fun relations.
+//! * `phash2/local_fun_via_its_imported_image` — the same closure through
+//!   `binary_to_term(term_to_binary(F))`, whose hash it pins as equal to the local form's while
+//!   asserting the compile-time identity items (`type`, `module`, `index`) and the image size.
+//! * `phash/legacy_local_fun` — the legacy `make_hash` port, `phash/2` (there is no `phash/1`:
+//!   the oracle's `erlang:function_exported(erlang, phash, 1)` is `false`): its answer is
+//!   `1 + hash rem Range` (a `Range` of 1 answers `1`, and the `2^32` form answers `hash + 1`,
+//!   which is what makes the `Range` arithmetic pinnable as a relation).
+//!
+//! Each claims contract A.2 alongside A.7 (the corpus registry only lets a module-run case claim
+//! the contracts it evidences directly). The closure is applied as well as hashed, so a fun whose
+//! hash were answered from a substitute while the fun itself did not work cannot pass.
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
 /// The module behind `phash2/local_fun_via_its_imported_image`: two closures (so the fun table
 /// is a real `make_fun3` entry) and a function that hashes the **imported** image of one of them
-/// (`binary_to_term(term_to_binary(F))`) — see the module docs for why the direct local form
-/// cannot be pinned.
+/// (`binary_to_term(term_to_binary(F))`) — see the module docs for why no hash integer is
+/// pinned.
 ///
 /// The identity items (`type`, `module`, `index`) are hard `=` matches, so a wrong `fun_info/2`
 /// item aborts the run as a `badmatch` instead of passing silently. The answer is **one
@@ -97,6 +105,55 @@ bor bit(erlang:phash2(G) =/= erlang:phash2(K), 16)\n\
 bor bit(erlang:phash2(G) =:= erlang:phash2(binary_to_term(term_to_binary(F))), 32),\n\
 byte_size(term_to_binary(F)) * 100 + Flags.\n";
 
+/// The module behind `phash2/local_fun_make_fun3` and `phash/legacy_local_fun`: one capturing
+/// closure factory `mk_cap(A)` (so every fun is a `make_fun3` entry carrying a free variable) and
+/// one function per hash port.
+///
+/// Each function hashes a local fun **directly** (no round trip) and answers with **one integer**
+/// as a module run requires: the fun image's byte size in the high digits (a compile-time constant,
+/// the same kind of *classification* the sibling case uses) followed by a relation mask — `511`
+/// when all nine `phash2/1,2` relations hold, `255` when all eight `phash/2` ones do. The funs are
+/// applied as well as hashed (`_ = F(1) + G(1) + I(1)`), so a hash answered from a substitute for
+/// a fun that does not actually work cannot pass. No hash *integer* is pinned: `uniq` rides the
+/// module CRC, which moves with the temp-dir source path.
+const FUN_HASH_MK_SOURCE: &str = "-module(fun_hash_mk).\n\
+-export([local_fun_phash2/0, local_fun_phash/0]).\n\
+bit(true, B) -> B;\n\
+bit(false, _) -> 0.\n\
+mk_cap(A) -> fun(X) -> X + A end.\n\
+local_fun_phash2() ->\n\
+F = mk_cap(1),\n\
+G = mk_cap(2),\n\
+I = binary_to_term(term_to_binary(F)),\n\
+Full = erlang:phash2(F, 1 bsl 32),\n\
+H = erlang:phash2(F),\n\
+_ = F(1) + G(1) + I(1),\n\
+Flags = bit(is_integer(H), 1)\n\
+bor bit(H >= 0 andalso H < (1 bsl 27), 2)\n\
+bor bit(H =:= erlang:phash2(F), 4)\n\
+bor bit(H =:= Full band 16#7FFFFFF, 8)\n\
+bor bit(erlang:phash2(F, 1000) =:= Full rem 1000, 16)\n\
+bor bit(erlang:phash2(F, 1) =:= 0, 32)\n\
+bor bit(H =:= erlang:phash2(I), 64)\n\
+bor bit(H =/= erlang:phash2(G), 128)\n\
+bor bit(erlang:phash2(mk_cap(3)) =/= H, 256),\n\
+byte_size(term_to_binary(F)) * 1000 + Flags.\n\
+local_fun_phash() ->\n\
+F = mk_cap(1),\n\
+G = mk_cap(2),\n\
+I = binary_to_term(term_to_binary(F)),\n\
+Hash = erlang:phash(F, 1 bsl 32) - 1,\n\
+P = erlang:phash(F, 1 bsl 27),\n\
+_ = F(1) + G(1) + I(1),\n\
+Flags = bit(is_integer(P), 1)\n\
+bor bit(P >= 1 andalso P =< (1 bsl 27), 2)\n\
+bor bit(P =:= erlang:phash(F, 1 bsl 27), 4)\n\
+bor bit(erlang:phash(F, 1) =:= 1, 8)\n\
+bor bit(erlang:phash(F, 65536) =:= 1 + (Hash rem 65536), 16)\n\
+bor bit(P =:= erlang:phash(I, 1 bsl 27), 32)\n\
+bor bit(P =/= erlang:phash(G, 1 bsl 27), 64)\n\
+bor bit(erlang:phash(mk_cap(3), 1 bsl 27) =/= P, 128),\n\
+byte_size(term_to_binary(F)) * 1000 + Flags.\n";
 /// The A.7 `phash`/`phash2` cases.
 pub(crate) fn group() -> Vec<Case> {
     vec![
@@ -283,9 +340,10 @@ pub(crate) fn group() -> Vec<Case> {
         // CRC, which moves with the temp-dir source path a module-run case compiles into), so the
         // golden pins the two compile-time identity items and the relations a correct
         // fun-identity hash must satisfy — never the integer, which would drift between
-        // compilations of the very same source. The runtime serves the hash for the **imported**
-        // (`NEW_FUN_EXT`) form only, so the closure is round-tripped first (the oracle hashes both
-        // forms to the identical value). See the module docs.
+        // compilations of the very same source. The direct `make_fun3` form is pinned by
+        // `phash2/local_fun_make_fun3` and `phash/legacy_local_fun`; the **imported**
+        // (`NEW_FUN_EXT`) image of the same closure, which hashes to the identical value, by
+        // `phash2/local_fun_via_its_imported_image`. See the module docs.
         Case {
             id: "phash2/local_fun_via_its_imported_image",
             description: "phash2/1,2 of a local fun's imported NEW_FUN_EXT image: identity items plus stability, range, a Range of 1 and distinct-fun/round-trip relations, classified into one integer",
@@ -300,6 +358,40 @@ pub(crate) fn group() -> Vec<Case> {
             }),
             golden: Golden {
                 stdout: Some("7863"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "phash2/local_fun_make_fun3",
+            description: "phash2/1,2 of a compiled module's make_fun3 local fun: the 27-bit full-hash mask relation, stability, the Range arithmetic, a Range of 1, the round-trip image identity and distinct-fun/free-variable relations, classified into one integer",
+            contracts: &[Contract::BeamAsm, Contract::OtpApps],
+            kind: CaseKind::Module(ModuleRun {
+                source: FUN_HASH_MK_SOURCE,
+                module: "fun_hash_mk",
+                function: "local_fun_phash2",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("81511"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "phash/legacy_local_fun",
+            description: "phash/2 of a compiled module's make_fun3 local fun: the 1-based range answer, stability, the 2^32/65536 range arithmetic, a Range of 1, the round-trip image identity and distinct-fun/free-variable relations, classified into one integer",
+            contracts: &[Contract::BeamAsm, Contract::OtpApps],
+            kind: CaseKind::Module(ModuleRun {
+                source: FUN_HASH_MK_SOURCE,
+                module: "fun_hash_mk",
+                function: "local_fun_phash",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("81255"),
                 exit_code: 0,
             },
         },
@@ -337,8 +429,8 @@ mod tests {
         assert!(eval_cases >= 12, "the group keeps its eval cases");
     }
 
-    /// The one module-run case: it evidences the `.beam`/`NEW_FUN_EXT` byte contract (A.2)
-    /// alongside the hash contract (A.7), and pins the compile-time identity items plus
+    /// The fun-hash module-run cases: they evidence the `.beam`/`NEW_FUN_EXT` byte contract (A.2)
+    /// alongside the hash contract (A.7), and pin the compile-time identity items plus
     /// relations only — never a fun's hash integer (it moves with the compile-time source path)
     /// and never the fun's image bytes.
     #[test]
@@ -364,11 +456,49 @@ mod tests {
         assert!(run.nif.is_none());
         assert!(
             !run.source.contains("erlang:phash2(F)"),
-            "the direct make_fun3 local form is the runtime's capability gap"
+            "this case hashes the imported image; the direct make_fun3 form is \
+             `phash2/local_fun_make_fun3`"
         );
         // The oracle's integer line: `78 * 100 + 63` — the image size and the 6-bit mask of the
         // six hash relations, all of which hold.
         assert_eq!(case.golden.stdout, Some("7863"));
         assert_eq!(case.golden.exit_code, 0);
+    }
+
+    /// The two **direct** (`make_fun3`) hash ports: each is a module run over the same source, one
+    /// per port, and each golden is the oracle's integer line — the image size in the high digits
+    /// plus a relation mask that is all-ones (`511` for the nine `phash2` relations, `255` for the
+    /// eight `phash` ones). The masks are the whole point: no hash integer is pinned, because
+    /// `uniq` rides the module CRC and moves with the compile-time source path.
+    #[test]
+    fn the_direct_make_fun3_ports_pin_relation_masks_only() {
+        let cases = group();
+        for (id, function, golden) in [
+            ("phash2/local_fun_make_fun3", "local_fun_phash2", "81511"),
+            ("phash/legacy_local_fun", "local_fun_phash", "81255"),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(
+                case.contracts,
+                &[Contract::BeamAsm, Contract::OtpApps],
+                "{id}: a module-run case must evidence the .beam contract"
+            );
+            assert_eq!(case.kind_label(), "module-run", "{id}");
+            let CaseKind::Module(run) = &case.kind else {
+                panic!("{id}: the fun-hash cases run a compiled module");
+            };
+            assert_eq!(run.module, "fun_hash_mk", "{id}");
+            assert_eq!(run.function, function, "{id}");
+            assert_eq!(run.arity, 0, "{id}");
+            assert!(run.args.is_empty(), "{id}");
+            assert!(run.nif.is_none(), "{id}");
+            // The direct form: the fun is hashed without being round-tripped first.
+            assert!(
+                run.source.contains("(F, 1 bsl 32)") && run.source.contains("(F, 1 bsl 27)"),
+                "{id}: the case hashes the local fun directly"
+            );
+            assert_eq!(case.golden.stdout, Some(golden), "{id}");
+            assert_eq!(case.golden.exit_code, 0, "{id}");
+        }
     }
 }

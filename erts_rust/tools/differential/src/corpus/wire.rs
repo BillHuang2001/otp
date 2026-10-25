@@ -72,9 +72,11 @@
 //!   `badarg`, while a genuinely `compressed` (80) image is accepted and decoded.
 //!
 //! The live handshake / a node-to-node loopback and the `DOP_*` control-message framing are
-//! **not** expressible through a single CLI process (they need two connected nodes and the
-//! `DFLAG_*` protocol), so they remain an honest, documented gap rather than a fabricated
-//! case.
+//! **not** expressible as one CLI process evaluating an expression — they need two connected
+//! nodes — so they live in [`super::dist`] and [`super::dist_extra`] as `CaseKind::Command`
+//! cases: each side's own runtime is the client, an optional [`super::PeerRun`] leg starts a
+//! **second process of that same runtime**, and a real `epmd`-less loopback carries the
+//! `DOP_*` payloads.
 //!
 //! ## Honest capability gaps (pinned as `unsupported`, never a mismatch)
 //!
@@ -82,12 +84,16 @@
 //!   A.5 *encode*-side gap; `wire/new_fun_ext_encode` pins it as `unsupported` (`beam_rt:
 //!   unsupported: local_fun`), never a mismatch. It is the `-eval` (`erl_eval`) half only: the
 //!   *compiled*-module half **agrees** byte-for-byte (see `wire/fun_ext_multi_closure_roundtrip`).
-//! * Calling a fun that was decoded from its own `NEW_FUN_EXT` image
-//!   (`F = binary_to_term(term_to_binary(F))`, then `F(Args)`) still raises a plain `badarg` on
-//!   the Rust runtime while the oracle applies it — a real divergence with an *ordinary* reason
-//!   (not a capability-gap signal), so no case pins it: the module-run case calls the
-//!   **original** fun and asserts the decoded fun's identity only. Handoff to the runtime nodes
-//!   (the `beam_engine` fun-call machinery for an imported `NEW_FUN_EXT` closure).
+//!
+//! ## Agreement notes
+//!
+//! * A fun decoded from its own `NEW_FUN_EXT` image is **callable**, and its two raise classes
+//!   are pinned: `wire/decoded_new_fun_ext_closure_is_callable` applies the decoded closure (a
+//!   plain one and a capturing `X * A + B` one), `wire/decoded_new_fun_ext_bad_index_raises_badfun`
+//!   pins `error:{badfun, F}` for an image whose `index` names no lambda of the module or whose
+//!   16-byte module checksum is corrupted, and
+//!   `wire/decoded_new_fun_ext_unloadable_module_raises_undef` pins `error:undef` for an image
+//!   naming a module that is not loadable.
 //! * `term_to_binary/2` with `{minor_version, 0|1}` reproduces the *legacy* `ATOM_EXT` (100) /
 //!   `FLOAT_EXT` (99) forms, so the `wire/minor_version_*_legacy_encode` cases `agree`.
 //!   Decoding a `compressed` (80) blob is covered by the `wire/compressed_decode_*` cases.
@@ -96,15 +102,13 @@
 //!   hash is randomised on every node start on **both** sides, so no whole-image byte golden exists;
 //!   the `etf/term_to_binary_local_*` cases in [`super::etf`] mask exactly those 4 bytes and compare
 //!   the rest of the image byte-for-byte.
-//! * The `[deterministic]` option is byte-exact only where **no re-sorting is needed**: a map
-//!   already in canonical key order (and any non-map term) encodes identically, while a map
-//!   whose flatmap/HAMT order differs from the canonical one is the BIF's typed
-//!   `unsupported` — the codec has no deterministic mode. The canonical flatmap key order
-//!   itself is pinned by the plain encoder elsewhere in this group.
-//! * `term_to_binary(make_ref())` now *executes* on both runtimes (a `NEWER_REFERENCE_EXT`
-//!   blob of 35 bytes on each), but the reference id's mask/hash bytes are random per
-//!   creation, so the images differ; only the `byte_size/1` shape would be pinnable, and the
-//!   image is deliberately left unpinned.
+//! * `[deterministic]` is served: a map's keys are sorted into canonical order on both runtimes
+//!   (`term_to_binary(#{b => 2, a => 1}, [deterministic])` is the canonical `a`, `b` image), and
+//!   the canonical flatmap key order is pinned by the plain-encoder cases in this group.
+//! * `term_to_binary(make_ref())` *executes* on both runtimes (a `NEWER_REFERENCE_EXT` blob of 35
+//!   bytes on each); the reference id's mask/hash bytes are random per creation, so the image is
+//!   pinned by its stable shape — the tag byte, the length and the round-trip identity — in
+//!   [`super::wire_ids`]'s `wire_ids/newer_reference_*` cases, never by its id bytes.
 //! * `FUN_EXT` (115) is deliberately not a case: the reference decoder does not validate it
 //!   (even a truncated blob decodes to the empty atom `''`), so any golden would pin an
 //!   unspecified artifact rather than the wire semantics. The modern `NEW_FUN_EXT` (112) is
@@ -144,6 +148,79 @@ Inner = (fun(A) -> fun(K) -> A * K end end)(6),\n\
 Flags = bit(is_function(F, 1), 1) bor bit(is_function(G, 1), 2)\n\
 bor bit(term_to_binary(G) =:= B, 4),\n\
 byte_size(B) * 10000 + byte_size(term_to_binary(Inner)) * 100 + Flags.\n";
+
+/// The module behind the three `wire/decoded_new_fun_ext_*` cases: what a **decoded**
+/// `NEW_FUN_EXT` closure does when it is *applied*, and what the two broken images raise.
+///
+/// Every image is built in Erlang from the encoded bytes of a real local fun — no harness or C
+/// support — by bit-syntax surgery on the `NEW_FUN_EXT` payload, whose layout is
+/// `[131][112][Size:u32][Arity:u8][Uniq:16][Index:u32][NumFree:u32][module atom][old_index]…`:
+/// `index` sits at bytes 23..27, the 16-byte module checksum at 7..23 and the module atom starts
+/// at byte 31. The bad-index and bad-checksum images keep their byte length (so the declared
+/// `Size` still holds), and the unloadable one swaps the 9-byte atom text for another 9-byte name
+/// (`wire_nfdec` → `wire_nfnon`, which nothing can load).
+///
+/// Each function answers with **one integer** as a module run requires: the two application
+/// results in the high digits plus a relation mask, and for the two raise cases a small
+/// classification code per image. Nothing here is a volatile figure — no image byte, no path, no
+/// pid.
+const WIRE_NEW_FUN_DECODE_SOURCE: &str = "-module(wire_nfdec).\n\
+-export([call_roundtrip/0, bad_images/0, unloadable_module/0]).\n\
+bit(true, B) -> B;\n\
+bit(false, _) -> 0.\n\
+roundtrip(F) -> binary_to_term(term_to_binary(F)).\n\
+call_roundtrip() -> call(6, 0).\n\
+call(A, B) ->\n\
+Id = fun(X) -> X end,\n\
+Cap = fun(X) -> X * A + B end,\n\
+GId = roundtrip(Id),\n\
+GCap = roundtrip(Cap),\n\
+Ans1 = GId(42),\n\
+Ans2 = GCap(7),\n\
+Flags = bit(is_function(GId, 1), 1) bor bit(is_function(GCap, 1), 2)\n\
+bor bit(element(2, erlang:fun_info(GCap, arity)) =:= 1, 4)\n\
+bor bit(length(element(2, erlang:fun_info(GCap, env))) =:= 2, 8),\n\
+Ans1 * 100000 + Ans2 * 1000 + Flags.\n\
+classify(Bin) ->\n\
+Outcome = try binary_to_term(Bin) of\n\
+G -> try (G)(1) of Val -> {applied, Val}\n\
+catch Cls:Reason -> {raised, Cls, Reason} end\n\
+catch Cls2:Reason2 -> {decode_raised, Cls2, Reason2} end,\n\
+case Outcome of\n\
+{applied, _} -> 0;\n\
+{raised, error, {badfun, _}} -> 1;\n\
+{raised, _, _} -> 2;\n\
+{decode_raised, _, _} -> 3\n\
+end.\n\
+bad_images() ->\n\
+F = fun(X) -> X + 1 end,\n\
+Base = term_to_binary(F),\n\
+<<Pre:23/binary, _Idx:32, Post/binary>> = Base,\n\
+BadIndex = <<Pre/binary, 16#7FFFFFFF:32, Post/binary>>,\n\
+<<Q:7/binary, _Uniq:16/binary, Rest/binary>> = Base,\n\
+BadChecksum = <<Q/binary, (binary:copy(<<255>>, 16))/binary, Rest/binary>>,\n\
+classify(BadIndex) * 10 + classify(BadChecksum).\n\
+unloadable_module() ->\n\
+F = fun(X) -> X + 1 end,\n\
+Base = term_to_binary(F),\n\
+<<Pre:31/binary, 119, Len:8, Name:Len/binary, Rest/binary>> = Base,\n\
+true = (Len =:= byte_size(<<\"wire_nfnon\">>)),\n\
+<<\"wire_nfdec\">> = Name,\n\
+Bad = <<Pre/binary, 119, Len:8, \"wire_nfnon\", Rest/binary>>,\n\
+Outcome = try binary_to_term(Bad) of\n\
+G -> try (G)(7) of Val -> {applied, Val}\n\
+catch Cls:Reason:St -> {raised, Cls, Reason, St} end\n\
+catch Cls2:Reason2 -> {decode_raised, Cls2, Reason2} end,\n\
+case Outcome of\n\
+{raised, error, undef, [Top | _]} ->\n\
+case Top of\n\
+{Fun0, Args0, []} when is_function(Fun0, 1), Args0 =:= [7] -> 1;\n\
+_ -> 2\n\
+end;\n\
+{raised, _, _, _} -> 3;\n\
+{applied, _} -> 4;\n\
+{decode_raised, _, _} -> 5\n\
+end.\n";
 
 /// The A.5 cases: the ETF codec used by the distribution wire.
 pub(crate) fn group() -> Vec<Case> {
@@ -696,8 +773,9 @@ pub(crate) fn group() -> Vec<Case> {
         // and the applications of the **original** funs (`F(39)`, `D(21)`) and of the nested
         // closure (`Inner(7)`) with hard matches, then classifies the two `NEW_FUN_EXT` image
         // byte sizes — stable integers for a fixed compiled module — plus a 3-bit relation mask
-        // into one integer: `82*10000 + 80*100 + 7 = 828007`. The decoded fun is never *called*:
-        // that is the runtime gap documented in the module docs.
+        // into one integer: `82*10000 + 80*100 + 7 = 828007`. The decoded fun is only
+        // *identified* here; *applying* one is what the three `wire/decoded_new_fun_ext_*` cases
+        // below pin.
         Case {
             id: "wire/fun_ext_multi_closure_roundtrip",
             description: "a capturing fun of a multi-closure compiled module round-trips through NEW_FUN_EXT (112): is_function, fun_info identity, image sizes and re-encode identity, classified into one integer",
@@ -712,6 +790,64 @@ pub(crate) fn group() -> Vec<Case> {
             }),
             golden: Golden {
                 stdout: Some("828007"),
+                exit_code: 0,
+            },
+        },
+        // -- *calling* a decoded NEW_FUN_EXT closure: the three apply-side cases --------------
+        //
+        // See `WIRE_NEW_FUN_DECODE_SOURCE`. The decoded closure is a first-class fun on both
+        // runtimes: applying it answers normally, and the two broken images raise the two
+        // documented classes (`{badfun, F}` / `undef` with the applied fun as the innermost
+        // stacktrace frame). Every image is built inside the module from the bytes of a real local
+        // fun, so no harness or C support is involved.
+        Case {
+            id: "wire/decoded_new_fun_ext_closure_is_callable",
+            description: "a local fun of a compiled module round-trips through NEW_FUN_EXT (112) and the decoded closure is applied: a plain fun and a capturing X*A+B closure answer their normal results, classified into one integer",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Module(ModuleRun {
+                source: WIRE_NEW_FUN_DECODE_SOURCE,
+                module: "wire_nfdec",
+                function: "call_roundtrip",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("4242015"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/decoded_new_fun_ext_bad_index_raises_badfun",
+            description: "a NEW_FUN_EXT image whose index names no lambda of the module, and one whose 16-byte module checksum is corrupted, both still decode and applying them raises error:{badfun, F}, classified into one integer",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Module(ModuleRun {
+                source: WIRE_NEW_FUN_DECODE_SOURCE,
+                module: "wire_nfdec",
+                function: "bad_images",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("11"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/decoded_new_fun_ext_unloadable_module_raises_undef",
+            description: "a NEW_FUN_EXT image naming a module atom that is not loadable decodes and applying it raises error:undef whose innermost stacktrace item is the applied fun {Fun, Args, []}, classified into one integer",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Module(ModuleRun {
+                source: WIRE_NEW_FUN_DECODE_SOURCE,
+                module: "wire_nfdec",
+                function: "unloadable_module",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("1"),
                 exit_code: 0,
             },
         },
@@ -1394,9 +1530,66 @@ mod tests {
         // The golden is the oracle's integer line, never an identity byte: the two image sizes
         // (82 bytes for the capturing closure, 80 for the nested one) are stable integers for a
         // fixed compiled module and the 3-bit mask (7) says every round-trip relation holds. The
-        // decoded fun is only *identified* (`is_function/2` + `fun_info/1`), never called.
+        // decoded fun is only *identified* (`is_function/2` + `fun_info/1`) here; *applying* a
+        // decoded closure is what the three `wire/decoded_new_fun_ext_*` cases pin.
         assert_eq!(case.golden.stdout, Some("828007"));
         assert_eq!(case.golden.exit_code, 0);
+    }
+
+    /// The three **apply-side** `NEW_FUN_EXT` cases: each is a module run over one fixture module
+    /// (so it uses the `run` action, not `-eval`) and each claims A.2 — the `.beam`/ETF byte
+    /// contract — because that is the contract it evidences directly. Every golden is the
+    /// oracle's integer line: two application results plus a relation mask for the callable case,
+    /// and a per-image classification code for the two raise cases. No image byte and no volatile
+    /// figure is pinned.
+    #[test]
+    fn the_decoded_new_fun_ext_cases_apply_the_closure_under_the_beam_asm_contract() {
+        let cases = group();
+        for (id, function, golden) in [
+            (
+                "wire/decoded_new_fun_ext_closure_is_callable",
+                "call_roundtrip",
+                "4242015",
+            ),
+            (
+                "wire/decoded_new_fun_ext_bad_index_raises_badfun",
+                "bad_images",
+                "11",
+            ),
+            (
+                "wire/decoded_new_fun_ext_unloadable_module_raises_undef",
+                "unloadable_module",
+                "1",
+            ),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), "module-run", "{id}");
+            let CaseKind::Module(run) = &case.kind else {
+                panic!("{id}: the decoded-fun cases run a compiled module");
+            };
+            assert_eq!(run.module, "wire_nfdec", "{id}");
+            assert_eq!(run.function, function, "{id}");
+            assert_eq!(run.arity, 0, "{id}");
+            assert!(run.args.is_empty(), "{id}");
+            assert!(run.nif.is_none(), "{id}");
+            assert_eq!(case.golden.stdout, Some(golden), "{id}");
+            assert_eq!(case.golden.exit_code, 0, "{id}");
+        }
+        // The fixture builds every broken image from the encoded bytes of a real fun — bit-syntax
+        // surgery on the `NEW_FUN_EXT` payload — so the three cases need no harness or C support.
+        let fixture = cases
+            .iter()
+            .find_map(|case| match &case.kind {
+                CaseKind::Module(run) if run.module == "wire_nfdec" => Some(run.source),
+                _ => None,
+            })
+            .expect("the fixture module is registered");
+        assert!(fixture.contains("term_to_binary(F)"), "the images come from a real fun");
+        assert!(fixture.contains("16#7FFFFFFF"), "the bad index is written into the image");
+        assert!(fixture.contains("binary:copy(<<255>>, 16)"), "the checksum is corrupted");
+        assert!(fixture.contains("wire_nfnon"), "the module atom is swapped for an unloadable one");
+        assert!(fixture.contains("Args0 =:= [7]"), "the innermost frame is the applied fun");
     }
 
     #[test]
