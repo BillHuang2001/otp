@@ -748,11 +748,17 @@ const BS_MATCH_COMMAND_ATOMS: [&str; 7] = [
     "=:=",
 ];
 
+/// The segment-type atoms a measured `bs_create_bin` names (``[Type, …]`'s first operand plus
+/// the accumulator's `all` size operand). Minted beside [`BS_MATCH_COMMAND_ATOMS`] and for the
+/// same reason: a segment type is an `Operand::Atom`, so its id has to exist before the
+/// instruction stream is assembled.
+const BS_CREATE_BIN_ATOMS: [&str; 2] = ["private_append", "all"];
+
 /// A per-shape body builder: `repeat` copies of the shape plus a `return`.
 ///
 /// It is handed the measured module because a body whose operands name module atoms
-/// (`bs_match`'s command list) must look their ids up in the table minted before the
-/// stream is assembled.
+/// (`bs_match`'s command list, `bs_create_bin`'s segment types) must look their ids up in the
+/// table minted before the stream is assembled.
 type BodyBuilder = fn(&Module, usize) -> Vec<Instr>;
 
 /// The atom `name` of a measured module (minted by [`measure_one_block`]).
@@ -1006,6 +1012,43 @@ fn body_bs_match(module: &Module, repeat: usize) -> Vec<Instr> {
     body
 }
 
+/// `bs_create_bin Dst X(1) {private_append X(0) unit 1 all, integer X(2) 6}` — the
+/// **bit-granular** construction build the compiler emits for a linear accumulator
+/// (`<<Acc/binary, C:6>>`, the `emqx_base62` decoder's per-character body): one
+/// `private_append` over an x-register accumulator with an append unit of `1`, then one
+/// six-bit `integer` field. The field width is not a whole number of bytes, so the shape
+/// takes the general route (`jit_open_append_bin_any` + one `jit_write_bit_field`), which is
+/// the route this row exists to price — the aligned route's byte stores are a different
+/// sequence and cannot stand in for it.
+fn body_bs_create_bin(module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsCreateBin {
+            fail: Label(2),
+            alloc: 0,
+            live: 3,
+            unit: 1,
+            dst: Operand::X(1),
+            segments: vec![
+                Operand::Atom(measured_atom(module, "private_append")),
+                Operand::Integer(1),
+                Operand::Integer(1),
+                Operand::Nil,
+                Operand::X(0),
+                Operand::Atom(measured_atom(module, "all")),
+                Operand::Atom(measured_atom(module, "integer")),
+                Operand::Integer(0),
+                Operand::Integer(1),
+                Operand::Nil,
+                Operand::X(2),
+                Operand::Integer(6),
+            ],
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
 /// Compile `module`'s function `func` with the counters on and return
 /// `(block_emitted_bytes, total_static_deopts)`.
 fn measure_module(module: &Module, func: u32) -> (u64, u64) {
@@ -1027,15 +1070,18 @@ fn measure_module(module: &Module, func: u32) -> (u64, u64) {
 /// return [`measure_module`]'s pair. One label means one IR block, so the summed
 /// `block_emitted_bytes` is that block's own size.
 ///
-/// The atoms are minted **before** `build` runs ([`BS_MATCH_COMMAND_ATOMS`]) because a
-/// `bs_match` command name is an `Operand::Atom` whose id has to exist first; the stream is
-/// then assembled through [`assemble_function`], the same block decomposition
-/// [`build_module`] uses, so a measured module is cut into blocks exactly like a real
-/// `.beam`.
+/// The atoms are minted **before** `build` runs ([`BS_MATCH_COMMAND_ATOMS`] /
+/// [`BS_CREATE_BIN_ATOMS`]) because a `bs_match` command name and a `bs_create_bin` segment
+/// type are `Operand::Atom`s whose ids have to exist first; the stream is then assembled
+/// through [`assemble_function`], the same block decomposition [`build_module`] uses, so a
+/// measured module is cut into blocks exactly like a real `.beam`.
 fn measure_one_block(name: &str, build: BodyBuilder, copies: usize) -> (u64, u64) {
     let mut module = Module::default();
     module.name = module.atom_table.intern(name);
     for atom in BS_MATCH_COMMAND_ATOMS {
+        module.atom_table.intern(atom);
+    }
+    for atom in BS_CREATE_BIN_ATOMS {
         module.atom_table.intern(atom);
     }
     let mut code = vec![Instr::Label(Label(2))];
@@ -1073,7 +1119,7 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
 
     // (2) The shapes. `repeatable` is `true` only when a second copy fits in the same
     // block (a block-terminating shape cannot), which is what the marginal needs.
-    let kinds: [(&str, BodyBuilder, bool); 15] = [
+    let kinds: [(&str, BodyBuilder, bool); 16] = [
         ("Move x<-int", body_move_x, true),
         ("Move x<-literal", body_move_literal, true),
         ("Test Y-src (is_nil)", body_test_y, true),
@@ -1089,6 +1135,7 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
         ("BsStartMatch4", body_bs_start_match4, true),
         ("BsGetInteger2", body_bs_get_integer2, true),
         ("BsMatch (static cmds)", body_bs_match, true),
+        ("BsCreateBin (6-bit append)", body_bs_create_bin, true),
     ];
     println!("=== baseline-JIT per-kind emitted-code size ===");
     println!(
@@ -1190,7 +1237,7 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
 
     // --- (4) liveness / consistency (never a threshold) ---------------------
     assert!(
-        rows.len() == 16,
+        rows.len() == 17,
         "the table must have one row per measured shape"
     );
     assert!(

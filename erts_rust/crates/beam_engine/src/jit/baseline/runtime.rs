@@ -600,6 +600,37 @@ pub(crate) type RefreshHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>);
 /// only cross as an index the helper re-reads from the machine.
 pub(crate) type OpenAppendHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64) -> i64;
 
+/// The **general** append-door helpers' native signature (the block ABI plus the
+/// accumulator's **slot index**, the plan's tail width in bits and the plan's append
+/// **unit**) — shared by [`jit_open_append_bin_any`] (an x-register index) and
+/// [`jit_open_append_bin_any_y`] (a Y-slot index).
+///
+/// The accumulator crosses as an index for the same two reasons as [`OpenAppendHelper`]
+/// (the block's spill has already made `machine.x` authoritative, and the block ABI admits
+/// only `movabs` immediates), and the unit is a compile-time constant the plan carries, so
+/// the door can apply C's append-**position** gate itself.
+pub(crate) type OpenAppendAnyHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64, i64) -> i64;
+
+/// [`jit_write_bit_field`]'s flag bit 0: the **accumulator** argument is a `Y` slot index
+/// rather than an x-register index.
+pub(crate) const WRITE_ACC_IN_Y: i64 = 1;
+
+/// [`jit_write_bit_field`]'s flag bit 1: the **value** argument is a `Y` slot index rather
+/// than an x-register index.
+pub(crate) const WRITE_VALUE_IN_Y: i64 = 2;
+
+/// The bit-granular field-write helper's native signature (the block ABI plus the
+/// accumulator's and the value's **slot indices**, the field's bit offset from the
+/// accumulator's window end, the field's width in bits and the
+/// [`WRITE_ACC_IN_Y`]/[`WRITE_VALUE_IN_Y`] location flags).
+///
+/// Both terms cross as slot indices, so the five arguments are all compile-time constants
+/// the emitter writes as `movabs` immediates — no run-time word can cross the block ABI
+/// (see [`super::emit::emit_helper_invoke`]).
+pub(crate) type WriteBitFieldHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64, i64, i64, i64) -> i64;
+
 /// The byte offset of [`JitRuntime::machine`] — the field the helper scaffolding is
 /// handed; generated code reads [`JitRuntime::x_regs`] instead.
 pub(crate) const RUNTIME_MACHINE_DISP: i32 = 0;
@@ -1507,6 +1538,194 @@ fn open_append_cursor(machine: &Machine, src: Eterm, tail_bits: i64) -> i64 {
     // `end_bits % 8 == 0`, so this is the exact byte offset of the first byte the
     // instruction's fields occupy.
     (base + end_bits / 8) as i64
+}
+
+/// The **general** in-place append precondition helper: the bit-granular twin of
+/// [`jit_open_append_bin`], asking the construction seam's general door
+/// ([`open_append_any`]) whether `machine.x[src_reg]` is a writable accumulator this
+/// instruction may append `tail_bits` more bits to at the plan's own append **unit**.
+///
+/// Returns the **payload base** (or `0` for every refusal). Unlike the byte-aligned form
+/// this is not a byte cursor: a bit-granular field is written at an **absolute bit**
+/// position, so the window end is re-derived per field by [`jit_write_bit_field`] and the
+/// base is only used as a liveness proof — the emitted sequence tests it against `0` and
+/// branches to its one-interpreter-step `fallback`, exactly as the aligned arm does.
+///
+/// **It mutates nothing** (the seam's queries allocate nothing and mutate nothing), so a
+/// later `fallback` — one whole interpreter step re-executing this very instruction — sees
+/// an accumulator whose window end and payload the block's prefix has not touched.
+pub(crate) extern "C" fn jit_open_append_bin_any(
+    rt: *mut JitRuntime<'_>,
+    src_reg: i64,
+    tail_bits: i64,
+    unit: i64,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is
+    // blocked in the block call that reached us).
+    let runtime = unsafe { &*rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
+    // this helper only **reads** through it — the seam's queries allocate nothing and
+    // mutate nothing — so a shared borrow cannot alias a `&mut Machine` (the driver holds
+    // none while the block runs).
+    let machine = unsafe { &*runtime.machine };
+    let Ok(src_reg) = u32::try_from(src_reg) else {
+        return 0;
+    };
+    let Some(src) = machine.x(src_reg) else {
+        return 0;
+    };
+    open_append_any_cursor(machine, src, tail_bits, unit)
+}
+
+/// The **`Y`-slot** form of [`jit_open_append_bin_any`]: the accumulator's Y-slot index,
+/// read through [`Machine::y`]'s bounds check (the same `0` decline as every other
+/// refusal, so the emitted `test rax, rax; je fallback` stays the one decline point).
+pub(crate) extern "C" fn jit_open_append_bin_any_y(
+    rt: *mut JitRuntime<'_>,
+    y_slot: i64,
+    tail_bits: i64,
+    unit: i64,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is
+    // blocked in the block call that reached us).
+    let runtime = unsafe { &*rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
+    // this helper only **reads** through it (`Machine::y` and the seam's pure queries), so
+    // a shared borrow cannot alias a `&mut Machine`.
+    let machine = unsafe { &*runtime.machine };
+    let Ok(y_slot) = u32::try_from(y_slot) else {
+        return 0;
+    };
+    let Some(src) = machine.y(y_slot) else {
+        return 0;
+    };
+    open_append_any_cursor(machine, src, tail_bits, unit)
+}
+
+/// The shared body of the two general-door helpers: the accumulator's payload base, or `0`
+/// for every refusal. The window end is deliberately **not** returned — the bit-granular
+/// write helper re-derives it from the same door for each field.
+fn open_append_any_cursor(machine: &Machine, src: Eterm, tail_bits: i64, unit: i64) -> i64 {
+    let Ok(tail_bits) = u32::try_from(tail_bits) else {
+        return 0;
+    };
+    let Ok(unit) = usize::try_from(unit) else {
+        return 0;
+    };
+    let Some((base, _end_bits)) = crate::families::bitstrings::create::seam::open_append_any(
+        machine, src, tail_bits, unit,
+    ) else {
+        return 0;
+    };
+    base as i64
+}
+
+/// Write **one** bit-granular field of the construction arm — the second route's field
+/// writer, over the family's one bit-granular rule
+/// ([`write_bit_field`](crate::families::bitstrings::create::seam::write_bit_field)).
+///
+/// Returns `1` once the field's bits are in the payload, `0` for every refusal (an
+/// out-of-range slot index, a `Y` slot outside the current frame, a **non-small** value —
+/// the family routes a bignum field through its own byte model — or a payload without room
+/// for this field). The emitted sequence tests the word and branches to its
+/// one-interpreter-step `fallback`, so a refusal is the family's own behaviour.
+///
+/// The room check and the window end are **one** query: asking the general door for
+/// `field_offset_bits + nbits` more bits both verifies `[cur_bit, cur_bit + nbits)` lies
+/// inside the payload's capacity (the seam's caller contract for `write_bit_field`) and
+/// answers the `(base, end_bits)` pair the write needs. The append **unit** passed here is
+/// `1`, i.e. ungated: the build's own unit gate was applied by the up-front door that
+/// verified the whole plan, and re-applying it per field would refuse a plan the family
+/// accepts.
+///
+/// `start_bit` is the door's `end_bits` — the accumulator's window end, hence the build's
+/// first writable bit, which is exactly what `raw::InPlace::new` records as its `start`
+/// (`raw::write_payload_bit`'s mask rule keeps the window's own high bits in a shared byte
+/// when the first bit of a build lands mid-byte). `cur_bit` is then the **absolute** bit
+/// `end_bits + field_offset_bits`.
+///
+/// **Re-execution idempotent**: the same field re-written at the same position produces
+/// the same bytes, because the rule derives all three cases from absolute positions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "C" fn jit_write_bit_field(
+    rt: *mut JitRuntime<'_>,
+    src_slot: i64,
+    field_offset_bits: i64,
+    value_slot: i64,
+    nbits: i64,
+    flags: i64,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is
+    // blocked in the block call that reached us).
+    let runtime = unsafe { &*rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
+    // this helper only **reads** through it — every write this arm performs is emitted
+    // inline by the block (`ErlSubBits.end` plus the destination store), never here — so a
+    // shared borrow cannot alias a `&mut Machine`. The payload bytes it writes go through
+    // the seam's `write_bit_field`, which takes a raw payload pointer rather than a
+    // `&mut Machine` (the payload is owned by a writable-payload registry entry, not by the
+    // machine's heap).
+    let machine = unsafe { &*runtime.machine };
+    let (Ok(src_slot), Ok(value_slot), Ok(field_offset_bits), Ok(nbits)) = (
+        u32::try_from(src_slot),
+        u32::try_from(value_slot),
+        u32::try_from(field_offset_bits),
+        u32::try_from(nbits),
+    ) else {
+        return 0;
+    };
+    if nbits == 0 || nbits > 64 {
+        return 0;
+    }
+    // The two terms cross as slot indices plus one flags word (the block ABI has room for
+    // five `movabs` immediates and no run-time word), so which machine file holds each
+    // follows from the flags.
+    let (Some(src), Some(value)) = (
+        slot_term(machine, src_slot, flags & WRITE_ACC_IN_Y != 0),
+        slot_term(machine, value_slot, flags & WRITE_VALUE_IN_Y != 0),
+    ) else {
+        return 0;
+    };
+    // A bignum (or any non-integer) field is the family's own path: `write_bit_field`
+    // models a `u64`, and the family routes a wide integer through its byte model.
+    if !beam_term::is_small(value) {
+        return 0;
+    }
+    let Some(field_end_bits) = field_offset_bits.checked_add(nbits) else {
+        return 0;
+    };
+    // One query for both halves: the room this field needs, and the `(base, end_bits)`
+    // pair the write addresses.
+    let Some((base, end_bits)) =
+        crate::families::bitstrings::create::seam::open_append_any(machine, src, field_end_bits, 1)
+    else {
+        return 0;
+    };
+    let Some(cur_bit) = end_bits.checked_add(field_offset_bits as usize) else {
+        return 0;
+    };
+    crate::families::bitstrings::create::seam::write_bit_field(
+        base,
+        end_bits,
+        cur_bit,
+        beam_term::signed_value(value) as u64,
+        nbits,
+    );
+    1
+}
+
+/// The `Eterm` in machine slot `slot` of the x-register file (`in_y == false`) or of the
+/// current frame's `Y` area — `None` for an out-of-frame `Y` slot or an out-of-bound
+/// x-register, which every caller folds into its own `0` decline.
+fn slot_term(machine: &Machine, slot: u32, in_y: bool) -> Option<Eterm> {
+    if in_y {
+        machine.y(slot)
+    } else {
+        machine.x(slot)
+    }
 }
 
 /// The **local tail-call** helper: pop the current frame with the interpreter's

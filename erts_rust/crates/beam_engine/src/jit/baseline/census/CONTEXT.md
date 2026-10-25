@@ -53,7 +53,7 @@ This node owns the census *record*; the instruments' code lives in the files the
   `../../../MEASURED.md` §Execution coverage.
 
 ## The evidence record (measured; never a gate)
-Recorded on the tree at `688b1a3ff2` with the oracle `erl` at OTP **29.1.1 / erts-17.1**
+Recorded on the tree at `b832285989` with the oracle `erl` at OTP **29.1.1 / erts-17.1**
 (`/nix/store/…-erlang-29.1.1`), 1-min load sampled at 0.5–0.7 around the runs.
 These are **counts**, not timings: host load does not affect their validity (only their wall time),
 which is why a census may run beside a measurement pass.
@@ -62,6 +62,10 @@ installed-OTP `.beam`s (every `<lib>/<app>-<vsn>/ebin`, no hardcoded app names, 
 `OTP_MODULE_CAP = 4096`) = **1359** modules / **103 079** functions, `functions_skipped = 0`.
 The **fixture half is version-controlled** and the OTP half is not: any figure that must not drift
 with the host is taken over the fixtures alone (see Table 2).
+**Every figure below was re-derived at `b832285989`** by running the gate commands under `## Gate
+commands` (one `--lib <test name> -- --nocapture` run each, `--test-threads=1` for the multi-test
+filter); each table says whether it moved from the previous record and, where one did, which
+lowering moved it. Nothing here is hand-carried from an older tree.
 
 ### The three instruction counting bases
 The same corpus is quoted on three denominators, and they are not interchangeable:
@@ -110,6 +114,12 @@ out of **119** variants visited at all; every non-`FuncInfo` deopt together is *
 inlined — the *never-executed* shape, so its 86 % share of the count is 0 % of the run time.
 The Y-window split on the same run: `blocks=185 454 publish=133 230 elided=52 224` (71.8 % of
 Y-touching blocks publish) `invalidations=544 956`.
+**Re-derived at `b832285989`: unchanged in every figure.** That is the expected result, and it is
+worth stating why: this table counts what *deopts*, and a `Bs*` shape never appears in it — the
+bitstring family's fallback is the family's own `claimed` helper arm (`jit_bitstr`), not an
+`emit_deopt`, so a lowering appearing or disappearing inside that arm cannot move a deopt count. The
+lowering's census evidence is Table 4b (the `inlined`/`refused` split) and Table 3 (the emitted
+bytes), never this table.
 
 ### Table 2 — the deopting-variant set over the **committed fixtures** (corpus-independent)
 `ERTS_ORACLE=/nonexistent/erl erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_static_deopt_census_over_the_corpus_is_printed -- --nocapture`
@@ -132,18 +142,32 @@ output — the always-deopting `FuncInfo` (one per function), the un-armed `Bif0
 half of Table 1.
 The fixture corpus also gives the deterministic half of the register-cache totals:
 `modules=38 functions=422 blocks=1192 ir_instrs=4570 emitted_bytes=330 645`.
+**Re-derived at `b832285989`: unchanged in every figure** — including the fixture half of Table 3
+(`blocks=1192 ir_instrs=4570 emitted_bytes=330 645`) and the per-fixture `code_len` column of Table 4.
+So no committed fixture carries a bit-granular `bs_create_bin` build: the corpus instances the new
+route lowers are all in the installed-OTP half, which is why the OTP-only byte figures moved
+(Table 3) while every fixture-only figure did not.
 
 ### Table 3 — register-cache traffic
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_register_cache_traffic_census_over_the_corpus_is_printed -- --nocapture`
 Grand total over 1359 modules / 103 079 functions / 597 565 blocks / 3 586 410 Σ ranges:
-spill **stores** `dirty` **1 389 278**, `written` 4 404 588, `full-cache` 5 285 140 — the dirty-set
-rule removes **3 015 310** already-clean stores (**−68.5 %** of the written-set model), exactly
+spill **stores** `dirty` **1 389 487**, `written` 4 405 127, `full-cache` 5 286 037 — the dirty-set
+rule removes **3 015 640** already-clean stores (**−68.46 %** of the written-set model), exactly
 7 B per removed store.
 Fill **register loads**: observable (block-local liveness ∪ the instruction's own inline write set)
-**1 551 064** vs full-cache 4 013 945.
-Emitted bytes **299 806 315**; spill calls 2 519 270 (Helper 1 806 394 / Exit 712 876), fill calls
+**1 551 314** vs full-cache 4 014 208.
+Emitted bytes **299 832 678**; spill calls 2 519 416 (Helper 1 806 540 / Exit 712 876), fill calls
 2 024 746 (Helper 1 427 181 / Prologue 597 565).
 The three store models come from **one** recorded run, so they are directly comparable.
+**Re-derived at `b832285989`: the OTP half and therefore the grand total moved; the fixture half
+(Table 2's `blocks=1192 ir_instrs=4570 emitted_bytes=330 645`) did not.** The move is the
+`bs_create_bin` bit-granular route: the corpus instances it now lowers emit real code instead of the
+one-interpreter-step deopt sequence (Table 4b: 34 → 84 inlined instances), so emitted bytes went
+`299 806 315 → 299 832 678` (**+26 363 B**) and every store/fill figure rose by the sequences those
+blocks gained — dirty stores `+209`, written `+539`, full-cache `+897`, fill loads `+250`, spill
+calls `+146` (Helper `+146`, Exit unchanged), with `blocks` and `ir_instrs` unchanged (a lowering
+changes a block's contents, never the block decomposition). The percentage therefore also moved a
+shade: `−68.5 % → −68.46 %`.
 
 ### Table 4 — per-kind emitted code size
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_per_kind_emitted_code_size_table_is_printed -- --nocapture`
@@ -169,8 +193,9 @@ shape that quietly went back to the helper.
 | `BsStartMatch4` | 431 | +236 | +291 | yes |
 | `BsGetInteger2` | 726 | +531 | +586 | yes |
 | `BsMatch (static cmds)` | 799 | +604 | +659 | yes |
+| `BsCreateBin (6-bit append)` | 526 | +331 | +387 | yes |
 | `CallLast` (unlinked exit) | 213 | +18 | n/a (block ends) | yes |
-Σ of the sixteen deltas, one occurrence each: **+2628 B** (this is the current reading of the
+Σ of the seventeen deltas, one occurrence each: **+2959 B** (this is the current reading of the
 instrument named above, not a hand-edited figure). Both figures are **whole-block** sizes, so
 both carry the shared prologue/exit/epilogue; the `2N − N` **marginal** is the confound-free
 per-occurrence figure and only exists where a second copy fits in the block.
@@ -178,8 +203,14 @@ An artifact-wide deopt-only figure would multiply each delta by that shape's occ
 this table deliberately does not do; the whole-artifact `code_len` over the 38 fixtures is
 **329 748 B** (largest `bsmatch.beam` 40 204 B / 90 blocks / 385 emitted instances, `bssmall.beam`
 37 876 B / 102 / 359).
-The eight `Bs*` rows are the reason the bitstring arms are budgeted as their own code-size class
-(the ninth arm, `bs_create_bin`, has no row of its own here):
+The nine `Bs*` rows are the reason the bitstring arms are budgeted as their own code-size class; the
+`bs_create_bin` row is the **bit-granular** route's (`private_append` over an x-register accumulator,
+append unit `1`, one six-bit `integer` field — `body_bs_create_bin`, the shape the `emqx_base62`
+decoder re-enters per character), so it prices the general door (`jit_open_append_bin_any`) plus one
+`jit_write_bit_field`, not the aligned route's byte stores. Re-derived at `b832285989`: the sixteen
+pre-existing rows are **unchanged**, the new row was added, and the Σ moved
+`+2628 → +2959 B` (both figures from the one run). The fixture artifact total above is unchanged: no
+committed fixture carries a bit-granular build, so the new route moved only the installed-OTP half.
 `emit/compile.rs::function_capacity_estimate` adds `BS_PATH_BYTES` (448) per bitstring-path
 instruction, `BS_MATCH_COMMAND_BYTES` (320) per accepted `bs_match` command and
 `CREATE_BIN_PATH_BYTES` (16 384) per `bs_create_bin`, so neither an unbounded `bs_match` list nor a
@@ -190,8 +221,8 @@ maximum-width construction arm can under-allocate the `CodeBuffer`.
 The instrument is `emit/test/refusal_census.rs`; it walks the same corpus and classifies every `Bs*`
 instruction instance as inlined, refused by one closed reason, or having no arm at all.
 Current corpus reading (the run behind the rows above): **27 438** `Bs*` instructions —
-**15 380** inlined, **6 558** refused, **5 500** with no arm.
-The refuse rows: **3 247** `bs_match` allocating command, **1 841** `bs_create_bin` `other`,
+**15 430** inlined, **6 508** refused, **5 500** with no arm.
+The refuse rows: **3 247** `bs_match` allocating command, **1 791** `bs_create_bin` `other`,
 **1 077** `bs_skip_bits2` runtime size/unit/stride, **171** `bs_get_integer2` runtime
 size/unit/stride, **73** `bs_match` width rule, **61** `bs_get_integer2` signed/little/native field,
 **47** `bs_create_bin` literal-area subject, **40** `bs_match` signed/little/native field,
@@ -200,7 +231,7 @@ The no-arm rows: `bs_get_tail` 3 694, `bs_get_binary2` 972, `bs_get_utf16` 487,
 `bs_get_utf8` 135, `bs_init_writable` 93, `bs_match_string` 69, `bs_skip_utf8` 18, `bs_get_float2` 15,
 `bs_get_utf32` 9, `bs_skip_utf16` 4, `bs_skip_utf32` 4.
 `bs_create_bin` is a **two-way** arm like the eight before it: of its **1 922** corpus instances
-**34** are inlined and **1 888** refused, split **1 841** `other` (the shape predicate's own
+**84** are inlined and **1 838** refused, split **1 791** `other` (the shape predicate's own
 declines — a plain/later-position or absent `private_append`, an append unit that does not divide 8,
 a `binary`/`float`/`utf*` segment, an `all` or runtime (`Dynamic`) size, a `little`/`signed`/`native`
 flag, a partial-byte or wider-than-a-word field, a `StrT` window the module cannot resolve, a `Y`
@@ -208,6 +239,13 @@ accumulator or field value, a plan with no fields, a field list whose byte offse
 plan's tail, the `MAX_FIELDS`/`MAX_TAIL_BYTES` caps) and **47** literal-area subject; the
 instrument's own `inlined | refused | opcode` table carries that accounting for every arm
 (`bs_get_integer2`'s 232 instances are all refused, `bs_skip_bits2`'s 3 of 1 080 inline).
+**Re-derived at `b832285989`: the `bs_create_bin` row moved and nothing else did** — its inlined
+count `34 → 84` and its `other` refusals `1 841 → 1 791`, which is the whole of the totals' move
+(`inlined 15 380 → 15 430`, `refused 6 558 → 6 508`); the 50 newly-lowered instances are the
+bit-granular (`Field::Bits` width `1..=63`) construction builds the second route accepts, and the
+literal-area-subject bucket (**47**), the eight match-context arms, the `test`/`bif`/`gc_bif`/`bif0`
+pools and the no-arm rows are all unchanged. `bs_instructions`, `no_arm` and `paths`/`modules_loaded`
+are unchanged by construction: a route decision changes attribution, never the corpus walk.
 The reason vocabulary is a closed set of `const` strings (`BS_REASON_ALLOC`, `_LITERAL`, `_RUNTIME`,
 `_UNIT`, `_WIDTH`, `_NO_FAIL`, `_LABEL`, `_Y_DST`, `_FIELD`, `_OTHER`), so a new refusal must be named
 rather than folded into a catch-all, and the test pins the accounting

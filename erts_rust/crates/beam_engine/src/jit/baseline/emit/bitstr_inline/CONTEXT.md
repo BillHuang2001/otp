@@ -52,7 +52,7 @@ Two shape facts come from the construction seam `families::bitstrings::create::s
 - **Every byte read is bounded before it is read.** `emit_bit_extract`'s over-read guard (`j + W <= num_bytes`, or `j + 2 <= num_bytes` for the granular form) is emitted before the load it protects, and both loads are byte-wise and assembled most-significant byte first — an x86 multi-byte load is little-endian and would produce the byte-reversed value with no error surfaced.
 - **The shape predicate is the single decision.** `emit/block.rs`'s arm, `emit/regalloc.rs`'s `cacheable_touches`/`cacheable_reads`/`cacheable_writes`/`is_inlined`, `emit/arith.rs::uses_y` and the refusal census all consult the same `*_shape` function, so a shape's emitted registers and its refusal cannot disagree with the code that runs.
 - Errors are `beam_common::{Result, BeamError}` only; a raw `*mut Eterm` is never touched here — the emitters write bytes and the layout constants are the only view of the frozen words.
-- Files stay near the ~1000-line guidance (`mod.rs` 570, `create.rs` 565, `bs_match.rs` 514, `start_match.rs` 401, `tail.rs` 356, `position.rs` 339, `integer.rs` 332, `tests.rs` 122); the per-shape suites are `../../bitstr_inline_tests.rs`, `../../bs_match_deopt_tests.rs` and `../../bs_create_bin_tests.rs`.
+- Files stay near the ~1000-line guidance (`mod.rs` 570, `create.rs` 826, `bs_match.rs` 514, `start_match.rs` 401, `tail.rs` 356, `position.rs` 339, `integer.rs` 332, `tests.rs` 122); the per-shape suites are `../../bitstr_inline_tests.rs`, `../../bs_match_deopt_tests.rs` and `../../bs_create_bin_tests.rs`.
 - Apache-2.0 header on every `.rs` (byte-exact; the repo license scanner enforces it).
 ## Routing Table
 - `mod.rs` → the module docs, the layout constants and the field-flag bits, the `#[cfg(test)]` per-shape instrument (`SHAPE_COUNT`/`SHAPE_*`/`inlined`), the four shared emitters (`emit_ctx_guard`, `emit_fallback_and_done`, `emit_bit_extract`, `emit_subject_view`) and the `mod`/re-export block the callers resolve through.
@@ -68,3 +68,58 @@ Two shape facts come from the construction seam `families::bitstrings::create::s
 - `../CONTEXT.md` → the emitter contract, the `fallback`/`fast_done`/`fail_arm` label shape and the `BS_PATH_BYTES`/`BS_MATCH_COMMAND_BYTES` code-size budgets.
 - `../../census/CONTEXT.md` → the per-kind emitted-code-size table and the refusal attribution, with their gate commands.
 - `../../bitstr.rs` (`jit_bitstr`) and `crate::families::bitstrings` → the helper every refused shape reaches, and the in-tree oracle.
+
+## `bs_create_bin`: the two sequential routes (`create.rs`, 826 lines)
+
+`create.rs` owns the shape predicate (`CreateBinShape::of`), the field planning
+(`prepare_fields` -> `PreparedField::{Bits, Const}`) and the two emitted sequences
+(`try_inline_bs_create_bin` -> `emit_aligned_fields` / `emit_bit_fields`).
+`CreateBinShape` carries `source`, `dst`, `unit`, `tail_bits`, `fields` and the per-field
+`field_bit_offsets`; `source_slot()` names the accumulator slot for the helper call and
+`route()` returns `Route::{Aligned, BitGranular}`.
+
+`route()` is `Aligned` iff `tail_bits % 8 == 0` **and** every field's width is a multiple of 8
+(a `ConstBytes` field always is); anything else is `BitGranular`.
+Both routes share the guard prefix and the commit, and differ only in the write sequence:
+
+```text
+  ; --- shared prefix ---------------------------------------------------------
+  guard dst frame window      -> fallback        (Loc::guard_store)
+  guard source when it is Y   -> fallback        (Loc::guard_load, SOURCE_GUARD_SCRATCH)
+  per Field::Bits: load + is_small -> fallback   (IMMED1_MASK / SMALL_TAG)
+  mov rdi,rt ; movabs rsi,src_slot ; movabs rdx,tail_bits[, movabs rcx,unit]
+  movabs r11,jit_open_append_bin[_y] | jit_open_append_bin_any[_y] ; call r11
+  test rax,rax ; je fallback                     ; 0 = refuse, rax = payload base
+  ; --- Aligned writes -------------------------------------------------------
+  per field: movabs rax,value ; sar_ri rax, imm ; mov byte [rdx + offset_bits/8], al
+  ; --- BitGranular writes ---------------------------------------------------
+  per field: mov rdi,rt ; movabs rsi,src_slot ; movabs rdx,field_offset_bits
+             movabs rcx,value_slot ; movabs r8,nbits ; movabs r9,flags
+             movabs r11,jit_write_bit_field ; call r11
+             test rax,rax ; je fallback          ; one room check per field
+  ; --- shared commit (the ONLY mutation) ------------------------------------
+  add dword [rdx + SUB_BITS_END_DISP], tail_bits
+  ; accumulator re-read into dst, then fallback/done
+```
+
+The bit-granular sequence therefore issues one helper call per field, each of which asks the
+seam for room for `field_offset_bits + nbits` bits and then writes that field's bits.
+Both sequences commit the window end exactly once, after every write, which is what keeps a
+`fallback` (one whole-instruction interpreter step) re-execution safe.
+
+## Deliberate refusals (structural, not gaps)
+
+- **`binary all`** (a run-time-length segment, e.g. `emqx_base62:encode/2`'s builds): a
+  run-time length fixes no static offset for itself or any later field, so the only lowering
+  is exactly the copy the family already performs (`BitWriter::push_bits_from` ->
+  `raw::InPlace::copy_bytes`, `raw::InPlace::push_bit` for a non-aligned destination) -- no
+  new invariant -- and it would lose the "one single last commit" property, because a
+  run-time length cannot be checked before the write without a length-dependent branch after
+  the first payload byte. It stays on `jit_bitstr`.
+- **A fresh non-append `[integer 8]`** (e.g. `emqx_base62:decode/2`'s temp `<<DecodeChar>>`):
+  `raw::make_binary` **allocates** a fresh result (an on-heap `ErlHeapBits` or the refc pair)
+  through the rooted seam, which a straight-line helper-free sequence cannot do without an
+  admission point. It stays on `jit_bitstr`.
+- **`BitGranular` + `ConstBytes`** in one plan: refused by the predicate (`CreateBinShape::of`
+  -> `None`), because the aligned half would commit a window end before the bit fields have
+  passed their own room check.
