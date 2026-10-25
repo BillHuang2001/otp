@@ -33,11 +33,14 @@
 //! [`seam::append_plan`] (this instruction *is* that shape, and here are its fields) and
 //! the append doors (the accumulator has room, and here is where its window starts).
 //!
-//! # Two routes, one predicate
+//! # Three routes, one predicate
 //!
 //! [`CreateBinShape::route`] — derived from the same [`CreateBinShape::of`] predicate every
 //! other consumer already calls, so no second predicate exists — splits the accepted shapes
-//! by **bit alignment**:
+//! that carry static fields by **bit alignment**, and [`CreateBinShape::of`] reports the
+//! third route ahead of that split: a build whose only segment is a whole `binary all` tail
+//! has no field at all, so it is branched on **before** [`CreateBinShape::route`] (which
+//! answers `Route::Aligned` for it vacuously). The three emitted sequences are therefore:
 //!
 //! * [`Route::Aligned`] — every field is a whole number of bytes. Field `i` is addressed as
 //!   `cursor + byte_offset` from the byte cursor [`create_door::emit_append_cursor`] leaves
@@ -50,10 +53,14 @@
 //!   one call to [`jit_write_bit_field`], which re-derives the payload base and the window
 //!   end from the general door ([`seam::open_append_any`]) and applies the family's one
 //!   bit-granular write rule ([`seam::write_bit_field`]) at an **absolute bit** position.
+//! * the **`binary all` tail** — one [`create_binary::emit_binary_all`] call that performs
+//!   the room check, the copy and the build's single `end` commit itself (the advance is the
+//!   source's run-time width, so there is no compile-time tail to add).
 //!
-//! Both routes share the destination/accumulator/`is_small` guards and the closing
-//! `end` commit + destination store, so a shape that moves from one route to the other
-//! changes only the field-write phase.
+//! The two field-write routes share the destination/accumulator/`is_small` guards and the
+//! closing `end` commit + destination store, so a shape that moves from one of them to the
+//! other changes only the field-write phase; the `binary all` tail keeps the destination
+//! and source guards and folds its commit into its one helper call.
 //!
 //! # The mutation order is the whole correctness argument
 //!
@@ -610,7 +617,8 @@ impl CreateBinShape {
 /// Emit `bs_create_bin Dst Segments` natively, or report that the block must helper it
 /// (`Ok(false)` with **zero bytes emitted**).
 ///
-/// See the module docs for the two emitted sequences, the mutation order they are built on
+/// See the module docs for the three emitted sequences (the aligned and bit-granular
+/// field-write routes and the `binary all` tail), the mutation order they are built on
 /// and the shapes [`CreateBinShape::of`] declines.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(

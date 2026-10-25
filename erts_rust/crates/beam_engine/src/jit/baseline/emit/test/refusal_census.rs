@@ -313,7 +313,10 @@ const BS_REASON_LABEL: &str = "unresolved fail label";
 const BS_REASON_Y_DST: &str = ">1 Y destination";
 /// (i) — a signed, little-endian or native-endian field.
 const BS_REASON_FIELD: &str = "signed/little/native field";
-/// The explicit catch-all: everything the nine rules above do not name (an unmodelled flag
+/// (j) — a `bs_match_string` pattern the arm will not lower: a bit offset, the pattern's
+/// length cap, or a bit width the static compare has no form for.
+const BS_REASON_MATCH_STRING: &str = "pattern not lowered (offset, length cap or bit width)";
+/// The explicit catch-all: everything the ten rules above do not name (an unmodelled flag
 /// atom, a truncated command group, a non-`Loc` destination that is not a literal, and
 /// every `bs_create_bin` refusal `CreateBinShape::of`'s single `None` cannot discriminate).
 const BS_REASON_OTHER: &str = "other";
@@ -669,9 +672,8 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
             {
                 return BsVerdict::Inlined(OP);
             }
-            let reason = fail_refusal(labels, *fail).unwrap_or_else(|| {
-                "pattern not lowered (offset, length cap or bit width)".to_string()
-            });
+            let reason = fail_refusal(labels, *fail)
+                .unwrap_or_else(|| BS_REASON_MATCH_STRING.to_string());
             BsVerdict::Refused(OP, reason)
         }
         Instr::BsGetTail { .. } => BsVerdict::NoArm("bs_get_tail"),

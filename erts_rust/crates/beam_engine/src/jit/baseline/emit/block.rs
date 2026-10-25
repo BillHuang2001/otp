@@ -1061,14 +1061,17 @@ pub(crate) fn emit_block(
             }
             // `bs_create_bin` over the **private-append accumulator** — the compiler's
             // `<<Acc/binary, C:6>>` linear-accumulator shape, one instruction per appended
-            // field. Only constant-width unsigned big-endian integer segments and (on the
-            // byte-aligned route) string-constant segments lower here; the shape picks one
-            // of two sequences, byte stores when every field is whole-byte and one bit-granular
-            // write helper per field otherwise (`bitstr_inline::Route`). Everything else (a
-            // runtime width or unit, a little-endian/signed/native field, a nested match
-            // context, a non-x accumulator, more than `MAX_FIELDS` fields or `MAX_TAIL_BYTES`
-            // bytes, a bit-granular plan carrying a string constant) emits **zero bytes** and
-            // takes the family's own arm below.
+            // field. Only constant-width unsigned big-endian integer segments, (on the
+            // byte-aligned route) string-constant segments and a single whole-`binary all`
+            // tail lower here; the shape picks one of **three** sequences
+            // (`bitstr_inline::Route` plus the tail it branches on before that split): byte
+            // stores when every field is whole-byte (the aligned route), one bit-granular
+            // write helper per field otherwise (the general route), or the `binary all`
+            // tail's single copy-and-commit helper call (no static field at all).
+            // Everything else (a runtime width or unit, a little-endian/signed/native field,
+            // a nested match context, a non-x accumulator, more than `MAX_FIELDS` fields or
+            // `MAX_TAIL_BYTES` bytes, a bit-granular plan carrying a string constant) emits
+            // **zero bytes** and takes the family's own arm below.
             // The `fallback` is ONE interpreter step for the whole instruction. Every guard
             // that can take it runs before the first payload store, and the accumulator's
             // window-end commit is the last fallible-free store, so a deopt re-executes

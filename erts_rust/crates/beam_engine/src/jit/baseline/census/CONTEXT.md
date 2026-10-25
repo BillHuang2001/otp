@@ -259,9 +259,8 @@ no-arm rows are `bs_get_tail` 73, `bs_get_float2` 8, `bs_get_binary2` 2.
 `bs_instructions`, `no_arm` and `paths`/`modules_loaded` are a property of the corpus walk, so a
 route or arm decision changes only the inlined/refused attribution.
 The reason vocabulary is a closed set of `const` strings (`BS_REASON_ALLOC`, `_LITERAL`, `_RUNTIME`,
-`_UNIT`, `_WIDTH`, `_NO_FAIL`, `_LABEL`, `_Y_DST`, `_FIELD`, `_OTHER`) plus the `bs_match_string`
-arm's own inline literal ("pattern not lowered (offset, length cap or bit width)"), so a new refusal
-must be named rather than folded into a catch-all, and the test pins the accounting
+`_UNIT`, `_WIDTH`, `_NO_FAIL`, `_LABEL`, `_Y_DST`, `_FIELD`, `_MATCH_STRING`, `_OTHER`), so a new
+refusal must be named rather than folded into a catch-all, and the test pins the accounting
 `inlined + refused + no_arm == bs_instructions` so no instance can be dropped silently.
 
 ### Table 5 — runtime deopt and dynamic execution (the hot in-crate shapes)
