@@ -19,7 +19,8 @@
 // %CopyrightEnd%
 
 //! The `bs_create_bin` shape: the compiler's **linear accumulator** build, lowered in
-//! place, on one of **two routes**.
+//! place, on one of **three routes** — aligned, bit-granular, or the `binary all` tail
+//! ([`create_binary`](create_binary)).
 //!
 //! `bs_init_writable` followed by a `bs_create_bin` whose first segment is a
 //! `private_append` of the accumulator itself and whose remaining segments are

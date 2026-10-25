@@ -285,7 +285,113 @@ The `sys` column is the same session's oracle-leg median and the per-leg medians
 - `cowboy_bstr:capitalize_token/3` — **3 of 3** builds lower (`x accumulators = 1`, `y accumulators = 2`, `const-bytes fields = 1`), `declined = 0`, `deopts = 0` of the 3 visited instances.
 - `cowboy_bstr:to_lower/1`'s `-to_lower/1-` comprehension loop — **1 of 1** build lowers, with the **`Y`-slot** accumulator, `deopts = 0`.
 - `emqx_base62:decode/2` — **2 of 6** visited instances lower, both **bit-granular** (`bit-granular = 2`, `aligned = 0`), `declined = 4`, `deopts = 0`.
-- `emqx_base62:encode/2` — **0 of 3**: all three are `binary all` accumulator builds, which stay on the family; `deopts = 0`.
+- `emqx_base62:encode/2` — all three are `binary all` accumulator builds, which the route (c) door `jit_append_binary_all` now lowers; the loaded artifact still records `deopt_count[BsCreateBin] = 4.00/call` and `step_one_per_call = 5.00`, so part of the kernel's instances still take the tier→family transition (see the share tables above).
+
+### The create arm's helper symbols, per kernel (self-time shares)
+Protocol, shared by the after column and the before column: the native baseline tier alone (`BENCH_TIER=baseline BEAM_RT_TIER=baseline`), release, `BENCH_ITERS=3000000`, `taskset -c 3`, `perf record -g -F 2000 -e cpu_core/cycles/u` around one `bench::foreign::foreign_{cowboy_bstr,emqx_base62}_decomposition` test binary (`--ignored --nocapture`), **two legs per kernel** (a / b) so a row that moves together with every other row is load rather than code, the kernel's own timed phase isolated with `perf report -i <data> --time <t0>,<t1> --no-children -g none --stdio` from the `workload = …` timestamps the harness prints, self time, 8–16 K samples per kernel.
+`perf record --clockid CLOCK_MONOTONIC` is required for that slicing — with the default clock the samples sit ~50 s off wall time and `--time` selects nothing.
+`/proc/loadavg` (1-min) recorded immediately before and after every leg: cowboy-a **24.55 → 19.55**, cowboy-b **19.55 → 27.42**, emqx-a **27.42 → 17.06**, emqx-b **17.06 → 10.74**, with the 15-min average drifting 16.5 → 16.0 across the session, so the host was shared throughout.
+The harness' `min_ns_per_call` on these legs reads **1342.1 / 1388.8 ns** (`to_lower`), **1420.4 / 1543.1** (`capitalize_token`), **1698.1 / 1615.7** (`encode`) and **2655.4 / 2611.4** (`decode`), higher than earlier sessions', so no cross-session absolute is comparable and only the **shares** below are.
+The **before** column is the pre-change tree's shares under exactly this protocol, quoted as measured then and **not** re-measured here; several other levers (the `bs_get_utf8`/`bs_get_utf16`/`bs_skip_utf8` shapes) landed between the two trees, so a moved share is the two trees' difference, not one commit's.
+`call_registered` and `step_instruction_inner` **do not exist in this harness' binary** (its context is `CountingContext`, and `step_instruction_inner` is inlined away at this HEAD), so those two published rows are answered by the reachable `Machine::exec_bif` + `ExecutionContext::call_bif` and `step_instruction_with_entry` + `step_instruction_body` rows.
+
+**`cowboy_bstr:to_lower/1`** (one `Y`-slot accumulator, absent → `declined = 0`):
+
+| symbol | before | after (a / b) |
+|---|---|---|
+| `[JIT]` DSO, all blocks | — | 27.29 / 27.42 |
+| `jit_open_append_bin_y` | **6.16** | **absent** (0.00) |
+| `jit_append_cursor` | — | **1.32 / 1.02** |
+| `jit_append_binary_all` / `jit_write_bit_field` / `jit_open_append_bin_any*` | — | 0.00 / 0.00 / 0.00 |
+| `enter_in_block` | — | 16.80 / 17.59 |
+| `families::dispatch` | — | 0.22 / 0.17 |
+| `bitstrings::exec` / `create::exec` | — | 0.29 / 0.28 |
+| `BitWriter::push_bits_from` / `raw::copy_bytes` | — | 0.00 / 0.00 |
+| `memmove` | — | 0.04 / 0.01 |
+| `alloc_words_rooted` | — | 0.07 / 0.08 |
+| `step_instruction_with_entry` / `_body` | — | 0.28 / 0.76 |
+| `jit_step_one` | — | 0.11 / 0.08 |
+
+Top-5: `enter_in_block` 16.80, `jit_publish_y` 6.82, `CompiledModule::function` 5.47, `call_store_impl` 5.28, `jit_allocate` 4.31.
+**It moved, and the profile explains it as a substitution rather than a disappearance:** the deleted `jit_open_append_bin_y` (6.16 %) is gone from the binary and the aligned route's whole door is now the in-block shape proof plus **`jit_append_cursor` 1.32 / 1.02 %**, while the residual is the per-instruction baseline machinery (`enter_in_block` ~17 %, `jit_publish_y` ~6 %, `call_store_impl` ~5 %, `CompiledModule::function` ~5.5 %, `jit_allocate` ~4.5 %, atom-hash `get` 2.85 %) and the family rows are ~0.3 % because this kernel lowers.
+
+**`cowboy_bstr:capitalize_token/1`** (three builds per call, `declined = 0`):
+
+| symbol | before | after (a / b) |
+|---|---|---|
+| `[JIT]` DSO, all blocks | — | 34.37 / 34.08 |
+| `jit_open_append_bin_y` | **5.55** | **absent** (0.00) |
+| `jit_open_append_bin` | **0.54** | **absent** (0.00) |
+| `jit_append_cursor` | — | **1.18 / 1.39** |
+| `jit_append_binary_all` / `jit_write_bit_field` / `jit_open_append_bin_any*` | — | 0.00 / 0.00 / 0.00 |
+| `enter_in_block` | — | 13.30 / 13.79 |
+| `families::dispatch` | — | 0.13 / 0.11 |
+| `bitstrings::exec` / `create::exec` | — | 0.25 / 0.17 |
+| `BitWriter::push_bits_from` / `raw::copy_bytes` | — | 0.00 / 0.00 |
+| `memmove` | — | 0.07 / 0.01 |
+| `alloc_words_rooted` | — | 0.07 / 0.06 |
+| `step_instruction_with_entry` / `_body` | — | 0.30 / 1.14 |
+| `jit_step_one` | — | 0.10 / 0.10 |
+
+Top-5: `enter_in_block` 13.30, `CompiledModule::function` 6.17, `jit_publish_y` 5.22, `jit_allocate` 4.86, `call_store_impl` 4.04.
+**It moved the same way and for the same reason:** both retired door symbols (`jit_open_append_bin_y` 5.55 % + `jit_open_append_bin` 0.54 %) are gone and all three builds now pay the inline proof plus **`jit_append_cursor` 1.18 / 1.39 %**, so the remaining ~13–14 % `enter_in_block`, ~5–6 % `jit_publish_y`/`CompiledModule::function` and ~4–5 % `jit_allocate`/`call_store_impl` are the tier's per-instruction machinery, not the create arm.
+
+**`emqx_base62:decode/2`** (bit-granular; `2 of 6` visited instances lower, `declined = 4`):
+
+| symbol | before | after (a / b) |
+|---|---|---|
+| `[JIT]` DSO, all blocks | — | 12.78 / 12.67 |
+| `jit_write_bit_field` | **6.09** | **absent** (0.00) |
+| `jit_open_append_bin_any_y` | 1.06 | **1.47 / 1.28** |
+| `jit_append_cursor` / `jit_append_binary_all` | — | 0.00 / 0.00 |
+| `bitstrings::exec` | 5.64 | **2.87 / 2.67** |
+| `bitstrings::create::exec` (+ `{closure#0}`) | — | 6.19 / 2.55 (a), 6.21 / 2.43 (b) |
+| `create::prepared::assemble_prepared` | — | 3.84 / 3.55 |
+| `matching::exec_other` / `jit_bitstr` | — | 3.76 / 1.70 (a), 4.14 / 1.70 (b) |
+| `step_instruction_inner` → `_with_entry` / `_body` | 8.93 | 2.72 / 6.09 (a), 3.00 / 6.31 (b) |
+| `call_registered` → `Machine::exec_bif` + `ExecutionContext::call_bif` | 6.72 | 2.82 + 4.80 (a), 2.78 + 4.64 (b) |
+| `alloc_words_rooted` | 5.38 | **0.60 / 0.65** |
+| `families::dispatch` | — | 1.56 / 1.43 |
+| `enter_in_block` | — | 3.65 / 3.87 |
+| `jit_step_one` | — | 1.10 / 1.14 |
+| `memmove` / `raw::copy_bytes` | — | 0.18 / 0.00 |
+
+Top-5: `create::exec` 6.19, `step_instruction_body` 6.09, `ExecutionContext::call_bif` 4.80, `jit_refresh_y` 4.66, `assemble_prepared` 3.84.
+**It moved and the profile explains it as the per-field helper's removal plus a routing shift:** `jit_write_bit_field` (6.09 %) is **absent** — the ≤57-bit plans write their field bytes as in-block straight-line stores behind the single door — the door itself is the unchanged `jit_open_append_bin_any_y` (1.47 / 1.28 %, against 1.06 % before), and the four declined instances keep the family on the path (`create::exec` 6.19 + `{closure#0}` 2.55 + `assemble_prepared` 3.84 + `exec_other` 3.76 + `jit_bitstr` 1.70), with this kernel's `erlang:bit_size/1` (48 M calls) showing as `exec_bif` 2.82 + `call_bif` 4.80.
+
+**`emqx_base62:encode/2`** (a `binary all` accumulator build):
+
+| symbol | before | after (a / b) |
+|---|---|---|
+| `[JIT]` DSO, all blocks | — | 10.59 / 10.02 |
+| `jit_append_binary_all` | — | **1.14 / 1.23** |
+| `jit_append_cursor` / `jit_write_bit_field` / `jit_open_append_bin_any*` | — | 0.00 / 0.00 / 0.00 |
+| `families::dispatch` | 4.50 | **6.78 / 7.51** |
+| `bitstrings::create::exec` | 2.06 (`{closure#0}`) | 2.11 / 2.24 (+ `{closure#0}` 0.96 / 1.16) |
+| `bitstrings::exec` | 3.00 | **1.19 / 1.14** |
+| `BitWriter::push_bits_from` | 0.42 | 0.46 / 0.63 |
+| `memmove` (`__memmove_avx_unaligned_erms`) | 1.49 | 1.08 / 1.07 |
+| `raw::copy_bytes` | absent | absent (0.00) |
+| `create::prepared::assemble_prepared` | — | 3.76 / 3.23 |
+| `step_instruction_with_entry` / `_body` | — | 0.89 / 2.24 (a), 0.91 / 2.11 (b) |
+| `alloc_words_rooted` | — | 0.30 / 0.40 |
+| `enter_in_block` | — | 5.81 / 6.66 |
+| `jit_step_one` | — | 0.43 / 0.30 |
+| `jit_family` / `jit_ext_call` | — | 3.39 / 1.69 (a), 3.38 / 1.33 (b) |
+
+Top-5: `families::dispatch` 6.78, atom-hash `HashMap<Arc<str>,Atom>::get` 6.31, `enter_in_block` 5.81, `CompiledModule::function` 4.09, `assemble_prepared` 3.76.
+**It did not move in the append-door sense and the profile says why:** this kernel had no append-door symbol before and has only the **new** `jit_append_binary_all` 1.14 / 1.23 % now, because the `binary all` tail is a native door here while the loaded artifact still reports `deopt_count[BsCreateBin] = 4.00/call` and `step_one_per_call = 5.00` — i.e. part of the kernel's `BsCreateBin` instances still take the tier→family transition, so `families::dispatch` reads **6.78 / 7.51 %** (4.50 % before) rather than shrinking.
+Its `memmove` share (1.49 → 1.08 %) is the byte copy that door still performs, and `push_bits_from`/`flatten_iolist` (3.15 / 3.33) are the harness' own iolist flattening, outside the tier.
+
+**Helper calls a `bs_create_bin` build still pays per instruction** (from the emitter, `../emit/bitstr_inline/`):
+- The **aligned** route pays **exactly one** positioned `jit_append_cursor` call (`create::create_door::emit_append_cursor`): the accumulator's five `ErlSubBits`/`BinRef` words are proved in-block as refusal-only branches, and the one call is the machine-private `&Machine` byte-cursor query.
+- The **bit-granular** route pays **one** positioned `jit_open_append_bin_any` (x-register accumulator) or `jit_open_append_bin_any_y` (`Y`-slot accumulator) call, and then **no per-field call** whenever every field of the plan is at most `MAX_INLINE_FIELD_BITS` (57) bits (`create_field::emit_bit_field_store`).
+- A bit-granular plan with **any field wider than 57 bits** keeps one `jit_write_bit_field` call per field (`create::emit_bit_fields`'s else arm); that helper remains defined and reachable only from there.
+- The **`binary all` tail** pays **one** positioned `jit_append_binary_all` call (`create::create_binary::emit_binary_all`), which performs both the copy and the build's single window-end commit.
+- `jit_open_append_bin` and `jit_open_append_bin_y` **no longer exist**: they have no definition and no call site in any `.rs` file — the aligned route's inline proof replaced them, and their names survive only in prose (`../inlineset/CONTEXT.md`, which still describes two routes and still names both).
+- No route emits a call for a **field** on the aligned route (straight-line stores) or an **in-block commit** (the window end is one store, or folded into `jit_append_binary_all`).
+
+The caveat that governs every row above: the host is shared, so the **load-normalised wall rows in `../../../../tools/bench/RESULTS.md` are the canonical cross-runtime figures** and only these self-time **shares** are comparable across legs — never the absolute ns, and never a share across the two trees without the other rows moving with it if the load did.
 
 ## See Also
 - `../CONTEXT.md` → the tier contract (the two artifact layouts, the block ABI, the driver loop, the routing table).
