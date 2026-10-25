@@ -197,7 +197,7 @@ The **crate root keeps only the summary** (`../CONTEXT.md` › *The inet write p
 - **The C `ram_file_drv` answers its two reply families through two different output calls.** `OK`/`ERROR`/`NUMBER` go through `driver_output2` (a plain byte list) while `DATA` goes through `driver_output_binary` (an improper `[header | binary]` iolist on a `[binary]` port), so an oracle probe that reads the raw port message must normalise with `binary_to_list(iolist_to_binary(D))` before comparing — and `io:format("~p", [D])` on the raw term raises. This crate keeps that split: `RamReply { header, body }` is delivered through [`DriverContext::deliver_read`](crate::DriverContext::deliver_read), so `OK`/`ERROR`/`NUMBER` are header-only (`body: None`) and a `DATA` reply is the 5-byte `[RESP_DATA, len:i32be]` header plus `Some(payload)` — an empty payload included (`Some(vec![])`, the C's `driver_output_binary(port, hdr, 5, bin, 0, 0)`).
 - **`ram_file_drv` is a registered built-in with a live runtime path.** `DriverRegistry::with_builtins()`
   (in `../driver.rs`) registers `"fd"`/`"efile"`/`"tcp_inet"`/`"udp_inet"`/`"ram_file_drv"`, and
-  `beam_rt` opens a port on it through `open_port({spawn_driver,"ram_file_drv"}, …)` (its
+  `beam_rt` opens a port on it through `open_port({spawn_driver,"ram_file_drv"}, …)` (`beam_rt`'s
   `src/port/ram_file_matrix_tests.rs` cross-checks this driver's whole command/reply matrix against the
   live oracle). The port's reserved `"close"` is the teardown op for a raw `open_port` port; the
   driver's own `"close"` verb exists for a direct caller (it resets the file and answers the C's `OK`),
