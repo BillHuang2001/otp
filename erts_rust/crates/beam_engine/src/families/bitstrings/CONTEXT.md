@@ -261,6 +261,72 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   execution entries (`Machine::run_label` / `Machine::run_export`) over synthetic
   `beam_loader::Module`s + a `MinimalContext`, plus a live `erlc`/`erl` oracle
   cross-check compiled from an inline source string at test time.
+  - `seam.rs` → the **construction seam** a native lowering of `bs_create_bin` codes
+    against (`pub(crate)`, so `src/jit/**` reaches it as
+    `crate::families::bitstrings::create::seam`; `create/mod.rs` declares it
+    `#[allow(dead_code)]` because nothing in a plain `--lib` build refers to it yet):
+    `append_plan` (static decidability → `AppendPlan`), the two run-time doors
+    `open_append`/`open_append_any`, and the family's single bit-granular write
+    `write_bit_field`. Contract below.
+  - `seam_tests.rs` → `#[cfg(test)]` the seam's accept and decline sets, the two doors'
+    run-time answers (including the unit gate), the word-identity/no-growth pin, and the
+    bit-granular write's byte-for-byte agreement with the family's own `BitWriter` at every
+    width in `1..=64` plus eleven `erl`-oracle cases.
+
+## The construction seam (`create/seam.rs`)
+
+The one family-private surface a native `bs_create_bin` lowering reads: the shape rules stay
+in the family, the emission rules stay in the tier.
+- `pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<AppendPlan>`
+  — pure, takes no `Machine`.
+  `pub(crate) struct AppendPlan { pub source: Operand, pub fields: Vec<Field>, pub tail_bits: u32, pub unit: usize }`
+  and `pub(crate) enum Field { Bits { value: Operand, bits: u32 }, Bytes { bytes: Vec<u8> } }`.
+- **Accepted shape:** a first `private_append` of the accumulator, then any mix of
+  constant-width unsigned big-endian `integer` fields with `bits` in **`1..=64`** (a
+  bit-granular width is plannable; no `little`/`signed`/`native` flag) and `string`
+  constants, with `unit` in `1|2|4|8`.
+  Every operand must be a **locatable register** — `Operand::X`/`Operand::Y`, and the
+  compiler's `Operand::Typed { reg: Reg::X(_) | Reg::Y(_), .. }` spelling.
+  `locatable_operand` is a pure operand classification with no `Machine`; **the tier owns
+  the Y frame-window guard.**
+- **Still declined:** a literal-area value or accumulator operand, a `binary`/`binary all`
+  segment, a `float`/UTF segment, a bignum-sized or `dynamic` width, a
+  signed/little/native field, and a first segment that is not a `private_append`.
+- `pub(crate) fn open_append(machine: &Machine, src: Eterm, tail_bits: u32) -> Option<(usize, usize)>`
+  — the **byte-aligned** door: `(payload base, window end)` when the accumulator is a
+  writable payload this machine owns, the window ends on a **byte** boundary and the
+  payload holds `tail_bits` more bits.
+  A tier that addresses fields as `cursor + byte_offset` uses this one.
+- `pub(crate) fn open_append_any(machine: &Machine, src: Eterm, tail_bits: u32, unit: usize) -> Option<(usize, usize)>`
+  — the **general** door for a plan carrying any bit-granular field: any alignment, gated on
+  C's append-**position** unit rule instead (`append_unit_allows`,
+  `erts_bs_append_checked`, `erl_bits.c:1778-1784`): `unit <= 1` is ungated, `unit == 8`
+  requires `end % 8 == 0`, any other `unit` requires `end % unit == 0`.
+  That is the same test the family applies to `src_bits % unit` at `start == 0`, so a shape
+  the family raises `badarg` on is never reported writable.
+- `pub(crate) fn write_bit_field(base: usize, start_bit: usize, cur_bit: usize, value: u64, nbits: u32)`
+  — the family's one bit-granular write rule: the low `nbits` bits of `value` **MSB-first**,
+  an entered payload byte cleared first, the window-end byte masked, each bit OR-ed in at
+  `7 - cur_bit % 8`; re-execution idempotent, `nbits <= 64`.
+  `value` is a **small** integer's `small_value(word) as u64` (sign-extended, so a negative
+  value's low `nbits` bits are its two's complement); a **bignum** field is the tier's own
+  refusal, because the family routes one through `BitWriter::push_wide_int`'s byte model,
+  which the `u64` door does not model.
+  Its body is `raw::write_bit_field`, which shares `raw::write_payload_bit` with
+  `raw::InPlace::push_bit`, so the seam's field write and the family's own writer cannot
+  disagree about a byte.
+  Every bit in `[cur_bit, cur_bit + nbits)` must already be inside the payload's capacity —
+  that is the door's `tail_bits` room check, which is why the door is consulted for the whole
+  plan before the first write.
+- A run-time door allocates nothing, mutates nothing and is safe to call speculatively;
+  `None` is the universal fallback signal (run the family helper).
+- **A `binary all` segment is deliberately not plannable.** Its width is a run-time bit
+  count, so it fixes no static offset for itself or for any later field — the entire product
+  of `append_plan` — and the only possible lowering is a run-time-length copy, which is
+  exactly what the family already does (`BitWriter::push_bits_from` → `push_whole_bytes` →
+  `raw::InPlace::copy_bytes`). The tier's family helper covers that shape; there is no
+  `Field::Binary`.
+  `AppendPlan::tail_bits` therefore stays a plain `u32` rather than an `Option<u32>`.
 
 ## Constraints
 - `#![deny(unsafe_code)]` crate-wide; `raw.rs` is the node's only non-test
