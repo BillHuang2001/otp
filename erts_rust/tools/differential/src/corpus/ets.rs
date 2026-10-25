@@ -37,10 +37,16 @@
 //!   A.1 half of this group); and
 //! * **introspection** — the stable `info/2` items (`size`, `type`, `protection`, `keypos`,
 //!   `name`, `named_table`, `compressed`, `id`-is-a-reference, `memory`-is-an-integer) plus
-//!   `badarg` for an unknown item; and the whole `info/1` item set
+//!   `badarg` for an unknown item; the whole `info/1` item set
 //!   (`ets/info_all_item_keys_and_deterministic_counters`), whose 12 deterministic pairs for a
 //!   fresh 3-object `set` are pinned while the per-VM ones (`id` a reference, `owner` a pid,
-//!   `memory` a byte count) stay relational; and//! * **ownership transfer** — `ets:give_away/3` (the `ets/give_away_*` cases): the new owner
+//!   `memory` a byte count) stay relational; and the `stats` item, pinned by its **shape**
+//!   plus the two figures that agree by value (`ets/info_stats_*`, see the `stats` section
+//!   below);
+//! * **slot navigation** — the `slot/2` domain
+//!   (`ets/slot_domain_is_a_fixed_slot_space_not_the_object_count`), whose count and contents
+//!   are the interior's own (see the `slot/2` section below);
+//! * **ownership transfer** — `ets:give_away/3` (the `ets/give_away_*` cases): the new owner
 //!   really receives the `{'ETS-TRANSFER', Tab, From, Gift}` transfer message, so the gift
 //!   *data* reaches it, and the message body's shape is pinned with the per-VM `Tab`/`From`
 //!   reduced to their types.
@@ -61,40 +67,42 @@
 //! split out of this file by responsibility (see that module's docs for the query surface and
 //! the two continuation/match-spec subtleties it pins).
 //!
-//! The `ets:*` BIFs still outside the runtime's served surface — `slot/2`,
-//! `select_reverse/1,2,3`, `is_compiled_ms/1`, `internal_delete_all/2` — raise a plain
-//! `error:undef`, an *observation* rather than a capability-gap signal, so a case for them
-//! would be a `mismatch` and none is pinned. **Handoff to the runtime nodes** (`beam_bifs` /
-//! `beam_ets`).
+//! # `ets:info(T, stats)` — shape, and the two figures that are the contract
 //!
-//! # `ets:info(T, stats)` is a **capability gap**, not an observation
+//! `stats` is served. For a hash table (`set`/`bag`/`duplicate_bag`) the answer is the 8-tuple
+//! `{Nactive, AvgChainLen, StdDevChainLen, StdDevExpected, MinChainLen, MaxChainLen,
+//! KeptItems, NLocks}`; for an `ordered_set` **without** an effective write concurrency it is
+//! the bare atom `false`, at every size, and a fine-locked one answers a 3-tuple
+//! `{RouteNodes, BaseNodes, MaxDepth}`. Only `KeptItems` and `NLocks` agree with the oracle
+//! **by value**: the bucket/chain figures describe ERTS's chained hash while this runtime's
+//! `set` is a CHAMP tree, and the 3-tuple's node/depth figures describe this runtime's own
+//! B+-tree. A case therefore pins the *shape* plus those two figures
+//! (`ets/info_stats_shape_and_the_two_agreeing_figures`,
+//! `ets/info_stats_kept_items_counts_objects_missed_by_a_fixed_table`,
+//! `ets/info_stats_a_plain_ordered_set_is_false`).
 //!
-//! The one `info/2` item that cannot be pinned at all is `stats`: the oracle answers it with an
-//! 8-element tuple of hash-table figures — `{256,0.01171875,0.13926206529140472,
-//! 0.10804153978824615,0,2,0,1}` for a fresh `set` with 3 objects (identical on every VM start,
-//! and for `bag`/`duplicate_bag`) and the atom `false` for an `ordered_set` — while the Rust
-//! runtime answers `ets:info(T, stats)` with its typed capability gap (`beam_rt: unsupported:
-//! bif`, exit `3`; served as `Err(unsupported_bif())` in `crates/beam_bifs/src/ets.rs`). A case
-//! pinning it would therefore be an `unsupported` verdict, i.e. an unauthorized gap in the
-//! ratchet, so **no** case is pinned — the closest *served* observation is the whole `info/1`
-//! item set, pinned by `ets/info_all_item_keys_and_deterministic_counters`. The gap is a handoff
-//! to the runtime nodes (`beam_bifs` / `beam_ets`): the interior's chain/tree statistics.
+//! `KeptItems` counts the objects a **fixed** table (`ets:safe_fixtable(T, true)`) still holds
+//! although they are out of the index — ERTS's pseudo-deleted `DbTerm`s — and returns to `0`
+//! once the table is unfixed. `NLocks` is the lock count of the effective
+//! `{write_concurrency, …}` mode, oracle-measured (`erl_db_hash.c:1028-1058`): `off` ⇒ `1`;
+//! `true`/`auto`/`4`/`100` ⇒ `64`; `128` ⇒ `128`; `1000` ⇒ `512`; `32768` ⇒ `32768`.
 //!
-//! # Other verified divergences found while authoring — deliberately NOT pinned
+//! # `ets:slot/2` — the slot space is the interior's own
 //!
-//! Each produces a *plain Erlang value/reason* (not a capability-gap signal), so a case would
-//! be a `mismatch`; they are handoffs to the runtime nodes and are recorded here instead:
+//! `slot/2` is served, and its **domain** is the interior's: ERTS's `set` answers 256 slots
+//! (`[]` below the count, `'$end_of_table'` at it, `badarg` past it) while this runtime's
+//! CHAMP interior has its own root-slot count, and the chained buckets and the K-ary B+-tree
+//! their own. The count and the contents are therefore **ours**: a case pins the list-ness of
+//! every in-range answer, the single `'$end_of_table'` terminator, the `badarg` past it and
+//! for a negative / float / atom / bignum slot, and that the slots **partition**
+//! `tab2list/1` — never ERTS's 256
+//! (`ets/slot_domain_is_a_fixed_slot_space_not_the_object_count`).
 //!
-//! * **`named_table` lookup by name** — `ets:new(ets_tab,[named_table,set])` then
-//!   `ets:lookup(ets_tab, a)` is `[{a,1}]` in the oracle but `badarg` in the Rust runtime
-//!   (the name registry is not consulted).
-//! * **`ets:info/1,2` on a deleted table** — `ets:delete(T), ets:info(T)` is `undefined` in the
-//!   oracle but `badarg` in the Rust runtime.
-//! * **`ets:info(T, owner)`** — the oracle returns a pid, the Rust runtime a non-pid
-//!   (`is_pid(ets:info(T, owner))` is `true` vs `false`).
-//! * **`ets:first/last` on a key-less table**: covered above by the `'$end_of_table'` cases; the
-//!   `next/2`/`prev/2` forms raise `badarg` for an absent key in **both** runtimes (agreement),
-//!   so only the present-key walks are pinned.
+//! # Key-less navigation
+//!
+//! `ets:first/last` on a key-less table are covered by the `'$end_of_table'` cases; the
+//! `next/2`/`prev/2` forms raise `badarg` for an absent key in **both** runtimes
+//! (agreement), so only the present-key walks are pinned.
 //!
 //! **Never edit this file from a context tree that has not rebuilt `differential`**: the corpus
 //! is compiled into the tool, so a golden change only takes effect after a rebuild.
@@ -727,12 +735,12 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
-        // The whole `info/1` item set. `ets:info(T, stats)` itself is the runtime's typed
-        // capability gap (see the module docs), so this is the *served* table-metadata
-        // observation: the sorted item **keys**, the twelve `{Item, Value}` pairs that are
-        // deterministic for a fixed table content (a fresh `set` holding 3 objects), and the
-        // per-VM values asserted only by their **type** — `memory` is a byte count, `id` a
-        // reference and `owner` a pid, never an exact figure.
+        // The whole `info/1` item set: the sorted item **keys**, the twelve `{Item, Value}`
+        // pairs that are deterministic for a fixed table content (a fresh `set` holding 3
+        // objects), and the per-VM values asserted only by their **type** — `memory` is a byte
+        // count, `id` a reference and `owner` a pid, never an exact figure.
+        // (`info/1` carries no `stats` item; that one is an `info/2` selector, pinned by the
+        // `ets/info_stats_*` cases below.)
         //
         // `Picked` is `lists:sort`ed because `info/1`'s item order is an implementation detail
         // (both runtimes happen to agree on it, but it is not part of the contract).
@@ -1139,6 +1147,149 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- `ets:info(T, stats)` (the shape plus the two agreeing figures) ---
+        //
+        // The 8-tuple is `{Nactive, AvgChainLen, StdDevChainLen, StdDevExpected, MinChainLen,
+        // MaxChainLen, KeptItems, NLocks}` (the C's `TUPLE8`, `erl_db.c:5585-5629`). Elements
+        // 1-6 measure the **oracle's** bucket-chained hash (this runtime's `set` is a CHAMP
+        // tree), so only the shape and elements 7/8 — `KeptItems` and `NLocks`, which agree by
+        // value — are pinned. The measured oracle line for this fixture is
+        // `{256,0.01953125,0.18647997081279755,0.13948102295398712,0,2,0,1}`: a 5-object plain
+        // `set` has `kept_items` 0 (nothing is retained: the table is not fixed) and `nlocks` 1
+        // (no write concurrency).
+        Case {
+            id: "ets/info_stats_shape_and_the_two_agreeing_figures",
+            description: "info/2 stats on a plain set is the 8-tuple whose kept_items/nlocks figures agree by value while the chain figures stay the interior's",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_info_stats, [set]), \
+                       ets:insert(T, [{a,1},{b,2},{c,3},{d,4},{e,5}]), \
+                       X = ets:info(T, stats), \
+                       {is_tuple(X), tuple_size(X), element(7,X), element(8,X)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,8,0,1}"),
+                exit_code: 0,
+            },
+        },
+        // `KeptItems` counts the objects a **fixed** table still holds although they are no
+        // longer in the index — ERTS's pseudo-deleted `DbTerm`s, which
+        // `db_calc_stats_hash` counts per bucket (`erl_db_hash.c:4096`), and this crate's
+        // `Table::deferred_objects`. So one of five objects deleted while
+        // `ets:safe_fixtable(T, true)` is in force reads `kept_items` 1, and unfixing the
+        // table releases it back to 0. `NLocks` is the modelled lock count of the effective
+        // `{write_concurrency, …}` mode: `{debug_hash_fixed_number_of_locks, 1024}` fixes it at
+        // the oracle's 1024, which both sides answer. `Nactive` (the oracle's 2304 here) is the
+        // interior's bucket count and is never pinned.
+        Case {
+            id: "ets/info_stats_kept_items_counts_objects_missed_by_a_fixed_table",
+            description: "info/2 stats counts the objects a fixed table retains after a delete (kept_items 1, released to 0 on unfix) and reports the fixed 1024-lock count",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_info_stats_fixed, \
+                       [set, {write_concurrency, {debug_hash_fixed_number_of_locks, 1024}}]), \
+                       ets:insert(T, [{a,1},{b,2},{c,3},{d,4},{e,5}]), \
+                       ets:safe_fixtable(T, true), ets:delete(T, a), \
+                       X = ets:info(T, stats), \
+                       ets:safe_fixtable(T, false), Y = ets:info(T, stats), \
+                       {is_tuple(X), tuple_size(X), element(7,X), element(8,X), \
+                        is_tuple(Y), element(7,Y), element(8,Y)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,8,1,1024,true,0,1024}"),
+                exit_code: 0,
+            },
+        },
+        // An `ordered_set` without an effective write concurrency has no hash interior to
+        // measure, so `stats` is the bare atom `false` at **every** size (the C's `else ret =
+        // am_false` arm) — an empty, a 3-object, a grown and a shrunk table all answer it. With
+        // an effective fine locking the oracle builds a **catree** and answers a 3-tuple of
+        // node/depth figures; this runtime's B+-tree fills the same 3-element shape with its own
+        // figures, so only the tuple's arity is pinned.
+        Case {
+            id: "ets/info_stats_a_plain_ordered_set_is_false",
+            description: "info/2 stats is the atom false at every size for an ordered_set without write concurrency, and a 3-tuple (shape only) once fine locking makes it a catree",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin E = ets:new(ets_stats_os_empty, [ordered_set]), \
+                       Empty = ets:info(E, stats), \
+                       ets:insert(E, [{a,1},{b,2},{c,3}]), Small = ets:info(E, stats), \
+                       ets:insert(E, [{d,4}]), Grown = ets:info(E, stats), \
+                       ets:delete(E, a), Shrunk = ets:info(E, stats), \
+                       W = ets:new(ets_stats_os_wc, [ordered_set, {write_concurrency, true}]), \
+                       ets:insert(W, [{a,1},{b,2}]), WStats = ets:info(W, stats), \
+                       {Empty, Small, Grown, Shrunk, is_tuple(WStats), tuple_size(WStats)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {false,false,false,false,true,3}"),
+                exit_code: 0,
+            },
+        },
+        // --- `ets:slot/2` (the slot space is the interior's, not the object count) ---
+        //
+        // The oracle's domain is 256 slots for a `set` (`[]` below the count, `'$end_of_table'`
+        // at it, `badarg` past it) while this runtime's CHAMP interior has its own root-slot
+        // count — and the chained buckets and the K-ary B+-tree theirs. The slot **count** and
+        // the slot **contents** are therefore the interior's own, so nothing here names them:
+        // the walk discovers the boundary and pins only the invariants that hold for every
+        // interior — every in-range answer is a list, exactly one `'$end_of_table'` terminates
+        // the walk, the slot past it is `badarg`, a negative/float/atom/bignum slot is `badarg`,
+        // and the slots **partition** `tab2list/1` (their concatenation is exactly the table's
+        // objects). An `ordered_set` is the one interior whose domain is fully specified: one
+        // single-object slot per object, so the boundary is `ets:info(T, size)`.
+        //
+        // The boundary is discovered with an old-style `catch` (never a pinned index) because it
+        // is where the two runtimes differ by design. Each fun binds its own pattern variables —
+        // re-using a name bound in an earlier fun body makes the oracle's `erl_eval` fail
+        // silently, which would look like a runtime crash.
+        Case {
+            id: "ets/slot_domain_is_a_fixed_slot_space_not_the_object_count",
+            description: "ets:slot/2 answers a list per in-range slot, one '$end_of_table' boundary with badarg past it, a badarg for a negative/float/atom/bignum slot, and slots that partition tab2list/1 — the slot count itself is the interior's own",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_slot_set, [set]), ets:insert(T, [{a,1}]), \
+                       Scan = fun F(N, Acc, AllLists) -> \
+                               case catch ets:slot(T, N) of \
+                                 {'EXIT', {SetReason, _SetTrace}} -> \
+                                       {error, SetReason, N, Acc, AllLists}; \
+                                 '$end_of_table' -> {end_of_table, N, Acc, AllLists}; \
+                                 L -> F(N + 1, Acc ++ L, AllLists andalso is_list(L)) \
+                               end end, \
+                       {Tag, N, Objs, AllLists} = Scan(0, [], true), \
+                       Class = fun (S) -> \
+                               case catch ets:slot(T, S) of \
+                                 {'EXIT', {SlotReason, _SlotTrace}} -> SlotReason; \
+                                 OtherSlot -> OtherSlot \
+                               end end, \
+                       O = ets:new(ets_slot_os, [ordered_set]), \
+                       ets:insert(O, [{6,a},{3,b},{4,c},{8,d},{1,e}]), \
+                       OScan = fun G(M, OAcc) -> \
+                               case catch ets:slot(O, M) of \
+                                 {'EXIT', {OsReason, _OsTrace}} -> {error, OsReason, M, OAcc}; \
+                                 '$end_of_table' -> {ordered_end, M, OAcc}; \
+                                 OL -> G(M + 1, [OL | OAcc]) \
+                               end end, \
+                       {OTag, ON, OAcc} = OScan(0, []), \
+                       OSlots = lists:reverse(OAcc), \
+                       {Tag, N > 0, AllLists, lists:sort(Objs) =:= ets:tab2list(T), \
+                        Class(N + 1), Class(-1), Class(1.0), Class(foo), Class(1 bsl 100), \
+                        OTag, ON =:= ets:info(O, size), \
+                        lists:all(fun (OS) -> is_list(OS) andalso length(OS) =:= 1 end, OSlots), \
+                        lists:append(OSlots) =:= ets:tab2list(O)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {end_of_table,true,true,true,badarg,badarg,badarg,badarg,badarg,ordered_end,true,true,true}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1193,8 +1344,8 @@ mod tests {
         assert!(expr.contains("is_integer(element(2, lists:keyfind(memory, 1, Items)))"));
         assert!(expr.contains("is_reference(element(2, lists:keyfind(id, 1, Items)))"));
         assert!(expr.contains("is_pid(element(2, lists:keyfind(owner, 1, Items)))"));
-        // No `stats` selector: that item is the runtime's capability gap (module docs), so
-        // pinning it would make the case `unsupported`, never an agreement.
+        // No `stats` selector: `info/1` has no such item (it is an `info/2` selector, pinned by
+        // the `ets/info_stats_*` cases), so it must not creep into this case's item set.
         assert!(!expr.contains("stats"));
         assert_eq!(case.golden.exit_code, 0);
     }
