@@ -1087,6 +1087,44 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // `bs_match_string` — the compiler's spelling of a **binary literal inside a
+            // match** (`<<"GET ", Rest/binary>>`, `<<"ok\n">>`): the pattern is a
+            // compile-time constant out of the module's string table, so its bytes are
+            // emitted as immediates and the compare is straight-line byte code (see
+            // [`bitstr_inline::match_string`]). Every guard — the match-context guard, the
+            // remaining-window check, the byte-alignment guard, the subject classification
+            // and the readable-bounds guard — runs before the **single** commit of the
+            // context's `start` word, so a `fallback` deopt re-executes the instruction
+            // against an untouched context. A pattern longer than
+            // `match_string::MAX_MATCH_BYTES`, a `NO_FAIL` fail code that raises and an
+            // unresolvable label emit **zero bytes** and take the family's own arm below.
+            //
+            // Like the shapes around it this never terminates the block: the hit path
+            // continues in-block and the fail/fallback paths always transfer control.
+            Instr::BsMatchString {
+                fail,
+                ctx,
+                bits,
+                offset,
+            } => {
+                if !bitstr_inline::try_inline_bs_match_string(
+                    buffer,
+                    labels,
+                    &linker,
+                    module,
+                    *fail,
+                    ctx,
+                    *bits,
+                    *offset,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

@@ -589,6 +589,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
     let mut bs_paths = 0usize;
     let mut bs_match_commands = 0usize;
     let mut create_bin_paths = 0usize;
+    let mut match_string_paths = 0usize;
     for instr in code {
         match instr {
             Instr::Bif { .. } => cmp_bifs += 1,
@@ -616,6 +617,12 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
                 bs_match_commands += commands.len();
             }
             Instr::BsCreateBin { .. } => create_bin_paths += 1,
+            // Every other bitstring-path instruction charges the generic
+            // [`BS_PATH_BYTES`]; `bs_match_string` additionally charges one
+            // [`BS_MATCH_STRING_PATH_BYTES`] because its compare is one emitted
+            // triple per pattern byte, bounded by
+            // `match_string::MAX_MATCH_BYTES`.
+            Instr::BsMatchString { .. } => match_string_paths += 1,
             Instr::BsGetInteger2(_)
             | Instr::BsGetPosition { .. }
             | Instr::BsSetPosition { .. }
@@ -635,6 +642,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + BS_PATH_BYTES * bs_paths
         + BS_MATCH_COMMAND_BYTES * bs_match_commands
         + CREATE_BIN_PATH_BYTES * create_bin_paths
+        + BS_MATCH_STRING_PATH_BYTES * match_string_paths
 }
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
@@ -742,6 +750,16 @@ const BS_MATCH_COMMAND_BYTES: usize = 320;
 /// instruction's own [`INSTRUCTION_BYTES`]. Deliberately loose: under-estimating would turn a
 /// large module into a `SystemLimit` compile error.
 const CREATE_BIN_PATH_BYTES: usize = 16_384;
+/// The code-size budget one `bs_match_string` adds on top of its own
+/// [`INSTRUCTION_BYTES`] (see [`code_capacity_estimate`]).
+///
+/// The compared pattern is emitted as one `movabs`–`movabs`–`cmp`–`jcc` triple per
+/// byte, so the budget is sized on the widest accepted pattern
+/// (`match_string::MAX_MATCH_BYTES` = 64 bytes: 64 × ~26 B ≈ 1.7 KiB) plus the
+/// guards (the context guard, the remaining-window check, the alignment guard, the
+/// subject classification and the bounds guard ≈ 220 B) and the commit. An
+/// under-estimate is a `SystemLimit` compile error, so the slack is deliberate.
+const BS_MATCH_STRING_PATH_BYTES: usize = 2_304;
 
 #[cfg(test)]
 mod tests {

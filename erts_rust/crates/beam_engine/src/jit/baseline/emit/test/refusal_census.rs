@@ -657,7 +657,23 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
         }
         // The remaining `Bs*` variants have no inline arm at all — reported so the corpus
         // view is complete, never silently dropped.
-        Instr::BsMatchString { .. } => BsVerdict::NoArm("bs_match_string"),
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => {
+            const OP: &str = "bs_match_string";
+            if bitstr_inline::match_string_shape(labels, module, *fail, ctx, *bits, *offset)
+                .is_some()
+            {
+                return BsVerdict::Inlined(OP);
+            }
+            let reason = fail_refusal(labels, *fail).unwrap_or_else(|| {
+                "pattern not lowered (offset, length cap or bit width)".to_string()
+            });
+            BsVerdict::Refused(OP, reason)
+        }
         Instr::BsGetTail { .. } => BsVerdict::NoArm("bs_get_tail"),
         Instr::BsGetFloat2(_) => BsVerdict::NoArm("bs_get_float2"),
         Instr::BsGetBinary2(_) => BsVerdict::NoArm("bs_get_binary2"),

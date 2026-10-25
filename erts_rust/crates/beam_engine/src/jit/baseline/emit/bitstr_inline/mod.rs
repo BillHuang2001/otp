@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's native lowerings for the bitstring family: eight **small, safe**
+//! The baseline JIT's native lowerings for the bitstring family: nine **small, safe**
 //! match-context shapes plus the `bs_create_bin` private-append construction shape.
 //!
 //! Every lowering here is allocation-free and raises nothing of its own: the match-context
@@ -68,6 +68,7 @@
 //! * [`start_match`] — `bs_start_match3` + `bs_start_match4`
 //! * [`integer`] — `bs_get_integer2`, and the tier's one width/flag rule
 //! * [`bs_match`] — `bs_match` over a fully static command list
+//! * [`match_string`] — `bs_match_string`
 //! * [`create`] — `bs_create_bin` over the private-append accumulator
 //! * [`tests`] — the in-crate unit suite
 //!
@@ -92,6 +93,7 @@ use super::operands::Loc;
 mod bs_match;
 mod create;
 mod integer;
+mod match_string;
 mod position;
 mod start_match;
 mod tail;
@@ -114,6 +116,8 @@ pub(crate) use integer::{
 };
 #[cfg(test)]
 pub(crate) use integer::field_is_little;
+pub(super) use match_string::try_inline_bs_match_string;
+pub(crate) use match_string::{match_string_shape, MatchStringShape};
 pub(super) use position::{try_inline_bs_get_position, try_inline_bs_set_position};
 pub(crate) use position::{get_position_shape, set_position_shape};
 pub(super) use start_match::{try_inline_bs_start_match3, try_inline_bs_start_match4};
@@ -204,7 +208,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 9;
+pub(crate) const SHAPE_COUNT: usize = 10;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -232,6 +236,9 @@ pub(crate) const SHAPE_BS_MATCH: usize = 7;
 /// The `bs_create_bin` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_CREATE_BIN: usize = 8;
+/// The `bs_match_string` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_BS_MATCH_STRING: usize = 9;
 
 #[cfg(test)]
 thread_local! {
@@ -246,7 +253,7 @@ thread_local! {
 /// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
 /// entries. The two kinds of shape here need that count for different reasons.
 ///
-/// For the **eight match-context shapes** the emission is the only observable there can
+/// For the **nine match-context shapes** the emission is the only observable there can
 /// be: such a shape calls no helper at all, so
 /// [`super::super::bitstr::bitstr_calls`] never moves for it and "the inline arm ran" *is*
 /// the decision to emit.

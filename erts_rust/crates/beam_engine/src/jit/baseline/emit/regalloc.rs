@@ -101,6 +101,7 @@ use super::aggregate::{
 use super::arith::{fast_arith, uses_y};
 use super::bif::bif_shape;
 use super::bitstr_inline::{
+    match_string_shape,
     bs_match_shape, get_integer2_shape, get_position_shape, set_position_shape, skip_bits2_shape,
     start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
 };
@@ -476,7 +477,7 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
-        // The nine bitstring shapes the emitter lowers natively
+        // The ten bitstring shapes the emitter lowers natively
         // ([`super::bitstr_inline`]: the six match-context ones, plus
         // `bs_get_integer2`, `bs_match` and `bs_create_bin`). Each is classified by the
         // **same** shape predicate its `try_inline_*` entry consults — those predicates
@@ -515,6 +516,12 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::BsCreateBin { dst, segments, .. } => {
             CreateBinShape::of(module, dst, segments).is_some()
         }
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => match_string_shape(labels, module, *fail, ctx, *bits, *offset).is_some(),
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
         // call at all, so the label test is the honest classification.)
@@ -751,6 +758,16 @@ pub(crate) fn cacheable_touches(
                 touches.extend(shape.registers());
             }
         }
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => {
+            if let Some((shape, _)) = match_string_shape(labels, module, *fail, ctx, *bits, *offset) {
+                touches.extend(shape.registers());
+            }
+        }
         _ => {}
     }
     touches
@@ -847,7 +864,7 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
                 }
             }
         }
-        // The nine bitstring shapes read the x-registers their own native
+        // The ten bitstring shapes read the x-registers their own native
         // lowering loads (a match context, a subject, a saved position, a field's
         // source, a private-append accumulator) and only when
         // their `*_shape` claims them.
@@ -901,6 +918,16 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
         }
         Instr::BsCreateBin { dst, segments, .. } => {
             if let Some(shape) = CreateBinShape::of(module, dst, segments) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => {
+            if let Some((shape, _)) = match_string_shape(labels, module, *fail, ctx, *bits, *offset) {
                 reads.extend(shape.reads());
             }
         }
@@ -1066,6 +1093,17 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
                 .map(|shape| shape.writes())
                 .unwrap_or_default()
         }
+        // `bs_match_string` binds nothing: its only mutation is the context's `start`
+        // heap word, so its write set is empty (charged anyway, so the four regalloc
+        // mirrors stay one decision — see `MatchStringShape::writes`).
+        Instr::BsMatchString {
+            fail,
+            ctx,
+            bits,
+            offset,
+        } => match_string_shape(labels, module, *fail, ctx, *bits, *offset)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
         // Everything else deopts.
         _ => Vec::new(),
     }
