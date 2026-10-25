@@ -75,7 +75,9 @@
 //! one module image by [`bitstr_tests::with_both_tiers_arg`]'s sibling
 //! [`with_both_tiers_args`]. Nothing here skips.
 
-use beam_loader::{BsGetArgs, Instr, Label, Module, Operand, NO_FAIL};
+use std::cell::Cell;
+
+use beam_loader::{BsGetArgs, Instr, Label, Module, Operand, Reg, NO_FAIL};
 use beam_term::{Atom, Eterm};
 
 use super::bitstr::bitstr_calls;
@@ -202,20 +204,62 @@ fn float_seg(module: &Module, value: Operand, size: i64) -> Vec<Operand> {
     ]
 }
 
+/// The operand count of one `bs_create_bin` segment group — the family's own
+/// `prepared::SEGMENT_OPERANDS` (type atom, `Live`, `Unit`, `Flags`, the value, the size),
+/// mirrored here because that constant is private to the family node.
+const SEGMENT_OPERANDS: usize = 6;
+
+/// How many arguments a segment list needs **beyond** `x(0)`: one per field group whose value
+/// operand — group slot 4 — is an x-register, i.e. for a field whose value is a run-time
+/// term (`integer`, `float`, `binary`). A `string` group's slot 4 is the literal's table
+/// offset, a compile-time constant, so it takes no register — which is exactly why a
+/// `string`-only (or all-zero-length) field list exports `f/1`.
+///
+/// `segments` is the **whole** operand list. The leading group is skipped: it is the
+/// `private_append` accumulator, whose slot 4 names `x(0)`, not an argument.
+fn field_argument_count(segments: &[Operand]) -> u32 {
+    segments
+        .chunks_exact(SEGMENT_OPERANDS)
+        .skip(1)
+        .filter(|group| {
+            matches!(
+                group[4],
+                Operand::X(_) | Operand::Typed { reg: Reg::X(_), .. }
+            )
+        })
+        .count() as u32
+}
+
 /// `bs_init_writable` + one `bs_create_bin` appending `fields` to `x(0)` — the shape every
 /// value row of section A runs.
 ///
-/// `f/(1 + fields.len() + extra_args)`: `x(0)` is the capacity hint `bs_init_writable` reads
-/// (C's `bin_size`, `erl_bits.c:2023`), and `x(1..)` are the field values.
+/// `f/(1 + count)`, where `count` is the number of field groups with an x-register value
+/// operand ([`field_argument_count`]): `x(0)` is the capacity hint `bs_init_writable` reads
+/// (C's `bin_size`, `erl_bits.c:2023`) and each such group's value operand is one more
+/// argument, so `x(1..1 + count)` are the field values. A row whose fields hold no such
+/// group — a `string`-only or empty field list — therefore exports `f/1`, and the same figure
+/// is the instruction's `Live`.
+///
+/// The count is a fact about the assembled segment list, which needs the module's interned
+/// atoms, so it is captured out of the build closure and the function's and the export's
+/// arity are set from it afterwards — `bin_module`'s block decomposition is arity-independent.
 fn accumulator_module(name: &str, strings: &[u8], fields: impl FnOnce(&Module) -> Vec<Operand>) -> Module {
-    bin_module(name, 2, strings, move |module| {
+    let arity = Cell::new(1u32);
+    let counted = &arity;
+    let mut module = bin_module(name, 1, strings, move |module| {
         let mut segments = append_seg(module, Operand::X(0));
         segments.extend(fields(module));
+        counted.set(1 + field_argument_count(&segments));
+        let live = counted.get();
         vec![
             Instr::BsInitWritable,
-            create_bin(Operand::X(0), segments, 2),
+            create_bin(Operand::X(0), segments, live),
         ]
-    })
+    });
+    let arity = arity.get();
+    module.functions[0].arity = arity;
+    module.exports[0].arity = arity;
+    module
 }
 
 /// The module's single `bs_create_bin` operands — the shape predicate's own input.
@@ -682,6 +726,14 @@ fn every_in_scope_construction_shape_stays_native_on_a_cache_free_compile() {
 // ---------------------------------------------------------------------------
 /// **C(1) An empty result.** A `string` field of length zero appends no bytes, so the
 /// accumulator's window commits `end += 0` and the answer is `<<>>`.
+///
+/// The zero-length `string` field is load-bearing, not decoration: the truly **zero-field**
+/// shape (the `private_append` group alone) is deliberately *not* inlinable — `append_plan`
+/// answers `None` for a plan with no fields, because a build that writes nothing has nothing
+/// to emit — so that shape takes the family route. This row pins an empty *result* on the
+/// lowered path, which is why it carries one field whose width is zero (and why the
+/// `static_deopts == 0` assertion below is meaningful). The no-field family route is not
+/// exercised here.
 #[test]
 fn an_empty_result_is_the_empty_binary() {
     let module = accumulator_module("bscb_empty", &[], |module| str_seg(module, 0, 0));
@@ -729,9 +781,11 @@ fn a_zero_length_string_beside_a_real_field_does_not_shift_the_offsets() {
 
 /// **C(3) The widest field: 64 bits, both signs, all eight bytes exactly.**
 ///
-/// The peak logical shift count is `4 + 8 * 7 = 60`, and the top byte of a negative value is
-/// the sign nibble the shift leaves behind — so a shift or mask that is off by one word bit
-/// shows up here and nowhere else.
+/// The peak shift count is `4 + 8 * 7 = 60`, and the top byte of a negative value is what the
+/// **arithmetic** (sign-filling) shift leaves behind — the raw word's bit 63 *is* the small
+/// value's sign bit, so `sar` reproduces `(value as i64 as u64).to_be_bytes()[0]` where a
+/// logical shift's zero fill would write `0F` for `-1`. A shift or mask that is off by one
+/// word bit shows up here and nowhere else.
 #[test]
 fn a_sixty_four_bit_field_writes_all_eight_bytes() {
     let module = accumulator_module("bscb_wide64", &[], |module| {

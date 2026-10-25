@@ -71,10 +71,23 @@
 //! path writes `(value as u64).to_be_bytes()[8 - nbytes..]` and `push_byte_field` writes
 //! the same bytes through `to_be_bytes`. A small int's word is
 //! `((value as u64) << 4) | TAG_IMMED1_SMALL`, so byte `i` (MSB first) is bit
-//! `4 + 8 * (nbytes - 1 - i)` of that word: a **logical** shift and a **byte** store
-//! reproduce it exactly — including a negative value (`<<(-1):8>>` is `0xFF`) and the
-//! truncation of an 8-bit field of `0x1FF` (`push_uint` masks nothing). The shift count
-//! peaks at `4 + 8 * 7 = 60`, inside the immediate's `u8` and below the 64-bit width.
+//! `4 + 8 * (nbytes - 1 - i)` of that word — but the family never hands `push_byte_field`
+//! that word: it hands it `small_value(field) as u64` (the 60-bit two's-complement value
+//! **sign-extended** to the whole 64 bits), so the bytes to reproduce are the sign-extended
+//! value's, not the zero-extended one's.
+//!
+//! The extraction is therefore an **arithmetic** (`sar`) shift right by that count, then a
+//! **byte** store: the raw word's bit 63 *is* the small value's sign bit (its bit 59), so
+//! `sar` fills the vacated high bits with that sign and the stored low byte is byte `i` of
+//! `(value as i64 as u64).to_be_bytes()` — `<<-1:64>>` is `FF`×8, an 8-byte field of the
+//! small `-0x0123_4567_89AB_CDEF` is `FE DC BA 98 76 54 32 11`, `<<-1:16>>` is `FF FF` and
+//! an 8-bit field of `0x1FF` truncates to `FF` (`push_uint` masks nothing).
+//! A **logical** (`shr`) shift would be right only for widths of ≤ 7 bytes: an 8-byte
+//! field's top byte has the shift count `60`, so the zero fill reaches the stored low byte
+//! and `-1` would be written as `0F FF FF FF FF FF FF FF`. For a **non-negative** field the
+//! raw word's bit 63 is 0, so `sar` and `shr` agree byte for byte — which is why the
+//! arithmetic shift is unconditionally the right instruction. The shift count peaks at
+//! `4 + 8 * 7 = 60`, inside the encoding's one-byte immediate and below the 64-bit width.
 //!
 //! # What is declined at compile time
 //!
@@ -415,10 +428,13 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
                     buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(*x))?;
                     touch(highest_touched, *x);
                     // Byte `i` (MSB first) of the big-endian field is word bits
-                    // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs); the shift is
-                    // logical, so a negative value's high bytes are sign-preserved exactly
-                    // as `to_be_bytes` produces them.
-                    buffer.shr_ri(Reg::Rdx, (4 + 8 * (nbytes - 1 - i)) as u8)?;
+                    // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift
+                    // is ARITHMETIC precisely because the caller wants
+                    // `(value as i64 as u64).to_be_bytes()`: the raw word's bit 63 is the
+                    // small value's sign bit, so `sar` sign-extends the 60-bit value to the
+                    // 64 bits `push_byte_field` receives, where a logical shift's zero fill
+                    // would corrupt a negative 8-byte field's top byte (`-1` as `0F FF …`).
+                    buffer.sar_ri(Reg::Rdx, (4 + 8 * (nbytes - 1 - i)) as u32)?;
                     buffer.mov_mr8(Reg::Rax, offset + i as i32, Reg::Rdx)?;
                 }
             }
