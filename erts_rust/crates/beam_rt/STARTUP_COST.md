@@ -188,9 +188,13 @@ The rustdoc and the crate's unit suite carry the band, its two branches and the 
 `+hms` surrogate's −13.5 % … −17 %, which measured a different mechanism (§ the sweep above).
 **Blast radius.** The widened band is `(1 864, 3 000]` — the capacities that `8 × 233` no longer
 covers but the floor does.
-Nothing at or below 1 864 moves: the 233-word nursery floor, 843 (`heap_growth`) and 987
-(`reds_boundary`) all stand, as do `bif_extra/process_info_spawned_exact_item_values`'
+Nothing at or below 1 864 moves: the 233-word nursery floor and `heap_growth`'s two settled
+capacities — 843 on the rows that never take a fullsweep, 987 after one — all stand, as do
+`bif_extra/process_info_spawned_exact_item_values`'
 `{heap_size,233}`/`{total_heap_size,233}`.
+`reds_boundary`'s 2 586-word plateau is above the 1 864-word edge, so it is not one of these: it
+holds on `young_after_collection`'s keeping branch (`young_minor_target_words(1 201) = 1 598` up to
+`8 × 1 598 = 12 784`).
 The two re-derivations the ask named are settled: `src/runner/tests/boundary_cost.rs`'s
 `MEASURED_YOUNG_CAPACITY = 2_585` is still the capacity this tree runs (its row dump reports
 `peak_young_capacity` 2 585, and the row's collection totals beside it are the same measured
