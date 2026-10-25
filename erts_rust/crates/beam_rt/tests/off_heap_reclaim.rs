@@ -32,9 +32,10 @@
 //! flat. The prune closes that loop for the payloads **one** park built: at every slice-boundary
 //! park whose window **published** the machine's root set it walks the process's own roots
 //! (`beam_gc::for_each_reachable_binary_payload`) and releases the handles nothing reaches.
-//! Across **many** parks the retention is not idempotent — the residue keeps one payload per park,
-//! monotonically, up to a payload-count cap — which is the open defect the ladder test pins (see
-//! *Known issue* below).
+//! Across **many** parks the retention is not a residue at all: a park releases the **whole**
+//! reservoir (the census reads `retained_by_live = 0`, `retained_by_shared = 0` and
+//! `binary_alloc` live `0` after every prune), so the peak a loop shows is one pre-emption window
+//! rather than a sum over parks (see *The phase-immune reading* below).
 //!
 //! Only **compiled bitstring code** feeds the reservoir
 //! (`Machine::alloc_refc_binary`/`alloc_refc_binary_with_capacity`, whose callers are
@@ -51,120 +52,126 @@
 //! therefore drives `beam_rt run <file.beam> <m>:<f>/<a> <args…>`, whose result the CLI prints
 //! via `~w~n`.
 //!
-//! # The bound, and why the payload is 4 KiB (measured)
+//! # A fixed-offset reading is a slice phase, never a leak
 //!
-//! The prune runs at a slice boundary, so the observable is a **sawtooth**, not a constant, and a
-//! ladder rung's read follows a completed churn block — i.e. a park — so a rung reports the
-//! **trough**, the post-prune residue, never the in-window peak (the payloads built between two
-//! parks, which nothing here samples).
+//! The reservoir is emptied at a **pre-emption**, so between two parks the figure is exactly the
+//! number of payloads the current slice has built. A reading taken at a fixed iteration offset
+//! therefore samples a fixed point of that cycle — measured on this tree, the `run` route, the
+//! native baseline tier, with the fixture below:
 //!
-//! The trough is what the bound is stated against, and it is measured:
+//! | reading | 1 024-byte payloads | 4 096-byte payloads |
+//! |---|---|---|
+//! | `discard(1 000)` / `discard(10 000)`, one read after the loop | 1 072 / 1 072 | 4 144 / 4 144 |
+//! | `ladder(10 000, 1 000)`, a rung every 1 000 iterations | `[1 072 000, 1 072, 1 073 072, 1 072, …]` | `[4 144, 8 288, …, 41 440]` |
 //!
-//! * with the churn run as **one** block and the figure read **once**, the residue is exactly one
-//!   payload — `discard(N, 4096)` = 4 144 bytes at N = 1 000, 128 000, 500 000 and 1 000 000 — so
-//!   the build-and-discard loop is genuinely closed for a single park;
-//! * with the same iterations split into blocks, the residue keeps **one payload per park** and
-//!   never falls back: rung `k` of the ladder is `k` payloads. That growth is the open defect
-//!   (*Known issue*), not a property of the loop.
+//! The ladder is the phase in its clearest form. A slice of the churn body is ≈999 iterations at
+//! 4 KiB payloads (≈444 at 1 KiB, where the sampler's own `erlang:memory/1` call charges four more
+//! reductions an iteration), so a 1 000-iteration rung is *one* iteration longer than a slice and
+//! the read advances one iteration deeper into the next window at every rung: rung `k` is `k`
+//! payloads, for ever, without the reservoir ever exceeding one slice. **A fixed-offset ladder's
+//! monotonicity is therefore not an assertion** — it is a property of the sampling offset, and the
+//! `1 072 000`-byte rung above is not a leak.
 //!
-//! The payload is 4 KiB because it is far past `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`
-//! (64 bytes, so every iteration really builds an off-heap refc payload) while staying small
-//! enough to keep 1 000 iterations inside one run, and because a retained payload shows up in the
-//! figure as `Bytes + 48` — a payload-shaped block, ~85× the bare 48-byte handle a leak would
-//! otherwise have to be read as.
+//! # The phase-immune reading: the dense envelope, and the bounds derived from it
 //!
-//! The discriminator for the reclamation call site
-//! (`RuntimeRunner::reclaim_off_heap_binaries`) is the pair measured on the same workload with it
-//! disabled and enabled: disabled, `discard(1000)` = 4 144 000 and `discard(10000)` = 41 440 000
-//! bytes — exactly `N × (4096 + 48)`, one payload plus its handle per iteration, linear in N,
-//! with peak RSS following it; enabled, `discard(N)` is 4 144 bytes at every N above. That pair
-//! is what makes a non-flat ladder attributable to the reclamation and not to the loop.
+//! Reading `erlang:memory(binary)` after **every** iteration and folding `{min, max}` removes the
+//! phase: the `min` is the post-park trough, the `max` is one pre-emption window, and the window —
+//! not `N` — bounds both. The fixture's `dense/2` returns `{Min, Max, Trough, Parks}`, where
+//! `Trough` is the largest reading taken immediately after a reading **fell** (the residue a park
+//! leaves behind), `Parks` counts those falls, and `-1` is the sentinel for "no reading ever
+//! fell". Measured (`/proc/loadavg` ≈ 0.6, counters only):
+//!
+//! | shape | N | payload | `{min, max, trough, parks}` |
+//! |---|---|---|---|
+//! | `dense/2` | 2 500 | 1 024 | `{0, 475 968, 1 072, 5}` |
+//! | `dense/2` | 20 000 | 1 024 | `{0, 475 968, 1 072, 45}` |
+//! | `dense/2` | 20 000 | 512 | `{1 040, 924 560, 1 040, 22}` |
+//! | `dense/2` | 20 000 | 2 048 | `{0, 930 624, 2 096, 45}` |
+//! | `dense_hold/3` `ref`, `ets`, `mon` | 20 000 | 1 024 | `{{0, 475 968, 1 072, 45}, true}` |
+//! | `dense/2` under `BEAM_RT_TIER=interpreter` | 20 000 | 1 024 | `{0, 428 800, 1 072, 50}` |
+//!
+//! Three properties follow, and they are the three the guard asserts:
+//!
+//! * the **peak** is one window — 444 iterations × (1 024 + 48) = **475 968 bytes** — the same at
+//!   N = 2 500 and at N = 20 000;
+//! * the **trough** is exactly one payload (1 072 bytes) at every park, never a residue that
+//!   accumulates, because the park releases the whole reservoir;
+//! * the **park count** moves with N (5 → 45 over the 8× step), so the readings are measured
+//!   against a signal that really is doing work.
+//!
+//! [`BOUND_BYTES`] is derived from that window rather than chosen: `beam_process`'s
+//! `DEFAULT_REDUCTIONS_PER_SLICE` (= `CONTEXT_REDS` = 4 000) divided by this body's ≈9 reductions
+//! per iteration gives ≈444 payloads per slice, `444 × 1 072` = **475 968**; the binary
+//! virtual-heap floor (`BIN_VH_MIN_SIZE` = 46 422 words = **371 376 bytes**) is added as margin,
+//! because that budget gates a prune and can only *delay* one: `475 968 + 371 376` = **847 344**,
+//! rounded up to **1 048 576 (1 MiB)**. That is 8× tighter than the bound a *single* read needs —
+//! [`SINGLE_READ_BYTES`], since one slice of the 4 KiB-payload churn body is 999 × 4 144 = 4.1 MB
+//! and a single read may legitimately land there — and every shape that retains instead of
+//! releasing breaks it:
+//!
+//! | the shape that breaks the bound | figure | factor over 1 MiB |
+//! |---|---|---|
+//! | one live reference declining every park (`ref`/`ets`/`mon`, 1 KiB payloads, N = 2 000) | 4 832 000 | 4.6× |
+//! | the same shape at N = 8 000 | 19 328 000 | 18.4× |
+//! | no prune at all (a per-iteration residue) at N = 20 000 | 21 440 000 | 20.4× |
+//!
+//! The first two rows are the pre-`is_inert_reference` figures of `gc_walk.rs`'s prune-only valve,
+//! which hit on **any** pointer-bearing foreign word: a reference block is foreign, so the prune
+//! declined at every park and `erlang:memory(binary)` read exactly `N × 2 416` bytes with zero
+//! releases while the reference-free control stayed flat.
+//!
+//! [`SMALL_BYTES`] (4 payloads = 4 288 bytes) is the trough bound, and it is the assertion that
+//! names a **per-park residue**: the measured trough is one payload at every park in every shape
+//! above, so a residue of one payload per park reaches 45 payloads = 48 240 bytes at N = 20 000 —
+//! 11× over the bound — and grows with the park count, while a phase never does.
+//!
+//! # The one shape this loop does not bound
+//!
+//! A slice that **never pre-empts** reaches no park, and so no prune: on the native baseline tier
+//! a linked tail exit charges no reduction, so a tail-call-only build-and-drop loop runs its whole
+//! computation inside one slice. Measured `nonpreempt(20 000, 1 024)` = `{1 072, 21 440 000, -1, 0}`
+//! — exactly `N × (1 024 + 48)`, no trough anywhere, every payload of the run retained. The same
+//! program under `BEAM_RT_TIER=interpreter` (one reduction per instruction) is
+//! `{1 072, 418 080, 391 280, 19 610}` — bounded. The repair is a reduction charge on the linked
+//! tail-exit path (`jit/baseline/runtime.rs::jit_tail_call`, plus `emit/link.rs`'s `call_only`/
+//! `jump` arm), a `beam_engine` change and **not** one here: no host-side charge can end such a
+//! slice, because the engine's position store parks at block granularity. This suite therefore
+//! keeps every fixture on a body with one non-tail call per iteration (`lists:seq/2` +
+//! `length/1`), which is what makes a park reachable at all, and it does not assert the unbounded
+//! shape.
 //!
 //! # What each test pins
 //!
 //! 1. [`memory_binary_is_flat_across_a_10x_iteration_step`] — two separate `beam_rt run`
-//!    invocations, N = 1000 and N = 10 000 iterations of build-and-discard: the 10× step must
-//!    add at most [`BOUND_BYTES`], and the larger figure must be under it in absolute terms.
-//! 2. [`memory_binary_does_not_grow_monotonically_over_the_loop`] — **one** process, 10 000
-//!    iterations, `erlang:memory(binary)` recorded every 1 000 (a 10-element ladder): the spread
-//!    (`max − min`) and the drift (`last − first`) must be within [`BOUND_BYTES`], *and* the
-//!    ladder must not be vacuous — its sampled maximum must reach [`MIN_PEAK_PAYLOADS`] payloads
-//!    and its minimum must stay under [`MAX_TROUGH_PAYLOADS`]. This test is **RED** on the
-//!    current product: the ladder is monotone, so the sampled maximum is ten payloads where the
-//!    guard asks for a hundred (*Known issue*).
-//! 3. [`a_retained_off_heap_binary_survives_every_prune_byte_exactly`] — the **safety** half:
+//!    invocations, N = 1 000 and N = 10 000 single reads: the 10× step must add at most
+//!    [`SINGLE_READ_BYTES`], and the larger figure must be under it in absolute terms.
+//! 2. [`the_dense_envelope_is_bounded_and_phase_immune`] — the dense envelope at
+//!    [`DENSE_SMALL_N`] and [`DENSE_N`]: non-inertness (a peak of at least [`MIN_PEAK_BYTES`] and
+//!    at least [`MIN_PARKS`] parks on each leg), both peaks under [`BOUND_BYTES`], both troughs
+//!    under [`SMALL_BYTES`], and the 10× sibling's peak and trough unmoved.
+//! 3. [`a_live_reference_in_the_root_set_costs_the_reservoir_nothing`] — the regression guard for
+//!    the reference exemption: one `make_ref/0`, one unnamed ETS tid and one `monitor/2` reference
+//!    held live across the whole loop, each against the same peak/trough bound as the
+//!    reference-free control *and* a peak within 2× of it. This is the assertion that is red on a
+//!    product whose prune declines on a reference.
+//! 4. [`a_retained_off_heap_binary_survives_every_prune_byte_exactly`] — the **safety** half:
 //!    a 64 KiB off-heap binary kept live across thousands of prunes must come back
 //!    **byte-exact** (MD5 unchanged, `=:=` a fresh rebuild, both ends of the payload read back,
 //!    identical to the live oracle's own answer), *and* its payload must still be counted in
 //!    `erlang:memory(binary)`. A prune that freed a live payload — or that never ran — cannot
 //!    satisfy both halves at once.
-//! 4. [`a_missing_toolchain_is_a_loud_skip_never_a_silent_pass`] — the loud-skip guard: an
+//! 5. [`a_missing_toolchain_is_a_loud_skip_never_a_silent_pass`] — the loud-skip guard: an
 //!    empty toolchain path resolves no compiler, and the suite's gate declines (printing the
 //!    shared `SKIPPED` / `NOT a pass` banner) instead of building a fixture or asserting.
-//!
-//! # Known issue — the residue retains one payload per park, so the ladder is monotone
-//!
-//! Measured on this tree with the system `erlc`-compiled fixture on the `run` route,
-//! `ladder(N, 1_000, Bytes)`: rung `k` is exactly `k` payloads of `Bytes + 48`, with **no
-//! sawtooth at all**, up to a cap of **999 payloads** followed by a reset to `0` on the next rung
-//! and a period of exactly 1 000 rungs.
-//!
-//! | `Bytes` | rung-to-rung | sampled maximum | at rung |
-//! |---|---|---|---|
-//! | 1 024 | `+1 072` | 1 070 928 = 999 × 1 072 | 998 |
-//! | 2 048 | `+2 096` | 2 093 904 = 999 × 2 096 | 998 |
-//! | 4 096 | `+4 144` | 4 139 856 = 999 × 4 144 | 998 |
-//!
-//! N = 10 000 (this suite's configuration) therefore reads `[4144, 8288, …, 41440]`; N = 200 000
-//! is 200 rungs with every difference `+4 144`; N = 2 000 000 is 2 000 rungs with 1 997 of 1 999
-//! differences `+4 144` and the two resets. The live oracle on the same fixture reports a flat
-//! band with no trend (`[87896, 29768, 125264, 29768, 133568, …]` — a ~100 KB sawtooth whose
-//! envelope does not move), so this is a divergence in the product, not in the workload.
-//!
-//! The growth is **per churn-block boundary, not per iteration**, and two controls isolate it to
-//! the park:
-//!
-//! * ten blocks of 1 000 iterations and ten blocks of 2 000 give the *same* ladder (topping at
-//!   103 600), four blocks of 5 000 give four rungs, twenty blocks of 1 000 give twenty — so the
-//!   increment tracks the number of blocks (parks), not the iteration count;
-//! * twelve consecutive reads after one `churn(2 000)` are flat (`[4144 × 12]`, and
-//!   `[65584 × 12]` at 65 536-byte payloads) — a read is not what leaks;
-//! * one `churn` block of 1 000 000 iterations read once is flat at 4 144, like every other
-//!   `discard(N)`;
-//! * an explicit `erlang:garbage_collect()` before each read does **not** clear the residue — it
-//!   doubles the increment to two payloads per rung (`[4144, 12432, 20720, …]`), because a forced
-//!   collection is itself another collection point. The retained payloads are therefore immortal
-//!   to a full GC, which rules out a stale heap word as their owner and points at the
-//!   reservoir-side retention instead.
-//!
-//! So one park is closed and each further collection retains exactly one more payload: the
-//! retained set is monotone in the number of pre-emptions, and its size is payload-size
-//! proportional (capped at 999 payloads — 4.1 MB at 4 KiB, ~65 MB at 64 KiB).
-//!
-//! The seam the law points at is the retention predicate of the prune,
-//! `src/context/gc/bin_vheap.rs`'s `live ∪ shared` pair. `shared` is derived **from the reservoir
-//! being pruned** (every entry with `refcount() > 1`), so a payload that acquires a second owner
-//! is immortal across every later prune and the belt is fed back to itself; `live` covers the
-//! rest. Narrowing it is a product change with a hard constraint: a false accept is only a leak,
-//! a **false reject frees a payload a live `BinRef.val` names**, so the predicate may only be
-//! narrowed where ownership is proven elsewhere (the runtime's escaped store, the mailbox's
-//! retained families, the send path's destination tables).
-//!
-//! [`memory_binary_does_not_grow_monotonically_over_the_loop`] is **red** on this state, and its
-//! failure message is the honest one — the sampled maximum is ten payloads where the non-vacuity
-//! guard asks for a hundred. Neither that guard, nor [`MAX_TROUGH_PAYLOADS`], nor
-//! [`BOUND_BYTES`] may be re-derived to fit this residue: the product owes a residue that does
-//! not grow, and [`BOUND_BYTES`] (8 MiB) cannot discriminate the current shape in any case — the
-//! signal is 37 KB at N = 10 000 and 4.1 MB at the cap, both under it.
-//!
-//! The guard itself is mis-specified against the sampling it is given, independently of the
-//! residue: [`MIN_PEAK_PAYLOADS`] asks a rung to report an **in-window peak**, and a rung's read
-//! follows a completed churn block, so it reports the trough. A *healthy* ladder cannot reach the
-//! threshold either — the oracle's own ten-rung readings peak at 123 776–184 480 bytes (30–45
-//! payloads) against the guard's 409 600-byte (98.8-payload) threshold. The re-derived guard
-//! therefore has to be stated against the property the sampling can see, the residue's
-//! **monotonicity** (`last − first` bounded by a small multiple of one payload, and a trough far
-//! below the cap), so that a residue growing one payload per park still fails it.
+//! 6. [`a_retained_off_heap_binary_survives_the_fun_loop_byte_exactly`] — the fun-loop safety
+//!    half: the same anti-dangle property through `lists:foldl/3`'s nested-machine route.
+//! 7. [`the_fun_loop_envelope_is_bounded_by_the_bin_vheap_budget`] — the fun-loop release half:
+//!    one read per N, bounded and non-growing (see the case's own note on the `N − last park`
+//!    aliasing that makes its small leg read a whole slice).
+//! 8. [`a_binary_named_only_by_a_pending_timer_survives_the_eval_statement_prune_byte_exactly`] —
+//!    the `-eval` route's escaped-payload store: a payload whose only owner is a pending
+//!    `erlang:send_after` survives the statement-boundary prune byte-exactly, with the prune
+//!    counted and nothing declined.
 //!
 //! # Conventions
 //!
@@ -207,36 +214,75 @@ const SMALL_N: u64 = 1_000;
 /// The larger iteration count of the 10× step.
 const LARGE_N: u64 = 10_000;
 
-/// The iterations between two ladder readings.
-const LADDER_STEP: u64 = 1_000;
-
-/// How many rungs the ladder has (`LARGE_N / LADDER_STEP`).
-const LADDER_LEN: usize = 10;
-
 /// The size of the binary the safety half **retains** across thousands of prunes.
 const KEEP_BYTES: u64 = 65_536;
 
 /// The churn count of the safety half: 6 000 × 4 KiB = 24 MiB of payloads built and discarded
-/// while the retained binary stays live (three times [`BOUND_BYTES`], so the assertion below is
-/// decisive against a run whose churn was never pruned).
+/// while the retained binary stays live (three times [`SINGLE_READ_BYTES`], so the assertion
+/// below is decisive against a run whose churn was never pruned).
 const RETAIN_CHURN_N: u64 = 6_000;
 
-/// The bound every assertion is stated against, in **bytes**.
-const BOUND_BYTES: u64 = 8 * 1024 * 1024;
+/// The bound a **single** read taken after a churn block is stated against, in bytes.
+///
+/// A single read lands at an arbitrary point of the slice phase, and one slice of the 4 KiB
+/// payload churn body is ≈999 iterations — 4.1 MB of payload bytes — so this bound is eight times
+/// the dense one on purpose: its only job is to separate "bounded by one slice" from "linear in
+/// N". The same loop with the reclamation disabled is `N × (4 096 + 48)` (4 144 000 bytes at
+/// N = 1 000, 41 440 000 at N = 10 000), and the fun-loop route's small leg reads a whole slice
+/// (4 144 000 at N = 1 000). The phase-immune bound is [`BOUND_BYTES`].
+const SINGLE_READ_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The peak a non-vacuous loop must reach: at least this many payloads outstanding between two
-/// parks. A ladder rung samples the **post-park residue**, not an in-window peak, so this
-/// threshold is unreachable by the sampling it is applied to — the current product reports 10
-/// payloads and a healthy runtime (the live oracle) reports 30–45. The guard is deliberately left
-/// at its value rather than re-derived to fit the residue; see the module docs' *Known issue* for
-/// the property it must be restated against (*monotonicity*, not peak height).
-const MIN_PEAK_PAYLOADS: u64 = 100;
+/// The **dense envelope's** peak bound, in bytes — derived, not chosen (module docs,
+/// *The phase-immune reading*).
+///
+/// `DEFAULT_REDUCTIONS_PER_SLICE` (4 000) ÷ the dense body's ≈9 reductions per iteration ≈ 444
+/// iterations per slice, × [`DENSE_BLOCK_BYTES`] (1 072) = 475 968 bytes, plus the binary
+/// virtual-heap floor (`BIN_VH_MIN_SIZE` = 46 422 words = 371 376 bytes) as margin = 847 344,
+/// rounded up to 1 MiB. The measured peak is 475 968 (2.2× of headroom); a product that retains
+/// instead of releasing is 4.6×–20.4× over it.
+const BOUND_BYTES: u64 = 1_048_576;
 
-/// The trough a completing prune must reach: fewer than this many payloads outstanding
-/// (the ladder's first rung is one payload at this payload size; an un-pruned reservoir never
-/// gets below N payloads). Unchanged by the *Known issue*: a trough that climbs is exactly what
-/// the product must stop doing.
-const MAX_TROUGH_PAYLOADS: u64 = 64;
+/// The payload the **dense** envelope is sampled with, in bytes.
+///
+/// Four times smaller than [`PAYLOAD_BYTES`] on purpose: a slice then holds ≈444 iterations
+/// instead of ≈999, so one window is 475 968 bytes and the derived [`BOUND_BYTES`] can be 8×
+/// tighter than [`SINGLE_READ_BYTES`]. At 4 KiB the window alone (4.1 MB) could not be told apart
+/// from the pre-fix retention.
+const DENSE_PAYLOAD_BYTES: u64 = 1_024;
+
+/// One dense payload plus its 48-byte control header — the unit the dense figures are counted in.
+const DENSE_BLOCK_BYTES: u64 = DENSE_PAYLOAD_BYTES + 48;
+
+/// The iteration count of the dense guard's small leg (measured 5 parks).
+const DENSE_SMALL_N: u64 = 2_500;
+
+/// The iteration count of the dense guard's large leg (measured 45 parks).
+const DENSE_N: u64 = 20_000;
+
+/// The peak a non-vacuous dense envelope must reach: 64 payloads.
+///
+/// Measured 444 payloads ([`MIN_PEAK_BYTES`] = 68 608 bytes, 6.9× below the measured 475 968), so
+/// the threshold is comfortably reachable by a real window and unreachable by a fixture that never
+/// fed the reservoir.
+const MIN_PEAK_PAYLOADS: u64 = 64;
+
+/// [`MIN_PEAK_PAYLOADS`] in bytes.
+const MIN_PEAK_BYTES: u64 = MIN_PEAK_PAYLOADS * DENSE_BLOCK_BYTES;
+
+/// The trough bound: 4 payloads — the assertion that names a **per-park residue**.
+///
+/// Measured one payload at every park in every shape, so a residue of one payload per park reaches
+/// 45 payloads at [`DENSE_N`] (11× over this bound) and grows with the park count, while a slice
+/// phase never does.
+const MAX_TROUGH_PAYLOADS: u64 = 4;
+
+/// [`MAX_TROUGH_PAYLOADS`] in bytes.
+const SMALL_BYTES: u64 = MAX_TROUGH_PAYLOADS * DENSE_BLOCK_BYTES;
+
+/// The park count both dense legs must show: the sampler really saw parks (measured 5 at
+/// [`DENSE_SMALL_N`] and 45 at [`DENSE_N`]), so "flat" cannot be the flatness of a reservoir that
+/// nothing ever emptied.
+const MIN_PARKS: u64 = 3;
 
 /// How long one `beam_rt run` child may live before it is killed and reported.
 ///
@@ -254,15 +300,26 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 /// it, and touch the heap (so the process reaches a heap-admission door, which is where the
 /// slice budget pre-empts — see the module docs). `discard/2` and `ladder/3` drive it and read
 /// `erlang:memory(binary)` (bytes) inside the *same* process; `retain/3` keeps one engine-built
-/// off-heap binary live across the churn and reports its identity/content plus the figure.
+/// off-heap binary live across the churn and reports its identity/content plus the figure;
+/// `dense/2` is the phase-immune sampler the guard asserts on and `dense_hold/3` is the same
+/// sampler with one live term held across it (`ref`/`ets`/`mon` — `make_ref/0`, an unnamed ETS
+/// tid and a `monitor/2` reference).
+///
+/// `ladder/3` is the **phase probe** the module docs quote (one reading per `Step` iterations);
+/// it is measured and documented, never asserted on, because which rung it reads is a property of
+/// the sampling offset.
 const FIXTURE_ERL: &str = r#"%% Generated by `beam_rt/tests/off_heap_reclaim.rs` (never committed).
 -module(offheap_reclaim).
 -export([discard/2, ladder/3, retain/3, foldl_discard/2, foldl_keep/3,
-         schedule_payload/2, collect_payload/2]).
+         schedule_payload/2, collect_payload/2, dense/2, dense_hold/3]).
 
 %% One iteration: build a `Bytes`-byte OFF-HEAP binary (`bs_create_bin` above the 64-byte
 %% on-heap limit), discard it, and touch the heap. The size is a RUNTIME value on purpose: a
 %% compile-time constant would be folded into a literal and never reach the payload reservoir.
+%% `lists:seq/2` + `length/1` are the one NON-TAIL call per iteration that makes a pre-emption
+%% (and therefore a park, and therefore a prune) reachable at all: a tail-call-only body charges
+%% nothing on the native tier and never parks (module docs, *The one shape this loop does not
+%% bound*).
 one(Bytes) ->
     _ = <<0:(Bytes*8)>>,
     L = lists:seq(1, 20),
@@ -275,6 +332,38 @@ churn(N, Bytes) -> one(Bytes), churn(N - 1, Bytes).
 %% N build-and-discard iterations, then the `binary_alloc` live-bytes figure in BYTES.
 discard(N, Bytes) -> churn(N, Bytes), erlang:memory(binary).
 
+%% The PHASE-IMMUNE sampler: one iteration, then `erlang:memory(binary)` after EVERY one of
+%% them, folded into {Min, Max, Trough, Parks}. `Trough` is the largest reading taken immediately
+%% after a reading FELL (the residue a park leaves behind) and `Parks` counts those falls; -1 is
+%% the sentinel for "no reading ever fell".
+dense(N, Bytes) -> dense(N, Bytes, -1, -1, -1, 0, -1).
+dense(0, _Bytes, Min, Max, Trough, Parks, _Prev) -> {Min, Max, Trough, Parks};
+dense(N, Bytes, Min, Max, Trough, Parks, Prev) ->
+    one(Bytes),
+    V = erlang:memory(binary),
+    Min1 = case Min of -1 -> V; _ -> min(Min, V) end,
+    Max1 = max(Max, V),
+    {Trough1, Parks1} =
+        case Prev >= 0 andalso V < Prev of
+            true -> {max(Trough, V), Parks + 1};
+            false -> {Trough, Parks}
+        end,
+    dense(N - 1, Bytes, Min1, Max1, Trough1, Parks1, V).
+
+%% One live term of each reference kind, held ACROSS the loop below (the caller keeps it live by
+%% using it afterwards). Every one of them is a reference thing in this runtime's term model: a
+%% `make_ref/0` block, an unnamed ETS table's tid, and a `monitor/2` reference.
+hold(ref) -> make_ref();
+hold(ets) -> ets:new(offheap_reclaim, []);
+hold(mon) -> erlang:monitor(process, self()).
+
+%% The same dense envelope with one live reference in the frame's own root set for the whole run.
+%% `is_reference/1` after the loop is what keeps `Hold` live across it (the compiler keeps it in a
+%% stack slot), and it also witnesses that the held term really is a reference.
+dense_hold(N, Bytes, Kind) ->
+    Hold = hold(Kind),
+    {Min, Max, Trough, Parks} = dense(N, Bytes),
+    {{Min, Max, Trough, Parks}, erlang:is_reference(Hold)}.
 %% The SAME workload driven by a `lists:foldl/3` fun-loop instead of direct recursion: the
 %% lambda body builds and drops one `Bytes`-byte off-heap binary per iteration and touches no
 %% heap otherwise. Returns the `binary_alloc` live-bytes figure in BYTES.
@@ -666,14 +755,19 @@ fn report(bytes: u64) -> String {
 
 /// **A 10× longer build-and-discard loop must not grow `erlang:memory(binary)`.**
 ///
-/// Two separate `beam_rt run` invocations of the same workload, N = 1 000 and N = 10 000, each
-/// printing the `binary_alloc` live-bytes figure at its end. Unfixed, the figure is linear in N
-/// (measured on the same fixture with the reclamation call disabled: 4 144 000 bytes at N =
-/// 1 000, 41 440 000 at N = 10 000 — the 10× step added 37 296 000 bytes, and `VmHWM` grew
-/// 121.8 → 158.8 MiB with it), so the bound below is decisive and the fixed sawtooth
-/// (≈1.4 MiB per window) has ~6× of headroom. Peak RSS is printed too (`VmHWM` is a monotonic
-/// kernel watermark, so a loaded host does not inflate it) but not asserted: the absolute
-/// figure is dominated by the runtime's fixed boot cost.
+/// Two separate `beam_rt run` invocations of the same workload (`discard/2`), N = 1 000 and
+/// N = 10 000, each printing the `binary_alloc` live-bytes figure once at the end. With the
+/// reclamation disabled the figure is linear in N — 4 144 000 bytes at N = 1 000 and 41 440 000 at
+/// N = 10 000, exactly `N × (4 096 + 48)`, the 10× step adding 37 296 000 bytes — so the bound
+/// below separates "bounded by one slice" from "linear in N" by an order of magnitude. Measured
+/// with the prune: **4 144 at both legs** (1 payload, i.e. the read landed just after a park).
+///
+/// The bound is [`SINGLE_READ_BYTES`] rather than the dense [`BOUND_BYTES`] because a single read
+/// samples the slice phase: one slice of this 4 KiB-payload body is ≈999 iterations = 4 139 856
+/// bytes, so a read may legitimately land anywhere under that. The phase-immune statement is
+/// [`the_dense_envelope_is_bounded_and_phase_immune`]'s, one test below. Peak RSS is printed too
+/// (`VmHWM` is a monotonic kernel watermark, so a loaded host does not inflate it) but not
+/// asserted: the absolute figure is dominated by the runtime's fixed boot cost.
 #[test]
 fn memory_binary_is_flat_across_a_10x_iteration_step() {
     let Some(toolchain) = setup("step") else {
@@ -722,11 +816,11 @@ fn memory_binary_is_flat_across_a_10x_iteration_step() {
         large.samples
     );
     println!(
-        "[off_heap_reclaim] the 10× step adds {} bytes ({:.2} MiB), bound {BOUND_BYTES} bytes \
-         ({:.2} MiB)",
+        "[off_heap_reclaim] the 10× step adds {} bytes ({:.2} MiB), bound {SINGLE_READ_BYTES} \
+         bytes ({:.2} MiB)",
         large_bytes.saturating_sub(small_bytes),
         large_bytes.saturating_sub(small_bytes) as f64 / (1024.0 * 1024.0),
-        BOUND_BYTES as f64 / (1024.0 * 1024.0)
+        SINGLE_READ_BYTES as f64 / (1024.0 * 1024.0)
     );
     if let (Some(small_line), Some(large_line)) = (&oracle_small, &oracle_large) {
         println!(
@@ -736,8 +830,8 @@ fn memory_binary_is_flat_across_a_10x_iteration_step() {
         );
     }
     assert!(
-        large_bytes <= small_bytes + BOUND_BYTES,
-        "the 10x iteration step must not grow erlang:memory(binary) by more than {BOUND_BYTES} \
+        large_bytes <= small_bytes + SINGLE_READ_BYTES,
+        "the 10x iteration step must not grow erlang:memory(binary) by more than {SINGLE_READ_BYTES} \
          bytes: {} at N={SMALL_N}, {} at N={LARGE_N} (a linear, un-reclaimed reservoir adds \
          ~{} bytes)",
         report(small_bytes),
@@ -745,130 +839,305 @@ fn memory_binary_is_flat_across_a_10x_iteration_step() {
         (LARGE_N - SMALL_N) * (PAYLOAD_BYTES + 48)
     );
     assert!(
-        large_bytes < BOUND_BYTES,
+        large_bytes < SINGLE_READ_BYTES,
         "even in absolute terms the figure after {LARGE_N} discarded payloads must stay under \
-         {BOUND_BYTES} bytes (it is bounded by the bin-vheap floor plus one pre-emption window, \
+         {SINGLE_READ_BYTES} bytes (it is bounded by the bin-vheap floor plus one pre-emption window, \
          not by N): got {}",
         report(large_bytes)
     );
 }
 
 // ---------------------------------------------------------------------------------------
-// 2. The non-monotonicity regression ladder
+// 2. The dense envelope — the phase-immune guard
 // ---------------------------------------------------------------------------------------
 
-/// **`erlang:memory(binary)` must not grow monotonically with the loop count.**
-///
-/// In **one** process: `LARGE_N` build-and-discard iterations, the figure recorded every
-/// `LADDER_STEP` (a 10-element ladder). Two independent halves are asserted:
-///
-/// * **bounded** — `max − min` and `last − first` are both within [`BOUND_BYTES`], i.e. the
-///   figure does not track N;
-/// * **the sawtooth is real** — the ladder's peak is at least [`MIN_PEAK_PAYLOADS`] payloads
-///   (the loop really accumulates between two parks, so the flatness is not the trivial
-///   flatness of a fixture that never fed the reservoir) and its trough is under
-///   [`MAX_TROUGH_PAYLOADS`] (the prune really released them).
-///
-/// Never exact bytes: the values are a live allocator reading, and the printed ladder is the
-/// measurement of record.
-#[test]
-fn memory_binary_does_not_grow_monotonically_over_the_loop() {
-    let Some(toolchain) = setup("ladder") else {
-        return;
-    };
-    let run = run_workload(
-        &toolchain,
-        "the ladder",
-        "ladder",
-        &[
-            &LARGE_N.to_string(),
-            &LADDER_STEP.to_string(),
-            &PAYLOAD_BYTES.to_string(),
-        ],
-    );
-    let ladder: Vec<u64> = run
-        .stdout
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .map(|rung| {
-            rung.trim().parse().unwrap_or_else(|error| {
-                panic!("the ladder printed a rung {rung:?} that is not a byte figure: {error}")
+/// One dense reading of `erlang:memory(binary)`: the sampled envelope and what it proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Envelope {
+    /// The smallest reading of the run.
+    min: u64,
+    /// The largest — one pre-emption window's worth of payloads.
+    max: u64,
+    /// The largest reading taken immediately after a reading **fell** (the residue a park leaves
+    /// behind), or `-1` when no reading ever fell.
+    trough: i64,
+    /// How many readings fell (one per park the sampler saw).
+    parks: u64,
+}
+
+impl Envelope {
+    /// Parses the fixture's `{Min, Max, Trough, Parks}` answer.
+    fn parse(label: &str, stdout: &str) -> Envelope {
+        let body = stdout.trim();
+        let fields: Vec<&str> = body
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .unwrap_or_else(|| {
+                panic!("{label}: {body:?} is not a {{Min, Max, Trough, Parks}} tuple")
             })
-        })
-        .collect();
-    assert_eq!(
-        ladder.len(),
-        LADDER_LEN,
-        "a {LARGE_N}-iteration loop sampled every {LADDER_STEP} is a {LADDER_LEN}-rung ladder: {}",
-        run.stdout
-    );
-    let oracle_ladder = oracle_answer(
-        &toolchain,
-        "the ladder",
-        "ladder",
-        &[
-            &LARGE_N.to_string(),
-            &LADDER_STEP.to_string(),
-            &PAYLOAD_BYTES.to_string(),
-        ],
-    );
-    let max = ladder.iter().copied().max().unwrap_or(0);
-    let min = ladder.iter().copied().min().unwrap_or(0);
-    let spread = max - min;
-    println!("\n[off_heap_reclaim] /proc/loadavg {}", loadavg());
-    println!(
-        "[off_heap_reclaim] the ladder (N={LARGE_N}, step {LADDER_STEP}, {PAYLOAD_BYTES}-byte \
-         payloads) in bytes: {ladder:?}"
-    );
-    println!(
-        "[off_heap_reclaim] min {} / max {} / spread {} bytes ({:.2} MiB) / last − first = {} \
-         bytes | VmHWM {:.1} MiB ({} samples)",
-        min,
-        max,
-        spread,
-        spread as f64 / (1024.0 * 1024.0),
-        ladder[LADDER_LEN - 1] as i64 - ladder[0] as i64,
-        run.vmhwm_mib(),
-        run.samples
-    );
-    if let Some(line) = &oracle_ladder {
-        println!(
-            "[off_heap_reclaim] the live oracle's ladder (its own allocator view): {}",
-            line.trim()
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            fields.len(),
+            4,
+            "{label}: {body:?} must be {{Min, Max, Trough, Parks}}"
+        );
+        let number = |text: &str, what: &str| -> i64 {
+            text.parse()
+                .unwrap_or_else(|error| panic!("{label}: {what} {text:?}: {error}"))
+        };
+        Envelope {
+            min: u64::try_from(number(fields[0], "min"))
+                .unwrap_or_else(|_| panic!("{label}: a negative min: {body:?}")),
+            max: u64::try_from(number(fields[1], "max"))
+                .unwrap_or_else(|_| panic!("{label}: a negative max: {body:?}")),
+            trough: number(fields[2], "trough"),
+            parks: u64::try_from(number(fields[3], "parks"))
+                .unwrap_or_else(|_| panic!("{label}: a negative park count: {body:?}")),
+        }
+    }
+
+    /// Parses the `dense_hold/3` answer `{{Min, Max, Trough, Parks}, true}` — the trailing `true`
+    /// is the fixture's own witness that the held term stayed live across the loop and really is
+    /// a reference.
+    fn parse_hold(label: &str, stdout: &str) -> Envelope {
+        let body = stdout.trim();
+        let inner = body
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix(",true}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: {body:?} must be {{{{Min, Max, Trough, Parks}}, true}} — the held \
+                     term must stay live (and be a reference) across the whole loop"
+                )
+            });
+        Envelope::parse(label, inner)
+    }
+
+    /// The three properties a reservoir that is **released at every park** shows, each of which a
+    /// retaining product breaks (module docs, *The phase-immune reading*):
+    ///
+    /// * [`MIN_PARKS`] parks really happened, so flatness cannot be vacuous;
+    /// * the trough is under [`SMALL_BYTES`] — the assertion that names a per-park residue;
+    /// * the peak is under [`BOUND_BYTES`] — one pre-emption window plus the bin-vheap floor,
+    ///   which a per-iteration residue exceeds by an order of magnitude.
+    fn assert_bounded(&self, label: &str, runs: &str) {
+        assert!(
+            self.parks >= MIN_PARKS,
+            "{label}: the sampler must see at least {MIN_PARKS} parks — a park is the only thing \
+             that runs the prune, so a reservoir nothing emptied would look flat too: {self:?} \
+             ({runs})"
+        );
+        assert!(
+            self.trough >= 0,
+            "{label}: no reading ever fell, so nothing was ever released — every payload the run \
+             built is still live: {self:?} ({runs})"
+        );
+        assert!(
+            (self.trough as u64) <= SMALL_BYTES,
+            "{label}: the post-park trough must stay under {SMALL_BYTES} bytes ({} payloads of \
+             {DENSE_BLOCK_BYTES}) — a residue of one payload per park reaches {} bytes over {} \
+             parks: {self:?} ({runs})",
+            SMALL_BYTES / DENSE_BLOCK_BYTES,
+            self.parks * DENSE_BLOCK_BYTES,
+            self.parks
+        );
+        assert!(
+            self.max <= BOUND_BYTES,
+            "{label}: the peak must stay under {BOUND_BYTES} bytes ({} payloads: one pre-emption \
+             window of 444 iterations plus the 371 376-byte bin-vheap floor) — a reservoir nothing \
+             released is one payload per iteration, {} bytes over {} iterations: {self:?} ({runs})",
+            BOUND_BYTES / DENSE_BLOCK_BYTES,
+            self.max / DENSE_BLOCK_BYTES * DENSE_BLOCK_BYTES,
+            self.max / DENSE_BLOCK_BYTES
         );
     }
+}
+
+/// Formats a dense figure for the printed report (`N bytes (M.MM MiB, ~K 1 KiB payloads)`).
+fn report_dense(bytes: u64) -> String {
+    format!(
+        "{bytes} bytes ({:.2} MiB, {} x {DENSE_PAYLOAD_BYTES}-byte payloads)",
+        bytes as f64 / (1024.0 * 1024.0),
+        bytes / DENSE_BLOCK_BYTES
+    )
+}
+
+/// **The dense `erlang:memory(binary)` envelope is one pre-emption window, and does not move with
+/// the loop count.**
+///
+/// One process per leg, `erlang:memory(binary)` read after **every** iteration and folded into
+/// `{min, max, trough, parks}` (the ladder this replaced sampled a fixed offset, which is a slice
+/// phase — see the module docs). `DENSE_SMALL_N` and `DENSE_N` are the 8× step.
+///
+/// Asserted, each half able to fail:
+///
+/// * **non-inertness** — the peak reaches [`MIN_PEAK_BYTES`] (64 payloads; measured 444) and the
+///   sampler saw at least [`MIN_PARKS`] parks (measured 5 and 45), so the envelope is a real
+///   sawtooth rather than the flatness of a reservoir nothing fed or nothing emptied;
+/// * **the peak is one window** — `max <= BOUND_BYTES` (1 MiB, derived from
+///   `DEFAULT_REDUCTIONS_PER_SLICE` ÷ 9 reductions per iteration × 1 072 bytes plus the bin-vheap
+///   floor; measured 475 968 = 2.2× under) on both legs;
+/// * **the trough is a per-park residue's opposite** — `trough <= SMALL_BYTES` (4 payloads;
+///   measured exactly 1) on both legs;
+/// * **the step does not move either** — the large leg's peak is within 2× of the small leg's
+///   (measured: identical) and its trough is within two payloads of it, so a residue that grows
+///   with the park count (5 × 1 072 vs 45 × 1 072) fails while a phase cannot.
+///
+/// Never exact bytes: these are live allocator readings, and the printed figures are the
+/// measurement of record.
+#[test]
+fn the_dense_envelope_is_bounded_and_phase_immune() {
+    let Some(toolchain) = setup("dense") else {
+        return;
+    };
+    let payload = DENSE_PAYLOAD_BYTES.to_string();
+    let small_n = DENSE_SMALL_N.to_string();
+    let large_n = DENSE_N.to_string();
+    let small = run_workload(
+        &toolchain,
+        "the dense envelope (small leg)",
+        "dense",
+        &[&small_n, &payload],
+    );
+    let large = run_workload(
+        &toolchain,
+        "the dense envelope (large leg)",
+        "dense",
+        &[&large_n, &payload],
+    );
+    let small = Envelope::parse("the dense envelope (small leg)", &small.stdout);
+    let large = Envelope::parse("the dense envelope (large leg)", &large.stdout);
+    let runs = format!("dense({DENSE_SMALL_N}, {DENSE_PAYLOAD_BYTES}) = {small:?}, dense({DENSE_N}, {DENSE_PAYLOAD_BYTES}) = {large:?}");
+    println!("\n[off_heap_reclaim] /proc/loadavg {}", loadavg());
+    println!("[off_heap_reclaim] {runs}");
+    println!(
+        "[off_heap_reclaim] bound {BOUND_BYTES} bytes ({} payloads) | trough bound {SMALL_BYTES} \
+         bytes ({} payloads) | non-vacuity {MIN_PEAK_BYTES} bytes and {MIN_PARKS} parks",
+        BOUND_BYTES / DENSE_BLOCK_BYTES,
+        SMALL_BYTES / DENSE_BLOCK_BYTES
+    );
+    for (label, envelope) in [
+        ("the small leg", small),
+        ("the large leg", large),
+    ] {
+        assert!(
+            envelope.max >= MIN_PEAK_BYTES,
+            "{label}: the loop must really accumulate between two parks — a peak of at least \
+             {MIN_PEAK_BYTES} bytes ({MIN_PEAK_PAYLOADS} payloads) — otherwise the envelope proves \
+             nothing: {envelope:?} ({runs})"
+        );
+        assert!(
+            envelope.max > envelope.min,
+            "{label}: the sampler must see a sawtooth (max > min), not one constant reading: \
+             {envelope:?} ({runs})"
+        );
+        envelope.assert_bounded(label, &runs);
+    }
     assert!(
-        spread <= BOUND_BYTES,
-        "the ladder's spread must stay within {BOUND_BYTES} bytes (a figure that tracks N has a \
-         spread of ~{} bytes): min {min}, max {max}, ladder {ladder:?}",
-        (LARGE_N - LADDER_STEP) * (PAYLOAD_BYTES + 48)
+        large.max <= 2 * small.max,
+        "the 8x iteration step must not grow the peak: {} on the small leg, {} on the large one \
+         ({runs})",
+        report_dense(small.max),
+        report_dense(large.max)
     );
     assert!(
-        ladder[LADDER_LEN - 1] <= ladder[0] + BOUND_BYTES,
-        "the last rung must not exceed the first by more than {BOUND_BYTES} bytes (monotone \
-         growth with N is the regression): first {}, last {}, ladder {ladder:?}",
-        ladder[0],
-        ladder[LADDER_LEN - 1]
-    );
-    assert!(
-        max >= MIN_PEAK_PAYLOADS * PAYLOAD_BYTES,
-        "the loop must really accumulate between two parks — a peak of at least \
-         {MIN_PEAK_PAYLOADS} payloads ({} bytes) — otherwise flatness proves nothing: max {max}, \
-         ladder {ladder:?}",
-        MIN_PEAK_PAYLOADS * PAYLOAD_BYTES
-    );
-    assert!(
-        min < MAX_TROUGH_PAYLOADS * PAYLOAD_BYTES,
-        "the prune must really release the discarded payloads — a trough under \
-         {MAX_TROUGH_PAYLOADS} payloads ({} bytes): min {min}, ladder {ladder:?}",
-        MAX_TROUGH_PAYLOADS * PAYLOAD_BYTES
+        large.trough <= small.trough.max(2 * DENSE_BLOCK_BYTES as i64),
+        "the trough must not grow with the park count: {} on the small leg ({} parks), {} on the \
+         large one ({} parks) ({runs})",
+        report_dense(small.trough.max(0) as u64),
+        small.parks,
+        report_dense(large.trough.max(0) as u64),
+        large.parks
     );
 }
 
 // ---------------------------------------------------------------------------------------
-// 3. The safety half — a pruned payload must never be a live one
+// 3. The reference exemption — a live reference may not cost the reservoir anything
+// ---------------------------------------------------------------------------------------
+
+/// **A live reference in the root set costs the off-heap reservoir nothing.**
+///
+/// The prune-only valve (`src/context/gc_walk.rs`, `Criterion::PayloadPrune`) must not treat a
+/// reference thing as a hazard: a reference block is a childless leaf whose payload words are
+/// terms or packed `u32` ids, never a `BinRef.val` pointer, so it can name no off-heap payload.
+/// When the valve treated it as a hazard, **any** live reference — `make_ref/0`, an unnamed ETS
+/// table's tid, a `monitor/2` or `alias/1` reference, i.e. what every `gen_server` holds — declined
+/// the prune at every park and the reservoir was retained for ever: `erlang:memory(binary)` read
+/// exactly `N × 2 416` bytes with zero releases, **4 832 000** at N = 2 000 and **19 328 000** at
+/// N = 8 000 (1 024-byte payloads), while the reference-free control stayed flat.
+///
+/// The same fixture with one such reference held live across the whole loop
+/// (`dense_hold/3`'s `ref`, `ets` and `mon`) must therefore show the **control's** envelope: the
+/// same [`BOUND_BYTES`] peak, the same [`SMALL_BYTES`] trough, [`MIN_PARKS`] parks and a peak
+/// within 2× of the control's. On the pre-fix product the peak was 4.6× over `BOUND_BYTES` (and
+/// 18.4× at N = 8 000) with no trough at all, so both the peak assertion and the
+/// `trough >= 0` / `parks` half of [`Envelope::assert_bounded`] were red.
+///
+/// The held term is a genuine root: the fixture keeps `Hold` live to the end of the frame (its
+/// `is_reference/1` witness is what tells the compiler so), and the prune's census over the same
+/// run shows the walk descending with **0 declines** — the reference is reached and classified,
+/// it is simply inert.
+#[test]
+fn a_live_reference_in_the_root_set_costs_the_reservoir_nothing() {
+    let Some(toolchain) = setup("dense_hold") else {
+        return;
+    };
+    let payload = DENSE_PAYLOAD_BYTES.to_string();
+    let n = DENSE_N.to_string();
+    let control_run = run_workload(
+        &toolchain,
+        "the reference-free control",
+        "dense",
+        &[&n, &payload],
+    );
+    let control = Envelope::parse("the reference-free control", &control_run.stdout);
+    println!("\n[off_heap_reclaim] /proc/loadavg {}", loadavg());
+    println!(
+        "[off_heap_reclaim] control dense({DENSE_N}, {DENSE_PAYLOAD_BYTES}) = {control:?} | VmHWM \
+         {:.1} MiB ({} samples)",
+        control_run.vmhwm_mib(),
+        control_run.samples
+    );
+    control.assert_bounded(
+        "the reference-free control",
+        &format!("dense({DENSE_N}, {DENSE_PAYLOAD_BYTES})"),
+    );
+    for (kind, what) in [
+        ("ref", "a make_ref/0 reference"),
+        ("ets", "an unnamed ETS table's tid"),
+        ("mon", "a monitor/2 reference"),
+    ] {
+        let label = format!("a live {what}");
+        let run = run_workload(&toolchain, &label, "dense_hold", &[&n, &payload, kind]);
+        let held = Envelope::parse_hold(&label, &run.stdout);
+        let runs = format!("dense_hold({DENSE_N}, {DENSE_PAYLOAD_BYTES}, {kind}) = {held:?}");
+        println!(
+            "[off_heap_reclaim] {label} ({kind}) = {held:?} | VmHWM {:.1} MiB ({} samples)",
+            run.vmhwm_mib(),
+            run.samples
+        );
+        held.assert_bounded(&label, &runs);
+        assert!(
+            held.max <= 2 * control.max,
+            "{label}: a live reference may not cost the reservoir anything — its peak must stay \
+             within 2x the reference-free control's ({}), but it is {} ({runs})",
+            report_dense(control.max),
+            report_dense(held.max)
+        );
+        assert!(
+            held.trough <= control.trough.max(2 * DENSE_BLOCK_BYTES as i64),
+            "{label}: a live reference may not leave a residue behind — the trough must match the \
+             control's ({}), but it is {} ({runs})",
+            report_dense(control.trough.max(0) as u64),
+            report_dense(held.trough.max(0) as u64)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 4. The safety half — a pruned payload must never be a live one
 // ---------------------------------------------------------------------------------------
 
 /// **A retained off-heap binary survives every prune byte-exactly.**
@@ -886,8 +1155,9 @@ fn memory_binary_does_not_grow_monotonically_over_the_loop() {
 /// * **and identical to the live oracle's own answer** for the same call.
 ///
 /// The churn is `RETAIN_CHURN_N × (PAYLOAD_BYTES + 48)` = ~24 MiB of payloads, three times
-/// [`BOUND_BYTES`], so a run whose churn was never pruned cannot satisfy the "under the bound"
-/// assertion either.
+/// [`SINGLE_READ_BYTES`], so a run whose churn was never pruned cannot satisfy the "under the
+/// bound" assertion either. Measured: `{65 536, true, true, <<255,255,255,255>>,
+/// <<255,255,255,255>>, 69 728}` — the retained payload plus exactly one churn payload.
 #[test]
 fn a_retained_off_heap_binary_survives_every_prune_byte_exactly() {
     let Some(toolchain) = setup("retain") else {
@@ -941,9 +1211,9 @@ fn a_retained_off_heap_binary_survives_every_prune_byte_exactly() {
         report(bytes)
     );
     assert!(
-        bytes < BOUND_BYTES,
+        bytes < SINGLE_READ_BYTES,
         "the churn's {RETAIN_CHURN_N} discarded payloads must have been pruned around the \
-         retained one, so the figure stays under {BOUND_BYTES} bytes; got {}",
+         retained one, so the figure stays under {SINGLE_READ_BYTES} bytes; got {}",
         report(bytes)
     );
     // The oracle's own answer must agree on everything but the figure: same size, same MD5
@@ -961,7 +1231,7 @@ fn a_retained_off_heap_binary_survives_every_prune_byte_exactly() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 4. The loud skip
+// 5. The loud skip
 // ---------------------------------------------------------------------------------------
 
 /// **A missing toolchain is a loud skip, never a silent pass and never a panic.**
@@ -1096,15 +1366,19 @@ fn a_retained_off_heap_binary_survives_the_fun_loop_byte_exactly() {
 /// epilogue, against the run's own published root set (its X registers, its whole Erlang stack,
 /// its FR file and the term it is about to return).
 ///
-/// The store is budgeted by `STORE_BUDGET_WORDS` (46 422 words, the C `BIN_VH_MIN_SIZE`), so the
-/// intended envelope is a converged capacity, not a function of N. **Today the first prune is not
-/// reliably reached** (4 096-byte payloads, three repeats each): `foldl_discard(1 000)` reads
-/// **4 144 000** bytes — every payload of the run, the fully un-pruned figure — and so does
-/// `foldl_discard(3 000)` (4 160 576), while N = 2 000 and every N from 4 000 to 10 000 read
-/// **16 576**. Both a never-pruned and a converged run are therefore reachable, which is the same
-/// retention family as the module docs' *Known issue*, and it is why this assertion is structural
-/// on purpose — bounded, and no growth from the small to the large N — never an exact byte figure
-/// and never a wall-clock claim.
+/// The store is budgeted by `STORE_BUDGET_WORDS` (46 422 words, the C `BIN_VH_MIN_SIZE`), so its
+/// envelope is a converged capacity, not a function of N — and one *read* of it is the same slice
+/// phase the module docs describe, on this route it is the fold's own nested call that has to end
+/// before the store is pruned. So the figure `foldl_discard(N, 4 096)` reports is
+/// `(N − last park) × 4 144`, measured: **4 144 000** at N = 1 000 (nothing of the slice had been
+/// released yet — the whole run), **16 576** at N = 10 000 (four payloads). At 1 024-byte payloads
+/// the same aliasing is visible step by step: `foldl_discard(1 995)` = 2 138 640,
+/// `(1 996)` = 0, `(1 997)` = 1 072, `(3 000)` = 1 076 288, `(4 000)` = 4 288, `(10 000)` = 4 288 —
+/// one park per ~1 996 iterations, and every reading is the phase *after* the last one. It is not
+/// a retention family: the envelope does not grow with N.
+///
+/// That is why the assertion is structural on purpose — bounded by [`SINGLE_READ_BYTES`], and no
+/// growth from the small to the large N — never an exact byte figure and never a wall-clock claim.
 #[test]
 fn the_fun_loop_envelope_is_bounded_by_the_bin_vheap_budget() {
     let Some(toolchain) = setup("foldl_discard") else {
@@ -1129,9 +1403,10 @@ fn the_fun_loop_envelope_is_bounded_by_the_bin_vheap_budget() {
     println!("[off_heap_reclaim] fun-loop envelope in bytes: {figures:?}");
     for (n, bytes) in &figures {
         assert!(
-            *bytes <= BOUND_BYTES,
+            *bytes <= SINGLE_READ_BYTES,
             "a {n}-iteration fun-loop holds {bytes} bytes of off-heap payloads, past the \
-             {BOUND_BYTES}-byte budget (a bounded sawtooth never exceeds it): {figures:?}"
+             {SINGLE_READ_BYTES}-byte single-read bound (a reservoir bounded by one slice never \
+             exceeds it): {figures:?}"
         );
     }
     let (_, small) = figures[0];
