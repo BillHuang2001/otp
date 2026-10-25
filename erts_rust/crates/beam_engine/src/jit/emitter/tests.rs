@@ -849,9 +849,9 @@
 
     #[test]
     fn emits_mov_mr8_which_stores_exactly_one_byte() {
-        // The value argument lands in `rsi` (System V second argument), so the plain
-        // store below is a byte store of `sil` — the highest-risk source, because
-        // without the forced `REX` code 6 reads as `DH`.
+        // The value argument lands in `rsi` (System V second argument); each fixture
+        // moves it into `src` and byte-stores that register. `src = Rsi` is the
+        // highest-risk case, because without the forced `REX` code 6 reads as `DH`.
         let store = |src: Reg| {
             let buf = byte_store_through(src);
             let f: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
@@ -905,6 +905,19 @@
         let mut scratch = [0_u8; 8];
         two(scratch.as_mut_ptr(), 0xFF);
         assert_eq!(scratch, [0xFF, 0, 0, 0, 0, 0xFF, 0, 0]);
+
+        // …including a **negative** displacement, which a payload writer needs when it
+        // goes back to patch a length prefix it already emitted.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_mr8(Reg::Rdi, -2, Reg::Rsi).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let back: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
+        let mut scratch = [0_u8; 8];
+        // The window starts at `[4]`, so a `-2` displacement lands at `[2]`.
+        let interior = scratch[4..].as_mut_ptr();
+        back(interior, 0x7E);
+        assert_eq!(scratch, [0, 0, 0x7E, 0, 0, 0, 0, 0]);
     }
 
     #[test]
