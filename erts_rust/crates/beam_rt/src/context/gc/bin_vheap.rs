@@ -39,6 +39,34 @@
 //! it just evacuated, while this runtime's payloads live outside every heap the collector owns and
 //! so need a separate reachability question against the same roots.
 //!
+//! # The release is park-gated, whole, and never gate-triggered
+//!
+//! * **Park-gated.** [`reclaim`] runs at a **pre-emption** (`Yield`) park only — see *The residual*
+//!   below — so an idle process keeps every payload it built until it is next pre-empted.
+//! * **Whole.** A park that reaches the release clears every handle no root names: an
+//!   env-gated census of `released` / `retained_by_live` / `retained_by_shared` over every shape
+//!   measured (a plain `<<0:(B*8)>>` build, `binary:copy/2`, `base64:encode/1`,
+//!   `list_to_binary/1`, `binary:part/3`, a `<<Acc/binary, Chunk/binary>>` accumulator, an
+//!   ETS-inserted-then-dead payload, a `lists:foldl` lambda) reads `retained_by_live = 0` and
+//!   `retained_by_shared = 0` at **every** park, with `released` equal to the reservoir minus the
+//!   one term being returned. So the `refcount() > 1` belt is a belt, not a working set, and the
+//!   peak a park-reaching loop shows is one pre-emption window rather than a sum over parks:
+//!   `erlang:memory(binary)` after the last park is the same figure at N = 20 000 as at N = 40 000
+//!   while the park count doubles.
+//! * **Never gate-triggered.** Every gate in [`reclaim`] is a **decline**: none of them can ask
+//!   for, cause or widen a reclaim. `OffHeapReclaimer::triggered` in particular is the C's
+//!   `MSO(p).overhead > bin_vheap_sz`, consulted as a gate; nothing reads it to *request* a prune.
+//!   One slice's dead garbage is therefore bounded by the slice length, never by the configured
+//!   budget, and a process whose own reservoir stays under the trigger releases nothing between
+//!   its parks.
+//! * **The reference-thing exemption.** The prune-only valve's `Criterion::PayloadPrune` hit set
+//!   excludes an inert reference thing (`super::gc_walk::is_inert_reference`: an internal or
+//!   external reference block). That is the one narrowing of the valve, and it is sound because a
+//!   reference's payload words are terms or packed `u32` ids — never a term reference and never a
+//!   `BinRef.val` pointer — so such a word can name no payload. Excluding it keeps the residual a
+//!   **leak** and never a dangle; without it any process holding one live `make_ref/0`,
+//!   `monitor/2` or `alias/1` reference (or an unnamed ETS tid) declines the prune at every park.
+//!
 //! # Why the single reclamation point is the slice-boundary park
 //!
 //! A prune is only sound against the process's **complete** root set, and only one site has both
@@ -72,13 +100,17 @@
 //! * A slice that **never pre-empts** reaches neither arm, and that is the unbounded case. On the
 //!   default native baseline tier a linked chain charges **no reduction per link**
 //!   (`Linker::emit_tail_exit` jumps straight to the successor entry and
-//!   `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop), so a BIF-free
-//!   self-recursive tail loop — `f(N) -> _ = <<0:(B*8)>>, f(N-1).` — runs its **whole**
-//!   computation inside one slice: no park, no prune, and the reservoir grows **linearly with the
-//!   loop count**. Measured on this tree: 1.31 GB of dead `binary_alloc` payloads after 20 000
-//!   iterations of a 64 KiB binary, with `erlang:memory(binary)` reporting every byte of it; the
-//!   same program under `BEAM_RT_TIER=interpreter` (which charges one reduction per instruction)
-//!   is a bounded sawtooth of ≤ 203 payloads. That contrast pins the mechanism to the **linked
+//!   `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop) and a BIF dispatch or
+//!   `call_ext` only *spends* (`BudgetProbe::spend` prices, never refuses), so a self-recursive
+//!   tail loop whose body is a binary build — with or without BIF calls — runs its **whole**
+//!   computation inside one slice: no park, no prune, and the payload bytes grow **linearly with
+//!   the loop count**. Measured on this tree: exactly `N × 4 144` bytes of dead `binary_alloc`
+//!   payloads for a 4 096-byte build (`0 → 82 880 000` across N = 2 000 → 20 000) with
+//!   `erlang:memory(binary)` reporting every byte and **no trough anywhere**; the bytes do not come
+//!   back after the owning process is killed (the same reading 200 ms / 2 s / 8 s later), while a
+//!   child that exits normally leaves `0`. Earlier figures: 1.31 GB after 20 000 iterations of a
+//!   64 KiB binary. The same program under `BEAM_RT_TIER=interpreter` (which charges one reduction
+//!   per instruction) is a bounded sawtooth of ≤ 203 payloads. That contrast pins the mechanism to the **linked
 //!   tail exit**, not to this point: nothing here is skipped, the point is simply never reached.
 //!   The repair is a charge on the linked-exit path — a `beam_engine` change
 //!   (`jit/baseline/runtime.rs::jit_tail_call`, plus `emit/link.rs`'s `call_only`/`jump` arm for
@@ -90,11 +122,15 @@
 //!   unsound outright because a running machine's roots are unpublished (see the two bullets
 //!   above).
 //!
-//! # Reading `erlang:memory(binary)` against this point: the figure is a slice phase, not a leak
+//! # Reading `erlang:memory(binary)` against this point: a slice phase for a park-reaching loop,
+//! a real leak for a slice that never ends
 //!
 //! A dead payload is freed only here, so between two parks `erlang:memory(binary)` reports exactly
 //! the payloads the slice has built since the last park, and a read taken at a **fixed iteration
-//! offset** therefore always samples the same point of the slice cycle. Measured on this tree with
+//! offset** therefore always samples the same point of the slice cycle — **for a loop that
+//! pre-empts**. The framing does not transfer to the non-pre-empting shape of *The residual*
+//! below: there the figure has no trough at all and grows with the loop count, which is the real
+//! unbounded leak, and a fixed-offset read of it grows with N rather than sampling a phase. Measured on this tree with
 //! a 4 KiB payload and a 1 000-iteration block: the block reads `0` at **every** rung when it is
 //! `999` iterations (the read lands exactly on a park), `k` payloads at rung `k` for `1 000`,
 //! `2k` for `1 001` and `3k` for `1 002`. A 2 000-rung `1 000`-iteration ladder is hard-capped at
