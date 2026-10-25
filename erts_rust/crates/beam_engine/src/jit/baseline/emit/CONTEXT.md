@@ -310,10 +310,12 @@ by construction).
   is what makes the file cohesive — each arm is one `try_inline_*` call plus an `emit_deopt` fallback —
   so splitting it further would scatter one decision across files or require inventing a visitor/table
   abstraction the emitter does not need. The block prologue it emits first is `prologue.rs`; the other
-  files are near or under the ~1000-line guidance (`test.rs` 979, `compile.rs` 1009, `aggregate.rs` 761,
-  `link.rs` 1136, `move.rs` 774, `block.rs` 1116, `mod.rs` 442, `regs.rs` 384, `liveness.rs` 153) —
-  `link.rs` and `compile.rs` exceed it by a little; neither is a single-scatter candidate today.
-- **`test.rs` (963) and `aggregate.rs` (744) are under the guidance but still large**: `test.rs` keeps
+  files are near or under the ~1000-line guidance (`test.rs` 979, `arith.rs` 978, `aggregate.rs` 761,
+  `move.rs` 774, `mod.rs` 490, `regs.rs` 384, `liveness.rs` 153) — `link.rs` 1136, `compile.rs` 1188,
+  `regalloc.rs` 1282 and `block.rs` 1567 exceed it, each one cohesive unit (the linker, the
+  compilation entry points, the register picker, the lowering dispatch); none is a single-scatter
+  candidate today.
+- **`test.rs` (979) and `aggregate.rs` (761) are under the guidance but still large**: `test.rs` keeps
   the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
   `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers
   live in `aggregate/list.rs`.
@@ -333,5 +335,6 @@ by construction).
 - **The code-size budgets.** `compile.rs::function_capacity_estimate` adds `BS_PATH_BYTES = 448` for **every** bitstring instruction and `BS_MATCH_COMMAND_BYTES = 320` for **every** accepted `bs_match` command, whether or not a predicate claims it — a predicate runs at emit time, the estimate runs before it, and an under-estimate is a `SystemLimit` compile error.
   `BS_PATH_BYTES` is sized on `bs_get_integer2`'s widest path (≈380 B: the `Y` guard ≈50, the context guard ≈40, the remaining-window guard and fail arm ≈60, the subject classification ≈130, the extractor ≈60, the tag/commit/store ≈40) in front of the ≈150 B `emit_step_and_continue` fallback `INSTRUCTION_BYTES` already covers; `BS_MATCH_COMMAND_BYTES` on the widest command, `integer` (≈300 B: the remaining guard ≈35, the subject classification ≈130, the extractor ≈90, the position advance + tag/store ≈45), with `ensure_*`/`skip` under 60 B each.
   `CREATE_BIN_PATH_BYTES = 16_384` is added for **every** `bs_create_bin` (`create_bin_paths`), on top of that instruction's own `INSTRUCTION_BYTES`: the construction shape's stores are emitted one byte at a time, so the budget is sized on the worst accepted shape — `MAX_FIELDS = 16` fields × 8 bytes plus `MAX_TAIL_BYTES = 256` constant bytes, with the guards, the helper call and the destination store added.
+  Each of the newer match-context shapes charges a path budget of its own on top of `BS_PATH_BYTES`, because its sequence is wider than the shared match-context guards it reuses: `BS_MATCH_STRING_PATH_BYTES = 2_304` per `bs_match_string` (one emitted triple per pattern byte, bounded by `match_string::MAX_MATCH_BYTES = 64`), `UTF32_PATH_BYTES`/`UTF16_PATH_BYTES` = 1 024 each and `UTF8_PATH_BYTES = 2_048`. Like the other path budgets they are charged whether or not a predicate claims the instruction, because the estimate runs before the predicate and an under-estimate is a `SystemLimit` compile error.
 - **The register-cache gate** (`regalloc.rs::{cacheable_touches, cacheable_reads, cacheable_writes, is_inlined}`) and the `Y` gate (`arith.rs::uses_y`) consult the same `*_shape` functions and the label-free `<Shape>::of(...)` constructors, so the emitted register set, the block's dirty-spill set and the `Y` refresh decision are derived from one decision. A shape's destination must be charged as **written** — the value lands in that cache register, so an uncharged write lets a stale register survive a block exit.
 

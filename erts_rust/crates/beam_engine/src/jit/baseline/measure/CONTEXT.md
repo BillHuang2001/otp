@@ -238,7 +238,7 @@ run entry), never as a speedup, consistent with the neutral record at `../../../
 shapes (`../inlineset/CONTEXT.md`, `../emit/bitstr_inline/CONTEXT.md`) runs a shape inside a block
 instead of through one helper call per instruction, per byte of the subject; the `bs_create_bin`
 construction arm on top of it writes an append accumulator's field bytes in-block.
-**Lever 1, the `bs_*` match/position shapes.** Measured as a **paired A/B inside one session**: two `beam_rt` binaries built from the same tree by
+**Lever 1, the `bs_*` match/position shapes — an earlier session's paired A/B, kept as the only measurement of that shape set as a whole.** Measured as a **paired A/B inside one session**: two `beam_rt` binaries built from the same tree by
 reverting only `src/jit` to `2115f8d696` (`$BEAM_RT` selects the binary; the bench records which one
 it ran in `runtimes[].program`), the two legs **interleaved** round by round, 3 rounds,
 `taskset -c 3` + `setsid -w`, `BENCH_TIER=baseline BEAM_RT_TIER=baseline`, release, one process at a
@@ -261,19 +261,25 @@ time, `/proc/loadavg` 1.92–3.74 recorded at every leg:
   at 6–12) reads 13.38→8.86 / 8.96→8.34 / 16.30→15.28 / 12.47→12.98 — consistent with the paired A/B
   on three cases and *wrong* on `encode`, because the oracle leg itself moved 32 % with the load
   (309.2→208.9 ns). Use the paired A/B; a cross-date pair of ratios is not evidence on this host.
-**Lever 2, the `bs_create_bin` construction arm.** A private-append build's field bytes are written in-block: straight-line stores for the byte-aligned route, one bit-write per field for the bit-granular route, and the window-end commit emitted last (`../emit/bitstr_inline/CONTEXT.md`). Measured as its own **paired A/B inside one session**: two `beam_rt` release binaries built from the same tree (the "no-inline" leg = this worktree's pre-change HEAD `13c9778374`, the "inline" leg = the final tree), `$BEAM_RT` selecting the binary (the bench records it in `runtimes[].program`), the two legs **interleaved round by round with the order rotated** across **5 rounds**, `taskset -c 3` + `setsid -w`, `BENCH_TIER=baseline BEAM_RT_TIER=baseline`, `tools/bench run --quick --runtime {rust,sys} --workloads foreign`, one process at a time, release, `/proc/loadavg` **2.38–5.56** recorded before and after every leg (each leg ≈8 s):
+**Lever 2, the `bs_create_bin` construction arm — this round's authoritative paired A/B.** A private-append build's fields are written in-block on **three routes**: straight-line stores at `cursor + field_offset` for the byte-aligned route, in-block field stores for a bit-granular plan whose every field is at most `MAX_INLINE_FIELD_BITS` (57) bits, and one `binary all` copy-and-commit for a whole-binary tail (`../emit/bitstr_inline/CONTEXT.md`). Measured on the merged tree as **two `beam_rt` release binaries from the same source tree**: the "inline" leg is this HEAD (`85e5293043`), the "no-inline" leg its base `63daa107fc` built in a detached worktree, so the only difference between the two binaries is the round's `src/jit` + `src/families` diff. `tools/bench`'s `foreign` workload only, `$BEAM_RT` selecting the binary (the bench records it in `runtimes[].program`), `taskset -c 3`, `BENCH_TIER=baseline BEAM_RT_TIER=baseline`, **6 rounds with the two legs interleaved and the order rotated every round**, each invocation `bench run --quick --workloads foreign --runtime all` (3 internal rounds), per-case `ns_per_call` **medians over the 6 rounds**:
 
-| case (matched N) | sys ns | no-inline ns | inline ns | **A/B (median)** | per-round A/B | ratio no-inline | ratio inline |
-|---|---|---|---|---|---|---|---|
-| `case_bstr_to_lower_ns_per_call` (50 000) | 327.4 | 2 726.3 | **2 160.2** | **1.2621×** | 1.2621 / 1.2545 / 1.2493 / 1.2727 / 1.2726 | 8.32 | **6.63** |
-| `case_bstr_capitalize_token_ns_per_call` (40 000) | 326.0 | 2 853.1 | **2 216.7** | **1.2839×** | 1.2871 / 1.2943 / 1.2670 / 1.2839 / 1.2777 | 8.77 | **6.89** |
-| `case_emqx_base62_encode_ns_per_call` (60 000) | 210.0 | 2 742.5 | 2 778.9 | **0.9857×** | 0.9857 / 0.9842 / 0.9826 / 0.9917 / 0.9894 | 13.07 | 13.24 |
-| `case_emqx_base62_decode_ns_per_call` (60 000) | 283.4 | 4 382.1 | **3 998.4** | **1.0896×** | 1.0834 / 1.1009 / 1.1305 / 1.0896 / 1.0829 | 15.49 | **14.08** |
+| case (matched N) | sys ns | no-inline ns | inline ns | **A/B (median)** | ratio no-inline | ratio inline |
+|---|---|---|---|---|---|---|
+| `case_bstr_to_lower_ns_per_call` (50 000) | 335.8 | 2 180.9 | **2 155.2** | **1.0119** (1.2 % faster) | 6.50 | **6.58** |
+| `case_bstr_capitalize_token_ns_per_call` (40 000) | 316.8 | 2 231.0 | **2 223.9** | **1.0032** (0.3 % faster) | 7.04 | **6.96** |
+| `case_emqx_base62_encode_ns_per_call` (60 000) | 210.9 | 2 783.6 | **2 558.2** | **1.0881** (8.8 % faster) | 13.20 | **12.08** |
+| `case_emqx_base62_decode_ns_per_call` (60 000) | 286.9 | 3 986.6 | **3 775.7** | **1.0558** (5.6 % faster) | 13.89 | **13.26** |
 
-The `sys` column is the same session's oracle-leg median and the per-leg medians are over the 5 rounds; this session is not lever 1's, so its ratio columns are not comparable with that table's and only the A/B within each session means anything.
-- The A/B is **same-session and paired**, which is the only load-robust figure on this host; a cross-session pair of ratios is not evidence (see the cross-session row above).
-- `to_lower` and `capitalize_token` gain because their per-element `bs_create_bin` (a `Y`-slot accumulator) now runs in-block, and `decode` gains from the bit-granular `integer 6` append; `encode`'s `binary all` shape is still helper-backed by design, so its ~1.4 % consistent slowdown is a code-layout effect with no shape change for that kernel — recorded as an honest negative rather than hidden.
-- Each A/B reproduces to ≤1.9 % / ≤2.2 % / ≤0.9 % / ≤4.4 % spread across the 5 rounds (`to_lower` / `capitalize_token` / `encode` / `decode`), far outside round noise for the two big movers.
+Per-round A/B (no-inline ÷ inline, measured inside the same round) — the stability evidence:
+- `to_lower`: 1.0105 1.0052 1.0129 1.0206 1.0108 1.0161 (median 1.0118).
+- `capitalize_token`: 1.0076 1.0182 1.0035 1.0025 1.0084 0.9976 (median 1.0056).
+- `encode`: 1.0826 1.1027 1.0894 1.0770 1.1000 1.0817 (median 1.0860).
+- `decode`: 1.0637 1.0457 1.0270 1.0825 1.0474 1.0570 (median 1.0522).
+- `encode` and `decode` clear the session noise floor in every one of the six rounds; `to_lower`'s 1.2 % and `capitalize_token`'s 0.3 % sit **at** it (their per-round A/B straddles 1.0), so only the two big movers are claimed as effects.
+- **The sys-side cross-leg drift is that noise floor, measured:** the *same* oracle binary runs in both legs, and its no-inline ÷ inline ratio reads `to_lower` 1.0081, `capitalize_token` 0.9802, `encode` 0.9955, `decode` 1.0097 — 0.2 % to 2.0 % per case with no code difference at all.
+- Discipline: `/proc/loadavg` (1-min) recorded immediately before and after every leg, **1.88–3.22** throughout on a 14-core host, every run pinned to CPU 3, wall 16.8–17.0 s per invocation, one process at a time. The deterministic counters were **identical on all 12 runs** (rust calls: `to_lower` 50 000, `capitalize_token` 40 000, `encode` 60 000, `decode` 60 000), so they are the contention-immune anchor and only the paired A/B is quoted as a timing.
+- **The seven newly inlined match-context shapes are coverage-only on these four kernels and contribute none of the deltas above.** `beam_disasm` of the staged upstream sources (`cowboy_bstr.erl`, `emqx_base62.erl`) shows **zero** `bs_match_string`, `bs_skip_utf8`/`bs_get_utf8`, `bs_skip_utf16`/`bs_get_utf16` or `bs_skip_utf32`/`bs_get_utf32` instructions — OTP folds a binary literal ≤ 64 bits into `bs_match` — so every measured delta comes from the **construction arm's helper cut** (the retired `jit_open_append_bin_y` door, and `jit_write_bit_field` now emitted only for a field wider than 57 bits), never from the new shapes. A kernel that reaches one of those seven is what would exercise them; these four do not.
+- The per-shape emission counts agree (`../foreign_kernel_tests.rs`'s cache-free compile, ten rows, all passing; deterministically identical on every run): zero deopts on all four kernels and `encode/2`'s `bs_match`/`bs_start_match4` also at zero, with the construction instances splitting as the "construction sites each kernel actually lowers" list below records.
 - A `bs_start_match3/4` **fresh** context is also still helper-backed (a rooted 5-word
   `ErlSubBits` allocation); only the reuse/rebind path is inlined.
 - Method caveat: the bench's Rust-side `case_*_ns_per_call` is **N-dependent** (its own note records
