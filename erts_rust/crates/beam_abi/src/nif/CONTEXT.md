@@ -116,6 +116,16 @@ The driver-side gaps are `../driver/CONTEXT.md`'s; the cross-cutting ones (undec
 - **`enif_send` throughout this tree copies** where the C transfers the message-env fragment chain; a `stop`-less resource type answers the host's code and runs no callback (the oracle SIGSEGVs on that shape).
 - **`enif_time_offset/1` has no `erl`-oracle pin** (its monotonic-time relation is pinned by unit tests only, `enif/time.rs`).
 
+## Constraints
+- **The C ABI shape is frozen by the parent.** `nif::{term,types,api}` are `../CONTEXT.md`'s; nothing here may change a struct layout, an enum width, a fn-pointer signature or the 176-entry table width.
+- **The aliasing contract above is not style.** No `&mut self` accessor on `NifEnv`, no plain (non-interior-mutable) callback-visible host field, no live `&`/`&mut` to a host across a call into foreign code.
+- **No new `#[no_mangle]` `enif_*` symbol**; a family's slots live in that family's file (extend its `populate`, never `mod.rs`); a host-extension helper is a plain `pub fn`.
+- **No `beam_codec` dependency edge.** ETF goes through `NifHost`; the crate's dependencies are `beam_common`, `beam_term`, `beam_alloc` and `libc` (the C-variadic shim additionally wants `$CC`/`$AR`, both optional — absence degrades, never fails the build).
+- **`unsafe` discipline** — every FFI declaration documented, every `unsafe` block preceded by a `// SAFETY:` rationale, `unsafe_op_in_unsafe_fn` clean; the raw-pointer ABI wrappers carry a scoped `allow(clippy::not_unsafe_ptr_arg_deref)` with the rationale inline.
+- **Both profiles are the gate** for anything touching a host seam or an env accessor (`--release` too; CI is debug-only).
+- **Licensing:** every new `*.rs` file here carries the OTP Apache-2.0 `%CopyrightBegin% … %CopyrightEnd%` header block, byte-exactly as `scripts/license-header.es` enforces.
+- Files target ~1000 lines (this node's `host.rs` is just over, and `api.rs` is a legitimately long generated table); split by responsibility.
+
 ## Routing Table
 - `mod.rs` → module docs, the `term`/`types`/`api`/`host`/`enif`/`loader` wiring (re-exported through `src/lib.rs`)
 - `term.rs` → `ERL_NIF_TERM`/`ERL_NIF_UINT`, the `Eterm ↔ ERL_NIF_TERM` seam
