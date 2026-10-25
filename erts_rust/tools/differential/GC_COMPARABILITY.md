@@ -13,8 +13,7 @@ baseline-JIT tier **and** under `BEAM_RT_TIER=interpreter`.
 
 The oracle is the system `erl` (OTP 29.1.1 / erts-17.1); a pinned golden is that VM's
 **single-line stdout** for the wrapped expression.
-`Probe::TermToBinary` is the default: the canonical `term_to_binary/1` image of the result is
-order-stable, so a map's `~w` key order can never leak into a golden.
+`Probe::TermToBinary` is the default: the `term_to_binary/1` image of every term this group builds is order-stable — the group's maps are integer-keyed, and integer keys have a single canonical order — so a map's `~w` key order can never leak into a golden.
 Forcing a collection with `erlang:garbage_collect/1` or `/2` and then observing the surviving term
 is the cleanest possible invariant check: the expression is pure, so *any* difference in the answer
 is a collector bug (a dropped, duplicated, mis-forwarded or mis-sized live term), not an environment
@@ -50,30 +49,14 @@ runtime's `run` action, where allocation and collection are driven by the engine
 
 ## Deliberately NOT pinned — internal counter, invariant, or capability gap
 
-`erlang:process_info(self(), memory)`'s **byte total** is not pinned (the oracle answers `21616`
-where the Rust runtime answers `3728`): it is a per-runtime heap-accounting figure, i.e. an
-internal counter, not an oracle value.
-`erlang:process_info(self(), garbage_collection)`'s **counter and limit values** (`minor_gcs`,
-`min_heap_size`, `fullsweep_after`, `min_bin_vheap_size`) are not pinned: `minor_gcs` is live and
-the limits are per-runtime allocator policy, so only the key set, the field types and `max_heap_size`
-being a map are.
-The `max_heap_size` option **map image** is not pinned either, and this one is a **divergence, not a
-volatility**: `term_to_binary/1` of that map orders its atom keys differently in the two runtimes
-(the oracle emits `error_logger, include_shared_binaries, kill, size`; the Rust runtime emits
-`kill, error_logger, include_shared_binaries, size`), so pinning the image would be a `mismatch`.
-It is the multi-key atom-keyed map divergence recorded in `divergences.md` (A.5).
-The same divergence reproduces on the smallest possible term
-(`term_to_binary(#{b => 2, a => 1})`), so it is a property of the runtime's ETF encoder, not of the
-collector; it is left out of this group for that reason (the `wire` group pins no multi-key
-atom-keyed image — only single-key ones and float/list/binary-keyed images).
-`erlang:process_info(self(), binary)` **is** served by both runtimes and is oracle-compared by its
-**shape** (`gc/process_info_binary_item_shape`): the item is tagged `binary`, its value is a list,
-and every element is a three-integer tuple `{Ref, Size, Refc}` (vacuously true for the Rust
-runtime's empty list).
-Its **entry list** is not pinned, because each entry is `{Ref, Size, Refc}` carrying a per-runtime
-heap **address** — the oracle lists the off-heap binaries an `-eval` process already holds, while
-the Rust runtime answers `[]` — so only the tag, the list type and the element shape are
-comparable.
+`erlang:process_info(self(), memory)`'s **byte total** is not pinned (measured at this revision: the oracle answers `13712` where the Rust runtime answers `1864`, each stable over repeated runs): it is a per-runtime heap-accounting figure, i.e. an internal counter, not an oracle value.
+`erlang:process_info(self(), garbage_collection)`'s **counter and limit values** (`minor_gcs`, `min_heap_size`, `fullsweep_after`, `min_bin_vheap_size`) are not pinned: `minor_gcs` is live and the limits are per-runtime allocator policy, so only the key set, the field types and `max_heap_size` being a map are.
+The `max_heap_size` option **map image** is not pinned as a plain `term_to_binary/1` image: the two runtimes order its atom keys differently (the oracle emits `error_logger, include_shared_binaries, kill, size` in 6 of 6 runs, the Rust runtime `kill, error_logger, include_shared_binaries, size` in 6 of 6), so a golden on it would be a `mismatch`.
+That ordering is the multi-key atom-keyed map interior recorded in `divergences.md` (A.5), so it is a property of the runtime's ETF encoder rather than of the collector, and it reproduces on the smallest possible term: the plain image of `#{b => 2, a => 1}` comes out `b, a` in 5 of 8 oracle launches and `a, b` in the other 3, because the oracle's own order is not stable across `-eval` VM starts.
+The `max_heap_size` map's **`[deterministic]`** image IS pinnable: `term_to_binary/2`'s `[deterministic]` sorts the keys into canonical term order on both runtimes, and it agrees for that map and for `#{b => 2, a => 1}` (the `a`, `b` image, 6 of 6 oracle runs and 4 of 4 here).
+The `wire`/`wire_extra` groups pin no multi-key atom-keyed image at all: they carry the single-key atom-keyed images (where the order is vacuous), the order-stable float/list/binary-keyed multi-key images (`wire/map_ext_canonical_key_order_float_list_binary`, `wire/map_ext_binary_key_order`), and multi-key maps otherwise only through order-free relations (`maps:size/1`, a sorted `maps:to_list/1`, and `=:=` against a recomposed term).
+`erlang:process_info(self(), binary)` **is** served by both runtimes and is oracle-compared by its **shape** (`gc/process_info_binary_item_shape`): the item is tagged `binary`, its value is a list, and every element is a three-integer tuple `{Ref, Size, Refc}` (vacuously true for the Rust runtime's empty list).
+Its **entry list** is not pinned, because each entry is `{Ref, Size, Refc}` carrying a per-runtime heap **address** — measured at this revision, the oracle lists 2 entries for a plain `-eval` process and 5 (the 100 000-byte one included) after `binary:copy(<<1>>, 100000)`, while the Rust runtime answers `{binary,[]}` in both shapes — so only the tag, the list type and the element shape are comparable.
 `erlang:garbage_collect/1`'s **reduction cost**, the nursery/mature sizes and any GC trace output are
 not pinned: none of them is observable through the black-box CLI contract the harness uses.
 The `gc/*` cases therefore assert nothing about *how* the collector works — only that every value it

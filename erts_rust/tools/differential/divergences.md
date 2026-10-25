@@ -138,18 +138,24 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `driver_dl_open(NULL)` + `driver_dl_sym` SIGSEGVs the oracle.
 
 ## A.5 — distribution wire / ETF (owner: `beam_codec`, `beam_rt`)
-- A **multi-key atom-keyed** small map has **no pinnable interior order**. The Rust runtime
-  keeps the map's construction order — both `term_to_binary(#{a => 1, b => 2})` and
-  `term_to_binary(#{b => 2, a => 1})` emit the two keys in source order — while the oracle's
-  order for the same term is a *per-VM* order that is canonical **within** one VM (independent
-  of the source order) but **not stable across `-eval` VM starts**: `maps:keys(#{a => 1, b => 2})`
-  answers `[a,b]` on some starts and `[b,a]` on others, and the map's `MAP_EXT` image flips with
-  it. So a byte or `~w` assertion on a multi-key atom-keyed map would be flaky on the *oracle*
-  side, not merely on the runtime's; no corpus case pins one — only single-key images (where the
-  order is vacuous) and `=:=`/sorted/`maps:size` projections are pinned.
-  **Integer**-, **float**-, **binary**- and **list**-keyed maps are order-stable in both runtimes
-  and are pinned (`wire.rs`/`wire_extra.rs`, incl. the non-canonical-wire-order canonicalization
-  case and the >32-key HAMT round trip). Owner: `beam_codec` / `beam_term`.
+- A **multi-key atom-keyed** small map has **no pinnable interior order**, and the difference is an
+  interior order rather than a semantic one. Measured: the Rust runtime's order is stable within a
+  build (`term_to_binary(#{a => 1, b => 2})` and `term_to_binary(#{b => 2, a => 1})` both emit `b`
+  then `a`, 8 of 8), the oracle's is canonical **within** one VM but **not stable across `-eval` VM
+  starts** (`term_to_binary(#{b => 2, a => 1})` emitted the `b, a` image in 5 of 8 launches and the
+  `a, b` image in the other 3, and a `~w` flips with it), and the two stable orders need not agree at all (the
+  `process_info(self(), garbage_collection)` `max_heap_size` map is
+  `error_logger, include_shared_binaries, kill, size` in the oracle over 6 of 6 runs and
+  `kill, error_logger, include_shared_binaries, size` here over 6 of 6). So a byte or `~w` assertion
+  on a multi-key atom-keyed map is unsafe on either count, and no corpus case pins one — only
+  single-key images (where the order is vacuous) and `=:=`/sorted/`maps:size` projections are
+  pinned. `term_to_binary/2`'s **`[deterministic]`** sorts the keys into canonical term order on
+  **both** runtimes and is served (`term_to_binary(#{b => 2, a => 1}, [deterministic])` is the `a`,
+  `b` image, 6 of 6 oracle runs and 4 of 4 here; the `max_heap_size` map's deterministic image
+  agrees too), so it is the one form a byte golden may carry. **Integer**-, **float**-,
+  **binary**- and **list**-keyed maps are order-stable in both runtimes and are pinned
+  (`wire.rs`/`wire_extra.rs`, incl. the non-canonical-wire-order canonicalization case and the
+  >32-key HAMT round trip). Owner: `beam_codec` / `beam_term`.
 
 ## A.7 — process signals (owner: `beam_bifs` / `beam_process`)
 - `unlink/1` on a **port** raises `error:badarg` in the Rust runtime (the port's link is not
@@ -313,10 +319,12 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 
 ## A.4 — port/driver observable grammar (owner: `beam_rt` / `beam_io`)
 - **`port_info(P, memory)` after `port_set_data/2`**: the item agrees on a plain port
-  (`{memory,48}` on both), but the word count differs once a term is stored on it (`{memory,160}` in
-  the oracle against `{memory,120}` in the runtime for a 3-element list) — an accounting residual, so
-  only the plain-port item and the `port_set_data/2`/`port_get_data/1` round trip (which returns
-  `true`, not `ok`) are pinned. Owner: `beam_rt`.
+  (`{memory,48}` on both), but the word count differs once a term is stored on it (measured 4 of 4
+  runs each: `{memory,160}` in the oracle against `{memory,120}` in the runtime for a 3-element
+  list, and the oracle grows with the term where the runtime's figure stays `120`) — an accounting
+  residual, so only the plain-port item and the
+  `port_set_data/2`/`port_get_data/1` round trip (which returns `true`, not `ok`) are pinned. Owner:
+  `beam_rt`.
 - **`port_connect/2` to another process only half-lands**: `erlang:port_connect(P, Other)` itself
   agrees (`port_info(P,connected)` is `{connected,Other}` on both), but once **`Other` has exited**
   the oracle kills the port — `port_info(P)` and every item are `undefined`, `port_close/1` raises
@@ -375,29 +383,20 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `{packet, 2}` / `{packet, 1}` observed on the raw peer),
   `inet_write/packet4_send_via_setopts_writes_the_prefix`,
   `inet_write/framed_sender_and_framed_receiver` and
-  `inet_write/packet4_send_prefixes_a_large_payload`, and the half-close and the write accounting
-  are `inet_write/shutdown_write_then_send_closes_the_writer` and
-  `inet_write/send_counters_advance_with_the_writes`. The write-side shapes that *stay* unpinnable
-  are the second send after a half-close (next entry) and the passive read below. Owner: `beam_rt` /
-  `beam_io`.
-- **A half-close's *first* send is pinnable; the write shapes beyond it are not.** After
-  `gen_tcp:shutdown(Cl, write)` a `gen_tcp:send/2` answers `{error,closed}` on **both** sides, which
-  is what `inet_write/shutdown_write_then_send_closes_the_writer` pins (exactly **one** send after
-  the shutdown). Beyond that one send:
-  - a **second non-empty** send is a typed capability gap (owner `beam_rt` / `beam_io`): oracle exit
-    `0` with `ok {ok,ok,{error,closed},{error,enotconn},<<104,105>>,closed}`, rust exit `3` with
-    `beam_rt: unsupported: opcode: run: process blocked (no message available)` (deterministic 2/2;
-    the driver marks the socket fully closed after the first failed write);
-  - a second **zero-length** send is a plain divergence (both exit `0`): the oracle answers `ok` for
-    every zero-length write on a write-shut socket, any number of times, where the rust runtime
-    answers `{error,closed}` on the second one — identical for `<<>>` and `[]` (owner `beam_rt` /
-    `beam_io`);
-  - `gen_tcp:send/2` after `gen_tcp:shutdown(Cl, read_write)` is racy **on the oracle**
-    (`{error,einval}` in 2 of 3 runs, `{error,closed}` in 1) against the rust runtime's stable
-    `{error,closed}`, so it is unpinnable and has no owner.
-  Pinned and agreeing around those: `inet_write/repeated_write_shutdown_keeps_the_writer_closed`,
-  `inet_write/empty_payload_after_write_shutdown_is_a_noop_success` (exactly one zero-length send)
-  and `inet_write/datagram_write_after_close_is_closed`.
+  `inet_write/packet4_send_prefixes_a_large_payload`, and the write accounting is
+  `inet_write/send_counters_advance_with_the_writes`. The only shape in this family that stays
+  unpinnable is the passive read of already-queued data (the entry below); the half-close's answer
+  matrix is pinned in full — `inet_write/shutdown_write_then_send_closes_the_writer` (the first send
+  is `{error,closed}`, then the repeated `shutdown(write)`/`shutdown(read)` are `{error,enotconn}`),
+  `inet_write/repeated_write_shutdown_keeps_the_writer_closed`,
+  `inet_write/empty_payload_after_write_shutdown_is_a_noop_success`,
+  `inet_write/zero_length_writes_after_write_shutdown_stay_ok` (nine spaced zero-length sends all
+  `ok`), `inet_write/second_nonempty_write_after_write_shutdown_is_enotconn` (the latch: every later
+  send, empty or not, is `{error,enotconn}`) and `inet_write/recv_after_a_write_latched_close` (the
+  read side of the same latch). The **`read_write`** half-close is measured and agrees too —
+  `gen_tcp:shutdown(Cl, read_write)` is `ok` and the two sends after it answer `{error,closed}` then
+  `{error,enotconn}` on both sides, 3 of 3 runs each — so no row spends a second connection on it,
+  since those are the same two answers the `write`-only rows pin. Owner: `beam_rt` / `beam_io`.
 - **A passive `gen_tcp:recv/2,3` whose data arrives while the recv is armed agrees**, and that is
   the shape a row may pin. A read with **nothing to read** answers `{error,timeout}` on both sides
   when its caller bound is 5000 ms or less, and is pinned
@@ -409,16 +408,20 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   divergence, not a capability gap. Owner: `beam_rt` / `beam_io`.
 - **The `inet:getstat/1` *send*-side counters are pinnable** — after two completed 3-byte writes both
   sides answer `{ok,[{send_cnt,2},{send_oct,6}]}` (`{ok,[{send_cnt,0},{send_oct,0}]}` before them) —
-  but the **recv**-side counters are racy **on the oracle** (`{2,6}` on one run, `{0,0}` on two
-  before the receives drain), so only a post-receive value may ever be pinned. Owner: `beam_io`.
-- **A bare-integer payload is written by the oracle and dropped by `beam_rt`.** `gen_tcp:send(Cl, 42)`
-  answers `ok` on both sides, but the oracle puts the single byte `42` on the wire where the runtime
-  writes nothing (measured: the peer receives `<<42,0,255,1,128>>` after a `42`, `<<0,255,1,128>>`
-  sequence on the oracle against `<<0,255,1,128>>` on `beam_rt`). The neighbouring bad-iodata shapes
-  **do** agree (`[256]` and `[<<"ab">> | 7]` are both `{error,einval}`, both sides), but the oracle
-  additionally writes a racy, timestamped `=ERROR REPORT==== … Bad value on output port 'tcp_inet'`
-  line to **stdout** for them, which makes any case around the badarg family unpinnable. Guarded by
-  `inet_write`'s `no_case_sends_a_bare_integer_payload`. Owner: `beam_rt` / `beam_io`.
+  the **recv**-side pair measures a drain and not the write path: for one 3-byte write drained in
+  full the reader answers `{recv_cnt,1}`/`{recv_oct,3}` and the writer `{recv_cnt,0}`/`{recv_oct,0}`
+  on both sides (measured 3 of 3 identical), but `recv_cnt` counts the driver's delivery events, so
+  it moves with how the arriving bytes coalesce (6 bytes read 5-then-1 answered `{1,5}` then
+  `{2,6}` in 6 of 6 oracle runs) — hence no row of this group puts them in a golden, while
+  `recv_oct` is the stable total. Owner: `beam_io`.
+- **The invalid-iodata send family cannot be a case.** `[256]` and `[<<"ab">> | 7]` are
+  `{error,einval}` on **both** sides, but the oracle also writes a racy, timestamped
+  `=ERROR REPORT==== … Bad value on output port 'tcp_inet'` line to **stdout** for them (measured: one
+  line in some runs, two in others) — which makes any golden in that family unpinnable. A plain
+  integer payload is **not** in this family: `gen_tcp:send(Cl, 42)` writes the single byte `42` and
+  then the following `<<"zz">>` on both sides (`{ok,<<42,122,122>>,ok}`, 3 of 3 runs each), so
+  `inet_write`'s `no_case_sends_a_bare_integer_payload` guard is about the error-report race above,
+  not about the integer byte. Owner: `beam_rt` / `beam_io`.
 ## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
 - `-extra foo`: the oracle prints a SIGTERM info report and **hangs** (no exit within a 20 s timeout);
   the Rust runtime exits `0`. A **plain argument after `--`** (`-- foo`) is a `mismatch`:
@@ -488,14 +491,20 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `-env Name=VALUE Value` split in `flags/env_switch_name_containing_equals`). Owner: `beam_rt`.
 
 ## A.7 — BIFs, ETS, printing, math (owner: `beam_bifs`, `beam_ets`)
-- `ets:info(T, stats)` is a typed capability gap (owner `beam_bifs`; the interiors are `beam_ets`):
-  a fresh 3-object `set` answers the **bare 8-tuple**
-  `{256,0.01171875,0.13926206529140472,0.10804153978824615,0,2,0,1}` in the oracle (identical over
-  two VM starts, and for `bag`/`duplicate_bag`) and `false` for an `ordered_set`, where the rust
-  runtime exits `3` with `beam_rt: unsupported: bif` (`crates/beam_bifs/src/ets.rs` maps `"stats"`
-  to `Err(unsupported_bif())`) — not catchable by the probe wrapper. The nearest served observation
-  is pinned by `ets/info_all_item_keys_and_deterministic_counters` (the `ets:info/1` item set and
-  its deterministic counters).
+- `ets:info(T, stats)` is **served** (owner `beam_bifs`; the interiors are `beam_ets`): a `set`
+  answers the **bare 8-tuple** `{Nactive, AvgChainLen, StdDevChainLen, StdDevExpected, MinChainLen,
+  MaxChainLen, KeptItems, NLocks}` (`erl_db.c:5585-5629`), an `ordered_set` without effective write
+  concurrency the atom `false` at every size, and a fine-locked `ordered_set` a 3-tuple. Elements
+  1–6 measure the oracle's bucket-chained hash where this runtime's `set` is a CHAMP tree, so they
+  are the interior's own and are never pinned. `KeptItems`/`NLocks` agree by value and are pinned by
+  `ets/info_stats_shape_and_the_two_agreeing_figures`,
+  `ets/info_stats_kept_items_counts_objects_missed_by_a_fixed_table` (a fixed table's retained
+  object reads `1` and is released back to `0` on unfix, and
+  `{debug_hash_fixed_number_of_locks, 1024}` fixes `NLocks` at the oracle's `1024`) and
+  `ets/info_stats_a_plain_ordered_set_is_false` (the same `false`, plus the fine-locked 3-tuple's
+  arity). The nearest served `ets:info/1` observation is pinned by
+  `ets/info_all_item_keys_and_deterministic_counters` (the item set and its deterministic
+  counters).
 - ETS query surface: `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a
   bare single-use ref where the oracle answers its own opaque `{Ref, _, _, Ref, _, _}` handle (so
   only the `{Matches, continuation}` split and the ref-ness are pinned).
@@ -635,17 +644,21 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   An encoding-order choice, not a semantic divergence. Owner: `beam_codec` / `beam_bifs`.
 
 ## A.2/A.7 — funs (owner: `beam_engine`, `beam_term`, `beam_bifs`)
-- **Calling a decoded `NEW_FUN_EXT` fun is broken** (owner `beam_engine`, the fun-call path for an
-  imported closure): `F = fun(X) -> X*2 end, G = binary_to_term(term_to_binary(F)), G(21)` answers
-  `42` in the oracle and `badarg` (exit `1`) in the rust runtime, while the encode, decode and
-  `is_function` halves of the same round trip all agree.
-- **`erlang:phash2/1,2` of a `make_fun3` *local* fun is a typed capability gap** (owners:
-  `beam_term`'s hashing + `beam_bifs`): `FunKind::Local` answers
-  `Err(TermError::FunIdentityUnavailable)`, so the BIF raises and the runtime exits `3` with
-  `unsupported: bif` — for an `-eval` closure and for a compiled module's fun alike. The
-  **imported** (`NEW_FUN_EXT`) form is served and agrees, and the oracle's relation
-  `phash2(F) =:= phash2(binary_to_term(term_to_binary(F)))` is `true`, so the imported form pins the
-  same hash (`phash2/local_fun_via_its_imported_image`).
+- **A fun decoded from its own `NEW_FUN_EXT` image is callable** and applying it is pinned:
+  `wire/decoded_new_fun_ext_closure_is_callable` applies a plain and a capturing closure,
+  `wire/decoded_new_fun_ext_bad_index_raises_badfun` pins `error:{badfun, F}` for an image whose
+  index names no lambda of the module (and for a corrupted 16-byte module checksum), and
+  `wire/decoded_new_fun_ext_unloadable_module_raises_undef` pins `error:undef` for an image naming a
+  module nothing can load. Owner: `beam_engine`.
+- **`erlang:phash2/1,2` and `erlang:phash/2` of a compiled module's `make_fun3` local fun are
+  served and agree** (owners: `beam_term`'s identity provider + `beam_bifs`):
+  `phash2/local_fun_make_fun3`, `phash/legacy_local_fun` and
+  `phash2/local_fun_via_its_imported_image` pin the relations — the 27-bit full-hash mask, the
+  `Range` arithmetic, stability, and the identity of the local hash with the hash of
+  `binary_to_term(term_to_binary(F))` — never a hash integer. An **`erl_eval`** closure is a
+  different identity and stays a typed capability gap: `erlang:phash2(fun(X) -> X + 1 end)` (oracle
+  `86202196`) is `beam_rt: unsupported: bif`, exit `3` — the same missing `erl_eval` attribution
+  that keeps `wire/new_fun_ext_encode` a gap. Owner: `beam_rt` / `beam_bifs`.
 - **No fun hash integer may be pinned.** A compiled local fun's `phash2` is stable across VM starts
   but **not** across compilations — its `uniq` rides the module CRC, which moves with the
   compile-time source path, so the same source hashes differently from two temp dirs — and
