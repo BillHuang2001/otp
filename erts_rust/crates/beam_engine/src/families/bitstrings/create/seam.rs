@@ -58,10 +58,13 @@
 //!   a segment list the prepared program resolves to the in-place accumulator form with
 //!   every later segment statically sized and side-effect free. Everything else is
 //!   `None`, which is not an error — it means "this instruction is not that shape".
-//! * The **tier** owns *what it can emit*: a `Some` plan may still be declined (a
-//!   register-operand form it does not lower, a bit-granular field its straight-line
-//!   byte stores cannot address, a payload capacity it cannot check inline). `None` from
-//!   a run-time door is the universal fallback signal: run the helper.
+//! * The **tier** owns *what it can emit*: a `Some` plan may still be declined (an operand
+//!   form it cannot bind — a `y` slot outside the published frame window, say — a plan that
+//!   mixes a [`Field::ConstBytes`] with a bit-granular field, a shape past its own
+//!   field/tail caps, a payload capacity it cannot check inline). A plan that is merely
+//!   **bit-granular** is not declined for that reason: the tier has a bit-granular route
+//!   that pairs the general door with [`write_bit_field`]. `None` from a run-time door is
+//!   the universal fallback signal: run the helper.
 //!
 //! The seam never decides the tier's business and the tier never re-derives the family's
 //! static facts (a second reading of the flag word or of a `StrT` window is exactly the
@@ -116,11 +119,14 @@
 //! while the window end is byte-aligned.
 //!
 //! * [`open_append`] is the **byte-aligned** door: it refuses unless the accumulator's
-//!   window end is on a byte boundary (`append_unit_allows(end_bits, 8)`). Every whole-byte
-//!   field lowering uses it.
+//!   window end is on a byte boundary (`append_unit_allows(end_bits, 8)`). The tier's
+//!   byte-aligned route — every field a whole number of bytes, addressed at
+//!   `cursor + byte_offset_i` — uses it.
 //! * [`open_append_any`] is the **general** door: it accepts any alignment (a bit-granular
 //!   field leaves the window ending mid-byte) and applies the plan's own unit gate
-//!   instead, so the shape it accepts is exactly the shape the family appends in place at.
+//!   instead — `end_bits % unit == 0` for `unit > 1`, `unit <= 1` ungated — so the shape it
+//!   accepts is exactly the shape the family appends in place at. A byte-aligned route may
+//!   use either door (the two agree whenever `unit` divides 8 and the end is byte-aligned).
 //!
 //! The general door is the one a bit-granular lowering pairs with [`write_bit_field`],
 //! since only that writer can place bits at a non-byte-aligned position.

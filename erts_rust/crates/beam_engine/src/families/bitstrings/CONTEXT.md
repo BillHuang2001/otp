@@ -108,9 +108,12 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   `bit_size/1`: the in-crate harness floor `src/bench/counting.rs`, which is what makes
   `emqx_base62:decode/1` measurable (`instr_per_call` 531, `rooted_calls_per_call` 32).
   The `#[allow(dead_code)]` on the function is load-bearing, not stale — its only caller is
-  `#[cfg(test)]`, so a plain `--lib` build would otherwise warn. The external test host
-  `tests/support/bifs.rs` still cannot reach it: integration tests see this crate from the
-  outside and `families` is a private module, so that floor would need a `pub` re-export.
+  `src/bench/counting.rs`, which `src/lib.rs` declares behind `#[cfg(test)] mod bench;`, so a plain
+  `--lib` build would otherwise warn. The external test host `tests/support/bifs.rs` still cannot reach
+  it: integration tests see this crate from the outside and `families`/`bitstrings` are only
+  `pub(crate)`, so that floor would need a `pub` re-export.
+  (`raw::write_bit_field` lost its allow — the construction seam's `seam::write_bit_field` calls it in
+  every build.)
 - `raw_tests.rs` → `raw`'s `#[cfg(test)]` unit tests, declared at the end of `raw.rs` as
   `#[cfg(test)] #[path = "raw_tests.rs"] mod tests;` so `super` is the `raw` module itself and
   its `#![allow(unsafe_code)]` is inherited: the frozen-layout accessors (`heap_bits`/
@@ -550,22 +553,26 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   `Vec<PreparedCommand>` with the command tag, flags, size/unit and `Dst` already resolved, which
   deletes the per-element `atom_name` + `&str` match, the flags literal-area read (the empty-list
   arm's own work) and the two `read_size` decodes while the load-time cost stays amortised.
-- **The reachability wall is this node's own `mod` declarations, not the crate root.** `src/lib.rs:109`
-  declares `pub(crate) mod families;`, so the items re-exported at `bitstrings/mod.rs` themselves —
-  `exec` (`:177`), `claimed` (`:136`), `bit_size` (`:83`) — ARE reachable from `src/jit/**`;
-  `jit/baseline/bitstr.rs:58` does exactly that. What is still private is `mod create; mod matching;
-  mod raw;` (`bitstrings/mod.rs:67-71`), and a private `mod` makes every `pub(crate)` body inside it
-  unreachable regardless of the item's own visibility. So these are **declared** seams that no caller
-  outside this node can resolve today: `matching/match_ctx.rs` (`enter_match`,
-  `read_ctx`/`reread_ctx`, `position_term`/`position_of` — the doc comment at `:29-37` states the intent),
-  `raw::{heap_bits, ctx_parts, set_ctx_start}`, and the whole construction side —
-  `create::assemble` (declared `pub(crate)`, `create/mod.rs:278`, whose doc comment claims the
-  construction side is reachable from outside, which it is not) and
-  `create::prepared::{prepare, assemble_prepared, CreateProgram, PreparedSeg, Width}` (whose module is
-  `pub(super) mod prepared;`, `create/mod.rs:139`, and whose own items are `pub(super)` = visible only
-  inside `create`). Opening a seam means widening the **enclosing `mod` declaration** as well
-  (`pub(crate) mod raw;` / `pub(crate) mod prepared;` / `pub(crate) mod create;`); widening an item
-  alone changes nothing.
+- **The reachability wall is this node's own `mod` declarations, not the crate root.** `src/lib.rs`
+  declares `pub(crate) mod families;` and `families/mod.rs` declares `pub(crate) mod bitstrings;`, so the
+  items re-exported at `bitstrings/mod.rs` themselves — `exec`, `claimed`, `bit_size` — ARE reachable
+  from `src/jit/**`; `jit/baseline/bitstr.rs` does exactly that. The same is now true of the
+  **construction** side: `bitstrings/mod.rs` declares `pub(crate) mod create;`, and
+  `create/mod.rs` in turn declares `pub(crate) mod seam;` / `pub(crate) mod prepared;`. That is the
+  enclosure chain `src/jit/**` resolves the construction seam through — the baseline tier's
+  `bs_create_bin` inline arm (`jit/baseline/emit/bitstr_inline/create.rs`) and its run-time helpers
+  (`jit/baseline/runtime.rs`'s `jit_open_append_bin*`/`jit_write_bit_field`) call
+  `crate::families::bitstrings::create::seam::*` directly, which is why `seam` needs no
+  `#[allow(dead_code)]`. What stays private is `mod matching;` and `mod raw;`, and a private `mod` makes
+  every body inside it unreachable regardless of the item's own visibility — so these are still
+  **declared** seams that no caller outside this node can resolve: `matching/match_ctx.rs`
+  (`enter_match`, `read_ctx`/`reread_ctx`, `position_term`/`position_of` — its doc comment states the
+  intent) and `raw::{heap_bits, ctx_parts, set_ctx_start}`. `raw` is reachable from this node's own
+  modules (`seam::write_bit_field` forwards the one `raw::write_bit_field` rule a tier needs), not from a
+  tier. `create::assemble` is `pub(super)` and says so in its doc: the walk stays inside the family, and
+  what a lowering consumes is the seam, never the walk or the family-private `Built` form. Opening a
+  further seam means widening the **enclosing `mod` declaration** as well; widening an item alone
+  changes nothing.
 - **`terms::number::make_integer_unrooted` at 2.61 % is CALL overhead, not allocation** — its
   small-value arm is `make_small` (no allocation), but the function is not inlined at its
   `src/operand.rs` call sites. **OWNER: the parent `src/` node.**
@@ -577,7 +584,8 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
 - **`src/exec_census.rs`** costs one latched `bool` load and a branch per interpreted instruction
   while disabled (`Machine::census_on`, latched once per run); its 2.12 % of `to_lower`'s self time
   is the recorder's own body on a **census-recording** run. The instrument has no call site in
-  this node.- **`tools/differential` corpus coverage hole** (see Test Strategy).
+  this node.
+- **`tools/differential` corpus coverage hole** (see Test Strategy).
 
 ## The four `foreign` bench workloads — exact `Bs*` shape inventory
 `tools/bench`'s `foreign` cases execute `cowboy_bstr:to_lower/1`, `cowboy_bstr:capitalize_token/1`,
@@ -599,30 +607,36 @@ The recurring shapes (only 9 of the 20 `claimed()` variants occur; no `BsMatchSt
 integer 6, integer 6]` (verify: 12 bits **and** `(remaining-12) mod 8 == 0`); `[ensure_exactly 0]`.
 
 ### The nine `bs_create_bin` builds — exact operand kinds (from the compiler's `.S`)
-`alloc = 0`, `Flags = nil` and an `{integer,256}` `bs_init_writable` hint on every one. The decisive column is the
-**accumulator (segment 0) operand kind**: only `capitalize_token/3`'s dash clause keeps it in an **x** register —
-every other build accumulates in a **`Y` slot** (the clause spilled it there before the `char_to_*` /
-`iolist_to_binary` call and the build re-loads it from there), and that one fact is what keeps all but one of these
-builds on the family helper. A build's `dst` is a separate operand (the publish target) and is usually `x` even when
-the accumulator is `y` — the dash clause is the only one that reads and writes the **same** `x(2)`.
+`alloc = 0`, `Flags = nil` and an `{integer,256}` `bs_init_writable` hint on every one. The decisive column
+is **the segments' kinds**, not the operand classes: an accumulator or field value may live in an **x
+register or an addressable `Y` slot** — `seam::append_plan` accepts both through `locatable_operand`, so a
+clause that spilled the accumulator into the frame before a call is no longer a refusal (the tier owns the
+run-time frame-window guard) — while a field must be a statically sized `integer` of `1..=64` bits or a
+`string` constant, and the accumulator segment must be the first `private_append`. A build's `dst` is a
+separate operand (the publish target) and is usually `x` even when the accumulator is `y` — the dash clause
+is the only one that reads and writes the **same** `x(2)`.
 
-| build | fn/arity · label | accumulator (dst) | field segments | `CreateBinShape::of` |
+| build | fn/arity · label | accumulator (dst) | field segments | verdict |
 |---|---|---|---|---|
-| `capitalize_token/3` dash `<<Acc/binary,$->>` | `{f,4}`·5 | `x(2)` → `x(2)` | `string` U8 `{string,<<"-">>}` S`{integer,1}` | **accepted** (`ConstBytes`, 8 bits) |
-| `capitalize_token/3` upper | `{f,4}`·6 | `y(1)` → `x(2)` | `integer` U1 `{x,0}` S`{integer,8}` | refused: `seam.rs:177` `x_register(value)?` |
-| `capitalize_token/3` lower | `{f,4}`·7 | `y(1)` → `x(2)` | same as upper | refused: same clause |
-| `-to_lower/1-lbc$^0/2-0-/2` | `{f,80}`·80 | `y(1)` → `x(1)` | `integer` U1 `{x,0}` S`{integer,8}`; this build's accumulator segment is **Unit 1**, the others' **Unit 8** | refused: same clause |
-| `encode/2` 4-field | `{f,7}`·7 | `y(1)` → `x(1)` | `binary` U8 `{x,0}` S`{atom,all}` | refused: `x_register` fires first |
-| `encode/2` 3-field | `{f,7}`·8 | `y(0)` → `x(1)` | `binary all` | refused: same |
-| `encode/2` 2-field | `{f,7}`·9 | `y(0)` → `x(1)` | `binary all` | refused: same |
-| `decode/2` temp `<<DecodeChar>>` | `{f,13}`·13/15/16 | none — the field **is** segment 0 | `integer` U1 `{x,0}` S`{integer,8}` | refused: `append_plan`'s first-segment `PreparedSeg::Append{private:true}` let-else (`seam.rs:164`) |
-| `decode/2` append | `{f,13}`·13/15/16 | `y(1)` → `x(1)` | `integer` U1 `{x,2}` S`{integer,6}` (clause 1), or S`{tr,{x,2}}` runtime (clause 2) | refused: `x_register` |
+| `capitalize_token/3` dash `<<Acc/binary,$->>` | `{f,4}`·5 | `x(2)` → `x(2)` | `string` U8 `{string,<<"-">>}` S`{integer,1}` | **inlined** — the `string` is a `Field::ConstBytes` (8 bits), `Route::Aligned` |
+| `capitalize_token/3` upper | `{f,4}`·6 | `y(1)` → `x(2)` | `integer` U1 `{x,0}` S`{integer,8}` | **inlined** — the `Y` accumulator binds through `locatable_operand`, `Route::Aligned` |
+| `capitalize_token/3` lower | `{f,4}`·7 | `y(1)` → `x(2)` | same as upper | **inlined**, `Route::Aligned` |
+| `-to_lower/1-lbc$^0/2-0-/2` | `{f,80}`·80 | `y(1)` → `x(1)` | `integer` U1 `{x,0}` S`{integer,8}`; this build's accumulator segment is **Unit 1**, the others' **Unit 8** | **inlined**, `Route::Aligned` |
+| `encode/2` 4-field | `{f,7}`·7 | `y(1)` → `x(1)` | `binary` U8 `{x,0}` S`{atom,all}` | **declined** — a `binary all` segment fixes no static width for itself or any later field |
+| `encode/2` 3-field | `{f,7}`·8 | `y(0)` → `x(1)` | `binary all` | **declined** — same |
+| `encode/2` 2-field | `{f,7}`·9 | `y(0)` → `x(1)` | `binary all` | **declined** — same |
+| `decode/2` temp `<<DecodeChar>>` | `{f,13}`·13/15/16 | none — the field **is** segment 0 | `integer` U1 `{x,0}` S`{integer,8}` | **declined** — not an append build at all (`seam::append_plan`'s first-segment `PreparedSeg::Append { private: true }` let-else), and a bare create allocates through `raw::make_binary` |
+| `decode/2` append | `{f,13}`·13/15/16 | `y(1)` → `x(1)` | `integer` U1 `{x,2}` S`{integer,6}` (clause 1), or S`{tr,{x,2}}` runtime (clause 2) | clause 1 **inlined**, `Route::BitGranular` (a 6-bit field); clause 2 declined at run time — a `Width::Dynamic` fixes no static offset |
 
-With the accumulator rule out of the way, the next refusal per family is `encode/2`'s `binary all` segment
-(`append_plan`'s `_ => return None`, `seam.rs:228`, `PreparedSeg::Binary`), then the 6-bit / runtime-size fields
-(`nbits % 8` at `seam.rs:213`; the whole-byte + `x`-value field rules at `create.rs:277`/`:282`). The temp build is
-the only create in these workloads whose output size is known from the instruction alone, which is why it is the one
-bare (non-append) create here.
+Three refusals survive in these workloads, and none of them is the accumulator's operand class: a `binary
+all` segment (`seam::append_plan` has no `Field::Binary`, see the construction-seam section below), a create
+that is not an append at all (the temp, which allocates), and a run-time (`Width::Dynamic`) field width. A
+**bit-granular** width is not a refusal either: `Field::Bits` carries `1..=64` bits, so the 6-bit field is
+planned and the tier's `CreateBinShape::route` sends it to `Route::BitGranular`, which pairs the general
+door with `seam::write_bit_field`. The one bit-granular refusal is a **mixed** plan that also carries a
+`Field::ConstBytes` — the constant copy has no bit-granular emission. The temp build is the only create in
+these workloads whose output size is known from the instruction alone, which is why it is the one bare
+(non-append) create here.
 Per-call build executions (inputs 30 B / 30 B / 12 B / 15 B): `to_lower`'s loop build **30**; `capitalize_token`'s
 dash **4** (four `-`), upper **5** (`t`, the initial `true` flag, plus one per dash), lower **21** (30 total);
 `encode/2`'s 4-field clause **4** (96 bits = 4×24) and its 3-/2-field clauses **0** (this input never leaves
