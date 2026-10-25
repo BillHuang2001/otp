@@ -128,6 +128,35 @@ This is the frozen public-API shape dependents design against; keep it stable.
   process mailbox, a single-threaded `ProcessRunner`/scheduler loop, and the `beam_bifs::PortHook`
   provider over a spawn driver; it owns the end-to-end vertical slice.
 
+## Cross-crate laws (BINDING — each was learned the hard way; do not re-open)
+
+### Term lifetime and rooting
+- A raw `Eterm` stored in a long-lived slot **roots nothing**. Any term that can outlive one instruction — a raise reason, a pending reply, a parked value, a cache entry, a stashed counter sample — must be copied onto a scanned heap or explicitly stabilized before its owner's heap can be relocated.
+- A pointer-stable, never-scanned store (the runtime arena, `alloc_words`) is the wrong home for a container whose children live on a scanned young heap: the copier gives such a container `Target::Foreign` and never descends, so the GC leaves the container verbatim while relocating the children out from under it.
+- When a heap-growth or move is *exempted* (`relocation_exempt` / `has_unpublished_roots() == true`), the correct fallback is **stabilize, never leave dangling** — a door that cannot copy must refuse, and the refusing path must first make its roots publishable.
+- A lease (an `Rc` handle over a shared store) held across an allocation is a deep copy or a dangling hazard, never a cheap borrow.
+- Per-site inventory and the "every site that can relocate a process heap" list: `beam_rt/src/runtime/CONTEXT.md`, `beam_rt/src/runtime/roots/CONTEXT.md`, `beam_rt/src/context/gc/CONTEXT.md`.
+
+### The aliasing contract on both C ABI envs (`beam_abi`)
+- An env handed to C takes `&self` accessors with interior mutability; **never** hold a Rust `&`/`&mut` to a host across a call into foreign (NIF/driver) code — `noalias` lets LLVM drop the foreign store, and only in `--release`.
+- Therefore `NifEnv` is shared (`&NifEnv` at every signature, `Cell`/`Rc<RefCell<…>>` for per-call state), `NifHost` is `&self`-receiver only, and the aliasing guard `beam_abi/src/nif/host_aliasing_tests.rs` must be run in **both** profiles — the dev profile is `opt-level = 1`, so it is not a proxy for release.
+- `NifHost: AsAnyHost` **cannot** be adopted: the runtime's per-call host borrows the runtime and so is not `'static`. `NifEnv::new_typed` + `host_as`/`with_host_as` is the sanctioned path for recovering a concrete host.
+
+### Driver ports: the drive-window rule
+- A port must not hold an atom-table lease outside a **drive window**, or the next intern deep-copies the whole table.
+- `PortRegistry::open_driver_atom_view`/`close_driver_atom_view` bracket every call into driver code, depth-counted so a nested close can never release early; between windows a port's atom view is `None`, and `beam_abi`'s `NifEntry::host` is the one durable `Rc<AtomTable>` holder.
+- The commit step tests `has_pending_driver_atoms()` **before** reaching `atoms_mut()`, so the transient view is dropped first and the shared table takes its append path.
+
+### One MD5, in `beam_common`
+- `beam_common::md5` (`digest`, incremental `Md5`) is the workspace's single RFC 1321 core, shared by `beam_loader`'s `.beam` chunk digests and `beam_bifs`' `erlang:md5/1`.
+- No consumer may reintroduce a copy: a module's chunk digest is its loader identity, so two implementations that drift sample-by-sample would produce modules the runtime and the oracle disagree about.
+
+### The baseline JIT's inline set and deopt idempotency
+- 16 bitstring shapes are inlined natively under `beam_engine/src/jit/baseline/emit/bitstr_inline/`: 15 match-context shapes (`bs_get_position`, `bs_set_position`, `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`, `bs_get_integer2`, a fully static `bs_match`, `bs_match_string`, the UTF-8/16/32 skip/get pairs) plus the `bs_create_bin` private-append construction shape.
+- A shape that would **allocate or root inside the instruction** is deliberately DECLINED: its predicate answers `None`, the entry emits zero bytes, and `emit/block.rs` falls through to the family helper. No inline arm may take an `ExecutionContext`.
+- **Deopt idempotency** is what makes the set safe: `jit_step_one` re-executes the *whole* instruction after a deopt, so no guard that can reach `fallback` may run against an already-mutated machine, and no arm may commit partial state before its last fallback.
+- Every shape carries a deopt pin (`src/jit/baseline/bitstr_shapes_deopt_tests.rs`, asserting tier agreement plus a once-only side effect). Detail: `beam_engine/src/jit/baseline/emit/bitstr_inline/CONTEXT.md`.
+
 ## Layering & dependency waves (design order — dependents design against a finished parent API)
 Determined by the Cargo workspace DAG; a crate may only use crates in earlier waves.
 | Wave | Crates | Depends on |
@@ -223,6 +252,17 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   ERTS and under Rust ERTS, compare observable results) — no behavior change without a case.
 - The vertical slice adds a `.beam` fixture (produced with the system `erlc`) + an integration test
   asserting the printed result.
+- **Measurement pins must express an invariant, not a magic constant.** An exact instruction/word/reduction
+  count is legitimate only where the quantity is genuinely deterministic; where it is load-, geometry- or
+  cadence-dependent, assert the *relation* the number was standing in for (a band, a ratio between two
+  measured quantities, or an in-code derivation such as `slices == ceil(reductions / SLICE_BUDGET)`), so the
+  suite cannot go red on a busy host. A pin that has to be re-typed after every legitimate scheduling change
+  is a bad test, and "loosening it until it cannot fail" is not the fix either.
+- Host load is not a result: read `/proc/loadavg` before and after a measurement run and prefer paired,
+  interleaved sampling over absolute wall time (this host is shared).
+- **Current state: every crate suite is green** (unit + integration + the oracle-cross-checked suites), and
+  the workspace builds warning-free. Per-crate counts live in each crate's own `CONTEXT.md` — do not pin an
+  aggregate total here, and check `git log` for the latest figure rather than trusting a copied one.
 
 ## Routing Table
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
@@ -277,9 +317,11 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   `async_free` exactly once. Residuals: Known Structural Debt; detail in `beam_abi/CONTEXT.md`.
 - **The compatibility gate (`../tools/differential/gate.sh`)** is the authority; a full-corpus sweep of
   `differential run <case-id>` is gate-equivalent per case (`compare.rs::verdict_with` folds in the
-  oracle-vs-golden drift check). Last full 2967-case sweep: **agree=2966, mismatch=0, unsupported=1,
-  skipped=0** (`gate.sh` exit 0); the one `unsupported` is `wire/new_fun_ext_encode` (A.5, unclosable by
-  design — see Known Structural Debt). One A.4 case
+  oracle-vs-golden drift check). The live corpus size and per-contract split belong to that node —
+  read `../tools/differential/CONTEXT.md` rather than pinning a case count here, because a pinned count
+  goes stale the moment the corpus grows. The required verdict is **zero mismatches**; the one recorded
+  capability gap is `wire/new_fun_ext_encode` (A.5, unclosable by design — see Known Structural Debt).
+  One A.4 case
   (`driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail`) has an oracle-side crash flake (a
   corpus-harness defect, not a divergence).
 - **Term/heap foundation complete** (see the section above): HAMT/CHAMP map builder, public
