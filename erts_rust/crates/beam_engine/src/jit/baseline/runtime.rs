@@ -1729,14 +1729,32 @@ fn slot_term(machine: &Machine, slot: u32, in_y: bool) -> Option<Eterm> {
 /// 3. C's `unit == 8` append-position gate (`erts_bs_append_checked`, `erl_bits.c:1778-1784`):
 ///    the window end must be on a byte boundary, because this door copies whole bytes and
 ///    deliberately does not duplicate the family's bit-granular writer;
-/// 4. the source must be an off-heap refc binary with a **byte-aligned** window at both ends
-///    (`start % 8 == 0 && size % 8 == 0`, a non-null base) — a mid-byte source window needs
-///    the bit-granular writer, and a source size that is not a whole number of the field's
+/// 4. the source must be a **readable bitstring with a byte-aligned window at both ends**
+///    (`start % 8 == 0 && size % 8 == 0`, a non-null base) — an on-heap `ErlHeapBits` and an
+///    off-heap refc binary alike, because both reach this door: the source of a real
+///    `<<Acc/binary, Bin/binary>>` is whatever the build before it produced, which for a
+///    small binary is an on-heap `ErlHeapBits` (`emqx_base62:encode/2`'s source is
+///    `iolist_to_binary/1`'s four-byte result). A mid-byte source window needs the
+///    bit-granular writer, and a source size that is not a whole number of the field's
 ///    `unit` is the family's own `badarg` (`erts_bs_put_binary_all`, `erl_bits.c:1311`),
 ///    which the `fallback` step raises faithfully;
 /// 5. room: `end_bits + size <= capacity_bits`, the same rule as the other append doors, and
 ///    the byte ranges must not overlap (the source can be a sub-binary of the accumulator's
 ///    own payload, which `copy_nonoverlapping` below must never be handed).
+///
+/// The source's parts come from `raw::heap_bits` — the very accessor the family's own
+/// `binary all` body reads them through
+/// (`create::segments::segment_source` -> `raw::heap_bits`/`raw::subject_bytes`) — so the
+/// door and the `fallback` step share one definition of "the source's bytes" and the
+/// widened gate is a gate change, not new logic: `beam_term::bitstring::bitstring_parts`
+/// handles the `HEADER_SUB_BITS` and the `ErlHeapBits` layout alike.
+///
+/// Safety of the widened gate: a `heap_bits` term's payload is the process heap (an
+/// on-heap binary's data words) or an off-heap refc payload, and this helper only
+/// **reads** the source through `copy_nonoverlapping` into the accumulator's payload. It
+/// holds `&Machine`, allocates nothing and raises nothing, so no collection can intervene
+/// between the parts read and the copy, and the accumulator's payload never aliases a
+/// heap-bits source (it is a machine-registered off-heap payload).
 ///
 /// Only then does it copy the `size / 8` bytes and commit — **exactly one** write of the
 /// accumulator's `ErlSubBits.end` word (`sb->end = new_position`, `erl_bits.c:1975`), the
@@ -1764,6 +1782,45 @@ pub(crate) extern "C" fn jit_append_binary_all(
     append_binary_all(machine, acc_slot, src_slot, flags)
 }
 
+/// How many times [`append_binary_all`] has executed on this thread and how many of those
+/// executions were **served** (answered the accumulator, i.e. really appended) rather than
+/// refused, as `(calls, served)`.
+///
+/// Test-only structural instrument (`#[cfg(test)]`-gated, so a production build carries no
+/// counter at all): a cross-tier byte agreement alone also holds for a door that refuses
+/// every source and lets `jit_step_one` re-run the whole instruction, so the rows assert this
+/// moved **and** was served. Per-thread and monotonic, so a caller takes a `before`/`after`
+/// pair around the run it is describing.
+#[cfg(test)]
+pub(crate) fn append_binary_all_calls() -> (u64, u64) {
+    APPEND_BINARY_ALL_CALLS.with(std::cell::Cell::get)
+}
+
+// The `append_binary_all_calls` counter's per-thread storage (test builds only).
+#[cfg(test)]
+thread_local! {
+    static APPEND_BINARY_ALL_CALLS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Bump the entry half of [`append_binary_all_calls`].
+#[cfg(test)]
+fn record_append_binary_all_entry() {
+    APPEND_BINARY_ALL_CALLS.with(|cell| {
+        let (calls, served) = cell.get();
+        cell.set((calls + 1, served));
+    });
+}
+
+/// Bump the served half of [`append_binary_all_calls`].
+#[cfg(test)]
+fn record_append_binary_all_served() {
+    APPEND_BINARY_ALL_CALLS.with(|cell| {
+        let (calls, served) = cell.get();
+        cell.set((calls, served + 1));
+    });
+}
+
 /// The decision-and-copy body of [`jit_append_binary_all`], split out so a test can drive it
 /// without a `JitRuntime` (the way [`append_cursor`] sits beside [`jit_append_cursor`]).
 pub(crate) fn append_binary_all(
@@ -1772,6 +1829,9 @@ pub(crate) fn append_binary_all(
     src_slot: i64,
     flags: i64,
 ) -> i64 {
+    #[cfg(test)]
+    record_append_binary_all_entry();
+
     let (Ok(acc_slot), Ok(src_slot)) = (u32::try_from(acc_slot), u32::try_from(src_slot)) else {
         return 0;
     };
@@ -1792,53 +1852,61 @@ pub(crate) fn append_binary_all(
     if end_bits % 8 != 0 {
         return 0;
     }
-    // (4) The source: an off-heap refc binary whose window is byte-aligned at both ends.
-    // SAFETY: `is_refc_binary` checks `is_boxed` before it dereferences the header and only
-    // reads the `ErlSubBits.orig` slot when the header says `ErlSubBits`.
-    if !unsafe { beam_term::refc::is_refc_binary(src) } {
+    // (4) The source: any readable bitstring whose window is byte-aligned at both ends —
+    // an on-heap `ErlHeapBits` and an off-heap refc binary alike. The parts come from
+    // `raw::heap_bits`, the term-level accessor the family's own `binary all` body reads
+    // them through (its `segment_source`), so the door serves exactly the terms the
+    // `fallback` step would and reads them the same way. A match context (a non-refc
+    // `ErlSubBits`), a bare `BinRef` and every non-bitstring are `None` — refused here and
+    // raised by the family as its own `badarg`/`type`.
+    let Some((src_base, src_bits, src_off)) = crate::families::bitstrings::raw::heap_bits(src)
+    else {
         return 0;
-    }
-    // SAFETY: `src` is a live refc-binary `ErlSubBits` over a live `BinRef`, so its frozen
-    // `base`/`start`/`end` are initialised and the payload is alive (a `beam_alloc::RefcBinary`
-    // handle owned by some machine keeps it so).
-    let (src_base, src_start, src_size) = unsafe { beam_term::bitstring_parts(src) };
-    if src_base.is_null() || src_start % 8 != 0 || src_size % 8 != 0 {
+    };
+    if src_base.is_null() || src_off != 0 || src_bits % 8 != 0 {
         return 0;
     }
     // (5) Room, and two disjoint byte ranges: a source that is a sub-binary of the
     // accumulator's **own** payload is refused rather than handed to `copy_nonoverlapping`.
-    let Some(new_end) = end_bits.checked_add(src_size) else {
+    // The two ranges are compared by **address**, because `heap_bits` has already advanced a
+    // refc window's base to its own byte-aligned start: a source window over the
+    // accumulator's payload that starts at a non-zero byte is `base + k` for `k > 0`, so
+    // comparing against the payload base alone would miss it. Both ranges are `bytes` long,
+    // so they overlap exactly when the distance between their starts is below `bytes` (a
+    // zero-length source copies nothing and needs no refusal).
+    let Some(new_end) = end_bits.checked_add(src_bits) else {
         return 0;
     };
     if new_end > capacity_bits {
         return 0;
     }
-    let src_offset = src_start / 8;
     let dst_offset = end_bits / 8;
-    let bytes = src_size / 8;
-    if src_base == base as *const u8 && src_offset < dst_offset + bytes && dst_offset < src_offset + bytes
+    let bytes = src_bits / 8;
+    if bytes != 0
+        && (src_base as usize).abs_diff(base as usize + dst_offset) < bytes
     {
         return 0;
     }
     if bytes != 0 {
-        // SAFETY: both ranges were just proved inside their own payloads (`src_offset + bytes`
-        // is inside the source's window, `dst_offset + bytes <= capacity_bits / 8`) and
-        // disjoint, and both payloads are live for this call: the source's is kept alive by
-        // the `RefcBinary` handle `src` names, the accumulator's by the machine's writable
-        // registry. A zero-length copy is skipped (a null or one-past-the-end pointer is not
-        // a valid `copy_nonoverlapping` operand even for `count == 0`).
+        // SAFETY: both ranges were just proved inside their own payloads (`bytes` is inside
+        // the source's window, `dst_offset + bytes <= capacity_bits / 8`) and disjoint, and
+        // both payloads are live for this call: a refc source's is kept alive by the
+        // `RefcBinary` handle it names, an on-heap source's by the process heap that holds
+        // its block, and the accumulator's by the machine's writable registry. No collection
+        // can run in between (this helper holds `&Machine` and allocates nothing). A
+        // zero-length copy is skipped (a one-past-the-end pointer is not a valid
+        // `copy_nonoverlapping` operand even for `count == 0`).
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                src_base.add(src_offset),
-                base.add(dst_offset),
-                bytes,
-            );
+            std::ptr::copy_nonoverlapping(src_base, base.add(dst_offset), bytes);
         }
     }
+
     // The build's result, and the **only** term mutation: C's `sb->end = new_position`
     // (`erl_bits.c:1975`). Routed through `raw::set_ctx_end` so the `end`-word rule stays in
     // one place; `acc` was proved a live `ErlSubBits` by the writable-append proof above.
     crate::families::bitstrings::raw::set_ctx_end(acc, new_end);
+    #[cfg(test)]
+    record_append_binary_all_served();
     acc.raw() as i64
 }
 

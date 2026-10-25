@@ -98,12 +98,12 @@ use super::bitstr_inline_tests::{
 };
 use super::counters;
 use super::emit::bitstr_inline::{self, SHAPE_CREATE_BIN};
+use super::runtime::append_binary_all_calls;
 use super::tests::assert_same_outcome;
 use crate::context::MinimalContext;
 use crate::families::bitstrings::bit_size;
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
-
 // ---------------------------------------------------------------------------
 // Module building blocks
 // ---------------------------------------------------------------------------
@@ -519,6 +519,9 @@ struct RunReport {
     counters: counters::Counters,
     /// How many times `jit_bitstr` (the family helper) ran during the run.
     bitstr_calls: u64,
+    /// How many times the `binary all` append door ran during the run, and how many of those
+    /// executions it **served** (a non-zero answer) rather than refused.
+    append_door: (u64, u64),
 }
 
 /// One counted run of exported `f/<args.len()>` on `tier`, with the baseline counters and the
@@ -533,11 +536,17 @@ fn run_counting(
     counters::reset();
     counters::set_enabled(true);
     let calls_before = bitstr_calls();
+    let door_before = append_binary_all_calls();
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     let args: Vec<Eterm> = args_spec.iter().map(|spec| spec.build(&mut ctx)).collect();
     let outcome = machine.run_export_outcome_with_tier(module, name, arity, &args, &mut ctx, tier);
     let calls = bitstr_calls() - calls_before;
+    let (door_calls, door_served) = append_binary_all_calls();
+    let door = (
+        door_calls - door_before.0,
+        door_served - door_before.1,
+    );
     counters::set_enabled(false);
     let snapshot = counters::snapshot();
     // Extract everything the assertions need into owned data while the heap is still alive.
@@ -554,9 +563,9 @@ fn run_counting(
         bits,
         counters: snapshot,
         bitstr_calls: calls,
+        append_door: door,
     }
 }
-
 // ---------------------------------------------------------------------------
 // A. Interpreter parity per inlined shape (value AND bytes)
 // ---------------------------------------------------------------------------
@@ -2519,36 +2528,128 @@ fn a_binary_all_append_of_a_writable_refc_source_runs_natively() {
     );
 }
 
-/// **A source the door refuses is one interpreter step, and the family's own build answers.**
-/// An on-heap (`ErlHeapBits`) source is not an off-heap refc binary, so the door answers `0`;
-/// the arm deopts, the family builds exactly once, and both tiers agree byte for byte — which
-/// is also the idempotence pin: the interpreter never attempted an arm, the baseline attempted
-/// one and re-executed the instruction.
+/// **An on-heap (`ErlHeapBits`) source is served natively — the door's source gate accepts any
+/// byte-aligned bitstring window, not only an off-heap refc binary.**
+///
+/// This is the shape real code reaches: the source of a `<<Acc/binary, Bin/binary>>` build is
+/// whatever the previous expression produced, and a small binary is an on-heap `ErlHeapBits`
+/// (`emqx_base62:encode/2`'s source is `iolist_to_binary/1`'s four-byte result). The door reads
+/// the source's parts through `raw::heap_bits` — the very accessor the family's own `binary all`
+/// segment uses — so an on-heap source is copied natively: the arm must **not** deopt, the
+/// appended bytes must be the source's, and the accumulator's window end must advance by
+/// exactly the source's bit size.
+///
+/// Pinned: the second build is planned and lowered with zero static deopts; the source really is
+/// on-heap on both sides (the premise, without which the row would prove nothing); the door ran
+/// **once and served** it (the `#[cfg(test)]` `append_binary_all_calls` pair); the counted run
+/// records no `BsCreateBin` deopt and no `jit_step_one` step; the built window is the one field
+/// byte plus the source's whole width; and the payload is the field byte followed by the source
+/// verbatim.
 #[test]
-fn a_binary_all_append_of_a_heap_source_deopts_to_the_family() {
-    let module = accumulator_module("bscb_bin_all_heap", &[], |module| {
-        bin_seg_all(module, Operand::X(1))
+fn a_binary_all_append_of_a_heap_source_runs_natively() {
+    let module = bin_module("bscb_bin_all_heap", 3, &[], move |module| {
+        let mut first = append_seg(module, Operand::X(0));
+        first.extend(int_seg(module, Operand::X(3), 8));
+        let mut second = append_seg(module, Operand::X(0));
+        second.extend(bin_seg_all(module, Operand::X(2)));
+        vec![
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(3),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), first, 4),
+            create_bin(Operand::X(0), second, 4),
+        ]
     });
+    // (1) Both builds are lowered with zero static deopts, so the append really has an arm.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    assert_eq!(builds.len(), 2, "the fixture holds two `bs_create_bin`s");
+    assert_eq!(
+        (lowered, declined),
+        (2, 0),
+        "the byte build and the `binary all` tail must both lower"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "an on-heap source is a run-time fact, never a compile-time refusal (deopts {:?})",
+        snapshot.instr_deopts
+    );
+    // (2) The premise and the value, per tier: the source is an on-heap bitstring, and both
+    //     tiers publish the field byte followed by the source verbatim.
     let name = atom(&module, "f");
-    let args = [ArgKind::Int(64), ArgKind::Bytes(b"hi")];
-    assert_construction_row("binary all over a heap binary", &module, &args, b"hi");
+    let args = [ArgKind::Int(64), ArgKind::Int(0x5A), ArgKind::Bytes(b"hi")];
+    let expected = [0x5A, b'h', b'i'];
+    with_both_tiers_args_observed(&module, name, &args, |i_args, interpreter, b_args, baseline| {
+        assert_same_outcome("binary all, heap source", interpreter, baseline, &module.atom_table);
+        for (tier, side_args) in [("interpreter", i_args), ("baseline", b_args)] {
+            let source = side_args[2];
+            assert_eq!(
+                bit_size(source),
+                Some(16),
+                "{tier}: the source must be a two-byte bitstring"
+            );
+            // SAFETY: `source` is the argument term this run built, and the run's heap is alive
+            // for the whole closure; `is_refc_binary` only reads the term's own header/`orig`.
+            assert!(
+                !unsafe { beam_term::refc::is_refc_binary(source) },
+                "{tier}: the premise — a two-byte binary is an on-heap `ErlHeapBits`, not an \
+                 off-heap refc binary"
+            );
+        }
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            assert_eq!(
+                returned_bytes("binary all, heap source", tier, outcome),
+                &expected[..],
+                "{tier}: the field byte, then the on-heap source verbatim"
+            );
+            assert_eq!(
+                bit_size(returned("binary all, heap source", tier, outcome)),
+                Some(24),
+                "{tier}: the window is the 8-bit field plus the source's own 16 bits — an `end` \
+                 commit that used anything but the source's size would show here"
+            );
+        }
+    });
+    // (3) The counted run: the door ran exactly once and **served** it, so nothing deopted.
     let report = run_counting(&module, name, &args, Tier::BaselineJit);
     assert_eq!(
-        report.bytes.as_deref(),
-        Some(&b"hi"[..]),
-        "the deopt's payload"
+        report.append_door,
+        (1, 1),
+        "the door must run once and serve the on-heap source (calls, served) = {:?}",
+        report.append_door
+    );
+    assert_eq!(
+        report.counters.step_one, 0,
+        "an on-heap source must not cost an interpreter step (`jit_step_one` ran {})",
+        report.counters.step_one
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        0,
+        "the arm's own instruction must never deopt at run time (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
     );
     assert_eq!(
         report.bitstr_calls, 1,
-        "a refused door call is one interpreter step running the family's build exactly once"
+        "one `jit_bitstr` call for `bs_init_writable` (no native arm) and none for either \
+         `bs_create_bin`: the door performed the copy itself"
     );
 }
 
-/// **The `Y`-slot accumulator form** of the same refusal: both terms cross the door as slot
+/// **The `Y`-slot accumulator form** of the same served path: both terms cross the door as slot
 /// indices with `WRITE_ACC_IN_Y` set for the accumulator, so the `Y` flag wiring is exercised
-/// end to end.
+/// end to end with an on-heap source.
 #[test]
-fn a_binary_all_append_with_a_y_slot_accumulator_deopts_on_a_heap_source() {
+fn a_binary_all_append_with_a_y_slot_accumulator_serves_a_heap_source() {
     let module = frame_module("bscb_bin_all_y", &[], 2, true, 0, |module| {
         bin_seg_all(module, Operand::X(1))
     });
@@ -2559,14 +2660,356 @@ fn a_binary_all_append_with_a_y_slot_accumulator_deopts_on_a_heap_source() {
     assert_eq!(
         report.bytes.as_deref(),
         Some(&b"hi"[..]),
-        "the deopt's payload"
+        "the served build's payload"
+    );
+    assert_eq!(report.bits, Some(16), "the served window");
+    assert_eq!(
+        report.append_door,
+        (1, 1),
+        "the `Y`-accumulator door call must be served (calls, served) = {:?}",
+        report.append_door
+    );
+    assert_eq!(
+        report.counters.step_one, 0,
+        "a served `Y`-accumulator build must not cost an interpreter step (`jit_step_one` ran \
+         {})",
+        report.counters.step_one
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        0,
+        "the arm's own instruction must never deopt at run time (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
     );
     assert_eq!(
         report.bitstr_calls, 1,
-        "one refused door call, then the family's single build"
+        "one `jit_bitstr` call for `bs_init_writable` and none for the `bs_create_bin`"
     );
 }
 
+/// **An empty on-heap source is served and leaves the accumulator's window alone.**
+///
+/// A zero-byte on-heap `ErlHeapBits` is a legal bitstring whose window is empty: the door's
+/// guards all pass (`src_bits == 0`, a non-null data base, a byte-aligned window at both ends)
+/// and the copy is a zero-byte one, which is the shape a door that blindly ran
+/// `copy_nonoverlapping` would fault on. The accumulator starts empty (`bs_init_writable`
+/// reports a zero-length window) and must come out with its `ErlSubBits.end` **unchanged** —
+/// a served answer that added a figure it invented, or committed twice, would widen it.
+///
+/// The premise is asserted, not assumed: the source term both runs pass is an on-heap
+/// bitstring (`!is_refc_binary`) of zero bits, so this row really is the widened gate's
+/// on-heap-empty case and not the refc-empty one the sibling row pins.
+#[test]
+fn an_empty_heap_binary_all_source_is_served_and_leaves_the_window_alone() {
+    let module = accumulator_module("bscb_bin_all_empty_heap", &[], |module| {
+        bin_seg_all(module, Operand::X(1))
+    });
+    let name = atom(&module, "f");
+    // `x(0)` is the capacity hint, `x(1)` the empty on-heap source.
+    let args = [ArgKind::Int(64), ArgKind::Bytes(b"")];
+    // (1) The append has an arm: one build, lowered, zero static deopts.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    assert_eq!(builds.len(), 1, "the fixture holds one `bs_create_bin`");
+    assert!(
+        builds.iter().all(|build| build.lowered),
+        "the `binary all` plan must be lowered"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    // (2) Both tiers: the same zero-bit result, and the source really is on-heap.
+    with_both_tiers_args_observed(&module, name, &args, |i_args, interpreter, b_args, baseline| {
+        assert_same_outcome(
+            "binary all, empty heap source",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        for (tier, side_args) in [("interpreter", i_args), ("baseline", b_args)] {
+            assert_eq!(
+                bit_size(side_args[1]),
+                Some(0),
+                "{tier}: the source must be a zero-bit bitstring"
+            );
+            // SAFETY: `side_args[1]` is the argument term this run built and the run's heap is
+            // alive for the whole closure; `is_refc_binary` only reads the term's own words.
+            assert!(
+                !unsafe { beam_term::refc::is_refc_binary(side_args[1]) },
+                "{tier}: the premise — an empty binary is an on-heap `ErlHeapBits`"
+            );
+        }
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            let value = returned("binary all, empty heap source", tier, outcome);
+            assert_eq!(
+                bit_size(value),
+                Some(0),
+                "{tier}: the empty append must not move the window end"
+            );
+        }
+    });
+    // (3) Non-vacuity: the arm was entered **and** served, with no interpreter step and no
+    //     `BsCreateBin` deopt — so the emitted `test rax,rax ; je fallback` did not branch.
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.append_door,
+        (1, 1),
+        "a zero-byte on-heap source must be served, not refused (calls, served) = {:?}",
+        report.append_door
+    );
+    assert_eq!(
+        report.bits,
+        Some(0),
+        "the served empty append leaves the zero-length window alone"
+    );
+    assert_eq!(
+        report.counters.step_one, 0,
+        "a served empty source must not cost an interpreter step (`jit_step_one` ran {})",
+        report.counters.step_one
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        0,
+        "the arm's own instruction must never deopt at run time (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+}
+
+/// **A non-byte-aligned on-heap source refuses (the door copies whole bytes only) and the
+/// fallback is the family's own bit-granular append.**
+///
+/// `<<Acc/binary, B/bitstring>>` (a `binary all` segment with `unit: 1`) accepts any source
+/// width, so a four-bit on-heap source is the family's legal input — the door refuses it because
+/// its window is not a whole number of bytes, one `jit_step_one` step re-executes the whole
+/// instruction, and the family writes the four bits bit-granularly. Both tiers must therefore
+/// publish the same **4-bit** bitstring with the same payload byte, and the refusal must cost
+/// exactly one `BsCreateBin` deopt.
+#[test]
+fn a_non_byte_aligned_heap_binary_all_source_defers_to_the_family_bit_writer() {
+    let module = bin_module("bscb_bin_all_heap_bits", 2, &[], move |module| {
+        // The source: a fresh writable accumulator with one four-bit field, i.e. an on-heap
+        // `ErlHeapBits` whose window is four bits long.
+        let mut source = append_seg(module, Operand::X(0));
+        source.extend(int_seg(module, Operand::X(2), 4));
+        // The build under test: the same `binary all` group a `/binary` tail emits, spelled
+        // with `unit: 1` so a four-bit source is legal for the family.
+        let mut appended = append_seg(module, Operand::X(0));
+        appended.extend(bin_seg_all(module, Operand::X(2)));
+        vec![
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(3),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(2),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), source, 4),
+            // The four-bit source out of the way, the capacity hint back for the destination.
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::X(3),
+                dst: Operand::X(0),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), appended, 4),
+        ]
+    });
+    let name = atom(&module, "f");
+    // Capacity 64 for both accumulators, and the four-bit field value.
+    let args = [ArgKind::Int(64), ArgKind::Int(0b1011)];
+    // (1) Both builds are lowered: a source's *width* is a run-time figure, so the refusal is
+    //     the door's, per instruction.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    assert_eq!(builds.len(), 2, "the fixture holds two `bs_create_bin`s");
+    assert_eq!(
+        (lowered, declined),
+        (2, 0),
+        "both builds must be lowered — the mid-byte source is a run-time refusal"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "a source's width is never a compile-time fact (deopts {:?})",
+        snapshot.instr_deopts
+    );
+    // (2) The counted run: only the append deopts, and the door refused it.
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.append_door,
+        (1, 0),
+        "the door must run once and refuse a four-bit source (calls, served) = {:?}",
+        report.append_door
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        1,
+        "exactly the append must deopt (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+    assert!(
+        report.counters.step_one >= 1,
+        "the refusal must really take the fallback (`jit_step_one` ran {})",
+        report.counters.step_one
+    );
+    assert_eq!(
+        report.bits,
+        Some(4),
+        "the family's bit-granular append publishes the source's four bits"
+    );
+    assert_eq!(
+        report.bytes, None,
+        "a four-bit bitstring is not byte-aligned, so there is no byte payload to report"
+    );
+    // (3) Both tiers: the same four-bit bitstring, same bits.
+    with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+        assert_same_outcome(
+            "binary all, mid-byte heap source",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            let value = returned("binary all, mid-byte heap source", tier, outcome);
+            assert_eq!(bit_size(value), Some(4), "{tier}: the source's four bits");
+            assert_eq!(
+                returned_storage_bytes("binary all, mid-byte heap source", tier, value),
+                vec![0b1011_0000],
+                "{tier}: the four bits left-aligned in the one payload byte"
+            );
+        }
+    });
+}
+
+/// **A non-bitstring source refuses with no mutation, and the family raises its own `badarg`.**
+///
+/// The `binary all` guard order puts the source-shape check before every mutation, so an integer
+/// source must leave the accumulator byte-identical — then the `fallback` interpreter step runs
+/// the family's `binary` segment, whose `is_not_bitstring(Src)` arm (`emu/bs_instrs.tab:390`)
+/// raises the bare `badarg`. The rows assert both halves: the door's `0` with the accumulator's
+/// window and payload unchanged after the run, and both tiers' identical `badarg`.
+#[test]
+fn a_non_bitstring_binary_all_source_refuses_without_mutating_and_the_family_raises() {
+    let module = bin_module("bscb_bin_all_nonbits", 3, &[], move |module| {
+        let mut field = append_seg(module, Operand::X(0));
+        field.extend(int_seg(module, Operand::X(1), 8));
+        let mut appended = append_seg(module, Operand::X(0));
+        appended.extend(bin_seg_all(module, Operand::X(2)));
+        vec![
+            // `x(0)` is the capacity, `x(1)` the field value, `x(2)` the non-bitstring source.
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), field, 3),
+            // The accumulator the build under test would append to stays observable in `x(3)`,
+            // so the run's raise cannot hide a mutation.
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(3),
+            },
+            create_bin(Operand::X(0), appended, 3),
+        ]
+    });
+    let name = atom(&module, "f");
+    // Capacity 64, the field's byte, and the non-bitstring source.
+    let args = [ArgKind::Int(64), ArgKind::Int(0x5A), ArgKind::Int(7)];
+    // (1) Both builds are lowered; the refusal is the door's, at run time.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    assert_eq!(builds.len(), 2, "the fixture holds two `bs_create_bin`s");
+    assert_eq!(
+        (lowered, declined),
+        (2, 0),
+        "a source's type is a run-time fact, so both builds must lower"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    // (2) The counted run: the door refused, one interpreter step ran the family, which raised.
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert!(
+        report.bytes.is_none() && report.bits.is_none(),
+        "a non-bitstring source raises; it must never yield a value (got bytes {:?}, bits {:?})",
+        report.bytes,
+        report.bits
+    );
+    assert_eq!(
+        report.append_door,
+        (1, 0),
+        "the door must run once and refuse a non-bitstring source (calls, served) = {:?}",
+        report.append_door
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        1,
+        "exactly the append must deopt (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+    // (3) The accumulator's own window and payload, after each tier's run: unchanged, i.e. the
+    //     family's single field byte — a door that committed `end` (or copied a byte) before the
+    //     source-shape guard would publish a window over bytes nobody wrote.
+    let observe = |tier: Tier| {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let built: Vec<Eterm> = args.iter().map(|spec| spec.build(&mut ctx)).collect();
+        let outcome =
+            machine.run_export_outcome_with_tier(&module, name, 3, &built, &mut ctx, tier);
+        let accumulator = machine
+            .x(3)
+            .expect("the fixture keeps the accumulator in `x(3)`");
+        // SAFETY: `accumulator` is the live term `x(2)` holds and the run's heap (which owns its
+        // payload) is alive for the whole of this call; `bitstring_parts` only reads the term's
+        // own frozen words.
+        let (_, offset, size) = unsafe { beam_term::bitstring::bitstring_parts(accumulator) };
+        (
+            format!("{outcome:?}"),
+            offset,
+            size,
+            returned_storage_bytes("non-bitstring source", "the accumulator", accumulator),
+        )
+    };
+    assert_eq!(
+        observe(Tier::BaselineJit),
+        observe(Tier::Interpreter),
+        "the native tier's accumulator must be byte-identical to the reference run's"
+    );
+    let (_, offset, size, payload) = observe(Tier::BaselineJit);
+    assert_eq!(
+        (offset, size, payload),
+        (0, 8, vec![0x5A]),
+        "the accumulator must still hold exactly the one field byte the first build wrote"
+    );
+    // (4) Both tiers raise the family's bare `badarg` — C's `is_not_bitstring(Src)` arm.
+    with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+        assert_same_outcome(
+            "binary all, non-bitstring source",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            assert!(
+                matches!(outcome, Err(beam_common::BeamError::BadArg)),
+                "{tier}: a non-bitstring source is the family's bare `badarg` (got {outcome:?})"
+            );
+        }
+    });
+}
 /// **A `Y`-slot source with a writable accumulator runs natively** — the door's
 /// `WRITE_VALUE_IN_Y` path.
 ///
