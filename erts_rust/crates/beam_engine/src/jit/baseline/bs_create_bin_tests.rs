@@ -92,7 +92,7 @@ use beam_term::{Atom, Eterm};
 
 use super::bitstr::bitstr_calls;
 use super::bitstr_inline_tests::{
-    atom, bitstr_module, emitted_shapes, static_deopts, visited_instances,
+    atom, bitstr_module, compile_cache_free, emitted_shapes, static_deopts, visited_instances,
 };
 use super::counters;
 use super::emit::bitstr_inline::{self, SHAPE_CREATE_BIN};
@@ -2736,6 +2736,502 @@ fn a_bit_granular_plan_with_a_constant_bytes_field_is_refused() {
                 .map(|shape| shape.route()),
             expected,
             "an integer {width} field beside a 2-byte string field"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A⁗. The bit-granular route's INLINE field stores
+// ---------------------------------------------------------------------------
+/// Compile `module`'s function `0` **cache-free** and report how many `bs_create_bin` plans
+/// took the inline field-store path during that compile, beside the compile's counter
+/// snapshot.
+///
+/// The figure is [`bitstr_inline::CreateBinShape::inline_field_plans`], a `#[cfg(test)]`
+/// compile-time instrument owned by the shape module. It is the **only** honest proof that a
+/// row's plan took the inline path: the general route used to issue one `jit_write_bit_field`
+/// helper call per field, and both forms produce the family's exact bytes, so tier parity —
+/// even an oracle-checked value — cannot tell them apart. A strictly positive delta is
+/// therefore the non-vacuity floor of the rows below, and a **zero** delta is the positive
+/// assertion of the row that pins a plan wider than the inline limit.
+fn inline_field_plan_delta(module: &Module) -> (usize, counters::Counters) {
+    let before = bitstr_inline::CreateBinShape::inline_field_plans();
+    let snapshot = compile_cache_free(module, 0);
+    let after = bitstr_inline::CreateBinShape::inline_field_plans();
+    let delta = after
+        .checked_sub(before)
+        .unwrap_or_else(|| panic!("the inline-field-plan counter went backwards ({before} -> {after})"));
+    (delta, snapshot)
+}
+
+/// **A⁗(1) A six-bit digit chain: the window offset cycles through 0, 6, 4 and 2, and every
+/// build takes the inline field store.**
+///
+/// This is the accumulator loop `emqx_base62:decode/2` runs — one 6-bit digit per character —
+/// so each build after the first starts *inside* a byte the previous build wrote. The
+/// expectation per chain is [`concatenated_bytes`], an independent statement of the rule
+/// (each value's low six bits, MSB-first), so a store that used a byte cursor instead of the
+/// absolute bit position, or that re-derived the start as `end_bits / 8 * 8`, fails here.
+///
+/// Every build spells append unit `1`: C's append-*position* gate refuses unit `8` once the
+/// window end is not a whole number of bytes, which is exactly a mid-byte second build.
+#[test]
+fn a_six_bit_digit_chain_cycles_the_window_offset_through_every_in_byte_position() {
+    let module = bin_module("bscb_inline_chain", 5, &[], |module| {
+        let mut code = vec![Instr::BsInitWritable];
+        for k in 1..=4u32 {
+            let mut segments = append_seg_unit(module, Operand::X(0), 1);
+            segments.extend(int_seg(module, Operand::X(k), 6));
+            code.push(create_bin(Operand::X(0), segments, 1 + k));
+        }
+        code
+    });
+    // The property the row is named for, stated as arithmetic: build `k` starts at bit `6k`,
+    // i.e. at in-byte offsets 0, 6, 4 and 2.
+    let offsets: Vec<usize> = (0..4).map(|build| build * 6 % 8).collect();
+    assert_eq!(
+        offsets,
+        vec![0, 6, 4, 2],
+        "the chain's in-byte start positions"
+    );
+
+    let name = atom(&module, "f");
+    // Four six-bit fields are 24 bits, so a three-byte capacity is an exact fit and no row
+    // grows the payload: the door is asked for the whole tail at once and every build stays on
+    // the success path.
+    let cases: [[i64; 4]; 4] = [
+        [0b10_1011, 0b11_0101, 0b0000_0011, 0b111_111],
+        [0, 0, 0, 0],
+        [-1, -1, -1, -1],
+        [0b1100_0000, 0b0000_0001, 0b1000_0000, 0x3F],
+    ];
+    for values in cases {
+        let expected = concatenated_bytes(&values.map(|value| (value, 6usize)));
+        let mut args = vec![ArgKind::Int(3)];
+        args.extend(values.iter().map(|value| ArgKind::Int(*value)));
+        let label = format!("6-bit chain {values:?}");
+        with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+            assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                let term = returned(&label, tier, outcome);
+                assert_eq!(
+                    bit_size(term),
+                    Some(24),
+                    "{tier}: {label}: four six-bit builds make a 24-bit window"
+                );
+                assert_eq!(
+                    returned_storage_bytes(&label, tier, term),
+                    expected,
+                    "{tier}: {label}: the chain's concatenated bits"
+                );
+            }
+        });
+    }
+
+    // Non-vacuity: all four instructions took the inline store, none statically deopted, and
+    // the family helper ran only for `bs_init_writable` (which has no native arm).
+    let (delta, snapshot) = inline_field_plan_delta(&module);
+    assert!(
+        delta >= 4,
+        "every one of the chain's four builds must take the inline field store (delta {delta})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    let report = run_counting(
+        &module,
+        name,
+        &[
+            ArgKind::Int(3),
+            ArgKind::Int(0b10_1011),
+            ArgKind::Int(0b11_0101),
+            ArgKind::Int(0b0000_0011),
+            ArgKind::Int(0b111_111),
+        ],
+        Tier::BaselineJit,
+    );
+    assert_eq!(report.bits, Some(24), "the counted run's window");
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "only `bs_init_writable` may reach the family helper, so every construction is native"
+    );
+}
+
+/// **A⁗(2) A negative value is its two's-complement low bits, at every inline width —
+/// including `57`, the widest the inline store accepts.**
+///
+/// The store extracts a field arithmetically (`sar`), because the raw small-integer word's bit
+/// 63 is the value's sign bit; a logical shift would leave the top byte of a wide negative
+/// field as zeroes instead of `0xFF`. The widths chosen pin both ends: `6` and `7` are inside
+/// the first byte (where the count peaks at `4 + 8 * 0`), and `57` spans eight bytes with a
+/// shift count of `4 + 8 * 6 = 52`.
+#[test]
+fn a_negative_value_is_written_as_its_twos_complement_by_the_inline_store() {
+    for width in [6i64, 7, 57] {
+        let module = accumulator_module("bscb_inline_neg", &[], |module| {
+            int_seg(module, Operand::X(1), width)
+        });
+        let (delta, snapshot) = inline_field_plan_delta(&module);
+        assert!(
+            delta >= 1,
+            "a {width}-bit field is inside the inline range (delta {delta})"
+        );
+        assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+
+        let capacity = (width + 7) / 8;
+        let name = atom(&module, "f");
+        for value in [-1i64, -0b10_1011, -43, i64::from(i32::MIN)] {
+            let expected = concatenated_bytes(&[(value, width as usize)]);
+            let label = format!("integer {width} of {value}");
+            with_both_tiers_args(
+                &module,
+                name,
+                &[ArgKind::Int(capacity), ArgKind::Int(value)],
+                |interpreter, baseline| {
+                    assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+                    for (tier, outcome) in
+                        [("interpreter", interpreter), ("baseline", baseline)]
+                    {
+                        let term = returned(&label, tier, outcome);
+                        assert_eq!(
+                            bit_size(term),
+                            Some(width as usize),
+                            "{tier}: {label}: the published width"
+                        );
+                        assert_eq!(
+                            returned_storage_bytes(&label, tier, term),
+                            expected,
+                            "{tier}: {label}: the two's-complement low bits"
+                        );
+                    }
+                },
+            );
+        }
+        let report = run_counting(
+            &module,
+            name,
+            &[ArgKind::Int(capacity), ArgKind::Int(-1)],
+            Tier::BaselineJit,
+        );
+        assert_eq!(report.bits, Some(width as usize), "the counted run's width");
+        assert_eq!(
+            report.bitstr_calls, 1,
+            "a negative value must not send the {width}-bit field to the family"
+        );
+    }
+}
+
+/// **A⁗(3) An append unit of `2` or `4` — a *non-byte-aligned* position gate — is served by
+/// the same inline store.**
+///
+/// The general door's gate is `position_bits % unit == 0` for any unit other than `8`, so a
+/// unit of 2 admits a 6-bit digit at bit 6 and a unit of 4 admits a 12-bit field at bit 12.
+/// The unit travels to the door as a compile-time constant (`CreateBinShape::unit`), so a
+/// lowering that dropped it — or that assumed `8` — would either refuse a build the
+/// interpreter accepts or accept one it rejects; each half is checked for parity *and* for the
+/// built bits.
+#[test]
+fn a_non_byte_aligned_append_unit_is_served_by_the_inline_store() {
+    // Unit 2: two six-bit builds, starting at bits 0 and 6 (both multiples of 2).
+    let unit2 = bin_module("bscb_inline_unit2", 3, &[], |module| {
+        let mut code = vec![Instr::BsInitWritable];
+        for k in 1..=2u32 {
+            let mut segments = append_seg_unit(module, Operand::X(0), 2);
+            segments.extend(int_seg(module, Operand::X(k), 6));
+            code.push(create_bin(Operand::X(0), segments, 1 + k));
+        }
+        code
+    });
+    // Unit 4: two twelve-bit builds, starting at bits 0 and 12 (both multiples of 4).
+    let unit4 = bin_module("bscb_inline_unit4", 3, &[], |module| {
+        let mut code = vec![Instr::BsInitWritable];
+        for k in 1..=2u32 {
+            let mut segments = append_seg_unit(module, Operand::X(0), 4);
+            segments.extend(int_seg(module, Operand::X(k), 12));
+            code.push(create_bin(Operand::X(0), segments, 1 + k));
+        }
+        code
+    });
+
+    for (label, module, width, capacity) in [
+        ("append unit 2", &unit2, 6usize, 2i64),
+        ("append unit 4", &unit4, 12, 3),
+    ] {
+        let name = atom(module, "f");
+        for (first, second) in [
+            (0b10_1011i64, 0b11_0101i64),
+            (-1, 0),
+            (0b111_111, 0b000_001),
+        ] {
+            let expected = concatenated_bytes(&[(first, width), (second, width)]);
+            let row = format!("{label}: {first:#b} then {second:#b}");
+            with_both_tiers_args(
+                module,
+                name,
+                &[
+                    ArgKind::Int(capacity),
+                    ArgKind::Int(first),
+                    ArgKind::Int(second),
+                ],
+                |interpreter, baseline| {
+                    assert_same_outcome(&row, interpreter, baseline, &module.atom_table);
+                    for (tier, outcome) in
+                        [("interpreter", interpreter), ("baseline", baseline)]
+                    {
+                        let term = returned(&row, tier, outcome);
+                        assert_eq!(
+                            bit_size(term),
+                            Some(2 * width),
+                            "{tier}: {row}: the two builds' widths add up"
+                        );
+                        assert_eq!(
+                            returned_storage_bytes(&row, tier, term),
+                            expected,
+                            "{tier}: {row}: the payload bits"
+                        );
+                    }
+                },
+            );
+        }
+        let (delta, snapshot) = inline_field_plan_delta(module);
+        assert!(
+            delta >= 2,
+            "{label}: both builds must take the inline field store (delta {delta})"
+        );
+        assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+        let report = run_counting(
+            module,
+            name,
+            &[
+                ArgKind::Int(capacity),
+                ArgKind::Int(0b10_1011),
+                ArgKind::Int(0b11_0101),
+            ],
+            Tier::BaselineJit,
+        );
+        assert_eq!(
+            report.bits,
+            Some(2 * width),
+            "{label}: the counted run's width"
+        );
+        assert_eq!(
+            report.bitstr_calls, 1,
+            "{label}: only `bs_init_writable` may reach the family helper"
+        );
+    }
+}
+
+/// **A⁗(4) Several bit-granular fields at distinct compile-time offsets, inside one build.**
+///
+/// A `6`, a `7` and a `12`-bit field start at bits 0, 6 and 13 — the third begins inside a
+/// byte neither of the first two started in, so the plan is the shape that separates "each
+/// field goes where its own offset says" from "each field goes where the previous one ended
+/// rounded up to a byte". The plan is one instruction, so one inline plan must be recorded.
+#[test]
+fn several_bit_granular_fields_are_written_at_their_own_offsets_inline() {
+    let module = accumulator_module("bscb_inline_multi", &[], |module| {
+        let mut fields = int_seg(module, Operand::X(1), 6);
+        fields.extend(int_seg(module, Operand::X(2), 7));
+        fields.extend(int_seg(module, Operand::X(3), 12));
+        fields
+    });
+    let name = atom(&module, "f");
+    // 6 + 7 + 12 = 25 bits, so a four-byte capacity is an exact fit.
+    let cases: [[i64; 3]; 3] = [
+        [0b10_1011, 0b101_0101, 0x0ABC],
+        [-1, -1, -1],
+        [0x3F, 0x01, 0x800],
+    ];
+    for values in cases {
+        let expected = concatenated_bytes(&[(values[0], 6), (values[1], 7), (values[2], 12)]);
+        let row = format!("6/7/12 bits of {values:?}");
+        with_both_tiers_args(
+            &module,
+            name,
+            &[
+                ArgKind::Int(4),
+                ArgKind::Int(values[0]),
+                ArgKind::Int(values[1]),
+                ArgKind::Int(values[2]),
+            ],
+            |interpreter, baseline| {
+                assert_same_outcome(&row, interpreter, baseline, &module.atom_table);
+                for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                    let term = returned(&row, tier, outcome);
+                    assert_eq!(
+                        bit_size(term),
+                        Some(25),
+                        "{tier}: {row}: the three widths add up"
+                    );
+                    assert_eq!(
+                        returned_storage_bytes(&row, tier, term),
+                        expected,
+                        "{tier}: {row}: each field at its own bit offset"
+                    );
+                }
+            },
+        );
+    }
+    let (delta, snapshot) = inline_field_plan_delta(&module);
+    assert!(
+        delta >= 1,
+        "the three-field plan must take the inline field store (delta {delta})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    let report = run_counting(
+        &module,
+        name,
+        &[
+            ArgKind::Int(4),
+            ArgKind::Int(0b10_1011),
+            ArgKind::Int(0b101_0101),
+            ArgKind::Int(0x0ABC),
+        ],
+        Tier::BaselineJit,
+    );
+    assert_eq!(report.bits, Some(25), "the counted run's width");
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "only `bs_init_writable` may reach the family helper"
+    );
+}
+
+/// **A⁗(5) A plan that legitimately declines at the door still agrees with the interpreter.**
+///
+/// The source is a plain on-heap binary (`ErlHeapBits`), so
+/// [`seam::open_append_any`](crate::families::bitstrings::create::seam::open_append_any)'s
+/// writable-target test fails and the emitted `test rax, rax ; je fallback` runs exactly one
+/// interpreter step. The row pins the *inline* form of that refusal (the plan really was
+/// emitted inline — a strictly positive delta — even though the door refuses it at run time),
+/// that the fallback is a **deopt** rather than a family helper call (`bitstr_calls` stays at
+/// zero, because `bs_init_writable` is not part of this fixture), and that the accumulator's
+/// own window is untouched on the deopting path, which is what makes the re-execution the
+/// family's single build rather than a second append.
+#[test]
+fn an_inline_field_plan_that_declines_at_the_door_still_agrees_with_the_interpreter() {
+    let subject: &'static [u8] = &[0x11, 0x22, 0x33];
+    let module = bin_module("bscb_inline_deopt", 2, &[], |module| {
+        let mut segments = append_seg_unit(module, Operand::X(0), 1);
+        segments.extend(int_seg(module, Operand::X(1), 6));
+        vec![create_bin(Operand::X(0), segments, 2)]
+    });
+    let name = atom(&module, "f");
+    let label = "inline plan declined at the door";
+    let value: i64 = -1;
+    // The plain binary's 24 bits, then the six-bit field in the top of the fourth byte.
+    let expected = concatenated_bytes(&[(0x11_2233, 24), (value, 6)]);
+
+    let (delta, snapshot) = inline_field_plan_delta(&module);
+    assert!(
+        delta >= 1,
+        "the plan must be emitted inline even though the door will refuse it at run time \
+         (delta {delta})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+
+    let report = run_counting(
+        &module,
+        name,
+        &[ArgKind::Bytes(subject), ArgKind::Int(value)],
+        Tier::BaselineJit,
+    );
+    assert_eq!(report.bits, Some(30), "the plain binary plus six bits");
+    assert!(
+        report.counters.step_one >= 1,
+        "a non-writable accumulator must really take the fallback (jit_step_one ran {} times)",
+        report.counters.step_one
+    );
+    assert_eq!(
+        report.bitstr_calls, 0,
+        "the fallback is one interpreter step (`jit_step_one`), never the family helper"
+    );
+
+    with_both_tiers_args_observed(
+        &module,
+        name,
+        &[ArgKind::Bytes(subject), ArgKind::Int(value)],
+        |interpreter_args, interpreter, baseline_args, baseline| {
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                let term = returned(label, tier, outcome);
+                assert_eq!(
+                    bit_size(term),
+                    Some(30),
+                    "{tier}: {label}: the plain binary plus six bits"
+                );
+                assert_eq!(
+                    returned_storage_bytes(label, tier, term),
+                    expected,
+                    "{tier}: {label}: the family's own concatenation"
+                );
+            }
+            for (tier, args) in [("interpreter", interpreter_args), ("baseline", baseline_args)] {
+                assert_eq!(
+                    bit_size(args[0]),
+                    Some(subject.len() * 8),
+                    "{tier}: {label}: the deopting path must leave the accumulator's window \
+                     alone — an advanced `end` here is what a non-idempotent commit looks like"
+                );
+            }
+        },
+    );
+}
+
+/// **A⁗(6) A field wider than the inline limit keeps the per-field helper — and still writes
+/// the field bit-exactly.**
+///
+/// [`bitstr_inline::CreateBinShape::inline_field_plans`] must **not** move: a field wider than
+/// 57 bits cannot be left-aligned in one 64-bit register at every window offset, so the whole
+/// plan keeps the `jit_write_bit_field` loop. The plan is still lowered (the shape is emitted,
+/// `BsCreateBin` does not statically deopt), so this is a *field-store* choice inside the arm
+/// and not a refusal of the shape — which is why the value, the width and the bits are checked
+/// beside the zero delta.
+#[test]
+fn a_field_wider_than_the_inline_limit_keeps_the_per_field_helper() {
+    for width in [58i64, 60, 63] {
+        let module = accumulator_module("bscb_inline_wide", &[], |module| {
+            int_seg(module, Operand::X(1), width)
+        });
+        let (delta, snapshot) = inline_field_plan_delta(&module);
+        assert_eq!(
+            delta, 0,
+            "a {width}-bit field is outside the inline range, so the plan must keep the \
+             per-field `jit_write_bit_field` helper"
+        );
+        assert_eq!(
+            static_deopts(&snapshot, "BsCreateBin"),
+            0,
+            "the plan is still lowered — only its field store stays on the helper"
+        );
+        let (emitted, _) = emitted_shapes(&module);
+        assert!(
+            emitted.contains(&SHAPE_CREATE_BIN),
+            "the {width}-bit shape must still be emitted (emitted {emitted:?})"
+        );
+
+        let capacity = (width + 7) / 8;
+        let name = atom(&module, "f");
+        let value: i64 = -1;
+        let expected = concatenated_bytes(&[(value, width as usize)]);
+        let label = format!("integer {width} of {value}");
+        with_both_tiers_args(
+            &module,
+            name,
+            &[ArgKind::Int(capacity), ArgKind::Int(value)],
+            |interpreter, baseline| {
+                assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+                for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                    let term = returned(&label, tier, outcome);
+                    assert_eq!(
+                        bit_size(term),
+                        Some(width as usize),
+                        "{tier}: {label}: the published width"
+                    );
+                    assert_eq!(
+                        returned_storage_bytes(&label, tier, term),
+                        expected,
+                        "{tier}: {label}: the helper's bits"
+                    );
+                }
+            },
         );
     }
 }

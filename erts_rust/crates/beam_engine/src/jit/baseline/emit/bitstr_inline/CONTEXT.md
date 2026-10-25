@@ -107,6 +107,8 @@ seam for room for `field_offset_bits + nbits` bits and then writes that field's 
 Both sequences commit the window end exactly once, after every write, which is what keeps a
 `fallback` (one whole-instruction interpreter step) re-execution safe.
 
+- **The bit-granular route's field stores are INLINE whenever every field of the plan is at most `MAX_INLINE_FIELD_BITS` (57) bits** (`create_field.rs`'s `emit_bit_field_store`, driven by `emit_bit_fields_inline`): the payload base the general door answered stays in a register, the window end is derived from the accumulator term once, and each field's bytes are straight-line stores at the absolute bit `end + field_offset_bits` — no helper call and no per-field room re-query (the door's whole-plan `tail_bits` check is the only admission point). **A plan with any field wider than 57 bits keeps the per-field `jit_write_bit_field` loop shown above**, because such a field cannot be left-aligned in one 64-bit register at every window offset; `#[cfg(test)] CreateBinShape::inline_field_plans()` is the compile-time counter that tells the two forms apart, pinned with its end-to-end tier-parity rows in `../../bs_create_bin_tests.rs` and with an exhaustive emitted-vs-`seam::write_bit_field` sweep (every width 1..=57 × offset 0..=64 × window end 0..=40 over a pre-filled payload) in `create_field_store_tests.rs`.
+
 ## Deliberate refusals (structural, not gaps)
 
 - **`binary all`** (a run-time-length segment, e.g. `emqx_base62:encode/2`'s builds): a

@@ -239,6 +239,12 @@ use create_field::{
     emit_bit_field_store, FieldScratch, MAX_INLINE_FIELD_BITS, PRODUCTION_FIELD_SCRATCH,
 };
 
+// The gold-standard oracle for `emit_bit_field_store`: the sequence is executed for every
+// width, window offset and window end over a byte-pre-filled payload and compared with the
+// family's own bit-granular write rule (`create_field_store_tests.rs`).
+#[cfg(test)]
+#[path = "create_field_store_tests.rs"]
+mod field_store_tests;
 // How many field-write plans the general route has emitted through the **inline** store
 // path (see `emit_bit_fields_inline`).
 //
