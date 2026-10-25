@@ -3315,3 +3315,118 @@ fn the_aligned_door_proves_the_shape_inline_for_both_accumulator_locations() {
     assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
     assert_construction_row("aligned, x accumulator, integer 8", &x_module, &args, &expected);
 }
+
+/// **The aligned route's `end % 8 == 0` refusal: a whole-byte build that meets a mid-byte
+/// window end declines, writes nothing and hands the instruction to the interpreter.**
+///
+/// The route is a function of the **fields'** widths, not of the accumulator's run-time
+/// window end, so a `unit 1` build of whole-byte fields is `Route::Aligned` while the
+/// window it opens at can sit mid-byte — which is exactly the state the second build of this
+/// fixture meets, the first having appended six bits. The inline proof's byte-alignment
+/// guard is therefore a real, reachable run-time refusal (the same `unit == 8` append
+/// position gate `seam::open_append` spells out, one clause earlier than the capacity
+/// lookup), and the family, whose unit-1 position gate is ungated, then appends the field at
+/// bit 6.
+///
+/// What the row pins:
+///
+/// * the shape predicate accepts **both** builds and the arm emits (zero static deopts), so
+///   the rejection is a run-time guard rather than a compile-time refusal;
+/// * the baseline run really took that guard (`jit_step_one` moved) instead of writing a
+///   whole byte at a byte-rounded cursor — the failure mode a missing guard produces, and the
+///   one where the result's width, its payload bits and the first build's own bits would all
+///   be wrong;
+/// * the answer is the interpreter's: 14 bits whose storage bytes are the two fields' bits end
+///   to end, which is also the "wrote nothing before the refusal" evidence — a partially
+///   written second build would corrupt the shared byte the first build occupies;
+/// * the re-execution is the family's single build, never a second append (`bitstr_calls`
+///   stays at the one `bs_init_writable` step, which has no native arm).
+#[test]
+fn a_whole_byte_build_at_a_mid_byte_window_end_refuses_the_aligned_route() {
+    let module = bin_module("bscb_mid_byte_aligned", 3, &[], |module| {
+        let mut first = append_seg_unit(module, Operand::X(0), 1);
+        first.extend(int_seg(module, Operand::X(1), 6));
+        let mut second = append_seg_unit(module, Operand::X(0), 1);
+        second.extend(int_seg(module, Operand::X(2), 8));
+        vec![
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), first, 2),
+            create_bin(Operand::X(0), second, 3),
+            Instr::Return,
+        ]
+    });
+    // The two routes, per instruction: the six-bit build is bit-granular, and the whole-byte
+    // one is aligned even though it appends at bit 6.
+    let mut routes = Vec::new();
+    for instr in &module.functions[0].code {
+        if let Instr::BsCreateBin { dst, segments, .. } = instr {
+            let shape = bitstr_inline::CreateBinShape::of(&module, dst, segments)
+                .expect("both builds are inlinable shapes");
+            routes.push(shape.route());
+        }
+    }
+    assert_eq!(
+        routes,
+        vec![
+            bitstr_inline::Route::BitGranular,
+            bitstr_inline::Route::Aligned
+        ],
+        "the second build is aligned by its fields and misaligned only by its window end"
+    );
+    let name = atom(&module, "f");
+    for (first, second) in [
+        (0b10_1011i64, 0xA5i64),
+        (0b0000_0001, 0x00),
+        (0b111_111, 0xFF),
+    ] {
+        // Two bytes hold the whole 6 + 8 bit result.
+        let capacity = 2i64;
+        let expected = concatenated_bytes(&[(first, 6), (second, 8)]);
+        let label = format!("{first:#b} then {second:#b} (8 bits at a mid-byte end)");
+        with_both_tiers_args(
+            &module,
+            name,
+            &[
+                ArgKind::Int(capacity),
+                ArgKind::Int(first),
+                ArgKind::Int(second),
+            ],
+            |interpreter, baseline| {
+                assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+                for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                    let term = returned(&label, tier, outcome);
+                    assert_eq!(
+                        bit_size(term),
+                        Some(14),
+                        "{tier}: {label}: the refused build's field is still appended once"
+                    );
+                    assert_eq!(
+                        returned_storage_bytes(&label, tier, term),
+                        expected,
+                        "{tier}: {label}: the first build's bits must survive the refusal, so \
+                         the aligned route wrote nothing"
+                    );
+                }
+            },
+        );
+    }
+    let args = [ArgKind::Int(2), ArgKind::Int(0b10_1011), ArgKind::Int(0xA5)];
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(report.bits, Some(14), "the counted run's width");
+    assert!(
+        report.counters.step_one >= 1,
+        "the byte-alignment guard must take the fallback (jit_step_one ran {} times)",
+        report.counters.step_one
+    );
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "the fallback is one interpreter step, so the family helper runs only for \
+         `bs_init_writable`"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the construction shape (emitted {emitted:?})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+}
