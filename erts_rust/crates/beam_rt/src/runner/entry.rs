@@ -401,10 +401,17 @@ pub(crate) fn registered_name(
 pub(crate) struct RunnerState {
     /// The live engines, keyed by pid.
     ///
+    /// It holds an engine for every pid the runtime spawned that is still alive, and it is pruned
+    /// to the live process table at every scheduler-pass boundary ([`RunnerState::prune_dead`],
+    /// called from [`Runtime::scheduler_pass`](crate::runtime::Runtime::scheduler_pass)), so an
+    /// engine whose process has died cannot outlive the pass that observed the death. A live parked
+    /// engine is never pruned — it is still found and resumed.
+    ///
     /// A [`FastHashMap`] (not `RandomState`'s SipHash): the map is only ever probed by pid
-    /// (`get`/`insert`/`remove` in this module, `runner/run.rs` and `runtime/scheduler.rs`), never
-    /// iterated for an observable order, and the keys are the runtime's own dense pids — see
-    /// [`crate::hasher`].
+    /// (`get`/`insert`/`remove` in this module, `runner/run.rs` and `runtime/scheduler.rs`; the
+    /// `remove` is the per-slice take-out in `runner/run.rs`, and the one whole-map sweep,
+    /// `prune_dead`'s `retain`, makes no ordering observable either), never iterated for an
+    /// observable order, and the keys are the runtime's own dense pids — see [`crate::hasher`].
     pub(super) engines: FastHashMap<ProcessId, ProcessEngine>,
     /// The `x(0)` of every process that ran to its `return`.
     pub(super) results: FastHashMap<ProcessId, Eterm>,
@@ -646,10 +653,12 @@ impl RunnerState {
     /// the process's registers are the truth there, and [`Runtime::gather_off_heap_roots`] gathers
     /// them (`crate::runtime::Runtime::gather_off_heap_roots`).
     ///
-    /// This family is gated on the pid still being in the `live` process table: an engine is not
-    /// removed when its process terminates, and a terminated process's heap is gone, so its
-    /// machine's registers would be dangling words. Only **live**, **un-published** engines are
-    /// enumerated, and the enumeration is `O(1)` when there are no engines at all.
+    /// This family is gated on the pid still being in the `live` process table: an engine outlives
+    /// its process's termination by at most the rest of the pass that observed it (the pass
+    /// boundary prunes `engines` to the live table — see [`RunnerState::prune_dead`]), and while a
+    /// dead engine is still in the map its machine's registers are dangling words because the
+    /// process's heap is gone, so only **live**, **un-published** engines are enumerated. The
+    /// enumeration is `O(1)` when there are no engines at all.
     ///
     /// `RunnerState` is moved out of the [`Runtime`](crate::runtime::Runtime) for the duration of
     /// a scheduler pass, so this covers the sites that run outside one (the `-eval` statement
