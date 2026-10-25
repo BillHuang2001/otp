@@ -33,8 +33,8 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   intended adopters are the BIF floors that serve `erlang:bit_size/1` — the in-crate harness floor
   `src/bench/counting.rs`, which **has** adopted it (that is what makes `emqx_base62:decode/1`
   measurable: `instr_per_call` 531, `rooted_calls_per_call` 32), and the external test host
-  `tests/support/bifs.rs`, which still cannot (integration tests see the crate from outside and
-  `families` is a private module, so it would need a `pub` re-export).
+  `tests/support/bifs.rs`, which still cannot (an integration test sees the crate from outside, and
+  `families` is only `pub(crate)`, so it would need a `pub` re-export).
 - All computation goes through `crate::context::ExecutionContext`; term construction via `crate::terms`.
   Families build no term layout of their own **except** `bitstrings/raw.rs` (see Duplication).
 
@@ -89,6 +89,12 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
   `push_wide_int`) and the readers (`read_uint_be`/`extract_bits`) take a byte-at-a-time arm only when the field
   is a whole number of bytes **and** byte-aligned, after every range/width check, so an out-of-range field keeps
   the oracle's error and a non-aligned shape keeps the bit-exact rule.
+  The construction side's **one exported surface** is `create/seam.rs` (`pub(crate) mod seam;` inside the
+  `pub(crate) mod create;`): the compile-time plan plus two run-time doors and the family's single
+  bit-granular field write — what the baseline tier's `bs_create_bin` inline arm consumes instead of
+  calling the family helper. The plan's accepted/declined shapes, both doors and the write rule are
+  `bitstrings/CONTEXT.md` → `## The construction seam`; this level only records that the seam exists and
+  that `src/jit/**` reaches it directly.
 - `receive.rs` — `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`/`RecvMarkerReserve`/`RecvMarkerBind`/`RecvMarkerUse`/`RecvMarkerClear`.
 
 ## The router sentinel + the honest-error convention
