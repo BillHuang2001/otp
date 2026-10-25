@@ -57,9 +57,9 @@ Success ⇒ one line `ok <repr>`, exit `0`; failure ⇒ `exception <class> <reas
 **Invariant:** a capability gap (`unsupported`/`skipped`) is **never** a mismatch — it can only cause exit `3` (not allowlisted) or `0` (allowlisted). The `1`-vs-`3` split is read **solely** from the top-level `summary`/`ratchet`; the per-contract `by_contract` rollup (which repeats `mismatch` keys at a deeper indent) is deliberately ignored. The gate's unauthorized/stale id lists are restricted to genuine gaps, so a `mismatch` can never be recorded as "allowed". The binary's own codes are unchanged (`0/1/2`).
 
 ## Status
-- **Corpus:** 3439 cases covering all nine contracts; the recorded sweep is `total=3439 agree=3438
-  mismatch=0 unsupported=1 skipped=0` with `ratchet: entries=1 allowed=1 unauthorized=0 stale=0` (a
-  16-way `differential run --out-file` sweep folded with `merge`, ~4.5 min wall with a report for
+- **Corpus:** 3463 cases covering all nine contracts; the recorded sweep is `total=3463 agree=3462
+  mismatch=0 unsupported=1 skipped=0` with `ratchet: allowlist=known-gaps.txt allowed=1 unauthorized=0 stale=0` (a
+  16-way `differential run --out-file` sweep folded with `merge`, ~5 min wall with a report for
   every id and every worker exit `0`; the serial `gate.sh` route boots every CLI case, so the
   parallel sweep is the practical authoritative route).
   The single non-agreeing case is the allowlisted `wire/new_fun_ext_encode`. Do **not** read the total
