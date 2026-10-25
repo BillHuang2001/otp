@@ -170,7 +170,10 @@
 //! [`reclaim`] therefore runs a **second, prune-only** valve
 //! ([`super::reaches_an_unscanned_word`]) after the collection one: it declines when *any* root
 //! word, or *any* child slot of any object reachable from the roots through the collector's
-//! scanned graph, is pointer-bearing and lies in a region the collector does not scan. That is a
+//! scanned graph, is pointer-bearing, lies in a region the collector does not scan, **and is not a
+//! reference thing** ([`super::is_inert_reference`] — an M1 `[header, node, serial, id]` block or a
+//! C-layout reference, whose payload words are terms or packed `u32` ids and never a `BinRef.val`
+//! pointer, so it can name no payload). That is a
 //! **strict superset** of the collection valve's decline set — dropping the forwarding test can
 //! only add declines — and the asymmetry is deliberate:
 //!
@@ -178,7 +181,14 @@
 //! > payload that is already garbage.
 //!
 //! A false accept is a leak; a false reject is a **dangling pointer**, read later through the
-//! frozen term layout. Every decline here opens the per-pid descent latch
+//! frozen term layout. The reference relaxation is the one narrowing, and it is not a weakening of
+//! that asymmetry: a reference block has no payload word that could be a term reference or a
+//! payload pointer, so excluding it can never reject a live payload. It is what makes the prune
+//! reachable at all — a process holding *any* live reference in its root set (every `gen_server`
+//! with a monitor, every process owning an unnamed ETS table, anything that called `make_ref/0`)
+//! would otherwise decline on every park for as long as it held it, retaining every payload the
+//! loop in between built, so `erlang:memory(binary)` would be exactly linear in the loop count.
+//! Every decline here opens the per-pid descent latch
 //! ([`Runtime::note_foreign_reachable`]) exactly as the collection valve's does, so a process that
 //! later drops the offending term also gets its collections back on the fast path.
 //!
@@ -377,7 +387,8 @@ impl OffHeapReclaimer {
 ///    reject here is a dangling pointer;
 /// 6. the **prune-only valve** ([`super::reaches_an_unscanned_word`]) — the strictly stronger
 ///    criterion this point needs: *any* pointer-bearing word a root or a scanned-graph child names
-///    in a region the collector does not scan (see the module docs' *the prune's own valve*);
+///    in a region the collector does not scan **that is not a reference thing** (a reference block
+///    has no payload word a `BinRef` could live in; see the module docs' *the prune's own valve*);
 /// 7. the **reachability walk** itself ([`beam_gc::for_each_reachable_binary_payload`]) — a walk
 ///    that cannot complete declines rather than reporting "nothing is live".
 ///

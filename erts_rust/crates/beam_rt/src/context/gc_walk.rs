@@ -166,7 +166,7 @@
 //! The per-object child enumeration is the canonical
 //! [`beam_term::layout::for_each_child_slot`] — the same model the workspace's own copier uses
 //! (`beam_message::copy`) — so the walk can never disagree with the collector about which
-//! payload words of an object are references. Two shapes need no descent at all and are
+//! payload words of an object are references. Three shapes need no descent at all and are
 //! deliberately skipped:
 //!
 //! * an **immediate** (a small integer, an atom, `NIL`, an internal pid/port id) has no
@@ -175,7 +175,14 @@
 //!   whose words reference the literal area alone, never a runtime heap region, so it can
 //!   neither dangle itself nor lead to a word that does. Skipping it is also what keeps a
 //!   *nested* pointer inside a literal (which carries no literal bit of its own) from being
-//!   mis-read as an unscanned heap container.
+//!   mis-read as an unscanned heap container;
+//! * a **reference thing** — the M1 `[header, node, serial, id]` block this runtime builds, or a
+//!   C-layout `[header, w1, w2]` reference — is a childless leaf whose payload words are terms or
+//!   packed `u32` ids, never a term reference ([`is_inert_reference`]). Both criteria therefore
+//!   treat it as inert, though for different reasons and with different consequences: a
+//!   collection ignores it because it forwards no word a relocation follows, and the off-heap
+//!   payload prune ignores it because a reference cannot name an off-heap payload at all — no
+//!   `BinRef.val` pointer exists anywhere in either reference layout.
 //!
 //! # Why this module is `unsafe`
 //!
@@ -200,7 +207,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use beam_process::{Process, ProcessId};
-use beam_term::boxed::internal_ref_id;
+use beam_term::boxed::{internal_ref_id, is_external_ref, is_internal_ref};
 use beam_term::layout::for_each_child_slot;
 use beam_term::list::ptr_val;
 use beam_term::prelude::is_list;
@@ -441,17 +448,26 @@ pub(crate) fn process_roots_are_unscanned_at(
 /// Decline when **any root word**, or **any child slot of any object reachable from the roots
 /// through the collector's scanned graph**, is pointer-bearing ([`super::gc::is_pointer_bearing`])
 /// **and** lies in a region the process's collector does not scan
-/// ([`WordRegion::Foreign`]). The descent is otherwise the collection valve's — the same
-/// [`WalkScratch`], the same visited set, the same `beam_term::layout::for_each_child_slot`
-/// enumeration — restricted to the **scanned** graph, because that is exactly the graph the
-/// payload walk follows.
+/// ([`WordRegion::Foreign`]) **and is not a reference thing** ([`is_inert_reference`]). The
+/// descent is otherwise the collection valve's — the same [`WalkScratch`], the same visited set,
+/// the same `beam_term::layout::for_each_child_slot` enumeration — restricted to the **scanned**
+/// graph, because that is exactly the graph the payload walk follows.
 ///
 /// It is a superset because every word the collection valve calls a hit is either a root word
 /// that is foreign, or a child slot of a scanned-graph-reachable object that is foreign: the
 /// forwarding test only refines *which* foreign words matter, so dropping it can only add
 /// declines. It is **strictly** stronger — the prune declines cases the collection allows — and
 /// that asymmetry is the whole point: a false accept is a leak, a false reject is a dangling
-/// pointer.
+/// pointer. The one relaxation the prune makes relative to "any foreign pointer-bearing word" is
+/// the reference thing, and it is safe precisely because such a block has no payload word that
+/// could be a term reference or a payload pointer: it is the one foreign leaf whose children are
+/// provably not references, so keeping it out of the hit set can never reject a live payload.
+///
+/// That relaxation is what makes the prune reachable at all in an ordinary program: a process
+/// holding **any** live reference in its root set — every `gen_server` with a monitor, every
+/// process owning an unnamed ETS table, anything that ever called `make_ref/0` — would otherwise
+/// decline on every park for as long as it held the reference, retaining every payload it built
+/// in between (see [`super::gc::bin_vheap::reclaim`]).
 ///
 /// `descend` is deliberately **not** a parameter here, unlike [`valve_verdict`]'s: the per-pid
 /// latch is opened by the events that can put a *scanned-forwarding* foreign container into the
@@ -663,7 +679,9 @@ enum Criterion {
     /// **forwards** a word into one it does.
     Collection,
     /// The off-heap payload prune ([`reaches_an_unscanned_word`]): **any** pointer-bearing word in
-    /// a region the collector does not scan, whether or not it forwards anything.
+    /// a region the collector does not scan that is **not a reference thing**
+    /// ([`is_inert_reference`]), whether or not it forwards anything. A reference thing cannot name
+    /// an off-heap payload, so it is the one foreign leaf the prune does not hit on.
     PayloadPrune,
     /// The NIF-resource-term prune ([`reachable_resource_words`]): collect **every** reachable
     /// word that is one of the caller's candidates. A resource term is a leaf (a magic reference
@@ -683,7 +701,8 @@ struct Walk<'a> {
     /// The hazard this walk answers for (see [`Criterion`]).
     criterion: Criterion,
     /// A hazard was reached: a foreign container forwarding a scanned word (a collection), or any
-    /// foreign pointer-bearing word at all (the prune) — or a root that is one.
+    /// foreign pointer-bearing word that is not a reference thing (the prune) — or a root that is
+    /// one.
     hit: bool,
     /// A container in a region the collector does not scan was reached at all (hazardous or not).
     /// This is what an admission point that handed over its whole root set needs in order to
@@ -1111,15 +1130,19 @@ impl<'a> Walk<'a> {
     /// Records a container in a region the collector does not scan and decides what it means: a
     /// hazard when the criterion says so — a collection's when it forwards a word into a region
     /// the collector **does** scan (a collection would relocate that word without updating the
-    /// container), the prune's whenever it is a pointer-bearing word at all (see
-    /// [`reaches_an_unscanned_word`]) — otherwise a container to expand so a foreign →
-    /// foreign → scanned chain is still found.
+    /// container), the prune's when it is a pointer-bearing word that is **not a reference thing**
+    /// (see [`reaches_an_unscanned_word`] and [`is_inert_reference`]) — otherwise a container to
+    /// expand so a foreign → foreign → scanned chain is still found.
     fn reach_foreign(&mut self, process: &Process, word: Eterm) {
         self.foreign_reached = true;
         if self.criterion == Criterion::PayloadPrune {
             // The prune frees off-heap payloads, and a foreign container may name one through a
-            // `BinRef` the collector's own walk can never see — whatever else it forwards.
-            self.hit = true;
+            // `BinRef` the collector's own walk can never see — whatever else it forwards. A
+            // reference thing is the one shape that provably cannot: its block is a childless leaf
+            // of immediates or packed `u32` ids, so it names no payload ([`is_inert_reference`]).
+            if !is_inert_reference(word) {
+                self.hit = true;
+            }
             return;
         }
         if self.geometry.forwards_scanned_word(process, word, self.traced) {
@@ -1277,6 +1300,26 @@ impl<'a> Walk<'a> {
             });
         }
     }
+}
+
+/// Whether `word` is a **reference thing** — an M1 internal-reference block (`make_ref/0`, a
+/// monitor reference, an alias, an unnamed ETS table's tid) or a C-layout external reference.
+///
+/// Such a block is **inert for the payload-prune question**: no payload word of it is a term
+/// reference or a `BinRef.val` pointer, so it can name no off-heap refc-binary payload. The M1
+/// shape this runtime builds is `[make_header(3, REF_SUBTAG), node, serial, id]` — three
+/// immediates, documented by [`beam_term::boxed::internal_ref_id`]; the C internal shape is
+/// `[make_header(2, REF_SUBTAG), w1, w2]` — two words of packed `u32` ids plus a marker,
+/// documented by [`beam_term::boxed::internal_ref_numbers`]; and the external shape
+/// [`beam_term::thing::write_external_ref`] writes is `[header, node, creation, packed u32
+/// ids…]`, whose node word is an immediate and whose other payload words are raw `u32`s or a bare
+/// id count, never terms. Everything else stays a hazard (see [`Walk::reach_foreign`]).
+fn is_inert_reference(word: Eterm) -> bool {
+    // SAFETY: both predicates are header tests on a boxed term and answer `false` for a word that
+    // is not a term at all (`is_boxed_term`'s own guard); `word` reaches this point only from
+    // `seed`, which admits exactly the live objects of the process's term graph (the module docs'
+    // argument), so its header word is live and aligned.
+    unsafe { is_internal_ref(word) || is_external_ref(word) }
 }
 
 /// Test-only tallies of the seeding's *scale* and of its **allocation discipline** — the witness
@@ -2273,9 +2316,279 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
+    // The off-heap payload prune's criterion: the one foreign leaf that can name no payload
+    // ---------------------------------------------------------------------------------------
+    //
+    // The prune declines when it reaches a pointer-bearing word in a region the collector does not
+    // scan, because a `[BinRef][ErlSubBits]` pair inside such a container names a payload the
+    // collector's own reachability walk can never report — freeing it would be a dangling pointer.
+    // A **reference thing** is the single exception: its block is four words of immediates (M1) or
+    // three packed `u32` ids plus a marker (the C layout), so no word in it can be a payload
+    // pointer ([`is_inert_reference`]). The three cases below pin the relaxation, the anti-dangle
+    // retention it must not regress, and the conservatism it leaves in place for every other
+    // foreign container.
+
+    /// Every root word [`Process::collect`] gathers, for a process whose roots were planted by a
+    /// case — the *whole* root set, so an assertion says "this is all the prune could have seen"
+    /// rather than "this is the one word I passed".
+    fn gathered_roots(process: &Process) -> Vec<Eterm> {
+        let mut roots: Vec<Eterm> = Vec::new();
+        process.registers().gather_roots(&mut roots);
+        for message in process.mailbox().iter() {
+            roots.push(message.payload());
+            roots.push(message.from());
+            roots.push(message.token());
+        }
+        for (key, value) in process.dict().entries() {
+            roots.push(key);
+            roots.push(value);
+        }
+        process.saved_args().gather_roots(&mut roots);
+        process.signals().gather_roots(&mut roots);
+        roots
+    }
+
+    /// An **M1 internal-reference thing** (`make_ref/0`'s block, [`INTERNAL_REF_WORDS`] words) built
+    /// on a `beam_term` test arena — a region outside every region a process's collector scans, so
+    /// the walk classifies it [`WordRegion::Foreign`] exactly as it classifies a reference on the
+    /// runtime's pooled BIF heap.
+    ///
+    /// The arena must outlive every walk that classifies the block.
+    fn foreign_reference(arena: &mut Heap, id: u64) -> Eterm {
+        // SAFETY: the arena hands out `INTERNAL_REF_WORDS` writable, word-aligned words it never
+        // frees and never moves, and `write_internal_ref` writes all four before the pointer
+        // escapes.
+        unsafe {
+            let hp = arena
+                .alloc_words(beam_term::boxed::INTERNAL_REF_WORDS)
+                .expect("the arena serves the reference block");
+            beam_term::boxed::write_internal_ref(hp, id).expect("a small id fits the block's slot")
+        }
+    }
+
+    /// A live **`[BinRef][ErlSubBits]` pair** on a `beam_term` test arena, naming `payload` — the
+    /// off-heap refc binary whose payload the prune would free. `payload` must outlive the term
+    /// (the caller keeps the owning `Vec`).
+    ///
+    /// This is the shape the prune's decline exists for: the collector's own reachability walk
+    /// enters only from-space objects, so a pair in a foreign region is invisible to it while the
+    /// payload it names is perfectly live.
+    fn foreign_payload_pair(arena: &mut Heap, payload: &[u64]) -> Eterm {
+        let base = payload.as_ptr().cast::<u8>();
+        // SAFETY: the arena serves the pair's `ERL_REFC_BITS_SIZE` words and never moves them, the
+        // caller keeps `payload` alive for the term's lifetime, and a `u64` slice is word-aligned
+        // (`write_refc_binary`'s flag-bit assert).
+        unsafe {
+            let hp = arena
+                .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+                .expect("the arena serves the 8-word pair");
+            beam_term::refc::write_refc_binary(
+                hp,
+                base.cast_mut().cast::<Eterm>(),
+                core::ptr::null_mut(),
+                base,
+                0,
+                payload.len() * 64,
+            )
+        }
+    }
+
+    /// **The relaxation.** A live reference thing planted as the process's **only** root in a
+    /// region the collector does not scan — `make_ref/0`'s M1 block, the shape every `gen_server`
+    /// with a monitor, every process owning an unnamed ETS table and every `make_ref/0` caller
+    /// holds for a whole loop — is **not** a payload-prune hit, and the collection criterion's
+    /// answer for that same root is unchanged.
+    ///
+    /// Why it matters beyond the unit: a hit declines the prune, and the prune is the runtime's
+    /// only off-heap release point, so a hit on a live reference retains every payload the process
+    /// builds for as long as it holds the reference — `erlang:memory(binary)` then grows linearly
+    /// in the loop count instead of holding flat. Nothing about the reference justifies that: its
+    /// block is four words of immediates, none of which can be a `BinRef.val` pointer. The
+    /// collection criterion's `false` is the control — the same root was already inert there (it
+    /// forwards no word a relocation follows), so the relaxation changes exactly one answer.
+    #[test]
+    fn a_reference_thing_in_a_foreign_region_is_not_a_payload_prune_hit() {
+        let (mut table, pid) = seeded_process();
+        let mut arena = Heap::new(64);
+        let reference = foreign_reference(&mut arena, 7);
+        let process = table.get(pid).expect("the spawned process");
+        assert_eq!(
+            super::super::gc::word_region_exactly(process, reference),
+            Some(WordRegion::Foreign),
+            "the planted reference must lie outside every region the collector scans"
+        );
+        plant_x(table.get_mut(pid).expect("the spawned process"), reference);
+        let process = table.get(pid).expect("the spawned process");
+        let roots = gathered_roots(process);
+        assert_eq!(
+            roots,
+            vec![reference],
+            "the constructed reference is the process's whole root set"
+        );
+        let mut scratch = WalkScratch::default();
+        assert!(
+            !reaches_an_unscanned_word(&mut scratch, process, roots.iter()),
+            "a reference thing can name no off-heap payload, so it must not decline the prune"
+        );
+        assert!(
+            !valve_verdict(&mut scratch, process, roots.iter(), /* descend */ true).declined,
+            "the collection criterion is unchanged: a reference forwards no word a relocation \
+             follows, so it was and stays inert"
+        );
+    }
+
+    /// **The anti-dangle half, which must never regress.** The same foreign region, the same
+    /// planting, but the leaf is a live `[BinRef][ErlSubBits]` pair instead of a reference: the
+    /// prune **must** still decline, because the collector's own walk cannot report the payload
+    /// that pair names (it admits only from-space objects) and freeing it would leave a live term
+    /// naming released memory.
+    ///
+    /// The relaxation is therefore exactly one leaf wide: the criterion still covers every foreign
+    /// word that could carry a `BinRef`, which is every foreign word that is not a reference thing.
+    #[test]
+    fn a_payload_pair_in_a_foreign_region_is_still_a_payload_prune_hit() {
+        let (mut table, pid) = seeded_process();
+        let payload: Vec<u64> = vec![0; 128];
+        let mut arena = Heap::new(64);
+        let pair = foreign_payload_pair(&mut arena, &payload);
+        let process = table.get(pid).expect("the spawned process");
+        assert_eq!(
+            super::super::gc::word_region_exactly(process, pair),
+            Some(WordRegion::Foreign),
+            "the pair is written outside every region the collector scans"
+        );
+        plant_x(table.get_mut(pid).expect("the spawned process"), pair);
+        let process = table.get(pid).expect("the spawned process");
+        let roots = gathered_roots(process);
+        assert_eq!(roots, vec![pair], "the pair is the whole root set");
+        let mut scratch = WalkScratch::default();
+        assert!(
+            reaches_an_unscanned_word(&mut scratch, process, roots.iter()),
+            "a foreign `[BinRef][ErlSubBits]` pair names a payload the collector's walk can never \
+             report, so the prune must decline — a false accept here is a dangling pointer"
+        );
+        // The collection criterion says nothing about it (no relocation touches an off-heap
+        // payload), which is exactly why the prune needs its own valve.
+        assert!(
+            !valve_verdict(&mut scratch, process, roots.iter(), /* descend */ true).declined,
+            "a collection has no complaint: nothing the pair holds would be relocated"
+        );
+    }
+
+    /// **The conservatism that stays.** A foreign container that is not a reference thing still
+    /// hits under the prune criterion even though it forwards nothing: a foreign cons of
+    /// immediates was already inert for a *collection* (case (e) of
+    /// [`a_foreign_container_in_every_seeded_root_family_is_detected`]), yet the prune must still
+    /// decline on it, because the walk does not classify a foreign container's children — a
+    /// `BinRef` pair could be one of them and the collector would never say so.
+    #[test]
+    fn a_foreign_container_that_is_not_a_reference_still_hits_the_prune() {
+        let (mut table, pid) = seeded_process();
+        let mut arena = Heap::new(64);
+        let inert = inert_foreign_container(&mut arena);
+        let tuple = arena
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("the arena builds the tuple");
+        for (name, foreign) in [("a cons of immediates", inert), ("a tuple of immediates", tuple)] {
+            let process = table.get(pid).expect("the spawned process");
+            assert_eq!(
+                super::super::gc::word_region_exactly(process, foreign),
+                Some(WordRegion::Foreign),
+                "{name}: it must lie outside every region the collector scans"
+            );
+            plant_x(table.get_mut(pid).expect("the spawned process"), foreign);
+            let process = table.get(pid).expect("the spawned process");
+            let roots = gathered_roots(process);
+            let mut scratch = WalkScratch::default();
+            assert!(
+                !valve_verdict(&mut scratch, process, roots.iter(), /* descend */ true).declined,
+                "{name}: a collection has nothing to relocate inside it"
+            );
+            assert!(
+                reaches_an_unscanned_word(&mut scratch, process, roots.iter()),
+                "{name}: the prune must still decline — its children were never classified, so \
+                 one of them could be a `BinRef` pair"
+            );
+        }
+    }
+
+    /// [`is_inert_reference`] recognizes **exactly** the two reference layouts and nothing else —
+    /// the guard that keeps the relaxation from widening by accident.
+    ///
+    /// The positive half is the M1 block this runtime builds (`REF_SUBTAG`) and a C-layout
+    /// external reference (`EXTERNAL_REF_SUBTAG`, what
+    /// [`beam_term::thing::write_external_ref`] writes and what a decoded wire reference becomes),
+    /// i.e. both header subtags the predicate ORs together. The negative half is every other shape
+    /// the walk meets: an immediate, a cons, a tuple, a `[BinRef][ErlSubBits]` pair and a bare
+    /// header word — none of which may be called inert, since each either carries a child slot or
+    /// is not a term at all.
+    #[test]
+    fn is_inert_reference_recognizes_both_reference_layouts_and_nothing_else() {
+        let mut arena = Heap::new(128);
+        let internal = foreign_reference(&mut arena, 11);
+        let external = {
+            // SAFETY: the arena serves the external block's words and never moves them; the node
+            // word is an immediate and the ids are packed into the block's data section.
+            unsafe {
+                let node = make_small(0);
+                let ids = [1u32, 2, 3];
+                let data_words = ids.len() / 2 + 1;
+                let hp = arena
+                    .alloc_words(3 + data_words)
+                    .expect("the arena serves the external reference block");
+                beam_term::thing::write_external_ref(hp, node, &ids, 0)
+            }
+        };
+        assert!(
+            is_inert_reference(internal),
+            "the M1 internal-reference block is a reference thing"
+        );
+        assert!(
+            is_inert_reference(external),
+            "a C-layout external reference is a reference thing"
+        );
+        assert!(
+            unsafe { is_internal_ref(internal) } && unsafe { is_external_ref(external) },
+            "the two layouts are covered by the two header tests the predicate ORs together \
+             (`REF_SUBTAG` for the internal block, `EXTERNAL_REF_SUBTAG` for the external one)"
+        );
+
+        let payload: Vec<u64> = vec![0; 16];
+        let not_references: Vec<(&str, Eterm)> = vec![
+            ("an immediate", make_small(5)),
+            ("NIL", NIL),
+            (
+                "a cons of immediates",
+                arena
+                    .cons(make_small(1), make_small(2))
+                    .expect("the arena builds the cons"),
+            ),
+            (
+                "a tuple of immediates",
+                arena
+                    .tuple(&[make_small(3)])
+                    .expect("the arena builds the tuple"),
+            ),
+            (
+                "a `[BinRef][ErlSubBits]` pair",
+                foreign_payload_pair(&mut arena, &payload),
+            ),
+            (
+                "a bare header word",
+                beam_term::boxed::make_header(3, beam_term::tag::REF_SUBTAG),
+            ),
+        ];
+        for (name, word) in not_references {
+            assert!(
+                !is_inert_reference(word),
+                "{name} ({word:?}) must not be treated as a reference thing"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
     // The scale of the seeding, measured on a real in-process compile
     // ---------------------------------------------------------------------------------------
-
     /// The repository root: `$ERL_TOP` when set, else three levels up from this crate's manifest
     /// directory (`<root>/erts_rust/crates/beam_rt`).
     fn source_root() -> std::path::PathBuf {
