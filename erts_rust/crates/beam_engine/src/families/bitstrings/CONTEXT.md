@@ -353,6 +353,12 @@ in the family, the emission rules stay in the tier.
   `Field::Binary`.
   `AppendPlan::tail_bits` therefore stays a plain `u32` rather than an `Option<u32>`.
 
+## Where the creation path touches the host, and what it costs
+The whole `bs_create_bin` / `bs_init_writable` chain reaches `ExecutionContext` at **one** door — `alloc_words_rooted`, via `terms::slack.rs::reserve` (`:164-171` → `Machine::alloc_rooted`, `machine/mod.rs:1350` → `Machine::with_roots`, `:1010`) — and at exactly **one** call per `[BinRef][ErlSubBits]` pair it builds: `raw::make_ctx` (`:247`), `raw::make_bits` (`:402`), `raw::make_binary` (`:456`), `raw::make_writable` (`:524`).
+- **The off-heap payload itself never crosses a host seam.** `Machine::alloc_refc_binary` (`machine/mod.rs:1618`) and `alloc_refc_binary_with_capacity` (`:1661`) call `beam_alloc::RefcBinary::{new,with_capacity}` directly (no `ctx`), and payload growth (`raw::InPlace::grow` → `Machine::grow_writable_payload`, `machine/mod.rs:1872`) is likewise `ctx`-free. So an in-place `private_append` build (`Built::Term`) makes **zero** host calls, and a copy-rebuild build makes one (`make_binary`'s pair) — a host sees term-pair reservations, never binary creations.
+- `Instr::BsCreateBin`'s `alloc` operand is **ignored** (`create/mod.rs:212`, `alloc: _`), so no `ensure_heap`/`ensure_heap_full` admission is spent on this instruction; `bs_init_writable` carries **no** operand at all (`beam_loader/src/instr.rs:1020`) — its capacity comes from the runtime `x(0)` small integer, else `DEFAULT_WRITABLE_SIZE` = 1024 (`create/mod.rs:169,203-206`).
+- **No reduction is charged anywhere on either path.** The only `reduce` a `bs_create_bin`/`bs_init_writable` costs is the driver's own charge: one per interpreted instruction (`machine/drive.rs:193-195`, before the body) or one per driver-loop iteration on the native tier (`jit/baseline/mod.rs:1245-1249`, i.e. per block entry, not per instruction). Nothing in `families/bitstrings/**`, `terms/slack.rs` or `machine/{offheap,mod}.rs`'s refc-binary helpers calls `reduce`/`wants_reduce` or bumps `Machine::reductions`.
+
 ## Constraints
 - `#![deny(unsafe_code)]` crate-wide; `raw.rs` is the node's only non-test
   `#[allow(unsafe_code)]` module (`run_tests.rs` carries a local allow for the frozen
