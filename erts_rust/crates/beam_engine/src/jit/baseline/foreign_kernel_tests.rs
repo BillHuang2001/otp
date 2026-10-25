@@ -89,13 +89,14 @@
 //! * [`the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted`] — the bitstring
 //!   family's ninth inline shape is the **constructing** one, `bs_create_bin` over the compiler's
 //!   `bs_init_writable` private-append accumulator. `capitalize_token/3`'s `<< Acc/binary, $- >>`
-//!   clause must emit it with zero deopts, and the row additionally pins **how many** of the
-//!   clause's builds lower and that the lowered one carries the `string "-"`
-//!   (`Field::ConstBytes`) segment.
-//! * [`the_to_lower_append_construction_stays_on_the_family`] — the honest negative twin:
-//!   `to_lower/1`'s comprehension build keeps its accumulator in a **`Y` slot**, which
-//!   `CreateBinShape::of` refuses by design, so that kernel's construction stays on the family.
-//!   The row pins the refusal *and its reason*, and the output rows above pin the value.
+//!   clause and both of its `<< Acc/binary, C >>` clauses must emit it with zero deopts, and the
+//!   row additionally pins **how many** of the clause's builds lower (three), that the lowered
+//!   `string "-"` one carries the `Field::ConstBytes` segment, and that the other two reach the
+//!   arm with a **`Y`-slot** accumulator.
+//! * [`the_to_lower_append_construction_lowers_its_y_slot_accumulator`] — `to_lower/1`'s
+//!   comprehension build keeps its accumulator in a **`Y` slot**, so that kernel is the
+//!   `Y`-form witness: the row pins its one build's `Y` accumulator, the emitted shape and the
+//!   exact `SHAPE_CREATE_BIN` `inlined` delta, and the output rows above pin the value.
 //!
 //! # Where this module sits in the node's harness
 //!
@@ -1120,10 +1121,12 @@ struct AppendBuild {
 
 /// Every `bs_create_bin` in `code`, in instruction order, with both gates' verdicts.
 ///
-/// The rows below read a staged artifact's own operands so they can tell the two refusals
-/// apart: "not a private-append accumulator build" (nothing for the arm to lower) versus "an
-/// accumulator the arm cannot address" (the documented non-x-register refusal). Without that a
-/// declined row would pass just as well for an instruction the shape never even considered.
+/// The rows below read a staged artifact's own operands so they can tell two questions apart:
+/// "is this a private-append accumulator build at all" (`planned`) and "does the arm lower
+/// it" (`lowered`) — plus **which register the accumulator lives in**, which is the only way
+/// to prove that a lowered build is the `Y` form rather than an x-register one. Without that
+/// a run of `lowered` rows would pass just as well for a set of builds the `Y` form never
+/// considered.
 fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild> {
     code.iter()
         .filter_map(|instr| {
@@ -1188,21 +1191,20 @@ fn function_index(staged: &Staged, program: &Program, function: &str, arity: u32
 /// `/3` clauses. That recursion carries **three** `bs_create_bin` builds, and the row pins all
 /// three rather than only the emitted shape:
 ///
-/// * exactly **one** lowers — the `<< Acc/binary, $- >>` clause, the one that *additionally*
-///   carries the **`string "-"`** segment. The seam models that as
-///   `seam::Field::ConstBytes`, a **different** field variant from every `Field::Bits` the
-///   other clauses use, so a row that only ever saw integer fields would not cover the
-///   constant-bytes store path at all;
-/// * the other **two** are the documented non-x-register refusal: their accumulator operand is
-///   a **`Y` slot** (`Typed { reg: Y(1), .. }`), which `seam::append_plan`'s first post-unit
-///   check (`x_register`) refuses, and which [`CreateBinShape::of`] would refuse anyway (the
-///   emitted store sequence re-reads the accumulator from `machine.x` after the
-///   `jit_open_append_bin` helper call, so a `Y` accumulator would need its frame-window guard
-///   repeated there). Asserting *that* is what stops the row from passing on an unrelated
-///   decline.
+/// * **one** is the `<< Acc/binary, $- >>` clause, the one that *additionally* carries the
+///   **`string "-"`** segment. The seam models that as `seam::Field::ConstBytes`, a
+///   **different** field variant from every `Field::Bits` the other clauses use, so a row
+///   that only ever saw integer fields would not cover the constant-bytes store path at all;
+/// * the other **two** are the `<< Acc/binary, C >>` clauses, whose accumulator is a **`Y`
+///   slot** (`Typed { reg: Y(1), .. }`) — the `Y` form the arm lowers through
+///   `jit_open_append_bin_y`, with its one up-front frame-window guard and its unguarded
+///   post-helper slot re-reads. Asserting the accumulator's `Loc` per build is what keeps
+///   "three lowered" from meaning "three x-register builds": the two `Y` builds are the
+///   evidence that this kernel exercises the `Y` form at run time.
 ///
-/// The negative twin for the other `cowboy_bstr` builder is
-/// [`the_to_lower_append_construction_stays_on_the_family`].
+/// The three builds' own tier agreement and their output bytes are pinned by
+/// [`cowboy_capitalize_token_agrees_on_both_tiers_and_with_the_oracle`]; this row is what
+/// makes the native lowering load-bearing.
 #[test]
 fn the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted() {
     let Some(staged) = stage_or_skip("cowboy_create_bin_arm", &COWBOY) else {
@@ -1221,10 +1223,19 @@ fn the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted() {
     let lowered = builds.iter().filter(|build| build.lowered).count();
     let declined = builds.len() - lowered;
     let const_bytes: usize = builds.iter().map(|build| build.const_bytes).sum();
+    let y_sources = builds
+        .iter()
+        .filter(|build| matches!(build.accumulator, Some(Reg::Y(_))))
+        .count();
+    let x_sources = builds
+        .iter()
+        .filter(|build| matches!(build.accumulator, Some(Reg::X(_))))
+        .count();
     println!(
         "create_bin_arm[capitalize_token/3] = {emitted:?}, BsCreateBin visited = {visited}, \
          lowered instances = {lowered_instances}, lowered builds = {lowered}, declined = \
-         {declined}, const-bytes fields = {const_bytes}, deopts = {deopts}"
+         {declined}, x accumulators = {x_sources}, y accumulators = {y_sources}, const-bytes \
+         fields = {const_bytes}, deopts = {deopts}"
     );
     // The census name first: a `static_deopts == 0` assertion against a variant name the
     // emitter never visits would hold trivially.
@@ -1247,39 +1258,42 @@ fn the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted() {
     );
     assert_eq!(
         (lowered, declined),
-        (1, 2),
-        "capitalize_token/3: exactly one build is the arm's shape and two stay on the family"
+        (3, 0),
+        "capitalize_token/3: all three builds are the arm's shape — the `string \"-\"` clause \
+         and both `Y`-accumulator clauses — so none may stay on the family"
     );
     assert_eq!(
         lowered, lowered_instances,
         "the builds `CreateBinShape::of` accepts and the instances the emitter actually lowered \
          must be the same set (accepted {lowered}, lowered {lowered_instances})"
     );
+    assert_eq!(
+        (y_sources, x_sources),
+        (2, 1),
+        "capitalize_token/3 must keep its two `<< Acc/binary, C >>` accumulators in `Y` slots and \
+         its `<< Acc/binary, $- >>` one in an x-register — a different split means the staged \
+         upstream source changed shape, and the `Y` form would no longer be exercised here"
+    );
     for build in &builds {
-        if build.lowered {
-            assert!(
-                matches!(build.accumulator, Some(Reg::X(_))),
-                "a lowered build's accumulator must be an x-register (accumulator: {:?})",
-                build.accumulator
-            );
-            assert!(
-                build.planned,
-                "a lowered build must have an append plan: `CreateBinShape::of` starts from it"
-            );
-        } else {
-            assert!(
-                matches!(build.accumulator, Some(Reg::Y(_))),
-                "a declined build must be declined because its accumulator is a `Y` slot, not \
-                 for an unrelated reason (accumulator: {:?})",
-                build.accumulator
-            );
-            assert!(
-                !build.planned,
-                "a `Y`-slot accumulator already fails `append_plan`'s first post-unit check \
-                 (`x_register`), so no plan may exist"
-            );
-        }
+        assert!(
+            build.planned,
+            "every build here must have an append plan: `CreateBinShape::of` starts from it \
+             (accumulator: {:?})",
+            build.accumulator
+        );
+        assert!(
+            build.lowered,
+            "every build here is the arm's shape and must be lowered (accumulator: {:?})",
+            build.accumulator
+        );
     }
+    // The exact per-compile emission count: a single `SHAPE_CREATE_BIN` delta of one would
+    // leave two builds silently on the family helper, which tier agreement cannot see.
+    assert_eq!(
+        lowered_instances, 3,
+        "the cache-free compile must inline all three builds' `SHAPE_CREATE_BIN` (`inlined` \
+         delta {lowered_instances})"
+    );
     // The `string "-"` segment: exactly one `Field::ConstBytes`, i.e. the store path an
     // all-integer build list never reaches.
     assert_eq!(
@@ -1289,26 +1303,25 @@ fn the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted() {
     );
 }
 
-/// **`cowboy_bstr:to_lower/1`'s construction stays on the family — and the row pins why.** The
-/// honest negative twin of
+/// **`cowboy_bstr:to_lower/1`'s comprehension accumulator lives in a `Y` slot, and the arm
+/// lowers it.** The `Y`-accumulator companion of
 /// [`the_cowboy_capitalize_token_append_arm_is_emitted_and_not_deopted`].
 ///
 /// The exported `to_lower/1` holds no `bs_create_bin` at all: the binary comprehension
 /// `<< <<(char_to_lower(C))>> || <<C>> <= B >>` is `bs_init_writable` plus a `CallLast` into the
 /// generated loop `-to_lower/1-lbc$^0/2-0-/2`, and *that* is where the one accumulator build
-/// lives. Its accumulator is a **`Y` slot**, which [`CreateBinShape::of`] refuses by design (the
-/// emitted store sequence re-reads the accumulator from `machine.x` after the
-/// `jit_open_append_bin` helper call, so a `Y` accumulator would need its frame-window guard
-/// repeated there) — so this kernel's construction runs on the family helper, exactly as it did
-/// before the arm landed.
+/// lives. Its accumulator is a **`Y` slot** — the compiler `move`s the writable binary into
+/// the frame before the loop's `call_last` — which the arm lowers through
+/// `jit_open_append_bin_y` (`Machine::y` behind one up-front frame-window guard).
 ///
-/// That is not a licence to assert nothing. The row pins the loop's build count, its zero
-/// static deopts, the **absent** shape, the zero emission count and the refusal *reason*, so it
-/// fails loudly in either direction: if an arm that does accept this shape silently stopped
-/// being emitted, or if a `Y`-capable lowering landed without this row's counters being updated
-/// to its new (positive) expectation.
+/// The row pins that positively and from three sides, because no single one of them is
+/// load-bearing on its own: the build's accumulator is a `Y` slot, the shape is in the
+/// emitted set, and the `SHAPE_CREATE_BIN` `inlined` delta over a cache-free compile is
+/// exactly **1**. `static_deopts("BsCreateBin") == 0` alone would prove nothing — the family
+/// route is a `claimed` helper arm, not an `emit_deopt`, so it reads 0 whether or not the
+/// build lowers.
 #[test]
-fn the_to_lower_append_construction_stays_on_the_family() {
+fn the_to_lower_append_construction_lowers_its_y_slot_accumulator() {
     let Some(staged) = stage_or_skip("cowboy_to_lower_create_bin", &COWBOY) else {
         return;
     };
@@ -1364,27 +1377,27 @@ fn the_to_lower_append_construction_stays_on_the_family() {
         snapshot.instr_deopts,
     );
     assert!(
-        !emitted.contains(&SHAPE_CREATE_BIN),
-        "to_lower's build has a `Y`-slot accumulator, which the arm refuses, so the shape must \
-         not be emitted (emitted: {emitted:?})"
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "to_lower's build has a `Y`-slot accumulator, which the arm lowers, so the shape must \
+         be emitted (emitted: {emitted:?})"
     );
     assert_eq!(
-        lowered_instances, 0,
-        "no `bs_create_bin` in the `{prefix}…` loop may lower"
+        lowered_instances, 1,
+        "the loop's one `bs_create_bin` must lower (`SHAPE_CREATE_BIN` `inlined` delta)"
     );
     let build = &builds[0];
     assert!(
         matches!(build.accumulator, Some(Reg::Y(_))),
-        "to_lower's accumulator must be the documented `Y`-slot refusal (accumulator: {:?})",
+        "to_lower's accumulator must be the `Y` slot the compiler moved the writable binary \
+         into (accumulator: {:?})",
         build.accumulator
     );
     assert!(
-        !build.planned,
-        "a `Y`-slot accumulator already fails `append_plan`'s first post-unit check \
-         (`x_register`), so no plan may exist"
+        build.planned,
+        "the seam's compile-time half must accept the build (`append_plan`)"
     );
     assert!(
-        !build.lowered,
-        "`CreateBinShape::of` must refuse a `Y`-slot accumulator"
+        build.lowered,
+        "`CreateBinShape::of` must accept a `Y`-slot accumulator"
     );
 }

@@ -44,26 +44,44 @@
 //!
 //! ```text
 //!   <the destination's Y-window guard>             ; a rejected destination writes nothing
-//!   <one is_small guard per Field::Bits>            ; a non-integer field is the family's badarg
-//!   <the jit_open_append_bin helper call>           ; a refused accumulator is the family's path
+//!   <the accumulator's Y-window guard, if Y>       ; guard only, still before every write
+//!   <one guarded load + is_small guard per Field::Bits>  ; a non-integer field is the family's badarg
+//!   <the append-door helper call>                  ; x-register | Y-slot door; a refusal is the family's path
 //!   test rax, rax ; je fallback                     ; the LAST guard, still before every write
 //!   <the field byte stores at the returned cursor>  ; the only payload writes
-//!   mov rdx, [machine.x + src*8]                    ; re-read: the helper clobbered every scratch
+//!   <the accumulator re-read>                       ; re-read: the helper clobbered every scratch
 //!   mov rcx, [boxed_val(rdx) + SUB_BITS_END_DISP]   ; the old window end
 //!   add rcx, tail_bits ; mov [block + END], rcx     ; THE ONLY MUTATION, last
-//!   <the accumulator term into Dst>
+//!   <the accumulator re-read into Dst>              ; Dst's Y address re-derived too
 //!   jmp fast_done
 //! fallback:
 //!   <one interpreter step>                          ; re-reads an untouched accumulator
 //! fast_done:
 //! ```
 //!
-//! `jit_open_append_bin` itself **mutates nothing** (it is `&Machine` throughout), so
-//! every guard that can reach `fallback` runs against the machine state the interpreter
-//! step will see. The payload bytes are the one thing written before the `end` commit,
-//! and they are written at the same offsets with the same values on every attempt, so
-//! even a deopt after them re-produces them — never a duplicated field.
+//! `jit_open_append_bin` (the x-register door) and `jit_open_append_bin_y` (the `Y`-slot
+//! door) themselves **mutate nothing** (they are `&Machine` throughout), so every guard
+//! that can reach `fallback` runs against the machine state the interpreter step will see.
+//! The payload bytes are the one thing written before the `end` commit, and they are
+//! written at the same offsets with the same values on every attempt, so even a deopt
+//! after them re-produces them — never a duplicated field.
 //!
+//! # The `Y` forms: two doors, and why the re-reads need no second guard
+//!
+//! The block ABI cannot carry a run-time *word* into a helper — `emit_helper_invoke` adds
+//! every argument as a `movabs` immediate — so a `Y` accumulator crosses as its **slot
+//! index** and [`jit_open_append_bin_y`] re-reads it through `Machine::y`'s bounds check.
+//! The emitted code, however, re-reads that slot **directly** (`y_base + k*8`) after the
+//! call, because the helper clobbers every caller-saved register and the window-end commit
+//! and the `Dst` store both need the term again. That direct read is unguarded, and the
+//! **once-up-front guard** is what makes it sound: the frame cannot change between the
+//! guard and the read (the helper only reads machine state and runs no interpreter step),
+//! so a slot inside the published window at the guard is still inside it later — exactly
+//! the argument [`super::Loc::store_at`] already relies on for a `Y` destination.
+//!
+//! Every post-helper re-read is therefore four instructions into a caller-saved scratch
+//! (`mov scratch,[rsp+RUNTIME_SLOT_DISP]` ; `mov scratch,[scratch+RUNTIME_YBASE_DISP]` ;
+//! `lea scratch,[scratch+y_offset(k)]` ; `mov dst,[scratch]`) and nothing more.//!
 //! # The byte extraction is exact, not approximate
 //!
 //! A whole-byte big-endian integer field of `nbytes` bytes is the value's low
@@ -99,10 +117,11 @@
 //!   `all` or runtime (`Dynamic`) size, a `little`/`signed`/`native` flag, a field that is
 //!   not a whole number of bytes or is wider than a machine word, a `StrT` window the
 //!   module cannot resolve, a plan with no fields;
-//! * an accumulator that is not an **x-register** (a `Y` or literal-area one) — the
-//!   sequence re-reads the accumulator from `machine.x` after the helper, and only an
-//!   x-register has no frame-window guard to repeat;
-//! * a field **value** that is not an x-register (same reason);
+//! * an accumulator or a field **value** operand that is neither an in-bound x-register nor
+//!   an addressable `Y` slot ([`super::Loc::of`] — a literal-area operand, an out-of-bound
+//!   register index, a `Y` index the emitted `lea`'s `disp32` could not address); both
+//!   kinds the tier *can* address are lowered, and [`super::Loc::of`] is the one place that
+//!   decision lives;
 //! * a field width outside `8..=64` whole bytes — the exact form above;
 //! * more than [`MAX_FIELDS`] fields or more than [`MAX_TAIL_BYTES`] tail bytes — the
 //!   emitted sequence is straight-line code, so an unbounded segment list would be an
@@ -121,9 +140,13 @@ use beam_loader::{Module, Operand};
 use crate::families::bitstrings::create::seam;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
-use super::super::super::runtime::{jit_open_append_bin, OpenAppendHelper, RUNTIME_YBASE_DISP};
+use super::super::super::runtime::{
+    jit_open_append_bin, jit_open_append_bin_y, OpenAppendHelper, RUNTIME_YBASE_DISP,
+};
 use super::super::operands::{x_offset, y_offset, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2};
-use super::super::{emit_positioned_helper_call, touch, Allocation, RUNTIME_SLOT_DISP};
+use super::super::{
+    emit_positioned_helper_call, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, RUNTIME_SLOT_DISP,
+};
 use super::{emit_fallback_and_done, IMMED1_MASK, POINTER_MASK, SMALL_TAG, SUB_BITS_END_DISP};
 
 #[cfg(test)]
@@ -143,17 +166,28 @@ const MAX_FIELDS: usize = 16;
 /// store, so the tail is capped here; a longer constant is the family's own copy.
 const MAX_TAIL_BYTES: usize = 256;
 
-/// One field of a lowered build, fully resolved for emission: the value's x-register and
-/// the compile-time byte offset from the accumulator's window end.
+/// The scratch the `Y` accumulator's up-front guard computes its slot address in, and the
+/// scratch its window bound goes to.
+///
+/// Both must be distinct from every other scratch the sequence holds live across the guard
+/// phase — [`Y_ADDR_SCRATCH`]/[`Y_ADDR_SCRATCH_2`] carry the *destination*'s address and
+/// bound — and neither is a cache register nor the block's reserved `rbx`/`rsp`. The value
+/// the guard computes is deliberately not kept: the helper re-reads the accumulator through
+/// `Machine::y`, and every later use re-derives the address behind this guard.
+const SOURCE_GUARD_SCRATCH: Reg = MOVE_SCRATCH;
+/// The `Y` accumulator guard's window-bound scratch (see [`SOURCE_GUARD_SCRATCH`]).
+const SOURCE_GUARD_END: Reg = MOVE_SCRATCH_2;
+
+/// One field of a lowered build, fully resolved for emission: the value's location and the
+/// compile-time byte offset from the accumulator's window end.
 #[derive(Clone, Debug)]
 enum PreparedField<'a> {
-    /// A run-time value from an x-register, written MSB-first as `bits` bits.
+    /// A run-time value, written MSB-first as `bits` bits.
     Bits {
-        /// The value's location (always [`Loc::X`] — see
-        /// [`CreateBinShape::of`]), used for the `is_small` guard's read.
+        /// The value's location — an in-bound x-register or an addressable `Y` slot (see
+        /// [`CreateBinShape::of`]), used for the `is_small` guard's read and for the
+        /// post-helper re-read every byte store needs.
         value: Loc,
-        /// The value's x-register index, used for every post-helper re-read.
-        x: u32,
         /// The field width in bits — a whole number of bytes, `8..=64`.
         bits: u32,
         /// The field's byte offset from the write cursor.
@@ -175,7 +209,8 @@ enum PreparedField<'a> {
 /// accumulator's window end.
 #[derive(Clone, Debug)]
 pub(crate) struct CreateBinShape {
-    /// The accumulator operand's location — always [`Loc::X`] (see the module docs).
+    /// The accumulator operand's location: an in-bound x-register or an addressable `Y`
+    /// slot (the emitted call's door follows from which — see the module docs).
     source: Loc,
     /// The destination: an x-register or an addressable `Y` slot.
     dst: Loc,
@@ -189,10 +224,10 @@ pub(crate) struct CreateBinShape {
 }
 
 /// The x-register a [`seam::Field::Bits`] value operand names; `None` for a constant
-/// string field.
+/// string field or a `Y`-slot value (a stack slot is never a cached x-register).
 ///
-/// [`CreateBinShape::of`] accepts a shape only when every field value resolves here, so a
-/// `None` for a `Bits` field is unreachable by construction.
+/// [`CreateBinShape::of`] accepts a shape only when every field value resolves to a
+/// [`Loc`], so a `None` for an *addressable* `Bits` field means a `Y` slot.
 fn bits_register(field: &seam::Field) -> Option<u32> {
     match field {
         seam::Field::Bits { value, .. } => Loc::of(value).and_then(Loc::register),
@@ -211,31 +246,16 @@ fn prepare_fields(shape: &CreateBinShape) -> Option<Vec<PreparedField<'_>>> {
         // `of` bounded every offset well inside `i32` (the whole tail is ≤ [`MAX_TAIL_BYTES`]).
         let offset = i32::try_from(*offset).ok()?;
         prepared.push(match field {
-            seam::Field::Bits { value, bits } => {
-                let value = Loc::of(value)?;
-                prepared_only_x(value)?;
-                PreparedField::Bits {
-                    value,
-                    x: value.register()?,
-                    bits: *bits,
-                    offset,
-                }
-            }
+            seam::Field::Bits { value, bits } => PreparedField::Bits {
+                value: Loc::of(value)?,
+                bits: *bits,
+                offset,
+            },
             seam::Field::ConstBytes { bytes } => PreparedField::Const { bytes, offset },
         });
     }
     Some(prepared)
 }
-
-/// Reject a field value that is not an x-register (the shape predicate's own rule, repeated
-/// here so the emission has no `Y` case to handle after bytes are on the wire).
-fn prepared_only_x(value: Loc) -> Option<()> {
-    match value {
-        Loc::X(_) => Some(()),
-        Loc::Y(_) => None,
-    }
-}
-
 impl CreateBinShape {
     /// The inlinable shape of a `bs_create_bin`, or `None` when the whole instruction must
     /// stay on the family.
@@ -249,12 +269,12 @@ impl CreateBinShape {
         segments: &[Operand],
     ) -> Option<CreateBinShape> {
         let plan = seam::append_plan(module, segments)?;
-        // Only an x-register accumulator: the sequence re-reads it from `machine.x` after
-        // the helper (whose call clobbers every scratch register) and again for the window
-        // commit, and a `Y` accumulator would need its frame-window guard repeated there.
-        let Loc::X(source) = Loc::of(&plan.source)? else {
-            return None;
-        };
+        // An in-bound x-register or an addressable `Y` slot: the `Y` forms carry the
+        // accumulator to the helper as a slot index and re-derive the slot's address
+        // post-helper behind the one up-front guard (see the module docs). Every other
+        // operand kind — a literal-area operand, an out-of-bound index, a `Y` index the
+        // `disp32` cannot address — is refused here, by the one shared predicate.
+        let source = Loc::of(&plan.source)?;
         let dst = Loc::of(dst)?;
         // The two shape caps (see [`MAX_FIELDS`] / [`MAX_TAIL_BYTES`]).
         if plan.fields.len() > MAX_FIELDS {
@@ -277,11 +297,9 @@ impl CreateBinShape {
                     if *bits == 0 || *bits % 8 != 0 || *bits > 64 {
                         return None;
                     }
-                    // A non-x value would need a frame-window guard repeated at every
-                    // post-helper re-read.
-                    let Loc::X(_) = Loc::of(value)? else {
-                        return None;
-                    };
+                    // An addressable `Y` value is lowered too: its guard is the `Loc::load`
+                    // above, and its byte stores re-read the slot unguarded post-helper.
+                    Loc::of(value)?;
                     *bits / 8
                 }
                 seam::Field::ConstBytes { bytes } => u32::try_from(bytes.len()).ok()?,
@@ -300,7 +318,7 @@ impl CreateBinShape {
             return None;
         }
         Some(CreateBinShape {
-            source: Loc::X(source),
+            source,
             dst,
             tail_bits: plan.tail_bits,
             fields: plan.fields,
@@ -308,7 +326,8 @@ impl CreateBinShape {
         })
     }
 
-    /// The x-register indices the shape touches — the accumulator and every field value.
+    /// The x-register indices the shape touches — the accumulator and every field value
+    /// (a `Y` slot contributes nothing: it is a stack slot, never a cached x-register).
     pub(crate) fn registers(&self) -> Vec<u32> {
         let mut registers = Vec::with_capacity(1 + self.fields.len());
         registers.extend(self.source.register());
@@ -334,9 +353,15 @@ impl CreateBinShape {
         self.dst.register().into_iter().collect()
     }
 
-    /// Whether the lowering accesses the current frame's Y window (a `Y` destination).
+    /// Whether the lowering accesses the current frame's Y window — a `Y` destination, a
+    /// `Y` accumulator or a `Y` field value.
     pub(crate) fn uses_y(&self) -> bool {
-        self.dst.is_y()
+        self.source.is_y()
+            || self.dst.is_y()
+            || self.fields.iter().any(|field| match field {
+                seam::Field::Bits { value, .. } => Loc::of(value).is_some_and(Loc::is_y),
+                seam::Field::ConstBytes { .. } => false,
+            })
     }
 }
 
@@ -360,9 +385,6 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     let Some(shape) = CreateBinShape::of(module, dst, segments) else {
         return Ok(false);
     };
-    let Loc::X(source) = shape.source else {
-        return Ok(false);
-    };
     let Some(prepared) = prepare_fields(&shape) else {
         return Ok(false);
     };
@@ -377,9 +399,19 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         .dst
         .guard_store(buffer, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2, fallback)?;
 
+    // (1b) The accumulator's frame-window guard, for the `Y` form: guard **only** — the
+    // helper reaches the term through `Machine::y` itself — emitted here so the post-helper
+    // unguarded re-reads of that slot (sections 4-6) are behind a proven in-frame address.
+    // The frame cannot move between this guard and those reads: the helper only reads
+    // machine state and runs no interpreter step.
+    shape
+        .source
+        .guard_load(buffer, SOURCE_GUARD_SCRATCH, SOURCE_GUARD_END, fallback)?;
+
     // (2) One `is_small` guard per integer field, still before any write: a non-integer
     // value is the family's `badarg` (`erts_bs_put_integer_*` returns 0 for a non-integer,
-    // `erl_bits.c:952`), reported by the `fallback` interpreter step.
+    // `erl_bits.c:952`), reported by the `fallback` interpreter step. A `Y` value's guard is
+    // [`Loc::load`]'s guarded read, in the same position.
     for field in &prepared {
         let PreparedField::Bits { value, .. } = field else {
             continue;
@@ -401,32 +433,47 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
 
     // (3) The construction seam's run-time half: `rax` returns the write cursor, or `0` for
     // every refusal — the last guard, and it costs exactly one test because the helper
-    // mutates nothing.
-    let helper: OpenAppendHelper = jit_open_append_bin;
+    // mutates nothing. The accumulator crosses as a **slot index** (the block ABI carries
+    // `movabs` immediates only), and which door resolves it follows from the `Loc`: the
+    // x-register door reads `machine.x`, the `Y` door `Machine::y`.
+    let (helper, source_slot): (OpenAppendHelper, u32) = match shape.source {
+        Loc::X(x) => (jit_open_append_bin, x),
+        Loc::Y(k) => (jit_open_append_bin_y, k),
+    };
     emit_positioned_helper_call(
         buffer,
         allocation,
         helper as *const (),
-        &[i64::from(source), i64::from(shape.tail_bits)],
+        &[i64::from(source_slot), i64::from(shape.tail_bits)],
         func,
         pc,
     )?;
     buffer.test_rr(Reg::Rax, Reg::Rax)?;
     buffer.jcc(Cond::E, fallback)?;
 
-    // (4) The field byte stores at the returned cursor. Every value is re-read from
-    // `machine.x` (`rbx` is callee-saved and survives the helper) — the call clobbered every
-    // scratch register, and the spill before it made `machine.x` authoritative for a cached
-    // register too.
+    // (4) The field byte stores at the returned cursor. Every value is re-read after the
+    // helper: an x-register from `machine.x` (`rbx` is callee-saved, and the spill before
+    // the call made that array authoritative for a cached register too), a `Y` slot through
+    // its re-derived address — once per field into `rcx`, since its four-instruction
+    // re-derivation should not be paid per byte.
     for field in &prepared {
         match field {
             PreparedField::Bits {
-                x, bits, offset, ..
+                value, bits, offset, ..
             } => {
                 let nbytes = (*bits / 8) as usize;
+                match *value {
+                    Loc::X(_) => {}
+                    Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rcx, k)?,
+                }
                 for i in 0..nbytes {
-                    buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(*x))?;
-                    touch(highest_touched, *x);
+                    match *value {
+                        Loc::X(x) => {
+                            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
+                            touch(highest_touched, x);
+                        }
+                        Loc::Y(_) => buffer.mov_rr(Reg::Rdx, Reg::Rcx)?,
+                    }
                     // Byte `i` (MSB first) of the big-endian field is word bits
                     // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift
                     // is ARITHMETIC precisely because the caller wants
@@ -461,8 +508,13 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
 
     // (5) The window-end commit — `sb->end = new_position` (`erl_bits.c:1975`), the build's
     // result, and **the only mutation** the sequence performs beyond the payload bytes.
-    buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(source))?;
-    touch(highest_touched, source);
+    match shape.source {
+        Loc::X(x) => {
+            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
+            touch(highest_touched, x);
+        }
+        Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
+    }
     buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
     buffer.and_rr(Reg::Rdx, Reg::Rax)?;
     buffer.mov_rm(Reg::Rcx, Reg::Rdx, SUB_BITS_END_DISP)?;
@@ -477,15 +529,36 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         // The window guard already ran and nothing between it and here moved the frame (the
         // helper only reads machine state), so the slot address is re-derived without a
         // second guard.
-        buffer.mov_rm(Reg::Rcx, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-        buffer.mov_rm(Reg::Rcx, Reg::Rcx, RUNTIME_YBASE_DISP)?;
-        buffer.lea(Y_ADDR_SCRATCH, Reg::Rcx, y_offset(k))?;
+        emit_y_slot_address(buffer, Y_ADDR_SCRATCH, k)?;
     }
-    buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(source))?;
-    touch(highest_touched, source);
+    match shape.source {
+        Loc::X(x) => {
+            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
+            touch(highest_touched, x);
+        }
+        Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
+    }
     shape
         .dst
         .store_at(buffer, Y_ADDR_SCRATCH, Reg::Rdx, allocation, highest_touched)?;
 
     emit_fallback_and_done(buffer, allocation, done, func, pc, fallback, fast_done)
+}
+
+/// Re-derive `Y` slot `k`'s **address** into `dst` from the block's own `rt` slot and the
+/// current frame's published `y_base`, with **no** frame-window guard.
+///
+/// Sound only behind the up-front [`Loc::guard_load`] of the same slot (see the module
+/// docs): the frame cannot change between them, so the guard's proof still holds here.
+fn emit_y_slot_address(buffer: &mut CodeBuffer, dst: Reg, k: u32) -> Result<()> {
+    buffer.mov_rm(dst, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    buffer.mov_rm(dst, dst, RUNTIME_YBASE_DISP)?;
+    buffer.lea(dst, dst, y_offset(k))
+}
+
+/// Re-derive `Y` slot `k`'s **word** into `dst`, with no frame-window guard (see
+/// [`emit_y_slot_address`]).
+fn emit_y_slot_value(buffer: &mut CodeBuffer, dst: Reg, k: u32) -> Result<()> {
+    emit_y_slot_address(buffer, dst, k)?;
+    buffer.mov_rm(dst, dst, 0)
 }

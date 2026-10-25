@@ -590,8 +590,9 @@ pub(crate) type PositionHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32,
 /// nothing — re-publishing the frame's Y window cannot fail.
 pub(crate) type RefreshHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>);
 
-/// The `jit_open_append_bin` helper's native signature (the block ABI plus the
-/// accumulator's x-register **index** and the plan's tail width in bits).
+/// The append-door helpers' native signature (the block ABI plus the accumulator's
+/// **slot index** and the plan's tail width in bits) — shared by [`jit_open_append_bin`]
+/// (an x-register index) and [`jit_open_append_bin_y`] (a Y-slot index).
 ///
 /// The accumulator is passed as an index, not as a word, because the block's spill has
 /// already made `machine.x` authoritative for it — and because the block ABI admits only
@@ -1447,10 +1448,54 @@ pub(crate) extern "C" fn jit_open_append_bin(
     let Ok(src_reg) = u32::try_from(src_reg) else {
         return 0;
     };
-    let Ok(tail_bits) = u32::try_from(tail_bits) else {
+    let Some(src) = machine.x(src_reg) else {
         return 0;
     };
-    let Some(src) = machine.x(src_reg) else {
+    open_append_cursor(machine, src, tail_bits)
+}
+
+/// The **`Y`-slot** form of [`jit_open_append_bin`]: the accumulator's Y-slot index and the
+/// plan's tail width in bits, read through [`Machine::y`]'s bounds check.
+///
+/// A `Y` accumulator cannot cross the block ABI as a word (see
+/// [`OpenAppendHelper`] — the emitter passes `movabs` immediates only), so it crosses as an
+/// **index** exactly as the x-register form does; the difference is which safe accessor
+/// resolves it. `Machine::y` answers `None` for a slot outside the current frame, which is
+/// the same `0` decline as every other refusal, so the emitted `test rax, rax; je
+/// fallback` turns it into one interpreter step rather than an out-of-frame read.
+///
+/// **It mutates nothing**, for the same reason as the x-register form: the emitted
+/// sequence performs the family's only mutation (`ErlSubBits.end` advance) inline, last.
+pub(crate) extern "C" fn jit_open_append_bin_y(
+    rt: *mut JitRuntime<'_>,
+    y_slot: i64,
+    tail_bits: i64,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is
+    // blocked in the block call that reached us).
+    let runtime = unsafe { &*rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
+    // this helper only **reads** through it — `Machine::y` and the seam's two queries
+    // allocate nothing and mutate nothing — so a shared borrow cannot alias a `&mut Machine`
+    // (the driver holds none while the block runs).
+    let machine = unsafe { &*runtime.machine };
+    let Ok(y_slot) = u32::try_from(y_slot) else {
+        return 0;
+    };
+    let Some(src) = machine.y(y_slot) else {
+        return 0;
+    };
+    open_append_cursor(machine, src, tail_bits)
+}
+
+/// The shared body of the two append-door helpers: resolve the accumulator's write cursor
+/// (payload base + its whole-byte window end) or `0` for every refusal.
+///
+/// Factored out so the x-register and `Y`-slot doors differ **only** in how the accumulator
+/// term is reached, and neither duplicates the seam query or the cursor arithmetic.
+fn open_append_cursor(machine: &Machine, src: Eterm, tail_bits: i64) -> i64 {
+    let Ok(tail_bits) = u32::try_from(tail_bits) else {
         return 0;
     };
     let Some((base, end_bits)) =

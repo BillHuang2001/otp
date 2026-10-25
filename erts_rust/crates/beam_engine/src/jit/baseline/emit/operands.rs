@@ -242,6 +242,33 @@ pub(super) fn guard_y_store(
     Ok(())
 }
 
+/// Emit only the **guard** of a `Y` source slot, leaving its address in `addr`, and record
+/// the guarded read.
+///
+/// The source half of [`guard_y_store`], for a lowering that hands a `Y` slot to a helper
+/// **by index** and therefore has no pre-call value to keep: the helper re-reads the term
+/// from the machine, but the emitted code re-derives that slot's address **directly**
+/// (`y_base + k*8`) once the helper has returned — and this guard is what makes such an
+/// unguarded re-read sound, because it proves the slot was inside the published frame
+/// before the helper ran. The frame cannot move in between (the helper only reads machine
+/// state and runs no interpreter step), so one up-front guard covers every later use.
+///
+/// See [`emit_guarded_y_address`] for the guard itself; a `Loc::X` emits nothing.
+pub(super) fn guard_y_read(
+    buffer: &mut CodeBuffer,
+    k: u32,
+    addr: Reg,
+    end: Reg,
+    fallback: CodeLabel,
+) -> Result<()> {
+    #[cfg(test)]
+    let before = buffer.len();
+    emit_guarded_y_address(buffer, addr, end, k, fallback)?;
+    #[cfg(test)]
+    super::super::counters::record_y_access(true, k, (buffer.len() - before) as u64);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The location abstraction: an in-bound x-register or an addressable Y slot
 // ---------------------------------------------------------------------------
@@ -336,6 +363,27 @@ impl Loc {
                 }
             },
             Loc::Y(k) => emit_guarded_y_load(buffer, dst, end, k, fallback),
+        }
+    }
+
+    /// Emit this location's frame-window guard, leaving a `Y` slot's address in `addr`;
+    /// an x-register emits nothing.
+    ///
+    /// The **read** twin of [`Loc::guard_store`], for a lowering that has no pre-call value
+    /// to keep (it hands a `Y` slot to a helper by index) but re-derives that slot's
+    /// address directly once the helper returns — the guard is what makes the later
+    /// unguarded re-read sound (see [`guard_y_read`]). `end` is the window-bound scratch and
+    /// must differ from `addr`.
+    pub(super) fn guard_load(
+        self,
+        buffer: &mut CodeBuffer,
+        addr: Reg,
+        end: Reg,
+        fallback: CodeLabel,
+    ) -> Result<()> {
+        match self {
+            Loc::X(_) => Ok(()),
+            Loc::Y(k) => guard_y_read(buffer, k, addr, end, fallback),
         }
     }
 
