@@ -696,10 +696,10 @@ fn runtime_size_refusal(size: &Operand, unit: u32) -> Option<String> {
 /// `binary`/`float`/`utf*`/`all` segment, a `little`/`signed`/`native` flag, a
 /// partial-byte or wider-than-a-word field), or one of the shape's own, additional ones:
 ///
-/// * an accumulator or a field **value** that is not an `x` register — the sequence
-///   re-reads it from `machine.x` after the helper call, so a `Y` slot (a
-///   `cowboy_bstr:to_lower/1`-style accumulator, say) stays on the family;
-/// * a `dst` [`Loc::of`] cannot address (a literal-area operand, an out-of-bound register);
+/// * an accumulator, field **value** or `dst` [`Loc::of`] cannot address — a
+///   literal-area operand, an out-of-bound register index, or a `Y` index the emitted
+///   `lea`'s `disp32` could not address (an x-register and an addressable `Y` slot are
+///   both lowered);
 /// * a `bits` width that is not a positive whole-byte multiple in `8..=64`;
 /// * a field byte-offset sum that does not land on the plan's tail;
 /// * its two shape caps, more than `MAX_FIELDS` fields or more than `MAX_TAIL_BYTES` tail

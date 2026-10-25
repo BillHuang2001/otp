@@ -260,12 +260,14 @@ time, `/proc/loadavg` 1.92–3.74 recorded at every leg:
   at 6–12) reads 13.38→8.86 / 8.96→8.34 / 16.30→15.28 / 12.47→12.98 — consistent with the paired A/B
   on three cases and *wrong* on `encode`, because the oracle leg itself moved 32 % with the load
   (309.2→208.9 ns). Use the paired A/B; a cross-date pair of ratios is not evidence on this host.
-- **`bs_create_bin` is still helper-backed**, which is why the construction-dominated cases
-  (`decode`, `encode`) move least: the in-place accumulator's capacity lives in the machine's
-  writable-payload registry (`raw::writable_append_target` takes `&Machine`) and
-  `create::{prepared, raw, BitWriter}` are private to `src/families/bitstrings/**`, so a native
-  lowering needs a new `pub(crate)` construction seam there first. That is the next lever on these
-  four cases.
+- **These ratios predate the construction arm and the `Y` forms of it.** `bs_create_bin`'s
+  private-append construction shape IS lowered natively now (the in-place accumulator's capacity
+  lives in the machine's writable-payload registry and `create::{prepared, raw, BitWriter}` are
+  private to `src/families/bitstrings/**`, so the arm reaches them through the family's own
+  `pub(crate)` construction seam and one positioned helper call), which is why the
+  construction-dominated cases (`decode`, `encode`) still move least on the rows above: what is
+  left of them is the per-element cost this door already pays plus every non-append form, which
+  stays on the family.
 - A `bs_start_match3/4` **fresh** context is also still helper-backed (a rooted 5-word
   `ErlSubBits` allocation); only the reuse/rebind path is inlined.
 - Method caveat: the bench's Rust-side `case_*_ns_per_call` is **N-dependent** (its own note records

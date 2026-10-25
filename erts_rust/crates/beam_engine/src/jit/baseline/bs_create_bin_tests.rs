@@ -27,15 +27,17 @@
 //! argument is the *order* of that write:
 //!
 //! ```text
-//!   <the destination's Y-window guard>          ; a rejected destination writes nothing
-//!   <one is_small guard per Field::Bits>        ; a non-integer field is the family's badarg
-//!   <the jit_open_append_bin helper call>       ; mutates NOTHING; 0 = decline
-//!   test rax, rax ; je fallback                 ; the LAST guard, still before every write
-//!   <the field byte stores at the returned cursor>
-//!   <the single ErlSubBits.end += tail_bits>    ; THE ONLY MUTATION, and it is last
-//!   <the accumulator term into Dst> ; jmp fast_done
+//!   <dst's frame-window guard>                           ; a rejected slot writes nothing
+//!   <the accumulator's frame-window guard, if Y>         ; guard ONLY, BEFORE any write
+//!   <one guarded load + is_small guard per Field::Bits>  ; a non-integer field is the family's badarg
+//!   <the helper call>                                    ; jit_open_append_bin (X) | jit_open_append_bin_y (Y)
+//!   test rax, rax ; je fallback                          ; the LAST guard, still before every write
+//!   <the field byte stores at the cursor in rax>         ; a Y field value is re-read (unguarded) per field
+//!   <the accumulator re-read (unguarded), the end commit>; THE ONLY MUTATION, last
+//!   <the accumulator re-read (unguarded) into Dst>       ; a Y Dst's address is re-derived too
+//!   jmp fast_done
 //! fallback:
-//!   <one interpreter step for the WHOLE instruction>
+//!   <one interpreter step>                               ; re-reads an untouched accumulator
 //! fast_done:
 //! ```
 //!
@@ -65,6 +67,13 @@
 //!   ordinary heap term afterwards (`put_tuple2`, then a fresh `bs_start_match3` /
 //!   `bs_get_integer2` / `bs_test_tail2` pass over it, which fails unless `end` — and
 //!   therefore the window — was committed exactly once).
+//! * **the `Y` forms are lowered too, and their one up-front guard is what makes them
+//!   sound.** Section A′ covers a frame-resident accumulator (the term crosses the block ABI
+//!   to `jit_open_append_bin_y` as its **slot index**), a frame-resident field value, and a
+//!   `Y` accumulator with two `Y` field values beside a `string` constant; section C(9) pins
+//!   an **out-of-frame destination** slot, which the predicate accepts and the emitted guard
+//!   rejects into the interpreter's own typed error; section E(c) pins the `Y`-accumulator
+//!   one-byte-short capacity, whose fallback must leave the untouched slot untouched.
 //! * **a declined shape emits nothing and stays on the family.** [`CreateBinShape::of`] must
 //!   answer `None` for `binary all`, a 6-bit field, a float segment and a runtime size/unit;
 //!   the emission counter must not move; and the family helper's **run-time** counter must
