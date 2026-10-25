@@ -68,7 +68,7 @@ pub(crate) mod create;
 mod matching;
 pub(crate) mod programs;
 #[allow(unsafe_code)]
-mod raw;
+pub(crate) mod raw;
 #[cfg(test)]
 mod run_tests;
 /// The one narrow name a host's BIF floor adopts to serve `erlang:bit_size/1`: a BIF

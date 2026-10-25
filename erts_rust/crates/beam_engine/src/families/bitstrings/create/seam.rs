@@ -143,22 +143,30 @@
 //! Every field must be a statically sized, **big-endian**, **unsigned** `integer` of
 //! 1..=64 bits over an x- or y-register, or a `string` constant. Everything else is
 //! `None`: a plain (`private: false`) or later-position append, an append unit that is
-//! not one of `1`/`2`/`4`/`8`, a `binary`/`float`/`utf*` segment, an `all` or runtime
-//! (`Dynamic`) size, a **literal-area** value operand, a `little`/`signed`/`native` flag,
-//! a field wider than a machine word or of zero width, a literal-area index or `StrT`
-//! window the module cannot resolve, and a plan with no fields at all (nothing to emit).
+//! not one of `1`/`2`/`4`/`8`, a `float`/`utf*` segment, a runtime (`Dynamic`) size, a
+//! **literal-area** value operand, a `little`/`signed`/`native` flag, a field wider than a
+//! machine word or of zero width, a literal-area index or `StrT` window the module cannot
+//! resolve, and a plan with no fields at all (nothing to emit).
 //!
-//! ## Why a `binary all` segment is not plannable
+//! One further shape is accepted, through the separate
+//! [`AppendPlan::binary_all`] member: an accumulator followed by exactly one
+//! `binary all` segment.
+//!
+//! ## When a `binary all` segment is plannable
 //!
 //! A `binary` segment sized `all` copies a **run-time** number of bits (the source
-//! sub-binary's own width), so the plan could carry no static width for it — and with no
-//! static width there is no static offset for any field after it, which is the whole
-//! product of [`append_plan`]. The only lowering possible would be an out-of-line helper
-//! doing a run-time-length copy, i.e. precisely what the family already does
-//! (`BitWriter::push_bits_from` → `push_whole_bytes` → `raw::InPlace::copy_bytes` for the
-//! byte-aligned case, the per-bit writer otherwise), so the seam declines the shape
-//! rather than inventing a second copy of that path. The tier's existing `bs_create_bin`
-//! family helper covers it.
+//! sub-binary's own width), so the plan carries no static width for it — and with no static
+//! width there is no static offset for any field *after* it, which is the whole product of
+//! [`append_plan`]. That is why a `binary all` followed by another segment, or preceded by a
+//! field, stays `None`.
+//!
+//! As the plan's **last and only** field it is plannable: nothing follows it, so no static
+//! offset is needed — its own bit offset is `0` (it starts at the accumulator's window end)
+//! and the destination position it lands on is the accumulator's, which a run-time door
+//! checks for byte alignment before copying. That is exactly the shape the compiler emits
+//! for an accumulator with one whole-binary tail (`<<Acc/binary, B/binary>>`), and it is the
+//! shape [`AppendPlan::binary_all`] carries: the lowering copies the source whole rather than
+//! writing a field at a static offset.
 
 use beam_loader::{Module, Operand, Reg};
 use beam_term::Eterm;
@@ -202,10 +210,17 @@ pub(crate) struct AppendPlan {
     /// ([`append_unit_allows`]).
     pub(crate) unit: usize,
     /// The summed width of [`AppendPlan::fields`]: exactly the bits the accumulator's
-    /// window end advances by.
+    /// window end advances by. A [`AppendPlan::binary_all`] plan's tail is **not** static,
+    /// so this is `0` for it — the run-time width never leaks into the figure.
     pub(crate) tail_bits: u32,
     /// The fields, in instruction order.
     pub(crate) fields: Vec<Field>,
+    /// The `binary all` source operand, when the plan is `private_append` + one
+    /// `binary all` and nothing else. Its width is the source's own, so it is not a
+    /// [`Field`]: the lowering copies the whole source instead of writing a static field.
+    /// Always the plan's **last** segment, and non-`None` only when [`AppendPlan::fields`]
+    /// is empty (see [`append_plan`]).
+    pub(crate) binary_all: Option<Operand>,
 }
 
 /// The compile-time half: recognise an in-place accumulator `bs_create_bin` and resolve
@@ -233,6 +248,26 @@ pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<Appen
     }
     let unit = *unit;
     let source = locatable_operand(value)?;
+    // A `binary all` segment copies a **run-time** number of bits (the source
+    // sub-binary's own width), so it carries no static width for the fields after it to
+    // be offset from. As the plan's **last and only** field there is nothing after it, so
+    // no static offset is needed: the accumulator's window starts at bit 0 of its own
+    // tail and the source is copied whole. That is exactly the shape the compiler emits
+    // for an accumulator with one whole-binary tail (`<<Acc/binary, B/binary>>`).
+    if let [PreparedSeg::Binary {
+        value,
+        width: Width::All,
+        ..
+    }] = &program.segments[1..]
+    {
+        return Some(AppendPlan {
+            source,
+            unit,
+            tail_bits: 0,
+            fields: Vec::new(),
+            binary_all: Some(locatable_operand(value)?),
+        });
+    }
     let mut fields = Vec::new();
     let mut tail_bits: u32 = 0;
     // `prepare` walks the same fixed-width groups in the same order, so the raw operands
@@ -297,6 +332,8 @@ pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<Appen
         fields.push(field);
     }
     // A plan with no fields writes nothing; there is nothing for a lowering to emit.
+    // (The `binary all` shape above returns before this: it has no static fields but does
+    // have the source copy to emit, so it is not a "nothing to emit" plan.)
     if fields.is_empty() {
         return None;
     }
@@ -305,6 +342,7 @@ pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<Appen
         unit,
         tail_bits,
         fields,
+        binary_all: None,
     })
 }
 

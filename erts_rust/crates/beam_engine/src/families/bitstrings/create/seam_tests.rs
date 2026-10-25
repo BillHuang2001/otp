@@ -452,6 +452,136 @@ fn the_plan_carries_the_appends_unit() {
     }
 }
 
+/// A `binary all` segment is accepted as the plan's **last and only** field: nothing
+/// follows it, so no static offset is needed — its own bit offset is `0` (it starts at the
+/// accumulator's window end), its width is the source's own (a run-time figure), and it is
+/// therefore carried as [`AppendPlan::binary_all`] rather than as a [`Field`].
+/// `emqx_base62:encode/2` emits exactly this shape three times.
+#[test]
+fn a_binary_all_segment_is_accepted_as_the_last_and_only_field() {
+    let module = seg_module();
+    for unit in [1i64, 2, 4, 8] {
+        let segments: Vec<Operand> = [
+            append(&module, "private_append", unit),
+            group(&module, "binary", 1, Operand::Nil, Operand::X(1), all(&module)),
+        ]
+        .concat();
+        let plan = append_plan(&module, &segments).expect("an accepted plan");
+        assert_eq!(plan.unit, unit as usize, "unit {unit}: the append unit");
+        assert!(
+            plan.fields.is_empty(),
+            "unit {unit}: a `binary all` is not a static field"
+        );
+        assert_eq!(
+            plan.tail_bits, 0,
+            "unit {unit}: a run-time width never leaks into the static tail"
+        );
+        assert_eq!(
+            plan.binary_all,
+            Some(Operand::X(1)),
+            "unit {unit}: the source operand is carried through"
+        );
+    }
+
+    // The compiler's `z,5` `Operand::Typed` spelling of both the accumulator and the source,
+    // and a `y`-register source, both resolve to the same plan shape.
+    let typed_acc = Operand::Typed {
+        reg: Reg::X(0),
+        ty: TypeIndex(0),
+    };
+    let typed_src = Operand::Typed {
+        reg: Reg::X(1),
+        ty: TypeIndex(0),
+    };
+    let typed: Vec<Operand> = [
+        group(
+            &module,
+            "private_append",
+            8,
+            Operand::Nil,
+            typed_acc.clone(),
+            all(&module),
+        ),
+        group(
+            &module,
+            "binary",
+            8,
+            Operand::Nil,
+            typed_src.clone(),
+            all(&module),
+        ),
+    ]
+    .concat();
+    let plan = append_plan(&module, &typed).expect("the typed spelling is accepted");
+    assert_eq!(plan.source, typed_acc, "the accumulator operand verbatim");
+    assert_eq!(plan.binary_all, Some(typed_src), "the source operand verbatim");
+
+    let y_source: Vec<Operand> = [
+        append(&module, "private_append", 8),
+        group(&module, "binary", 8, Operand::Nil, Operand::Y(2), all(&module)),
+    ]
+    .concat();
+    let plan = append_plan(&module, &y_source).expect("a y-register source is accepted");
+    assert_eq!(plan.binary_all, Some(Operand::Y(2)));
+    assert_eq!(plan.tail_bits, 0);
+}
+
+/// A `binary all` is plannable **only** as the last and only field. Anywhere else there is
+/// either no static offset for the segment after it (the shape's whole `None` reason) or a
+/// plan shape the lowering does not express, so the seam declines.
+#[test]
+fn a_binary_all_segment_out_of_the_last_position_is_declined() {
+    let module = seg_module();
+    let acc = append(&module, "private_append", 8);
+    let tail = group(&module, "binary", 8, Operand::Nil, Operand::X(1), all(&module));
+    let field = int(&module, Operand::X(2), 8);
+
+    // A `binary all` followed by another segment: nothing static can offset the follower.
+    let followed: Vec<Operand> = [acc.clone(), tail.clone(), field.clone()].concat();
+    assert_eq!(
+        append_plan(&module, &followed),
+        None,
+        "a `binary all` followed by an integer field"
+    );
+
+    // A `binary all` preceded by a static field: only the tail-and-only shape is carried,
+    // so a preceding field declines it.
+    let preceded: Vec<Operand> = [acc.clone(), field, tail.clone()].concat();
+    assert_eq!(
+        append_plan(&module, &preceded),
+        None,
+        "an integer field followed by a `binary all`"
+    );
+
+    // Two `binary all`s: the second has no static offset.
+    let twice: Vec<Operand> = [acc.clone(), tail.clone(), tail].concat();
+    assert_eq!(
+        append_plan(&module, &twice),
+        None,
+        "two `binary all` segments"
+    );
+
+    // A `binary all` whose source is a **literal-area** value: the operand cannot be bound
+    // to a register, exactly like a literal-area field value.
+    let literal_source: Vec<Operand> = [
+        acc,
+        group(
+            &module,
+            "binary",
+            8,
+            Operand::Nil,
+            Operand::Literal(0),
+            all(&module),
+        ),
+    ]
+    .concat();
+    assert_eq!(
+        append_plan(&module, &literal_source),
+        None,
+        "a literal-area `binary all` source"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. The decline set — one shape per assert
 // ---------------------------------------------------------------------------/// Every shape a lowering must not emit bytes for is declined. The list is deliberately
@@ -488,17 +618,10 @@ fn every_shape_outside_the_accept_set_is_declined() {
     let odd_unit: Vec<Operand> = [append(&module, "private_append", 3), field.clone()].concat();
     assert_eq!(append_plan(&module, &odd_unit), None, "an append unit 3");
 
-    // Every other segment kind.
-    let binary_all: Vec<Operand> = [
-        acc.clone(),
-        group(&module, "binary", 8, Operand::Nil, Operand::X(1), all(&module)),
-    ]
-    .concat();
-    assert_eq!(
-        append_plan(&module, &binary_all),
-        None,
-        "a `binary` segment sized `all`"
-    );
+    // Every other segment kind. A `binary` sized `all` is **not** here: it is accepted as
+    // the plan's last and only field
+    // (`a_binary_all_segment_is_accepted_as_the_last_and_only_field`) and refused in every
+    // other position (`a_binary_all_segment_out_of_the_last_position_is_declined`).
     let binary_fixed: Vec<Operand> = [
         acc.clone(),
         group(

@@ -285,8 +285,13 @@ pub(crate) fn set_ctx_start(t: Eterm, start: usize) {
 /// The caller must pass a term [`ctx_parts`] accepted (a live `ErlSubBits`) whose
 /// bits `[0, end)` are the ones it means to publish, and must keep
 /// `start <= end <= `the payload's capacity in bits.
+///
+/// `pub(crate)` (rather than `pub(super)`) because the baseline JIT's
+/// [`jit_append_binary_all`](crate::jit::baseline::runtime::jit_append_binary_all) door
+/// commits a `binary all` append through it: that is the one write such a build makes, and
+/// routing it through this function keeps the `end`-word rule in one place.
 #[inline]
-pub(super) fn set_ctx_end(t: Eterm, end: usize) {
+pub(crate) fn set_ctx_end(t: Eterm, end: usize) {
     // SAFETY: the caller passed a term `ctx_parts` accepted as a live `ErlSubBits`
     // block, so word 3 is its mutable `end` field.
     unsafe {
@@ -563,7 +568,11 @@ pub(super) fn make_writable(
 /// The capacity is *only* ever taken from that registry: the payload roster
 /// ([`Machine::refc_binaries`]) knows every payload's length, and an ordinary binary's
 /// length is emphatically not a writable capacity.
-pub(super) fn writable_append_target(
+///
+/// `pub(crate)` because the baseline JIT's
+/// [`jit_append_binary_all`](crate::jit::baseline::runtime::jit_append_binary_all) door
+/// reuses this exact three-clause proof rather than restating it.
+pub(crate) fn writable_append_target(
     machine: &Machine,
     src: Eterm,
 ) -> Option<(*mut u8, usize, usize)> {

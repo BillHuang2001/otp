@@ -626,6 +626,17 @@ pub(crate) const WRITE_VALUE_IN_Y: i64 = 2;
 pub(crate) type WriteBitFieldHelper =
     for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64, i64, i64, i64) -> i64;
 
+/// [`jit_append_binary_all`]'s native signature: the block ABI plus the **slot indices** of
+/// the accumulator and of the `binary all` source, and the
+/// [`WRITE_ACC_IN_Y`]/[`WRITE_VALUE_IN_Y`] location flags naming which machine file holds
+/// each term.
+///
+/// The same three-immediate-argument shape as [`OpenAppendAnyHelper`], and for the same
+/// reason: the terms cross as slot indices because the block ABI admits only `movabs`
+/// immediates in [`super::emit::emit_helper_invoke`], so no run-time word can cross it.
+pub(crate) type AppendBinaryAllHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64, i64) -> i64;
+
 /// The byte offset of [`JitRuntime::machine`] — the field the helper scaffolding is
 /// handed; generated code reads [`JitRuntime::x_regs`] instead.
 pub(crate) const RUNTIME_MACHINE_DISP: i32 = 0;
@@ -1694,6 +1705,141 @@ fn slot_term(machine: &Machine, slot: u32, in_y: bool) -> Option<Eterm> {
     } else {
         machine.x(slot)
     }
+}
+
+/// The **`binary all`** in-place append: copy the whole of a byte-aligned source binary onto
+/// the end of a writable accumulator payload and advance the accumulator's window end by it.
+///
+/// The one shape this serves is the compiler's accumulator with a single whole-binary tail
+/// (`<<Acc/binary, B/binary>>`, `seam::AppendPlan::binary_all`). Its source width is a
+/// run-time figure, so no static field offset exists for it — which is why this is a
+/// **helper** rather than an emitted store sequence: the payload write, the registry proof
+/// and the term commit all live in the machine.
+///
+/// Guard order (every guard precedes every mutation, and a refusal writes **nothing** — no
+/// payload byte, no term word — so the emitted sequence's `fallback` interpreter step stays
+/// idempotent):
+///
+/// 1. both terms are read from the machine by slot index (x-register file or `Y`, named by
+///    the [`WRITE_ACC_IN_Y`]/[`WRITE_VALUE_IN_Y`] flag bits, the same convention
+///    [`jit_write_bit_field`] uses);
+/// 2. the accumulator's writable-append proof (`raw::writable_append_target`: an off-heap
+///    refc binary over a payload **this machine** registered as writable, `start == 0`,
+///    non-null base) — so the accumulator's window end and capacity are both known;
+/// 3. C's `unit == 8` append-position gate (`erts_bs_append_checked`, `erl_bits.c:1778-1784`):
+///    the window end must be on a byte boundary, because this door copies whole bytes and
+///    deliberately does not duplicate the family's bit-granular writer;
+/// 4. the source must be an off-heap refc binary with a **byte-aligned** window at both ends
+///    (`start % 8 == 0 && size % 8 == 0`, a non-null base) — a mid-byte source window needs
+///    the bit-granular writer, and a source size that is not a whole number of the field's
+///    `unit` is the family's own `badarg` (`erts_bs_put_binary_all`, `erl_bits.c:1311`),
+///    which the `fallback` step raises faithfully;
+/// 5. room: `end_bits + size <= capacity_bits`, the same rule as the other append doors, and
+///    the byte ranges must not overlap (the source can be a sub-binary of the accumulator's
+///    own payload, which `copy_nonoverlapping` below must never be handed).
+///
+/// Only then does it copy the `size / 8` bytes and commit — **exactly one** write of the
+/// accumulator's `ErlSubBits.end` word (`sb->end = new_position`, `erl_bits.c:1975`), the
+/// build's result. Nothing after that point can fail.
+///
+/// Answers the accumulator term (never `0`: it is a boxed term with a live pointer) on
+/// success and `0` for every refusal.
+pub(crate) extern "C" fn jit_append_binary_all(
+    rt: *mut JitRuntime<'_>,
+    acc_slot: i64,
+    src_slot: i64,
+    flags: i64,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is blocked
+    // in the block call that reached us).
+    let runtime = unsafe { &*rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
+    // this helper only **reads** through it — the single write it performs is the
+    // accumulator's `ErlSubBits.end` word and the copy of source bytes into the accumulator's
+    // payload, neither of which lives in the machine (the payload is owned by a
+    // writable-payload registry entry, the term by the process heap) — so a shared borrow
+    // cannot alias a `&mut Machine`.
+    let machine = unsafe { &*runtime.machine };
+    append_binary_all(machine, acc_slot, src_slot, flags)
+}
+
+/// The decision-and-copy body of [`jit_append_binary_all`], split out so a test can drive it
+/// without a `JitRuntime` (the way [`append_cursor`] sits beside [`jit_append_cursor`]).
+pub(crate) fn append_binary_all(
+    machine: &Machine,
+    acc_slot: i64,
+    src_slot: i64,
+    flags: i64,
+) -> i64 {
+    let (Ok(acc_slot), Ok(src_slot)) = (u32::try_from(acc_slot), u32::try_from(src_slot)) else {
+        return 0;
+    };
+    let (Some(acc), Some(src)) = (
+        slot_term(machine, acc_slot, flags & WRITE_ACC_IN_Y != 0),
+        slot_term(machine, src_slot, flags & WRITE_VALUE_IN_Y != 0),
+    ) else {
+        return 0;
+    };
+    // (2) The accumulator's writable-append proof: `(payload base, capacity bits, end bits)`.
+    let Some((base, capacity_bits, end_bits)) =
+        crate::families::bitstrings::raw::writable_append_target(machine, acc)
+    else {
+        return 0;
+    };
+    // (3) C's `unit == 8` append-position gate (`erts_bs_append_checked`,
+    // `erl_bits.c:1778-1784`) — the byte copy below needs a byte-aligned window end.
+    if end_bits % 8 != 0 {
+        return 0;
+    }
+    // (4) The source: an off-heap refc binary whose window is byte-aligned at both ends.
+    // SAFETY: `is_refc_binary` checks `is_boxed` before it dereferences the header and only
+    // reads the `ErlSubBits.orig` slot when the header says `ErlSubBits`.
+    if !unsafe { beam_term::refc::is_refc_binary(src) } {
+        return 0;
+    }
+    // SAFETY: `src` is a live refc-binary `ErlSubBits` over a live `BinRef`, so its frozen
+    // `base`/`start`/`end` are initialised and the payload is alive (a `beam_alloc::RefcBinary`
+    // handle owned by some machine keeps it so).
+    let (src_base, src_start, src_size) = unsafe { beam_term::bitstring_parts(src) };
+    if src_base.is_null() || src_start % 8 != 0 || src_size % 8 != 0 {
+        return 0;
+    }
+    // (5) Room, and two disjoint byte ranges: a source that is a sub-binary of the
+    // accumulator's **own** payload is refused rather than handed to `copy_nonoverlapping`.
+    let Some(new_end) = end_bits.checked_add(src_size) else {
+        return 0;
+    };
+    if new_end > capacity_bits {
+        return 0;
+    }
+    let src_offset = src_start / 8;
+    let dst_offset = end_bits / 8;
+    let bytes = src_size / 8;
+    if src_base == base as *const u8 && src_offset < dst_offset + bytes && dst_offset < src_offset + bytes
+    {
+        return 0;
+    }
+    if bytes != 0 {
+        // SAFETY: both ranges were just proved inside their own payloads (`src_offset + bytes`
+        // is inside the source's window, `dst_offset + bytes <= capacity_bits / 8`) and
+        // disjoint, and both payloads are live for this call: the source's is kept alive by
+        // the `RefcBinary` handle `src` names, the accumulator's by the machine's writable
+        // registry. A zero-length copy is skipped (a null or one-past-the-end pointer is not
+        // a valid `copy_nonoverlapping` operand even for `count == 0`).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_base.add(src_offset),
+                base.add(dst_offset),
+                bytes,
+            );
+        }
+    }
+    // The build's result, and the **only** term mutation: C's `sb->end = new_position`
+    // (`erl_bits.c:1975`). Routed through `raw::set_ctx_end` so the `end`-word rule stays in
+    // one place; `acc` was proved a live `ErlSubBits` by the writable-append proof above.
+    crate::families::bitstrings::raw::set_ctx_end(acc, new_end);
+    acc.raw() as i64
 }
 
 /// The **local tail-call** helper: pop the current frame with the interpreter's
