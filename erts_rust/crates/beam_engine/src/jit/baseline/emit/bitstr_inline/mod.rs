@@ -102,7 +102,11 @@ pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 #[cfg(test)]
 pub(crate) use bs_match::{bs_match_group_len, bs_match_integer_flags, bs_match_static_size};
 pub(super) use create::try_inline_bs_create_bin;
-pub(crate) use create::{CreateBinShape, Route};
+pub(crate) use create::CreateBinShape;
+/// The route split, re-exported for the arm's own tests (the emitter reaches it through
+/// [`CreateBinShape::route`]).
+#[cfg(test)]
+pub(crate) use create::Route;
 pub(super) use integer::try_inline_bs_get_integer2;
 pub(crate) use integer::{
     field_is_unsupported, field_width_supported, get_integer2_shape, GetInteger2Shape,
