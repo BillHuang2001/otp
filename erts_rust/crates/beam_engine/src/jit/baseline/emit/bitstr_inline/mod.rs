@@ -18,11 +18,13 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's native lowerings for the bitstring family's **small, safe**
-//! match-context shapes.
+//! The baseline JIT's native lowerings for the bitstring family: eight **small, safe**
+//! match-context shapes plus the `bs_create_bin` private-append construction shape.
 //!
-//! Every lowering here is allocation-free and raises nothing of its own: it reads the
-//! `ErlSubBits` match-context words and (for the mutating shapes) writes one word back.
+//! Every lowering here is allocation-free and raises nothing of its own: the match-context
+//! shapes read the `ErlSubBits` words and (for the mutating ones) write one word back, while
+//! the construction shape calls one helper that **mutates nothing** and then writes the
+//! accumulator's payload bytes and its window end.
 //! A shape the module cannot prove safe is **refused at compile time** by its `*_shape`
 //! predicate — returning `Ok(false)` with **zero bytes emitted** — so `emit_block`'s
 //! existing `_ if bitstrings::claimed(instr) => emit_bitstr(...)` arm keeps handling it
@@ -39,14 +41,19 @@
 //! `beam_term::is_boxed` holds and its header word is `HEADER_SUB_BITS` — exactly
 //! `raw::ctx_parts`'s test.
 //!
-//! # The two invariants these lowerings keep
+//! # The invariants these lowerings keep
 //!
 //! * **M before W.** No shape here both advances the match context and writes a
 //!   destination; the two mutating shapes (`bs_set_position`, `bs_skip_bits2`) have no
 //!   destination at all, so the "write `start` before `Dst`" rule cannot be violated.
 //! * **No allocation, hence no re-read.** Every sequence below allocates nothing, so no
 //!   moving collection can run part-way through one, which is why the context operand is
-//!   read exactly once and its block address reused.
+//!   read exactly once and its block address reused. The construction shape re-reads its
+//!   accumulator from `machine.x` after the helper call — not for a collection, but because
+//!   the call clobbers every scratch register.
+//! * **A `fallback` is a deopt, so every sequence is re-execution idempotent.** The
+//!   construction shape therefore commits the accumulator's window end **last**, after every
+//!   payload byte store, and its helper mutates nothing (see [`create`]).
 //!
 //! Per-shape ground truth (the interpreter is the in-tree oracle):
 //! `crate::families::bitstrings::matching`.
