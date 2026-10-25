@@ -124,6 +124,11 @@ mod utf32_tests;
 /// cross-check).
 #[cfg(test)]
 mod utf16_tests;
+/// The `bs_get_utf16` arm's own suite (the value/position rows, the surrogate-pair and half-pair
+/// rows, the `dst == ctx` hazard, the exactly-once character-consumption pin and the live `erl`
+/// oracle cross-check).
+#[cfg(test)]
+mod utf16_get_tests;
 pub(super) use bs_match::try_inline_bs_match;
 pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 #[cfg(test)]
