@@ -1156,11 +1156,9 @@ fn write_payload_bit(base: *mut u8, start_bit: usize, cur_bit: usize, bit: u8) {
 /// * `nbits <= 64`;
 /// * writes only the payload bytes the field spans: no term access, no `Machine`, no
 ///   allocation.
-// The seam is the bitstring family's **exported** surface for a native lowering, and
-// nothing in a plain `--lib` build refers to the bit-field door yet (see `create/mod.rs`'s
-// `mod seam`): the reachability root is one level up, so the lint would fire here first.
-// The door is deliberately part of the contract, not dead weight.
-#[allow(dead_code)]
+// Live in a plain `--lib` build: the safe door `create::seam::write_bit_field` is this
+// function's caller, and the baseline tier's `jit_write_bit_field` helper reaches it
+// through that seam.
 #[inline]
 pub(crate) fn write_bit_field(
     base: *mut u8,

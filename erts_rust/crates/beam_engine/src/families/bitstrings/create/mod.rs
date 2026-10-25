@@ -138,11 +138,9 @@ mod segments;
 mod size;
 pub(crate) mod prepared;
 // The seam is the bitstring family's **exported** surface for a native lowering: its two
-// consumers are the baseline tier's `bs_create_bin` inline arm (outside this node) and
-// [`seam_tests`](seam_tests). Until the tier adopts it, nothing in a plain `--lib` build
-// refers to it, so the dead-code lint would fire on every item; the seam is deliberately
-// part of the contract, not dead weight.
-#[allow(dead_code)]
+// consumers are the baseline tier's `bs_create_bin` inline arm and its run-time helpers
+// (`src/jit/baseline/{emit/bitstr_inline/create.rs, runtime.rs}`), beside
+// [`seam_tests`](seam_tests).
 pub(crate) mod seam;
 
 use crate::interpreter::LabelMap;

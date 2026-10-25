@@ -263,11 +263,13 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   cross-check compiled from an inline source string at test time.
   - `seam.rs` → the **construction seam** a native lowering of `bs_create_bin` codes
     against (`pub(crate)`, so `src/jit/**` reaches it as
-    `crate::families::bitstrings::create::seam`; `create/mod.rs` declares it
-    `#[allow(dead_code)]` because nothing in a plain `--lib` build refers to it yet):
+    `crate::families::bitstrings::create::seam`):
     `append_plan` (static decidability → `AppendPlan`), the two run-time doors
     `open_append`/`open_append_any`, and the family's single bit-granular write
-    `write_bit_field`. Contract below.
+    `write_bit_field`. Its production consumers are the baseline tier's `bs_create_bin`
+    inline arm (`src/jit/baseline/emit/bitstr_inline/create.rs`) and its run-time helpers
+    (`src/jit/baseline/runtime.rs`'s `jit_open_append_bin*`/`jit_write_bit_field`), so the
+    module needs no `#[allow(dead_code)]`. Contract below.
   - `seam_tests.rs` → `#[cfg(test)]` the seam's accept and decline sets, the two doors'
     run-time answers (including the unit gate), the word-identity/no-growth pin, and the
     bit-granular write's byte-for-byte agreement with the family's own `BitWriter` at every
@@ -279,24 +281,32 @@ The one family-private surface a native `bs_create_bin` lowering reads: the shap
 in the family, the emission rules stay in the tier.
 - `pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<AppendPlan>`
   — pure, takes no `Machine`.
-  `pub(crate) struct AppendPlan { pub source: Operand, pub fields: Vec<Field>, pub tail_bits: u32, pub unit: usize }`
-  and `pub(crate) enum Field { Bits { value: Operand, bits: u32 }, Bytes { bytes: Vec<u8> } }`.
+  `pub(crate) struct AppendPlan { pub(crate) source: Operand, pub(crate) unit: usize, pub(crate) tail_bits: u32, pub(crate) fields: Vec<Field> }`
+  and `pub(crate) enum Field { Bits { value: Operand, bits: u32 }, ConstBytes { bytes: Vec<u8> } }`.
+  `unit` is the accumulator (first) segment's append **unit** (`1|2|4|8`): it is not a
+  plan-time filter, it is what the run-time doors hand to C's append-**position** gate
+  (`append_unit_allows`). `tail_bits` is the summed field width — exactly the bits the
+  accumulator's window end advances by.
 - **Accepted shape:** a first `private_append` of the accumulator, then any mix of
   constant-width unsigned big-endian `integer` fields with `bits` in **`1..=64`** (a
-  bit-granular width is plannable; no `little`/`signed`/`native` flag) and `string`
-  constants, with `unit` in `1|2|4|8`.
-  Every operand must be a **locatable register** — `Operand::X`/`Operand::Y`, and the
-  compiler's `Operand::Typed { reg: Reg::X(_) | Reg::Y(_), .. }` spelling.
+  bit-granular width is plannable — the width is **not** required to be a whole number of
+  bytes; no `little`/`signed`/`native` flag) and `string` constants, with `unit` in `1|2|4|8`.
+  Every operand the plan hands back — the accumulator (`source`) and every `Field::Bits`
+  `value` — is a **locatable register**: an **x-register or an addressable `Y` slot**, in
+  the plain `Operand::X`/`Operand::Y` spelling and in the compiler's
+  `Operand::Typed { reg: Reg::X(_) | Reg::Y(_), .. }` one.
   `locatable_operand` is a pure operand classification with no `Machine`; **the tier owns
-  the Y frame-window guard.**
+  the Y frame-window guard** (whether that slot is addressable at run time).
 - **Still declined:** a literal-area value or accumulator operand, a `binary`/`binary all`
-  segment, a `float`/UTF segment, a bignum-sized or `dynamic` width, a
-  signed/little/native field, and a first segment that is not a `private_append`.
+  segment, a `float`/UTF segment, a bignum-sized or `dynamic` width, a zero-width field, a
+  field wider than 64 bits, a signed/little/native field, and a first segment that is not a
+  `private_append`.
 - `pub(crate) fn open_append(machine: &Machine, src: Eterm, tail_bits: u32) -> Option<(usize, usize)>`
   — the **byte-aligned** door: `(payload base, window end)` when the accumulator is a
   writable payload this machine owns, the window ends on a **byte** boundary and the
   payload holds `tail_bits` more bits.
-  A tier that addresses fields as `cursor + byte_offset` uses this one.
+  A tier that addresses field `i` as `cursor + byte_offset_i` uses this one, because that
+  addressing is sound only while the window end is byte-aligned.
 - `pub(crate) fn open_append_any(machine: &Machine, src: Eterm, tail_bits: u32, unit: usize) -> Option<(usize, usize)>`
   — the **general** door for a plan carrying any bit-granular field: any alignment, gated on
   C's append-**position** unit rule instead (`append_unit_allows`,
@@ -304,6 +314,13 @@ in the family, the emission rules stay in the tier.
   requires `end % 8 == 0`, any other `unit` requires `end % unit == 0`.
   That is the same test the family applies to `src_bits % unit` at `start == 0`, so a shape
   the family raises `badarg` on is never reported writable.
+- **Two doors, not one loosened door.** The byte-aligned route's `cursor + byte_offset`
+  addressing holds only at a byte-aligned window end, so it must not be made to pay the
+  general route's per-position `unit` test; the bit-granular route needs the general door
+  because a bit field leaves the window ending mid-byte. Which door a lowering pairs with
+  which write sequence is the tier's own call (`Route::{Aligned, BitGranular}`,
+  `jit/baseline/emit/bitstr_inline/create.rs::route`); this seam states only the two
+  contracts.
 - `pub(crate) fn write_bit_field(base: usize, start_bit: usize, cur_bit: usize, value: u64, nbits: u32)`
   — the family's one bit-granular write rule: the low `nbits` bits of `value` **MSB-first**,
   an entered payload byte cleared first, the window-end byte masked, each bit OR-ed in at
@@ -314,7 +331,7 @@ in the family, the emission rules stay in the tier.
   which the `u64` door does not model.
   Its body is `raw::write_bit_field`, which shares `raw::write_payload_bit` with
   `raw::InPlace::push_bit`, so the seam's field write and the family's own writer cannot
-  disagree about a byte.
+  disagree about a byte — there is exactly one definition of the rule in this node.
   Every bit in `[cur_bit, cur_bit + nbits)` must already be inside the payload's capacity —
   that is the door's `tail_bits` room check, which is why the door is consulted for the whole
   plan before the first write.
