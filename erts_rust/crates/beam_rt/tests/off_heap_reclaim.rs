@@ -87,6 +87,7 @@
 //! | `dense/2` | 20 000 | 1 024 | `{0, 475 968, 1 072, 45}` |
 //! | `dense/2` | 20 000 | 512 | `{1 040, 924 560, 1 040, 22}` |
 //! | `dense/2` | 20 000 | 2 048 | `{0, 930 624, 2 096, 45}` |
+//! | `dense/2` | 20 000 | 4 096 | `{0, 1 839 936, 4 144, 45}` |
 //! | `dense_hold/3` `ref`, `ets`, `mon` | 20 000 | 1 024 | `{{0, 475 968, 1 072, 45}, true}` |
 //! | `dense/2` under `BEAM_RT_TIER=interpreter` | 20 000 | 1 024 | `{0, 428 800, 1 072, 50}` |
 //!
@@ -111,14 +112,16 @@
 //!
 //! | the shape that breaks the bound | figure | factor over 1 MiB |
 //! |---|---|---|
-//! | one live reference declining every park (`ref`/`ets`/`mon`, 1 KiB payloads, N = 2 000) | 4 832 000 | 4.6× |
-//! | the same shape at N = 8 000 | 19 328 000 | 18.4× |
-//! | no prune at all (a per-iteration residue) at N = 20 000 | 21 440 000 | 20.4× |
+//! | one live reference declining every park, 1 KiB payloads, N = 10 000 | 10 720 000 | 10.2× |
+//! | the same shape at 4 KiB payloads | 41 440 000 | 39.5× |
+//! | no prune at all (a per-iteration residue) at N = 20 000, 1 KiB payloads | 21 440 000 | 20.4× |
 //!
-//! The first two rows are the pre-`is_inert_reference` figures of `gc_walk.rs`'s prune-only valve,
-//! which hit on **any** pointer-bearing foreign word: a reference block is foreign, so the prune
-//! declined at every park and `erlang:memory(binary)` read exactly `N × 2 416` bytes with zero
-//! releases while the reference-free control stayed flat.
+//! The first two rows are what `gc_walk.rs`'s prune-only valve produces when it hits on **any**
+//! pointer-bearing foreign word: a reference block is foreign, so the prune declined at every park
+//! and `erlang:memory(binary)` read exactly `N × (payload + 48)` with zero releases — 1 000 rungs of
+//! this file's own ladder at 1 KiB payloads read `[1 072 000, 2 144 000, …, 10 720 000]`, each rung
+//! one whole payload over the last — while the reference-free control stayed at the dense envelope
+//! above.
 //!
 //! [`SMALL_BYTES`] (4 payloads = 4 288 bytes) is the trough bound, and it is the assertion that
 //! names a **per-park residue**: the measured trough is one payload at every park in every shape
