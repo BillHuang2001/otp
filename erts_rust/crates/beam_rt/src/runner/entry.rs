@@ -401,10 +401,17 @@ pub(crate) fn registered_name(
 pub(crate) struct RunnerState {
     /// The live engines, keyed by pid.
     ///
+    /// It holds an engine for every pid the runtime spawned that is still alive, and it is pruned
+    /// to the live process table at every scheduler-pass boundary ([`RunnerState::prune_dead`],
+    /// called from [`Runtime::scheduler_pass`](crate::runtime::Runtime::scheduler_pass)), so an
+    /// engine whose process has died cannot outlive the pass that observed the death. A live parked
+    /// engine is never pruned — it is still found and resumed.
+    ///
     /// A [`FastHashMap`] (not `RandomState`'s SipHash): the map is only ever probed by pid
-    /// (`get`/`insert`/`remove` in this module, `runner/run.rs` and `runtime/scheduler.rs`), never
-    /// iterated for an observable order, and the keys are the runtime's own dense pids — see
-    /// [`crate::hasher`].
+    /// (`get`/`insert`/`remove` in this module, `runner/run.rs` and `runtime/scheduler.rs`; the
+    /// `remove` is the per-slice take-out in `runner/run.rs`, and the one whole-map sweep,
+    /// `prune_dead`'s `retain`, makes no ordering observable either), never iterated for an
+    /// observable order, and the keys are the runtime's own dense pids — see [`crate::hasher`].
     pub(super) engines: FastHashMap<ProcessId, ProcessEngine>,
     /// The `x(0)` of every process that ran to its `return`.
     pub(super) results: FastHashMap<ProcessId, Eterm>,
@@ -646,10 +653,12 @@ impl RunnerState {
     /// the process's registers are the truth there, and [`Runtime::gather_off_heap_roots`] gathers
     /// them (`crate::runtime::Runtime::gather_off_heap_roots`).
     ///
-    /// This family is gated on the pid still being in the `live` process table: an engine is not
-    /// removed when its process terminates, and a terminated process's heap is gone, so its
-    /// machine's registers would be dangling words. Only **live**, **un-published** engines are
-    /// enumerated, and the enumeration is `O(1)` when there are no engines at all.
+    /// This family is gated on the pid still being in the `live` process table: an engine outlives
+    /// its process's termination by at most the rest of the pass that observed it (the pass
+    /// boundary prunes `engines` to the live table — see [`RunnerState::prune_dead`]), and while a
+    /// dead engine is still in the map its machine's registers are dangling words because the
+    /// process's heap is gone, so only **live**, **un-published** engines are enumerated. The
+    /// enumeration is `O(1)` when there are no engines at all.
     ///
     /// `RunnerState` is moved out of the [`Runtime`](crate::runtime::Runtime) for the duration of
     /// a scheduler pass, so this covers the sites that run outside one (the `-eval` statement
@@ -885,6 +894,77 @@ impl RunnerState {
     /// Whether `pid` is a process this runtime spawned an engine for.
     pub(crate) fn contains(&self, pid: ProcessId) -> bool {
         self.engines.contains_key(&pid)
+    }
+
+    /// Drops the engine of every pid `live` denies, answering how many engines were dropped —
+    /// the **one** reclamation of a terminated process's engine.
+    ///
+    /// An engine is the sole holder of a process's machine ([`ProcessEngine::machine`]), and
+    /// that machine is the sole holder of the process's **off-heap refc-binary reservoir**
+    /// ([`Machine::refc_binaries`]) plus, through [`ProcessEngine::off_heap`], its binary
+    /// virtual-heap budget. Nothing else names either: the payload handles live in the map
+    /// alone (the PCB's own off-heap table is deliberately left empty, see `runner/run.rs`), so
+    /// an engine that outlives its process keeps every payload that process built off-heap —
+    /// its reserve included — for the runtime's whole life. The `RunnerState::engines` map is
+    /// otherwise only ever emptied by the per-slice take-out (`runner/run.rs`), which puts the
+    /// engine **back** at every park arm, so a process that dies while parked (an
+    /// `exit(Pid, kill)`, an exit signal serviced at schedule-in, a raise while blocked) would
+    /// leave its machine in the map for ever.
+    ///
+    /// Pruning is sound because the process is *gone*: its heap has been released by
+    /// [`ProcessTable::terminate`](beam_process::ProcessTable::terminate), so the machine's
+    /// root words are dangling and no caller may read them — which is exactly why the two
+    /// gather doors gate the parked-machine family on the pid still being live
+    /// ([`RunnerState::gather_off_heap_roots`],
+    /// [`RunnerState::for_each_parked_machine_root_mut`]). Dropping the engine is therefore
+    /// **not** swallowing a verdict: every outcome a caller can still need (the `x(0)` in
+    /// [`RunnerState::results`], the reason in [`RunnerState::exits`], the classified
+    /// [`BeamError`] in [`RunnerState::errors`]) lives in its own map and is *not* touched
+    /// here — the CLI's `run` route reads `exits`/`errors` **after** the target left the table
+    /// ([`Runtime::process_exit`](crate::runtime::Runtime::process_exit),
+    /// [`RunnerState::take_error`]).
+    ///
+    /// # The armed receive deadline
+    ///
+    /// A process parked on a finite `receive … after T` holds the deadline's
+    /// [`TimerHandle`] in [`ProcessEngine::parked_timeout`]. Dropping the engine would leave
+    /// that deadline pending in the runtime's timer heap with nothing to resume, so every one
+    /// found here is handed to `cancel_timeout` (the caller's cancel, which also forgets the
+    /// deadline's wake record — see
+    /// [`Runtime::cancel_receive_timeout`](crate::runtime::Runtime::cancel_receive_timeout)).
+    /// The runtime, not this table, owns the timer heap, so the handle is handed out rather
+    /// than cancelled here: that keeps this function free of a `&mut Runtime` and leaves the
+    /// timer vocabulary in one place.
+    ///
+    /// A pid the table still holds is left exactly as it is, whether its engine is running,
+    /// pre-empted or parked in a publishing or an exempt window: **the park/resume protocol is
+    /// untouched** — a live parked engine is still found and resumed, and
+    /// [`park_window`](super::run) still owns both halves of its exemption.
+    ///
+    /// `O(#engines)` (one retain, no allocation) and called once per scheduler-pass round, where
+    /// the live processes are exactly the ones the pass's own table holds (see
+    /// `crate::runtime::Runtime::scheduler_pass`).
+    pub(crate) fn prune_dead(
+        &mut self,
+        live: impl Fn(ProcessId) -> bool,
+        cancel_timeout: &mut impl FnMut(TimerHandle),
+    ) -> usize {
+        let before = self.engines.len();
+        self.engines.retain(|pid, engine| {
+            if live(*pid) {
+                return true;
+            }
+            // The deadline a parked process armed, released before its engine goes: a fire
+            // with no engine left to resume would only record a wake for a pid that can never
+            // run again.
+            if let Some(handle) = engine.parked_timeout.take() {
+                cancel_timeout(handle);
+            }
+            // Dropping the engine here releases the machine (its heap words and its off-heap
+            // payload reservoir), the binary virtual-heap budget and the park state.
+            false
+        });
+        before - self.engines.len()
     }
 
     /// `pid`'s executing module and engine machine, when this runtime holds them.

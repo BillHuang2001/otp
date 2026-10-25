@@ -180,7 +180,7 @@ fn close_peer_write(rig: &mut ResetRig) {
 
 /// Hands the readiness to the **reactor**: `poll(2)`s the port's poller and dispatches every ready
 /// event through the registry — the route `tests/inet.rs`'s
-/// `a_reactor_observed_peer_close_releases_the_registration_and_reports_closed` takes — until the
+/// `a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed` takes — until the
 /// poller is **quiescent** (a poll reports nothing ready) or the driver has released the dead
 /// socket's registration.
 ///

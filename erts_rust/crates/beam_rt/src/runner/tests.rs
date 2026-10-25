@@ -1222,19 +1222,32 @@ build_and_park(N) ->
 ///   * the process's own off-heap table is still empty — **no** slot was ever handed out
 ///     (`off_heap_binary_count() == 0`), so no O(slots) scan can exist, and
 ///     `off_heap_binary_bytes() == 0` measures that same (never-compacted) slot space;
-///   * the engine reservoir grew by a **whole number of iterations**, with an iteration always
-///     building the same number of payloads: the per-iteration count `K` is measured from the
-///     first slice that grew and every later slice's growth is checked against it. `K = 2` here
-///     (the fixture builds two binaries per iteration), so the divisibility has teeth.
+///   * the engine reservoir is **monotonically non-decreasing** (read with `checked_sub`, so a
+///     shrink is a failure rather than a wrap): nothing prunes it on this path, because the
+///     fixture's payloads stay far below the bin-vheap trigger, and the reservoir is the one
+///     holder of what the process builds.
+///
+/// After the loop, **one slice never discharges more than one iteration** — the law the
+/// `SLICE_BUDGET`-reduction budget implies on this tier: `JitMode::Interpreter` charges every
+/// instruction, and one iteration costs more than the whole budget — two runtime-sized binary
+/// builds, the loop's arithmetic, the accumulator add and the tail call all pass that
+/// per-instruction charge (measured: roughly 18–21 charges for one iteration against the
+/// 8-reduction budget) — so at most one iteration boundary can fall inside a slice. A slice's
+/// growth is therefore `0` (it ended mid-iteration, or between two of them), `1` (it ended
+/// between the iteration's two builds) or `2` (a whole iteration's two payloads); the widest
+/// growth the run observed is asserted to be exactly the two payloads an iteration builds, so a
+/// slice discharging three or more fails.
 ///
 /// The pin cannot pass vacuously:
-///   * the loop is long and the reduction budget tiny (`JitMode::Interpreter` charges **every**
-///     instruction), so the process really pre-empts and every slice is asserted to pre-empt;
+///   * the loop is long and the reduction budget tiny, so the process really pre-empts and every
+///     slice is asserted to pre-empt;
 ///   * the fixture builds its binaries from a **variable** size (`<<0:Size/unit:8>>`,
 ///     `Size = 256`, passed as an argument), so the compiler cannot fold them to literals and
-///     every iteration really reaches `alloc_refc_binary`; the reservoir is asserted to hold
-///     **≥ 2** payloads and to grow **across** slices, so an inert fixture (no off-heap build)
-///     fails rather than passing trivially.
+///     every iteration really reaches `alloc_refc_binary`;
+///   * the reservoir is asserted to hold **≥ 2** payloads, to grow **across** slices, to have
+///     completed **≥ 2** iterations, and at least one slice must show a whole iteration's growth
+///     — so an inert fixture (no off-heap build, or one that never finishes an iteration inside
+///     a slice) fails rather than passing trivially.
 #[test]
 fn a_process_never_hands_out_off_heap_slots_across_slices() {
     let source = "\
@@ -1281,9 +1294,8 @@ loop(N, Size, Acc) ->
     const SLICE_BUDGET: u32 = 8;
     let mut reservoir = 0;
     let mut first_slice_reservoir = 0;
-    // The payloads one iteration builds, measured from the first slice that grew. `None` until
-    // then: a slice can end mid-iteration, so a zero delta is legitimate.
-    let mut per_iteration: Option<usize> = None;
+    // Every slice's growth in payloads, checked after the loop against the budget-derived law.
+    let mut deltas: Vec<usize> = Vec::with_capacity(SLICES);
     for slice in 0..SLICES {
         let outcome = {
             let mut runner = RuntimeRunner::new(&mut rt, &mut state);
@@ -1318,41 +1330,54 @@ loop(N, Size, Acc) ->
             bytes, 0,
             "slice {slice}: the never-compacted off-heap slot space stays empty"
         );
-        // (b) This fixture stays below the bin-vheap trigger (its ~25 KB of payloads against the
-        // 46 422-word budget), so no slice-boundary prune runs and the reservoir grows by whole
-        // iterations, each building `K` payloads.
-        let delta = length - reservoir;
-        match per_iteration {
-            Some(k) => assert_eq!(
-                delta % k,
-                0,
-                "slice {slice}: {delta} new payloads is not a whole number of {k}-payload \
-                 iterations"
-            ),
-            None => {
-                if delta > 0 {
-                    per_iteration = Some(delta);
-                }
-            }
-        }
+        // (b) The reservoir only ever GROWS on this path: the fixture's payloads stay far below
+        // the bin-vheap trigger (its ~25 KB against the 46 422-word budget), so no slice-boundary
+        // prune runs. A shrink is therefore a real divergence, not a wrap — hence `checked_sub`.
+        let delta = length.checked_sub(reservoir).unwrap_or_else(|| {
+            panic!(
+                "slice {slice}: the reservoir SHRANK from {reservoir} to {length} payloads, but \
+                 no prune runs on this path (the fixture never reaches the bin-vheap trigger)"
+            )
+        });
+        deltas.push(delta);
         if slice == 0 {
             first_slice_reservoir = length;
         }
         reservoir = length;
     }
 
-    let per_iteration = per_iteration.expect(
-        "the fixture must build off-heap payloads in at least one slice (two runtime-sized \
-         `<<N:Size/unit:8>>` constructions per iteration)",
-    );
+    // **A slice never discharges more than one iteration.** On the interpreter tier every
+    // instruction is charged, and one iteration costs more than the whole `SLICE_BUDGET` budget
+    // (two runtime-sized binary builds, the loop's arithmetic, the accumulator add and the tail
+    // call — measured roughly 18–21 charges per iteration for the 8-reduction budget), so at most
+    // one iteration boundary can fall inside a slice. The widest growth the run observed is
+    // therefore the payload count of ONE iteration, and it has to be exactly that: fewer would
+    // mean no slice ever finished a whole iteration (an inert fixture, or a budget so small only
+    // sub-iteration progress fits), more would mean a slice discharged two — i.e. the budget no
+    // longer isolates one iteration, which is a fact about the slice cadence, not about this
+    // pin's subject.
+    const PAYLOADS_PER_ITERATION: usize = 2;
+    let per_slice_cap = *deltas
+        .iter()
+        .max()
+        .expect("SLICES is non-zero, so every slice recorded a growth");
     assert_eq!(
-        per_iteration, 2,
-        "an iteration builds exactly two off-heap payloads (the fixture's two constructions)"
+        per_slice_cap, PAYLOADS_PER_ITERATION,
+        "the widest per-slice growth must be exactly one iteration's {PAYLOADS_PER_ITERATION} \
+         off-heap payloads (the fixture's two `<<N:Size/unit:8>>` constructions); observed \
+         growths: {deltas:?}"
     );
-    assert_eq!(
-        reservoir % per_iteration,
-        0,
-        "{reservoir} payloads is not a whole number of {per_iteration}-payload iterations"
+    assert!(
+        deltas.iter().all(|&d| d <= PAYLOADS_PER_ITERATION),
+        "no slice may grow the reservoir by more than one iteration's {PAYLOADS_PER_ITERATION} \
+         payloads; observed growths: {deltas:?}"
+    );
+    // Whole iterations really happen: some slice carried both of an iteration's payloads, so the
+    // readings above are not a run of phantom partial iterations.
+    assert!(
+        deltas.iter().any(|&d| d == PAYLOADS_PER_ITERATION),
+        "at least one slice must show a whole iteration's growth ({PAYLOADS_PER_ITERATION} \
+         payloads); observed growths: {deltas:?}"
     );
 
     // Non-vacuity: the fixture really built off-heap payloads, and built MORE of them by the end
@@ -1366,10 +1391,14 @@ loop(N, Size, Acc) ->
         "the reservoir must GROW across slices (first slice {first_slice_reservoir}, final \
          {reservoir})"
     );
+    // The iterations the slices finished — the trailing partial one (if a slice stopped between
+    // an iteration's two builds) is not counted, which is why this floors rather than divides
+    // exactly.
+    let completed_iterations = reservoir / PAYLOADS_PER_ITERATION;
     assert!(
-        reservoir / per_iteration >= 2,
-        "the slices really completed several iterations (got {} of them)",
-        reservoir / per_iteration
+        completed_iterations >= 2,
+        "the slices really completed several iterations (got {completed_iterations} of them, from \
+         {reservoir} payloads)"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -4178,12 +4207,25 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 ///   collections is that one plus one at every `K`-th iteration — measured `1 + N / K` exactly
 ///   from N = 1 to N = 10 (1, 2, 2, 3, 3, 4, 4, 5, 5, 6) as well as on the five rows below.
 ///
-/// The **boundary door adds nothing to the count**: a slice prices exactly 800 iterations
-/// (`reductions == 5N + 5` against a 4 000-unit budget) and 800 is a multiple of `K`, so each
-/// slice-end boundary falls on a cycle boundary and any collection it takes is one the following
-/// admission would have taken anyway. Measured (this host, debug build) at N = 5 000 / 10 000 /
-/// 25 000 / 50 000 / 100 000: `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against
-/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 0 and
+/// The **boundary door adds nothing to the count**, and slice length is not what makes that true:
+/// a slice prices at most `4 000 / 3 = 1 333` iterations (`reductions == 3N + 5` plus one unit per
+/// pre-emption, against a 4 000-unit budget) and 1 333 is **not** a multiple of `K`, so a slice-end
+/// boundary lands mid-cycle on roughly half the rows. What keeps the cadence exact is the door's
+/// own **occupancy watermark**: it may only collect once seven eighths of the settled capacity is
+/// used (`BOUNDARY_OCCUPANCY_NUM`/`_DEN` in `../context/gc/reds_door.rs`), so a boundary needs at
+/// least `7/8 x K` iterations of a cycle already allocated in the space. For any capacity carrying
+/// fewer than eight iterations that rounds up to the **whole** cycle — here `7/8 x 2 = 1.75`, i.e.
+/// both of the cycle's 401-word iterations (`7/8 x 843 = 737.6` words, cleared by the 802 words two
+/// iterations fill and not by the 401 one iteration fills). A boundary offered after one iteration
+/// therefore declines, and one offered after the cycle's two is exactly the state in which the
+/// **next** admission request would have collected: a firing takes that collection instead of
+/// adding one, and the space it leaves behind restarts the cycle from the same point, so the count
+/// stays `1 + N/K` whatever phase the boundaries land on. (Where a row settles on the 987-word
+/// capacity its one fullsweep installed, the two-iteration fill of 802 words stays below
+/// `987 x 7/8 = 863.6`, so no boundary fires at all there — the other way the count is preserved.)
+/// Measured (this host, debug build) at N = 5 000 / 10 000 / 25 000 / 50 000 / 100 000:
+/// `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against `yields` = 3 / 7 / 18 / 37 /
+/// 75, at an 843-word nursery capacity (987 after the fullsweep) with `major` 0 or 1 and
 /// `debt_boundaries` 0 on every row.
 ///
 /// # What would make it regress
@@ -4195,9 +4237,12 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 ///   collecting): the retired chain would rise above one space and a boundary would observe
 ///   collection debt;
 /// * a change to the fixture's `test_heap` request: `K` moves with the footprint;
-/// * a slice-granularity change (`RUN_STEP_SLICES`, `DEFAULT_REDUCTIONS_PER_SLICE`) that made a
-///   slice price a non-multiple of `K` iterations — a boundary collection would then land
-///   mid-cycle and add to the count.
+/// * a slice-granularity change (`RUN_STEP_SLICES`, `DEFAULT_REDUCTIONS_PER_SLICE`): harmless on
+///   its own — every boundary's *phase* moves with the slice length, and the watermark is what
+///   keeps a mid-cycle firing impossible for a capacity carrying fewer than eight iterations —
+///   but a settled nursery carrying eight or more of them would let a boundary collect with the
+///   cycle only part-used, and that collection is then additional to the admission's instead of
+///   taking its place.
 #[test]
 fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
     // Five N, spanning a slice boundary count from 2 to 26: the relation is checked on every row
