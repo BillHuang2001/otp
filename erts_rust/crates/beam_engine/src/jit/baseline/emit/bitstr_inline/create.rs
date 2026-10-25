@@ -232,6 +232,33 @@ use super::{emit_fallback_and_done, IMMED1_MASK, POINTER_MASK, SMALL_TAG, SUB_BI
 #[cfg(test)]
 use super::{record_inlined, SHAPE_CREATE_BIN};
 
+#[path = "create_field.rs"]
+mod create_field;
+
+use create_field::{
+    emit_bit_field_store, FieldScratch, MAX_INLINE_FIELD_BITS, PRODUCTION_FIELD_SCRATCH,
+};
+
+// How many field-write plans the general route has emitted through the **inline** store
+// path (see `emit_bit_fields_inline`).
+//
+// A `#[cfg(test)]` non-vacuity probe: a row that only compares values cannot tell an
+// inline plan from one that silently stayed on the per-field helper, so the end-to-end
+// tier-parity tests assert this counter moved.
+// Thread-local for the same reason `super::INLINED` is: the test harness runs the crate's
+// tests on parallel threads of one process, and a process-global counter would let a
+// neighbouring test's compile account for this one's.
+#[cfg(test)]
+thread_local! {
+    static INLINE_FIELD_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one plan emitted through the inline store path (see [`INLINE_FIELD_PLANS`]).
+#[cfg(test)]
+fn note_inline_field_plan() {
+    INLINE_FIELD_PLANS.with(|plans| plans.set(plans.get() + 1));
+}
+
 /// The most fields one natively lowered build writes.
 ///
 /// The emitted sequence is straight-line code (one guarded byte store per field byte on the
@@ -513,6 +540,18 @@ impl CreateBinShape {
                 seam::Field::ConstBytes { .. } => false,
             })
     }
+
+    /// How many field-write plans this thread's compiles have emitted through the
+    /// **inline** general-route store path (see [`INLINE_FIELD_PLANS`]).
+    ///
+    /// The non-vacuity probe the end-to-end tests read: it is reachable from a sibling test
+    /// module through this type because `create` is private to `bitstr_inline` while
+    /// `CreateBinShape` is re-exported from it.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn inline_field_plans() -> usize {
+        INLINE_FIELD_PLANS.with(std::cell::Cell::get)
+    }
 }
 
 /// Emit `bs_create_bin Dst Segments` natively, or report that the block must helper it
@@ -642,7 +681,16 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     match route {
         Route::Aligned => emit_aligned_fields(buffer, &prepared, highest_touched)?,
         Route::BitGranular => {
-            emit_bit_fields(buffer, &shape, &prepared, allocation, func, pc, fallback)?
+            emit_bit_fields(
+                buffer,
+                &shape,
+                &prepared,
+                allocation,
+                func,
+                pc,
+                fallback,
+                highest_touched,
+            )?
         }
     }
 
@@ -758,16 +806,26 @@ fn emit_aligned_fields(
     Ok(())
 }
 
-/// The **general** (bit-granular) route's field-write phase: one helper call per field, each
-/// one followed by its own `test rax, rax ; je fallback`.
+/// The **general** (bit-granular) route's field-write phase.
 ///
-/// Every argument is a compile-time constant (`movabs`): the accumulator's slot index, the
-/// field's **bit** offset, the value's slot index, the field width in bits and the
-/// [`WRITE_ACC_IN_Y`]/[`WRITE_VALUE_IN_Y`] flags naming which machine file holds each term.
-/// The helper re-derives the payload base and the window end from the general door, applies
-/// the family's bit-granular write rule, and answers `1`/`0`; a refusal is the family's own
-/// path through the `fallback`, and the payload bytes it may already have written are the
-/// same bytes a re-execution writes.
+/// It has two forms, chosen per **plan** by the field widths, and both run behind the
+/// up-front general door and its `test rax, rax ; je fallback`:
+///
+/// * [`emit_bit_fields_inline`] — every field is at most [`MAX_INLINE_FIELD_BITS`] bits, so
+///   the payload base the door answered stays in a register, the window end is derived from
+///   the accumulator term once, and each field's bytes are straight-line stores.
+/// * the per-field `jit_write_bit_field` call below — a field wider than that cannot be
+///   left-aligned in one 64-bit register for every window offset, so the whole plan keeps
+///   the helper sequence (one call per field, each re-deriving the base and the window end
+///   from the seam).
+///
+/// Every argument of the helper is a compile-time constant (`movabs`): the accumulator's
+/// slot index, the field's **bit** offset, the value's slot index, the field width in bits
+/// and the [`WRITE_ACC_IN_Y`]/[`WRITE_VALUE_IN_Y`] flags naming which machine file holds
+/// each term. The helper re-derives the payload base and the window end from the general
+/// door, applies the family's bit-granular write rule, and answers `1`/`0`; a refusal is
+/// the family's own path through the `fallback`, and the payload bytes it may already have
+/// written are the same bytes a re-execution writes.
 fn emit_bit_fields(
     buffer: &mut CodeBuffer,
     shape: &CreateBinShape,
@@ -776,7 +834,13 @@ fn emit_bit_fields(
     func: u32,
     pc: u32,
     fallback: CodeLabel,
+    highest_touched: &mut Option<u32>,
 ) -> Result<()> {
+    if prepared.iter().all(|field| {
+        matches!(field, PreparedField::Bits { bits, .. } if *bits <= MAX_INLINE_FIELD_BITS)
+    }) {
+        return emit_bit_fields_inline(buffer, shape, prepared, highest_touched);
+    }
     let acc_in_y = shape.source.is_y();
     let src_slot = i64::from(shape.source_slot());
     let helper: WriteBitFieldHelper = jit_write_bit_field;
@@ -814,6 +878,69 @@ fn emit_bit_fields(
         buffer.test_rr(Reg::Rax, Reg::Rax)?;
         buffer.jcc(Cond::E, fallback)?;
     }
+    Ok(())
+}
+
+/// The **inline** general-route field-write phase: one wide field store per field, no call,
+/// for a plan whose every field is at most [`MAX_INLINE_FIELD_BITS`] bits.
+///
+/// `rax` holds the payload base the up-front general door answered, so it moves to the
+/// base register; the window end comes from the accumulator term itself — the door proved
+/// it is an `ErlSubBits` over a `BinRef` with `start == 0`, so
+/// `beam_term::bitstring_parts`' size for it **is** the `ErlSubBits.end` word, which **is**
+/// the door's `end_bits` (`ErlSubBits` words 3 and 4 are `end` and `orig`, exactly the
+/// `SUB_BITS_END_DISP` the window commit already reads). One mask-and-load derives it, and
+/// every field of the plan reuses it.
+///
+/// What that drops is only the helper's own re-verification: the whole-plan room check the
+/// up-front door made implies every field's room, the append-unit gate was the plan's, and
+/// the `is_small` refusal is this arm's up-front per-field guard (see
+/// [`super::create_field`]).
+///
+/// Every value is re-read from the machine after the helper: a cached x-register was
+/// spilled before the call, so `machine.x` (via `rbx`) is authoritative, and a `Y` slot is
+/// reached through its own re-derived address behind the up-front guard.
+fn emit_bit_fields_inline(
+    buffer: &mut CodeBuffer,
+    shape: &CreateBinShape,
+    prepared: &[PreparedField<'_>],
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    let FieldScratch {
+        base, end, ..
+    } = PRODUCTION_FIELD_SCRATCH;
+    // The door's answer (the payload base) into the register the whole phase keeps it in.
+    buffer.mov_rr(base, Reg::Rax)?;
+    match shape.source {
+        Loc::X(x) => {
+            buffer.mov_rm(end, Reg::Rbx, x_offset(x))?;
+            touch(highest_touched, x);
+        }
+        Loc::Y(k) => emit_y_slot_value(buffer, end, k)?,
+    }
+    buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
+    buffer.and_rr(end, Reg::Rax)?;
+    buffer.mov_rm(end, end, SUB_BITS_END_DISP)?;
+    for field in prepared {
+        let PreparedField::Bits {
+            value,
+            bits,
+            offset_bits,
+        } = field
+        else {
+            continue;
+        };
+        match *value {
+            Loc::X(x) => {
+                buffer.mov_rm(Reg::Rax, Reg::Rbx, x_offset(x))?;
+                touch(highest_touched, x);
+            }
+            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rax, k)?,
+        }
+        emit_bit_field_store(buffer, Reg::Rax, *bits, *offset_bits, &PRODUCTION_FIELD_SCRATCH)?;
+    }
+    #[cfg(test)]
+    note_inline_field_plan();
     Ok(())
 }
 
