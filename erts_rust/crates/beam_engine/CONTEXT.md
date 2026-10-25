@@ -193,7 +193,7 @@ The child `CONTEXT.md` files own the per-subsystem detail; this table only route
 - `src/families/` -> the `dispatch` seam plus the nine owning families (`tuples`, `records`, `lists`, `funs`, `exceptions`, `floats`, `maps`, `bitstrings` incl. `create/`+`matching/`, `receive`); see `src/families/CONTEXT.md` and its children.
 - `src/jit/` -> the tier seam, `cache/`, `emitter/`, `baseline/` (with `inlineset/`, `emit/`, `measure/`, `census/`, `runtime/`, `testing/`, `bench/`), feature-gated `cranelift/`; see `src/jit/CONTEXT.md` and its children.
 - `src/bench/` -> the `#[cfg(test)]`-only in-process foreign-workload decomposition harness; see `src/bench/CONTEXT.md`.
-- `tests/` -> `support/mod.rs` (the test `ModuleHost`, `SEED_ATOMS`, the host BIF floor) and `fixtures/`; see `tests/CONTEXT.md`, and the rest are named in `TEST_NOTES.md`.
+- `tests/` -> `support/mod.rs` (the test `ModuleHost`, `SEED_ATOMS`, the host BIF floor), `fixtures/` and the two probe-data dirs `dynamic_census/`/`real_beam_variant_proofs/` (none of the three has its own `CONTEXT.md`); see `tests/CONTEXT.md`, and the rest are named in `TEST_NOTES.md`.
 - `INSTRUCTION_SURFACE.md` -> exhaustive instruction surface, execution semantics, design decisions, full known-gap and handoff lists.
 - `MEASURED.md` -> measured performance + coverage detail; `PERF.md` -> tier performance snapshots; `TEST_NOTES.md` -> test enumeration + gate figures.
 
