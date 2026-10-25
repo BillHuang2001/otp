@@ -49,8 +49,12 @@
 //! instruction with the same operands — idempotent.
 //!
 //! The refusals the helper answers are the shapes whose copy the tier does not express: a
-//! non-writable or non-refc accumulator, a window end that is not byte-aligned, a
-//! non-refc/non-byte-aligned/oversized source, and a payload without room. Each is one
+//! non-writable or non-refc accumulator, an accumulator window end that is not byte-aligned, a
+//! source that is not a bitstring or whose own window is not byte-aligned at both ends, a
+//! source window overlapping the accumulator's payload, and a payload without room. The source
+//! may be an off-heap refc binary **or** an on-heap `ErlHeapBits` binary — the gate reads
+//! either through the family's own `raw::heap_bits` accessor, the same one the `fallback`'s
+//! family body reads its bytes through. Each refusal is one
 //! interpreter step, so the family's own value, fail transfer or raise (a source size that is
 //! not a whole number of the field's `unit` is the family's `badarg`) is what the process
 //! observes.
