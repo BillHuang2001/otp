@@ -590,25 +590,20 @@ pub(crate) type PositionHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32,
 /// nothing — re-publishing the frame's Y window cannot fail.
 pub(crate) type RefreshHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>);
 
-/// The append-door helpers' native signature (the block ABI plus the accumulator's
-/// **slot index** and the plan's tail width in bits) — shared by [`jit_open_append_bin`]
-/// (an x-register index) and [`jit_open_append_bin_y`] (a Y-slot index).
-///
-/// The accumulator is passed as an index, not as a word, because the block's spill has
-/// already made `machine.x` authoritative for it — and because the block ABI admits only
-/// `movabs` immediates in [`super::emit::emit_helper_invoke`], so a run-time value can
-/// only cross as an index the helper re-reads from the machine.
-pub(crate) type OpenAppendHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64) -> i64;
-
 /// The **general** append-door helpers' native signature (the block ABI plus the
 /// accumulator's **slot index**, the plan's tail width in bits and the plan's append
 /// **unit**) — shared by [`jit_open_append_bin_any`] (an x-register index) and
 /// [`jit_open_append_bin_any_y`] (a Y-slot index).
 ///
-/// The accumulator crosses as an index for the same two reasons as [`OpenAppendHelper`]
-/// (the block's spill has already made `machine.x` authoritative, and the block ABI admits
-/// only `movabs` immediates), and the unit is a compile-time constant the plan carries, so
-/// the door can apply C's append-**position** gate itself.
+/// The accumulator crosses as an index, not as a word, because the block's spill has
+/// already made `machine.x` authoritative for it — and because the block ABI admits only
+/// `movabs` immediates in [`super::emit::emit_helper_invoke`], so a run-time value can
+/// only cross as an index the helper re-reads from the machine. The unit is a compile-time
+/// constant the plan carries, so the door can apply C's append-**position** gate itself.
+///
+/// The aligned route's door ([`jit_append_cursor`]) instead takes the payload base and the
+/// window end it has already loaded from the accumulator's own block, because its lowering
+/// proves that shape inline (see [`super::emit::bitstr_inline`]'s `create_door`).
 pub(crate) type OpenAppendAnyHelper =
     for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, i64, i64) -> i64;
 
@@ -1443,100 +1438,73 @@ pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
     runtime.refresh_y_base();
 }
 
-/// The **in-place append precondition** helper behind the native `bs_create_bin`
-/// construction arm: ask the family's construction seam whether `machine.x[src_reg]` is a
-/// writable accumulator this instruction may append `tail_bits` more bits to, and hand the
-/// block the **write cursor** (payload base + the accumulator's whole-byte window end).
+/// The **machine-private half** of the aligned append door, for a lowering that has already
+/// proved the accumulator's refc-binary shape inline: answers the byte cursor
+/// `base + end_bits / 8` when `base` is a payload **this machine** registered writable and
+/// `end_bits + tail_bits` fits that payload's capacity, else `0` (the universal fallback
+/// signal). Reads only; allocates nothing; mutates nothing.
 ///
-/// Returns `0` for every refusal — an out-of-range register index, a negative argument, a
-/// source term that is not an off-heap refc binary this machine registered as writable, a
-/// window that is not whole-byte aligned, or a payload without room for `tail_bits`. `0`
-/// is the universal decline signal: a real payload base is a live allocation address and
-/// can never be null. The emitted sequence tests the word and branches to its one-interpreter-
-/// step `fallback`, so a refusal is the family's own behaviour, never an error of this
-/// helper's.
+/// It is the remainder of `seam::open_append` once the block has proved the term shape
+/// itself (`route::Aligned`'s inline proof in [`super::emit::bitstr_inline`]'s
+/// `create_door`): `raw::writable_append_target`'s
+/// registry clause — the payload base is the key — its `checked_mul(8)` byte-to-bit
+/// conversion, the `unit == 8` append-position gate and the `end + tail <= capacity` room
+/// rule. Every one of them answers exactly what that seam function answers for the same
+/// machine state, which is what keeps an inline-proof mistake a **refusal** (one
+/// interpreter step) and never a wrong result.
 ///
-/// **It mutates nothing.** The `ErlSubBits.end` advance the family's build performs is
-/// emitted **inline** by the block ([`super::emit::bitstr_inline`]'s `create` shape) as the
-/// last store before the destination is written, precisely so that a later `fallback`
-/// (one whole interpreter step re-executing this very instruction) sees an accumulator the
-/// block's prefix has not touched. Committing `end` here would put the mutation before the
-/// field stores, and a deopt would then append the tail twice — a wrong result.
-pub(crate) extern "C" fn jit_open_append_bin(
+/// `0` is a safe decline signal: a real payload base is a live allocation address and can
+/// never be null, and the cursor is `base` plus a non-negative byte offset.
+///
+/// **It mutates nothing** — see [`jit_open_append_bin_any`]'s note on why the window-end
+/// commit must stay in the block.
+pub(crate) extern "C" fn jit_append_cursor(
     rt: *mut JitRuntime<'_>,
-    src_reg: i64,
-    tail_bits: i64,
+    base: usize,
+    end_bits: usize,
+    tail_bits: usize,
 ) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call (the driver is
     // blocked in the block call that reached us).
     let runtime = unsafe { &*rt };
     // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
-    // this helper only **reads** through it — the seam's two queries (`writable_append_target`,
-    // `open_append`) allocate nothing and mutate nothing — so a shared borrow cannot alias a
-    // `&mut Machine` (the driver holds none while the block runs).
+    // this helper only **reads** through it — `Machine::writable_capacity` walks the
+    // per-process writable-payload registry and allocates nothing — so a shared borrow
+    // cannot alias a `&mut Machine` (the driver holds none while the block runs).
     let machine = unsafe { &*runtime.machine };
-    let Ok(src_reg) = u32::try_from(src_reg) else {
-        return 0;
-    };
-    let Some(src) = machine.x(src_reg) else {
-        return 0;
-    };
-    open_append_cursor(machine, src, tail_bits)
+    append_cursor(machine, base, end_bits, tail_bits)
 }
 
-/// The **`Y`-slot** form of [`jit_open_append_bin`]: the accumulator's Y-slot index and the
-/// plan's tail width in bits, read through [`Machine::y`]'s bounds check.
-///
-/// A `Y` accumulator cannot cross the block ABI as a word (see
-/// [`OpenAppendHelper`] — the emitter passes `movabs` immediates only), so it crosses as an
-/// **index** exactly as the x-register form does; the difference is which safe accessor
-/// resolves it. `Machine::y` answers `None` for a slot outside the current frame, which is
-/// the same `0` decline as every other refusal, so the emitted `test rax, rax; je
-/// fallback` turns it into one interpreter step rather than an out-of-frame read.
-///
-/// **It mutates nothing**, for the same reason as the x-register form: the emitted
-/// sequence performs the family's only mutation (`ErlSubBits.end` advance) inline, last.
-pub(crate) extern "C" fn jit_open_append_bin_y(
-    rt: *mut JitRuntime<'_>,
-    y_slot: i64,
-    tail_bits: i64,
+/// The decision body of [`jit_append_cursor`], split out so a test can pin it against
+/// `seam::open_append` (the byte-aligned door the aligned route used to call) without a
+/// `JitRuntime`.
+pub(crate) fn append_cursor(
+    machine: &Machine,
+    base: usize,
+    end_bits: usize,
+    tail_bits: usize,
 ) -> i64 {
-    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
-    // `JitRuntime` and never aliases it for the duration of the call (the driver is
-    // blocked in the block call that reached us).
-    let runtime = unsafe { &*rt };
-    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`, and
-    // this helper only **reads** through it — `Machine::y` and the seam's two queries
-    // allocate nothing and mutate nothing — so a shared borrow cannot alias a `&mut Machine`
-    // (the driver holds none while the block runs).
-    let machine = unsafe { &*runtime.machine };
-    let Ok(y_slot) = u32::try_from(y_slot) else {
-        return 0;
-    };
-    let Some(src) = machine.y(y_slot) else {
-        return 0;
-    };
-    open_append_cursor(machine, src, tail_bits)
-}
-
-/// The shared body of the two append-door helpers: resolve the accumulator's write cursor
-/// (payload base + its whole-byte window end) or `0` for every refusal.
-///
-/// Factored out so the x-register and `Y`-slot doors differ **only** in how the accumulator
-/// term is reached, and neither duplicates the seam query or the cursor arithmetic.
-fn open_append_cursor(machine: &Machine, src: Eterm, tail_bits: i64) -> i64 {
-    let Ok(tail_bits) = u32::try_from(tail_bits) else {
-        return 0;
-    };
-    let Some((base, end_bits)) =
-        crate::families::bitstrings::create::seam::open_append(machine, src, tail_bits)
+    // The payload must be one **this machine** registered as writable
+    // (`raw::writable_append_target`'s registry clause, keyed on the payload's first data
+    // byte) — an ordinary refc binary's length is emphatically not a capacity.
+    let Some(capacity_bits) = machine
+        .writable_capacity(base as *const u8)
+        .and_then(|capacity_bytes| capacity_bytes.checked_mul(8))
     else {
         return 0;
     };
-    // The payload base plus the whole-byte window end — `open_append` guarantees
-    // `end_bits % 8 == 0`, so this is the exact byte offset of the first byte the
-    // instruction's fields occupy.
+    // C's append-position gate for a whole-byte build (`append_unit_allows(end_bits, 8)`,
+    // `erl_bits.c:1778-1784`), kept here so this door agrees with the seam's on every input.
+    if end_bits % 8 != 0 {
+        return 0;
+    }
+    let Some(new_end) = end_bits.checked_add(tail_bits) else {
+        return 0;
+    };
+    if new_end > capacity_bits {
+        return 0;
+    }
     (base + end_bits / 8) as i64
 }
 

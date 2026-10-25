@@ -219,9 +219,8 @@ use crate::families::bitstrings::create::seam;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::super::runtime::{
-    jit_open_append_bin, jit_open_append_bin_any, jit_open_append_bin_any_y, jit_open_append_bin_y,
-    jit_write_bit_field, OpenAppendAnyHelper, OpenAppendHelper, WriteBitFieldHelper,
-    RUNTIME_YBASE_DISP, WRITE_ACC_IN_Y, WRITE_VALUE_IN_Y,
+    jit_open_append_bin_any, jit_open_append_bin_any_y, jit_write_bit_field, OpenAppendAnyHelper,
+    WriteBitFieldHelper, RUNTIME_YBASE_DISP, WRITE_ACC_IN_Y, WRITE_VALUE_IN_Y,
 };
 use super::super::operands::{x_offset, y_offset, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2};
 use super::super::{
@@ -234,10 +233,13 @@ use super::{record_inlined, SHAPE_CREATE_BIN};
 
 #[path = "create_field.rs"]
 mod create_field;
+#[path = "create_door.rs"]
+mod create_door;
 
 use create_field::{
     emit_bit_field_store, FieldScratch, MAX_INLINE_FIELD_BITS, PRODUCTION_FIELD_SCRATCH,
 };
+use create_door::emit_append_cursor;
 
 // The gold-standard oracle for `emit_bit_field_store`: the sequence is executed for every
 // width, window offset and window end over a byte-pre-filled payload and compared with the
@@ -639,28 +641,22 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     }
 
     // (3) The construction seam's run-time half — the whole plan's room check, and the last
-    // guard before every write. The accumulator crosses as a **slot index** (the block ABI
-    // carries `movabs` immediates only), and which door resolves it follows from the `Loc`:
-    // the x-register door reads `machine.x`, the `Y` door `Machine::y`. `rax` answers a
-    // non-zero word on success (the byte cursor on the aligned route, the payload base on the
-    // general one — neither is read inline, so both are only tested) and `0` for every
-    // refusal. The helper mutates nothing, so this costs exactly one test.
+    // guard before every write. `rax` answers a non-zero word on success (the byte cursor on
+    // the aligned route, the payload base on the general one) and `0` for every refusal. The
+    // door mutates nothing, so this costs exactly one test — and the aligned route's own
+    // emitted sequence already carries it (see [`create_door::emit_append_cursor`]).
     let source_slot = shape.source_slot();
     match route {
-        Route::Aligned => {
-            let helper: OpenAppendHelper = match shape.source {
-                Loc::X(_) => jit_open_append_bin,
-                Loc::Y(_) => jit_open_append_bin_y,
-            };
-            emit_positioned_helper_call(
-                buffer,
-                allocation,
-                helper as *const (),
-                &[i64::from(source_slot), i64::from(shape.tail_bits)],
-                func,
-                pc,
-            )?;
-        }
+        Route::Aligned => emit_append_cursor(
+            buffer,
+            allocation,
+            shape.source,
+            shape.tail_bits,
+            func,
+            pc,
+            fallback,
+            highest_touched,
+        )?,
         Route::BitGranular => {
             let helper: OpenAppendAnyHelper = match shape.source {
                 Loc::X(_) => jit_open_append_bin_any,
@@ -678,10 +674,10 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
                 func,
                 pc,
             )?;
+            buffer.test_rr(Reg::Rax, Reg::Rax)?;
+            buffer.jcc(Cond::E, fallback)?;
         }
     }
-    buffer.test_rr(Reg::Rax, Reg::Rax)?;
-    buffer.jcc(Cond::E, fallback)?;
 
     // (4) The field writes — the route's own phase (see the module docs).
     match route {

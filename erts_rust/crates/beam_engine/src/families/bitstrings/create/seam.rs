@@ -316,6 +316,12 @@ pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<Appen
 /// with a bit-granular field must use [`open_append_any`].
 ///
 /// Allocates nothing, mutates nothing, safe to call speculatively.
+///
+/// Built for its tests only: the baseline JIT's aligned route proves the accumulator's term
+/// shape inline and asks the machine for the capacity alone
+/// ([`crate::jit::baseline::runtime::jit_append_cursor`]), so no production path calls this
+/// one — it survives as the **reference answer** that door is pinned against.
+#[cfg(test)]
 pub(crate) fn open_append(
     machine: &Machine,
     src: Eterm,
