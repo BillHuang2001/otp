@@ -141,6 +141,7 @@ Admin/`DUMP` codec types `DumpReq`/`DumpResp`/`DumpLine`/`DumpNodeKind`, `KillRe
 ## Test Strategy
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_dist` green, plus `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - In-module `#[cfg(test)]` unit tests per module (`connection`'s are path-included from `src/connection_tests.rs`: the frame-read EOF seam over `MemoryTransport` and the blocking decode-failure policy) + the `tests/` integration suites for the cross-module seams.
+- The real-`erl` recipe is `tests/live_interop.rs` (plus `live_accept.rs`/`live_accept_blocking.rs` for the two accept halves and `live_driver.rs` for the non-blocking driver); run one with `--test <name>` — they spawn a node through `tests/common/mod.rs`.
 - **Per-suite claims, the live-`erl` recipes and the shared spawn harness live in `tests/CONTEXT.md`** — that file is the source of truth for what each suite proves.
 - Live suites skip **honestly** (clear `eprintln`, never a faked pass) when `erl`/`epmd` is absent from `PATH`; the hermetic suites always run.
 - The `beam_rt` two-live-VM suites are the runtime's, not this crate's: `../beam_rt/tests/dist_two_vm{,_rust,_wire}.rs`.
