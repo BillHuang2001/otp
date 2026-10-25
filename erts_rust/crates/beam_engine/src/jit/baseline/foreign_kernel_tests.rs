@@ -120,7 +120,7 @@ use beam_term::{is_small, make_small, signed_value, Atom, AtomTable, Eterm, MAX_
 use super::bitstr_inline_tests::{emitted_shapes_for, static_deopts, visited_instances};
 use super::bitstr_tests::export;
 use super::emit::bitstr_inline::{
-    inlined, CreateBinShape, SHAPE_BS_MATCH, SHAPE_CREATE_BIN, SHAPE_START_MATCH3,
+    inlined, CreateBinShape, Route, SHAPE_BS_MATCH, SHAPE_CREATE_BIN, SHAPE_START_MATCH3,
     SHAPE_START_MATCH4,
 };
 use super::tests::{assert_same_outcome, error_reason};
@@ -1114,6 +1114,20 @@ struct AppendBuild {
     planned: bool,
     /// Whether [`CreateBinShape::of`] (the inline arm's own predicate) accepts it.
     lowered: bool,
+    /// The route the arm emits an accepted build with — `None` exactly when the arm
+    /// declines it, so this is the per-build form of the two-route split (below).
+    route: Option<Route>,
+    /// The plan's append **unit** (`1`, `2`, `4` or `8`) — the figure C gates the append
+    /// *position* on; `None` for a refused plan.
+    unit: Option<usize>,
+    /// The widths, in bits, of the plan's run-time-value fields (`seam::Field::Bits`), in
+    /// instruction order — the "6-bit" in "the 6-bit append". Empty for a refused plan.
+    field_bits: Vec<u32>,
+    /// Whether every field segment's **size** operand is a compile-time integer literal
+    /// (`Operand::Integer`/`Operand::Character`, the only form `seam::append_plan` can
+    /// resolve to a static width). A run-time `size(Expr)` register and the atom `all` are
+    /// both `false` — the two ways a field width is *not* a compile-time fact.
+    literal_width: bool,
     /// The constant-bytes (`string` segment) field count of an accepted field list, `0` when
     /// the plan was refused.
     const_bytes: usize,
@@ -1127,6 +1141,12 @@ struct AppendBuild {
 /// to prove that a lowered build is the `Y` form rather than an x-register one. Without that
 /// a run of `lowered` rows would pass just as well for a set of builds the `Y` form never
 /// considered.
+///
+/// [`CreateBinShape::route`] is captured per build as well, because "lowered" is only half of
+/// what the two-route split needs: an accepted build is emitted either as whole-byte stores or
+/// as bit-granular writes, and the kernels below are the reason the second route exists at all
+/// (`emqx_base62` appends **6-bit** fields). A row that only counted `lowered` would pass for a
+/// build the arm happened to emit down the wrong route.
 fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild> {
     code.iter()
         .filter_map(|instr| {
@@ -1135,6 +1155,7 @@ fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild> {
             };
             let accumulator = named_register(accumulator_operand(module, segments));
             let plan = seam::append_plan(module, segments);
+            let shape = CreateBinShape::of(module, dst, segments);
             let const_bytes = plan
                 .as_ref()
                 .map(|plan| {
@@ -1144,14 +1165,46 @@ fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild> {
                         .count()
                 })
                 .unwrap_or(0);
+            let field_bits = plan
+                .as_ref()
+                .map(|plan| {
+                    plan.fields
+                        .iter()
+                        .filter_map(|field| match field {
+                            Field::Bits { bits, .. } => Some(*bits),
+                            Field::ConstBytes { .. } => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(AppendBuild {
                 accumulator,
                 planned: plan.is_some(),
-                lowered: CreateBinShape::of(module, dst, segments).is_some(),
+                lowered: shape.is_some(),
+                route: shape.as_ref().map(CreateBinShape::route),
+                unit: plan.as_ref().map(|plan| plan.unit),
+                field_bits,
+                literal_width: has_literal_widths(segments),
                 const_bytes,
             })
         })
         .collect()
+}
+
+/// Whether every field segment of `segments` names its **size** with a compile-time integer
+/// literal — the only size form [`seam::append_plan`] can resolve to a static field width.
+///
+/// The first group is the accumulator itself (whose `Size` operand is the compiler's `all`),
+/// so it is skipped: the question is about the *fields* the build writes. Everything that is
+/// not `Operand::Integer`/`Operand::Character` — a register holding a run-time `size(Expr)`,
+/// the atom `all` — is a width no lowering can plan, which is what makes "declined" in the
+/// rows below a statement about the width rather than about the shape at large.
+fn has_literal_widths(segments: &[Operand]) -> bool {
+    let mut fields = segments.chunks_exact(SEGMENT_OPERANDS).skip(1).peekable();
+    if fields.peek().is_none() {
+        return false;
+    }
+    fields.all(|group| matches!(group[5], Operand::Integer(_) | Operand::Character(_)))
 }
 
 /// The index of exported `function/arity` in `program`'s staged artifact.
@@ -1400,4 +1453,315 @@ fn the_to_lower_append_construction_lowers_its_y_slot_accumulator() {
         build.lowered,
         "`CreateBinShape::of` must accept a `Y`-slot accumulator"
     );
+}
+
+/// **`emqx_base62:decode/2`'s bit-granular append is emitted, and its runtime-width build is
+/// honestly not** — the non-vacuity row for the second `bs_create_bin` route, and the
+/// construction-side twin of [`the_base62_decode_match_arm_is_emitted_and_not_deopted`].
+///
+/// The kernel's per-character body ends in `<< Acc/bitstring, RestBit:6 >>`, i.e. a `bits`
+/// accumulator plus a **six-bit** `integer` field: the aligned route's whole-byte stores cannot
+/// express it, so it is the shape the bit-granular route exists for. Two clauses carry it —
+/// the `$9` branch (block label 13) and the plain branch (block label 15) — and the bench input
+/// [`DECODE_INPUT`] is 15 bytes of ordinary base62, so the plain one runs **14** times per
+/// kernel call (the first clause's guard needs two bytes left, so it fires while 15…2 bytes
+/// remain) while the `$9` one never runs; both are nevertheless emitted at compile time, which
+/// is what this row pins. The third clause (block label 16) appends
+/// `<< Acc/bitstring, RestBit:RightBitSize >>` with a **run-time** `size(Expr)`, so no
+/// lowering can plan it.
+///
+/// Without a row like this the two output rows above would also pass for an implementation that
+/// left every construction on the family helper: a per-field deopt still returns the right
+/// bytes, so tier agreement is *vacuously* satisfied. And "lowered" alone would not name the
+/// route — the whole point of the bit-granular sequence — so the accepted builds' **route**,
+/// their append **unit** and their field width are asserted per build, beside the declined
+/// one being named as the runtime-width build rather than merely "not lowered".
+///
+/// `static_deopts("BsCreateBin") == 0` is asserted too, but it proves little on its own: the
+/// family route is a `claimed` helper arm, not an `emit_deopt`, so it reads 0 whether or not a
+/// build lowers. The load-bearing evidence is the `SHAPE_CREATE_BIN` `inlined` delta over a
+/// cache-free compile plus the per-build `CreateBinShape::of` verdicts.
+#[test]
+fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtime_width() {
+    let Some(staged) = stage_or_skip("base62_decode_create_bin", &EMQX) else {
+        return;
+    };
+    let index = function_index(&staged, &EMQX, "decode", 2);
+    let index32 = u32::try_from(index)
+        .unwrap_or_else(|_| panic!("decode/2's function index must fit a u32"));
+    let before = inlined(SHAPE_CREATE_BIN);
+    let (emitted, snapshot) = emitted_shapes_for(&staged.module, index32);
+    let lowered_instances = usize::try_from(inlined(SHAPE_CREATE_BIN) - before)
+        .unwrap_or_else(|_| panic!("the lowered-instance count must fit a usize"));
+    let visited = visited_instances(&snapshot, "BsCreateBin");
+    let deopts = static_deopts(&snapshot, "BsCreateBin");
+    let builds = append_builds(&staged.module, &staged.module.functions[index].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    let bit_granular = builds
+        .iter()
+        .filter(|build| build.route == Some(Route::BitGranular))
+        .count();
+    let aligned = builds
+        .iter()
+        .filter(|build| build.route == Some(Route::Aligned))
+        .count();
+    let appends = builds
+        .iter()
+        .filter(|build| build.accumulator.is_some())
+        .count();
+    let wrappers = builds.len() - appends;
+    println!(
+        "create_bin_arm[decode/2] = {emitted:?}, BsCreateBin visited = {visited}, lowered \
+         instances = {lowered_instances}, lowered builds = {lowered}, declined = {declined}, \
+         bit-granular = {bit_granular}, aligned = {aligned}, accumulator builds = {appends}, \
+         non-append builds = {wrappers}, deopts = {deopts}"
+    );
+    // The census name first: a `static_deopts == 0` assertion against a variant name the
+    // emitter never visits would hold trivially. The six instances are the three clauses'
+    // `<<DecodeChar>>` wrappers (not private-append builds) and the three accumulator builds.
+    assert_eq!(
+        (visited, builds.len()),
+        (6, 6),
+        "decode/2 carries six `bs_create_bin` instances — three `<<DecodeChar>>` wrappers and \
+         three `<<Acc/bitstring, RestBit:N>>` appends — and the emitter must visit all of them \
+         (found {})",
+        builds.len()
+    );
+    assert_eq!(
+        (appends, wrappers),
+        (3, 3),
+        "three of the six must be private-append accumulator builds and three the plain \
+         `<<DecodeChar>>` construction, whose first segment is not `private_append`"
+    );
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "decode/2: the `bs_create_bin` private-append arm must emit (emitted: {emitted:?})"
+    );
+    assert_eq!(
+        deopts, 0,
+        "decode/2: `BsCreateBin` is a `claimed` family arm, so a static deopt here would mean \
+         the instruction left the arm entirely (deopts: {:?})",
+        snapshot.instr_deopts,
+    );
+    assert_eq!(
+        (lowered, declined),
+        (2, 4),
+        "decode/2: the two 6-bit appends are lowered and the other four instances (the three \
+         `<<DecodeChar>>` wrappers and the runtime-width append) stay where they were"
+    );
+    assert_eq!(
+        lowered, lowered_instances,
+        "the builds `CreateBinShape::of` accepts and the instances the emitter actually lowered \
+         must be the same set (accepted {lowered}, lowered {lowered_instances})"
+    );
+    assert_eq!(
+        lowered_instances, 2,
+        "the cache-free compile must inline both 6-bit builds' `SHAPE_CREATE_BIN` (`inlined` \
+         delta {lowered_instances})"
+    );
+
+    // The two accepted builds, per build: the bit-granular route, unit 1, one 6-bit field, and
+    // the `Y` slot the compiler holds `Acc` in. Asserting the route (not merely "lowered") is
+    // what makes this row evidence for the *second* sequence rather than for the arm at large.
+    for build in builds.iter().filter(|build| build.lowered) {
+        assert_eq!(
+            build.accumulator,
+            Some(Reg::Y(1)),
+            "decode/2's lowered builds must take their accumulator from the `Y` slot the \
+             compiler moved `Acc` into"
+        );
+        assert!(
+            build.planned && build.literal_width,
+            "a lowered build's plan must resolve a static width at unit 1 (accumulator: {:?})",
+            build.accumulator
+        );
+        assert_eq!(
+            build.unit,
+            Some(1),
+            "decode/2's appends carry append unit 1 (the `integer` accumulator's unit), which \
+             is the figure C gates the append position on"
+        );
+        assert_eq!(
+            build.field_bits,
+            vec![6],
+            "decode/2's append writes exactly one six-bit field — the whole reason the aligned \
+             route cannot express it"
+        );
+        assert_eq!(
+            build.route,
+            Some(Route::BitGranular),
+            "a six-bit field is not a whole number of bytes, so the arm must take the \
+             bit-granular route for it"
+        );
+        assert_eq!(
+            build.const_bytes, 0,
+            "the bit-granular route carries no constant bytes (a mixed plan is refused)"
+        );
+    }
+    assert_eq!(
+        (bit_granular, aligned),
+        (2, 0),
+        "decode/2's only accepted builds are the two bit-granular ones; an aligned build here \
+         would mean the routes were chosen from something other than the field widths"
+    );
+
+    // The third clause: an accumulator build whose field width is a **run-time** `size(Expr)`
+    // (`{tr,{x,2},{t_integer,{1,8}}}`, block label 16), so it must be provably declined —
+    // present as a private-append build, refused by both gates, and refused *because* its width
+    // is not a compile-time literal.
+    let runtime_width: Vec<&AppendBuild> = builds
+        .iter()
+        .filter(|build| build.accumulator.is_some() && !build.lowered)
+        .collect();
+    assert_eq!(
+        runtime_width.len(),
+        1,
+        "decode/2 must have exactly one declined accumulator build — the third clause's \
+         runtime-width append"
+    );
+    let build = runtime_width[0];
+    assert_eq!(
+        build.accumulator,
+        Some(Reg::Y(1)),
+        "the declined build is still a private-append accumulator build over `Acc`"
+    );
+    assert!(
+        !build.literal_width,
+        "the third clause's field width is a run-time `size(Expr)` register, never a literal"
+    );
+    assert!(
+        !build.planned,
+        "the family's compile-time half must refuse a run-time field width (`append_plan`)"
+    );
+    assert_eq!(
+        build.route, None,
+        "`CreateBinShape::of` must return `None` for the runtime-width build, so the arm emits \
+         nothing for it"
+    );
+    assert!(
+        build.field_bits.is_empty() && build.unit.is_none(),
+        "a refused plan carries no fields and no unit (fields: {:?}, unit: {:?})",
+        build.field_bits,
+        build.unit
+    );
+
+    // The three `<<DecodeChar>>` wrappers: not accumulator builds at all, so neither gate ever
+    // considered them. Named explicitly so a future shape change that turned one into an
+    // append build would fail here instead of silently changing the split.
+    for build in builds.iter().filter(|build| build.accumulator.is_none()) {
+        assert!(
+            !build.planned && !build.lowered && build.route.is_none(),
+            "a `<<DecodeChar>>` wrapper has no `private_append` segment, so no gate may accept \
+             it (planned {}, lowered {})",
+            build.planned,
+            build.lowered
+        );
+    }
+}
+
+/// **`emqx_base62:encode/2`'s `binary all` builds stay on the family — and the row says so,
+/// rather than claiming a lowering that does not happen.**
+///
+/// The kernel's four-chars-per-clause body ends in
+/// `<< Acc/binary, (iolist_to_binary(CharList))/binary >>`: a `binary` segment with the
+/// **`all`** size, i.e. a width that is only known at run time and never a whole number of
+/// bits the plan could resolve. Every one of the three clauses carries that same shape, so the
+/// construction arm must decline all three — the honest verdict, and the reason `encode/1`'s
+/// figures in `tools/bench/RESULTS.md` are not attributable to the `bs_create_bin` arm.
+///
+/// The row exists so the split is *pinned* rather than assumed: a later change that started
+/// lowering these must fail here (and update the row and the inline-set docs) instead of
+/// leaving a document claiming a native path that never ran. `static_deopts == 0` records the
+/// second half of the same fact — the family route is a `claimed` helper arm, not a deopt, so
+/// "not lowered" and "deopted" are different statements.
+#[test]
+fn the_base62_encode_append_builds_stay_on_the_family() {
+    let Some(staged) = stage_or_skip("base62_encode_create_bin", &EMQX) else {
+        return;
+    };
+    let index = function_index(&staged, &EMQX, "encode", 2);
+    let index32 = u32::try_from(index)
+        .unwrap_or_else(|_| panic!("encode/2's function index must fit a u32"));
+    let before = inlined(SHAPE_CREATE_BIN);
+    let (emitted, snapshot) = emitted_shapes_for(&staged.module, index32);
+    let lowered_instances = usize::try_from(inlined(SHAPE_CREATE_BIN) - before)
+        .unwrap_or_else(|_| panic!("the lowered-instance count must fit a usize"));
+    let visited = visited_instances(&snapshot, "BsCreateBin");
+    let deopts = static_deopts(&snapshot, "BsCreateBin");
+    let builds = append_builds(&staged.module, &staged.module.functions[index].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    let appends = builds
+        .iter()
+        .filter(|build| build.accumulator.is_some())
+        .count();
+    let runtime_widened = builds.iter().filter(|build| !build.literal_width).count();
+    println!(
+        "create_bin_arm[encode/2] = {emitted:?}, BsCreateBin visited = {visited}, lowered \
+         instances = {lowered_instances}, lowered builds = {lowered} (all `binary all`, so they \
+         stay on the family), declined = {declined}, accumulator builds = {appends}, \
+         non-literal-width builds = {runtime_widened}, deopts = {deopts}"
+    );
+    assert_eq!(
+        (visited, builds.len()),
+        (3, 3),
+        "encode/2 has one `bs_create_bin` per clause — the four-field clause, the trailing \
+         four-bit one and the trailing two-bit one — and the emitter must visit all three \
+         (found {})",
+        builds.len()
+    );
+    assert!(
+        !emitted.contains(&SHAPE_CREATE_BIN),
+        "encode/2's builds all carry a `binary`/`all` segment, so the arm must emit nothing \
+         for them (emitted: {emitted:?})"
+    );
+    assert_eq!(
+        deopts, 0,
+        "encode/2: a declined construction stays on the family's `claimed` helper arm, so it \
+         must not appear as a static deopt either (deopts: {:?})",
+        snapshot.instr_deopts,
+    );
+    assert_eq!(
+        (lowered, declined),
+        (0, 3),
+        "none of encode/2's builds may be lowered: every one of them appends a run-time-width \
+         binary"
+    );
+    assert_eq!(
+        lowered_instances, 0,
+        "the cache-free compile must inline no `SHAPE_CREATE_BIN` for encode/2 (`inlined` delta \
+         {lowered_instances})"
+    );
+    assert_eq!(
+        appends, 3,
+        "all three are nevertheless genuine private-append accumulator builds — the decline is \
+         about their field widths, not about the shape the seam recognises"
+    );
+    assert_eq!(
+        runtime_widened, 3,
+        "every build's non-accumulator segment sizes itself with `all`, i.e. no compile-time \
+         width"
+    );
+    for build in &builds {
+        assert!(
+            matches!(build.accumulator, Some(Reg::Y(_))),
+            "encode/2's accumulator is a `Y` slot the compiler moved the writable binary into \
+             (accumulator: {:?})",
+            build.accumulator
+        );
+        assert!(
+            !build.planned,
+            "`seam::append_plan` must refuse a `binary`/`all` segment (accumulator: {:?})",
+            build.accumulator
+        );
+        assert!(
+            !build.lowered && build.route.is_none(),
+            "`CreateBinShape::of` must return `None` for every one of encode/2's builds"
+        );
+        assert!(
+            build.field_bits.is_empty() && build.unit.is_none() && build.const_bytes == 0,
+            "a refused plan carries no fields, no unit and no constant bytes"
+        );
+    }
 }
