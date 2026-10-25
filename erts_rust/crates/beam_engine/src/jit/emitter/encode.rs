@@ -113,6 +113,81 @@ impl CodeBuffer {
         self.emit_mem_modrm(src, base, disp)
     }
 
+    // -- narrow memory stores ------------------------------------------------
+
+    /// `mov byte [base + disp], src` — an 8-bit store (`88 /r`).
+    ///
+    /// Writes **exactly one byte**: the destination's neighbouring bytes are
+    /// untouched, which the 64-bit [`Self::mov_mr`] cannot promise. The point of a
+    /// byte store is a binary payload's byte field, so it is the width a native
+    /// `bs_create_bin` construction arm writes its segments with.
+    ///
+    /// # The 8-bit `REX` aliasing rule
+    ///
+    /// Without a `REX` prefix, byte-register codes `4..=7` name the **legacy high
+    /// bytes** `AH`/`CH`/`DH`/`BH`, not the low bytes of `rsp`/`rbp`/`rsi`/`rdi`
+    /// (`SPL`/`BPL`/`SIL`/`DIL`); the low-byte names exist only when a `REX` prefix
+    /// is present. [`super::CodeBuffer`]'s `REX` encoder emits *nothing* when every
+    /// field is low, so a naive byte store with `src` = `Rsp`/`Rbp`/`Rsi`/`Rdi` and a
+    /// low base would silently store a **different register** (the `AH` family) — a
+    /// wrong store, not an error. This encoder therefore forces a bare `REX` (`0x40`,
+    /// no `W`/`R`/`B` bit) in exactly that case: `src`'s low three bits are `4..=7`
+    /// **and** no `REX` extension bit is needed anyway. Whenever an `r8`-`r15` operand
+    /// on either side already forces a `REX`, that prefix satisfies the rule and no
+    /// extra byte is added — so a byte store is 6 bytes with a low base and a low
+    /// `src` outside that group, 7 with the forced `REX`.
+    ///
+    /// [`Self::mov_mr16`]/[`Self::mov_mr32`] carry no such rule: the 16- and 32-bit
+    /// register names have no legacy-high-byte alias, so they emit only the `REX`
+    /// bits their operands need.
+    pub fn mov_mr8(&mut self, base: Reg, disp: i32, src: Reg) -> Result<()> {
+        self.emit_mov_mr_narrow(8, base, disp, src)
+    }
+
+    /// `mov word [base + disp], src` — a 16-bit store (`66 89 /r`).
+    ///
+    /// Writes exactly the two low bytes of `src` (little-endian), leaving the other
+    /// six bytes of the destination word alone. The `66` operand-size prefix is what
+    /// selects the 16-bit width (`REX.W` stays clear).
+    pub fn mov_mr16(&mut self, base: Reg, disp: i32, src: Reg) -> Result<()> {
+        self.emit_mov_mr_narrow(16, base, disp, src)
+    }
+
+    /// `mov dword [base + disp], src` — a 32-bit store (`89 /r`, `REX.W` clear).
+    ///
+    /// Writes exactly the four low bytes of `src` (little-endian). Same opcode as
+    /// [`Self::mov_mr`] with the `REX.W` bit clear — the store-direction mirror of
+    /// [`Self::mov_rm32`].
+    pub fn mov_mr32(&mut self, base: Reg, disp: i32, src: Reg) -> Result<()> {
+        self.emit_mov_mr_narrow(32, base, disp, src)
+    }
+
+    /// Emits the narrow (`8`/`16`/`32`-bit) memory store `mov [base + disp], src`:
+    /// the `66` operand-size prefix for the 16-bit form, then the `REX` prefix
+    /// (subject to the 8-bit aliasing rule [`Self::mov_mr8`] documents), then the
+    /// `88 /r` (8-bit) or `89 /r` (16/32-bit) opcode, then the shared `ModRM`/`disp32`
+    /// memory operand.
+    fn emit_mov_mr_narrow(&mut self, width: u8, base: Reg, disp: i32, src: Reg) -> Result<()> {
+        debug_assert!(
+            matches!(width, 8 | 16 | 32),
+            "narrow store width must be 8, 16 or 32"
+        );
+        // An 8-bit source in codes 4..=7 read as `AH`/`CH`/`DH`/`BH` unless a `REX`
+        // prefix is present; when no extension bit forces one, emit the bare `REX`.
+        let byte_high_alias =
+            width == 8 && (4..=7).contains(&(src.code() & 0x7)) && ext(src) == 0 && ext(base) == 0;
+        if width == 16 {
+            self.emit_u8(0x66)?;
+        }
+        if byte_high_alias {
+            self.emit_u8(0x40)?;
+        } else {
+            self.emit_rex(false, ext(src), 0, ext(base))?;
+        }
+        self.emit_u8(if width == 8 { 0x88 } else { 0x89 })?;
+        self.emit_mem_modrm(src, base, disp)
+    }
+
     /// `lea dst, [base + disp]` — the address of `base + disp`.
     pub fn lea(&mut self, dst: Reg, base: Reg, disp: i32) -> Result<()> {
         self.emit_rex(true, ext(dst), 0, ext(base))?;

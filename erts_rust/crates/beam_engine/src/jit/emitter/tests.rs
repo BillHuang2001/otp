@@ -799,3 +799,282 @@
             "REX.B without REX.W for an r12 base, plus its SIB byte"
         );
     }
+
+    /// Builds a sealed `extern "C" fn(*mut u8, i64)` that poisons the four registers
+    /// whose **high** byte an `AH`-family mis-encode would read (`rax`→`AH`,
+    /// `rcx`→`CH`, `rdx`→`DH`, `rbx`→`BH`), moves the value argument (`rsi`) into
+    /// `src`, and byte-stores `src` at `[base + 2]`.
+    ///
+    /// The poisons are chosen so that each register's **second** byte is a distinct,
+    /// non-zero value: a store that silently encoded `AH`/`CH`/`DH`/`BH` would write
+    /// `0x11`/`0x33`/`0x44`/`0x22` instead of the value under test. The base is `rdi`
+    /// (a low code, so it forces no `REX`), except when `rdi` is itself the source —
+    /// then the pointer moves to `rax` first. Every callee-saved register the fixture
+    /// writes is pushed and popped, so it cannot corrupt its own caller.
+    fn byte_store_through(src: Reg) -> CodeBuffer {
+        let mut buf = CodeBuffer::new().unwrap();
+        // `rbx` always (it hosts the `BH` poison), plus a callee-saved source.
+        let mut saved = vec![Reg::Rbx];
+        if matches!(src, Reg::Rbp | Reg::R13) {
+            saved.push(src);
+        }
+        for reg in &saved {
+            buf.push_r(*reg).unwrap();
+        }
+        for (reg, poison) in [
+            (Reg::Rax, 0x1111_i64),
+            (Reg::Rbx, 0x2222),
+            (Reg::Rcx, 0x3333),
+            (Reg::Rdx, 0x4444),
+        ] {
+            buf.mov_ri(reg, poison).unwrap();
+        }
+        let base = if src == Reg::Rdi {
+            buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+            Reg::Rax
+        } else {
+            Reg::Rdi
+        };
+        if src != Reg::Rsi {
+            buf.mov_rr(src, Reg::Rsi).unwrap();
+        }
+        buf.mov_mr8(base, 2, src).unwrap();
+        for reg in saved.iter().rev() {
+            buf.pop_r(*reg).unwrap();
+        }
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        buf
+    }
+
+    #[test]
+    fn emits_mov_mr8_which_stores_exactly_one_byte() {
+        // The value argument lands in `rsi` (System V second argument), so the plain
+        // store below is a byte store of `sil` — the highest-risk source, because
+        // without the forced `REX` code 6 reads as `DH`.
+        let store = |src: Reg| {
+            let buf = byte_store_through(src);
+            let f: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
+            let mut scratch = [0xA5_u8; 8];
+            f(scratch.as_mut_ptr(), 0x5A);
+            scratch
+        };
+
+        // A `src` from every low group — including all four `AH`-family codes that
+        // are reachable as a value source (`rsp` cannot be loaded without destroying
+        // the stack, so its encoding is pinned byte-wise below instead).
+        for src in [
+            Reg::Rax,
+            Reg::Rcx,
+            Reg::Rdx,
+            Reg::Rbx,
+            Reg::Rsi,
+            Reg::Rdi,
+            Reg::Rbp,
+        ] {
+            assert_eq!(
+                store(src),
+                [0xA5, 0xA5, 0x5A, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5],
+                "one byte written at [2] and nothing else, src = {src:?} \
+                 (a mis-encoded AH/CH/DH/BH store lands a poison byte here)"
+            );
+        }
+        // …and the extended registers, whose `REX.R` already disambiguates the width.
+        for src in [Reg::R8, Reg::R11, Reg::R13] {
+            assert_eq!(
+                store(src),
+                [0xA5, 0xA5, 0x5A, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5],
+                "one byte written at [2] and nothing else, src = {src:?}"
+            );
+        }
+
+        // Only the source's **low** byte is stored, never the wider register.
+        let buf = byte_store_through(Reg::Rsi);
+        let f: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
+        let mut scratch = [0_u8; 8];
+        f(scratch.as_mut_ptr(), 0x1122_3344_5566_7788);
+        assert_eq!(scratch, [0, 0, 0x88, 0, 0, 0, 0, 0]);
+
+        // The displacement is honoured: two different offsets in one scratch.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_mr8(Reg::Rdi, 0, Reg::Rsi).unwrap();
+        buf.mov_mr8(Reg::Rdi, 5, Reg::Rsi).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let two: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
+        let mut scratch = [0_u8; 8];
+        two(scratch.as_mut_ptr(), 0xFF);
+        assert_eq!(scratch, [0xFF, 0, 0, 0, 0, 0xFF, 0, 0]);
+    }
+
+    #[test]
+    fn emits_mov_mr8_with_the_bare_rex_the_high_byte_aliases_require() {
+        // The encodings: `88 /r` (+ the `ModRM`/`disp32` operand), 6 bytes with a low
+        // base and a low `src` outside the aliasing group.
+        let mut plain = CodeBuffer::new().unwrap();
+        plain.mov_mr8(Reg::Rdi, 0, Reg::Rax).unwrap();
+        assert_eq!(emitted(&plain), vec![0x88, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(plain.len(), 6);
+
+        // …and the forced bare `REX` (`0x40`, no `W`/`R`/`B`) for every source whose
+        // unprefixed code means `AH`/`CH`/`DH`/`BH`. `rsp` is the one member of that
+        // group that cannot be loaded with a value, so its encoding is pinned here.
+        for (src, modrm) in [
+            (Reg::Rsp, 0xA7_u8),
+            (Reg::Rbp, 0xAF),
+            (Reg::Rsi, 0xB7),
+            (Reg::Rdi, 0xBF),
+        ] {
+            let mut buf = CodeBuffer::new().unwrap();
+            buf.mov_mr8(Reg::Rdi, 0, src).unwrap();
+            assert_eq!(
+                emitted(&buf),
+                vec![0x40, 0x88, modrm, 0x00, 0x00, 0x00, 0x00],
+                "the bare REX that turns code {} into SPL/BPL/SIL/DIL, src = {src:?}",
+                src.code() & 0x7
+            );
+            assert_eq!(buf.len(), 7, "a forced-REX byte store, src = {src:?}");
+        }
+
+        // An extension bit already forces a `REX`, so no extra byte is added and the
+        // `W` bit stays clear: `REX.R` for an `r8`-`r15` source, `REX.B` (+ the SIB
+        // byte) for an `r12` base.
+        let mut src_ext = CodeBuffer::new().unwrap();
+        src_ext.mov_mr8(Reg::Rdi, 0, Reg::R8).unwrap();
+        assert_eq!(
+            emitted(&src_ext),
+            vec![0x44, 0x88, 0x87, 0x00, 0x00, 0x00, 0x00],
+            "REX.R without REX.W for an r8 source"
+        );
+        assert_eq!(src_ext.len(), 7);
+        let mut base_ext = CodeBuffer::new().unwrap();
+        base_ext.mov_mr8(Reg::R12, 0, Reg::Rax).unwrap();
+        assert_eq!(
+            emitted(&base_ext),
+            vec![0x41, 0x88, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00],
+            "REX.B without REX.W for an r12 base, plus its SIB byte"
+        );
+        assert_eq!(base_ext.len(), 8);
+        // An extended base already forces a REX, so an aliasing `src` needs nothing
+        // more — and the store reaches the low-byte register.
+        let mut both = CodeBuffer::new().unwrap();
+        both.mov_mr8(Reg::R12, 0, Reg::Rsi).unwrap();
+        assert_eq!(
+            emitted(&both),
+            vec![0x41, 0x88, 0xB4, 0x24, 0x00, 0x00, 0x00, 0x00],
+            "REX.B alone satisfies the low-byte rule for an aliasing src"
+        );
+
+        // The width control: the 64-bit store of the same operands keeps `REX.W`.
+        let mut wide = CodeBuffer::new().unwrap();
+        wide.mov_mr(Reg::Rdi, 0, Reg::Rax).unwrap();
+        assert_eq!(
+            emitted(&wide),
+            vec![0x48, 0x89, 0x87, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(wide.len(), plain.len() + 1);
+
+        // An `rbp` base keeps the explicit `disp32`: the store path shares the load
+        // path's `emit_mem_modrm`, so it never becomes the `mod=00` RIP-relative form.
+        let mut rbp_base = CodeBuffer::new().unwrap();
+        rbp_base.mov_mr8(Reg::Rbp, 0, Reg::Rax).unwrap();
+        assert_eq!(
+            emitted(&rbp_base),
+            vec![0x88, 0x85, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn emits_mov_mr16_and_mov_mr32_which_write_exact_widths() {
+        // A scratch of 0xFF with the value `0x1122_3344_5566_7788`: the 16-bit store
+        // must land `0x7788` (two bytes) and the 32-bit one `0x5566_7788` (four),
+        // leaving every other byte at 0xFF — so neither overruns like the 64-bit form.
+        let value = 0x1122_3344_5566_7788_i64;
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_mr16(Reg::Rdi, 3, Reg::Rsi).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let word_store: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
+        let mut scratch = [0xFF_u8; 12];
+        word_store(scratch.as_mut_ptr(), value);
+        assert_eq!(
+            scratch,
+            [0xFF, 0xFF, 0xFF, 0x88, 0x77, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            "exactly two bytes at [3]"
+        );
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_mr32(Reg::Rdi, 3, Reg::Rsi).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let dword_store: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
+        let mut scratch = [0xFF_u8; 12];
+        dword_store(scratch.as_mut_ptr(), value);
+        assert_eq!(
+            scratch,
+            [0xFF, 0xFF, 0xFF, 0x88, 0x77, 0x66, 0x55, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            "exactly four bytes at [3]"
+        );
+
+        // The control: the 64-bit store of the same value does overrun the window, so
+        // the narrow stores above are demonstrably narrower.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_mr(Reg::Rdi, 3, Reg::Rsi).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let wide_store: extern "C" fn(*mut u8, i64) = buf.as_fn_ptr();
+        let mut scratch = [0xFF_u8; 12];
+        wide_store(scratch.as_mut_ptr(), value);
+        assert_eq!(
+            &scratch[3..11],
+            &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
+        );
+
+        // The encodings: `66 89 /r` and `89 /r` with `REX.W` clear — and, unlike
+        // `mov_mr8`, **no** forced bare `REX` for an `rsp`/`rbp`/`rsi`/`rdi` source
+        // (the 16/32-bit names have no legacy-high-byte alias).
+        let mut word = CodeBuffer::new().unwrap();
+        word.mov_mr16(Reg::Rdi, 0, Reg::Rax).unwrap();
+        assert_eq!(
+            emitted(&word),
+            vec![0x66, 0x89, 0x87, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(word.len(), 7);
+        let mut word_alias_free = CodeBuffer::new().unwrap();
+        word_alias_free.mov_mr16(Reg::Rdi, 0, Reg::Rsi).unwrap();
+        assert_eq!(
+            emitted(&word_alias_free),
+            vec![0x66, 0x89, 0xB7, 0x00, 0x00, 0x00, 0x00],
+            "no REX byte for the 16-bit form of an aliasing code"
+        );
+        let mut dword = CodeBuffer::new().unwrap();
+        dword.mov_mr32(Reg::Rdi, 0, Reg::Rax).unwrap();
+        assert_eq!(emitted(&dword), vec![0x89, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(dword.len(), 6);
+        let mut dword_alias_free = CodeBuffer::new().unwrap();
+        dword_alias_free.mov_mr32(Reg::Rdi, 0, Reg::Rsp).unwrap();
+        assert_eq!(
+            emitted(&dword_alias_free),
+            vec![0x89, 0xA7, 0x00, 0x00, 0x00, 0x00],
+            "no REX byte for the 32-bit form of an aliasing code"
+        );
+        // The prefix order is `66`, then `REX`, then the opcode; the extension bits
+        // stay width-independent (`REX.R` for `r9`, `REX.B` + SIB for `r12`).
+        let mut word_ext = CodeBuffer::new().unwrap();
+        word_ext.mov_mr16(Reg::Rdi, 0, Reg::R9).unwrap();
+        assert_eq!(
+            emitted(&word_ext),
+            vec![0x66, 0x44, 0x89, 0x8F, 0x00, 0x00, 0x00, 0x00],
+            "66 then REX.R then the opcode"
+        );
+        assert_eq!(word_ext.len(), 8);
+        let mut dword_ext = CodeBuffer::new().unwrap();
+        dword_ext.mov_mr32(Reg::R12, 0, Reg::R9).unwrap();
+        assert_eq!(
+            emitted(&dword_ext),
+            vec![0x45, 0x89, 0x8C, 0x24, 0x00, 0x00, 0x00, 0x00],
+            "REX.R+REX.B, no REX.W, plus the SIB byte an r12 base forces"
+        );
+        assert_eq!(dword_ext.len(), 8);
+    }
