@@ -100,6 +100,10 @@ mod tail;
 #[cfg(test)]
 mod tests;
 
+/// The `bs_match_string` arm's own suite (boundaries, the legitimate-deopt idempotency pin,
+/// the compile-time refusals and the live `erl` oracle cross-check).
+#[cfg(test)]
+mod match_string_tests;
 pub(super) use bs_match::try_inline_bs_match;
 pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 #[cfg(test)]
@@ -118,6 +122,11 @@ pub(crate) use integer::{
 pub(crate) use integer::field_is_little;
 pub(super) use match_string::try_inline_bs_match_string;
 pub(crate) use match_string::{match_string_shape, MatchStringShape};
+/// The shape's own code-size cap, re-exported for the arm's tests: the refusal row is
+/// "a pattern **longer** than this", so a test must derive the bound from the shape rather
+/// than hard-code 64 (a widened cap would otherwise leave the row asserting nothing).
+#[cfg(test)]
+pub(crate) use match_string::MAX_MATCH_BYTES;
 pub(super) use position::{try_inline_bs_get_position, try_inline_bs_set_position};
 pub(crate) use position::{get_position_shape, set_position_shape};
 pub(super) use start_match::{try_inline_bs_start_match3, try_inline_bs_start_match4};
