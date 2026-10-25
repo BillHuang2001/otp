@@ -881,9 +881,10 @@ pub(crate) fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
-            // The bitstring family's **small, allocation-free match-context shapes**
-            // (see [`bitstr_inline`]): `bs_get_position`, `bs_set_position`,
-            // `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3` and `bs_start_match4`.
+            // The bitstring family's **native, allocation-free shapes** (see
+            // [`bitstr_inline`]): the match-context shapes (the position/tail/start-match/
+            // integer extractors, the static `bs_match`, `bs_match_string` and the UTF
+            // skip/get pairs) plus the `bs_create_bin` construction build.
             // Each has its own guarded native sequence with its own compile-time shape
             // predicate, which **refuses** (emitting zero bytes) exactly the shapes whose
             // run-time behaviour is not provable — an un-addressable operand, a `NO_FAIL`
@@ -893,7 +894,7 @@ pub(crate) fn emit_block(
             // `_ if bitstrings::claimed(instr)` arm: a `match` arm after a `_ if` guard
             // arm is unreachable.
             //
-            // None of the six terminates the block. A shape's hit path continues in-block;
+            // None of these arms terminates the block. A shape's hit path continues in-block;
             // its miss/fail/fallback paths leave through an exit that always transfers
             // control (the linker's `emit_exit`, or `emit_step_and_continue`), so the
             // block's own fall-through after the arm is still reachable and `terminated`

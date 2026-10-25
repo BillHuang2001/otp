@@ -244,7 +244,7 @@ instrument's own `inlined | refused | opcode` table carries that accounting for 
 count `34 → 84` and its `other` refusals `1 841 → 1 791`, which is the whole of the totals' move
 (`inlined 15 380 → 15 430`, `refused 6 558 → 6 508`); the 50 newly-lowered instances are the
 bit-granular (`Field::Bits` width `1..=63`) construction builds the second route accepts, and the
-literal-area-subject bucket (**47**), the eight match-context arms, the `test`/`bif`/`gc_bif`/`bif0`
+literal-area-subject bucket (**47**), the match-context arms, the `test`/`bif`/`gc_bif`/`bif0`
 pools and the no-arm rows are all unchanged. `bs_instructions`, `no_arm` and `paths`/`modules_loaded`
 are unchanged by construction: a route decision changes attribution, never the corpus walk.
 The reason vocabulary is a closed set of `const` strings (`BS_REASON_ALLOC`, `_LITERAL`, `_RUNTIME`,
