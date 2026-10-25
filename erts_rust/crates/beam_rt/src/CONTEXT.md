@@ -167,27 +167,60 @@ Binding for anyone reading a `erlang:memory(binary)` figure or touching `context
 (the full argument is that file's module docs and `context/gc/CONTEXT.md`; this is the rule).
 
 - **The prune has exactly one caller**, the `Yield` (pre-emption) arm at `runner/run.rs` →
-  `RuntimeRunner::reclaim_off_heap_binaries` → `context::gc::bin_vheap::reclaim`. The `Wait` arm does
-  not call it, and a **slice that never pre-empts** reaches neither.
+  `RuntimeRunner::reclaim_off_heap_binaries` → `context::gc::bin_vheap::reclaim`. Neither the `Wait`
+  arm nor a `BifOutcome::Suspend` park calls it, so a process that parks in a `receive` after building
+  payloads keeps every one of them until it is next **pre-empted** (measured across a receive park in
+  four places — the child's pre-park read, the parent's read while it is parked, the child's post-wake
+  read, the parent again — all four the *same* byte count with the dead bytes included, and zero prune
+  entries for the child).
+- **At a pre-emption the reservoir is pruned whole and nothing is retained.** The census line
+  (`released` / `retained_by_live` / `retained_by_shared` / `binary_alloc_live`, emitted only with
+  `BEAM_RT_BOOT_TRACE=1`) reports `retained_by_live = 0` and `retained_by_shared = 0` at every park of
+  every shape measured, so the `refcount() > 1` belt is a belt and not a working set: the peak a
+  park-reaching loop shows is **one pre-emption window**, not a sum over parks.
 - **A monotone `erlang:memory(binary)` ladder is a slice phase, not a leak.** A dead payload is freed
   only at that point, so the figure is exactly the payloads the current slice has built since the last
   park; a read at a fixed iteration offset samples the same point of the cycle every time. Measured
   with a 4 KiB payload and a 1 000-iteration block: `0` at every rung at `999` iterations, `k` payloads
   at rung `k` for `1 000`, `2k` for `1 001`, `3k` for `1 002`; a 2 000-rung ladder is hard-capped at
-  one slice's worth (999) and resets every 1 000 rungs, identically at 1 024/2 048/4 096 B. The two
-  tests of a real leak are therefore: does the peak exceed one slice's worth, and does it rise with the
-  **rung count** at a fixed total iteration count. A fixed-offset read of a bounded reservoir fails both.
-- **The one unbounded shape is a slice that never ends.** On the default native baseline tier a linked
-  chain charges **no reduction per link** (`Linker::emit_tail_exit` jumps to the successor entry;
-  `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop), so a BIF-free self-recursive
-  tail loop — `f(N) -> _ = <<0:(B*8)>>, f(N-1).` — runs its whole computation inside one slice: no
-  park, no prune, reservoir linear in the loop count. Measured 1.31 GB of dead `binary_alloc` payloads
-  after 20 000 iterations of a 64 KiB binary; the same source under `BEAM_RT_TIER=interpreter` (one
-  charge per instruction) is a bounded sawtooth of ≤ 203 payloads. The repair is a charge on the
-  linked-exit path — a `beam_engine` change this crate cannot make — and neither substitute works: a
-  host-side charge cannot end such a slice (the engine parks at block granularity, so a mid-block
-  refusal re-executes the block's prefix), and a mid-slice prune is unsound because a running machine's
-  roots are unpublished.
+  one slice's worth (999) and resets every 1 000 rungs, identically at 1 024/2 048/4 096 B. A dense
+  read (one sample per iteration) pins the trough at ~1 payload and the maximum at one window. The
+  **two tests of a real leak** are therefore: does the *trough* grow with the park count, and does the
+  peak grow with the iteration count at **zero** parks. A fixed-offset read of a bounded reservoir
+  fails both.
+- **The prune's valve is stronger than the collection valve's, with exactly one exemption.** A
+  pointer-bearing word in a region the collector does not scan declines the prune whether or not it
+  forwards anything — except a **reference thing** (`gc_walk.rs::is_inert_reference`: the M1
+  `[header, node, serial, id]` block or a C-layout reference), whose payload words are immediates or
+  packed `u32` ids, never a term reference and never a `BinRef.val` pointer, so it can name no payload.
+  That exemption is what keeps the point reachable in ordinary code: a process holding one live
+  reference in its root set — every `gen_server` with a monitor, every owner of an unnamed ETS table,
+  anything that called `make_ref/0` — reads the same flat figure as a reference-free one (measured
+  194 624 B at N=2 000 and 310 592 B at N=8 000 with 10 and 41 parks all releasing, identical for the
+  `make_ref` / ETS-tid / monitor-reference shapes and the plain / pid controls).
+- **The bin-vheap budget GATES the prune; it can never CAUSE one.** `OffHeapReclaimer::triggered` (the
+  C's `MSO(p).overhead > bin_vheap_sz`, 46 422 words by default) is one gate `reclaim` consults, and
+  nothing consults it to *ask* for a reclaim. One slice's worth of dead off-heap garbage is therefore
+  bounded by the **slice length**, never by the configured budget, and a process whose own reservoir
+  stays under the trigger releases nothing between its parks (a bounded per-process residue, freed at
+  process death).
+- **The one unbounded shape is a slice that never ends, and no heap switch can see it.** On the default
+  native baseline tier reductions are charged by a `call`/`call_ext` instruction and by the
+  heap-admission doors; a **linked** tail exit charges nothing (`Linker::emit_tail_exit` jumps to the
+  successor entry; `jit/baseline/runtime.rs::jit_tail_call` is only the checked frame pop) and a BIF
+  dispatch only *spends* (never refuses). A self-recursive tail loop whose body is a binary build plus
+  BIF calls therefore runs its whole computation inside one slice: **no park, no prune, the reservoir
+  linear in the loop count**. Measured on `f(N) -> _ = <<0:(B*8)>>, f(N-1).` at 64 KiB — 500 →
+  32 792 000 B, 1 000 → 65 584 000, 2 000 → 131 168 000, 4 000 → 262 336 000 (exactly `N × 65 584`),
+  zero parks — and at 1 KiB, 2 000 → 2 144 000, 8 000 → 8 576 000. `max_heap_size` / `+hmax` charge
+  through `Process::set_off_heap_binary_bytes` **at the prune**, so with no prune they bound nothing
+  here. The repair is a reduction charge on the linked tail exit / block entry — a **`beam_engine`**
+  change this crate cannot make — and no host-side substitute works: a BIF-dispatch charge cannot end
+  such a slice (the engine parks at block granularity, so a mid-block refusal re-executes the block's
+  prefix), the `BifOutcome::Suspend` park it would map onto reaches **no** prune (measured: 100 such
+  parks at N=20 000 leave the figure at exactly `N × 1 072`, unchanged), and a mid-slice prune is
+  unsound because a running machine's roots are unpublished. `BEAM_RT_TIER=interpreter` (one charge
+  per instruction) bounds the same source — the honest user-visible mitigation, not the fix.
 
 ## The debt gate on the fun-applying stdlib fast paths (cross-cutting: execution · bridges · gc)
 Binding facts for anyone touching `RuntimeContext::resolve_external_call`, `FunBridge` or the collection doors.
