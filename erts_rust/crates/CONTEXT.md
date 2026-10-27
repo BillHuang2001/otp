@@ -488,10 +488,12 @@ A.9's differential coverage is boot/version **observability** plus the in-proces
 - **`module_info(exports)` is the module's `ExpT` chunk order reversed** — ERTS's rule (`erl_bif_info.c::exported_from_module` conses over the insertion-ordered global export list; the loader inserts in `ExpT` order) — so `eunit`'s generator iteration order matches the oracle's; `functions` is code order. Residual: an MFA whose global export entry predates the module's load (a BIF the module implements) sorts to the end of the C's list.
 - **BIF-dispatch tracing is `BEAM_RT_BOOT_TRACE`, not `BEAM_RT_DEBUG_DIST`.** `RuntimeContext::call_bif` gates both its `ENTER` and its `call_bif … -> {error:?}` line on `debug_trace::enabled()` (`beam_rt/src/context/execution.rs:166,175`; `debug_trace.rs:52` reads `BEAM_RT_BOOT_TRACE`), and the failure is rendered as `-> Raise(Raise { … })`, so grepping the trace for the word `error` finds nothing.
 - **A.4 port/driver residuals** (each a typed error, never a wrong result): (a) a **header-less** read of a
-  built-in driver port (`tcp_inet`/`udp_inet` passive `recv`, still on `beam_io`'s flat
-  `DriverContext::input()` sink) arrives as list elements where the C answers a binary on a `[binary]` port —
-  a read carrying the C's `(hbuf, hlen, buf, len)` split does render it, and a line frame's derived header
-  prefix stays out of the input counters; (b) a **raw-mode read of nothing** (`driver_output(NULL,0)`) is
+  built-in driver port renders as integer-list elements on either stream — which is also the measured oracle
+  shape on the inet `{deliver,port}` route (an inet port's C binary-IO flag is clear), so the two agree; the
+  flat `DriverContext::input()` sink now serves only the named `recv` verbs, because a passive `gen_tcp:recv`
+  is a completion (`InetAsyncResult::Data`) rather than port data — a read carrying the C's
+  `(hbuf, hlen, buf, len)` split does render a binary/improper list, and a line frame's derived header prefix
+  stays out of the input counters; (b) a **raw-mode read of nothing** (`driver_output(NULL,0)`) is
   dropped where the oracle delivers `{Port,{data,[]}}`; (c) `INET_REQ_FDOPEN`'s adoption form, `ignorefd` and
   `tcp_sendfile` reproduce their refusals only. Detail: `beam_io/CONTEXT.md`.
 - **A.3 residuals** (each a typed refusal or a deferred answer): (a) an off-call-path NIF thread reaches only
