@@ -317,7 +317,14 @@ fn the_lowered_call_still_gives_its_continuation_a_native_sub_block() {
 
     // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
     // continuation pc 4 is strictly inside that block.
-    assert!(function.entries[4].is_null(), "pc 4 is not an IR block start");
+    // The published table is the **folded** one: `entries[4]` carries the continuation
+    // sub-block's own entry (`emit::compile::merge_sub_entries`), which is what lets the
+    // transfer probe answer both shapes with one lookup. `sub_entries` survives as the
+    // raw sub-block table, so the two agree at a continuation address.
+    assert!(
+        !function.entries[4].is_null() && function.entries[4] == function.sub_entries[4],
+        "pc 4's folded slot is its continuation sub-block entry"
+    );
     assert!(!function.sub_entries[4].is_null(), "pc 4 has a sub-block entry");
     // An IR block start is still served by the block table, and gains no sub-block.
     assert!(!function.entries[1].is_null(), "pc 1 is the `Label(2)` block start");

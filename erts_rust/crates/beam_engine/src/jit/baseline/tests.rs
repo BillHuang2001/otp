@@ -1259,7 +1259,14 @@ fn a_call_continuation_inside_a_block_gets_its_own_native_sub_block() {
 
     // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
     // continuation pc 4 is strictly inside that block.
-    assert!(function.entries[4].is_null(), "pc 4 is not an IR block start");
+    // The published table is the **folded** one: `entries[4]` carries the continuation
+    // sub-block's own entry (`emit::compile::merge_sub_entries`), which is what lets the
+    // transfer probe answer both shapes with one lookup. `sub_entries` survives as the
+    // raw sub-block table, so the two agree at a continuation address.
+    assert!(
+        !function.entries[4].is_null() && function.entries[4] == function.sub_entries[4],
+        "pc 4's folded slot is its continuation sub-block entry"
+    );
     assert!(!function.sub_entries[4].is_null(), "pc 4 has a sub-block entry");
     // An IR block start is still served by the block table, and gains no sub-block.
     assert!(!function.entries[1].is_null(), "pc 1 is the `Label(2)` block start");
@@ -4837,14 +4844,20 @@ fn a_block_whose_y_accesses_all_follow_a_frame_helper_skips_the_prologue_publish
 /// `local_call_case`'s `f/0` calls `g/0` at pc 3; the continuation pc 4 is strictly
 /// inside `f/0`'s `Label(2)` block `[1, 5)`, so the driver re-enters `f/0` at the
 /// sub-block after `g/0` returns rather than stepping the interpreter. The compile-time
-/// assertions pin the LAZY per-function table (`entries[4]` empty, `sub_entries[4]`
-/// present) as the sub-block path that ran.
+/// assertions pin the LAZY per-function table (`sub_entries[4]` present and folded into
+/// `entries[4]`) as the sub-block path that ran.
 #[test]
 fn a_continuation_sub_block_executes_and_agrees_across_tiers() {
     let (module, name) = local_call_case();
     let labels = crate::interpreter::build_label_map(&module);
     let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
-    assert!(function.entries[4].is_null(), "pc 4 is not an IR block start");
+    // The published table is the **folded** one: `entries[4]` carries the continuation
+    // sub-block's own entry (`emit::compile::merge_sub_entries`), so the transfer probe
+    // answers both shapes with one lookup.
+    assert!(
+        !function.entries[4].is_null() && function.entries[4] == function.sub_entries[4],
+        "pc 4's folded slot is its continuation sub-block entry"
+    );
     assert!(
         !function.sub_entries[4].is_null(),
         "pc 4 is a continuation sub-block of the lazy function"
