@@ -661,16 +661,45 @@ impl Evaluator<'_, '_> {
             let value = self.expr(tree, env)?;
             self.prune_escaped(env, value);
             self.prune_resources(env, value);
+            // The one statement may have killed the process it ran in; its value must not be
+            // handed back (see [`Evaluator::still_alive`]).
+            self.still_alive()?;
             return Ok(value);
         };
         let mut last = NIL;
         for expression in body {
+            // The statement just evaluated may have ended the process it ran in, so the driver
+            // stops at the boundary instead of evaluating the rest of the expression on behalf of a
+            // process that no longer exists.
+            self.still_alive()?;
             self.reset_scratch(env);
             last = self.expr(expression, env)?;
             self.prune_escaped(env, last);
             self.prune_resources(env, last);
         }
+        self.still_alive()?;
         Ok(last)
+    }
+    /// Stops the driver when the process it evaluates in has been **terminated**.
+    ///
+    /// The one producer today is the port-exit family: a non-trapping owner whose port died is
+    /// terminated with the port's own reason (measured — an untagged `erlang:port_command/2` on a
+    /// `gen_tcp` socket kills it with `einval`). Its heap and its mailbox died with it, so
+    /// evaluating the **rest** of the expression would run on behalf of a dead process: the next
+    /// `receive … after` would report the mailbox plumbing instead (`beam_process`'s
+    /// `unknown_process`, which rendered as the internal `beam_rt: term not found`) and a later
+    /// `io:format` would print for a process that is gone.
+    ///
+    /// The death's own reason is the answer — the same one
+    /// [`Runtime::as_action_process`](crate::runtime::Runtime::as_action_process) reports as the
+    /// action's outcome; this is a **non-consuming** look
+    /// ([`Runtime::target_death`](crate::runtime::Runtime::target_death)), because the action
+    /// wrapper is the one place that turns it into the outcome.
+    fn still_alive(&mut self) -> EResult<()> {
+        match self.ctx.runtime.target_death(self.ctx.pid()) {
+            Some(death) => Err(Flow::Fatal(death)),
+            None => Ok(()),
+        }
     }
     /// Releases the off-heap refc-binary payloads the `-eval` route's escaped-payload store holds
     /// that nothing reaches any more ([`reclaim::prune`]).

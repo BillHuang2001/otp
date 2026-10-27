@@ -546,6 +546,12 @@ impl RuntimeContext<'_> {
                         let mut ctx = RuntimeContext::new(self.runtime);
                         ctx.port_exit_reason_term(&signal.reason)?
                     };
+                    // A route synchronously waiting for this process (`-eval`'s own process) must
+                    // learn **why** it is gone: the death is recorded before the terminate, and no
+                    // later statement runs in a process that no longer exists
+                    // ([`Runtime::note_target_exit`]). The term is an interned atom or an
+                    // immediate, so the record outlives the process.
+                    self.runtime.note_target_exit(pid, reason);
                     self.process_table_mut().terminate(pid, reason)?;
                     continue;
                 }
@@ -659,6 +665,10 @@ fn deliver_signal(
                 let mut ctx = RuntimeContext::new(runtime);
                 ctx.port_exit_reason_term(&signal.reason)?
             };
+            // A route synchronously waiting for this process — the `run` action's target — must
+            // learn **why** it is gone, or it waits for a wake no process can produce
+            // ([`Runtime::note_target_exit`]).
+            runtime.note_target_exit(signal.to, reason);
             table.terminate(signal.to, reason)?;
             return Ok(true);
         }

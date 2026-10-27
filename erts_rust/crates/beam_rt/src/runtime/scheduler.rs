@@ -531,9 +531,20 @@ impl Runtime {
             // capability gap. Its recorded exit reason is what the process really exited with
             // (`killed`), so it is reported as that raise.
             if let Some(reason) = self.process_exit(pid) {
-                let text = self.format_term_w(reason, None)?;
-                return Err(error::message(text.trim_end_matches('\n')));
-            }            if Instant::now() >= deadline {
+                return Err(self.exit_reason_error(reason));
+            }
+            // A target a route **terminated out of band** — the port-exit family's non-trapping
+            // arm, which ends a port's owner with the reason the port died of, is the one producer
+            // today — is in neither arm above: nothing announced it to the runner, so its recorded
+            // exit reason lives in [`Runtime::note_target_exit`]'s map. Without this arm the loop
+            // would step and poll for a process that is already gone until the wall-clock deadline
+            // (measured: an untagged `erlang:port_command/2` in a `run` target spun the full
+            // `RUN_DEADLINE`), and the quiescence test cannot answer for it — a port the dead owner
+            // left open keeps the pass awake.
+            if let Some(death) = self.target_death_error(pid) {
+                return Err(death);
+            }
+            if Instant::now() >= deadline {
                 return Err(error::message(format!(
                     "run: {name}:{function}/{arity} did not terminate within {} ms",
                     RUN_DEADLINE.as_millis()

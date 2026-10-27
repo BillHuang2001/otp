@@ -1019,6 +1019,28 @@ pub struct Runtime {
     /// bare `next_deadline()` — a deadline that cannot wake this process is not a reason to
     /// sleep a poll slice per round, nor to withhold the typed `blocked` diagnostic.
     run_wake_pid: Option<ProcessId>,
+    /// The exit reason of a process one of the runtime's **synchronous routes** was waiting for,
+    /// when the runtime terminated it itself — see [`Runtime::note_target_exit`].
+    ///
+    /// Two routes wait for exactly one process and must not read a dead process's mailbox or
+    /// wait for a wake no process can produce: the `run` action
+    /// (`Runtime::pump_run_to_completion`, waiting for [`Runtime::run_wake_pid`]) and an action's
+    /// own process ([`Runtime::as_action_process`], waiting for [`Runtime::self_pid`]). The
+    /// **runner** records a process's `return`/`raise` in
+    /// [`Runtime::runner_state`](crate::runner::RunnerState), but a process can also be
+    /// terminated out of band — the port-exit family's non-trapping arm
+    /// ([`crate::port::exit`]) ends a port's owner with the reason its port died of — and
+    /// without this record neither route learns anything: the runner-state arms answer nothing
+    /// and the quiescence test does not describe a dead process, so the `run` route spun out its
+    /// whole deadline and the `-eval` driver carried on evaluating statements in a process that no
+    /// longer existed ([`Runtime::target_death`] is the one reader).
+    ///
+    /// Only a **watched** pid is recorded ([`Runtime::watches_process`]), so the map holds at most
+    /// one entry per live route, and the recorded word is always runtime-lifetime — the one
+    /// producer builds it from an interned atom or an immediate
+    /// ([`RuntimeContext::port_exit_reason_term`](crate::port)) — so nothing here roots a heap
+    /// that a collection relocates.
+    target_exits: FastHashMap<ProcessId, Eterm>,
     /// The **timed-out resume address** of every process whose finite `receive … after T`
     /// deadline has fired, keyed by pid.
     ///
@@ -1632,6 +1654,7 @@ impl Runtime {
             timers: Timers::new(),
             timer_wake_targets: TimerWakes::default(),
             run_wake_pid: None,
+            target_exits: FastHashMap::default(),
             timer_resumes: FastHashMap::default(),
             timer_wakes: Vec::new(),
             pending_spawns: Vec::new(),
@@ -5285,6 +5308,9 @@ impl Runtime {
     ///    `Ok`, an ordinary `Err`, and `erlang:halt/0,1`'s (a raise like any other) alike. That
     ///    is why the swap is captured and restored around the call instead of living in a
     ///    `Drop`: the restore is one line, and an error path can never leak the child's pid.
+    ///    A child the runtime **terminated** while the body ran (the port-exit family's
+    ///    non-trapping arm — see [`Runtime::note_target_exit`]) is the action's outcome, and is
+    ///    reported instead of anything the body produced: its heap is gone.
     /// 5. An `Ok` result is **copied onto the runtime's pointer-stable store** before the child is
     ///    ended, because the term `body` built lives on the *child's* heap, which ends with it —
     ///    the same move, for the same reason, the runner makes for `x(0)` of a scheduled process
@@ -5333,6 +5359,16 @@ impl Runtime {
         let previous = std::mem::replace(&mut self.self_pid, action_pid);
         let result = body(self);
         self.self_pid = previous;
+        // Step 4a: the child may have been **terminated while the body ran**. The port-exit
+        // family ends a port's non-trapping owner with the reason its port died of (measured: an
+        // untagged `erlang:port_command/2` on a `gen_tcp` socket kills the owner with `einval`),
+        // and no runner state records such a death — so the action's outcome is that reason
+        // ([`Runtime::target_death_error`]). Asking **before** the escape below is also what keeps
+        // the copy from reading a term on the dead child's heap: the heap died with the process, so
+        // neither the value the body produced nor a raise's live reason is readable any more.
+        if let Some(death) = self.target_death_error(action_pid) {
+            return Err(death);
+        }
         // Step 5: the result escapes the child's heap *before* the child is ended. A payload the
         // action built off-heap (or received in a message) is resolved through the child's own
         // scan state and the runtime's escaped-payload store, exactly as the runner resolves a
@@ -5365,6 +5401,84 @@ impl Runtime {
         let reason = self.intern("normal");
         self.processes.terminate(action_pid, reason)?;
         result
+    }
+    /// Whether `pid` is a process one of the runtime's **synchronous routes** waits for: an
+    /// action's own process ([`Runtime::as_action_process`]'s child, which is
+    /// [`Runtime::self_pid`] while the body runs) or the `run` action's target
+    /// ([`Runtime::run_wake_pid`]).
+    ///
+    /// It is the predicate that bounds [`Runtime::note_target_exit`]: a death nobody waits for
+    /// needs no record, because no route reads one.
+    pub(crate) fn watches_process(&self, pid: ProcessId) -> bool {
+        pid == self.self_pid || self.run_wake_pid == Some(pid)
+    }
+    /// Records `reason` as the exit reason of `pid`, **provided a synchronous route waits for it**
+    /// ([`Runtime::watches_process`]).
+    ///
+    /// The one producer is the port-exit family's non-trapping arm
+    /// ([`crate::port::exit`]'s `deliver_signal` and `RuntimeContext::poll_port_signals`), which
+    /// ends a port's owner with the reason the port died of — the C's `erts_queue_message`-less
+    /// link death, which no runner state records. Called immediately **before** that terminate, so
+    /// the route's own reader ([`Runtime::target_death`]) finds the reason the moment the process
+    /// leaves the table.
+    ///
+    /// `reason` must be runtime-lifetime (an interned atom, an immediate): the exit reason a port
+    /// death carries always is ([`RuntimeContext::port_exit_reason_term`](crate::port)), so the map
+    /// can be read by a route whose process — and therefore whose heap — has already died.
+    ///
+    /// A producer that terminates a watched process **without** recording (a local
+    /// `erlang:exit/2` takes `ProcessTable`'s signal path, whose reason term may live on the
+    /// caller's heap, and an inbound `DOP_EXIT2`/link death arrives from a peer) leaves the route
+    /// with [`Runtime::target_death`]'s honest "the process was terminated" diagnostic — never a
+    /// wrong answer, and never a hang.
+    pub(crate) fn note_target_exit(&mut self, pid: ProcessId, reason: Eterm) {
+        if self.watches_process(pid) {
+            self.target_exits.insert(pid, reason);
+        }
+    }
+    /// Why the synchronous route waiting for `pid` must stop — `Some` once `pid` has left the
+    /// process table, `None` while it is still live.
+    ///
+    /// The answer is the recorded exit reason ([`Runtime::note_target_exit`]) rendered exactly the
+    /// way the `run` route has always rendered a runner-recorded exit (`beam_rt: error einval`), or
+    /// — for a death this runtime holds no reason for — the honest diagnostic that the process was
+    /// terminated while the runtime ran it. Either way a route that was waiting for one process
+    /// reports *why* it is gone instead of reading a dead process's mailbox (the internal
+    /// `term not found` an untagged `erlang:port_command/2` used to print), waiting for a wake no
+    /// process can produce (the `run` route that hung until its deadline) or fabricating a value.
+    ///
+    /// **Non-consuming**: an inner step ([`crate::eval`]'s statement boundary) may ask several
+    /// times, and the route's own outermost point ([`Runtime::target_death_error`]) is the one that
+    /// turns it into the outcome.
+    pub(crate) fn target_death(&mut self, pid: ProcessId) -> Option<BeamError> {
+        if self.processes.contains(pid) {
+            return None;
+        }
+        Some(match self.target_exits.get(&pid).copied() {
+            Some(reason) => self.exit_reason_error(reason),
+            None => error::message("the process was terminated while the runtime was running it"),
+        })
+    }
+    /// [`Runtime::target_death`] for the route that **reports** the death: the same answer, and the
+    /// record is consumed so the map cannot outlive the route that put it there.
+    pub(crate) fn target_death_error(&mut self, pid: ProcessId) -> Option<BeamError> {
+        let death = self.target_death(pid);
+        if death.is_some() {
+            self.target_exits.remove(&pid);
+        }
+        death
+    }
+    /// `reason` as the [`BeamError`] a route reports in place of its own result — the one
+    /// rendering both death arms use (`beam_rt: error einval`), so a process that died instead of
+    /// returning is classified exactly like one that raised.
+    ///
+    /// The printer's own refusal (an allocation failure) is returned as itself: a death must never
+    /// be turned into a silent success.
+    pub(crate) fn exit_reason_error(&mut self, reason: Eterm) -> BeamError {
+        match self.format_term_w(reason, None) {
+            Ok(text) => error::message(text.trim_end_matches('\n')),
+            Err(failure) => failure,
+        }
     }
 
     /// Prints `term` through the registered `io:format/2` `~p` printer.

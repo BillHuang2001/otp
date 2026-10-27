@@ -90,12 +90,16 @@ use support::EvalProbe;
 // ---------------------------------------------------------------------------------------
 
 /// Runs one probe differentially ([`support::differential_eval`]) and asserts the pinned
-/// observable: CLI exit `0`, the exact **stdout** bytes, and — the essential invariant — a
-/// stderr that never carries the pre-fix `process blocked` verdict.
+/// observable: CLI exit `0`, the exact **stdout** bytes, and — the essential invariants — a
+/// stderr that carries neither the pre-fix `process blocked` verdict nor the runtime's own
+/// internal plumbing text (`term not found`, the `beam_process`
+/// [`unknown_process`](beam_process) diagnostic that an untagged command's death used to leak
+/// when the driver went on evaluating in a process that no longer existed).
 ///
-/// The last assertion is what makes a *hang* visible even if a future change made the two
-/// runtimes agree on some other text: a process left parked after issuing a port command is
-/// exactly the failure this file exists to catch.
+/// The last assertions are what make a *hang* or an *internal string* visible even if a future
+/// change made the two runtimes agree on some other text: a process left parked after issuing a
+/// port command, and a route that reports its own bookkeeping instead of an Erlang-level answer,
+/// are exactly the failures this file exists to catch.
 fn pinned(what: &str, expr: &str, expected: &str) -> EvalProbe {
     let run = support::differential_eval("port_command_caller", what, expr);
     assert_eq!(
@@ -115,6 +119,11 @@ fn pinned(what: &str, expr: &str, expected: &str) -> EvalProbe {
     assert!(
         !run.stderr_text().contains("blocked"),
         "{what}: the issuing process must be resumed, not left parked — stderr {:?}",
+        run.stderr_text()
+    );
+    assert!(
+        !run.stderr_text().contains("term not found"),
+        "{what}: no internal plumbing text may reach the user — stderr {:?}",
         run.stderr_text()
     );
     run
@@ -360,5 +369,122 @@ fn a_read_from_a_process_that_is_not_the_controlling_process() {
         "a non-owner gen_tcp:recv/3 succeeds",
         expr,
         "{ok,<<\"hi\">>}\n",
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The untagged command: the port dies of `einval`, and the death is an Erlang-level answer
+// ---------------------------------------------------------------------------------------
+/// An **untagged** `erlang:port_command(Port, Data)` (no `<<Size:16, TagBin/binary>>` prefix) is
+/// the C `init_caller` failure — `driver_failure_posix(desc, EINVAL)`
+/// (`../../erts/emulator/drivers/common/inet_drv.c:12635-12638`) — so the port is killed with
+/// reason `einval` and no `{inet_reply, …}` is ever sent.
+///
+/// The probe uses a **spawned, non-trapping** child which owns the socket, because the oracle's
+/// own `-eval`/`-s` process traps exits (`init` sets `trap_exit=true`) and would survive the
+/// death — the non-trapping matrix row is the spawned child, and the parent `monitor`s it so the
+/// child's **exact** exit reason is observable, which is the crisp assertion this case pins:
+/// `down=einval`, then no trailing message at all (`rest=timeout` — no reply, no `alive`, no
+/// `{cmd, …}`, since the child dies at the command).
+///
+/// Two wrong answers this rules out, both of which reached the user before the fix: the internal
+/// `term not found` (the driver kept evaluating in a process the port round had already removed)
+/// and, on the `run` route, a hang ([`an_untagged_command_terminates_the_run_target`]).
+#[test]
+fn a_spawned_untagged_command_kills_the_child_with_the_ports_einval() {
+    let expr = "begin \
+         P = self(), \
+         Child = spawn(fun() -> \
+             {ok,L} = gen_tcp:listen(0,[{ip,{127,0,0,1}},binary,{active,false}]), \
+             {ok,Port} = inet:port(L), \
+             {ok,Cl} = gen_tcp:connect({127,0,0,1},Port,[binary,{active,false}]), \
+             {ok,_A} = gen_tcp:accept(L), \
+             true = erlang:port_command(Cl, <<\"raw\">>), \
+             receive after 500 -> ok end, \
+             P ! alive end), \
+         MRef = erlang:monitor(process, Child), \
+         Down = receive {'DOWN',MRef,process,_,W} -> W after 3000 -> nodown end, \
+         Rest = receive alive -> alive; {inet_reply,_,_} -> reply \
+                    after 800 -> timeout end, \
+         io:format(\"down=~p rest=~p~n\",[Down,Rest]) end";
+    pinned(
+        "an untagged port_command/2 kills its own process with einval",
+        expr,
+        "down=einval rest=timeout\n",
+    );
+}
+
+/// The `run` action's target is **not** a trapping process, so the same untagged command must
+/// terminate it with the port's own reason — the CLI then renders the target's abnormal exit on
+/// stderr (`beam_rt: error einval`) and exits `1`.
+///
+/// This is the regression pin for the second wrong answer: the death signal used to reach the
+/// process table and vanish, so the run round kept waiting for a target that no longer existed
+/// and the CLI ended at `RUN_DEADLINE` (60 s) with `run: pc:go/0 did not terminate within
+/// 60000 ms`. The assertion is therefore *both* the wording and **the clock**: a bounded
+/// completion far inside [`support::PROBE_TIMEOUT`] is the invariant, never a 60 s wait.
+///
+/// Not oracle-compared: the oracle's `-s`/`-run` action process traps exits, so it survives the
+/// death (`cmd=true` then `alive`) — an own-state difference this crate documents. The
+/// oracle-comparable half of the matrix is the spawned-child case above.
+#[test]
+fn an_untagged_command_terminates_the_run_target() {
+    const SOURCE: &str = "\
+-module(pc_run).\n\
+-export([go/0]).\n\
+go() ->\n\
+    {ok,L} = gen_tcp:listen(0,[{ip,{127,0,0,1}},binary,{active,false}]),\n\
+    {ok,Port} = inet:port(L),\n\
+    {ok,Cl} = gen_tcp:connect({127,0,0,1},Port,[binary,{active,false}]),\n\
+    {ok,_A} = gen_tcp:accept(L),\n\
+    R = erlang:port_command(Cl, <<\"raw\">>),\n\
+    io:format(\"cmd=~p~n\",[R]),\n\
+    receive after 500 -> ok end,\n\
+    io:format(\"alive~n\",[]),\n\
+    ok.\n";
+    let Some(fixture) = support::ErlangFixture::compile(
+        "port_command_caller",
+        "untagged_run_target",
+        "pc_run",
+        SOURCE,
+    ) else {
+        return;
+    };
+    let beam = fixture.beam();
+    let beam = beam.to_str().expect("the fixture path is UTF-8");
+    let started = std::time::Instant::now();
+    let Some(run) = support::run_runtime(&["run", beam, "pc_run:go/0"]) else {
+        support::skip_loudly(
+            "port_command_caller",
+            "the `run` action did not finish inside the probe timeout",
+        );
+        return;
+    };
+    let elapsed = started.elapsed();
+    assert_eq!(
+        run.stdout, "cmd=true\n",
+        "the command itself is accepted (`true`), and the target must not reach the second \
+         statement — stderr {:?}",
+        run.stderr
+    );
+    assert_eq!(
+        run.code, 1,
+        "the target's abnormal exit is a runtime error, never a hang and never success — \
+         stderr {:?}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("einval"),
+        "the target's exit reason is the port's own `einval` — stderr {:?}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("term not found") && !run.stderr.contains("blocked"),
+        "no internal plumbing text may reach the user — stderr {:?}",
+        run.stderr
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "the run must report the death, not wait out the deadline — took {elapsed:?}"
     );
 }
