@@ -234,13 +234,14 @@ use beam_codec::{
     Decoder, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
 };
 use beam_common::Result;
-use beam_term::{atom_val, signed_value, Atom, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, Atom, AtomTable, Eterm};
 
 use crate::access;
 use crate::arith;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, system_limit, unsupported_bif};
+use crate::iolist;
 use crate::numeric::{
     base_arg, format_scientific, integer_digits, parse_float, parse_float_options, parse_integer,
     render_float, small_arg, DEFAULT_FLOAT_DECIMALS,
@@ -334,190 +335,26 @@ fn make_bin(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Result<Eterm> {
 ///
 /// Propagates the heap's allocation failure.
 fn byte_list(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Result<Eterm> {
-    let mut elems = Vec::with_capacity(bytes.len());
-    for &byte in bytes {
-        elems.push(ctx.int(i64::from(byte))?);
-    }
-    ctx.list(&elems)
-}
-
-/// The [`Eterm`] slots the iolist walk keeps **inline** — a plain array on the Rust
-/// stack — before it spills to a heap `Vec` (see [`WalkStack`]).
-///
-/// One list level costs one frame (its pending tail) plus one for the element being
-/// expanded, so 128 frames cover an iolist nested roughly 127 levels deep: far past
-/// any real iolist, while the whole stack stays a 1 KiB stack footprint. A deeper
-/// iolist is not rejected — the frames past this depth go into the spill `Vec`, the
-/// walk's only possible allocation.
-const INLINE_WALK_FRAMES: usize = 128;
-
-/// The iolist walk's work stack: [`INLINE_WALK_FRAMES`] slots inline, spilling to a
-/// `Vec` only when a deeper iolist needs them — so a flat or moderately nested iolist
-/// allocates **nothing** for the walk itself.
-///
-/// LIFO order is preserved across the spill: a frame reaches the `Vec` only once the
-/// inline array is full, and is popped from the `Vec` first for the same reason.
-struct WalkStack {
-    inline: [Eterm; INLINE_WALK_FRAMES],
-    len: usize,
-    spill: Vec<Eterm>,
-}
-
-impl WalkStack {
-    /// An empty stack (each pass pushes its own root).
-    fn empty() -> Self {
-        Self {
-            inline: [NIL; INLINE_WALK_FRAMES],
-            len: 0,
-            spill: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, term: Eterm) {
-        if self.len < INLINE_WALK_FRAMES {
-            self.inline[self.len] = term;
-            self.len += 1;
-        } else {
-            self.spill.push(term);
-        }
-    }
-
-    fn pop(&mut self) -> Option<Eterm> {
-        if let Some(term) = self.spill.pop() {
-            return Some(term);
-        }
-        self.len = self.len.checked_sub(1)?;
-        Some(self.inline[self.len])
-    }
-
-    /// Empties the stack for the next pass, **keeping** the spill's capacity, so the
-    /// second pass of a deep iolist never re-grows it.
-    fn reset(&mut self) {
-        self.len = 0;
-        self.spill.clear();
-    }
+    iolist::byte_list(ctx, bytes)
 }
 
 /// The iolist shapes: an integer in `0..=255`, a binary, or a (possibly improper)
 /// list of iolists whose tail is a binary or `[]`.
 ///
-/// The walk is iterative (a work stack) so a deeply nested iolist cannot overflow the
-/// Rust stack — C's `erts_iolist_to_buf` is iterative for the same reason — and the
-/// stack is [`WalkStack`], which keeps the ordinary case allocation-free.
-///
-/// This module walks an iolist **twice** over one [`WalkStack`], both times
-/// iteratively: [`iolist_byte_len`] validates and measures it, [`append_iolist`] then
-/// fills a single buffer reserved with that exact capacity. The pre-pass's validation
-/// is **authoritative for both**: a term graph cannot change between the passes (the
-/// walk only reads, and no BIF runs in between), so the second pass's `badarg` arms
-/// are unreachable and exist only so an impossible shape is a typed error rather than
-/// a silent skip or a panic.
+/// The traversal itself is [`crate::iolist`]'s — the crate's one iolist walk — so this
+/// module only decides the top-level rule ([`iolist::TopLevel::List`]) and hands the
+/// resulting bytes to the heap. That walk is iterative (a work stack) so a deeply
+/// nested iolist cannot overflow the Rust stack, and it measures the iolist first so
+/// the buffer it fills is reserved to the exact byte count — see
+/// [`crate::iolist::bytes`] and `tests/binconv_alloc.rs` for the pinned counts.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for an element that is
 /// none of the three shapes (including a non-byte-aligned bitstring, an integer
-/// outside `0..=255` and any improper tail that is not a binary). The single
-/// allocation is the byte buffer, sized to the iolist's exact byte count — see
-/// `tests/binconv_alloc.rs` for the pinned counts.
+/// outside `0..=255` and any improper tail that is not a binary).
 fn iolist_bytes(root: Eterm) -> Result<Vec<u8>> {
-    let mut stack = WalkStack::empty();
-    let total = iolist_byte_len(root, &mut stack)?;
-    let mut out = Vec::with_capacity(total);
-    append_iolist(root, &mut stack, &mut out)?;
-    Ok(out)
-}
-
-/// The byte length of the iolist `root`, **validating** every element on the way.
-///
-/// # Errors
-///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) exactly where
-/// [`iolist_bytes`] documents it; `system_limit` only for a byte count that cannot
-/// fit a `usize` (an iolist of more than `usize::MAX` bytes, which no heap could
-/// hold).
-fn iolist_byte_len(root: Eterm, stack: &mut WalkStack) -> Result<usize> {
-    stack.reset();
-    stack.push(root);
-    let mut total = 0usize;
-    while let Some(term) = stack.pop() {
-        if access::is_nil(term) {
-            continue;
-        }
-        if access::is_small(term) {
-            // A byte. The range check is the validation, not just a conversion.
-            u8::try_from(signed_value(term)).map_err(|_| badarg())?;
-            total = total.checked_add(1).ok_or_else(system_limit)?;
-            continue;
-        }
-        if bits::is_binary(term) {
-            // `byte_size` rejects a non-byte-aligned bitstring, as C's `erts_iolist_size`
-            // does; it reads the size word without copying the payload.
-            total = total
-                .checked_add(bits::byte_size(term)?)
-                .ok_or_else(system_limit)?;
-            continue;
-        }
-        if access::is_list(term) {
-            // The tail of a list is a *tail* position: for `list_to_binary/1` (as in
-            // C's `erts_iolist_to_buf`) it may only be another list, `[]` or a binary
-            // — `list_to_binary([1|2])` is `badarg`, `list_to_binary([1|<<2>>])` is not.
-            let tail = access::cdr(term);
-            if !access::is_list(tail) && !access::is_nil(tail) && !bits::is_binary(tail) {
-                return Err(badarg());
-            }
-            // Push the tail first so the head is popped (and appended) first.
-            stack.push(tail);
-            stack.push(access::car(term));
-            continue;
-        }
-        return Err(badarg());
-    }
-    Ok(total)
-}
-
-/// Appends the bytes of the iolist `root` to `out` — the write half of the walk, run
-/// only after [`iolist_byte_len`] has validated `root`, so `out` is already reserved to
-/// the exact byte count and never reallocates.
-///
-/// A binary element is copied **straight into `out`** through the closure-scoped
-/// borrow [`bits::with_bytes`], not through a per-element temporary `Vec`.
-///
-/// # Errors
-///
-/// As [`iolist_byte_len`]; the `badarg` arms are unreachable (the pre-pass is
-/// authoritative — the term cannot change between the passes) and are kept so an
-/// impossible shape can never be silently skipped.
-fn append_iolist(root: Eterm, stack: &mut WalkStack, out: &mut Vec<u8>) -> Result<()> {
-    stack.reset();
-    stack.push(root);
-    while let Some(term) = stack.pop() {
-        if access::is_nil(term) {
-            continue;
-        }
-        if access::is_small(term) {
-            out.push(u8::try_from(signed_value(term)).map_err(|_| badarg())?);
-            continue;
-        }
-        if bits::is_binary(term) {
-            bits::with_bytes(term, |bytes| {
-                out.extend_from_slice(bytes);
-                Ok(())
-            })?;
-            continue;
-        }
-        if access::is_list(term) {
-            let tail = access::cdr(term);
-            if !access::is_list(tail) && !access::is_nil(tail) && !bits::is_binary(tail) {
-                return Err(badarg());
-            }
-            stack.push(tail);
-            stack.push(access::car(term));
-            continue;
-        }
-        return Err(badarg());
-    }
-    Ok(())
+    iolist::bytes(root, iolist::TopLevel::List)
 }
 
 // ---------------------------------------------------------------------------
@@ -529,9 +366,6 @@ fn append_iolist(root: Eterm, stack: &mut WalkStack, out: &mut Vec<u8>) -> Resul
 /// Unlike `iolist_to_binary/1`, a bare binary is *not* an iolist here
 /// (`list_to_binary(<<1,2>>)` is `badarg` in the oracle too).
 fn list_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    if !access::is_list(args[0]) && !access::is_nil(args[0]) {
-        return Err(badarg());
-    }
     let bytes = iolist_bytes(args[0])?;
     make_bin(ctx, &bytes)
 }
@@ -600,6 +434,12 @@ fn binary_part_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// non-negative offset. The subject must be byte-aligned and the whole range must
 /// lie inside it.
 ///
+/// The range rule itself is [`iolist::part_range`] (the crate's one spelling of it, so
+/// `erlang:binary_part/2,3`, `binary:part/2,3`, `binary:bin_to_list/2,3` and
+/// `binary:match/2,3`'s `{scope, …}` cannot drift apart), and the payload is read
+/// through the borrowing [`bits::with_bytes`]: only the **selected** bytes are copied
+/// out of the term, never the whole subject.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary
@@ -611,24 +451,17 @@ fn binary_part_range(
     start_term: Eterm,
     length_term: Eterm,
 ) -> Result<Eterm> {
-    let data = bytes_arg(subject)?;
-    let start = uint_arg(start_term)?;
-    let length = small_arg(length_term)?;
-    let size = data.len();
-    let (start, length) = if length < 0 {
-        let length = length.unsigned_abs() as usize;
-        if length > start {
-            return Err(badarg());
-        }
-        (start - length, length)
-    } else {
-        (start, length as usize)
-    };
-    let end = start.checked_add(length).ok_or_else(badarg)?;
-    if end > size {
+    if !bits::is_binary(subject) {
         return Err(badarg());
     }
-    make_bin(ctx, &data[start..end])
+    // The borrow ends before the heap write below: the slice is copied out of the term
+    // first (a buffer proportional to the *result*, not to the subject), so nothing
+    // derived from the term's storage is live while the destination heap is written.
+    let slice = bits::with_bytes(subject, |data| {
+        let (start, length) = iolist::part_range(data.len(), start_term, length_term)?;
+        Ok(data[start..start + length].to_vec())
+    })?;
+    make_bin(ctx, &slice)
 }
 
 // ---------------------------------------------------------------------------
@@ -1920,6 +1753,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
+    use beam_term::signed_value;
     use beam_codec::error::is_unsupported;
     use beam_codec::term::external_pid_parts;
     use beam_process::{PortId, ProcessId};

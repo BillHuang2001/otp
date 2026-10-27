@@ -119,6 +119,7 @@ use crate::arith;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::badarg;
+use crate::iolist;
 use crate::registry::BifRegistry;
 
 // ---------------------------------------------------------------------------
@@ -307,12 +308,11 @@ fn codepoint_list(ctx: &mut BifContext<'_>, text: &str) -> Result<Eterm> {
 }
 
 /// A char list of `bytes`' individual bytes (`erts_bin_bytes_to_list`).
+///
+/// The builder is [`crate::iolist::byte_list`] — the crate's one byte-list
+/// implementation, so this and `binary_to_list/1` cannot drift.
 fn byte_list(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Result<Eterm> {
-    let mut elems = Vec::new();
-    for byte in bytes {
-        elems.push(ctx.int(i64::from(*byte))?);
-    }
-    ctx.list(&elems)
+    iolist::byte_list(ctx, bytes)
 }
 
 /// `erts_convert_native_to_filename` for the UTF-8 native encoding: `NIL` for

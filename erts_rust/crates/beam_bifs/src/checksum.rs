@@ -86,6 +86,7 @@ use crate::access;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
+use crate::iolist;
 use crate::registry::BifRegistry;
 
 /// Registers this module's ten BIFs.
@@ -141,67 +142,18 @@ struct Input {
 /// `md5([1.5])`) and an improper tail that is neither a list, `[]` nor a
 /// byte-aligned binary (`crc32([1|2])`) are all `badarg`.
 ///
-/// The walk uses an explicit work stack, so a deeply nested list cannot overflow the
-/// Rust stack.
+/// The walk is [`crate::iolist`]'s (an explicit work stack, so a deeply nested list
+/// cannot overflow the Rust stack) and the buffer is reserved to the exact byte count.
 fn collect_input(root: Eterm) -> Result<Input> {
-    if bits::is_bitstring(root) {
-        if bits::bit_size(root)? % 8 != 0 {
-            return Err(badarg());
-        }
-        // A bare binary — `<<>>` included — is one (possibly zero-length) call.
-        return Ok(Input { bytes: bits::bytes(root)?, called: true });
-    }
-    if access::is_nil(root) {
-        // The `is_nil(ioterm)` early return: no `sumfun` call, so no reduction.
-        return Ok(Input { bytes: Vec::new(), called: false });
-    }
-    if !access::is_list(root) {
-        return Err(badarg());
-    }
-
-    let mut bytes = Vec::new();
-    let mut called = false;
-    let mut stack = vec![root];
-    while let Some(term) = stack.pop() {
-        if access::is_nil(term) {
-            continue;
-        }
-        if access::is_small(term) {
-            let byte = signed_value(term);
-            if !(0..=255).contains(&byte) {
-                return Err(badarg());
-            }
-            // A flat byte run is at least one byte, hence one `sumfun` call.
-            bytes.push(byte as u8);
-            called = true;
-            continue;
-        }
-        if bits::is_bitstring(term) {
-            if bits::bit_size(term)? % 8 != 0 {
-                return Err(badarg());
-            }
-            bytes.extend_from_slice(&bits::bytes(term)?);
-            called = true;
-            continue;
-        }
-        if access::is_list(term) {
-            let tail = access::cdr(term);
-            // `do_chksum`'s cons-tail rule: a bitstring tail is a valid iolist
-            // (`[1|<<2>>]`); anything that is not `[]`, a cons or a bitstring is an
-            // improper list (a byte tail is rejected — `ALLOW_BYTE_TAIL` is off).
-            if !access::is_nil(tail) && !access::is_list(tail) && !bits::is_bitstring(tail) {
-                return Err(badarg());
-            }
-            // Push the tail first so the head is processed next (LIFO).
-            stack.push(tail);
-            stack.push(access::car(term));
-            continue;
-        }
-        return Err(badarg());
-    }
-    Ok(Input { bytes, called })
+    // The traversal and the acceptance rules are the crate's one iolist walk
+    // ([`crate::iolist`]): `do_chksum` flattens through `iolist_to_binary/1`'s rule
+    // (a bare byte-aligned binary, `[]`, or an iolist), so a second copy of the walk
+    // here could only drift. What is checksum-specific is the mapping from the walk's
+    // **leaf** count to `called`: every leaf is one `sumfun` call — a zero-length
+    // binary leaf included — while `[]` visits none.
+    let (bytes, leaves) = iolist::bytes_and_leaves(root, iolist::TopLevel::ListOrBinary)?;
+    Ok(Input { bytes, called: leaves != 0 })
 }
-
 // ---------------------------------------------------------------------------
 // CRC-32 and Adler-32 (the workspace's zlib 1.3.2 port, `beam_deflate`)
 // ---------------------------------------------------------------------------

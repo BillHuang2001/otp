@@ -1881,11 +1881,9 @@ impl<'a> BifContext<'a> {
     ///
     /// Propagates the heap's allocation failure.
     pub fn charlist(&mut self, text: &str) -> Result<Eterm> {
-        let mut elems = Vec::with_capacity(text.len());
-        for byte in text.bytes() {
-            elems.push(self.int(i64::from(byte))?);
-        }
-        self.list(&elems)
+        // [`crate::iolist::byte_list`] is the crate's one byte-list builder: same
+        // shape, one capacity-reserved element vector.
+        crate::iolist::byte_list(self, text.as_bytes())
     }
 }
 

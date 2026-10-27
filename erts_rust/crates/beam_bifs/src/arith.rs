@@ -511,7 +511,20 @@ fn abs(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// Unary `-A` (negation).
+///
+/// The small-integer fast path is [`add`]'s: a 60-bit small negates exactly in
+/// machine arithmetic (`checked_neg` is only `None` for `i64::MIN`, which no small
+/// integer can be), and only `-MIN_SMALL` — `2^59` — leaves the 60-bit small range,
+/// where [`int_from_machine`] promotes into exactly the bignum the widened
+/// [`Big::neg`] fold produces. So a small integer costs no allocation, while a
+/// bignum, a float and a non-number keep the widened route's result (`badarith`
+/// included).
 fn negate(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    if let Some(value) = small_operand(args[0]) {
+        if let Some(negated) = value.checked_neg() {
+            return int_from_machine(ctx, negated);
+        }
+    }
     match number(args[0])? {
         Num::Int(value) => int_term(ctx, &value.neg()),
         Num::Float(f) => ctx.make_float(-f),
@@ -519,7 +532,15 @@ fn negate(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// Unary `+A` (numeric identity).
+///
+/// A small integer is its own result — the value is already inside the small range,
+/// so [`int_from_machine`] builds the same immediate the widened fold would, without
+/// the [`Big`] allocation; every other operand keeps the widened route (`badarith`
+/// for a non-number).
 fn identity(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    if let Some(value) = small_operand(args[0]) {
+        return int_from_machine(ctx, value);
+    }
     match number(args[0])? {
         Num::Int(value) => int_term(ctx, &value),
         Num::Float(f) => ctx.make_float(f),
