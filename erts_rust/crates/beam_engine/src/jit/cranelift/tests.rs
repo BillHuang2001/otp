@@ -173,6 +173,9 @@ fn the_compiled_function_runs_the_export_natively() {
         tables: crate::jit::baseline::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
+        // No run-cached reduction hook (a hand-built runtime block); a charge would go
+        // through `charge_reduce`'s `dyn` fallback.
+        reduce_hook: None,
     };
 
     let word = code
@@ -722,6 +725,9 @@ fn a_native_entry_declares_the_register_write_extent() {
         tables: crate::jit::baseline::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
+        // No run-cached reduction hook (a hand-built runtime block); a charge would go
+        // through `charge_reduce`'s `dyn` fallback.
+        reduce_hook: None,
     };
 
     let word = code

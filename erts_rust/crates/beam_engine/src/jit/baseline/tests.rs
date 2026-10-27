@@ -104,6 +104,10 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
+        // No run-cached reduction hook: these are hand-built runtimes, so a charge (if any
+        // of these suites latched `reduce_on`) goes through the `dyn` door exactly as it
+        // always did (`runtime::JitRuntime::charge_reduce`'s fallback).
+        reduce_hook: None,
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
@@ -125,6 +129,21 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         RUNTIME_YBASE_DISP + std::mem::size_of::<*const u8>() as i32
     );
     assert_eq!(RUNTIME_SLOT_DISP, 0);
+    // The run-cached reduction hook (`JitRuntime::reduce_hook`) is **appended after** every
+    // field generated code reads — `current_code` is the last of them — so adding it moved
+    // no `RUNTIME_*_DISP` offset and changed not one emitted byte. The pin is the append
+    // itself: a reader that ever needed an emission change would have to break it.
+    assert!(
+        std::mem::offset_of!(JitRuntime<'static>, reduce_hook)
+            >= RUNTIME_CURRENT_CODE_DISP as usize + std::mem::size_of::<*mut u64>(),
+        "the reduction hook must sit after every field emitted code reads"
+    );
+    // Declaration order is layout order under `#[repr(C)]`, so the hook following
+    // `current_code` directly also means nothing was inserted between them.
+    assert_eq!(
+        std::mem::offset_of!(JitRuntime<'static>, reduce_hook),
+        std::mem::offset_of!(JitRuntime<'static>, current_code) + std::mem::size_of::<*mut u64>()
+    );
 }
 
 #[test]
@@ -2794,6 +2813,10 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
+        // No run-cached reduction hook: these are hand-built runtimes, so a charge (if any
+        // of these suites latched `reduce_on`) goes through the `dyn` door exactly as it
+        // always did (`runtime::JitRuntime::charge_reduce`'s fallback).
+        reduce_hook: None,
     };
     assert_eq!(
         enter_compiled(&eager, &module, &mut rt as *mut JitRuntime<'_>, 0, f_pc),
@@ -3195,6 +3218,10 @@ fn run_ext_call(
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
+        // No run-cached reduction hook: these are hand-built runtimes, so a charge (if any
+        // of these suites latched `reduce_on`) goes through the `dyn` door exactly as it
+        // always did (`runtime::JitRuntime::charge_reduce`'s fallback).
+        reduce_hook: None,
     };
     // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
     let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);

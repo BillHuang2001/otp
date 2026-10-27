@@ -1124,6 +1124,18 @@ fn drive(
     machine.reduce_on = ctx.wants_reduce();
     let reduce_on = machine.reduce_on;
     machine.reductions = 0;
+    // The run's **devirtualised** reduction charge: one hook, built here (this driver call
+    // *is* one scheduling slice, so its answer is fixed for the slice) from the host's own
+    // `reduce`, and offered to every charge below — the loop head's per-block-entry one and
+    // the in-block transfer's (`runtime::commit_in_block_entry`) — as one indirect call
+    // instead of a `*mut dyn` reborrow plus a vtable load per charge. Built **only** when the
+    // gate above latched `true`, so a host whose `reduce` is the default no-op never pays for
+    // a hook it would never reach.
+    let reduce_hook = if reduce_on {
+        Some(ctx.reduce_hook())
+    } else {
+        None
+    };
     // Latch the per-run dynamic-census gate too, exactly as `Machine::drive` does: the
     // tier's per-instruction deopt helper (`jit_step_one` ->
     // `Machine::step_instruction_with_entry`) is the same census funnel the interpreter
@@ -1192,6 +1204,7 @@ fn drive(
         tables: runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
+        reduce_hook,
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run
@@ -1247,10 +1260,11 @@ fn drive(
             // the two always agree (the interpreter driver's invariant).
             (*machine_ptr).reductions = (*machine_ptr).reductions.saturating_add(1);
         }
-        if reduce_on {
-            // SAFETY: as above — no native code is running and the context is live
-            // for the whole loop.
-            unsafe { (*ctx_ptr).reduce(1) }?;
+        if reduce_on && !rt.charge_reduce(1) {
+            // The host refused this iteration's charge: `charge_reduce` stored its own
+            // typed error, and the block below has not been entered, so the machine is
+            // parked on the block entry the position store above published.
+            return Err(rt.take_reduce_refusal());
         }
         // Native entry for the ACTIVE module: the caller-owned artifact in context
         // `0`, the callee's blocks (if the tier has any) in a non-entry context. Each

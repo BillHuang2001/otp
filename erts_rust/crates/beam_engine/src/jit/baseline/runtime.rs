@@ -40,7 +40,7 @@ use beam_common::BeamError;
 use beam_loader::{ImportRef, Instr, Module};
 use beam_term::Eterm;
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, ReduceHook};
 use crate::error;
 use crate::machine::{Continuation, Machine};
 use crate::Step;
@@ -305,6 +305,27 @@ pub(crate) struct JitRuntime<'a> {
     /// written **only** by generated code and by the driver (which still stores the
     /// same field directly at its loop head — see `Machine::set_current_code`).
     pub(crate) current_code: *mut u64,
+    /// The run's **devirtualised reduction charge** — the host's own
+    /// [`ExecutionContext::reduce`] behind a monomorphised shim
+    /// ([`ExecutionContext::reduce_hook`]), built once per driver call because this driver
+    /// call **is** one scheduling slice.
+    ///
+    /// Filled when the driver latches [`Machine::reduce_on`] from
+    /// [`ExecutionContext::wants_reduce`] (the same one-answer-per-run gate the interpreter
+    /// latches), so `Some` and `reduce_on == true` are the two halves of one decision and a
+    /// host whose hook is the default no-op pays nothing at all. The **one** consumer is
+    /// [`Self::charge_reduce`], hence every per-transfer charge
+    /// ([`commit_in_block_entry`]) and the driver's own per-block-entry charge: what used to
+    /// be a `*mut dyn` reborrow plus a vtable load per charge is one indirect call.
+    ///
+    /// `None` while `reduce_on` is `false`; a `None` with `reduce_on == true` (a hand-built
+    /// runtime, e.g. in a unit test) still charges, through the `dyn` door — see
+    /// [`Self::charge_reduce`], which keeps that path semantically identical.
+    ///
+    /// Read and written **only by Rust** (the driver and the helpers), never by generated
+    /// code, so its position is immaterial to the emitted stream and it is **appended** so
+    /// every pre-existing `#[repr(C)]` offset — and therefore every emitted byte — stays put.
+    pub(crate) reduce_hook: Option<ReduceHook>,
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -506,6 +527,52 @@ impl JitRuntime<'_> {
         };
         self.literals_base = base;
         self.literals_end = end;
+    }
+    /// Charge `n` reductions to the host — the **one** reduction door of this tier, shared
+    /// by the driver's per-block-entry charge and by the per-transfer charge of
+    /// [`commit_in_block_entry`].
+    ///
+    /// Answers `true` when the host accepted the charge and `false` when it refused it; a
+    /// refusal's error is already stored in [`Self::error`] **unchanged** (the shim writes
+    /// the host's own [`BeamError`] there), so the caller's refusal arm only has to take it
+    /// back out and answer [`ERROR`].
+    ///
+    /// The dispatch is the run-cached [`Self::reduce_hook`], i.e. one indirect call through a
+    /// monomorphised shim: no `*mut dyn` fat-pointer move and no vtable load per charge. A
+    /// runtime that carries **no** hook (a hand-built one, e.g. in a unit test) while
+    /// [`Machine::reduce_on`] is latched still charges — through the same
+    /// [`ExecutionContext::reduce`] door the hook wraps — so the count and the ordering a
+    /// host observes never depend on whether the hook was latched.
+    #[inline]
+    pub(crate) fn charge_reduce(&mut self, n: u32) -> bool {
+        if let Some(hook) = self.reduce_hook {
+            return hook.charge(n, &mut self.error);
+        }
+        // SAFETY: `self.ctx` is the driver's live `&mut dyn ExecutionContext` reborrowed as a
+        // raw pointer; no other `&mut` to it exists while this helper runs (the driver is
+        // blocked in the block call that reached us, or is at its own loop head).
+        let ctx = unsafe { &mut *self.ctx };
+        match ctx.reduce(n) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err);
+                false
+            }
+        }
+    }
+    /// Take the refusal [`Self::charge_reduce`] stored, for a caller whose own error channel
+    /// is a `Result`.
+    ///
+    /// Never on a hot path (a refused charge is a pre-emption), and
+    /// a `false` from the shim without an error would be a shim-contract violation rather
+    /// than a legitimately empty refusal — so it answers a **typed** error naming the site
+    /// instead of silently accepting the charge.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn take_reduce_refusal(&mut self) -> BeamError {
+        self.error.take().unwrap_or_else(|| {
+            crate::error::unsupported("reduce hook refused a charge without an error")
+        })
     }
 }
 
@@ -2230,11 +2297,12 @@ fn commit_in_block_entry(
     // target once — for the exit word — and reuses it for the position store.
     machine.set_current_code_word(word as u64);
     machine.reductions = machine.reductions.saturating_add(1);
-    if machine.reduce_on {
-        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as a
-        // raw pointer; the driver holds no `&mut` to it while the helper runs.
-        let ctx = unsafe { &mut *runtime.ctx };
-        ctx.reduce(1)?;
+    if machine.reduce_on && !runtime.charge_reduce(1) {
+        // The host refused: its own typed error is already in `runtime.error` (see
+        // [`JitRuntime::charge_reduce`]), and the transfer is **not** taken — nothing of the
+        // target block has run, and the position published above is the target's entry, so
+        // the machine is parked exactly where a driver-side refusal parks it.
+        return Err(runtime.take_reduce_refusal());
     }
     Ok(())
 }
