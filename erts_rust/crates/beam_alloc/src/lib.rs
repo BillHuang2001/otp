@@ -82,8 +82,8 @@ pub use crate::allocator::{
 // confused: one grows an off-heap binary payload, the other a per-process term heap.
 pub use crate::binary::{
     payload_capacity, GrowOutcome as PayloadGrowOutcome, GrowthCounters, RefcBinary,
-    Relocation as PayloadRelocation, DEFAULT_RESERVATION_FACTOR,
-    EXACT_RESERVATION_CAPACITY_LIMIT, GROW_DOUBLING_LIMIT_BYTES, MAX_PAYLOAD_BYTES,
+    Relocation as PayloadRelocation, DEFAULT_RESERVATION_FACTOR, GROW_DOUBLING_LIMIT_BYTES,
+    MAX_PAYLOAD_BYTES,
 };
 pub use crate::heap::Heap;
 pub use crate::policy::{CarrierPolicy, PolicyOptionKind};
@@ -105,8 +105,8 @@ pub mod prelude {
     };
     pub use crate::binary::{
         payload_capacity, GrowOutcome as PayloadGrowOutcome, GrowthCounters, RefcBinary,
-        Relocation as PayloadRelocation, DEFAULT_RESERVATION_FACTOR,
-        EXACT_RESERVATION_CAPACITY_LIMIT, GROW_DOUBLING_LIMIT_BYTES, MAX_PAYLOAD_BYTES,
+        Relocation as PayloadRelocation, DEFAULT_RESERVATION_FACTOR, GROW_DOUBLING_LIMIT_BYTES,
+        MAX_PAYLOAD_BYTES,
     };
     pub use crate::heap::Heap;
     pub use crate::refcount::RefCount;

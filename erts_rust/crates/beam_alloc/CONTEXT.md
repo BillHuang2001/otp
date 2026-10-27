@@ -221,8 +221,7 @@ tests) + `binary/growth.rs` (capacity growth, counters, the relocation protocol)
   `with_capacity_and_allocator(alloc, capacity)`, `with_limits(alloc, capacity, reserved_bytes,
   max_capacity)`; read side `len`, `is_empty`, `capacity`, `reserved_bytes`, `spare_capacity`,
   `max_capacity`, `as_bytes`, `refcount`, `data_ptr`, `growth_counters`, and
-  `GROW_DOUBLING_LIMIT_BYTES`/`DEFAULT_RESERVATION_FACTOR`/`MAX_PAYLOAD_BYTES`/
-  `EXACT_RESERVATION_CAPACITY_LIMIT`. `Clone` bumps the
+  `GROW_DOUBLING_LIMIT_BYTES`/`DEFAULT_RESERVATION_FACTOR`/`MAX_PAYLOAD_BYTES`. `Clone` bumps the
   refcount; last `Drop` frees once through the **same `AllocRef` + exact `Layout`** (`HEADER_SIZE +
   header.reserved`, the layout the *current* block was allocated with).
 - **Payload = reservation + capacity + length** (all in the private header, i.e. allocator space —
@@ -234,14 +233,12 @@ tests) + `binary/growth.rs` (capacity growth, counters, the relocation protocol)
   written, with **no** zero fill — see below), `compact` (drop spare capacity to `round_up_unit(len)`).
   Growth schedule = C's `GROW_PROC_BIN_SIZE` in integer math: double up to
   `GROW_DOUBLING_LIMIT_BYTES` (16 MiB), then +20 %.
-- **The reservation is two-zone** (`reservation_for`): `capacity <= EXACT_RESERVATION_CAPACITY_LIMIT`
-  (992 = `1024 - HEADER_SIZE`, i.e. the largest capacity whose block still fits the default ladder's
-  top class) reserves **exactly** `round_up_unit(capacity)` — no slack, so the block
-  `HEADER_SIZE + reservation` lands on a size class instead of `alloc_mid`; above the limit the
-  geometric slack is unchanged (`round_up_unit(max(capacity, DEFAULT_RESERVATION_FACTOR × capacity))`),
-  and both are capped by `MAX_PAYLOAD_BYTES`. Amortisation is preserved either way: a small payload
-  whose capacity is exhausted moves into the geometric zone on its first grow (the 256 B → 64 KiB
-  append ladder still costs `moves <= 8`, `bytes_copied <= 2n`).
+- **The reservation is geometric for all capacities** (`reservation_for`): `round_up_unit(max(capacity,
+  capacity × DEFAULT_RESERVATION_FACTOR))` (factor 4), capped by `MAX_PAYLOAD_BYTES`. A small payload
+  therefore starts with slack it may never use — a 256 B capacity reserves 1 KiB — and that slack is
+  deliberate (see `## Design Decisions`). Amortisation is untouched: a payload whose capacity is
+  exhausted applies the `GROW_PROC_BIN_SIZE` schedule to the *reservation*, so an append loop stays
+  logarithmic in moves (the 256 B → 64 KiB ladder still costs `moves <= 8`, `bytes_copied <= 2n`).
 - **`set_len_unwritten(len)` is the high-water publish** (`src/binary/growth.rs`): it sets the header
   length under the *caller's* invariant that it has already written every byte of `[old_len, len)` —
   `set_len` zero-fills that range first, which for a writable accumulator is pure waste because the
@@ -341,27 +338,8 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   fitting cached segment (a bad fit is tail-trimmed, keeping the base).
 ### Where a `bs_init_writable` accumulator payload lands (the `foreign`-kernel shape)
 - `bs_init_writable` asks for `RefcBinary::with_capacity(capacity)` with `capacity` = the compiler's hint: **256 bytes** when the comprehension's output size is not statically known (`lib/compiler/src/beam_ssa_bc_size.erl:36` "the default size of 256 bytes", the literal at `:579`; the C reads `x(0)` as bytes, `../../erts/emulator/beam/erl_bits.c:2023-2035`). The `beam_engine/src/bench/` docs' "256 bits = 32 bytes" is wrong by 8×.
-- A 256 B capacity is at or below `EXACT_RESERVATION_CAPACITY_LIMIT` (992), so `reservation_for(256)` reserves **exactly 256** B and the request is `HEADER_SIZE(32) + 256 = 288` B at `MIN_ALIGN` 16 — inside the default ladder (`large_threshold` 1024), hence a **slab class block of 256** (`alloc_small`: one class free-list pop), not `alloc_mid`. Before this policy the same request reserved 1024 B, i.e. a 1056 B block, **32 B above the ladder top**, and every output binary paid the pooled path: the good-fit scan (`state.rs::take_mbc_fit`, **oldest-first**) plus a boundary-tag split, and a fresh carrier's first-touch faults landed on `MbcCarrier::alloc`'s header store (inlined into `alloc_impl`).
-- The route chosen was the **reservation bound**, not a taller ladder: extending the ladder to 2048 would have moved every genuinely-large object in the 1–2 KiB *request* band onto slab carriers (~256 B of page-fault-resident memory per live object instead of an exact pooled block) and would still not cover a 4×-reserved 512 B hint, whereas the bound targets exactly the small-capacity case with one constant derived from `large_threshold` and `HEADER_SIZE` (its unit test asserts the relation, so a future ladder change keeps them in step).
-- The request count is **one per output binary, not per append**: the append loop writes into the reservation (`beam_engine`'s `raw::InPlace`), so a 30 B result out of a 256 B capacity makes 0 grows and 0 moves; `compact()`/high-water trimming is never called for an accumulator. A *growing* accumulator (`binary_append`'s 32 KiB output) now starts from a 256 B reservation instead of 1024 B and takes one extra in-place grow before entering the geometric zone — the same block count, less zero-fill (measured below).
-
-### Measured: the exact small-capacity reservation (paired A/B, instructions/call)
-The route was adopted on the routing argument above, then **measured against the pre-change runtime** with
-a round-interleaved paired A/B (`perf stat -e instructions:u`, `taskset -c 3`, min of 3 samples per
-(binary, N), slope over N = 20 000/100 000 calls; both binaries built `--release -p beam_rt` from the
-same tree, only `binary.rs`/`binary/growth.rs`/`lib.rs` reverted in the "before" build; host loadavg
-138–159 during the run, so absolute wall times are meaningless but a paired instruction slope is not):
-- `bstr_to_lower` (`cowboy_bstr:to_lower/1`, 30 B in/out): **54 790 → 66 201 instr/call (+20.8 %)**;
-- `bstr_capitalize` (`cowboy_bstr:capitalize_token/1`): **54 356 → 65 712 instr/call (+20.8 %)**.
-So on these two kernels the slab route is **more** instructions per call than the pooled one, not fewer —
-the opposite of the routing argument's expectation, and reproducible (two independent paired runs). The
-cost is per *output binary*, so it is a plausible mechanism (e.g. the class-256 carrier's full 1 MiB is
-touched at subdivision, where the MBC carrier touches ~2 pages, and/or the smaller `reserved` bound
-changes how often the engine's append sink calls `ensure_capacity`), but the attribution is **not
-established**: **this reservation policy must not be adopted on the strength of the routing argument
-alone** — the ladder route (b) and the `set_len_unwritten` adoption (a free ~256 B/call of zero fill in
-`beam_engine`, still inert here) both remain open, and reverting `reservation_for` to the purely
-geometric form is the safe default until the mechanism is attributed with callgrind.
+- A 256 B capacity reserves `round_up_unit(256 × 4) = 1024` B, so the request is `HEADER_SIZE(32) + 1024 = 1056` B at `MIN_ALIGN` 16 — **32 B above the default ladder top** (`large_threshold` 1024), hence `alloc_mid`: a block of the pooled 1 MiB variable-size MBC carrier (the good-fit scan `state.rs::take_mbc_fit`, **oldest-first**, plus a boundary-tag split, and a coalesce on free). That is the intended landing; reserving the 256 B exactly so the 288 B block would land on class 256 was measured to cost more, not less (see `## Design Decisions`).
+- The request count is **one per output binary, not per append**: the append loop writes into the reservation (`beam_engine`'s `raw::InPlace`), so a 30 B result out of a 256 B capacity makes 0 grows and 0 moves; `compact()`/high-water trimming is never called for an accumulator. A *growing* accumulator (`binary_append`'s 32 KiB output) starts from a 1 KiB reservation and enters the geometric zone directly.
 
 ### When a free actually unmaps (pointer-invalidation map)
 `Heap::drop` (heap.rs:242) never unmaps anything itself — it only calls `AllocRef::dealloc` →
@@ -533,6 +511,11 @@ The `std::alloc`-backed `StdlibAllocator` (`heap.rs:296-381`, `dealloc` → `std
   `refcount() == 1` (C's `ASSERT(erts_refc_read(…refc, 1) == 1)`), so a reallocation can never pull the
   block out from under another handle; and the replacement block is obtained *before* the old one is
   freed, so a failed grow leaves the payload and every pointer into it fully valid.
+- **The payload reservation is geometric for all capacities.** `with_capacity(capacity)` reserves
+  `round_up_unit(capacity × DEFAULT_RESERVATION_FACTOR)` (4×, capped by `MAX_PAYLOAD_BYTES`), small
+  capacities included. Reserving a small capacity *exactly* so its block lands on the top size class
+  was measured to cost ~+20 % instructions per output binary on the four `foreign` kernels, so the
+  slack stays.
 - **`len` lives in the header, not the handle.** A clone and its original must never disagree about the
   payload length, and growth has to be visible to whichever handle reads next; caching it per handle
   would make `as_bytes` and `Drop` drift apart. `Drop` therefore frees with `HEADER_SIZE +
@@ -561,10 +544,9 @@ The `std::alloc`-backed `StdlibAllocator` (`heap.rs:296-381`, `dealloc` → `std
   return to baseline (no leak on the tested paths).
 - Gate (GREEN required, current): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
   -p beam_alloc --no-fail-fast` → **245 lib + 18 (`tests/allocator.rs`) + 13 (`tests/heap.rs`) + 4
-  (`tests/hot_path.rs`) + 15 (`tests/refc_binary_growth.rs`) + 12 (`tests/reserved_heap.rs`) = 307
-  tests, 0 failures**; the new cases are `reservation_policy_is_exact_for_small_capacities_and_geometric_above`
-  (lib) plus `a_small_capacity_payload_is_served_by_a_size_class`,
-  `a_small_reservation_still_grows_amortised_linearly` and
+  (`tests/hot_path.rs`) + 14 (`tests/refc_binary_growth.rs`) + 12 (`tests/reserved_heap.rs`) = 306
+  tests, 0 failures**; the growth-policy cases are `reservation_is_geometric_for_all_capacities` (lib)
+  plus `a_small_reservation_still_grows_amortised_linearly` and
   `set_len_unwritten_publishes_written_bytes_without_zero_filling`
   (`tests/refc_binary_growth.rs`);
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets` is
