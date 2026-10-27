@@ -36,6 +36,7 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 ## Known Issues
 - **Looser than the C, deliberately:** an obsolete/transform-only roster opcode (`-allocate_zero/2`, `-is_constant/2`, `-make_fun2/1`; none has an `ops.tab` line) lowers to `Instr::Generic` instead of `PLEASE_RECOMPILE` (`beam_load.c:600-605`); an `f` target no `label` defines is accepted (a release-build C accepts it too) and surfaces as a typed execution error; the `bs_match` sub-instruction vocabulary is only the engine's typed `unsupported` (`beam_load.c:625-638`).
 - **Stricter than the C:** a defined label 0 is refused (the C tests only `< 0 || >= label_count`, `asm_load.c:512-518`).
+- **Which error a doubly-malformed stream reports:** the boundaries are located (and the boundary rules applied) before the bodies are lowered, so a stream that carries both a malformed `func_info` boundary and an unlowerable instruction names the boundary; a stream with one defect reports that defect, and every one of these is `BadArg` either way — the accept/reject verdict is unchanged.
 
 ## Notes for Agents
 - Read `src/lower/instr.rs` for the per-opcode table; read `src/instr.rs` (`../instr.rs`) for the variant shapes and `../CONTEXT.md` for the vocabulary summary.
