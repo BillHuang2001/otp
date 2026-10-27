@@ -107,7 +107,40 @@ pub const GROW_DOUBLING_LIMIT_BYTES: usize = 1 << 24;
 /// up to [`UNIT_SIZE`]) so that a typical accumulator loop fills the reservation several
 /// times over before it ever needs a move. It is a *reservation* policy, not a limit: the
 /// hard bound is still the payload's `max_capacity`.
+///
+/// The factor applies **above** [`EXACT_RESERVATION_CAPACITY_LIMIT`] only: below it the
+/// slack would cost a whole size class (see that constant).
 pub const DEFAULT_RESERVATION_FACTOR: usize = 4;
+
+/// The capacity up to which [`RefcBinary::with_capacity`] reserves **exactly** the capacity
+/// asked for, i.e. without the [`DEFAULT_RESERVATION_FACTOR`] slack.
+///
+/// Why stop at all: the allocator serves a payload whose whole block (this crate's
+/// [`HEADER_SIZE`] control header plus the payload reservation) fits the top of the
+/// small-block size-class ladder from a **size class** — one intrusive-free-list pop — and
+/// everything larger from a pooled variable-size multi-block carrier, which costs a
+/// good-fit carrier scan, a boundary-tag split on the way in and a coalesce on the way out
+/// *per payload*. A `4x` reservation on a small accumulator moved that block across the
+/// boundary: the compiler's default writable-accumulator hint is 256 bytes
+/// (`beam_ssa_bc_size.erl`'s "default size of 256 bytes"), so `4 * 256 = 1024` payload
+/// bytes plus the 32-byte control header is `1056` bytes — 32 bytes past the 1024-byte top
+/// of `SizeClasses::default_small_block` — and **every** such output binary paid the pooled
+/// path while producing 30-100 bytes.
+///
+/// Why this value: it is exactly `1024 - HEADER_SIZE`, so every capacity whose *exact*
+/// reservation can still be served by a size class keeps its whole block on the ladder
+/// (`round_up_unit(capacity) + HEADER_SIZE <= 1024`), and the slack resumes one byte above
+/// it. That discontinuity is the intent: it is the point where the block stops being served
+/// by a class. The value is derived from the *default* ladder; a host that configures a
+/// different [`SizeClasses`](crate::size_class::SizeClasses) table still allocates correctly,
+/// it just pays whichever path its own table routes to.
+///
+/// Reserving exactly is not a growth-policy regression: [`RefcBinary::ensure_capacity`]
+/// computes each grown reservation from the *current* reservation with the C's
+/// `GROW_PROC_BIN_SIZE` schedule, so an append loop that outgrows a small payload still
+/// doubles (and therefore stays amortised linear) — it simply reaches its first move up to
+/// two appends earlier than a 4x reservation would have.
+pub const EXACT_RESERVATION_CAPACITY_LIMIT: usize = 1024 - HEADER_SIZE;
 
 /// The largest payload this allocator can serve in one block.
 ///
@@ -139,10 +172,18 @@ fn grow_span(size: usize) -> usize {
 }
 
 /// The reservation [`RefcBinary::with_capacity`] picks for a requested `capacity`:
-/// `round_up_unit(max(capacity, capacity * DEFAULT_RESERVATION_FACTOR))`, clamped to
-/// [`MAX_PAYLOAD_BYTES`].
+///
+/// * at or below [`EXACT_RESERVATION_CAPACITY_LIMIT`] — `round_up_unit(capacity)`, i.e. no
+///   slack, so the payload's whole block stays on the size-class ladder (the constant
+///   documents why);
+/// * above it — `round_up_unit(max(capacity, capacity * DEFAULT_RESERVATION_FACTOR))`.
+///
+/// Both are clamped to [`MAX_PAYLOAD_BYTES`].
 #[inline]
 fn reservation_for(capacity: usize) -> usize {
+    if capacity <= EXACT_RESERVATION_CAPACITY_LIMIT {
+        return round_up_unit(capacity).min(MAX_PAYLOAD_BYTES);
+    }
     let with_slack = capacity.saturating_mul(DEFAULT_RESERVATION_FACTOR);
     round_up_unit(capacity.max(with_slack)).min(MAX_PAYLOAD_BYTES)
 }
@@ -289,9 +330,12 @@ impl RefcBinary {
     /// Allocates an empty off-heap binary with `capacity` writable payload bytes,
     /// reserving spare room through the registry's [`AllocType::Binary`] allocator.
     ///
-    /// The reservation is `round_up_unit(capacity * DEFAULT_RESERVATION_FACTOR)`: an
-    /// accumulator that appends into it therefore grows **in place** for several rounds
-    /// before the first move.
+    /// The reservation is `round_up_unit(capacity)` up to
+    /// [`EXACT_RESERVATION_CAPACITY_LIMIT`] and
+    /// `round_up_unit(capacity * DEFAULT_RESERVATION_FACTOR)` above it: a small accumulator
+    /// keeps its whole block on the allocator's size-class ladder (the constant documents
+    /// why), while a larger one still grows **in place** for several rounds before the
+    /// first move.
     pub fn with_capacity(capacity: usize) -> Result<RefcBinary> {
         RefcBinary::with_capacity_and_allocator(allocator(AllocType::Binary).clone(), capacity)
     }
@@ -720,6 +764,43 @@ mod tests {
         assert_eq!(alloc.stats().live_blocks, 0, "a failed allocation leaks nothing");
     }
 
+    /// The reservation policy: **exact** (no slack) at or below
+    /// [`EXACT_RESERVATION_CAPACITY_LIMIT`], the multiplicative slack above it — chosen so
+    /// that the whole block of a small capacity (control header included) stays on the
+    /// default size-class ladder instead of a pooled multi-block carrier.
+    #[test]
+    fn reservation_policy_is_exact_for_small_capacities_and_geometric_above() {
+        let limit = EXACT_RESERVATION_CAPACITY_LIMIT;
+        let classes = SizeClasses::default_small_block();
+        assert_eq!(
+            limit,
+            classes.large_threshold() - HEADER_SIZE,
+            "the limit is the last capacity whose whole block fits the ladder top"
+        );
+        for &capacity in &[0usize, 1, 16, 17, 64, 200, 256, 512, 991, limit] {
+            assert_eq!(
+                reservation_for(capacity),
+                round_up_unit(capacity),
+                "capacity {capacity}: no slack"
+            );
+            assert!(
+                HEADER_SIZE + reservation_for(capacity) <= classes.large_threshold(),
+                "capacity {capacity}: header + reservation stays on the ladder"
+            );
+        }
+        // One byte above the limit the block no longer fits a class, and the slack resumes
+        // (the discontinuity is the point: it is where the class path ends).
+        for &capacity in &[limit + 1, 1024, 4096, 65_536] {
+            assert_eq!(
+                reservation_for(capacity),
+                round_up_unit(capacity * DEFAULT_RESERVATION_FACTOR),
+                "capacity {capacity}: the geometric slack"
+            );
+        }
+        // Clamped to what one block can hold — a hostile capacity saturates, never wraps.
+        assert_eq!(reservation_for(usize::MAX / 2), MAX_PAYLOAD_BYTES);
+        assert_eq!(reservation_for(MAX_PAYLOAD_BYTES), MAX_PAYLOAD_BYTES);
+    }
     #[test]
     fn new_uses_the_registry_binary_allocator() {
         let binary = RefcBinary::new(&[1, 2, 3, 4]).expect("allocate");

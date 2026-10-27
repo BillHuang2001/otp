@@ -337,6 +337,52 @@ impl RefcBinary {
         Ok(())
     }
 
+    /// Sets the logical payload length **without initialising** the bytes this newly exposes.
+    ///
+    /// This is the publish step for a writer that has already written the range through
+    /// [`data_ptr`](RefcBinary::data_ptr) — an accumulator appending into the payload's raw
+    /// capacity. [`set_len`](RefcBinary::set_len) is the wrong door for it: that one
+    /// zero-fills `[old_len, len)`, which is a write of the whole newly exposed range
+    /// (≈256 bytes per small output binary, and every grown capacity step on a long append
+    /// ladder) immediately before — or worse, *over* — the bytes the writer put there.
+    ///
+    /// # Invariant (the caller's, not this crate's)
+    ///
+    /// The bytes in `[old_len(), len)` must already be **written** with whatever the payload
+    /// is meant to hold: after this call they are part of
+    /// [`as_bytes`](RefcBinary::as_bytes), which requires every byte it exposes to be
+    /// initialised. Exposing a range no writer has touched is undefined behaviour — the
+    /// slice would read uninitialised off-heap memory. A caller that has not (yet) written
+    /// the range must use [`set_len`](RefcBinary::set_len) instead; a caller that only wants
+    /// to publish *less* than `len` passes the written prefix as `len`
+    /// (**written high water**, never the capacity).
+    ///
+    /// The one intended caller is the writable-accumulator path in `beam_engine`
+    /// (`Machine::alloc_refc_binary_with_capacity`, which currently calls `set_len` on a
+    /// payload whose capacity is about to be handed to an appender, and
+    /// `Machine::cover_writable_capacity`, which republishes a just-grown capacity): both
+    /// extend the length over bytes the append sink writes before any read.
+    ///
+    /// Shrinking is the same as [`set_len`](RefcBinary::set_len)'s (the bytes stay, they are
+    /// just no longer part of the payload), and growing past the current
+    /// [`capacity`](RefcBinary::capacity) is refused rather than silently reallocating.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] if the payload is still shared or if `len` exceeds the
+    /// capacity; in both cases the payload (and its length) is unchanged.
+    pub fn set_len_unwritten(&mut self, len: usize) -> Result<()> {
+        self.require_unique()?;
+        let capacity = self.capacity();
+        if len > capacity {
+            return Err(error::payload_len_exceeds_capacity(len, capacity));
+        }
+        // No byte is written: the caller owns the `[old_len, len)` initialisation (see the
+        // invariant above). Publishing the new length is a header store only.
+        self.header_mut().len = len;
+        Ok(())
+    }
+
     /// Releases the spare capacity: reallocates (if needed) so that the payload reserves
     /// and offers exactly [`len`](RefcBinary::len) writable bytes.
     ///
