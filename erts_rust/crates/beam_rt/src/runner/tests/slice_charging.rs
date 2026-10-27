@@ -70,19 +70,23 @@
 //! | native | 700 | 1 | 0 | 0 | 0 | 0 | 0 | 2 809 | 1 341 315 |
 //! | native | 997 | 1 | 0 | 0 | 0 | 0 | 0 | 3 997 | 1 341 315 |
 //! | native | 998 | 1 | 0 | 0 | 0 | 0 | 0 | 4 000 | 1 341 315 |
-//! | native | 999 | 2 | 1 | 0 | 1 | 0 | 1 | 4 004 | 233 |
-//! | native | 2 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
-//! | native | 4 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
-//! | native | 5 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
-//! | native | 20 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
-//! | native | 80 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | native | 999 | 2 | 1 | 0 | 1 | 0 | 1 | 4 004 | 3 000 |
+//! | native | 2 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 3 000 |
+//! | native | 4 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 3 000 |
+//! | native | 5 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 3 000 |
+//! | native | 20 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 3 000 |
+//! | native | 80 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 3 000 |
 //! | interpreter | 798 | 4 | 3 | 0 | 3 | 1 | 1 | 13 588 | 117 344 |
-//! | interpreter | 2 000 | 9 | 8 | 0 | 8 | 1 | 1 | 34 020 | 190 104 |
-//! | interpreter | 20 000 | 85 | 84 | 0 | 84 | 3 | 1 | 339 968 | 312 394 |
+//! | interpreter | 2 000 | 9 | 8 | 0 | 8 | 1 | 1 | 34 020 | 188 686 |
+//! | interpreter | 20 000 | 85 | 84 | 0 | 84 | 3 | 1 | 339 968 | 304 635 |
 //!
-//! (A row's `heap_size` is the capacity the nursery held when the loop returned, so on the
-//! interpreter tier it is that row's own phase-dependent figure — bounded, never a function of
-//! the work, see the interpreter control at the end of the test.)
+//! (A row's `heap_size` is the capacity the nursery held when the loop returned. On the native
+//! tier's collected rows that is the boundary collapse's carried capacity —
+//! [`collector_floor_words`], 3 000 words, the same figure `boundary_cost`'s churn shape settles
+//! on — and it is 233 only on the un-collected N = 0 row, which reports the space a fresh process
+//! starts with before allocating anything. On the interpreter tier it is that row's own
+//! phase-dependent figure — bounded, never a function of the work, see the interpreter control at
+//! the end of the test.)
 //!
 //! `heap_growth:run/1` (the allocating engine-native shape — one 401-word `test_heap` per
 //! iteration through `sprawl/1`) on the same default native tier:
@@ -179,7 +183,8 @@
 //!      `Process::collect_kind(CollectionKind::Minor)` first and escalates only when the live
 //!      promotion cannot fit the mature region, and this shape's boundary live set is empty (its
 //!      per-iteration tuples are all dead by then), so the minor is promotable and no fullsweep
-//!      is taken — leaving the shape's `heap_size` on the collector's floor (233) instead of
+//!      is taken — leaving the shape's `heap_size` on the capacity a boundary collapse installs
+//!      (3 000 words, the carried minor target [`collector_floor_words`] derives) instead of
 //!      tracking N. Whether a boundary has anything to promote is a fact of the iteration phase
 //!      the pre-emption lands on, not of N (the `heap_growth` rows do promote a live iteration at
 //!      some of their boundaries), so pin 3 states the fullsweep **mechanism** and pins each of
@@ -200,10 +205,12 @@
 //! Its `heap_size` is the nursery capacity the last slice's growth left in place, which the
 //! live-set-targeted minor rule
 //! ([`HeapPolicy::young_minor_target_words`](beam_gc::HeapPolicy::young_minor_target_words))
-//! bounds instead of letting it follow N: **190 104** words at N = 2 000 and **312 394** at
-//! N = 20 000 — a 10x step in the work moves the reported capacity by less than 2x, and both
-//! figures sit far below the 1 341 315 words the native tier's *uncollected* row reports at
-//! N = 997, i.e. the figure is amortized over the pre-emptions instead of tracking the work.
+//! bounds — through the carried growth request the copy-out forces, the same plateau
+//! `reds_door` measures — instead of letting it follow N: **188 686** words at N = 2 000 and
+//! **304 635** at N = 20 000 — a 10x step in the work moves the reported capacity by less than
+//! 2x, and both figures sit far below the 1 341 315 words the native tier's *uncollected* row
+//! reports at N = 997, i.e. the figure is amortized over the pre-emptions instead of tracking the
+//! work.
 //!
 //! Every figure above is the **native baseline** tier's unless the row says `interpreter`, so any
 //! other mode invalidates them: the control is reached by forcing the interpreter on this thread,
@@ -284,16 +291,24 @@ fn emulator_default_policy() -> beam_gc::HeapPolicy {
     crate::config::HeapOptions::default().policy().clone()
 }
 
-/// The collector's floor under this runtime: the young-nursery capacity a collected process with
-/// an **empty** live set settles on, i.e.
-/// [`HeapPolicy::young_minor_target_words`](beam_gc::HeapPolicy::young_minor_target_words)`(0)`
-/// — which is also its
-/// [`nursery_floor_words`](beam_gc::HeapPolicy::nursery_floor_words), so no capacity any
-/// collection installs can sit below it. It is `beam_gc::DEFAULT_MIN_HEAP_WORDS` (233) for the
-/// emulator-default policy, and every saturated `native_reds` row reads it back as
-/// `process_info(self(), heap_size)`.
+/// The capacity a **boundary collection** leaves: the young nursery a collected process with an
+/// **empty** live set settles on.
+///
+/// A `native_reds` boundary fires after the loop's copy-out has forced the growth seam to retire
+/// a space, and the collapse that follows **spends** that request
+/// (`Nursery::pending_growth_need`) through the `need`-augmented minor rule, clamped above by the
+/// keep band's upper edge — `beam_gc`'s `minor_carriage_bound` =
+/// `max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR x young_minor_target_words(live))`. At an
+/// empty live set that clamp **is** the band's floor, so the capacity is
+/// `max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR x young_minor_target_words(0))` —
+/// `max(3 000, 8 x 233) = 3 000` for the emulator-default policy, derived from the two public
+/// constants rather than a calibrated literal. It also bounds every capacity the plain rule
+/// installs below it (`young_minor_target_words(0)` = 233 is that lower edge). Every saturated
+/// `native_reds` row reads the figure back as `process_info(self(), heap_size)`.
 fn collector_floor_words() -> i64 {
-    emulator_default_policy().young_minor_target_words(0) as i64
+    let policy = emulator_default_policy();
+    beam_gc::MINOR_SHRINK_FLOOR_WORDS
+        .max(beam_gc::YOUNG_SHRINK_FACTOR * policy.young_minor_target_words(0)) as i64
 }
 
 /// The largest `NativeReds` iteration count whose **linear** total (`4N + 9`) is still strictly
@@ -598,7 +613,8 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
             "N={n}: exactly one pre-emption and one boundary collection, whatever N is — and that \
              collection is a minor (`major == 0`): the door pins `CollectionKind::Minor` first \
              and only escalates when the live promotion cannot fit the mature region, and this \
-             shape's boundary live set is empty, so it fits the 233-word initial region: {row:?}"
+             shape's boundary live set is empty, so it fits the 233-word initial **mature** region \
+             (`initial_mature_words`, never re-sized): {row:?}"
         );
         // The two mature figures say the same thing from the collector's side: the region is
         // still the one a spawn policy installs (`initial_mature_words`, never re-sized, which
