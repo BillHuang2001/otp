@@ -45,7 +45,7 @@
 //! under a hang guard, never a fixed sleep. The `erl` rows at the bottom cross-check the
 //! observable counterpart on the system driver and skip **loudly** when `erl` is absent.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::active_tests::{
     active_false, active_multi, active_once, active_true, link, link_with, packet, passive_count,
@@ -299,8 +299,31 @@ fn a_passive_port_has_no_mode_and_never_spends() {
         port.take_active_spends().is_empty(),
         "`{{active, false}}` never spends"
     );
-    // ... and the bytes are on the passive path, where the existing `recv` route reads them.
-    until_input(&mut port, 3);
+    // ... and nothing was read at all: a passive socket with no queued receive is never read, so
+    // the bytes wait in the kernel for the next `recv`.
+    assert_eq!(
+        port.input_len(),
+        0,
+        "a passive socket with no queued receive is never read"
+    );
+    assert_eq!(
+        port.named("recv", &[]),
+        ctl_ok(),
+        "the explicit recv verb is the read that answers them"
+    );
+    assert_eq!(
+        port.input_len(),
+        3,
+        "the recv verb read the buffered bytes into the port queue"
+    );
+    assert_eq!(
+        port.registry
+            .get_mut(port.id)
+            .expect("the port is live")
+            .drain_input(),
+        b"abc".to_vec(),
+        "and it takes the whole payload"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -457,16 +480,3 @@ fn the_oracle_agrees_with_what_the_spend_notification_reports() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Rounds until the port's **passive** input queue holds `want` bytes — the non-vacuity witness
-/// that a passive port really took the passive path — under [`GUARD`].
-fn until_input(port: &mut Rig, want: usize) {
-    let deadline = Instant::now() + GUARD;
-    while port.input_len() < want {
-        assert!(
-            Instant::now() < deadline,
-            "the passive bytes never reached the input queue ({} of {want})",
-            port.input_len()
-        );
-        let _ = port.round();
-    }
-}

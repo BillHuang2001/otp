@@ -99,7 +99,7 @@ use super::frame;
 use super::header;
 use super::stat;
 use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
-use super::{Interest, ReadReport, TcpInetDriver};
+use super::{Interest, TcpInetDriver};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply};
 use crate::driver::DriverContext;
 use crate::port_failure::DriverFailure;
@@ -388,9 +388,6 @@ impl TcpInetDriver {
         // 1)`, `:12315`) and leave the deadline to the port's `TIMEOUT` task (`add_multi_timer`,
         // `:12313`, which `Driver::next_timeout` declares).
         self.set_interest(ctx, Interest::READABLE)?;
-        // The enqueue selects the read side even out of a spent `{active, …}` grant's window —
-        // the C's `sock_select(INETP(desc), (FD_READ|FD_CLOSE), 1)` on `TCP_REQ_RECV` (`:12315`).
-        self.read_armed = true;
         Ok(async_ok_reply(id))
     }
 
@@ -567,11 +564,17 @@ impl TcpInetDriver {
         Ok(completed)
     }
 
-    /// The read-readiness callback's body: serve the accepts a listener has queued, then either
-    /// complete the pending receive or move the bytes into the port's input queue (the passive
-    /// floor's `{Port, {data, …}}` path) — that last step only while the descriptor's read side is
-    /// selected (see [`TcpInetDriver::read_armed`]), so a spent `{active, …}` grant leaves the
-    /// peer's bytes in the kernel for the next arm.
+    /// The read-readiness callback's body: serve the accepts a listener has queued, then complete
+    /// the pending receive if one is queued.
+    ///
+    /// **Nothing is read here without a queued `TCP_REQ_RECV`.** The C selects a socket's read
+    /// side in exactly two states — a granted `{active, …}` (`sock_select(desc,(FD_READ|FD_CLOSE),
+    /// (desc->active>0))`, `inet_drv.c:7966`) and a waiting receive (`:12317`) — so with
+    /// `{active,false}` and no receive queued `inet_drv` performs no `read(2)` at all and the
+    /// peer's bytes stay in the kernel for the next `recv`. An active grant's readiness never
+    /// reaches this method (`ready_input` dispatches it to
+    /// [`TcpInetDriver::active_delivery`]); a passive read belongs to the queued operation
+    /// [`TcpInetDriver::try_complete_recv`] answers, or to an explicit `recv` verb.
     pub(super) fn async_ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         self.serve_accepts(ctx)?;
         if !self.state.is_connected() {
@@ -579,28 +582,8 @@ impl TcpInetDriver {
         }
         if self.async_ops.recv().is_some() {
             self.try_complete_recv(ctx)?;
-            return Ok(());
         }
-        // No operation is queued, so nothing can be answered here: the C never reads in this state
-        // at all — read interest is armed only by a queued `TCP_REQ_RECV` (`:12315`) or a granted
-        // `{active, …}` (`:7966`), never by a passive socket's mere readability. The bytes are
-        // still moved onto the port input queue (this floor's passive `{Port, {data, …}}`
-        // channel), which is why the read happens at all, but a close it finds is **not**
-        // discovered: it is left pending in [`TcpInetDriver::pending_close`] for the first read the
-        // C would have made — a queued receive, the `recv` verb, or (after an `{active, …}` arm)
-        // the active delivery. Latching it here would end a connection the oracle keeps using: the
-        // C never observes the peer's end of file, so it keeps answering `ok` to a zero-length
-        // `send` after `shutdown(S, write)` and never tears the descriptor down.
-        //
-        // The reactor's read is additionally gated on the descriptor's read **selection**
-        // ([`TcpInetDriver::read_armed`]): a delivery that spent its `{active, …}` grant deselected
-        // the socket (`inet_drv.c:13106`-`:13114`), so the peer's later bytes must stay in the
-        // kernel for the next arm instead of being moved onto the passive channel here.
-        if !self.read_armed {
-            return Ok(());
-        }
-        self.read_available(ctx, ReadReport::Unselected)
-            .map(|_read| ())
+        Ok(())
     }
 }
 
@@ -660,17 +643,12 @@ impl TcpInetDriver {
         if !arg.is_empty() {
             return Err(error::badarg());
         }
-        // An explicit read is never gated by a spent `{active, …}` grant — `sock_select(…, 0)`
-        // drops only the *reactor's* read callback (`:13107`) — and the port's eager passive read
-        // resumes once it has run, so the read side is selected again (see
-        // [`TcpInetDriver::read_armed`]).
-        self.read_armed = true;
         if self.framed().is_some() {
             return self.verb_recv_framed(ctx);
         }
         // This caller answers a close its own read discovers (below), so the receive ladder is not
         // armed by it.
-        let read = self.read_available(ctx, ReadReport::Answered)?;
+        let read = self.read_available(ctx)?;
         if read == 0 && self.peer_close.seen {
             // This read is what found the peer gone, so it answers the close itself: `closed` for
             // an end-of-file, `econnreset` when the read's error was a reset under
@@ -723,7 +701,7 @@ impl TcpInetDriver {
                     //
                     // A close discovered here is answered by this verb below, so it owes no
                     // receive one-shot.
-                    let read = self.read_available(ctx, ReadReport::Answered)?;
+                    let read = self.read_available(ctx)?;
                     if read == 0 {
                         if self.peer_close.seen {
                             // This read is what found the peer gone (see [`verb_recv`]):

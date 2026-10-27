@@ -74,6 +74,7 @@ use super::super::accept_tests::poll_round;
 use super::async_tests::{async_events, await_events, linked, recv_operand};
 use super::super::opcode_tests::{escript_stdout, op, Rig};
 use super::super::opt::INET_INFINITY;
+use super::super::TcpInetDriver;
 use super::super::wire::{ctl_xerror, INET_REP_ERROR, INET_REP_OK};
 use crate::completion::{InetAsyncResult, InetReason};
 use crate::port_task::ReadMessage;
@@ -161,13 +162,21 @@ fn state_code(rig: &mut Rig) -> u8 {
     reply[4]
 }
 
-/// Whether the port's driver currently holds a **read** registration — the crate's mirror of the
-/// C's `sock_select(…, (FD_READ|FD_CLOSE), 1)` at the `TCP_REQ_RECV` site (`inet_drv.c:12315`).
-fn read_armed(rig: &Rig) -> bool {
+/// Whether the port's driver still holds its poller **registration**.
+///
+/// This is *not* the C's read selection (`desc->active > 0` or a queued `TCP_REQ_RECV`), which the
+/// driver re-derives per callback and which no registration can express (`poller::Interest` has no
+/// empty mask and `mio`'s epoll is edge-triggered): the registration stays armed for the socket's
+/// life so the park can be woken by the peer's edge. What a read is *allowed* to do is asserted
+/// behaviourally instead — the park completes only once the peer writes, and nothing reaches the
+/// passive channel before it.
+fn registered(rig: &Rig) -> bool {
     rig.registry
         .get(rig.id)
         .expect("the port is live")
-        .read_armed()
+        .driver_as::<TcpInetDriver>()
+        .expect("the port runs tcp_inet")
+        .is_registered()
 }
 
 // ---------------------------------------------------------------------------
@@ -193,8 +202,8 @@ fn the_passive_receive_parks_before_a_peer_byte_and_completes_on_the_edge() {
 
     assert_eq!(arm_receive(&mut port, INET_INFINITY), 0, "the first id is 0");
     assert!(
-        read_armed(&port),
-        "the enqueue selects the read side (`sock_select(FD_READ|FD_CLOSE, 1)`, `:12315`)"
+        registered(&port),
+        "the park stays woken by the socket's registration (`sock_select(FD_READ|FD_CLOSE, 1)`, `:12315`)"
     );
 
     assert!(

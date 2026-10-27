@@ -91,15 +91,14 @@
 //! FD_READ|FD_CLOSE, desc->active > 0)`, `:7944`-`:7986`) and **deselects** it the moment a
 //! delivery spends the grant (`:13106`-`:13114`). This crate's poller has no empty-interest mask
 //! (`crate::poller::Interest` is `READABLE`/`WRITABLE`/`BOTH`) and `mio`'s epoll is
-//! **edge-triggered**, so the registration is kept armed for the socket's life and the driver
-//! reproduces the C's selection itself: [`TcpInetDriver::read_armed`](super::TcpInetDriver) is
-//! cleared by the delivery that empties a grant, and set again by an armed `{active, …}` grant
-//! (which also re-registers, so already-buffered bytes produce a fresh edge —
-//! [`TcpInetDriver::after_setopts`](super::TcpInetDriver)), by a queued `TCP_REQ_RECV`, by the
-//! synchronous `recv` verbs and on every fresh connection. While it is clear the reactor reads
-//! nothing, so a peer write during the spent window waits in the kernel for the next arm — where
-//! the C leaves it — instead of being moved onto the passive `{Port, {data, …}}` channel and
-//! going missing from the next delivery.
+//! **edge-triggered**, so the registration is kept armed for the socket's life and the *read* is
+//! the driver's selection: a delivery runs only for an armed grant
+//! ([`TcpInetDriver::active_delivery`](super::TcpInetDriver), reached from `ready_input` and from
+//! [`TcpInetDriver::after_setopts`](super::TcpInetDriver)), and a passive socket is read only by a
+//! queued `TCP_REQ_RECV` or an explicit `recv` verb. With `{active,false}` and no receive queued
+//! the peer's bytes therefore wait in the kernel for the next `recv`, exactly where the C leaves
+//! them, instead of being moved onto the passive `{Port, {data, …}}` channel and going missing from
+//! the next delivery.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`,
 //! `erts/emulator/beam/packet_parser.{c,h}`.
@@ -329,10 +328,9 @@ impl TcpInetDriver {
         }
         // `if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`
         // (`inet_drv.c:13106`-`:13114`): the delivery that emptied the grant deselects the socket's
-        // read side, so a peer write during the spent window is never read by the reactor.
-        if !self.is_active_mode() {
-            self.read_armed = false;
-        }
+        // read side. The registration itself stays armed (no empty `Interest`, edge-triggered), but
+        // nothing reads for it: `ready_input` only calls into this module while a grant is in force,
+        // so a peer write during the spent window waits in the kernel for the next arm or `recv`.
         Ok(())
     }
 
@@ -414,10 +412,9 @@ impl TcpInetDriver {
         if self.state.is_connected() && self.has_socket() && before_active == INET_PASSIVE {
             if self.is_active_mode() {
                 self.set_interest(ctx, Interest::READABLE)?;
-                // `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` (`:7982`): an armed
-                // grant selects the socket's read side again, ending any spent-grant window
-                // (see [`TcpInetDriver::read_armed`](super::TcpInetDriver)).
-                self.read_armed = true;
+                // `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` (`:7982`): an armed grant
+                // selects the socket's read side, and the re-registration makes already-buffered
+                // bytes produce a fresh edge for the inline burst below.
             }
         }
         if self.inline_burst(before_active, before_htype) {

@@ -38,11 +38,12 @@
 //! * an **inherited** `{packet, 2}` complete record survives the close latch: `tcp_clear_input`
 //!   (`:11705`-`:11715`, reached from `tcp_recv_closed` at `:12823`) frees only the *partial*
 //!   framing buffer, never a frame the same call already decoded;
-//! * with **no** operation queued, the reactor's eager passive read still moves the bytes onto the
-//!   port's `{Port, {data, …}}` channel, once — but it discovers **nothing**: the C selects a
-//!   socket's read side only for a waiting `TCP_REQ_RECV` or an `{active, …}` grant
-//!   (`inet_drv.c:12317`, `:7966`), so a close read outside those two states stays pending and
-//!   leaves the descriptor CONNECTED (the measured oracle row for this shape);
+//! * with **no** operation queued, **nothing is read at all**: the C selects a socket's read side
+//!   only for a waiting `TCP_REQ_RECV` or an `{active, …}` grant (`inet_drv.c:12317`, `:7966`), so
+//!   the burst's bytes stay in the kernel, the owner gets no `{Port, {data, …}}` and the descriptor
+//!   stays CONNECTED with the close undiscovered (the measured oracle row for this shape) — the
+//!   first `TCP_REQ_RECV` queued afterwards answers the payload, the second the owed
+//!   `{error, closed}`;
 //! * and the system `erl` agrees: a `gen_tcp:recv/3` on a write-then-close burst answers
 //!   `{ok, Data}`, then `{error, closed}`.
 //!
@@ -59,7 +60,7 @@ use super::opcode_tests::{escript_stdout, listening_port, op, Rig};
 use super::opt::{INET_INFINITY, INET_LOPT_PACKET};
 use super::wire::{ctl_ok, ctl_xerror};
 use super::TcpInetDriver;
-use crate::completion::{CompletionEvent, InetAsyncResult};
+use crate::completion::{CompletionEvent, InetAsyncResult, InetReason};
 use crate::port::DEFAULT_READINESS_RED_BUDGET;
 use crate::port_task::PortNotification;
 use beam_process::PortId;
@@ -140,16 +141,14 @@ fn await_any_events(rig: &mut Rig, want: usize) -> Vec<(u16, InetAsyncResult)> {
     events
 }
 
-/// Drives the reactor until the port reports at least one notification, returning every
-/// notification the rounds produced.
+/// Runs `rounds` full reactor rounds (poller, readiness dispatch, port tasks) and returns every
+/// notification they produced.
 ///
-/// `ready_input` is the only path that reads a socket with **no** operation queued, and it is
-/// reached through the poller: `handle_events` schedules the readiness task and runs it, then
-/// `execute_port_tasks` harvests the port's input into [`PortNotification`]s.
-fn reactor_notifications(rig: &mut Rig) -> Vec<PortNotification> {
-    let guard = Instant::now() + HANG_GUARD;
+/// Used with **no** operation queued: the driver must read nothing at all, so every call answers an
+/// empty vector — `ready_input` reaches the socket and performs no `read(2)`.
+fn drive_rounds(rig: &mut Rig, rounds: usize) -> Vec<PortNotification> {
     let mut notifications = Vec::new();
-    while notifications.is_empty() {
+    for _ in 0..rounds {
         let events = rig.poller.poll(Some(POLL_INTERVAL)).expect("the poller polls");
         rig.registry
             .handle_events(&mut rig.poller, &events)
@@ -159,10 +158,6 @@ fn reactor_notifications(rig: &mut Rig) -> Vec<PortNotification> {
                 .execute_port_tasks(&mut rig.poller, DEFAULT_READINESS_RED_BUDGET)
                 .expect("a port-task round")
                 .notifications,
-        );
-        assert!(
-            Instant::now() < guard,
-            "no notification arrived within {HANG_GUARD:?}"
         );
     }
     notifications
@@ -429,56 +424,65 @@ fn a_complete_packet_2_record_survives_the_close_latch() {
 // Row 4 — no queued operation: the notification channel
 // ---------------------------------------------------------------------------
 
-/// With **no** operation queued, the reactor's read still reaches the owner: `read_available`
-/// queues the bytes it read **before** it latches the close
-/// (the C's `driver_output` inside `tcp_deliver` then `tcp_recv_closed`), so the round that
-/// observes the end-of-file reports `{Port, {data, …}}` first and the close only through
-/// `port_closed()` — each exactly once, never a second `Data`.
+/// With **no** operation queued, **nothing is read at all**: the C selects a socket's read side only
+/// for a waiting `TCP_REQ_RECV` (`inet_drv.c:12317`) or an `{active, …}` grant (`:7966`), so the
+/// burst's bytes stay in the kernel, the owner receives no `{Port, {data, …}}`, the receive counters
+/// stay `0`, and the descriptor stays CONNECTED with the close undiscovered.
+/// The first receive queued afterwards answers the payload; the second the owed `{error, closed}`.
 #[test]
-fn a_write_then_close_reports_data_before_closed_exactly_once() {
+fn a_write_then_close_burst_is_read_only_by_a_queued_receive() {
     let (mut port, mut peer) = linked();
-
     peer.write_all(b"abc").expect("the peer writes its payload");
     peer.shutdown(Shutdown::Write)
         .expect("the peer closes its write side");
-
-    let notifications = reactor_notifications(&mut port);
-    let data: Vec<_> = notifications
-        .iter()
-        .filter_map(|notification| match notification {
-            PortNotification::Data { port, read } => Some((*port, read.flattened())),
-            PortNotification::Closed { .. } => None,
-        })
-        .collect();
+    // Rounds with no operation queued: the socket is neither active nor has a waiting receive, so
+    // the driver performs no `read(2)` — the bytes wait in the kernel.
+    let notifications = drive_rounds(&mut port, 3);
+    assert!(
+        notifications.is_empty(),
+        "a passive socket with no queued receive is never read: {notifications:?}"
+    );
     assert_eq!(
-        data,
-        vec![(port.id, b"abc".to_vec())],
-        "the bytes reach the owner as one {{Port,{{data,…}}}} notification"
+        port.registry
+            .get(port.id)
+            .expect("the port is live")
+            .input_len(),
+        0,
+        "nothing lands on the port's input queue either"
     );
     assert!(
         !port
             .registry
             .port_closed(port.id)
             .expect("the port is live"),
-        "the eager passive read does **not** discover the close: the C selects a socket's read \
-         side only for a waiting `TCP_REQ_RECV` or an `{{active, ...}}` grant (`inet_drv.c:12317`, \
-         `:7966`), so the measured oracle row for this shape keeps the descriptor CONNECTED and \
-         keeps answering a zero-length `send` `ok`"
+        "and the close stays undiscovered — only a read somebody answers may find it"
     );
-    // Exactly once: a further round down the same path reports neither the bytes again nor a
-    // close observation.
-    let again = port
-        .registry
-        .execute_port_tasks(&mut port.poller, DEFAULT_READINESS_RED_BUDGET)
-        .expect("a port-task round")
-        .notifications;
-    assert!(again.is_empty(), "the report is made once: {again:?}");
-    assert!(
-        !port
-            .registry
-            .port_closed(port.id)
-            .expect("the port is live"),
-        "and nothing is latched behind the owner's back"
+    // The receive queued afterwards is the read the C makes: it answers the burst's payload.
+    assert_eq!(
+        port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)),
+        vec![1, 0, 0],
+        "the receive is queued on the port"
+    );
+    let events = await_any_events(&mut port, 1);
+    match &events[0].1 {
+        InetAsyncResult::Data(read) => assert_eq!(
+            read.flattened(),
+            b"abc".to_vec(),
+            "the whole burst is the receive's payload"
+        ),
+        other => panic!("the burst was lost: {other:?}"),
+    }
+    // And the close is owed to the receive after it.
+    assert_eq!(
+        port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)),
+        vec![1, 0, 0],
+        "the second receive is queued"
+    );
+    let events = await_any_events(&mut port, 1);
+    assert_eq!(
+        events[0].1,
+        InetAsyncResult::Error(InetReason::Closed),
+        "the close is reported exactly once, to the receive after the payload"
     );
 }
 
