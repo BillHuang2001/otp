@@ -157,6 +157,15 @@ byte delta the live block moved by); `reset`; `alloc_words`/`alloc_tuple`/`cons`
 `committed_words`, `capacity`, `used`, `available`, `peak_used`, `allocator`. Plus
 `pub enum GrowOutcome { GrewInPlace, MoveRequired }`. Re-exported at the crate root and in the prelude.
 
+**Adoption — no per-process `ReservedHeap` exists today.** The only constructing host is the engine's
+pointer-stable term arena (`beam_engine`'s `ContextHeap`, `src/context.rs:1509`, `fresh_region` at
+`:1781-1791`, plus the survivor region at `src/context/reclaim.rs:315`), which backs the
+`-eval`/table-less route, not a process heap; `beam_process` and `beam_gc` never construct one, and
+`beam_rt`'s mention (`src/runtime/retention.rs:27`) is a description of that arena. A fresh process's
+heap is instead a fixed-capacity [`Heap`] inside `beam_gc`'s `HeapSpace` (`beam_gc/src/space.rs:58-61`),
+so growth is by GC replacement (`beam_gc/src/nursery.rs:191-192`). Grep `ReservedHeap` before claiming
+otherwise.
+
 **Host-adoption contract (the point of the type):**
 1. On an `AllocKind::Heap` exhaustion the host calls `try_grow(n)` and retries. `GrewInPlace` ⇒ the
    committed limit was raised (to exactly `used + n`), the bump pointer did **not** move — a cached
