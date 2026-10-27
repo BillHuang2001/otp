@@ -534,3 +534,29 @@ change touches.
   bucket-chain histogram) are untouched: the run buckets are an *accounting* index over the same
   runs (`TermStore::words`/`blocks`/`memory` bookkeeping is identical — every word is still counted
   once, and a reused run is still exact-fit), and the hash is only *carried*.
+### One arena run per copy — tried, measured, **reverted**
+The remaining per-op reservation count was attacked directly: `TermStore::copy` used to reserve one
+run **per node** (`alloc_words(n)` as the recursion reaches each node — 28 reservations and 28
+reclamation records for this payload's 27 nodes / 71 words). The experiment replaced that with **one
+contiguous run per copy**: a sizing pass (`copy_words`, mirroring the writer node for node) measures
+the graph, one `alloc_words(total)` reserves it, and a write pass (`write_term`) fills it behind a
+single monotone cursor, so `free` becomes one reclamation.
+Measured exactly as above (same module, `N = 100 000` pairs against `N = 0`), on the same host
+session, `/proc/loadavg` `56.59 50.79 75.04` (before) and `25.87 29.96 54.62` (after):
+| case | per-object reservations | one run per copy | ratio |
+|---|---|---|---|
+| `ets_copy` | **20 753** / 20 752 instr/op | **20 371** / 20 371 / 20 245 (`N = 200 000`) | **0.982×** |
+| `etf_roundtrip` (control) | 22 555 / 22 558 | 22 597 / 22 616 | 1.002× (flat) |
+So the shape change is real but only **−1.8 %**, i.e. **−382 instructions/op** — under the ≥3 %
+margin this was gated on — and it is *stable* (two `N` points, three pairs, ±0.1 instr/op), so the
+figure is a measurement, not noise. The reason is arithmetic: the 28 reservations and 28 releases
+cost roughly what the extra sizing traversal costs (`copy_words` re-classifies all 27 nodes and
+re-reads their headers, which is most of what an allocation avoided), and the write pass then pays a
+bounds check per node (`CopySink::take`) to stay sound inside the one run.
+The shape was reverted, and the per-object reservation stays, because the change also **coarsens
+reuse**: an exact-fit free run is now a whole object, so a table churning objects of *differing*
+sizes reuses far fewer freed runs than the per-node scheme (whose buckets are the handful of small
+node sizes every object shares) and therefore maps more blocks. That is a real memory downside on the
+heterogeneous shapes a real table sees — `ets:info(T, memory)` is unaffected (`Table::memory` sums
+live words, not block capacity), but the arena's high-water is not. Paying that for <2 % of the op
+was not a trade worth making; the next lever on this path is not the reservation count.
