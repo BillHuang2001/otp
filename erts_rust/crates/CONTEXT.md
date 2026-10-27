@@ -260,8 +260,8 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   is a bad test, and "loosening it until it cannot fail" is not the fix either.
 - Host load is not a result: read `/proc/loadavg` before and after a measurement run and prefer paired,
   interleaved sampling over absolute wall time (this host is shared).
-- **Current state: every crate suite is green** (unit + integration + the oracle-cross-checked suites), and
-  the workspace builds warning-free. Per-crate counts live in each crate's own `CONTEXT.md` — do not pin an
+- **Current state: the workspace builds warning-free; one `beam_rt` integration test is red.** `beam_rt/tests/io_device.rs::a_live_non_stdio_device_is_a_typed_gap` still pins the old exit-3 capability gap, while an explicit live non-stdio device now reaches `error:terminated` (CLI exit 1 with empty stdout — the oracle's own exit code), so the test needs rewriting; every other crate suite is green modulo the OTP-version-skew tests listed per crate.
+  Per-crate counts live in each crate's own `CONTEXT.md` — do not pin an
   aggregate total here, and check `git log` for the latest figure rather than trusting a copied one.
 
 ## Routing Table
