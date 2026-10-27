@@ -65,11 +65,13 @@
 //! ([`support::skip_loudly`]): `erl` is needed for every oracle half and `erlc` for the one
 //! `-s`-route fixture.
 //!
-//! [`a_read_of_already_buffered_data_on_an_accepted_socket_stalls_to_the_peer_close`] is the one
-//! `#[ignore]`d case. It pins a **known** `beam_io` residual (an accepted socket whose data was
-//! already buffered before the read op armed produces no port event at all, so the wait only ends
-//! at EOF) by asserting today's answer *and* the oracle's, so closing the gap flips exactly one
-//! test.
+//! [`a_read_of_already_buffered_data_on_an_accepted_socket_answers_closed_at_the_peer_close`] is the one
+//! `#[ignore]`d case. It pins a **known `beam_io` residual** — an accepted socket whose payload
+//! was drained into the port's input queue before the read op armed raises no read event, so this
+//! runtime answers `{error,closed}` at the peer's close where the oracle answers `{ok,<<"hi">>}`
+//! from its buffer — by asserting today's answer *and* the oracle's, so closing the gap flips
+//! exactly one test. Its own waits are bounded like every other case here, so running it with
+//! `--ignored` costs a few seconds and can never hang the suite.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -171,7 +173,7 @@ const PORT_S_ROUTE: u16 = 21333;
 const PORT_SECOND_READ: u16 = 21337;
 /// [`an_accept_with_no_client_ends_at_the_port_event_deadline`].
 const PORT_DEADLINE: u16 = 21345;
-/// [`a_read_of_already_buffered_data_on_an_accepted_socket_stalls_to_the_peer_close`].
+/// [`a_read_of_already_buffered_data_on_an_accepted_socket_answers_closed_at_the_peer_close`].
 const PORT_BUFFERED: u16 = 21349;
 
 // ---------------------------------------------------------------------------------------------
@@ -1262,34 +1264,39 @@ fn still_running_after(program: &Path, args: &[&str], window: Duration) -> Verdi
 // 9. the documented residual (ignored)
 // ---------------------------------------------------------------------------------------------
 
-/// **Known gap (ignored):** a passive read on an **accepted** socket whose payload was already
-/// buffered *before* the read op armed produces no port event at all.
-///
-/// This runtime's answer today is `{error,closed}`, and it only arrives when the peer closes:
-/// nothing wakes the nested wait, the read interest the driver should have registered never
-/// fires, and the wait's own no-progress deadline is not reached because the *listener's*
-/// interest keeps the round busy until EOF. The oracle answers `{ok,<<"hi">>}` immediately, from
-/// the buffer.
+/// **Known `beam_io` residual (ignored):** a passive read on an **accepted** socket whose payload
+/// was buffered *before* the read op armed is answered from the socket's own buffer by the oracle
+/// and not by this runtime.
 ///
 /// | leg | printed answer |
 /// |---|---|
-/// | this runtime | `recv={error,closed}` (after the peer closes) |
-/// | the oracle | `recv={ok,<<"hi">>}` (immediately) |
+/// | this runtime | `recv={error,closed}` — typed, and printed only once the peer closes |
+/// | the oracle | `recv={ok,<<"hi">>}` — immediately, from the buffer |
 ///
-/// The defect is in `beam_io`'s **accepted-socket** path (`TcpInetDriver::from_accepted` /
-/// read-interest registration; the C attempts the read synchronously at control time,
-/// `inet_drv.c:12309`), not in this crate's nested wait: the connect-side socket with the same
-/// pre-buffered payload is delivered
-/// ([`a_passive_read_of_data_sent_after_the_arm_completes_on_a_connect_side_socket`]), and the
-/// only thing that differs is which port adopted the descriptor. It is a **typed mismatch after a
-/// silent stall, never a hang**: both runtimes exit 0.
+/// Both legs are **typed and bounded**, never a hang: this runtime's reader is the socket's
+/// **owner** (the fixture opens, accepts and reads in one process), so the completion addressing
+/// is not involved — the read op simply never sees an event, and what ends the wait is the peer's
+/// FIN (`Peer::close` after [`ARM_MARGIN`]), which answers `{error,closed}`. With a peer that
+/// stays open and silent the same read ends at the nested wait's own typed diagnostic
+/// (`unsupported: port event: … within the 5 s bound`, exit 3), measured. Both runtimes exit 0 on
+/// the pinned shape; the divergence is the payload, not the shape.
 ///
-/// Both legs are asserted, so closing the gap in `beam_io` flips exactly this test (un-ignore it
-/// at the same time) and no other case has to be weakened. Run it with
-/// `--ignored --test-threads=1`.
+/// The gap is in **`beam_io`'s `TcpInetDriver`**, and it is one missing attempt: the C reads
+/// synchronously at **control** time (`inet_drv.c:12309`), so bytes already in the kernel/port
+/// buffer satisfy the operation before any interest is armed; this driver has no control-time read
+/// attempt — it arms read interest and reads from a readiness callback or from
+/// `try_complete_recv` — and a payload the port's input queue already holds is left for nobody.
+/// The two related shapes are the same code: `TcpInetDriver::from_accepted`'s read-interest
+/// registration (a connect-side socket with the identical pre-buffered payload *is* delivered —
+/// [`a_passive_read_of_data_sent_after_the_arm_completes_on_a_connect_side_socket`]), and the
+/// destructive `latch_peer_close` that loses a send-then-close peer's bytes outright.
+///
+/// Flipping this test is the whole change: un-ignore it and its expectations become the oracle's
+/// on both legs. Run it with `--ignored --test-threads=1`; every wait it makes is bounded
+/// ([`LINE_TIMEOUT`], [`EXIT_TIMEOUT`], [`PEER_DEADLINE`]), so it cannot hang the suite.
 #[test]
-#[ignore = "beam_io: an accepted socket's already-buffered payload raises no read event"]
-fn a_read_of_already_buffered_data_on_an_accepted_socket_stalls_to_the_peer_close() {
+#[ignore = "beam_io TcpInetDriver has no control-time read attempt (inet_drv.c:12309): an accepted socket's already-buffered payload raises no read event, so the read answers {error,closed} at the peer's close where the oracle answers {ok,<<\"hi\">>}"]
+fn a_read_of_already_buffered_data_on_an_accepted_socket_answers_closed_at_the_peer_close() {
     let Some(oracle) = require_oracle("inet_nested (buffered residual)") else {
         return;
     };

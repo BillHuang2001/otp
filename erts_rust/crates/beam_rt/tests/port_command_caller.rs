@@ -23,13 +23,18 @@
 //!
 //! # The two rules this file pins
 //!
-//! 1. **The recipient is the command's caller, not the port's owner.** ERTS sends a completed
+//! 1. **The recipient is the operation's issuer, not the port's owner.** ERTS sends a completed
 //!    command's `{inet_reply, Port, Status[, Tag]}` to `desc->caller` — the process that ran the
 //!    `port_command/2` — and clears that field as it sends it
 //!    (`inet_reply_finish`, `../../erts/emulator/drivers/common/inet_drv.c:2614-2637`, set by
-//!    every `tcp_inet_command*`). Any process may command a port another process owns, so
-//!    addressing the reply to the owner leaves the real issuer blocked in
-//!    `prim_inet:send/4`'s `receive {inet_reply, S, Status, Mref}` for ever.
+//!    every `tcp_inet_command*`). A queued **asynchronous** operation carries the same fact per
+//!    operation — `enq_async`'s `opp->caller = driver_caller(desc->port)`
+//!    (`inet_drv.c:2427`), which `send_async_ok`/`send_async_error` address — so a passive
+//!    `gen_tcp:recv/3`'s `{inet_async, Port, Id, Result}` belongs to the process that issued the
+//!    read as well. Any process may command or read a port another process owns, so addressing
+//!    the completion to the owner leaves the real issuer blocked in `prim_inet:send/4`'s
+//!    `receive {inet_reply, S, Status, Mref}` — or in `prim_inet:recv0/3`'s `after`-less
+//!    `receive {inet_async, S, Ref, Status}` — for ever.
 //! 2. **A command issued inside a scheduler slice must park on a route that can be resumed.**
 //!    The reply is a *message*, so the issuer's `receive` has to suspend the **process**. A
 //!    callee entered on the nested `call_bif` route inside a slice can never be advanced (that
@@ -38,45 +43,53 @@
 //!    in-machine entry exactly there (`context::apply::fun_image_guard_yields_for_a_slice`,
 //!    consumed by `context::execution::resolve_external_call`).
 //!
-//! # What each case would have caught before the fix
+//! # The matrix: what each row pins
 //!
-//! | Case | Pre-fix behaviour it rules out |
+//! | Case | The rule it pins |
 //! |---|---|
-//! | [`a_spawned_sender_is_resumed_by_its_own_reply`] | the spawned `gen_tcp:send/2` wrote its bytes and then hung: `prim_inet:send/3` was refused the in-machine entry, folded into the nested route, and its `receive` came back as `unsupported: … process blocked (no message available)` (CLI exit 3, child never reports) |
-//! | [`a_spawned_command_reply_carries_its_own_tag_and_never_reaches_the_owner`] | the `{inet_reply, S, ok, Tag}` went to the port's **owner** — the child blocked and the owner received a message it never asked for, so the probe answered `no_reply` / `owner_got_reply` instead of `{tagged,ok,true}` / `no_owner_reply` |
-//! | [`two_concurrent_senders_each_get_their_reply`] | the second (concurrent) issuer never saw its reply — only the recorded *owner* would have been addressed |
-//! | [`a_send_on_a_closed_socket_is_closed`], [`a_send_after_the_peer_closed_is_closed`] | a command's negative answer is also an `{inet_reply, …}`; a mis-addressed one would hang the caller instead of answering `{error,closed}` |
-//! | [`an_untagged_command_gets_no_reply_and_the_port_dies_of_einval`] | over-delivery: a command that carries **no** caller tag must produce **no** reply (the C's `init_caller` failure is `driver_failure_posix(…, EINVAL)`, `inet_drv.c:12635-12638`) |
+//! | [`a_spawned_sender_is_resumed_by_its_own_reply`] | a spawned `gen_tcp:send/2` returns `ok`: the callee enters **in-machine** (`prim_inet:send/3` issues `term_to_binary/2`, so the call-site guard's per-function arm yields to the in-machine entry where the context cannot pump), its `receive` suspends the process, and the reply resumes it |
+//! | [`a_spawned_command_reply_carries_its_own_tag_and_never_reaches_the_owner`] | the `{inet_reply, S, ok, Tag}` carries the **issuer's** own `Mref` and the owner receives nothing |
+//! | [`two_concurrent_senders_each_get_their_reply`] | a second, concurrent issuer on one port still gets its own reply |
+//! | [`a_read_from_a_process_that_is_not_the_controlling_process`] | the read twin: a **non-owner**'s passive `gen_tcp:recv/3` is answered by its own `{inet_async, …}` while the owner stays alive |
+//! | [`a_send_on_a_closed_socket_is_closed`], [`a_send_after_the_peer_closed_is_closed`] | a command's negative answer is a reply too — `{error,closed}` instead of a hang |
+//! | [`an_untagged_command_gets_no_reply_and_the_port_dies_of_einval`] | a command carrying **no** caller tag produces **no** reply: the C's `init_caller` failure is `driver_failure_posix(…, EINVAL)` (`inet_drv.c:12635-12638`) |
 //!
 //! # What is compared
 //!
-//! Every probe is one `-eval` expression run under the built `beam_rt` binary **and** under the
-//! system `erl`, with the **exit code** and the **stdout bytes** required to be equal
-//! (`support::differential_eval`) and the bytes then pinned exactly, so the suite still
-//! discriminates without a toolchain. A missing `erl` is a **loud** skip
-//! ([`support::skip_loudly`]), never a silent pass.
+//! Each probe runs under the built `beam_rt` binary **and** under the system `erl`, with the
+//! **exit code** and the **stdout bytes** required to be equal, and the bytes then pinned
+//! exactly, so the suite still discriminates without a toolchain. A probe is either one `-eval`
+//! expression ([`support::differential_eval`]) or a compiled fixture on the `run` route (its
+//! `run` action prints the target's own result after the probe's line). A missing `erl` is a
+//! **loud** skip ([`support::skip_loudly`]), never a silent pass.
 //!
 //! Each probe additionally asserts the **essential invariant** rather than only the text: the
-//! run exits `0` and its stderr never carries the pre-fix `process blocked` verdict, i.e. the
-//! process that issued the command was *resumed* and not left parked.
+//! run exits `0` and its stderr never carries the `process blocked` verdict, i.e. the process
+//! that issued the command or the read was *resumed* and not left parked.
 //!
 //! # Determinism (no volatile value is pinned, no probe can hang)
 //!
 //! Every socket is loopback-only (`{ip, {127,0,0,1}}`, port `0`) and the ephemeral port is
-//! never pinned; every socket and port is closed before the probe answers. A spawned helper that
-//! must let the parent's read arm first waits on a **bounded** `receive after 300 -> ok end`
+//! never pinned; every socket and port is closed before the probe answers. A wait that must let
+//! the other side's socket operation arm first is a **bounded** `receive after 300 -> ok end`
 //! (never a `timer:sleep`, never an unbounded wait), and every probe-side wait carries its own
-//! bound, so a lost reply shows up as a visible mismatch. [`support::PROBE_TIMEOUT`] additionally
-//! kills a child that never answers.
+//! bound, so a lost reply or a lost read shows up as a visible mismatch. [`support::PROBE_TIMEOUT`]
+//! additionally kills a child that never answers.
 //!
-//! # The one matrix row this runtime cannot pin yet
+//! # Where the remaining read-side residual lives
 //!
-//! The read-side twin — `gen_tcp:recv/3` from a process that is **not** the controlling process
-//! (`{ok, Bin}`, no `not_owner`) — is [`a_read_from_a_process_that_is_not_the_controlling_process`],
-//! `#[ignore]`d because two *other*, independent gaps stand in its way (a spawned process's
-//! passive `gen_tcp:recv/3` never returns; and an owning helper left parked in a bounded
-//! `receive` makes the CLI report `unsupported: run: process blocked`). Neither is the
-//! reply-recipient rule, so the row is documented here and escalated rather than pinned green.
+//! The read twin is pinned here ([`a_read_from_a_process_that_is_not_the_controlling_process`]):
+//! a non-owner's passive `gen_tcp:recv/3` is answered because the port layer records **per
+//! operation** who issued it (`PortMeta::async_callers`, taken when that id's `{inet_async, …}` is
+//! rendered) and addresses the completion there.
+//!
+//! One read shape is still a `beam_io` residual and is **not** pinned here: a read of data that
+//! was already buffered before the read operation was issued, with a `timeout 0`. The oracle
+//! answers it from the buffer because the C attempts the receive at control time
+//! (`inet_drv.c:12309`); `TcpInetDriver` has no control-time read attempt, so it times out — for
+//! the port's **owner** as well, which is what makes it a driver gap rather than an addressing
+//! one. It is recorded, with its oracle expectation, as
+//! [`../inet_async_caller.rs`](../inet_async_caller.rs)'s `b` case (`#[ignore]`d on that row).
 
 // The shared harness is compiled in whole; this suite uses its bounded runner, its toolchain
 // discovery and its `-eval` differential.
@@ -330,46 +343,104 @@ fn an_untagged_command_gets_no_reply_and_the_port_dies_of_einval() {
 }
 
 // ---------------------------------------------------------------------------------------
-// The matrix row this runtime cannot pin yet
+// (1) the read twin: a non-owner's passive read is answered by its own operation
 // ---------------------------------------------------------------------------------------
 
-/// A passive `gen_tcp:recv/3` from a process that is **not** the controlling process succeeds
-/// (`{ok, <<"hi">>}`) — the oracle's answer, with no `not_owner` in sight.
+/// A passive `gen_tcp:recv/3` issued by a process that is **not** the socket's controlling
+/// process returns the peer's data — the read twin of the reply rule above.
 ///
-/// `#[ignore]`d: two *other* gaps stand between this runtime and the row, and neither is the
-/// reply-recipient rule this file pins.
+/// A passive read is not a control-op answer: `prim_inet:recv0/3` receives an operation id back
+/// and then `receive`s the driver's `{inet_async, Port, Id, Result}` with **no** `after`, and the
+/// C addresses that completion to the operation's issuer (`enq_async`'s
+/// `opp->caller = driver_caller(desc->port)`, `inet_drv.c:2427`). Addressed to the socket's owner
+/// instead, the spawned reader below would never be woken — it would wait out its own 3 s driver
+/// timeout and answer `no_answer` — so the pinned `recv={ok,<<"hi">>}` *is* the addressing rule.
 ///
-/// * The reader must be a second process, and a **spawned** process's passive `gen_tcp:recv/3`
-///   never returns today — measured with the payload already buffered *and* with a `0` timeout,
-///   so it is the read op's completion, not the arrival, that is lost.
-/// * The alternative shape (the `-eval` process reads a socket a spawned owner opened, so the
-///   reader is the nested route that *does* complete a read) needs that owner to stay alive, and
-///   a spawned process left parked in a bounded `receive` at the end of a `-eval` run makes the
-///   CLI report `unsupported: run: process blocked (no message available)` (exit 3) instead of
-///   exiting on its own.
+/// The **owner stays alive** for the whole probe: it opens the pair, accepts, and issues the
+/// write, so the reader's only distinguishing property is that it does not control the socket.
+/// An owner that exits before the read is a different (and unpinnable) shape: the oracle answers
+/// `{error, einval}` there — measured 3/3 on OTP 29.1.2 — because the socket's driver port dies
+/// with its owner.
 ///
-/// The expectation below is the **oracle's own**, recorded with `erl -noshell -eval …`; the row
-/// stays visible here so it is re-pinned the moment either blocker is closed.
+/// Driven on the **`run`** route, whose pass loop returns as soon as the target pid does
+/// (`Runtime::pump_run_to_completion`), so a helper's bookkeeping can never turn the run into
+/// `unsupported: run: process blocked` the way a parked child does on the `-eval` route. The
+/// child is killed and every socket closed before the target returns, so nothing is left parked.
 #[test]
-#[ignore = "a spawned process's passive gen_tcp:recv/3 never returns; an owning helper's parked receive makes the CLI report `process blocked` (both outside the reply-recipient rule)"]
 fn a_read_from_a_process_that_is_not_the_controlling_process() {
-    let expr = "begin \
-         P = self(), \
-         spawn(fun() -> \
-             {ok,L} = gen_tcp:listen(0,[{ip,{127,0,0,1}},binary,{active,false}]), \
-             {ok,Port} = inet:port(L), \
-             {ok,Cl} = gen_tcp:connect({127,0,0,1},Port,[binary,{active,false}]), \
-             {ok,A} = gen_tcp:accept(L), \
-             ok = gen_tcp:send(A, <<\"hi\">>), \
-             P ! {sock, Cl} end), \
-         Cl = receive {sock,S} -> S after 3000 -> none end, \
-         R = gen_tcp:recv(Cl, 2, 3000), \
-         io:format(\"~p~n\",[{R}]) end";
-    pinned(
-        "a non-owner gen_tcp:recv/3 succeeds",
-        expr,
-        "{ok,<<\"hi\">>}\n",
+    const SOURCE: &str = "\
+-module(pc_recv).\n\
+-export([go/0]).\n\
+go() ->\n\
+    {ok,L} = gen_tcp:listen(0,[{ip,{127,0,0,1}},binary,{active,false}]),\n\
+    {ok,Port} = inet:port(L),\n\
+    {ok,Cl} = gen_tcp:connect({127,0,0,1},Port,[binary,{active,false}]),\n\
+    {ok,A} = gen_tcp:accept(L),\n\
+    P = self(),\n\
+    Child = spawn(fun() -> P ! {r, gen_tcp:recv(Cl, 2, 3000)} end),\n\
+    receive after 300 -> ok end,\n\
+    ok = gen_tcp:send(A, <<\"hi\">>),\n\
+    Ans = receive {r,X} -> X after 5000 -> no_answer end,\n\
+    exit(Child, kill),\n\
+    gen_tcp:close(Cl), gen_tcp:close(A), gen_tcp:close(L),\n\
+    io:format(\"recv=~p~n\",[Ans]),\n\
+    ok.\n";
+    const EXPECTED: &str = "recv={ok,<<\"hi\">>}\n";
+    let Some(fixture) = support::ErlangFixture::compile(
+        "port_command_caller",
+        "non_owner_recv",
+        "pc_recv",
+        SOURCE,
+    ) else {
+        return;
+    };
+    let Some(oracle) = support::resolve_oracle() else {
+        support::skip_loudly("port_command_caller", "no `erl` oracle on $PATH");
+        return;
+    };
+    let dir = fixture.dir().to_str().expect("the fixture dir is UTF-8");
+    let beam = fixture.beam();
+    let beam = beam.to_str().expect("the fixture path is UTF-8");
+    let Some(oracle_run) = support::run_bounded(
+        &oracle,
+        &[
+            "-noshell", "-pa", dir, "-s", "pc_recv", "go", "-s", "init", "stop",
+        ],
+    ) else {
+        support::skip_loudly(
+            "port_command_caller",
+            "the oracle did not answer the non-owner read inside the probe timeout",
+        );
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&oracle_run.stdout),
+        EXPECTED,
+        "the oracle's own answer moved — re-measure before trusting this row"
     );
+    let Some(run) = support::run_runtime(&["-noshell", "run", beam, "pc_recv:go/0"]) else {
+        support::skip_loudly(
+            "port_command_caller",
+            "the `run` action did not finish the non-owner read inside the probe timeout",
+        );
+        return;
+    };
+    assert_eq!(
+        run.stdout,
+        format!("{EXPECTED}ok\n"),
+        "a non-owner's passive read must be answered with the peer's data — got {:?}, \
+         stderr {:?}",
+        run.stdout,
+        run.stderr
+    );
+    assert_eq!(run.code, 0, "exit code — stderr {:?}", run.stderr);
+    for forbidden in ["blocked", "unsupported", "term not found"] {
+        assert!(
+            !run.stderr.contains(forbidden),
+            "the reader must be resumed, not parked or refused (`{forbidden}`) — stderr {:?}",
+            run.stderr
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------
