@@ -433,6 +433,12 @@ impl RuntimeContext<'_> {
         // callback has had its chance to set `PORT_CONTROL_FLAG_BINARY` (`io.c:4403-4411`) and to
         // leave the reply pointer it answered with.
         let ports = std::rc::Rc::clone(&self.runtime.ports);
+        // The **issuer** of the operation, for the case where it queues an asynchronous one: the
+        // driver addresses that operation's `{inet_async, …}` completion to the process whose
+        // control op was handed the id (the C's `opp->caller = driver_caller(desc->port)`,
+        // `inet_drv.c:2427`), and `port_control/3` is not restricted to the port's owner — which
+        // is what lets a spawned reader's `gen_tcp:recv/3` return at all.
+        let caller = self.pid();
         let (reply, binary, shape) = {
             let mut registry = ports
                 .try_borrow_mut()
@@ -446,7 +452,7 @@ impl RuntimeContext<'_> {
             registry.open_driver_atom_view(&view);
             // The window is closed on the error path too: leaving it open would keep the lease and
             // force the next intern anywhere into a copy of the whole table.
-            let reply = registry.port_control(port, &operation.to_string(), &bytes);
+            let reply = registry.port_control(port, &operation.to_string(), &bytes, Some(caller));
             registry.close_driver_atom_view();
             let reply = reply?;
             let binary = registry.control_binary(port);

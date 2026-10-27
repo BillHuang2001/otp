@@ -580,6 +580,113 @@ impl Driver for StageDriver {
     }
 }
 
+/// The pid that issues a control op on a port it does **not** own — the C's `desc->caller` for
+/// that operation.
+const CALLER: ProcessId = ProcessId::new(13, 0);
+
+/// A driver that answers an **async-allocating** control op and stages the completion(s) that
+/// op's id names — the shape `tcp_inet`'s `TCP_REQ_RECV` has (`[INET_REP_OK] ++ <<Id:16/big>>`,
+/// `async_ok_reply`, `inet_drv.c:12319`).
+///
+/// A real driver stages that completion from the **same** callback whenever the bytes are already
+/// there (`try_complete_recv` at enqueue time), which is why the issuer has to be recorded before
+/// the drain that follows a control call.
+struct QueueDriver {
+    /// The op id the control reply allocates.
+    id: u16,
+    /// How many completions with that id the control call stages: one is the ordinary answer, two
+    /// the duplicate a mis-addressed re-report would produce.
+    staged: usize,
+    /// What the teardown stages, if anything — the C's `async_error_am_all` flush.
+    teardown: Option<CompletionEvent>,
+}
+
+impl QueueDriver {
+    /// A driver that answers the receive verb by allocating `id` and staging `staged` completions
+    /// for it.
+    fn new(id: u16, staged: usize) -> QueueDriver {
+        QueueDriver {
+            id,
+            staged,
+            teardown: None,
+        }
+    }
+
+    /// A driver that allocates `id` and answers it from its **teardown**, the state a close finds
+    /// a queued operation in.
+    fn flushing(id: u16, event: CompletionEvent) -> QueueDriver {
+        QueueDriver {
+            id,
+            staged: 0,
+            teardown: Some(event),
+        }
+    }
+
+    /// The verb `prim_inet:recv/3` sends — `TCP_REQ_RECV`(42) offset by the control magic word,
+    /// which is the decimal `c_uint` `erts_internal:port_control/3` forwards.
+    fn recv_op() -> String {
+        format!("{}", super::ops::inet_opts::INET_CONTROL_MAGIC + 42)
+    }
+
+    /// The C's `[INET_REP_OK] ++ <<Id:16/big>>`.
+    fn allocated_reply(id: u16) -> Vec<u8> {
+        vec![1, (id >> 8) as u8, (id & 0xff) as u8]
+    }
+}
+
+impl Driver for QueueDriver {
+    fn name(&self) -> &str {
+        "async_queue_fixture"
+    }
+
+    fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        // A write is never what these tests are about; consume it so the stream stays honest.
+        let written = ctx.output().len();
+        ctx.output().consume(written);
+        Ok(written)
+    }
+
+    fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn control(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        _command: &str,
+        _arg: &[u8],
+    ) -> Result<Vec<u8>> {
+        for _ in 0..self.staged {
+            ctx.deliver_completion(async_ok(self.id))?;
+        }
+        Ok(QueueDriver::allocated_reply(self.id))
+    }
+
+    fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        match self.teardown.take() {
+            Some(event) => ctx.deliver_completion(event),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A registry holding `driver` as a live port owned by `owner`, whose C counterpart declares a
+/// `control` callback — the capability every async-allocating verb is gated on
+/// (`call_driver_control` answers `badarg` without one, `io.c:4035`).
+fn registry_with_control(driver: QueueDriver, owner: ProcessId) -> (PortRegistry, PortId) {
+    let mut registry = PortRegistry::new().expect("a port registry");
+    let mut meta = port_meta(owner, StreamType::Binary);
+    meta.driver_has_control = true;
+    let id = registry
+        .register(Box::new(driver), meta)
+        .expect("the fixture port registers");
+    (registry, id)
+}
+
 /// The `port_info` metadata of a `{spawn_driver, _}` port owned by `owner` on `stream` — the
 /// block `open_port/2`'s driver arm builds, without a child, a descriptor or a `Name` decode.
 fn port_meta(owner: ProcessId, stream: StreamType) -> PortMeta {
@@ -594,6 +701,8 @@ fn port_meta(owner: ProcessId, stream: StreamType) -> PortMeta {
         owner,
         // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
         command_caller: None,
+        // And no asynchronous operation is queued yet either.
+        async_callers: HashMap::new(),
         // The `Name` form whose bytes come from the driver's own `output` callback (see
         // `PortName::bytes_from_driver_output`), which is the arm a socket driver takes.
         kind: PortName::SpawnDriver,
@@ -735,6 +844,8 @@ fn a_snapshot_attributes_only_its_own_ports_completion() {
         owner: OWNER,
         stream: StreamType::Binary,
         line: None,
+        command_caller: None,
+        async_callers: HashMap::new(),
     };
     let packets = completions(registry.drain_io_completions(Some(own)));
     assert_eq!(
@@ -769,6 +880,8 @@ fn a_snapshot_attributes_only_its_own_ports_completion() {
         owner: OTHER_OWNER,
         stream: StreamType::List,
         line: None,
+        command_caller: None,
+        async_callers: HashMap::new(),
     };
     assert!(
         registry.drain_io_completions(Some(stale)).is_empty(),
@@ -777,6 +890,122 @@ fn a_snapshot_attributes_only_its_own_ports_completion() {
     assert!(
         registry.drain_io_completions(None).is_empty(),
         "and the drop is final: the completion was never re-reported against a reused number"
+    );
+}
+
+/// A queued asynchronous operation's completion is addressed to the process that **issued** the
+/// control op, not to the port's owner — the C's `opp->caller = driver_caller(desc->port)`
+/// (`enq_async_w_tmo`, `inet_drv.c:2427`), which `send_async_ok`/`send_async_error` address the
+/// `{inet_async, …}` to (`:2494-2500`/`:2541-2559`).
+///
+/// This is what makes a **spawned non-owner's** passive `gen_tcp:recv/3` return at all: its
+/// `prim_inet:recv0/3` waits in `receive {inet_async, S, Ref, Status}` with no `after`
+/// (`erts/preloaded/src/prim_inet.erl:808-826`), so a data or timeout completion addressed to the
+/// owner leaves the real reader parked for ever.
+#[test]
+fn a_recorded_operation_id_answers_the_process_that_issued_the_control_op() {
+    let (mut registry, id) = registry_with_control(QueueDriver::new(7, 1), OWNER);
+    let reply = registry
+        .port_control(id, &QueueDriver::recv_op(), b"", Some(CALLER))
+        .expect("the fixture driver answers the receive verb");
+    assert_eq!(
+        reply,
+        QueueDriver::allocated_reply(7),
+        "the C's `[INET_REP_OK] ++ <<Id:16/big>>` names the operation the caller parks on"
+    );
+    let packets = completions(registry.drain_pending_events());
+    assert_eq!(
+        packets.len(),
+        1,
+        "the operation's own completion, reported once"
+    );
+    assert_eq!(packets[0].port, id);
+    assert_eq!(
+        packets[0].owner, CALLER,
+        "the recipient is the operation's issuer, not the port's owner"
+    );
+    assert_eq!(packets[0].event, async_ok(7));
+}
+
+/// The record is **taken** when its completion is rendered — the C's `deq_async` clearing the
+/// operation — so a second completion carrying the same id falls back to the port's owner instead
+/// of being sent to a process that is no longer waiting for it.
+#[test]
+fn a_second_completion_with_the_same_id_falls_back_to_the_owner() {
+    let (mut registry, id) = registry_with_control(QueueDriver::new(7, 2), OWNER);
+    registry
+        .port_control(id, &QueueDriver::recv_op(), b"", Some(CALLER))
+        .expect("the fixture driver answers the receive verb");
+    let packets = completions(registry.drain_pending_events());
+    assert_eq!(packets.len(), 2, "both staged completions are reported");
+    assert_eq!(
+        packets[0].owner, CALLER,
+        "the first one answers the issuer that is parked on it"
+    );
+    assert_eq!(
+        packets[1].owner, OWNER,
+        "the record was taken, so a repeat of the same id is the owner's"
+    );
+    assert_eq!(packets[1].event, async_ok(7));
+}
+
+/// A close flushes the operations it still has queued (`async_error_am_all`) and each answer goes
+/// to **its own** issuer, read from the close's [`ClosedPortSnapshot`] — the metadata that held
+/// the records is gone by the time the drain sees them.
+#[test]
+fn a_close_time_completion_is_attributed_through_the_snapshot() {
+    let (mut registry, id) = registry_with_control(QueueDriver::flushing(7, async_ok(7)), OWNER);
+    registry
+        .port_control(id, &QueueDriver::recv_op(), b"", Some(CALLER))
+        .expect("the fixture driver answers the receive verb");
+    // The control call queued the operation and staged nothing, so the only completion left in
+    // the port is the one its teardown owes.
+    assert!(
+        completions(registry.drain_pending_events()).is_empty(),
+        "a queued operation that is not yet satisfiable answers nothing"
+    );
+    registry.close(id).expect("the port closes");
+    assert!(!registry.contains(id), "the close removed the metadata");
+    let packets = completions(registry.drain_pending_events());
+    assert_eq!(packets.len(), 1, "the teardown's flush, reported once");
+    assert_eq!(packets[0].port, id);
+    assert_eq!(
+        packets[0].owner, CALLER,
+        "the issuer came from the close's snapshot, not from metadata that is gone"
+    );
+    assert_eq!(packets[0].event, async_ok(7));
+}
+
+/// The issuer table is **moved** into the close's snapshot with the metadata that held it, so no
+/// record keyed by a port number survives the close: a fresh port starts with an empty table, and
+/// a driver whose id counter restarts at zero cannot inherit a dead port's issuer.
+#[test]
+fn a_close_takes_the_issuer_table_with_it() {
+    let (mut registry, id) = registry_with_control(QueueDriver::new(7, 0), OWNER);
+    registry
+        .port_control(id, &QueueDriver::recv_op(), b"", Some(CALLER))
+        .expect("the fixture driver answers the receive verb");
+    registry.close(id).expect("the port closes");
+    assert!(
+        registry.meta.get(&id.number()).is_none(),
+        "the table lived on the metadata the close removed"
+    );
+    // A fresh port allocating the same id from its own counter answers its own owner: nothing
+    // remembers that id 7 once belonged to a process that is no longer reading this socket. A new
+    // registry restarts `beam_io`'s numbering, so this really is a **recycled** number.
+    let (mut registry, fresh) = registry_with_control(QueueDriver::new(7, 1), OTHER_OWNER);
+    assert_eq!(
+        fresh, id,
+        "the recycled number is the case under test: the entry must not outlive its port"
+    );
+    registry
+        .port_control(fresh, &QueueDriver::recv_op(), b"", None)
+        .expect("the fixture driver answers the receive verb");
+    let packets = completions(registry.drain_pending_events());
+    assert_eq!(packets.len(), 1);
+    assert_eq!(
+        packets[0].owner, OTHER_OWNER,
+        "no issuer was recorded for this operation, so the port's owner has it"
     );
 }
 

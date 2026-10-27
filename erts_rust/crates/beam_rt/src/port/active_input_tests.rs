@@ -59,7 +59,7 @@
 //! production code.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
@@ -567,6 +567,7 @@ fn port_meta(owner: ProcessId, stream: StreamType, command: &str) -> PortMeta {
         owner,
         // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
         command_caller: None,
+        async_callers: HashMap::new(),
         // The `Name` form whose bytes come from the driver's own callbacks
         // (`PortName::bytes_from_driver_output`), which is the arm a socket driver takes.
         kind: PortName::SpawnDriver,

@@ -391,7 +391,7 @@ impl Session {
         self.rt
             .ports
             .borrow_mut()
-            .port_control(port, verb, arg)
+            .port_control(port, verb, arg, None)
             .unwrap_or_else(|error| panic!("the {verb:?} control op on {port:?}: {error}"))
     }
 

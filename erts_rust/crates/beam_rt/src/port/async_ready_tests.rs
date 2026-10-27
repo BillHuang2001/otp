@@ -600,7 +600,7 @@ impl Open {
         self.runtime
             .ports
             .borrow_mut()
-            .port_control(self.id, "1", &[])
+            .port_control(self.id, "1", &[], None)
             .expect("the fixture's control callback answers")
     }
 

@@ -435,7 +435,7 @@ fn monitor_code(rt: &Runtime, id: PortId, pid: ProcessId) -> Vec<u8> {
     let cell = Rc::clone(&rt.ports);
     let mut registry = cell.try_borrow_mut().expect("the port registry is free");
     registry
-        .port_control(id, "6", &request)
+        .port_control(id, "6", &request, None)
         .expect("the driver's `control` answers")
 }
 

@@ -68,19 +68,28 @@
 //!
 //! The C addresses a completion to `desc->caller` — the process that issued the control op or
 //! command that produced it, not necessarily the port's owner. The frozen [`beam_io::Driver`]
-//! seam carries no caller, so this runtime reconstructs it where it can: the command path
-//! records the issuer on the port ([`super::PortMeta::command_caller`], set by
-//! [`super::PortRegistry::command`]) and this drain **takes** it when it renders the command's
-//! `{inet_reply, …}` — the C's `inet_reply_finish` clearing `desc->caller` as it sends
-//! (`inet_drv.c:2632-2634`). That is what makes `gen_tcp:send/2` from a process that does not
-//! own the socket return to *that* process instead of leaving it blocked in
-//! `prim_inet:send/4`'s `receive`.
+//! seam carries no caller, so this runtime reconstructs it at the two places the port layer knows
+//! who ran the operation, and this drain **takes** the record when it renders the message:
 //!
-//! The `{inet_async, …}` family still goes to the port's **owner**: a queued asynchronous
-//! operation's issuer is recorded per operation in the C (`enq_async`'s `driver_caller(port)`),
-//! and this runtime's async path has no such record — the last *command's* caller is not it. For
-//! every `prim_inet` caller the two are the same process (the owner issues its own control ops),
-//! so the divergence is unobservable there; it is recorded in `src/port/CONTEXT.md` regardless.
+//! * a **command's** issuer is [`super::PortMeta::command_caller`], set by
+//!   [`super::PortRegistry::command`] and taken when the `{inet_reply, …}` is rendered — the C's
+//!   `inet_reply_finish` clearing `desc->caller` as it sends (`inet_drv.c:2632-2634`), which is
+//!   what makes `gen_tcp:send/2` from a process that does not own the socket return to *that*
+//!   process instead of leaving it blocked in `prim_inet:send/4`'s `receive`;
+//! * a **queued asynchronous operation's** issuer is [`super::PortMeta::async_callers`], keyed by
+//!   the id the operation's control reply allocated and recorded by
+//!   [`super::PortRegistry::port_control`] — the C's per-operation
+//!   `opp->caller = driver_caller(desc->port)` (`enq_async`'s `enq_async_w_tmo`,
+//!   `inet_drv.c:2427`), taken when that id's `{inet_async, …}` is rendered.
+//!
+//! The second record is what makes a **non-owner's** passive `gen_tcp:recv/3` (or
+//! `gen_udp:recv/3`, or an `accept` a spawned acceptor issued) return at all: its driver timeout
+//! and its data both arrive as completions of the id its own control op was handed, and a
+//! completion addressed to the port's owner leaves the real reader parked for ever — its
+//! `prim_inet:recv0/3` has no Erlang `after`, so the driver's timeout is the only deadline it has.
+//!
+//! Everything else — the input, peer-close and exit channels — names no issuer, which is what the
+//! owner fallback is for.
 //!
 //! # Term-free until the last moment
 //!
@@ -91,7 +100,7 @@
 //! released — the same snapshot rule the `{Port, {data, …}}` builders follow.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 
 use beam_common::BeamError;
@@ -106,6 +115,8 @@ use super::{
     intern_reuse, PortEvent, PortMeta, PortName, PortRegistry, RuntimeContext, StreamShape,
     StreamType,
 };
+
+use super::ops::inet_opts::INET_CONTROL_MAGIC;
 /// One drained completion, bound to the port that produced it **and** to everything its
 /// delivery still needs once that port's metadata may be gone.
 ///
@@ -113,16 +124,17 @@ use super::{
 /// [`PortRegistry::drain_io_completions`]) rather than at delivery time, because a completion
 /// staged around a port's teardown outlives the port's [`PortMeta`] — the C's
 /// `async_error_am_all` case — and a message with no recoverable recipient would be lost.
-/// [`CompletionPacket::owner`] is that resolved **recipient**: the command's caller for an
-/// `{inet_reply, …}` (the C's `desc->caller`), the port's owner for every other family.
+/// [`CompletionPacket::owner`] is that resolved **recipient**: the operation's issuer for an
+/// `{inet_reply, …}` or an `{inet_async, …}` (the C's `desc->caller`), the port's owner for every
+/// channel that names no issuer.
 #[derive(Debug)]
 pub(crate) struct CompletionPacket {
     /// The port whose driver produced the completion (the C's `desc->dport`), i.e. the `Port`
     /// element of both message families.
     pub(crate) port: PortId,
-    /// The process the message is **addressed to** — the command's caller for an
-    /// `{inet_reply, …}`, the port's owner for every other family (see the module docs on the
-    /// addressee rule).
+    /// The process the message is **addressed to** — the operation's issuer for an
+    /// `{inet_reply, …}` or an `{inet_async, …}`, the port's owner for every channel that names
+    /// none (see the module docs on the addressee rule).
     pub(crate) owner: ProcessId,
     /// The port's `binary`/`list` option, which decides how an
     /// [`InetAsyncResult::Data`] payload is rendered.
@@ -136,34 +148,47 @@ pub(crate) struct CompletionPacket {
 /// gone.
 ///
 /// [`PortRegistry::close`](super::PortRegistry) snapshots one of these before it removes the
-/// port (the port's own `{inet_reply, …}`/`{inet_async, …}` must still reach its owner), and
+/// port (the port's own `{inet_reply, …}`/`{inet_async, …}` must still reach its recipient), and
 /// passes it to [`PortRegistry::drain_io_completions`] so the drain can attribute a completion
 /// whose port no longer has metadata. It is keyed by port number, so a **recycled** number can
 /// never inherit the snapshot: the drain only consults it for the very port that was closed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ClosedPortSnapshot {
     /// The port that was closed.
     pub(crate) port: PortId,
-    /// The process that owned it — the recipient of anything it still owes.
+    /// The process that owned it — the recipient of anything it still owes that names no issuer.
     pub(crate) owner: ProcessId,
     /// Its `binary`/`list` option.
     pub(crate) stream: StreamType,
     /// Its line framing, carried to an accepted socket the way `open_port/2`'s driver-port arm
     /// carries it.
     pub(crate) line: Option<usize>,
+    /// The port's outstanding **command** issuer at close time (the C's `desc->caller`), so the
+    /// `{inet_reply, …}` the teardown still owes reaches the process that issued the command.
+    pub(crate) command_caller: Option<ProcessId>,
+    /// The port's queued **asynchronous operations** at close time, by id — the C's per-operation
+    /// `opp->caller` table. The close flushes every one of them (`async_error_am_all`) and each
+    /// answer must reach its own issuer.
+    ///
+    /// The map moves here from the metadata the close removes, so a **recycled** port number
+    /// cannot inherit a dead port's issuers: a fresh port's id counter restarts at zero and would
+    /// otherwise collide with the entry.
+    pub(crate) async_callers: HashMap<u16, ProcessId>,
 }
 
 impl PortRegistry {
     /// The [`ClosedPortSnapshot`] of `id`, or `None` when this registry does not hold it.
     ///
     /// [`PortRegistry::close`] takes it **before** it removes the port's metadata, which is the
-    /// only moment the recipient is still readable.
+    /// only moment the recipients are still readable.
     pub(super) fn closed_snapshot(&self, id: PortId) -> Option<ClosedPortSnapshot> {
         self.meta.get(&id.number()).map(|meta| ClosedPortSnapshot {
             port: id,
             owner: meta.owner,
             stream: meta.stream,
             line: meta.line,
+            command_caller: meta.command_caller,
+            async_callers: meta.async_callers.clone(),
         })
     }
 
@@ -179,7 +204,7 @@ impl PortRegistry {
     /// so every drain point owes both sweeps and no site can forget one. A failure's port is
     /// gone from [`PortRegistry::meta`] by the time the completion sweep runs, and its
     /// [`ClosedPortSnapshot`] is folded into the fallback list, so an operation it left queued
-    /// (`async_error_am_all`) still reaches its owner.
+    /// (`async_error_am_all`) still reaches its issuer.
     ///
     /// `fallback` is the [`ClosedPortSnapshot`] of the port a caller has just closed: a
     /// completion harvested from a port that is no longer in [`PortRegistry::meta`] is
@@ -213,30 +238,47 @@ impl PortRegistry {
         let drained = self.registry.take_completions();
         let mut events = Vec::with_capacity(drained.len());
         for PortCompletion { port, event } in drained {
-            // The **recipient** of an `{inet_reply, …}` is the command's *caller*, not the
-            // port's owner: the C sends it to `desc->caller` — the process that ran the
-            // `port_command/2` (`inet_reply_finish`'s
-            // `erl_drv_send_term(desc->dport, desc->caller, …)`, `inet_drv.c:2632`) — and takes
-            // that field as it sends it (`desc->caller = am_undefined`, `:2634`). Any process may
-            // command a port another process owns, so addressing the reply to the owner would
-            // leave the real issuer blocked in `prim_inet:send/4`'s
-            // `receive {inet_reply, S, Status, Mref}` for ever while the port's owner received a
-            // message it never asked for. The other families keep the owner, which is who the C
-            // addresses them to (`erl_drv_send_term`'s implicit recipient).
+            // The **recipient** is the process that issued the operation, not the port's owner —
+            // the C's `desc->caller` (`enq_async_w_tmo`, `inet_drv.c:2427`) and, for a command
+            // reply, the same field as `inet_reply_finish` reads it
+            // (`erl_drv_send_term(desc->dport, desc->caller, …)`, `:2632`, then
+            // `desc->caller = am_undefined`, `:2634`). Any process may command a port or read its
+            // socket, so addressing either family to the owner would leave the real issuer blocked
+            // in `prim_inet`'s `receive` for ever while the owner received a message it never
+            // asked for.
+            //
+            // Both records are **taken**: the C's `deq_async` clears the operation's caller as it
+            // sends the completion, and a second completion carrying the same id therefore falls
+            // back to the owner. Everything else (the input/peer-close/exit channels) names no
+            // issuer at all, which is what the owner fallback is for.
             let resolved = match self.meta.get_mut(&port.number()) {
                 Some(meta) => {
-                    let recipient = match event {
+                    let recipient = match &event {
                         CompletionEvent::InetReply { .. } => {
                             meta.command_caller.take().unwrap_or(meta.owner)
                         }
-                        _ => meta.owner,
+                        CompletionEvent::InetAsync { id, .. } => {
+                            meta.async_callers.remove(id).unwrap_or(meta.owner)
+                        }
                     };
                     Some((recipient, meta.owner, meta.stream, meta.line))
                 }
                 None => fallbacks
                     .iter()
                     .find(|snapshot| snapshot.port == port)
-                    .map(|snapshot| (snapshot.owner, snapshot.owner, snapshot.stream, snapshot.line)),
+                    .map(|snapshot| {
+                        let recipient = match &event {
+                            CompletionEvent::InetReply { .. } => {
+                                snapshot.command_caller.unwrap_or(snapshot.owner)
+                            }
+                            CompletionEvent::InetAsync { id, .. } => snapshot
+                                .async_callers
+                                .get(id)
+                                .copied()
+                                .unwrap_or(snapshot.owner),
+                        };
+                        (recipient, snapshot.owner, snapshot.stream, snapshot.line)
+                    }),
             };
             let Some((recipient, owner, stream, line)) = resolved else {
                 if let CompletionEvent::InetAsync {
@@ -379,6 +421,9 @@ impl PortRegistry {
             // A freshly adopted socket has not been commanded yet (the C's `desc->caller =
             // am_undefined`, `inet_drv.c:10939`).
             command_caller: None,
+            // A freshly adopted socket queues no operation of its own (the C's `tcp_inet_copy`
+            // builds a fresh `async_queue`, `inet_drv.c:11795`).
+            async_callers: HashMap::new(),
             kind: PortName::SpawnDriverBuiltin,
             driver_has_control,
             driver_terms: None,
@@ -409,6 +454,47 @@ impl PortRegistry {
             }
             Err(_) => InetAsyncResult::Error(InetReason::from_errno(libc::EMFILE)),
         }
+    }
+}
+
+/// The id an **async-allocating** control op's reply handed out, or `None` when the op queued
+/// nothing.
+///
+/// Three requests queue an asynchronous operation and answer its id as
+/// `[INET_REP_OK] ++ <<Id:16/big>>` ([`beam_io`]'s `async_ok_reply`, the C's
+/// `put_int16(id, buf)`, `inet_drv.c:12319`/`:15010`/`:12209`):
+///
+/// | Request | Opcode | Driver |
+/// |---|---|---|
+/// | `TCP_REQ_RECV` | `42` | `tcp_inet` |
+/// | `PACKET_REQ_RECV` | `60` | `udp_inet` |
+/// | `INET_REQ_ACCEPT` | `26` | `tcp_inet` |
+///
+/// Every other control verb answers without allocating one, and a **refused** enqueue answers
+/// `[0] ++ reason` (`ctl_xerror`) or a bare `[0]` — which is why the reply shape and the opcode
+/// are tested together, in one place, rather than either alone: the numeric opcodes are the
+/// `prim_inet` route (the named verbs are this floor's own synchronous conveniences and allocate
+/// nothing), and a three-byte `[1, hi, lo]` is the only successful allocation shape.
+///
+/// The opcode is decoded the way both `*_inet_ctl` entries decode it — subtracting
+/// [`INET_CONTROL_MAGIC`] in **unsigned** arithmetic (`inet_drv.c:11958`/`:14574`), so an `Op`
+/// below the magic number matches nothing here either.
+pub(crate) fn allocated_async_id(op: &str, reply: &[u8]) -> Option<u16> {
+    /// `TCP_REQ_RECV` on `tcp_inet` (`erts/emulator/drivers/common/inet_drv.c:12265`).
+    const TCP_REQ_RECV: u32 = 42;
+    /// `PACKET_REQ_RECV` on `udp_inet` (`inet_drv.c:14987`).
+    const PACKET_REQ_RECV: u32 = 60;
+    /// `INET_REQ_ACCEPT` on `tcp_inet` (`inet_drv.c:12159`).
+    const INET_REQ_ACCEPT: u32 = 26;
+    let code: u32 = op.parse().ok()?;
+    let opcode = code.wrapping_sub(INET_CONTROL_MAGIC as u32);
+    if !matches!(opcode, TCP_REQ_RECV | PACKET_REQ_RECV | INET_REQ_ACCEPT) {
+        return None;
+    }
+    match reply {
+        // `INET_REP_OK` is `1` (`inet_drv.c:339`), then the big-endian 16-bit id.
+        [1, hi, lo] => Some(u16::from_be_bytes([*hi, *lo])),
+        _ => None,
     }
 }
 

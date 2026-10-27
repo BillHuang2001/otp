@@ -611,6 +611,25 @@ struct PortMeta {
     /// write round, and a driver's *late* second reply (a partial write finished by a later
     /// `ready_output`) still belongs to the last command, exactly as there.
     command_caller: Option<ProcessId>,
+    /// The process that issued each **queued asynchronous operation**, keyed by the id that
+    /// operation's control reply handed out — the C's per-operation `opp->caller`
+    /// (`enq_async_w_tmo`'s `opp->caller = driver_caller(desc->port)`,
+    /// `../../erts/emulator/drivers/common/inet_drv.c:2427`), which `send_async_ok`/
+    /// `send_async_error` address the completion to (`:2494-2500`, `:2541-2559`).
+    ///
+    /// One entry per queued operation, unlike the one-per-port
+    /// [`PortMeta::command_caller`]: a socket may hold a receive **and** an accept at once, and
+    /// any process may issue either on a socket another process owns — a `gen_tcp:recv/3` from a
+    /// spawned reader is legal and answers *that* reader. Addressed to [`PortMeta::owner`]
+    /// instead, the reader would never be woken and would wait out its own timeout, which is what
+    /// makes the id worth recording.
+    ///
+    /// Recorded by [`PortRegistry::port_control`] when the driver's reply allocates an id
+    /// ([`completion::allocated_async_id`]) and **taken** by
+    /// [`PortRegistry::sweep_completions`] when that id's completion is rendered, so a second
+    /// completion carrying the same id falls back to the owner exactly as the C's `deq_async`
+    /// clearing the operation does.
+    async_callers: HashMap<u16, ProcessId>,
     /// Which `Name` form opened the port.
     ///
     /// The two message producers route on it (see [`PortName::stream_shape`] and
@@ -1972,13 +1991,30 @@ impl PortRegistry {
     /// exception, so they must be kept distinct by *cause* when reasoning about a reply: the gate
     /// here never consults the verb, while the driver's rejection is per-verb.
     ///
+    /// # `caller` is the operation's issuer, recorded per queued operation
+    ///
+    /// A control op that **queues an asynchronous operation** answers an id, and the operation's
+    /// completion is a message addressed to the process that issued it — not to the port's owner
+    /// (`enq_async_w_tmo`'s `opp->caller = driver_caller(desc->port)`,
+    /// `../../erts/emulator/drivers/common/inet_drv.c:2427`, consumed by `send_async_ok`/
+    /// `send_async_error`, `:2494-2500`/`:2541-2559`). `port_control/3` is not restricted to the
+    /// owner, so `caller` is recorded on the port against the returned id
+    /// ([`PortMeta::async_callers`]) and taken when the completion is rendered. `None` records
+    /// nothing, which is the right answer for a caller that cannot be suspended on a message.
+    ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened), for
     /// a port whose driver declares no `control` callback (above), and for the driver's own
     /// rejection (a negative result); the typed capability gap for a reply the driver answers from
     /// memory of its own (see [`driver::DriverPortAdapter::control_reply`]).
-    pub fn port_control(&mut self, id: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
+    pub fn port_control(
+        &mut self,
+        id: PortId,
+        op: &str,
+        arg: &[u8],
+        caller: Option<ProcessId>,
+    ) -> Result<Vec<u8>> {
         if !self.has_driver_control(id) {
             // A port whose driver declares no `control` callback — the oracle's `badarg` for every
             // verb (`call_driver_control`, `io.c:4035`) — or a port this registry does not hold,
@@ -1986,6 +2022,24 @@ impl PortRegistry {
             return Err(BeamError::BadArg);
         }
         let reply = self.registry.port_control(&mut self.poller, id, op, arg);
+        // An async-allocating control op answers `[1] ++ <<Id:16/big>>` and queues the operation
+        // that id names (`async_ok_reply`), and the C records *that* operation's caller on the
+        // spot — `enq_async_w_tmo`'s `opp->caller = driver_caller(desc->port)`
+        // (`../../erts/emulator/drivers/common/inet_drv.c:2427`), which
+        // `send_async_ok`/`send_async_error` address the completion to (`:2494-2500`,
+        // `:2541-2559`). The record is taken **before** the drain below: a zero-timeout
+        // operation's completion can already be staged by this very call, and an operation whose
+        // issuer is not recorded yet would be addressed to the port's owner.
+        if let (Some(caller), Ok(bytes)) = (caller, &reply) {
+            if let Some(async_id) = completion::allocated_async_id(op, bytes) {
+                if let Some(meta) = self.meta.get_mut(&id.number()) {
+                    // `insert`, not `entry`: a driver's id counter is per port and restarts at
+                    // zero, and the drain removes each entry as its completion is rendered, so a
+                    // live id can never still be here.
+                    meta.async_callers.insert(async_id, caller);
+                }
+            }
+        }
         // A control op can in principle stage a completion (`prim_inet`'s `recv`/`accept` arms
         // queue an operation that completes later), so the channel is drained here too — the
         // drain is unconditional, because a failing control call must not also lose the reply
@@ -3613,7 +3667,10 @@ impl RuntimePorts {
     /// No `PortHook` method takes it yet — the reachable port-control entry is
     /// [`PortRegistry::port_control`], called directly by the native floor's
     /// `erlang:port_control/3` (`src/native/port.rs`) — so this method is retained for a
-    /// `runtime.rs`-internal caller (see `src/port/CONTEXT.md`'s API Surface note).
+    /// `runtime.rs`-internal caller (see `src/port/CONTEXT.md`'s API Surface note). It passes
+    /// **no** caller, which is why it can only ever be a forwarded-bytes form: it has no process
+    /// to attribute a queued asynchronous operation's completion to, so the operation's
+    /// `{inet_async, …}` keeps the port's owner.
     ///
     /// # Errors
     ///
@@ -3624,7 +3681,7 @@ impl RuntimePorts {
         // The driver's `control` callback is a drive window (see
         // [`PortRegistry::open_driver_atom_view`]).
         registry.open_driver_atom_view(&self.atoms);
-        let reply = registry.port_control(port, op, arg);
+        let reply = registry.port_control(port, op, arg, None);
         registry.close_driver_atom_view();
         reply
     }
@@ -4055,6 +4112,8 @@ impl PortHook for RuntimePorts {
                     owner: self.owner,
                     // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
                     command_caller: None,
+                    // And no asynchronous operation is queued yet — the C's empty `async_queue`.
+                    async_callers: HashMap::new(),
                     kind: PortName::SpawnDriverBuiltin,
                     driver_has_control,
                     // A built-in driver has no C host, so it has no term queue, interns no name and
@@ -4168,6 +4227,8 @@ impl PortHook for RuntimePorts {
                 owner: self.owner,
                 // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
                 command_caller: None,
+                // And no asynchronous operation is queued yet — the C's empty `async_queue`.
+                async_callers: HashMap::new(),
                 kind: PortName::SpawnDriver,
                 driver_has_control,
                 driver_terms: Some(driver_terms),
@@ -4218,6 +4279,8 @@ impl PortHook for RuntimePorts {
             owner: self.owner,
             // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
             command_caller: None,
+            // And no asynchronous operation is queued yet — the C's empty `async_queue`.
+            async_callers: HashMap::new(),
             kind: spec.kind,
             // `beam_io::SpawnDriver` — this family's driver — has no `control` callback at all, so
             // `port_control/3` is `badarg` for every verb (the C's `!prt->drv_ptr->control`).

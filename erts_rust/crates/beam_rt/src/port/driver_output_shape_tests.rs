@@ -813,6 +813,7 @@ fn split_meta(stream: StreamType, line: Option<usize>, owner: ProcessId) -> Port
         owner,
         // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
         command_caller: None,
+        async_callers: HashMap::new(),
         driver_has_control: false,
         driver_terms: None,
         driver_atoms: None,

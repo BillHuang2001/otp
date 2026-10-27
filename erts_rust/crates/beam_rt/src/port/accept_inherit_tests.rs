@@ -286,7 +286,7 @@ fn accept_op() -> String {
 
 /// Runs one control op and fails loudly with the driver's own error text.
 fn control(reg: &mut PortRegistry, id: PortId, op: &str, arg: &[u8]) -> Vec<u8> {
-    reg.port_control(id, op, arg)
+    reg.port_control(id, op, arg, None)
         .unwrap_or_else(|error| panic!("the {op} control op on {id:?}: {error}"))
 }
 
@@ -941,7 +941,7 @@ fn a_rejected_setopts_never_enters_the_option_mirror() {
         let truncated = record(INET_LOPT_ACTIVE, INET_MULTI);
         assert!(
             matches!(
-                reg.port_control(listener.id, &setopts_op(), &truncated),
+                reg.port_control(listener.id, &setopts_op(), &truncated, None),
                 Err(BeamError::BadArg)
             ),
             "a multi `{{active, N}}` record without its counter is the driver's typed `badarg`"

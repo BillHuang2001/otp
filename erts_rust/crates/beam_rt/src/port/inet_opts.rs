@@ -103,7 +103,7 @@ use crate::port::{PortRegistry, StreamType};
 use beam_io::{ActiveMode, ActiveSpend};
 /// `ERTS_INET_DRV_CONTROL_MAGIC_NUMBER` (`erts/emulator/beam/sys.h:1466`) — the offset the Erlang
 /// side adds to every `inet` control request and both `*_inet_ctl` entries subtract again.
-const INET_CONTROL_MAGIC: u64 = 0x03f1_a300;
+pub(crate) const INET_CONTROL_MAGIC: u64 = 0x03f1_a300;
 
 /// `INET_REQ_SETOPTS` (7) — the request the mirror listens for (`inet_drv.c:812`).
 const INET_REQ_SETOPTS: u64 = 7;

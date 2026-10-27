@@ -41,7 +41,7 @@
 //! [`PortRegistry::close`] like any other.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
@@ -398,6 +398,7 @@ fn register_driver_port(
         owner: OWNER,
         // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
         command_caller: None,
+        async_callers: HashMap::new(),
         // This fixture's driver implements `control`, so the captured capability is the driver's
         // own answer — exactly what `open_port/2` captures from a real one.
         driver_has_control: true,
