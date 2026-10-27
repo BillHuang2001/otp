@@ -63,6 +63,7 @@ pub mod pair;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use beam_common::BeamError;
@@ -323,6 +324,189 @@ pub fn oracle_eval(oracle: &Path, code_dir: Option<&Path>, expr: &str) -> Option
         }
         Probe::TimedOut | Probe::Failed => None,
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// A fixture compiled at test time, and this runtime driven under it
+// ---------------------------------------------------------------------------------------
+
+/// A per-case **scratch directory** under `$TMPDIR`, removed on drop.
+///
+/// Every suite that compiles a fixture gives the compiled `.beam` a directory of its own and
+/// hands that directory out as the **only** `-pa` either runtime gets, so nothing else on this
+/// repository's code path can shadow the fixture (and the oracle is never handed a directory
+/// that holds a module it already has).
+pub struct Scratch {
+    dir: PathBuf,
+}
+
+impl Scratch {
+    /// Creates `<tmp>/beam_rt_<label>_<pid>_<n>`, or `None` after a loud skip naming `banner`
+    /// when the directory cannot be created.
+    #[allow(dead_code)]
+    pub fn new(banner: &str, label: &str) -> Option<Scratch> {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "beam_rt_{label}_{}_{n}",
+            std::process::id()
+        ));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(Scratch { dir }),
+            Err(error) => {
+                skip_loudly(banner, &format!("cannot prepare {}: {error}", dir.display()));
+                None
+            }
+        }
+    }
+
+    /// The directory.
+    #[allow(dead_code)]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// `module.beam` inside the directory.
+    #[allow(dead_code)]
+    pub fn beam(&self, module: &str) -> PathBuf {
+        self.dir.join(format!("{module}.beam"))
+    }
+
+    /// Writes `source` as `module.erl` inside the directory.
+    #[allow(dead_code)]
+    pub fn write_source(&self, module: &str, source: &str) -> PathBuf {
+        let path = self.dir.join(format!("{module}.erl"));
+        std::fs::write(&path, source)
+            .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // The compiled artifacts are not source; a failure to remove them is reported, never
+        // hidden.
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            println!("note: could not remove {}: {error}", self.dir.display());
+        }
+    }
+}
+
+/// The compiler: a sibling of the resolved oracle first (the same installation), else `$PATH`.
+#[allow(dead_code)]
+pub fn resolve_erlc(oracle: &Path) -> Option<PathBuf> {
+    if let Some(dir) = oracle.parent() {
+        let candidate = dir.join("erlc");
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    find_on_path("erlc")
+}
+
+/// **The fixture shape every compiled-fixture suite in this crate uses**: one module in its own
+/// scratch directory, compiled by the system `erlc` at test time (never committed as a `.beam`).
+///
+/// [`ErlangFixture::compile`] is a loud skip (`None`) when the toolchain is absent or `erlc`
+/// cannot run, and a **panic** when `erlc` *rejects* the source — the suite's own fixture being
+/// invalid is a repository defect, not a missing toolchain.
+pub struct ErlangFixture {
+    scratch: Scratch,
+    module: String,
+}
+
+impl ErlangFixture {
+    /// Writes `source` as `<module>.erl` into a fresh scratch directory and compiles it there.
+    #[allow(dead_code)]
+    pub fn compile(
+        banner: &str,
+        label: &str,
+        module: &str,
+        source: &str,
+    ) -> Option<ErlangFixture> {
+        let oracle = require_oracle(banner)?;
+        let Some(erlc) = resolve_erlc(&oracle) else {
+            skip_loudly(banner, "no `erlc` beside the oracle and none on $PATH");
+            return None;
+        };
+        let scratch = Scratch::new(banner, label)?;
+        assert!(
+            !source.trim().is_empty(),
+            "the `{module}` fixture source is empty"
+        );
+        let source_path = scratch.write_source(module, source);
+        let output = Command::new(&erlc)
+            .arg("-o")
+            .arg(scratch.dir())
+            .arg(&source_path)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run `{}`: {error}", erlc.display()));
+        assert!(
+            output.status.success(),
+            "`{}` rejected the fixture {}: {}\n{}",
+            erlc.display(),
+            source_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+        let fixture = ErlangFixture {
+            scratch,
+            module: module.to_string(),
+        };
+        assert!(
+            fixture.beam().is_file(),
+            "`erlc` produced no {}; stderr:\n{}",
+            fixture.beam().display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(fixture)
+    }
+
+    /// The scratch directory (the one `-pa` either runtime may be given).
+    #[allow(dead_code)]
+    pub fn dir(&self) -> &Path {
+        self.scratch.dir()
+    }
+
+    /// The compiled module's `.beam`.
+    #[allow(dead_code)]
+    pub fn beam(&self) -> PathBuf {
+        self.scratch.beam(&self.module)
+    }
+
+    /// A path inside the scratch directory (for a fixture that writes a file of its own).
+    #[allow(dead_code)]
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.scratch.dir().join(name)
+    }
+}
+
+/// One finished bounded child run: its exit code and captured streams, untrimmed.
+pub struct Observed {
+    /// The exit code (`-1` when the child was killed by a signal).
+    #[allow(dead_code)]
+    pub code: i32,
+    /// Everything the child wrote to stdout, verbatim.
+    #[allow(dead_code)]
+    pub stdout: String,
+    /// Everything the child wrote to stderr, verbatim.
+    #[allow(dead_code)]
+    pub stderr: String,
+}
+
+/// Runs the built **`beam_rt`** binary with `args` under the shared bounded runner
+/// (`/dev/null` stdin, killed and reaped at [`PROBE_TIMEOUT`]).
+///
+/// `None` when the child could not be run to completion; the caller reports a loud skip.
+#[allow(dead_code)]
+pub fn run_runtime(args: &[&str]) -> Option<Observed> {
+    let output = run_bounded(Path::new(env!("CARGO_BIN_EXE_beam_rt")), args)?;
+    Some(Observed {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------

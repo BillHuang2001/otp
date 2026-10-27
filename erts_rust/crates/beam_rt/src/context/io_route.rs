@@ -54,6 +54,30 @@
 //!   replies — the same seam that already carries `io:getopts/1`/`io:scan_erl_form/4` for
 //!   `epp` (`tests/scheduled_io_device.rs`).
 //!
+//! # The routing table (probed against OTP 29.1.2 / erts-17.1.1)
+//!
+//! Every row is a shape a suite pins, and the oracle column is what the system `erl` answers
+//! for the same program:
+//!
+//! | Call, and its leader / device | Oracle | Here |
+//! |---|---|---|
+//! | `io:put_chars/1` with a **capture** leader | the leader receives `{io_request, From, ReplyAs, {put_chars, unicode, …}}` once per call, its `{io_reply, ReplyAs, ok}` is the value, and nothing reaches the terminal | the in-machine `io.erl` body, one request per call — `tests/io_leader_capture.rs` |
+//! | `io:nl/0` with a capture leader | the same `put_chars` request, its payload a **1-character list** (not a binary) | the same |
+//! | the same call with `standard_error` as the leader | fd 2, and nothing on stdout | the floor's direct sink (`Stream::Stderr`) |
+//! | a **dead** leader | `error:terminated` — the send is a no-op and the monitor fires at once | the same, through the protocol |
+//! | a leader replying `{error, boom}` | `error:badarg` (`conv_reason/1`) | the same |
+//! | `io:put_chars/2` on a device pid that is the caller | `error:calling_self` | the same |
+//! | an **unregistered** atom device | `{error, arguments}` ⇒ `error:badarg` | the same |
+//! | `io:put_chars/2`, `io:format/3`, `io:nl/1`, `io:write/2`, `io:fwrite/3` on a `file:open/2` device | `ok`, and the bytes land in the file — a `[write]` file is a **latin1** device, so a `unicode` request re-encodes `[229,228,246]` to `e5 e4 f6` | the native file service, byte-identical (`tests/io_file_device.rs`) |
+//! | the same on a **closed** or **dead** device pid | `{error, terminated}` ⇒ `error:terminated`, and nothing is written | the same |
+//! | the same inside a **scheduler slice** (the `run` action) | completes | the typed `unsupported` gap — a slice may not suspend for the round trip |
+//!
+//! The capture rows are why the protocol is not optional: `eunit_proc`'s
+//! `new_group_leader/1` **is** that capture leader, so a runtime that answered such a call on
+//! its own stream would leak every test's output into the run's transcript
+//! (`tests/eunit_capture.rs` pins both halves — a passing run's summary only, and a failing
+//! test's own output inside its report).
+//!
 //! # Why the seam, and not the BIF
 //!
 //! [`RuntimeContext::call_bif`] runs **inside** a scheduler slice, where the nested pump is
