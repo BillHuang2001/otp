@@ -177,6 +177,13 @@ pub(super) struct CalleeAdmission {
     /// ([`callee_observes_its_call_site`](super::apply::callee_observes_its_call_site)), i.e.
     /// whether it must stay on the synchronous `call_bif` route.
     pub(super) observes_call_site: bool,
+    /// Whether that verdict comes from the **module-wide `erlang:load_nif/2` arm**
+    /// ([`CallSiteReadingImports::LoadNif`](super::apply::CallSiteReadingImports)), which no
+    /// context may override: a library registered under the wrong module identity is a wrong
+    /// result. The per-function **fun-image** arm (`false` here) does yield to the in-machine
+    /// entry where the nested route could only ever answer `blocked()` — see
+    /// [`fun_image_guard_yields`](super::apply::fun_image_guard_yields).
+    pub(super) load_nif_scope: bool,
     /// [`Module::export`]'s answer — the entry label the synchronous `run_export` would enter,
     /// or `None` for a function the module does not export (the synchronous path's `undef`).
     pub(super) label: Option<Label>,
@@ -510,12 +517,14 @@ mod tests {
         for _ in 0..3 {
             let cached = callee_admission(&module, function, 0, || CalleeAdmission {
                 observes_call_site: uncached,
+                load_nif_scope: true,
                 label: module.export(function, 0),
             });
             assert_eq!(
                 cached,
                 CalleeAdmission {
                     observes_call_site: uncached,
+                    load_nif_scope: true,
                     label: None
                 },
                 "the cached verdict must equal the predicate's own answer"
@@ -541,6 +550,7 @@ mod tests {
         let key = ModuleKey::of(&module).expect("a checksummed image has a key");
         let recorded = CalleeAdmission {
             observes_call_site: false,
+            load_nif_scope: false,
             label: Some(Label(17)),
         };
         ADMISSIONS.with(|cache| {
@@ -582,6 +592,7 @@ mod tests {
         for _ in 0..2 {
             let verdict = callee_admission(&module, Atom::MAX, 0, || CalleeAdmission {
                 observes_call_site: false,
+                load_nif_scope: false,
                 label: None,
             });
             assert_eq!(verdict.label, None);

@@ -546,7 +546,20 @@ impl ExecutionContext for RuntimeContext<'_> {
         // callee's name lookup and the `prim_tty` exemption below are never memoized — see the
         // `ir_cache` module docs for why caching the seam's *overall* answer would be wrong.
         let admission = callee_admission(&callee, function_atom, arity);
-        if !crate::native::prim_tty::is_builtin_library(module) && admission.observes_call_site {
+        // …except that the per-function **fun-image** half of that verdict yields to the in-machine
+        // entry when this context **cannot pump** (a scheduler slice): the guarded route is the
+        // *nested* machine, which such a context can never advance, so a callee that parks there
+        // folds into the typed `blocked()` gap — a hang for `prim_inet:send/3`, whose
+        // `receive {inet_reply, …}` is the port layer's own reply to **this** process. Entered
+        // in-machine the `receive` suspends the process and the reply wakes it. The module-wide
+        // `load_nif` arm never yields (a wrong library identity would be a wrong result); see
+        // [`apply::fun_image_guard_yields_for_a_slice`].
+        let call_site_refusal = admission.observes_call_site
+            && !apply::fun_image_guard_yields_for_a_slice(
+                self.may_pump_scheduler(),
+                admission.load_nif_scope,
+            );
+        if !crate::native::prim_tty::is_builtin_library(module) && call_site_refusal {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
                     "seam decline [{trace_pid:?}] {module}:{function}/{arity}: observes its call site"

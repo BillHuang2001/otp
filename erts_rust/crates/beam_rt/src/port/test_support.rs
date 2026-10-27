@@ -396,6 +396,8 @@ fn register_driver_port(
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
+        // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
+        command_caller: None,
         // This fixture's driver implements `control`, so the captured capability is the driver's
         // own answer — exactly what `open_port/2` captures from a real one.
         driver_has_control: true,

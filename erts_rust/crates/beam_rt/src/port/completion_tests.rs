@@ -592,6 +592,8 @@ fn port_meta(owner: ProcessId, stream: StreamType) -> PortMeta {
         notify_exit: false,
         monitors: Vec::new(),
         owner,
+        // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
+        command_caller: None,
         // The `Name` form whose bytes come from the driver's own `output` callback (see
         // `PortName::bytes_from_driver_output`), which is the arm a socket driver takes.
         kind: PortName::SpawnDriver,

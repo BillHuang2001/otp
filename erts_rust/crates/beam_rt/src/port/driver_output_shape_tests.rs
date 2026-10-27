@@ -811,6 +811,8 @@ fn split_meta(stream: StreamType, line: Option<usize>, owner: ProcessId) -> Port
         notify_exit: false,
         monitors: Vec::new(),
         owner,
+        // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
+        command_caller: None,
         driver_has_control: false,
         driver_terms: None,
         driver_atoms: None,

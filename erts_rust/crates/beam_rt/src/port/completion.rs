@@ -64,13 +64,23 @@
 //! `beam_io::PortRegistry::close` into a registry-owned queue reported exactly once by the next
 //! drain.
 //!
-//! # The recipient is the port's **owner**, not the C's `desc->caller`
+//! # The recipient is the C's `desc->caller`, falling back to the port's **owner**
 //!
-//! The C addresses a completion to `desc->caller` — the process that issued the control op that
-//! queued the operation. The frozen [`beam_io::Driver`] seam carries no caller, so this runtime
-//! addresses the port's **owner** ([`super::PortMeta::owner`]). For every `prim_inet` caller the
-//! two are the same process (the owner is the one that issued the control op), so the divergence
-//! is unobservable in practice; it is recorded in `src/port/CONTEXT.md` regardless.
+//! The C addresses a completion to `desc->caller` — the process that issued the control op or
+//! command that produced it, not necessarily the port's owner. The frozen [`beam_io::Driver`]
+//! seam carries no caller, so this runtime reconstructs it where it can: the command path
+//! records the issuer on the port ([`super::PortMeta::command_caller`], set by
+//! [`super::PortRegistry::command`]) and this drain **takes** it when it renders the command's
+//! `{inet_reply, …}` — the C's `inet_reply_finish` clearing `desc->caller` as it sends
+//! (`inet_drv.c:2632-2634`). That is what makes `gen_tcp:send/2` from a process that does not
+//! own the socket return to *that* process instead of leaving it blocked in
+//! `prim_inet:send/4`'s `receive`.
+//!
+//! The `{inet_async, …}` family still goes to the port's **owner**: a queued asynchronous
+//! operation's issuer is recorded per operation in the C (`enq_async`'s `driver_caller(port)`),
+//! and this runtime's async path has no such record — the last *command's* caller is not it. For
+//! every `prim_inet` caller the two are the same process (the owner issues its own control ops),
+//! so the divergence is unobservable there; it is recorded in `src/port/CONTEXT.md` regardless.
 //!
 //! # Term-free until the last moment
 //!
@@ -103,13 +113,16 @@ use super::{
 /// [`PortRegistry::drain_io_completions`]) rather than at delivery time, because a completion
 /// staged around a port's teardown outlives the port's [`PortMeta`] — the C's
 /// `async_error_am_all` case — and a message with no recoverable recipient would be lost.
+/// [`CompletionPacket::owner`] is that resolved **recipient**: the command's caller for an
+/// `{inet_reply, …}` (the C's `desc->caller`), the port's owner for every other family.
 #[derive(Debug)]
 pub(crate) struct CompletionPacket {
     /// The port whose driver produced the completion (the C's `desc->dport`), i.e. the `Port`
     /// element of both message families.
     pub(crate) port: PortId,
-    /// The process the message belongs to — the port's owner (see the module docs on the
-    /// addressee divergence).
+    /// The process the message is **addressed to** — the command's caller for an
+    /// `{inet_reply, …}`, the port's owner for every other family (see the module docs on the
+    /// addressee rule).
     pub(crate) owner: ProcessId,
     /// The port's `binary`/`list` option, which decides how an
     /// [`InetAsyncResult::Data`] payload is rendered.
@@ -200,14 +213,32 @@ impl PortRegistry {
         let drained = self.registry.take_completions();
         let mut events = Vec::with_capacity(drained.len());
         for PortCompletion { port, event } in drained {
-            let resolved = match self.meta.get(&port.number()) {
-                Some(meta) => Some((meta.owner, meta.stream, meta.line)),
+            // The **recipient** of an `{inet_reply, …}` is the command's *caller*, not the
+            // port's owner: the C sends it to `desc->caller` — the process that ran the
+            // `port_command/2` (`inet_reply_finish`'s
+            // `erl_drv_send_term(desc->dport, desc->caller, …)`, `inet_drv.c:2632`) — and takes
+            // that field as it sends it (`desc->caller = am_undefined`, `:2634`). Any process may
+            // command a port another process owns, so addressing the reply to the owner would
+            // leave the real issuer blocked in `prim_inet:send/4`'s
+            // `receive {inet_reply, S, Status, Mref}` for ever while the port's owner received a
+            // message it never asked for. The other families keep the owner, which is who the C
+            // addresses them to (`erl_drv_send_term`'s implicit recipient).
+            let resolved = match self.meta.get_mut(&port.number()) {
+                Some(meta) => {
+                    let recipient = match event {
+                        CompletionEvent::InetReply { .. } => {
+                            meta.command_caller.take().unwrap_or(meta.owner)
+                        }
+                        _ => meta.owner,
+                    };
+                    Some((recipient, meta.owner, meta.stream, meta.line))
+                }
                 None => fallbacks
                     .iter()
                     .find(|snapshot| snapshot.port == port)
-                    .map(|snapshot| (snapshot.owner, snapshot.stream, snapshot.line)),
+                    .map(|snapshot| (snapshot.owner, snapshot.owner, snapshot.stream, snapshot.line)),
             };
-            let Some((owner, stream, line)) = resolved else {
+            let Some((recipient, owner, stream, line)) = resolved else {
                 if let CompletionEvent::InetAsync {
                     result: InetAsyncResult::Accepted { fd },
                     ..
@@ -231,7 +262,7 @@ impl PortRegistry {
             events.push(PortEvent::Completion {
                 packet: CompletionPacket {
                     port,
-                    owner,
+                    owner: recipient,
                     stream,
                     event,
                 },
@@ -345,6 +376,9 @@ impl PortRegistry {
             notify_exit: false,
             monitors: Vec::new(),
             owner,
+            // A freshly adopted socket has not been commanded yet (the C's `desc->caller =
+            // am_undefined`, `inet_drv.c:10939`).
+            command_caller: None,
             kind: PortName::SpawnDriverBuiltin,
             driver_has_control,
             driver_terms: None,

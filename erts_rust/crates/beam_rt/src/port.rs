@@ -594,6 +594,23 @@ struct PortMeta {
     /// The process the port belongs to — the recipient of its `{Port, {data, …}}` and
     /// `{Port, {exit_status, …}}` messages, and the value of its `connected`/`links` items.
     owner: ProcessId,
+    /// The process that issued the port's **current** command — the C's `desc->caller`
+    /// (`inet_drv.c:1836`'s `driver_caller(port)`, recorded by every `command`/`commandv`).
+    ///
+    /// `erlang:port_command/2,3` is *not* restricted to the port's owner: any process may issue
+    /// one, and the driver then sends the command's `{inet_reply, Port, Status[, Tag]}` back to
+    /// **that** process (`inet_reply_finish`'s `erl_drv_send_term(desc->dport, desc->caller, …)`,
+    /// `inet_drv.c:2632`) — which is what `prim_inet:send/4` blocks on. Addressed to
+    /// [`PortMeta::owner`] instead, a spawned sender would never see its reply and would block in
+    /// `receive {inet_reply, S, Status, Mref}` for ever.
+    ///
+    /// Set by every accepted command ([`PortRegistry::command`]) and taken by
+    /// [`PortRegistry::sweep_completions`] when the reply is rendered — the C's
+    /// `inet_reply_finish` clearing `desc->caller` to `am_undefined` (`:2634`). It is one field
+    /// per port for the same reason the C has one: a command's reply is staged by its own
+    /// write round, and a driver's *late* second reply (a partial write finished by a later
+    /// `ready_output`) still belongs to the last command, exactly as there.
+    command_caller: Option<ProcessId>,
     /// Which `Name` form opened the port.
     ///
     /// The two message producers route on it (see [`PortName::stream_shape`] and
@@ -1686,6 +1703,7 @@ impl PortRegistry {
     /// conversion — `badarg` for a term that is not iodata).
     pub fn command_with_data<F>(
         &mut self,
+        caller: Option<ProcessId>,
         id: PortId,
         make_data: F,
         options: PortCommandOptions,
@@ -1697,7 +1715,7 @@ impl PortRegistry {
             return Ok(outcome);
         }
         let bytes = make_data()?;
-        self.command(id, &bytes, options)
+        self.command(caller, id, &bytes, options)
     }
     /// The C's **pre-conversion** half of the `port_command` decision: the checks that answer
     /// without ever looking at the data, in the C's order.
@@ -1796,6 +1814,7 @@ impl PortRegistry {
     /// `EPIPE`).
     pub fn command(
         &mut self,
+        caller: Option<ProcessId>,
         id: PortId,
         bytes: &[u8],
         options: PortCommandOptions,
@@ -1814,6 +1833,17 @@ impl PortRegistry {
             // Nothing was queued, so nothing is written and nothing is counted: the caller owns
             // the bytes and the options and re-issues the command once the driver is idle.
             return Ok(outcome);
+        }
+        // Accepted — the command's **caller** is recorded before the round runs, because that
+        // round is where a socket driver stages the command's `{inet_reply, …}` and the drain
+        // below renders it for `desc->caller` (`inet_reply_finish`, `inet_drv.c:2632`), never for
+        // the port's owner. `port_command/2,3` on a port another process owns is legal (the
+        // oracle's own answer: the reply goes to the issuer), so this is the field that makes a
+        // spawned sender's `prim_inet:send/4` return instead of blocking in its `receive`.
+        if let Some(caller) = caller {
+            if let Some(meta) = self.meta.get_mut(&id.number()) {
+                meta.command_caller = Some(caller);
+            }
         }
         // Accepted — only now do the bytes count as output. `erlang:statistics(io)`'s total and
         // the port's own `port_info(Port, output)` figure are bumped at the same instant, so the
@@ -1885,7 +1915,7 @@ impl PortRegistry {
     ///
     /// As for [`PortRegistry::command`], plus the typed capability gap for a busy port.
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
-        match self.command(id, bytes, PortCommandOptions::EMPTY)? {
+        match self.command(None, id, bytes, PortCommandOptions::EMPTY)? {
             PortCommandOutcome::Done => Ok(()),
             PortCommandOutcome::Busy => Err(error::unsupported(busy_wait::NO_PUMP_REASON)),
         }
@@ -3535,7 +3565,7 @@ impl RuntimePorts {
         // The accepted command's round runs the driver's `output` callback, so it is a drive
         // window (see [`PortRegistry::open_driver_atom_view`]).
         registry.open_driver_atom_view(&self.atoms);
-        let outcome = registry.command(port, bytes, options);
+        let outcome = registry.command(Some(self.owner), port, bytes, options);
         registry.close_driver_atom_view();
         outcome
     }
@@ -3566,7 +3596,7 @@ impl RuntimePorts {
         // The accepted command's round runs the driver's `output` callback, so it is a drive
         // window (see [`PortRegistry::open_driver_atom_view`]).
         registry.open_driver_atom_view(&self.atoms);
-        let outcome = registry.command_with_data(port, make_data, options);
+        let outcome = registry.command_with_data(Some(self.owner), port, make_data, options);
         registry.close_driver_atom_view();
         outcome
     }
@@ -4023,6 +4053,8 @@ impl PortHook for RuntimePorts {
                     notify_exit: false,
                     monitors: Vec::new(),
                     owner: self.owner,
+                    // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
+                    command_caller: None,
                     kind: PortName::SpawnDriverBuiltin,
                     driver_has_control,
                     // A built-in driver has no C host, so it has no term queue, interns no name and
@@ -4134,6 +4166,8 @@ impl PortHook for RuntimePorts {
                 notify_exit: false,
                 monitors: Vec::new(),
                 owner: self.owner,
+                // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
+                command_caller: None,
                 kind: PortName::SpawnDriver,
                 driver_has_control,
                 driver_terms: Some(driver_terms),
@@ -4182,6 +4216,8 @@ impl PortHook for RuntimePorts {
             notify_exit: spawn_options.exit_status,
             monitors: Vec::new(),
             owner: self.owner,
+            // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
+            command_caller: None,
             kind: spec.kind,
             // `beam_io::SpawnDriver` — this family's driver — has no `control` callback at all, so
             // `port_control/3` is `badarg` for every verb (the C's `!prt->drv_ptr->control`).

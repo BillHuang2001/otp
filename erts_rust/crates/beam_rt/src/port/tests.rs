@@ -327,6 +327,8 @@ fn test_meta(command: &str) -> PortMeta {
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
+        // Nothing has been commanded yet — the C's `desc->caller = am_undefined`.
+        command_caller: None,
         // `PortName::Spawn` is the internal form, backed by `beam_io::SpawnDriver`: no driver
         // `control` callback exists to claim.
         driver_has_control: false,

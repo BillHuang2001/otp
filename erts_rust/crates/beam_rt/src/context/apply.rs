@@ -668,8 +668,24 @@ pub(super) fn call_site_reading_imports(module: &Module) -> CallSiteReadingImpor
 ///
 /// [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
 /// [`Module::imports`]: beam_loader::Module::imports
+///
+/// Test-facing: production reaches the same verdict through [`callee_admission`], which needs the
+/// arm as well as the answer ([`fun_image_guard_yields_for_a_slice`]).
+#[cfg(test)]
 pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, arity: u32) -> bool {
-    match call_site_reading_imports(module) {
+    observes_call_site(call_site_reading_imports(module), module, function, arity)
+}
+
+/// [`callee_observes_its_call_site`]'s verdict for an already-classified module
+/// ([`call_site_reading_imports`]), so a caller that needs both the verdict **and** the arm it
+/// came from ([`callee_admission`]) scans the import table once.
+fn observes_call_site(
+    scope: CallSiteReadingImports,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+) -> bool {
+    match scope {
         CallSiteReadingImports::LoadNif => true,
         CallSiteReadingImports::None => false,
         CallSiteReadingImports::FunImage => match module.function(function, arity) {
@@ -679,6 +695,50 @@ pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, ari
             None => true,
         },
     }
+}
+
+/// Whether the **per-function fun-image** half of the call-site guard
+/// ([`callee_observes_its_call_site`]) yields to the in-machine entry because this context
+/// cannot re-enter the scheduler.
+///
+/// `can_pump` is [`RuntimeContext::may_pump_scheduler`] (`false` only for a **scheduler slice**)
+/// and `load_nif_scope` says whether the verdict came from the module-wide
+/// `erlang:load_nif/2` arm, which never yields.
+///
+/// # Why the fun-image arm yields
+///
+/// The guarded route is the **synchronous** one — `call_bif` → `run_export` → a *nested* machine
+/// driven by [`RuntimeContext::pump_once`](super::RuntimeContext::pump_once) — and a nested run
+/// inside a slice may not advance the scheduler at all (`may_pump_scheduler() == false`), so a
+/// callee that parks in a `receive` there **cannot ever** be resumed: it folds into the typed
+/// [`beam_engine::blocked`] gap. `prim_inet:send/3` is exactly that shape — its body issues
+/// `erlang:port_command/2` and then waits for the driver's `{inet_reply, S, Ref}` (the C's
+/// `inet_drv` writes the reply to `desc->caller`, i.e. to *this* process), so the guard used to
+/// turn `gen_tcp:send/2` from a **scheduled** process into a hang followed by a
+/// `blocked (no message available)` kill, while the byte had already been written.
+///
+/// Entering that callee **in-machine** instead suspends the *process* (`RunOutcome::Wait`), the
+/// runner parks it, and the port reply delivered to it wakes it through the ordinary
+/// resume-on-send path — the C's own behaviour, where a process that waits for a port reply is
+/// simply suspended.
+///
+/// # Why that is sound here
+///
+/// The fun-image arm is a conservative routing choice, not an identity requirement: the fun
+/// image itself is derived by searching every loaded module for the fun's own `(uniq, index)`
+/// ([`FunIdentityBridge`]), so an in-machine callee's stale `current_module` cannot fabricate
+/// one; the park hazard it guards against (a parked machine holding an unpublished
+/// `Machine::pending_exception` while a signal-driven heap growth relocates the heap) is declined
+/// by the runner's **park-window relocation exemption**, which every park arm takes. What the
+/// arm must never do is lose the `load_nif` scope: a library registered under the wrong module
+/// identity is the oracle's `bad_lib`, i.e. a wrong result rather than a gap, so that arm keeps
+/// its refusal in both contexts. See [`callee_observes_its_call_site`] for both scopes.
+///
+/// [`RuntimeContext::may_pump_scheduler`]: crate::context::RuntimeContext::may_pump_scheduler
+/// [`FunIdentityBridge`]: crate::context::bridges::FunIdentityBridge
+#[must_use]
+pub(crate) fn fun_image_guard_yields_for_a_slice(can_pump: bool, load_nif_scope: bool) -> bool {
+    !can_pump && !load_nif_scope
 }
 
 /// The **memoized** pair the in-machine cross-module seam needs from one callee:
@@ -699,9 +759,13 @@ pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, ari
 /// [`ExecutionContext::resolve_external_call`](beam_engine::ExecutionContext::resolve_external_call).
 /// This predicate's own two inputs are the only pure ones in that chain.
 pub(crate) fn callee_admission(module: &Module, function: Atom, arity: u32) -> CalleeAdmission {
-    super::ir_cache::callee_admission(module, function, arity, || CalleeAdmission {
-        observes_call_site: callee_observes_its_call_site(module, function, arity),
-        label: module.export(function, arity),
+    super::ir_cache::callee_admission(module, function, arity, || {
+        let scope = call_site_reading_imports(module);
+        CalleeAdmission {
+            observes_call_site: observes_call_site(scope, module, function, arity),
+            load_nif_scope: matches!(scope, CallSiteReadingImports::LoadNif),
+            label: module.export(function, arity),
+        }
     })
 }
 
