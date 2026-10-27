@@ -147,6 +147,10 @@ This is the frozen public-API shape dependents design against; keep it stable.
 - `PortRegistry::open_driver_atom_view`/`close_driver_atom_view` bracket every call into driver code, depth-counted so a nested close can never release early; between windows a port's atom view is `None`, and `beam_abi`'s `NifEntry::host` is the one durable `Rc<AtomTable>` holder.
 - The commit step tests `has_pending_driver_atoms()` **before** reaching `atoms_mut()`, so the transient view is dropped first and the shared table takes its append path.
 
+### Port commands: the reply belongs to the caller, and a park needs a resumable route
+- `{inet_reply,…}` is addressed to the process that **issued** the command (the C's `desc->caller`, set in `tcp_inet_command*`), not to the port's owner: `PortMeta::command_caller` carries it and `sweep_completions` falls back to the owner only when no caller was captured, so `gen_tcp:send/2` from a spawned process sees its own reply.
+- A port command issued inside a scheduler slice may park; the park must happen on a route that can be resumed, so a call site whose callee would run a **nested** machine yields to the in-machine entry whenever the context cannot pump (`context::apply::fun_image_guard_yields_for_a_slice`). A nested run that parks is folded into a `blocked` verdict that no signal can ever wake, which is why a spawn-only `gen_tcp:send/2` used to write its bytes and hang.
+
 ### One MD5, in `beam_common`
 - `beam_common::md5` (`digest`, incremental `Md5`) is the workspace's single RFC 1321 core, shared by `beam_loader`'s `.beam` chunk digests and `beam_bifs`' `erlang:md5/1`.
 - No consumer may reintroduce a copy: a module's chunk digest is its loader identity, so two implementations that drift sample-by-sample would produce modules the runtime and the oracle disagree about.
