@@ -57,15 +57,6 @@
 //! accept interest keeps that count non-zero by design.
 //! `tests/inet_nested.rs` is that route's suite; this one stays on `run`.
 //!
-//! # The `beam_io` residual behind the nested route
-//!
-//! A passive read on an **accepted** socket whose payload was buffered **before** the read op armed
-//! produces no port event at all, so it only ends at the peer's close and answers `{error,closed}`
-//! where the oracle answers `{ok, <<"hi">>}` — a `beam_io` accepted-socket arming defect
-//! (`TcpInetDriver::from_accepted`'s read-interest registration), pinned by the `#[ignore]`d case in
-//! `tests/inet_nested.rs`; the connect-side socket with the same pre-buffered payload is delivered.
-//! It is a typed mismatch after a silent stall, never a hang: both runtimes exit 0.
-//!
 //! # The three pinned paths
 //!
 //! | Test | Fixture | Completion pinned |

@@ -76,20 +76,19 @@
 //! bound, so a lost reply or a lost read shows up as a visible mismatch. [`support::PROBE_TIMEOUT`]
 //! additionally kills a child that never answers.
 //!
-//! # Where the remaining read-side residual lives
+//! # Where the read-side cases live
 //!
 //! The read twin is pinned here ([`a_read_from_a_process_that_is_not_the_controlling_process`]):
 //! a non-owner's passive `gen_tcp:recv/3` is answered because the port layer records **per
 //! operation** who issued it (`PortMeta::async_callers`, taken when that id's `{inet_async, …}` is
 //! rendered) and addresses the completion there.
 //!
-//! One read shape is still a `beam_io` residual and is **not** pinned here: a read of data that
-//! was already buffered before the read operation was issued, with a `timeout 0`. The oracle
-//! answers it from the buffer because the C attempts the receive at control time
-//! (`inet_drv.c:12309`); `TcpInetDriver` has no control-time read attempt, so it times out — for
-//! the port's **owner** as well, which is what makes it a driver gap rather than an addressing
-//! one. It is recorded, with its oracle expectation, as
-//! [`../inet_async_caller.rs`](../inet_async_caller.rs)'s `b` case (`#[ignore]`d on that row).
+//! A read of data that was already buffered before the read operation was issued, with a
+//! `timeout 0`, is [`../inet_async_caller.rs`](../inet_async_caller.rs)'s `b` case, and it answers
+//! the oracle's `{ok, <<"hi">>}` on both the owner and a non-owner reader: the driver attempts the
+//! receive **inside** its control call (the C's `tcp_recv(desc, n)`, `inet_drv.c:12310`), so the
+//! bytes are in hand before any read interest is armed and nothing is left for a readiness event
+//! to supply.
 
 // The shared harness is compiled in whole; this suite uses its bounded runner, its toolchain
 // discovery and its `-eval` differential.

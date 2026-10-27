@@ -139,7 +139,7 @@ The design rationale and binding invariants of the runtime glue — the mature-G
 * `enif_schedule_nif` chains run; `nif_yield_point` is a no-op (fairness) — A3.
 * Socket `{active, true|N|once}` input arrives as the oracle's messages; an accepted socket inherits the listener's options — A4.
 * Ports match the oracle's observable shape; `line`/`{line,N}` adopted; `port_command/2,3` runs `beam_io`'s table — A4, `src/port/CONTEXT.md`.
-* A nested passive socket operation really waits for its `{inet_async, …}`; the one residual is `beam_io`'s missing control-time read attempt for data buffered before the op armed — A4, `src/port/CONTEXT.md`.
+* A nested passive socket operation really waits for its `{inet_async, …}`, and data buffered before the read armed is answered from the driver's control-time read attempt (`inet_drv.c:12310`) — A4, `src/port/CONTEXT.md`.
 * A zero-slice round holding an unabsorbed heap-fragment wake counts as round progress (no full poll block) — `src/runtime/CONTEXT.md`.
 * A driver that closes its own port is a full closer: owner and monitors get the failure's own reason — A4.
 * The send family's reference alias, remote destination and local port id; a registered port name, a remote port term and an unreachable remote destination stay gaps — A4.
