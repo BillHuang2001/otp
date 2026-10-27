@@ -29,14 +29,13 @@
 //! themselves live in the sibling modules and consume these.
 //!
 //! Error handling note (shared by both ports): a well-formed term almost always
-//! hashes. The *reachable* typed failures for a well-formed term are the two
-//! identity gaps: a `FunKind::Local` fun (a `make_fun3` closure), whose inlined
-//! 2-word descriptor carries neither the module nor `old_uniq` that the C's
-//! `ErlFunEntry` supplies — see [`crate::fun`] — and an internal reference, whose C
-//! hash mixes an id of the node container this tree's M1 `Ref` thing does not carry
-//! (see [`crate::boxed::internal_ref_numbers`]). They are reported as the dedicated
-//! `TermError::FunIdentityUnavailable` / `TermError::RefIdentityUnavailable` (the
-//! term is fine; the identity is not carried), never as a substituted value. A word
+//! hashes. The one *reachable* typed failure for a well-formed term is an identity
+//! gap: a `FunKind::Local` fun (a `make_fun3` closure), whose inlined 2-word
+//! descriptor carries neither the module nor `old_uniq` that the C's `ErlFunEntry`
+//! supplies — see [`crate::fun`] — reported as `TermError::FunIdentityUnavailable`
+//! (the term is fine; the identity is not carried), never as a substituted value.
+//! An **internal reference** used to be the second such gap; it is now hashed from
+//! its own `id` word (see [`internal_ref_hash_word`]). A word
 //! that is not a term at all (a bare header word, e.g. the ABI's `THE_NON_VALUE`) is
 //! reported as `TermError::NotATerm` rather than dereferenced. Every other `Err` in
 //! the ports is for a forged/unknown term layout (unreachable through the safe API)
@@ -45,6 +44,7 @@
 
 use crate::bitstring::bitstring_parts;
 use crate::boxed::{boxed_val, make_boxed, ERL_BIN_REF_SIZE};
+use crate::error::TermResult;
 use crate::eterm::Eterm;
 
 // `FUNNY_NUMBER1..15` (`erl_term_hashing.c:98-112`) — the primes just above 2^28
@@ -130,6 +130,58 @@ pub(super) fn uint32_hash(hash: u32, e: u32, k: u32) -> u32 {
     uint32_hash_2(hash, e, 0, k)
 }
 
+/// The `u32` both ports mix for an **internal reference** — the M1 substitution for
+/// the C's `internal_ref_numbers(t)[0]`.
+///
+/// # The C operand, and what replaces it
+///
+/// The C mixes the first id of the reference's node container:
+/// `UINT32_HASH_RET(internal_ref_numbers(term)[0], FUNNY_NUMBER9, FUNNY_NUMBER10)`
+/// (`erl_term_hashing.c:288-290`, `make_hash`) and
+/// `UINT32_HASH(internal_ref_numbers(term)[0], HCONST_7)` (`:1454-1458`,
+/// `make_hash2`). `internal_ref_numbers(x)` is `&external_ref_data(x)[1]`
+/// (`erl_node_container_utils.h:264`), so `[0]` is the low `u32` of the container's
+/// packed 64-bit reference value — `id & REF_MASK`, the 18-bit wire number
+/// (`erl_bif_unique.h:115-167`, mirrored by `beam_codec::ref_wire::ref_id_to_numbers`).
+///
+/// This tree's M1 internal-reference thing carries no node container: it is the
+/// frozen four-word `[make_header(3, REF_SUBTAG), node, serial, id]` block
+/// ([`crate::boxed::write_internal_ref`]) whose `node`/`serial` words are zero and
+/// whose *whole* identity is the single 60-bit `id` word — the word
+/// `beam_common::next_ref_id` mints and [`crate::boxed::internal_ref_id`] reads back.
+/// A literal transcription of the C would therefore mix the **same** operand for
+/// every local reference of a process, collapsing `erlang:phash2/1`'s 27-bit result
+/// onto one value and making every `dict`/`gb_trees` keyed by a reference collide.
+///
+/// So the mixed operand is the id word's **low 32 bits**: the reference's whole
+/// identity in the same `u32` width and bit shape the C's `UINT32_HASH*` macros take,
+/// with nothing substituted and nothing dropped that carries identity. Two
+/// consequences are deliberate and documented rather than hidden:
+///
+/// * the value is **not** oracle-comparable — ERTS's own id comes from its running
+///   reference space (`value = esdp->ref++`, `erl_bif_unique.h:169-178`), so no two
+///   VMs agree on it even for the C's exact formula. Only *structural* properties are
+///   asserted (see `tests/record_ref_hash.rs`);
+/// * the operand is wider than the C's 18-bit `num[0]` projection, so an internal
+///   reference and an **external** one carrying the same wire numbers do not join the
+///   same hash bucket the way the oracle's do — the M1 id is a plain counter with no
+///   wire packing to project, and mixing only 18 bits would throw away 14 bits of a
+///   perfectly good counter. The external arm keeps the C-exact `num[0]` operand.
+///
+/// # Errors
+///
+/// [`TermError::BadRef`] when `t` is a `REF_SUBTAG` thing of a layout that is neither
+/// the M1 block nor readable — e.g. a C-layout `ErtsORefThing` (header arity 2),
+/// whose id word does not exist. Never a mixed-in zero or a truncated id.
+/// (`TermError::RefIdentityUnavailable` used to be the answer here; the M1 id word
+/// is the identity, so the gap is closed.)
+pub(super) fn internal_ref_hash_word(t: Eterm) -> TermResult<u32> {
+    // SAFETY: the caller dispatched on `REF_SUBTAG`, so `t` is a boxed term whose
+    // header word is live and aligned; `internal_ref_id` re-validates the M1 arity
+    // and the small-integer id word before reading it.
+    let id = unsafe { crate::boxed::internal_ref_id(t)? };
+    Ok((id & 0xffff_ffff) as u32)
+}
 /// `SINT32_HASH(y, AConst)` (`erl_term_hashing.c:904-912`) — a negative value is
 /// mixed twice (once with `-y`, once with `y`).
 #[inline]

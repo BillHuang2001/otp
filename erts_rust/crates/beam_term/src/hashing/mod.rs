@@ -444,15 +444,16 @@ unsafe fn hash_words(t: Eterm, mut h: u64) -> u64 {
 // **these values are a compatibility contract**: the system ERTS produces them,
 // so a Rust term must hash identically (Level-1 drop-in).
 //
-// Error handling: a well-formed term almost always hashes. The *reachable* typed
-// failures for a well-formed term are the two identity gaps: a [`FunKind::Local`] fun
+// Error handling: a well-formed term almost always hashes. The one *reachable* typed
+// failure for a well-formed term is an identity gap: a [`FunKind::Local`] fun
 // (a `make_fun3` closure), whose inlined 2-word descriptor carries neither the module
-// nor `old_uniq` that the C's `ErlFunEntry` supplies — see [`crate::fun`] — and an
-// internal reference, whose C hash mixes an id of the node container this tree's M1
-// `Ref` thing does not carry (see [`crate::boxed::internal_ref_numbers`]). They are
-// reported as the dedicated [`crate::error::TermError::FunIdentityUnavailable`] /
-// [`crate::error::TermError::RefIdentityUnavailable`] (the term is fine; the identity
-// is not carried), never as a substituted value.
+// nor `old_uniq` that the C's `ErlFunEntry` supplies — see [`crate::fun`] — reported as
+// the dedicated [`crate::error::TermError::FunIdentityUnavailable`] (the term is fine;
+// the identity is not carried), never as a substituted value.
+// An **internal reference** used to be the second such gap; it is now hashed from its
+// own `id` word, the identity the M1 thing actually carries — see
+// `common::internal_ref_hash_word` for the substitution the C's
+// `internal_ref_numbers(t)[0]` operand needed.
 // A word that is **not a term at all** — a bare header word, i.e. the C ABI's
 // `THE_NON_VALUE` (`0`, or a bare `FLOAT` header in a debug build) and friends;
 // see [`crate::tag::is_term_word`] — is reported as

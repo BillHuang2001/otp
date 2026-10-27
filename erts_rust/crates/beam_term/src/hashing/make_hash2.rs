@@ -26,14 +26,14 @@
 //! are a compatibility contract**: the system ERTS produces them, so a Rust term
 //! must hash identically (Level-1 drop-in).
 //!
-//! The reachable typed failures for a well-formed term are two identity gaps: a
-//! `FunKind::Local` fun (a `make_fun3` closure), whose inlined 2-word descriptor
-//! carries no module and no `old_uniq` (`TermError::FunIdentityUnavailable`), and an
-//! internal reference, whose C hash mixes an id of the node container this tree's M1
-//! `Ref` thing does not carry (`TermError::RefIdentityUnavailable`) — see the
-//! `common` submodule for the shared error-handling note.
+//! The **single** reachable typed failure for a well-formed term is an identity gap:
+//! a `FunKind::Local` fun (a `make_fun3` closure), whose inlined 2-word descriptor
+//! carries no module and no `old_uniq` (`TermError::FunIdentityUnavailable`) — see the
+//! `common` submodule for the shared error-handling note. An **internal reference**
+//! no longer refuses: its M1 `id` word is its whole identity, so it is mixed in the
+//! C's `u32` shape (see `internal_ref_hash_word`).
 //!
-//! The **first** of those is closeable by the caller: a `make_fun3` closure's `index`
+//! That fun gap is closeable by the caller: a `make_fun3` closure's `index`
 //! and `old_uniq` *are* in the term, so only its defining module is missing, and
 //! [`make_hash2_with_identity`] takes a [`LocalFunIdentity`] provider that supplies
 //! it (the runtime's `LocalFunIdentity` seam already resolves exactly that, for the
@@ -79,10 +79,10 @@ use crate::thing::{
 use crate::tuple::tuple_val;
 
 use super::common::{
-    base_bits, bitstring_parts_any, block_hash, is_ssmall28, not_ssmall28_hash, sint32_hash,
-    uint32_hash, uint32_hash_2, HCONST, HCONST_10, HCONST_11, HCONST_12, HCONST_13, HCONST_14,
-    HCONST_15, HCONST_16, HCONST_19, HCONST_2, HCONST_23, HCONST_3, HCONST_4, HCONST_5, HCONST_6,
-    HCONST_7, HCONST_9,
+    base_bits, bitstring_parts_any, block_hash, internal_ref_hash_word, is_ssmall28,
+    not_ssmall28_hash, sint32_hash, uint32_hash, uint32_hash_2, HCONST, HCONST_10, HCONST_11,
+    HCONST_12, HCONST_13, HCONST_14, HCONST_15, HCONST_16, HCONST_19, HCONST_2, HCONST_23,
+    HCONST_3, HCONST_4, HCONST_5, HCONST_6, HCONST_7, HCONST_9,
 };
 use super::identity::{local_fun_module, LocalFunIdentity};
 
@@ -498,13 +498,13 @@ fn make_hash2_from(
                     }
                     REF_SUBTAG => {
                         // The C mixes `internal_ref_numbers(term)[0]`
-                        // (`erl_term_hashing.c:1454-1458`) — the first id of the
-                        // reference's **node container**. This tree's M1 on-heap `Ref`
-                        // thing (`[header, w1, w2]`) carries a single process-local id
-                        // and no node container, so the oracle's value (itself
-                        // environment-dependent) cannot be reproduced. Refuse rather
-                        // than mix a wrong number.
-                        return Err(TermError::RefIdentityUnavailable);
+                        // (`erl_term_hashing.c:1454-1458`). This tree's M1 `Ref` thing
+                        // carries no node container, so the operand is the reference's
+                        // `id` word — its whole identity — in the C's `u32` shape; see
+                        // [`internal_ref_hash_word`].
+                        let id = internal_ref_hash_word(term)?;
+                        hash = uint32_hash(hash, id, HCONST_7);
+                        to_common = true;
                     }
                     EXTERNAL_REF_SUBTAG => {
                         // SAFETY: the header says external reference.

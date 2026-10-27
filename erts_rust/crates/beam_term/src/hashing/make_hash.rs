@@ -34,9 +34,11 @@
 //!   [`compute_record_definition_hash`] because `record::write_record` can only
 //!   store a placeholder (see the `HOp::RecordInit` arm);
 //! * an **internal reference** mixes `internal_ref_numbers(term)[0]`
-//!   (`:288-290`) — an id of the node container this tree's M1 `Ref` thing does not
-//!   carry — so it is refused with `TermError::RefIdentityUnavailable` rather than
-//!   mixed from a different word;
+//!   (`:288-290`). This tree's M1 `Ref` thing carries no node container, so the
+//!   mixed `u32` is the reference's **`id` word** (low 32 bits) — its whole identity
+//!   — instead of the C's 18-bit `num[0]` projection (see
+//!   [`internal_ref_hash_word`]); a reference of any other layout answers
+//!   [`TermError::BadRef`] rather than a mixed-in substitute;
 //! * a **`make_fun3` (`FunKind::Local`) fun** mixes `atom_val(fe->module)`'s hvalue,
 //!   `fe->index`, `fe->old_uniq` and the capture count (`:242-261`). The frozen term
 //!   carries the middle two in its inlined descriptor, so only the **defining module**
@@ -67,8 +69,8 @@ use crate::tag::{
 use crate::thing::{big_parts, external_pid_parts, external_port_parts, external_ref_parts};
 
 use super::common::{
-    bitstring_parts_any, uint32_hash_step, HItem, HOp, FN1, FN10, FN11, FN12, FN13, FN14, FN15,
-    FN2, FN3, FN4, FN5, FN6, FN8, FN9,
+    bitstring_parts_any, internal_ref_hash_word, uint32_hash_step, HItem, HOp, FN1, FN10, FN11,
+    FN12, FN13, FN14, FN15, FN2, FN3, FN4, FN5, FN6, FN8, FN9,
 };
 use super::identity::{local_fun_module, reborrow, LocalFunIdentity};
 use super::make_hash2::{compute_record_definition_hash, make_hash2_with_identity};
@@ -326,12 +328,12 @@ pub fn make_hash_with_identity(
             HOp::Ref | HOp::ExternalRef => {
                 let first = if op == HOp::Ref {
                     // The C mixes `internal_ref_numbers(term)[0]`
-                    // (`erl_term_hashing.c:288-290`) — the first id of the reference's
-                    // **node container**. This tree's M1 on-heap `Ref` thing carries a
-                    // single process-local id and no node container, so the oracle's
-                    // value (itself environment-dependent) cannot be reproduced.
-                    // Refuse rather than mix a wrong number.
-                    return Err(TermError::RefIdentityUnavailable);
+                    // (`erl_term_hashing.c:288-290`). This tree's M1 `Ref` thing carries
+                    // no node container, so the operand is the reference's `id` word —
+                    // its whole identity — in the C's `u32` shape. See
+                    // [`internal_ref_hash_word`] for the substitution and why a literal
+                    // port would collapse every local reference onto one value.
+                    internal_ref_hash_word(term)?
                 } else {
                     // SAFETY: the tag says external reference.
                     // `external_ref_numbers(x)` is `&external_ref_data(x)[1]` — the word

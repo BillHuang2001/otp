@@ -26,10 +26,12 @@
 //!   computes from the definition block itself ([`compute_record_definition_hash`])
 //!   because `record::write_record` can only store a caller-supplied placeholder —
 //!   and
-//! * an **internal reference** must be REFUSED with the typed
-//!   [`TermError::RefIdentityUnavailable`] (its C hash mixes an id of the node
-//!   container this tree's M1 `Ref` thing does not carry), never hashed to a
-//!   non-oracle value.
+//! * an **internal reference** must hash from its **`id` word** — the M1
+//!   substitution for the C's `internal_ref_numbers(t)[0]`
+//!   (`erl_term_hashing.c:288-290` / `:1454-1458`), whose value is *not*
+//!   oracle-comparable (ERTS's own reference numbering is per-VM), so only the
+//!   structural properties are pinned: in-range, stable for one term, distinct per
+//!   mint, and not the identity of the integer spelling of its id.
 //!
 //! The offline pins keep the record contract verifiable without `erl`; the live
 //! cross-check (skipped loudly when `erlc`/`erl` are absent) compiles a real
@@ -263,36 +265,159 @@ fn native_record_hash_is_content_stable() {
     assert_ne!(make_hash(r1, &t), make_hash(r3, &t));
 }
 
-/// An internal reference is a well-formed term the operation cannot faithfully
-/// complete: both ports refuse it with the dedicated typed error (never a wrong
-/// value), while the internal structural `term_hash` is unaffected.
+/// An internal reference hashes from its **`id` word** — the M1 substitution for the
+/// C's `internal_ref_numbers(t)[0]` (`erl_term_hashing.c:288-290` for `make_hash`,
+/// `:1454-1458` for `make_hash2`).
 ///
-/// The oracle's `erlang:phash2(make_ref(), 1 bsl 32)` is **environment-dependent**
-/// (the C mixes `internal_ref_numbers(x)[0]`, an id of the running node's container
-/// — `erl_term_hashing.c:1454-1458`), so it is deliberately NOT pinned; the
-/// contract asserted here is the typed refusal.
+/// Nothing numeric is pinned: ERTS's own reference numbering is per-VM
+/// (`value = esdp->ref++`, `erl_bif_unique.h:169-178`), so even the C's exact formula
+/// yields a different value in every VM. The contract asserted is structural:
+///
+/// * both ports answer `Ok` for a reference — alone and nested in a container the
+///   walk descends into (the defect this replaces was a hard refusal);
+/// * the value is **stable** for one term (a `dict`/`gb_trees` key must not wander);
+/// * **distinct mints hash distinctly**, i.e. the operand really is the identity and
+///   not the zeroed `node`/`serial` words (a literal C port would collapse every
+///   local reference of a process onto one hash);
+/// * the mix is **not the identity**: a reference does not hash like the integer
+///   carrying its own id.
 #[test]
-fn internal_reference_is_refused_by_both_ports() {
+fn internal_reference_hashes_by_its_id_word() {
+    let mut t = AtomTable::new();
+    t.seed(["a", "b"]);
+    let mut heap = Heap::new(1024);
+    // Eight mints from the ONE shared reference-id space (`beam_common::next_ref_id`)
+    // — the same source `erlang:make_ref/0` draws from.
+    let ids: [u64; 8] = core::array::from_fn(|_| beam_common::next_ref_id());
+    let refs: Vec<Eterm> = ids
+        .iter()
+        .map(|&id| {
+            // SAFETY: `heap` owns `INTERNAL_REF_WORDS` words per call, never
+            // reallocates, and outlives every term below.
+            let hp = unsafe { heap.alloc_words(INTERNAL_REF_WORDS) }.unwrap();
+            unsafe { write_internal_ref(hp, id) }.unwrap()
+        })
+        .collect();
+    // (1) `Ok` for both ports, and (2) stable for one term.
+    let h2: Vec<u32> = refs
+        .iter()
+        .map(|&r| make_hash2(r, &t).expect("a reference has hashable identity"))
+        .collect();
+    let h1: Vec<u32> = refs
+        .iter()
+        .map(|&r| make_hash(r, &t).expect("a reference has hashable identity"))
+        .collect();
+    for (i, &r) in refs.iter().enumerate() {
+        assert_eq!(make_hash2(r, &t), Ok(h2[i]));
+        assert_eq!(make_hash(r, &t), Ok(h1[i]));
+    }
+    // (3) Distinct mints are distinct keys. The weak (and safe) form first: the hash
+    // is not constant over the window — exactly the shape a literal C port produces.
+    let distinct2: std::collections::BTreeSet<u32> = h2.iter().copied().collect();
+    let distinct1: std::collections::BTreeSet<u32> = h1.iter().copied().collect();
+    assert!(
+        distinct2.len() > 1,
+        "make_hash2 collapsed {} distinct references onto {distinct2:?}",
+        refs.len()
+    );
+    assert!(
+        distinct1.len() > 1,
+        "make_hash collapsed {} distinct references onto {distinct1:?}",
+        refs.len()
+    );
+    // ... and the concrete pair every `dict` insert relies on: the first two mints
+    // (consecutive ids from the shared space) hash apart.
+    assert_ne!(h2[0], h2[1], "two consecutive mints share a phash2 value");
+    assert_ne!(h1[0], h1[1], "two consecutive mints share a phash value");
+    // (4) The mix is not the identity: a reference is not its own id as an integer.
+    // Id `0` is skipped: both ports start from `hash = 0` and the C's mixing steps
+    // are pure `*prime + operand`, so the operand `0` maps to `0` in *every* arm —
+    // probative for nothing. (`beam_common::next_ref_id`'s first draw is `0`.)
+    for (i, &id) in ids.iter().enumerate() {
+        if id == 0 {
+            continue;
+        }
+        let as_int = make_small(id as i64);
+        assert_ne!(
+            make_hash2(refs[i], &t),
+            make_hash2(as_int, &t),
+            "phash2(ref {id}) equals phash2({id}) — the ref arm is the identity"
+        );
+        assert_ne!(
+            make_hash(as_int, &t),
+            Ok(h1[i]),
+            "phash(ref {id}) equals phash({id}) — the ref arm is the identity"
+        );
+    }
+    // A container the walk descends into reaches the same reference.
+    let tup = heap.tuple(&[make_small(1), refs[0]]).unwrap();
+    assert!(make_hash2(tup, &t).is_ok());
+    assert!(make_hash(tup, &t).is_ok());
+    assert_ne!(make_hash2(tup, &t), make_hash2(refs[0], &t));
+    // The internal structural hash is unaffected and stays deterministic.
+    assert_eq!(term_hash(refs[0], &t), term_hash(refs[0], &t));
+}
+/// A `REF_SUBTAG` thing of the **C layout** (`ErtsORefThing`: header arity 2, packed
+/// `u32` ids) has no `id` word, so it is a *shape* failure — the typed
+/// [`TermError::BadRef`], never a value mixed from a substitute — while a reference
+/// the runtime actually builds is a hashable term.
+///
+/// The two layouts share the `REF_SUBTAG` header, so this pins that the ports go
+/// through `boxed::internal_ref_id`'s arity check instead of reading word 3 blindly.
+#[test]
+fn c_layout_reference_is_a_shape_failure_not_a_wrong_value() {
     let mut t = AtomTable::new();
     t.seed(["a", "b"]);
     let mut heap = Heap::new(32);
-    // SAFETY: `heap` owns the 3-word ref block and outlives the band.
-    let r = unsafe {
+    // SAFETY: `heap` owns the 3-word C-layout block and outlives the term.
+    let c_layout = unsafe {
         let p = heap.alloc_words(3).unwrap();
         *p = make_header(2, REF_SUBTAG);
         *p.add(1) = Eterm::from_raw(0xffff_ffff_0000_0000);
         *p.add(2) = Eterm::from_raw(0x0000_0002_0000_0001);
         make_boxed(p)
     };
-    assert_eq!(make_hash2(r, &t), Err(TermError::RefIdentityUnavailable));
-    assert_eq!(make_hash(r, &t), Err(TermError::RefIdentityUnavailable));
-    // The internal structural hash still works and stays deterministic.
-    assert_eq!(term_hash(r, &t), term_hash(r, &t));
-
-    // A ref nested in a tuple is refused too (the walk reaches it).
-    let tup = heap.tuple(&[make_small(1), r]).unwrap();
-    assert_eq!(make_hash2(tup, &t), Err(TermError::RefIdentityUnavailable));
-    assert_eq!(make_hash(tup, &t), Err(TermError::RefIdentityUnavailable));
+    assert_eq!(make_hash2(c_layout, &t), Err(TermError::BadRef));
+    assert_eq!(make_hash(c_layout, &t), Err(TermError::BadRef));
+    // Nested, the walk reaches it and propagates the same typed answer.
+    let tup = heap.tuple(&[make_small(1), c_layout]).unwrap();
+    assert_eq!(make_hash2(tup, &t), Err(TermError::BadRef));
+    assert_eq!(make_hash(tup, &t), Err(TermError::BadRef));
+}
+/// An **external** reference (another node's) hashes too — its wire words are all
+/// present, so both ports mix them exactly as the C does
+/// (`UINT32_HASH_RET(external_ref_numbers(t)[0], …)`, `:290` / `:1460-1461`) instead
+/// of refusing.
+///
+/// The mix is the stored `num[0]` word, so distinct id arrays hash distinctly and a
+/// repeated call is stable; a **zero-length** reference (the C's `count == 0`) reads
+/// the zeroed word after the count and mixes `0` rather than failing.
+#[test]
+fn external_reference_hashes_its_wire_words() {
+    let mut t = AtomTable::new();
+    t.seed(["a", "b", "other"]);
+    let node = make_atom(t.lookup("other").expect("seeded"));
+    let mut heap = Heap::new(256);
+    let mk = |heap: &mut Heap, ids: &[u32]| {
+        // SAFETY: `heap` owns `external_ref_size_words(ids.len())` words per call,
+        // never reallocates, and outlives the term; `node` is a seeded atom immediate.
+        let hp = unsafe { heap.alloc_words(external_ref_size_words(ids.len())) }.unwrap();
+        unsafe { write_external_ref(hp, node, ids, 0x0BAD_CAFE) }
+    };
+    let a = mk(&mut heap, &[0x0003_FFFF, 0x1234_5678, 0xDEAD_BEEF]);
+    let b = mk(&mut heap, &[0x0003_FFFE, 0x1234_5678, 0xDEAD_BEEF]);
+    let empty = mk(&mut heap, &[]);
+    assert!(make_hash2(a, &t).is_ok(), "an external ref must hash");
+    assert!(make_hash(a, &t).is_ok(), "an external ref must hash");
+    assert_eq!(make_hash2(a, &t), make_hash2(a, &t));
+    assert_eq!(make_hash(a, &t), make_hash(a, &t));
+    // Distinct wire ids ⇒ distinct hashes (the `num[0]` word is what both ports mix).
+    assert_ne!(make_hash2(a, &t), make_hash2(b, &t));
+    assert_ne!(make_hash(a, &t), make_hash(b, &t));
+    // A zero-length reference mixes the zeroed word after the count (the C's `0`).
+    assert!(make_hash2(empty, &t).is_ok());
+    assert!(make_hash(empty, &t).is_ok());
+    assert_ne!(make_hash2(empty, &t), make_hash2(a, &t));
 }
 
 // ---------------------------------------------------------------------------
