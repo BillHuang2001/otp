@@ -50,13 +50,16 @@
 //!
 //! A missing `erl` is a **loud** skip, never a silent pass (`tests/support/mod.rs`).
 //!
-//! # The deliberate non-parity
+//! # A live non-stdio device: the observable the two sides agree on
 //!
-//! One probe is **not** oracle-equal by design, and is pinned as such rather than dropped:
-//! a **live non-stdio device** (a registered pid other than the caller's group leader or the
-//! `standard_error` device) needs the `{io_request, …}`/`{io_reply, …}` round trip, which a
-//! BIF may not perform — this runtime answers the typed `unsupported` (exit 3) instead of
-//! blocking, so `a_live_non_stdio_device_is_a_typed_gap` asserts only *this* runtime's side.
+//! A **live non-stdio device** (a registered pid that is neither the caller's group leader nor
+//! the `standard_error` device) needs the `{io_request, …}`/`{io_reply, …}` round trip. This
+//! runtime runs OTP's own `io.erl` body in-machine for that route, the spawned device never
+//! replies, and the `-eval` process ends in `error:terminated` — the oracle's own exit code
+//! (`1`) with the same empty stdout. `a_live_non_stdio_device_terminates_like_the_oracle` pins
+//! exactly that pair (code + stdout, differentially) and this runtime's stderr separately: the
+//! two sides differ only in the *rendering* of the failure (`beam_rt: error terminated` on fd 2
+//! versus the oracle's own diagnostics), which is not a comparison this suite may pin.
 //! Every device-taking arm — `io:put_chars/2` included — shares that one model.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
@@ -466,15 +469,23 @@ fn an_uncaught_bad_device_exits_like_the_oracle() {
 // The one deliberate non-parity: a live non-stdio device
 // ---------------------------------------------------------------------------------------
 
-/// A **live** io device this runtime cannot serve from a BIF (a registered pid that is
-/// neither the caller's group leader nor the `standard_error` device) is the typed
-/// `unsupported` — exit 3, one `unsupported:` line on stderr, nothing on stdout.
+/// A **live** non-stdio io device (a registered pid that is neither the caller's group leader
+/// nor the `standard_error` device) takes the `{io_request, …}`/`{io_reply, …}` protocol: the
+/// `io.erl` body runs in-machine, posts the request, and waits for a reply the spawned device
+/// never sends, so the process ends in `error:terminated`.
 ///
-/// The oracle is deliberately **not** consulted: it would post an `{io_request, …}` to that
-/// process and block for ever in the `receive` (the spawned device never replies), so the
-/// oracle side of this probe is not expressible as a terminating comparison.
+/// That is the oracle's own observable — **exit 1 with empty stdout** — on all five device-taking
+/// arms, and the code/stdout pair is therefore compared **differentially** (`differential`), not
+/// pinned alone.
+///
+/// The stderr half is deliberately **not** compared: `beam_rt` renders the CLI's own
+/// `beam_rt: error terminated` line, while the oracle's stderr is empty for the same exit code
+/// (its `-eval` process is killed by the `terminated` error, which it reports through its own
+/// channel rather than the CLI's), so a stderr comparison would pin a rendering difference
+/// instead of behaviour. This runtime's line is asserted separately — present, and never on
+/// stdout — so the test still discriminates without an oracle.
 #[test]
-fn a_live_non_stdio_device_is_a_typed_gap() {
+fn a_live_non_stdio_device_terminates_like_the_oracle() {
     for (what, function) in [
         ("io:nl/1", "io:nl(io_device_probe)"),
         ("io:write/2", "io:write(io_device_probe, hi)"),
@@ -486,17 +497,24 @@ fn a_live_non_stdio_device_is_a_typed_gap() {
             "P = spawn(fun() -> receive _ -> ok end end), register(io_device_probe, P), \
              {function}, halt(0)."
         );
-        let run = beam_rt_eval(&expr);
-        assert_eq!(run.code, 3, "{what}: a capability gap is CLI exit 3");
+        let run = differential(what, &expr);
+        assert_eq!(run.code, 1, "{what}: the live device ends in error:terminated");
         assert!(
             run.out.is_empty(),
-            "{what}: a capability gap prints nothing to stdout — got {:?}",
+            "{what}: nothing reaches stdout — got {:?}",
             run.out_str()
         );
-        let err = run.err_str();
+        // This runtime's own half: the CLI reports the termination on fd 2 only.
+        let rust = beam_rt_eval(&expr);
         assert!(
-            err.contains("unsupported") && err.contains("io-device"),
-            "{what}: the typed gap must name the live io-device process — stderr: {err:?}"
+            rust.err_str().contains("terminated"),
+            "{what}: the CLI reports the termination on stderr — got {:?}",
+            rust.err_str()
+        );
+        assert!(
+            !rust.err_str().contains("unsupported"),
+            "{what}: a live device is no longer a capability gap — got {:?}",
+            rust.err_str()
         );
     }
 }
