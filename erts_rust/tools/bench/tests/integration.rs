@@ -280,4 +280,30 @@ fn a_real_foreign_workload_is_measured_under_both_runtimes() {
         rust_capable.contains(&"gc_class"),
         "the rust-schedulable workload set must include `gc_class`; got {rust_capable:?}"
     );
+
+    // `jsone` and `bbmustache` are whole-application pure-Erlang programs (a JSON codec and a
+    // Mustache renderer) driven by their *own* eunit suites, and they are run with an identical
+    // argv under both runtimes — so their rows are a direct runtime-execution comparison. Same
+    // guard: registered, `Both`, `compute`, A.1+A.7, and Rust-schedulable.
+    for id in ["jsone", "bbmustache"] {
+        let w = workload::find(id)
+            .unwrap_or_else(|| panic!("the `{id}` workload must be registered"));
+        assert!(
+            matches!(w.runtimes(), Runtimes::Both),
+            "`{id}` must run under both runtimes, got {:?}",
+            w.runtimes()
+        );
+        assert_eq!(w.category(), Category::Compute);
+        assert!(
+            w.contracts().contains(&"A.1") && w.contracts().contains(&"A.7"),
+            "`{id}` contracts: {:?}",
+            w.contracts()
+        );
+        // A.9 (build/bootstrapping) is deliberately not claimed by these rows.
+        assert!(!w.contracts().contains(&"A.9"), "`{id}` contracts: {:?}", w.contracts());
+        assert!(
+            rust_capable.contains(&id),
+            "the rust-schedulable workload set must include `{id}`; got {rust_capable:?}"
+        );
+    }
 }

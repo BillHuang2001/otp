@@ -30,24 +30,36 @@ use std::path::{Path, PathBuf};
 use crate::workload::Workload;
 
 pub mod baseline;
+pub mod bbmustache;
 pub mod binary_append;
 pub mod copy_bound;
 pub mod cowboy;
 pub mod elixir_compiler;
 pub mod emqx;
 pub mod erlc_compiler;
+pub mod eunit_ledger;
+pub mod eunit_project;
 pub mod file_io;
 pub mod foreign;
 pub mod foreign_sample;
 pub mod gc_bound;
 pub mod gc_class;
+pub mod jsone;
 pub mod khepri;
 pub mod list_walk;
 pub mod plb;
 pub mod slice;
 pub mod tool;
 /// The workload ids that accept a `--repo <id>=<path>` override.
-pub const REPO_WORKLOADS: [&str; 5] = ["elixir_compiler", "plb", "cowboy", "khepri", "emqx"];
+pub const REPO_WORKLOADS: [&str; 7] = [
+    "elixir_compiler",
+    "plb",
+    "cowboy",
+    "khepri",
+    "emqx",
+    "jsone",
+    "bbmustache",
+];
 
 /// The environment variable name that overrides workload `id`'s external repo path.
 pub fn repo_env_var(id: &str) -> String {
@@ -127,6 +139,8 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(cowboy::Cowboy),
         Box::new(khepri::Khepri),
         Box::new(emqx::Emqx),
+        Box::new(jsone::Jsone::new()),
+        Box::new(bbmustache::Bbmustache::new()),
         Box::new(slice::Slice),
         Box::new(foreign::Foreign),
         Box::new(list_walk::ListWalk),
@@ -209,6 +223,8 @@ mod tests {
                 "cowboy",
                 "khepri",
                 "emqx",
+                "jsone",
+                "bbmustache",
                 "slice",
                 "foreign",
                 "list_walk",
