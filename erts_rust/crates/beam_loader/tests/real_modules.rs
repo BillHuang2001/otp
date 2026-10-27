@@ -124,6 +124,7 @@ fn loads_every_installed_otp_beam() {
     let mut loaded = 0usize;
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut empty: Vec<String> = Vec::new();
+    let mut slack: Vec<String> = Vec::new();
 
     for path in &sweep.beams {
         let label = rel_label(&sweep.root, path);
@@ -134,7 +135,10 @@ fn loads_every_installed_otp_beam() {
                 // empty function list means the pipeline parsed the chunks but
                 // silently dropped the code — still a defect.
                 if loaded_module.functions.is_empty() {
-                    empty.push(label);
+                    empty.push(label.clone());
+                }
+                for table in slack_tables(&loaded_module) {
+                    slack.push(format!("{label}:{table}"));
                 }
             }
             Err(error) => {
@@ -184,6 +188,57 @@ fn loads_every_installed_otp_beam() {
         "{} module(s) loaded but yielded no function: {empty:?}",
         empty.len()
     );
+    assert!(
+        slack.is_empty(),
+        "{} retained-table(s) kept allocation slack in real compiler output: {:?}",
+        slack.len(),
+        slack.iter().take(10).collect::<Vec<_>>()
+    );
+}
+
+/// Names every retained table of `module` whose `capacity` exceeds its `len`.
+///
+/// The IR is sized exactly, so slack is address space the module holds for the rest of
+/// its life and never uses: the module tables, each function body, and each function's
+/// block list. The sweep over the whole installed OTP is where the sizing is proven
+/// against real compiler output — in particular that the per-body capacity pre-count
+/// for the `deallocate`/`return` fusion lands on the post-fusion length.
+fn slack_tables(module: &Module) -> Vec<String> {
+    let mut found = Vec::new();
+    let tables: [(&str, usize, usize); 6] = [
+        ("atoms", module.atoms.len(), module.atoms.capacity()),
+        ("exports", module.exports.len(), module.exports.capacity()),
+        ("locals", module.locals.len(), module.locals.capacity()),
+        ("imports", module.imports.len(), module.imports.capacity()),
+        ("funs", module.funs.len(), module.funs.capacity()),
+        (
+            "functions",
+            module.functions.len(),
+            module.functions.capacity(),
+        ),
+    ];
+    for (name, len, capacity) in tables {
+        if capacity > len {
+            found.push(format!("{name}({len}/{capacity})"));
+        }
+    }
+    for (index, function) in module.functions.iter().enumerate() {
+        if function.code.capacity() > function.code.len() {
+            found.push(format!(
+                "function[{index}].code({}/{})",
+                function.code.len(),
+                function.code.capacity()
+            ));
+        }
+        if function.blocks.capacity() > function.blocks.len() {
+            found.push(format!(
+                "function[{index}].blocks({}/{})",
+                function.blocks.len(),
+                function.blocks.capacity()
+            ));
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------

@@ -37,28 +37,58 @@
 
 use crate::instr::Instr;
 
-/// `deallocate N; return` -> `DeallocateReturn(N)`.
+/// `deallocate N; return` -> `DeallocateReturn(N)`, `code` still owned.
+///
+/// Applies [`fuse_in_place`] to an owned body, so the caller that already owns the
+/// vector neither pays for a second allocation nor gives up the original capacity.
+pub fn fuse(code: Vec<Instr>) -> Vec<Instr> {
+    let mut code = code;
+    fuse_in_place(&mut code);
+    code
+}
+
+/// `deallocate N; return` -> `DeallocateReturn(N)`, compacted in place.
 /// Only an ADJACENT pair with no intervening `Instr::Label` is fused (a `Label`
 /// is the only branch target, so two adjacent non-`Label` instructions are
 /// guaranteed to be in the same block). Everything else is left untouched, so
 /// `Instr::Deallocate`/`Instr::Return` stay live for hand-built modules.
-pub fn fuse(code: Vec<Instr>) -> Vec<Instr> {
-    let mut out: Vec<Instr> = Vec::with_capacity(code.len());
-    let mut iter = code.into_iter().peekable();
-    while let Some(instr) = iter.next() {
-        match instr {
-            // The very next instruction is the `Return` (any `Label` between the
-            // two would have been that next instruction instead, so the pair is
-            // adjacent by construction).
-            Instr::Deallocate(n) if matches!(iter.peek(), Some(Instr::Return)) => {
-                // Consume the `Return`; the pair becomes one instruction.
-                iter.next();
-                out.push(Instr::DeallocateReturn(n));
+///
+/// `code` is compacted with a read/write index pair: every element is either moved
+/// down into the write slot or replaced by the fused instruction, so the buffer is
+/// never reallocated (the capacity is untouched) and `truncate` only lowers the
+/// length. The rule keys on the adjacency of the *already-emitted* element, so a
+/// `Label` sitting between a `deallocate` and a `return` blocks the fuse exactly as
+/// it does when the pair is copied through a fresh vector.
+pub fn fuse_in_place(code: &mut Vec<Instr>) {
+    let len = code.len();
+    let mut read = 0usize;
+    let mut write = 0usize;
+    while read < len {
+        // The next instruction is the `Return` (any `Label` between the two would
+        // have been that next instruction instead, so the pair is adjacent by
+        // construction). Binds only the `Copy` word, so nothing is moved out.
+        let pop = match code[read] {
+            Instr::Deallocate(n) if matches!(code.get(read + 1), Some(Instr::Return)) => Some(n),
+            _ => None,
+        };
+        match pop {
+            Some(n) => {
+                // The `Return` is consumed by the fused instruction.
+                code[write] = Instr::DeallocateReturn(n);
+                read += 2;
             }
-            other => out.push(other),
+            None => {
+                // `write <= read` always holds, so this never overwrites an
+                // instruction that has not been read yet.
+                if write != read {
+                    code.swap(write, read);
+                }
+                read += 1;
+            }
         }
+        write += 1;
     }
-    out
+    code.truncate(write);
 }
 
 #[cfg(test)]
@@ -152,5 +182,61 @@ mod tests {
         // A trailing `deallocate` (no following instruction) must not panic or fuse.
         let code = vec![Instr::Return, Instr::Deallocate(0)];
         assert_eq!(fuse(code.clone()), code);
+    }
+
+    /// A body with several fusable pairs, a `Label` separating two of them and a
+    /// trailing lone `Deallocate`.
+    fn mixed_body() -> Vec<Instr> {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Deallocate(1),
+            Instr::Return,
+            Instr::Label(Label(2)),
+            Instr::Deallocate(2),
+            Instr::Return,
+            Instr::Deallocate(3),
+        ]
+    }
+
+    #[test]
+    fn fuse_and_fuse_in_place_agree_on_a_mixed_body() {
+        let mut in_place = mixed_body();
+        fuse_in_place(&mut in_place);
+        assert_eq!(fuse(mixed_body()), in_place);
+        assert_eq!(
+            in_place,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::DeallocateReturn(1),
+                Instr::Label(Label(2)),
+                Instr::DeallocateReturn(2),
+                Instr::Deallocate(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn fuse_in_place_keeps_the_allocation_and_only_lowers_the_length() {
+        let mut code = mixed_body();
+        let capacity = code.capacity();
+        let before = code.len();
+        fuse_in_place(&mut code);
+        assert_eq!(code.capacity(), capacity);
+        // Two adjacent pairs collapsed in this body.
+        assert_eq!(code.len(), before - 2);
+    }
+
+    #[test]
+    fn fuse_in_place_keeps_the_allocation_when_nothing_fuses() {
+        let mut code = vec![
+            Instr::Deallocate(1),
+            Instr::Label(Label(2)),
+            Instr::Return,
+        ];
+        let capacity = code.capacity();
+        let before = code.len();
+        fuse_in_place(&mut code);
+        assert_eq!(code.capacity(), capacity);
+        assert_eq!(code.len(), before);
     }
 }
