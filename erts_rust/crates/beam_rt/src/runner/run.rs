@@ -761,10 +761,9 @@ pub(super) fn resume_from_process_roots(
 ///   before collecting for a relocation-exempt pid;
 /// * the host collection gate
 ///   ([`context::gc_walk`](crate::context::gc_walk)) is a *strictly more conservative* valve:
-///   it declines on a container that forwards a scanned word out of an unscanned region,
-///   reachable from the roots it gathers, and an
-///   un-published process root set is a subset of the published one, so a gate that declined for
-///   the published roots declines for these too;
+///   it declines on a container that forwards a scanned word out of an unscanned region
+///   reachable from the roots it gathers, and an un-published process root set is a subset of the
+///   published one, so a gate that declined for the published roots declines for these too;
 /// * [`Process::grow_nursery`](beam_process::Process::grow_nursery) — the one growth path that is
 ///   deliberately **not** gated on the exemption — relocates nothing (it retires the old space
 ///   onto a chain the next collection collapses).

@@ -38,8 +38,7 @@
 //! 1. **The cheap, `O(roots)` classification** (`Walk::seed`, the old single-level valve): every
 //!    word the collection is about to publish is tested once with [`root_is_unscanned`]. A root
 //!    that is *itself* an unscanned container forwarding a scanned word declines the collection
-//!    here, without any descent —
-//!    the common direct case, at the cost the valve always had.
+//!    here, without any descent — the common direct case, at the cost the valve always had.
 //! 2. **The descent** — an **iterative worklist** walk, run **only** when a caller-supplied
 //!    `descend` gate allows it (see [`any_root_is_unscanned`]):
 //!
