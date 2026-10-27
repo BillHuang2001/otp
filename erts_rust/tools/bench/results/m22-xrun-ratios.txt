@@ -1,0 +1,94 @@
+m22 cross-runtime record — derived table (auditable intermediate)
+Sources: results/m22-xrun-r{1..6}-{rust,sys}.json — six matched rounds over the GC/allocator
+workload group (baseline, gc_bound, gc_class, list_walk, slice), `--quick`, alternating the side
+order every round, one process at a time, each pass pinned with `taskset -c 3 setsid -w`.
+No metric value was edited. `sys` = the system ERTS on PATH (Erlang/OTP 29.1.2 / erts-17.1.1);
+`rust` = erts_rust/target/release/beam_rt at its default (native baseline-JIT) tier, version=30.
+Figure quoted = median of the six per-round values; ratio = median of the six per-round ratios.
+Ratio > 1 => rust dearer. `ops`/`elements` are the deterministic N companions (identical every round).
+m21 comparability: m21 measured baseline,gc_bound,gc_class,list_walk and NO slice row, so every
+slice line below is new (see m22-vs-m21.txt for which rows are diffable).
+
+A. startup / compute / vm accounting (baseline)
+baseline/startup_ms[p50]                                          130.88              107.68    1.210  1.163 1.221 1.200 1.285 1.165 1.237
+baseline/startup_ms[p99]                                          136.38              110.77    1.178  1.155 1.023 1.200 1.207 1.147 1.291
+baseline/compute_loop_ms[p50]                                     150.02              167.42    0.875  0.875 0.822 0.887 0.938 0.874 0.814
+baseline/compute_ops_per_sec                                   6,657,011           5,989,102    1.140  1.141 1.196 1.123 1.062 1.139 1.221
+baseline/vm_memory_total_bytes                                 7,253,583          36,193,568    0.200  0.200 0.200 0.200 0.201 0.201 0.200
+
+B. per-case per-unit (value = median of the six rounds)
+list_walk/case_list_walk_ns_per_element                            15.20                2.26    6.753  6.617 6.786 6.744 6.735 6.762 9.306
+gc_bound/case_churn_ns_per_op                                  23,879.90            4,235.61    5.600  5.634 5.150 5.622 5.711 5.313 5.577
+gc_class/case_send_recv_ns_per_op                              18,659.16            3,299.96    5.442  5.489 4.839 5.529 6.113 5.396 5.152
+gc_class/case_ets_copy_ns_per_op                               10,980.98            1,805.36    6.104  6.089 5.064 6.118 6.291 5.741 6.643
+gc_class/case_compile_ns_per_op                           239,840,909.50       16,643,446.00   14.453  14.276 12.542 14.626 14.728 14.385 14.521
+
+C. slice per-case wall_ms[p50] (N=1: whole-process wall time, one call per process)
+slice/case_add_wall_ms[p50]                                       126.04              121.77    1.037  1.066 1.031 1.053 1.019 1.043 0.853
+slice/case_fib_wall_ms[p50]                                       126.71              120.91    1.046  1.074 1.049 1.043 1.008 1.074 0.845
+slice/case_pick_wall_ms[p50]                                      126.70              122.25    1.032  0.867 1.060 1.042 1.023 1.049 0.826
+slice/case_calendar_last_day_wall_ms[p50]                         126.79              122.35    1.030  0.856 1.043 1.066 1.019 1.041 0.769
+slice/case_queue_from_size_wall_ms[p50]                           126.79              125.96    0.995  0.873 0.965 1.064 1.024 1.061 0.800
+slice/case_gb_trees_size_wall_ms[p50]                             126.59              127.70    0.993  0.954 0.892 1.052 1.032 1.042 0.890
+slice/case_base64_encode_size_wall_ms[p50]                        127.08              128.82    0.984  0.879 0.961 1.007 1.036 1.059 0.715
+slice/case_ordsets_from_size_wall_ms[p50]                         126.19              124.62    1.013  0.838 1.003 1.024 1.046 1.039 0.800
+slice/case_string_str_length_wall_ms[p50]                         126.24              123.46    1.024  0.837 1.018 1.067 1.030 1.051 0.828
+
+C2. slice per-case wall_ms[p99] — the per-case tail (same six rounds)
+slice/case_add_wall_ms[p99]                                       127.61              123.59    1.027  1.019 1.034 1.052 1.102 0.961 0.846
+slice/case_fib_wall_ms[p99]                                       128.07              132.76    0.963  0.958 1.051 0.968 0.931 1.159 0.773
+slice/case_pick_wall_ms[p99]                                      132.53              128.61    1.031  0.646 1.055 1.008 1.228 1.136 0.803
+slice/case_calendar_last_day_wall_ms[p99]                         128.16              131.01    0.975  0.819 1.053 0.950 1.001 1.015 0.738
+slice/case_queue_from_size_wall_ms[p99]                           127.42              132.45    0.954  0.828 0.902 1.061 1.007 1.056 0.745
+slice/case_gb_trees_size_wall_ms[p99]                             127.17              139.80    0.914  0.827 0.723 1.002 1.021 1.047 0.719
+slice/case_base64_encode_size_wall_ms[p99]                        128.20              130.80    0.978  0.869 0.961 0.995 1.021 1.072 0.534
+slice/case_ordsets_from_size_wall_ms[p99]                         126.98              126.61    1.003  0.807 0.990 1.017 1.031 1.040 0.694
+slice/case_string_str_length_wall_ms[p99]                         127.17              129.70    0.974  0.604 0.945 1.071 1.003 1.061 0.746
+
+D. OS peak RSS (VmHWM, bytes) — median of the six rounds per side
+baseline/peak_memory_bytes                                   100,311,040         135,231,488    0.742  0.742 0.743 0.742 0.741 0.741 0.741
+gc_bound/case_churn_peak_rss_bytes                            68,440,064          67,647,488    1.012  1.010 1.012 1.009 1.013 1.011 1.014
+list_walk/case_list_walk_peak_rss_bytes                       68,153,344          67,381,248    1.012  1.005 1.009 1.010 1.015 1.013 1.013
+gc_class/case_send_recv_peak_rss_bytes                        68,657,152          67,698,688    1.014  1.010 1.016 1.014 1.011 1.015 1.015
+gc_class/case_ets_copy_peak_rss_bytes                         68,431,872          67,633,152    1.011  1.007 1.014 1.007 1.011 1.011 1.012
+gc_class/case_compile_peak_rss_bytes                         149,678,080          81,092,608    1.846  1.882 1.911 1.845 1.846 1.838 1.844
+slice/case_add_peak_rss_bytes                                 68,065,280          67,512,320    1.008  1.007 1.005 1.008 1.011 1.012 1.008
+slice/case_string_str_length_peak_rss_bytes                   68,243,456          67,602,432    1.009  1.007 1.006 1.010 1.009 1.010 1.012
+
+E. per-round per-unit values, rust/sys (ns unless stated) — the stability evidence
+round   churn_ns/op        list_walk_ns/elem    gc_class send_recv    gc_class ets_copy    gc_class compile
+r1       23,521.6/     4,175.1          14.9/         2.3      18,209.4/     3,317.7      10,652.4/     1,749.3         239.2/        16.8   (compile in ms)
+r2       25,066.5/     4,867.7          15.8/         2.3      19,109.0/     3,948.8      11,119.9/     2,196.1         240.5/        19.2   (compile in ms)
+r3       23,535.0/     4,186.3          15.3/         2.3      18,147.0/     3,282.2      10,842.0/     1,772.1         238.2/        16.3   (compile in ms)
+r4       24,224.8/     4,241.9          15.0/         2.2      20,055.0/     3,280.9      11,338.9/     1,802.5         243.5/        16.5   (compile in ms)
+r5       22,472.0/     4,229.4          15.1/         2.2      17,708.4/     3,281.9      10,380.6/     1,808.3         237.8/        16.5   (compile in ms)
+r6       25,933.9/     4,650.0          23.2/         2.5      21,476.4/     4,168.5      15,150.1/     2,280.7         325.6/        22.4   (compile in ms)
+
+F. status / withheld audit
+  rows: 60 (6 rounds x 2 sides x 5 workloads), status=ok: 60, not-ok: 0
+  withheld marginals: 0  — every case reports its paired median in every round
+  the deterministic counters (case_*_ops/_elements) are identical in every round on each side:
+    gc_bound/case_churn_ops: rust=[10000.0] sys=[200000.0]
+    list_walk/case_list_walk_elements: rust=[50000000.0] sys=[100000000.0]
+    gc_class/case_send_recv_ops: rust=[25000.0] sys=[200000.0]
+    gc_class/case_ets_copy_ops: rust=[40000.0] sys=[400000.0]
+    gc_class/case_compile_ops: rust=[2.0] sys=[8.0]
+
+G. runtime resolution (both sides, every pass)
+  sys  : /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl  version=29 supported=true
+  rust : erts_rust/target/release/beam_rt  version=30 supported=true
+
+H. load band (results/m22-xrun-load.log, /proc/loadavg at every pass boundary)
+  matched passes: 12 passes, 24 readings; 1-min load min 6.97 max 21.85 median 12.59
+  supplementary --runtime all pass: 21.85 -> 15.14
+  Per-pass table, the two spike rounds and the load narrative: results/m22-load-record.md.
+
+I. the budget-evaluation pass (NOT a timing source)
+  results/m22-budgetprobe-all.json is one `--runtime all --quick` pass over the same five workloads,
+  run only so the latency-budget rows that need BOTH sides in one report can be evaluated and so
+  `bench compare` has a report carrying both sides (two single-side reports share no
+  (workload,runtime) key, so the two-file mode reports every row `only-in-a`/`only-in-b`).
+  It is runtime-major (all `sys` rows, then all `rust` rows), so it carries the documented ordering
+  bias; every figure in sections A-E comes from the twelve matched single-side passes.
+  Its driver-printed verdict block is archived verbatim as results/m22-budgetprobe-all.txt, and its
+  cross-runtime diff as results/m22-compare-cross-runtime.txt.

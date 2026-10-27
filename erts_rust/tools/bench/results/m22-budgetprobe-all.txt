@@ -1,0 +1,188 @@
+bench 0.1.0 — profile quick — 2 runtime(s), 10 result(s)
+  runtime sys  supported=true  version=29       /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl
+  runtime rust supported=true  version=30       erts_rust/target/release/beam_rt
+  [ok] baseline         sys  
+        startup_ms: n=10 min=104.1633 mean=105.0719 p50=105.1798 p99=105.6997 ms
+        compute_loop_ms: n=5 min=162.2154 mean=164.1696 p50=164.3960 p99=165.3283 ms
+        compute_ops_per_sec=6091262.2316 ops/s
+        vm_memory_total_bytes=36197272.0000 bytes
+        peak_memory_bytes=135368704
+  [ok] gc_bound         sys  
+        case_churn_wall_ms: n=3 min=952.4945 mean=959.2563 p50=954.0364 p99=970.8938 ms
+        case_churn_startup_ms: n=3 min=115.6134 mean=115.8773 p50=115.6575 p99=116.3471 ms
+        case_churn_peak_rss_bytes: n=3 min=67506176.0000 mean=67661824.0000 p50=67690496.0000 p99=67786833.9200 bytes
+        case_churn_ns_per_op=4188.3764 ns
+        case_churn_ops=200000.0000 ops
+        peak_memory_bytes=67788800
+        note: staged $TMPDIR/bench-scratch-gc_bound-43143-0-1793126133339480123/bench_gc_bound.beam (embedded source, LEN=256, per-op increment=1, erlc=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc)
+        note: case churn: paired median=837.675 ms min=836.837 ms max=855.624 ms noise=±1.243 ms over 3 round(s)
+        note: observed stdout: churn=N*1=200000
+        note: case churn: N=200000 churns (sys), each allocating and abandoning a 256-element list, a 256-byte binary and a 256-element tuple
+        note: method: every round runs the program at N churns and then at 0 churns back to back, and ns/op is the median paired difference (wall@N - wall@0) / N * 1e6 — never two separate means, whose difference absorbs a drifting boot cost instead of cancelling it. N is per runtime so both marginals are measurable, the fixed process startup (incl. the Rust runtime's code-path resolution) cancels inside every pair, and a figure inside the noise band is withheld rather than published
+        note: note: the op count is deterministic and contention-immune; the wall-clock rows move with host load. Whether a runtime's collector actually runs during the loop is its own admission policy — this row measures the allocate-and-abandon wall time, and claims no collection count
+  [ok] gc_class         sys  
+        case_send_recv_wall_ms: n=3 min=768.4369 mean=773.6865 p50=773.4834 p99=779.0260 ms
+        case_send_recv_startup_ms: n=3 min=114.9724 mean=116.2004 p50=116.4651 p99=117.1498 ms
+        case_send_recv_peak_rss_bytes: n=3 min=67629056.0000 mean=67687765.3333 p50=67629056.0000 p99=67801661.4400 bytes
+        case_send_recv_ns_per_op=3292.5552 ns
+        case_send_recv_ops=200000.0000 ops
+        case_ets_copy_wall_ms: n=3 min=816.6919 mean=819.5780 p50=817.1711 p99=824.7169 ms
+        case_ets_copy_startup_ms: n=3 min=116.5370 mean=117.0727 p50=117.2400 p99=117.4370 ms
+        case_ets_copy_peak_rss_bytes: n=3 min=67665920.0000 mean=67743744.0000 p50=67776512.0000 p99=67788554.2400 bytes
+        case_ets_copy_ns_per_op=1750.3873 ns
+        case_ets_copy_ops=400000.0000 ops
+        case_compile_wall_ms: n=3 min=244.5813 mean=245.6909 p50=246.1718 p99=246.3166 ms
+        case_compile_startup_ms: n=3 min=115.8562 mean=116.6658 p50=116.7133 p99=117.4137 ms
+        case_compile_peak_rss_bytes: n=3 min=80433152.0000 mean=80820906.6667 p50=80846848.0000 p99=81176002.5600 bytes
+        case_compile_ns_per_op=16092972.3750 ns
+        case_compile_ops=8.0000 ops
+        peak_memory_bytes=81182720
+        note: staged $TMPDIR/bench-scratch-gc_class-43143-1-1793126136711049479/bench_gc_class_driver.beam (bench driver + the committed gc_class_copy_bound.erl/gc_class_compile.erl copied read-only into the scratch dir; erlc=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc)
+        note: compile case: source=erts_rust/tools/bench/../../../lib/stdlib/src/ordsets.erl (a real lib/*/src/*.erl), outdir root=$TMPDIR/bench-scratch-gc_class-43143-1-1793126136711049479/compile_out, BEAM_RT_GCH_SRC/BEAM_RT_GCH_OUT set on the child
+        note: case send_recv: paired median=658.511 ms min=651.972 ms max=661.975 ms noise=±5.136 ms over 3 round(s)
+        note: case send_recv: N=200000 (sys) rounds of the class a copy-bound round trip of the ~390-word payload (above the 233-word nursery, so a collection is admitted)
+        note: case ets_copy: paired median=700.155 ms min=699.730 ms max=707.631 ms noise=±1.000 ms over 3 round(s)
+        note: case ets_copy: N=400000 (sys) rounds of the class a copy-bound round trip of the ~390-word payload (above the 233-word nursery, so a collection is admitted)
+        note: case compile: paired median=128.744 ms min=128.725 ms max=129.606 ms noise=±1.000 ms over 3 round(s)
+        note: code:which(compile)=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/lib/compiler-10.0.7/ebin/compile.beam (the system OTP installation)
+        note: case compile: N=8 (sys) rounds of the class an in-process compile of the real source
+        note: case compile: the startup run printed no `which=<path>` line (its compile attribution): []
+        note: case compile: the startup run printed no `which=<path>` line (its compile attribution): []
+        note: case compile: the startup run printed no `which=<path>` line (its compile attribution): []
+        note: observed stdout: send_recv=200000 ets_copy=400000 compile=8 (each case prints N * 1)
+        note: method: ns/op = median(wall at N rounds - wall at 0 rounds) / N * 1e6, from interleaved paired rounds (each round runs the N-round sample and then the 0-round sample back to back, so a drifting boot cost cancels inside the pair); N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of every pair; the figure is withheld when the median does not clear the noise band
+        note: note: the classes are the sibling harness's own fixtures, run unchanged — the payload is deliberately above the default nursery so a collection is admitted (unlike copy_bound's 70-word wrapper); the op count is deterministic and contention-immune while the wall-clock rows move with host load
+        note: cases: 3 ok, 0 unsupported (of 3)
+  [ok] list_walk        sys  
+        case_list_walk_wall_ms: n=3 min=336.9398 mean=337.9157 p50=337.9029 p99=338.8844 ms
+        case_list_walk_startup_ms: n=3 min=116.9371 mean=117.0449 p50=117.0124 p99=117.1819 ms
+        case_list_walk_peak_rss_bytes: n=3 min=67272704.0000 mean=67395584.0000 p50=67411968.0000 p99=67500277.7600 bytes
+        case_list_walk_ns_per_element=2.2072 ns
+        case_list_walk_elements=100000000.0000 elements
+        peak_memory_bytes=67502080
+        note: staged $TMPDIR/bench-scratch-list_walk-43143-2-1793126143470366247/bench_list_walk.beam (embedded source, LEN=1000, erlc=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc)
+        note: case list_walk: paired median=220.718 ms min=219.927 ms max=221.967 ms noise=±1.171 ms over 3 round(s)
+        note: observed stdout: list_walk=N*500500=50050000000
+        note: case list_walk: N=100000 walks (sys) at LEN=1000, i.e. 100000000 elements walked
+        note: method: paired startup-cancelled marginal — every round runs the N-walk pass then the 0-walk pass back to back, and ns/element = median(paired difference) / (N * LEN) * 1e6, withheld below 3x max(1 ms, 1.4826*MAD) of the paired differences; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels inside every pair; the module is BIF-free and builds no term
+        note: note: element count is deterministic and contention-immune; the wall-clock rows move with host load
+  [ok] slice            sys  
+        case_add_wall_ms: n=5 min=115.5964 mean=116.3974 p50=116.2539 p99=117.1488 ms
+        case_add_peak_rss_bytes: n=5 min=67194880.0000 mean=67509452.8000 p50=67592192.0000 p99=67664117.7600 bytes
+        case_fib_wall_ms: n=5 min=114.9028 mean=115.4373 p50=115.5129 p99=115.8981 ms
+        case_fib_peak_rss_bytes: n=5 min=67481600.0000 mean=67541401.6000 p50=67555328.0000 p99=67587604.4800 bytes
+        case_pick_wall_ms: n=5 min=115.3497 mean=116.0845 p50=116.1346 p99=116.8533 ms
+        case_pick_peak_rss_bytes: n=5 min=67399680.0000 mean=67543040.0000 p50=67493888.0000 p99=67682304.0000 bytes
+        case_calendar_last_day_wall_ms: n=5 min=116.9106 mean=117.5880 p50=117.9277 p99=118.1097 ms
+        case_calendar_last_day_peak_rss_bytes: n=5 min=67497984.0000 mean=67623321.6000 p50=67551232.0000 p99=67821404.1600 bytes
+        case_queue_from_size_wall_ms: n=5 min=116.5824 mean=122.0047 p50=117.0875 p99=140.9194 ms
+        case_queue_from_size_peak_rss_bytes: n=5 min=67411968.0000 mean=67552051.2000 p50=67563520.0000 p99=67721953.2800 bytes
+        case_gb_trees_size_wall_ms: n=5 min=116.1082 mean=116.8732 p50=117.1595 p99=117.3986 ms
+        case_gb_trees_size_peak_rss_bytes: n=5 min=67411968.0000 mean=67553689.6000 p50=67584000.0000 p99=67715072.0000 bytes
+        case_base64_encode_size_wall_ms: n=5 min=116.6165 mean=117.1091 p50=117.1586 p99=117.4289 ms
+        case_base64_encode_size_peak_rss_bytes: n=5 min=67366912.0000 mean=67643801.6000 p50=67706880.0000 p99=67839590.4000 bytes
+        case_ordsets_from_size_wall_ms: n=5 min=115.3558 mean=116.4345 p50=116.2376 p99=118.4083 ms
+        case_ordsets_from_size_peak_rss_bytes: n=5 min=67358720.0000 mean=67475046.4000 p50=67469312.0000 p99=67587932.1600 bytes
+        case_string_str_length_wall_ms: n=5 min=116.6165 mean=116.9298 p50=116.9321 p99=117.1937 ms
+        case_string_str_length_peak_rss_bytes: n=5 min=67231744.0000 mean=67502899.2000 p50=67502080.0000 p99=67776839.6800 bytes
+        peak_memory_bytes=67842048
+        note: observed stdout: add=5 fib=6765 pick=2 calendar_last_day=29 queue_from_size=3 gb_trees_size=5 base64_encode_size=8 ordsets_from_size=3 string_str_length=5
+  [ok] baseline         rust 
+        startup_ms: n=10 min=124.1436 mean=124.8348 p50=125.0152 p99=125.3694 ms
+        compute_loop_ms: n=5 min=143.7015 mean=144.9600 p50=145.1218 p99=145.8689 ms
+        compute_ops_per_sec=6898453.3851 ops/s
+        vm_memory_total_bytes=7253583.0000 bytes
+        peak_memory_bytes=100311040
+  [ok] gc_bound         rust 
+        case_churn_wall_ms: n=3 min=348.3760 mean=353.1617 p50=354.2223 p99=356.8337 ms
+        case_churn_startup_ms: n=3 min=123.7296 mean=124.6321 p50=124.9180 p99=125.2422 ms
+        case_churn_peak_rss_bytes: n=3 min=68321280.0000 mean=68461909.3333 p50=68526080.0000 p99=68538122.2400 bytes
+        case_churn_ns_per_op=22897.3477 ns
+        case_churn_ops=10000.0000 ops
+        peak_memory_bytes=68538368
+        note: staged $TMPDIR/bench-scratch-gc_bound-43143-4-1793126153306078983/bench_gc_bound.beam (embedded source, LEN=256, per-op increment=1, erlc=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc)
+        note: case churn: paired median=228.973 ms min=223.458 ms max=233.157 ms noise=±6.203 ms over 3 round(s)
+        note: observed stdout: churn=N*1=10000
+        note: case churn: N=10000 churns (rust), each allocating and abandoning a 256-element list, a 256-byte binary and a 256-element tuple
+        note: method: every round runs the program at N churns and then at 0 churns back to back, and ns/op is the median paired difference (wall@N - wall@0) / N * 1e6 — never two separate means, whose difference absorbs a drifting boot cost instead of cancelling it. N is per runtime so both marginals are measurable, the fixed process startup (incl. the Rust runtime's code-path resolution) cancels inside every pair, and a figure inside the noise band is withheld rather than published
+        note: note: the op count is deterministic and contention-immune; the wall-clock rows move with host load. Whether a runtime's collector actually runs during the loop is its own admission policy — this row measures the allocate-and-abandon wall time, and claims no collection count
+  [ok] gc_class         rust 
+        case_send_recv_wall_ms: n=3 min=534.7831 mean=552.1076 p50=555.4193 p99=565.9063 ms
+        case_send_recv_startup_ms: n=3 min=124.5587 mean=129.8625 p50=125.8820 p99=138.8814 ms
+        case_send_recv_peak_rss_bytes: n=3 min=68632576.0000 mean=68699477.3333 p50=68694016.0000 p99=68770283.5200 bytes
+        case_send_recv_ns_per_op=17078.9448 ns
+        case_send_recv_ops=25000.0000 ops
+        case_ets_copy_wall_ms: n=3 min=541.0372 mean=543.3740 p50=542.6833 p99=546.3273 ms
+        case_ets_copy_startup_ms: n=3 min=124.4217 mean=125.1004 p50=125.3700 p99=125.5067 ms
+        case_ets_copy_peak_rss_bytes: n=3 min=68485120.0000 mean=68498773.3333 p50=68493312.0000 p99=68517396.4800 bytes
+        case_ets_copy_ns_per_op=10429.3459 ns
+        case_ets_copy_ops=40000.0000 ops
+        case_compile_wall_ms: n=3 min=600.9707 mean=602.4815 p50=601.0914 p99=605.2966 ms
+        case_compile_startup_ms: n=3 min=125.8140 mean=126.2610 p50=126.0813 p99=126.8715 ms
+        case_compile_peak_rss_bytes: n=3 min=148705280.0000 mean=149430272.0000 p50=149737472.0000 p99=149845852.1600 bytes
+        case_compile_ns_per_op=237578340.5000 ns
+        case_compile_ops=2.0000 ops
+        peak_memory_bytes=149848064
+        note: staged $TMPDIR/bench-scratch-gc_class-43143-5-1793126154890027159/bench_gc_class_driver.beam (bench driver + the committed gc_class_copy_bound.erl/gc_class_compile.erl copied read-only into the scratch dir; erlc=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc)
+        note: compile case: source=erts_rust/tools/bench/../../../lib/stdlib/src/ordsets.erl (a real lib/*/src/*.erl), outdir root=$TMPDIR/bench-scratch-gc_class-43143-5-1793126154890027159/compile_out, BEAM_RT_GCH_SRC/BEAM_RT_GCH_OUT set on the child
+        note: case send_recv: paired median=426.974 ms min=408.901 ms max=430.861 ms noise=±5.763 ms over 3 round(s)
+        note: case send_recv: N=25000 (rust) rounds of the class a copy-bound round trip of the ~390-word payload (above the 233-word nursery, so a collection is admitted)
+        note: case ets_copy: paired median=417.174 ms min=415.667 ms max=421.980 ms noise=±2.234 ms over 3 round(s)
+        note: case ets_copy: N=40000 (rust) rounds of the class a copy-bound round trip of the ~390-word payload (above the 233-word nursery, so a collection is admitted)
+        note: case compile: paired median=475.157 ms min=475.010 ms max=478.495 ms noise=±1.000 ms over 3 round(s)
+        note: WARNING: code:which(compile)=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/lib/compiler-10.0.7/ebin/compile.beam (the system OTP installation) — this compile figure is served by the SYSTEM OTP compiler, not by this tree's bootstrap/lib/compiler/ebin: never quote it as an in-tree-compiler measurement
+        note: case compile: N=2 (rust) rounds of the class an in-process compile of the real source
+        note: case compile: the startup run printed no `which=<path>` line (its compile attribution): []
+        note: case compile: the startup run printed no `which=<path>` line (its compile attribution): []
+        note: case compile: the startup run printed no `which=<path>` line (its compile attribution): []
+        note: observed stdout: send_recv=25000 ets_copy=40000 compile=2 (each case prints N * 1)
+        note: method: ns/op = median(wall at N rounds - wall at 0 rounds) / N * 1e6, from interleaved paired rounds (each round runs the N-round sample and then the 0-round sample back to back, so a drifting boot cost cancels inside the pair); N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of every pair; the figure is withheld when the median does not clear the noise band
+        note: note: the classes are the sibling harness's own fixtures, run unchanged — the payload is deliberately above the default nursery so a collection is admitted (unlike copy_bound's 70-word wrapper); the op count is deterministic and contention-immune while the wall-clock rows move with host load
+        note: cases: 3 ok, 0 unsupported (of 3)
+  [ok] list_walk        rust 
+        case_list_walk_wall_ms: n=3 min=848.8886 mean=858.6017 p50=853.8752 p99=872.6578 ms
+        case_list_walk_startup_ms: n=3 min=125.5257 mean=125.6634 p50=125.5895 p99=125.8693 ms
+        case_list_walk_peak_rss_bytes: n=3 min=68038656.0000 mean=68097365.3333 p50=68050944.0000 p99=68199464.9600 bytes
+        case_list_walk_ns_per_element=14.5600 ns
+        case_list_walk_elements=50000000.0000 elements
+        peak_memory_bytes=68202496
+        note: staged $TMPDIR/bench-scratch-list_walk-43143-6-1793126161314286780/bench_list_walk.beam (embedded source, LEN=1000, erlc=/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc)
+        note: case list_walk: paired median=728.000 ms min=723.363 ms max=747.452 ms noise=±6.875 ms over 3 round(s)
+        note: observed stdout: list_walk=N*500500=25025000000
+        note: case list_walk: N=50000 walks (rust) at LEN=1000, i.e. 50000000 elements walked
+        note: method: paired startup-cancelled marginal — every round runs the N-walk pass then the 0-walk pass back to back, and ns/element = median(paired difference) / (N * LEN) * 1e6, withheld below 3x max(1 ms, 1.4826*MAD) of the paired differences; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels inside every pair; the module is BIF-free and builds no term
+        note: note: element count is deterministic and contention-immune; the wall-clock rows move with host load
+  [ok] slice            rust 
+        case_add_wall_ms: n=5 min=124.3508 mean=127.5461 p50=125.2366 p99=137.5917 ms
+        case_add_peak_rss_bytes: n=5 min=67969024.0000 mean=68082892.8000 p50=68079616.0000 p99=68152524.8000 bytes
+        case_fib_wall_ms: n=5 min=124.4951 mean=126.0986 p50=125.1200 p99=127.9519 ms
+        case_fib_peak_rss_bytes: n=5 min=67985408.0000 mean=68091904.0000 p50=68112384.0000 p99=68140728.3200 bytes
+        case_pick_wall_ms: n=5 min=124.8994 mean=125.2602 p50=125.1356 p99=125.8654 ms
+        case_pick_peak_rss_bytes: n=5 min=68034560.0000 mean=68100096.0000 p50=68063232.0000 p99=68226252.8000 bytes
+        case_calendar_last_day_wall_ms: n=5 min=125.2452 mean=125.4535 p50=125.5092 p99=125.6169 ms
+        case_calendar_last_day_peak_rss_bytes: n=5 min=68263936.0000 mean=68353228.8000 p50=68345856.0000 p99=68452843.5200 bytes
+        case_queue_from_size_wall_ms: n=5 min=124.8790 mean=125.1658 p50=125.1877 p99=125.3726 ms
+        case_queue_from_size_peak_rss_bytes: n=5 min=67989504.0000 mean=68088627.2000 p50=68108288.0000 p99=68159733.7600 bytes
+        case_gb_trees_size_wall_ms: n=5 min=124.6346 mean=125.3173 p50=125.3209 p99=125.7545 ms
+        case_gb_trees_size_peak_rss_bytes: n=5 min=68153344.0000 mean=68188569.6000 p50=68190208.0000 p99=68214456.3200 bytes
+        case_base64_encode_size_wall_ms: n=5 min=125.6585 mean=126.5800 p50=126.1342 p99=128.9544 ms
+        case_base64_encode_size_peak_rss_bytes: n=5 min=68333568.0000 mean=68424499.2000 p50=68464640.0000 p99=68468736.0000 bytes
+        case_ordsets_from_size_wall_ms: n=5 min=124.8533 mean=125.4390 p50=125.4435 p99=125.9479 ms
+        case_ordsets_from_size_peak_rss_bytes: n=5 min=68038656.0000 mean=68154982.4000 p50=68157440.0000 p99=68260986.8800 bytes
+        case_string_str_length_wall_ms: n=5 min=124.9122 mean=125.2273 p50=125.0372 p99=125.8214 ms
+        case_string_str_length_peak_rss_bytes: n=5 min=68214784.0000 mean=68272947.2000 p50=68247552.0000 p99=68352737.2800 bytes
+        peak_memory_bytes=68468736
+        note: observed stdout: add=5 fib=6765 pick=2 calendar_last_day=29 queue_from_size=3 gb_trees_size=5 base64_encode_size=8 ordsets_from_size=3 string_str_length=5
+wrote erts_rust/tools/bench/out/m22-budgetprobe-all.json
+latency budgets — 8 met / 0 exceeded / 3 not measured
+  met            baseline[rust] startup_ms p50 = 125.02  (limit <= 800) — A gross-regression alarm for the Rust boot median (the six m19 matched rounds read 260.3-261.4 ms at a 1-min load of 0.5-4.5; m17's loaded rounds read 289-546 ms at load 3-92), not an SLO — a shared host can double it without a code change, so the load-robust judgement is the rust/sys ratio row.
+  met            baseline[rust] startup_ms p99 = 125.37  (limit <= 2500) — Catches a hang or an order-of-magnitude tail regression (the six m19 matched rounds read 261.9-267.6 ms p99; m17 read up to 485 ms, with a single 1702 ms outlier on a heavily loaded A/B round), not an SLO: a boot's p99 is a handful of samples, so this row only notices a gross failure.
+  met            baseline[rust] startup_ms p50 = 1.19x  (limit rust/sys <= 6) — The load-robust startup judgement: the six m19 matched rounds read 2.51-2.53x (m16 reached 3.79x), so 6x is a regression alarm with headroom above every recorded round — not a target, and deliberately not so tight that ordinary host drift trips it.
+  met            baseline[rust] startup_ms p99 = 1.19x  (limit rust/sys <= 6) — The same instrument for the tail; the p99 ratios track the p50 ones (2.35-2.58x across the six m19 matched rounds) because a boot's p99 is a handful of samples, so the same 6x alarm applies — not an SLO for a shared host.
+  met            baseline[sys] startup_ms p99 = 105.70  (limit <= 400) — The oracle's own tail, recorded at 103.5-113.3 ms across the six m19 matched rounds (m17 read 105-153 ms): a host artifact big enough to move the far less load-sensitive `sys` side shows up here too, so it cannot be misread as a Rust regression — and 400 ms is deliberately loose because this row exists to attribute, not to gate.
+  not-measured   cowboy[sys] latency_ms p99  (limit <= 5) — no `cowboy` result in this report (the workload is not registered, or was not selected by --workloads) — The request-tail budget on the I/O-bound target, recorded at 0.11-0.16 ms p99 while serving ~119-124k req/s through a real Cowboy release across the three m19 external reps (m17's contended pass read 3.03-3.59 ms at ~38k req/s): 5 ms leaves room for a loaded host yet still flags a real latency regression; it reads the summary the cowboy row actually records (`latency_ms` — there is no separate p99 metric) and it is sys-only because the Rust runtime cannot boot an OTP release.
+  met            list_walk[rust] case_list_walk_ns_per_element value = 14.56  (limit <= 2000) — The per-element dispatch budget for the standing per-unit gap, recorded at 18.4-18.7 ns/element across the six m19 matched rounds (the oracle reads 2.30-2.34; m17's loaded rounds read up to 48.2): over a hundred times today's figure, so it is a regression alarm for the engine's dispatch path and not a parity target — the gap itself is `beam_engine`'s to close.
+  not-measured   copy_bound[rust] case_send_recv_ns_per_op value  (limit <= 20000) — no `copy_bound` result in this report (the workload is not registered, or was not selected by --workloads) — The messaging budget for the two-process send/receive round trip, recorded at 6242-6338 ns/op across the six m19 matched rounds (the oracle reads 1487-1531; m17's worst round read 12450): ~3.2x above today's figure and still ~1.6x above m17's worst, so it is a regression alarm rather than a parity target, and it is not a hard ceiling on a contended host.
+  met            gc_bound[rust] case_churn_ns_per_op value = 22897.35  (limit <= 200000) — The GC-churn budget for allocate-and-abandon, recorded at 59.6k-60.3k ns/op across the six m19 matched rounds (the oracle reads 4.24k-4.27k; m17's worst round read 106k): ~3.3x above today's figure, a regression alarm for a figure whose collection count the row does not claim — not a parity target.
+  not-measured   file_io[rust] case_write_read_ns_per_op value  (limit <= 200000) — no `file_io` result in this report (the workload is not registered, or was not selected by --workloads) — The file-I/O budget for the write-then-read round trip of a 4096-byte payload, recorded at 97.6k-103.1k ns/op across the six m19 matched rounds (median 98 643) while the oracle reads 133.9k-135.6k — i.e. the Rust runtime is already ~1.36x cheaper on this case, so the limit sits ~2x above the measured figure as a regression alarm for the file path, not a parity target and not a clean cross-runtime ratio.
+  met            gc_class[rust] case_send_recv_ns_per_op value = 17078.94  (limit <= 200000) — The GC-class budget for the two-process round trip of a ~390-word payload (deliberately above the nursery, so a collection is admitted), recorded at 51.0k-51.4k ns/op across the six m19 matched rounds (median 51 282) against the oracle's 3.19k-3.27k: the limit is ~3.9x the measured figure, a regression alarm for the copy-plus-collect path — the ~15.8x gap itself is the engine's to close, not what this row gates.
