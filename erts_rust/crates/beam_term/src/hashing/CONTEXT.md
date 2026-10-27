@@ -59,8 +59,9 @@ references and on-heap bin refs use an opaque raw-word fallback (not stable acro
   when no provider (or a `None` answer) attributes it — the 2-word descriptor inlines only `uniq`/`index`
   (the documented M1 substitution for the C's out-of-line `ErlFunEntry`), so with a provider the fun hashes
   exactly like the equivalent `NEW_FUN_EXT` image.
-  An **internal reference** ⇒ `TermError::RefIdentityUnavailable` (still open: the C mixes
-  `internal_ref_numbers(term)[0]`, a node-container projection this layout does not expose).
+  An **internal reference** is **closed**: it hashes from its own `id` word (`internal_ref_hash_word`), which
+  is the identity the term really carries, so neither port refuses a reference any more — the only remaining
+  answer for a reference is the operand above or the typed `TermError::BadRef` for a foreign layout.
 - No dependency edge beyond `beam_common`/`beam_term`'s own modules; the ports take the `AtomTable` as a
   parameter (an atom's `hvalue` is table state, never global).
 - `unsafe` (payload-word dereference) stays confined to the marked walk sites.
