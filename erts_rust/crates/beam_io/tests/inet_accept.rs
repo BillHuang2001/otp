@@ -86,8 +86,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use beam_common::BeamError;
 use beam_io::drivers::inet::{
-    INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_REP_ERROR, INET_REP_OK,
-    INET_TYPE_DGRAM, INET_TYPE_STREAM,
+    INET_AF_INET, INET_AF_LOOPBACK, INET_LOPT_DELIVER, INET_PROTO_DEFAULT, INET_REP_ERROR,
+    INET_REP_OK, INET_TYPE_DGRAM, INET_TYPE_STREAM,
 };
 use beam_io::prelude::*;
 use beam_process::PortId;
@@ -108,12 +108,6 @@ const INET_REQ_GETSTATUS: u32 = 16;
 const INET_REQ_ACCEPT: u32 = 26;
 const INET_REQ_LISTEN: u32 = 27;
 const TCP_REQ_RECV: u32 = 42;
-/// The `{deliver, …}` option code (`INET_LOPT_DELIVER`, `inet_drv.c:900`); the value `0` in the
-/// record below is `{deliver, port}` (`INET_DELIVER_PORT`, `:783`).
-///
-/// The crate re-exports the wire vocabulary and the `{active, …}`/`{packet, …}` codes but not this
-/// driver-state code, so the suite states it the way `tests/udp_inet.rs` does.
-const INET_LOPT_DELIVER: u8 = 25;
 /// `ERTS_INET_DRV_CONTROL_MAGIC_NUMBER` (`erts/emulator/beam/sys.h:1466`): what
 /// `erlang:port_control/3` adds to every opcode, and what the drivers subtract again.
 const CONTROL_MAGIC: u32 = 0x03f1_a300;
