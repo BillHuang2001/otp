@@ -34,7 +34,7 @@ woken-but-not-yet-resumed process's `regs` snapshot is **not** its whole live ro
 prefix the park had to keep exempt, a term a host holds outside the published set). The signal site therefore consults the **host**
 `CollectionGate` beside that crate predicate (`ptab.rs`'s private `declines_signal_collection`, which
 OR-s the two), and `RuntimeCollectionGate` declines the relocation for a receiver whose gathered roots
-reach a container in an unscanned region, so the signal takes the heap-fragment route the cascade
+reach a container that forwards a scanned word out of an unscanned region, so the signal takes the heap-fragment route the cascade
 already uses for a `Running`/exempt receiver. Measured on the trace that pinned the mover: mature base
 `0x70876d95dc10` → `0x70875d099090`, nursery used 232 → 20 words.
 
@@ -67,10 +67,10 @@ blocked receiver collects its nursery and copies straight in.
 The exemption (`ParkExemption::LiveFloats`, `exempt = fr_count > 0`) holds only where the slice
 ended with a live FR prefix, which is exactly the state no publication can carry, because the
 machine keeps those slots as roots of its own.
-The two halves are **complementary**: the gate declines only when an unscanned container is
-reachable from the receiver's **gathered** roots, while the park's publication is what puts the
-runner's own host-held terms into that gathered set — and the exemption is what keeps a live FR
-prefix out of a relocation for the parked window.
+The two halves are **complementary**: the gate declines only when a container that forwards a
+scanned word out of an unscanned region is reachable from the receiver's **gathered** roots, while
+the park's publication is what puts the runner's own host-held terms into that gathered set — and
+the exemption is what keeps a live FR prefix out of a relocation for the parked window.
 The mitigation is **decline-only and bounded**: it never
 *allows* a collection, so an affected process's heap grows on that path only until it is resumed, and
 its own admission point then collects as usual.

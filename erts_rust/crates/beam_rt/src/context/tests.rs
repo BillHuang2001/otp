@@ -6167,7 +6167,7 @@ fn foreign_root_aliasing_a_young_child(
 }
 
 /// **The hole-2 regression guard: a collection is DECLINED while a live machine root is a
-/// container in a region the collector does not scan.**
+/// container that forwards a scanned word out of a region the collector does not scan.**
 ///
 /// A copying collector relocates exactly the words in its *from* set (here the process's
 /// young space) and classifies every other address as `Target::Foreign`
@@ -6674,8 +6674,9 @@ fn the_valve_collects_when_the_nested_graph_is_fully_scanned() {
 /// **The same guard on the collecting allocation seam.**
 ///
 /// [`ExecutionContext::alloc_words_rooted`] is the second site the fix reconciles: when the
-/// running process's young bump fails it collects over the handed-in root set — but a root in
-/// an unscanned region makes that move unsound, so the valve must decline the collection and
+/// running process's young bump fails it collects over the handed-in root set — but a root that
+/// forwards a scanned word out of an unscanned region makes that move unsound, so the valve must
+/// decline the collection and
 /// take the pointer-stable arena fallback instead (`Runtime::gc_stats().fallbacks` advances,
 /// `collections` does not).
 ///

@@ -150,8 +150,8 @@ use crate::runtime::Runtime;
 use crate::RuntimeContext;
 
 /// Whether **any** machine root handed to a collection site, or any container in the process's
-/// own root set, **reaches** a container in an unscanned region (the building block is
-/// [`root_is_unscanned`]).
+/// own root set, **reaches** a container that forwards a scanned word out of an unscanned region
+/// (the building block is [`root_is_unscanned`]).
 ///
 /// This is the **valve** every collection site consults: it is the conservative reachability
 /// check of [`crate::context::gc_walk`]. The single-level test it replaces could only see a
@@ -1440,16 +1440,17 @@ pub(crate) fn ensure_heap(
         forced,
         x_regs.len() + stack.len(),
     );
-    // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root in a region the
-    // collector does not scan would be left pointing at young words this move relocates, so the
-    // move is **declined** — the heap keeps its terms, the unscanned root stays valid and the
-    // program stays correct. The test runs *after* the occupancy short-circuit (an ordinary
+    // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root that forwards a young
+    // word out of a region the collector does not scan would be left pointing at a word this move
+    // relocates, so the move is **declined** — the heap keeps its terms, the foreign container
+    // keeps its words and the program stays correct. The test runs *after* the occupancy short-circuit (an ordinary
     // admission point that is not about to collect pays nothing) and *before* the request is
     // consumed, so a forced collection it refuses stays armed for the runner's park arm.
     //
     // `descend` is the pid's **foreign-reachability gate**
     // ([`Runtime::foreign_reachable`](crate::runtime)): the per-word root phase always runs, so
-    // a root that is *itself* a foreign container is still declined here without any descent,
+    // a root that is *itself* a foreign container forwarding a scanned word is still declined
+    // here without any descent,
     // and the descent — the `O(live objects)` half — is only paid for a process that has ever
     // held one (see the valve's module docs). A **hit** opens the gate permanently: a foreign
     // container really did reach a live root, which is the event the gate records.
@@ -1752,9 +1753,9 @@ fn ensure_heap_full_commit(
         x_count + roots.stack.len() + fr_count,
         roots.stack.len(),
     );
-    // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root in
-    // a region the collector does not scan declines the move (see [`root_is_unscanned`]), so the
-    // heap keeps its terms and the unscanned root stays valid. Tested after the occupancy
+    // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root
+    // that forwards a scanned word out of such a region declines the move (see
+    // [`root_is_unscanned`]), so the heap keeps its terms and the container's words stay valid. Tested after the occupancy
     // short-circuit and before the request is consumed, so a refused forced collection stays
     // armed for the runner's park arm. The descent is gated on `pid`'s foreign-reachability bit
     // and a hit opens it permanently, exactly as in [`ensure_heap`].
@@ -2257,8 +2258,9 @@ fn alloc_words_rooted_commit(
         return runtime.alloc_words(n);
     };
     // The unscanned-root valve (see [`root_is_unscanned`]): collecting over a root set that
-    // contains a container in a region the collector does not scan would relocate the young
-    // words it reaches without updating it, so this collection is declined and the block comes
+    // contains a container forwarding a young word out of a region the collector does not scan
+    // would relocate that word without updating the container, so this collection is declined and
+    // the block comes
     // from the pointer-stable arena — the same honest fallback every other refusal path takes.
     // The descent is gated on `pid`'s foreign-reachability bit and a hit opens it permanently,
     // exactly as in [`ensure_heap`]. A declined collection leaves a forced request **armed**,

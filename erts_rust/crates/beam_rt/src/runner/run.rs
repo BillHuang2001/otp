@@ -761,7 +761,8 @@ pub(super) fn resume_from_process_roots(
 ///   before collecting for a relocation-exempt pid;
 /// * the host collection gate
 ///   ([`context::gc_walk`](crate::context::gc_walk)) is a *strictly more conservative* valve:
-///   it declines on an unscanned container reachable from the roots it gathers, and an
+///   it declines on a container that forwards a scanned word out of an unscanned region,
+///   reachable from the roots it gathers, and an
 ///   un-published process root set is a subset of the published one, so a gate that declined for
 ///   the published roots declines for these too;
 /// * [`Process::grow_nursery`](beam_process::Process::grow_nursery) — the one growth path that is
@@ -1568,7 +1569,8 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 //
                 // The installed host collection gate
                 // (`crate::context::gc_walk::RuntimeCollectionGate`) declines when an
-                // **unscanned container is reachable from the receiver's GATHERED roots**
+                // **container that forwards a scanned word out of an unscanned region is
+                // reachable from the receiver's GATHERED roots**
                 // (`seed_process_roots`, which includes `extra_roots`), and
                 // `Runtime::serve_gc_request` gates its descent differently; both are decline-only,
                 // so a delivery they refuse still takes the fragment fallback and the process's

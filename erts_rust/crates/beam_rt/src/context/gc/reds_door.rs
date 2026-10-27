@@ -251,10 +251,11 @@ pub(crate) fn collect_at_reds_boundary(
     // of one hand-off halts the process's collection.
     let (x_count, _) = machine_root_bounds(&roots);
     let fr_count = fr_count.min(roots.fr.len());
-    // The **unscanned-root valve**, exactly as the full heap-admission door runs it: a root in a
-    // region the collector does not scan declines the move (see [`super::root_is_unscanned`]), so
-    // the heap keeps its terms and the unscanned root stays valid. A hit opens `pid`'s descent
-    // latch permanently — the only direction it can ever move on its own.
+    // The **unscanned-root valve**, exactly as the full heap-admission door runs it: a root that
+    // forwards a scanned word out of such a region declines the move (see
+    // [`super::root_is_unscanned`]), so the heap keeps its terms and the container's words stay
+    // valid. A hit opens `pid`'s descent latch permanently — the only direction it can ever move
+    // on its own.
     let descend = runtime.foreign_reachable(pid);
     let machine_roots = || {
         roots.x[..x_count]

@@ -37,7 +37,8 @@
 //!
 //! 1. **The cheap, `O(roots)` classification** (`Walk::seed`, the old single-level valve): every
 //!    word the collection is about to publish is tested once with [`root_is_unscanned`]. A root
-//!    that is *itself* an unscanned container declines the collection here, without any descent —
+//!    that is *itself* an unscanned container forwarding a scanned word declines the collection
+//!    here, without any descent —
 //!    the common direct case, at the cost the valve always had.
 //! 2. **The descent** — an **iterative worklist** walk, run **only** when a caller-supplied
 //!    `descend` gate allows it (see [`any_root_is_unscanned`]):
@@ -656,9 +657,9 @@ impl From<ForeignLatch> for RuntimeCollectionGate {
 }
 
 impl beam_process::CollectionGate for RuntimeCollectionGate {
-    /// `true` when the receiver's gathered roots reach a container in a region its collector
-    /// does not scan — [`process_roots_are_unscanned`], reached only for a pid whose descent latch
-    /// is open (see the type docs).
+    /// `true` when the receiver's gathered roots reach a container that forwards a scanned word
+    /// out of a region its collector does not scan — [`process_roots_are_unscanned`], reached only
+    /// for a pid whose descent latch is open (see the type docs).
     fn declines_relocation(&mut self, receiver: &Process) -> bool {
         // The pid's bit is the O(1) fast path: a CLEAR bit means no container from an unscanned
         // region has ever entered this process's reachable graph, so the descent can find nothing

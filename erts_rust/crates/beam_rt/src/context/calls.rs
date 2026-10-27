@@ -2189,7 +2189,7 @@ impl RuntimeContext<'_> {
     }
 
     /// Opens the running process's **descent gate** ([`crate::context::gc_walk`]) when `term` is
-    /// a container in a region its collector does not scan.
+    /// a container that forwards a scanned word out of a region its collector does not scan.
     ///
     /// A registered BIF, the runtime-native floor and a NIF all build their results on a pooled
     /// heap **outside** the process's own young/mature area, and the engine stores such a result
