@@ -58,6 +58,7 @@ Each session's `m*-load-record.md` / `m*-tool-targets-notes.md` pins the host co
 
 ## See Also
 - `../RESULTS.md` → the m15 summary tables, exact commands, the paired-estimator record (§3.4) and the still-open items.
-- `m21-load-record.md` → the current GC/allocator record: per-pass load table, command shape, withheld audit, memory rows.
+- `m22-load-record.md` → the current GC/allocator record: per-pass load table, command shape, withheld audit, memory rows; its `m22-vs-m21.txt` is the before/after reading.
+- `m21-load-record.md` → the same for the workstream's *before* record.
 - `../CONTEXT.md` → the workload definitions, the loop-count calibration rule and the runbook pointer.
 - `../src/marginal.rs` → the paired estimator that produced the per-unit figures.
