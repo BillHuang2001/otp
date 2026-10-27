@@ -217,6 +217,9 @@ The action's own process never becomes a scheduler slice: its `receive … after
 * `scheduled_io_device.rs` — scheduled io-device round trips (`io:getopts/1`, `io:setopts/2`, `io:scan_erl_form/4`), each line oracle-cross-checked (`erl`).
 * `io_device.rs` — the native io floor's request wrappers, so an installed compiler `catch` handler's diagnostic is not replaced by `error:calling_self` (`erl`).
 * `io_diagnostic_unmask.rs` — that unmasking end to end: the compiler's own `Function: ~w/~w` report still prints before it re-raises (`erl`+`erlc`).
+* `io_leader_capture.rs` — the **group-leader capture** route: a leader process receives `{io_request, From, ReplyAs, Req}` once per output call with OTP's request shapes (`put_chars` payloads, `nl`'s 1-character list), replies `{io_reply, ReplyAs, ok}` and **nothing reaches stdout**; the `standard_error` leader still takes the direct sink; a **dead** leader is `error:terminated`; a leader answering `{error, boom}` is the oracle's `badarg` (`erl`+`erlc`).
+* `eunit_capture.rs` — `eunit:test/1` under this runtime: a passing run's stdout is **only** its summary (`All N tests passed.`, parsed — plus a control probe proving the fixture's noise is real on the stream route), and a failing run reports the failure **with the test's captured output**. Asserted by structure and count, never a byte-exact transcript: the stacktrace keeps more frames than OTP's, a documented residual (`erl`+`erlc`).
+* `io_file_device.rs` — the `io` output family on a `file:open/2` device: the bytes read back are identical to the oracle's file (ASCII pinned literally, the latin1 re-encoding of a `unicode` request pinned), a dead and a closed device are `error:terminated` with nothing written, and the scheduler-slice route pins the typed `unsupported` boundary (`erl`+`erlc`).
 * `display_oracle.rs` — `erlang:display/1` byte-for-byte against the live `erl`: the `%T` renderer's record/map/float/atom/printable-list shapes and the `\r\n` terminator, over a compiled fixture and over `-eval` literals (`erl`+`erlc`).
 
 ### Introspection and tracing (A.8)
@@ -254,7 +257,7 @@ A source-only fixture is compiled at test time by the system `erlc`/`cc` into a 
 * `module_info.rs` carries one divergence of its own (`exports` order); `gc_strategy_classes.rs` and `gc_immix_payload.rs` are self-comparison arms, never an oracle comparison.
 
 ## Application-level call chains (current state)
-`compile_file.rs` drives the real `compiler` application in process; no test drives `syntax_tools`, `eunit`, `xref`, `dialyzer` or `edoc`.
+`compile_file.rs` drives the real `compiler` application in process and `eunit_capture.rs` drives the real `eunit` application (`eunit:test/1` on a compiled fixture, whose captured output rides the group-leader protocol); no test drives `syntax_tools`, `xref`, `dialyzer` or `edoc`.
 The deepest chains are `proc_lib_start.rs` (`proc_lib:start[_link]/4` → `proc_lib:sync_start/2`), `multimodule.rs` (real stdlib loaded on demand), `io_scan.rs` (the `{get_until,…}` request driving the real `erl_scan`/`erl_parse`) and `boot.rs` (all 22 boot directives, `{apply,{c,erlangrc,[]}}` included).
 A real stdlib module does not complete a compile on the scheduled `run` route (`ordsets.erl` does, an order of magnitude slower than the `-eval` route; `calendar.erl`/`lists.erl` spend the whole window inside one `Runtime::scheduler_pass`, which the between-pass `RUN_DEADLINE` never sees) — the scheduled route's limit there is its own throughput.
 
