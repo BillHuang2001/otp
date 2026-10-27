@@ -178,48 +178,61 @@ fn assert_list_is_intact(term: Eterm, cells: usize, what: &str) {
 /// A fullsweep over a nursery that was grown for a burst, filled, and then has almost nothing
 /// live in it shrinks to `young_target_words(live)`.
 ///
-/// **The derivation.** `grow_nursery(2_500)` retires the 233-word birth space and installs the
-/// 2586-word curated one (chain `233 + 2586 = 2819`), and the request it could not satisfy — the
-/// seam holds no root set, so it cannot collect — rides into the **next** collection as the C's
-/// `need` term. That round has an empty live set, so it installs
-/// `young_target_words_with_need(0, 2_500) = next_words(2 * 2_500 + 64 = 5064) = 6772` and
-/// consumes the request: the burst's room is paid for once, not re-derived per collection. The
-/// round under test follows with no growth in between, so it is the **plain** live-set rule: a
+/// **The derivation.** `build_list` grows the nursery through the no-relocation seam as it conses
+/// the 450-cell (900-word) list, and `grow_nursery(2_500)` then adds the burst's request, the
+/// largest one, which rides into the **next** collection as the C's `need` term. That settling
+/// round has the 900-word list live, so it asks
+/// `young_target_words_with_need(900, 2_500) = next_words(2 * (900 + 2_500) + 64 = 6_864) = 10_958`
+/// — paid in full, once, because the keep band's own upper edge for that live set is
+/// `YOUNG_SHRINK_FACTOR * young_target_words(900) = 8 * 2_586 = 20_688`, above it, so the carriage
+/// bound does not bite here.
+/// The round under test follows with no growth in between, so it is the **plain** live-set rule: a
 /// 59-element tuple = **60 words** live, the target is `next_words(2 * 60 + 64 = 184) = 233`, and
-/// `6772 > 8 * 233 = 1864` — the nursery is more than the whole keep band above its target and
+/// `10_958 > 8 * 233 = 1_864` — the nursery is more than the whole keep band above its target and
 /// gives the memory back.
 #[test]
 fn a_fullsweep_whose_live_set_is_small_shrinks_to_the_live_set_target() {
     let policy = HeapPolicy::default();
     let mut c = Collector::new(policy.clone()).expect("collector");
     assert_eq!(c.young().capacity_words(), 233, "the initial nursery");
-    // A burst allocation: the growth seam installs the curated 2586-word space and records the
-    // 2500-word request it could not collect for.
+    // A burst allocation: the list is built through the no-relocation seam (which records every
+    // room request it could not collect for) and the burst's own growth adds the 2_500-word one.
+    let cells = 450;
+    let mut roots = build_list(&mut c, cells);
+    let live_burst = size_object(roots[0]);
+    assert_eq!(live_burst, 2 * cells, "the 450-cell list is 900 words");
+    let chain_before_burst = c.heap_size_words();
     c.grow_nursery(2_500).expect("the burst's growth");
+    let burst_space = c.young().capacity_words();
+    assert!(
+        burst_space >= policy.next_words(2_500, 0),
+        "the burst installed at least the curated {}-word space (it installed {burst_space})",
+        policy.next_words(2_500, 0)
+    );
     assert_eq!(
         c.heap_size_words(),
-        233 + policy.next_words(2_500, 0),
-        "the chain is the 233-word space the growth retained plus the 2586-word one it installed"
+        chain_before_burst + burst_space,
+        "the chain is what the list's growths retained plus the space the burst installed"
     );
-    // The round that pays for the request: an empty live set, so the installed capacity is
-    // exactly the need-augmented empty-live-set target.
-    let paid = policy.young_target_words_with_need(0, 2_500);
-    assert_eq!(paid, 6_772, "next_words(2 * 2_500 + 64 = 5064) = 6772");
-    let mut no_roots: Vec<Eterm> = Vec::new();
-    c.collect_major(&mut no_roots).expect("the settling fullsweep");
+    // The round that pays for the request: the installed capacity is the need-augmented
+    // whole-heap target, bounded by the keep band's upper edge (which does not bind here).
+    let paid = policy
+        .young_target_words_with_need(live_burst, 2_500)
+        .min(YOUNG_SHRINK_FACTOR * policy.young_target_words(live_burst));
+    assert_eq!(paid, 10_958, "next_words(2 * (900 + 2_500) + 64 = 6_864) = 10_958");
+    let stats = c.collect_major(&mut roots).expect("the settling fullsweep");
+    assert_eq!(stats.words_copied, live_burst, "exactly the list was copied");
     assert_eq!(c.young_space_count(), 1, "the settling round collapsed the chain");
+    let collected_capacity = c.heap_size_words();
     assert_eq!(
-        c.young().capacity_words(),
-        paid,
+        collected_capacity, paid,
         "the first collection pays for the growth request: {paid} words"
     );
-    let collected_capacity = c.heap_size_words();
-    assert_eq!(collected_capacity, paid, "one space holds the whole chain");
     // The nursery is filled — the fullsweep will find it full — but almost all of it is garbage:
     // the only live term is a 59-element (60-word) tuple. Nothing grows in this window, so the
     // request above is spent and the rule under test is the plain one.
     let elems: Vec<Eterm> = (0..59).map(|i| make_small(i as i64)).collect();
-    let mut roots = vec![tuple_in(c.young_mut(), &elems)];
+    roots[0] = tuple_in(c.young_mut(), &elems);
     fill_with_garbage(&mut c, 4);
     let occupied = c.young().used_words();
     assert!(
@@ -339,38 +352,39 @@ fn a_fullsweep_whose_live_set_outgrows_the_nursery_grows_it() {
 /// the churn protection: a resize here would reintroduce the per-round space install the
 /// hysteresis band exists to remove.
 ///
-/// **The derivation.** `grow_nursery(1_100)` retires the 233-word birth space and installs the
-/// 1598-word curated one (chain `233 + 1598 = 1831`), and its 1100-word request is carried into the
-/// **next** collection as the C's `need` term. That settling round has an empty live set, so it
-/// installs `young_target_words_with_need(0, 1_100) = next_words(2 * 1_100 + 64 = 2264) = 2586`
+/// **The derivation.** `build_list` grows the nursery as it conses the 200-cell (400-word) list,
+/// and `grow_nursery(1_100)` adds the burst's request, which rides into the **next** collection as
+/// the C's `need` term. That settling round has the 400-word list live, so it asks
+/// `young_target_words_with_need(400, 1_100) = next_words(2 * (400 + 1_100) + 64 = 3_064) = 4_185`
 /// and spends the request — the burst's room is paid for once.
 ///
 /// The round under test then follows with **no growth in between**, so it is the plain live-set
-/// rule: the live set is a 200-cell list = **400 words**, the target is
-/// `next_words(2 * 400 + 64 = 864) = 987`, and the keep band is `[4/3 * 987, 8 * 987] =
-/// [1316, 7896]`. The collected 2586-word space is inside it on both sides —
-/// `should_grow(2586, 987)` is false (`3 * 2586 = 7758 >= 4 * 987`) and `should_shrink` likewise —
-/// so the capacity is kept and the chain is materialised as one space.
+/// rule: the same 400-word live set, the target is `next_words(2 * 400 + 64 = 864) = 987`, and the
+/// keep band is `[4/3 * 987, 8 * 987] = [1_316, 7_896]`. The collected 4_185-word space is inside
+/// it on both sides — `should_grow(4_185, 987)` is false (`3 * 4_185 = 12_555 >= 4 * 987`) and
+/// `should_shrink` likewise — so the capacity is kept and the chain is materialised as one space.
 #[test]
 fn a_fullsweep_whose_live_set_is_not_far_below_the_capacity_keeps_it() {
     let policy = HeapPolicy::default();
     let mut c = Collector::new(policy.clone()).expect("collector");
-    c.grow_nursery(1_100).expect("grow");
-    assert_eq!(c.heap_size_words(), 233 + policy.next_words(1_100, 0));
-    // The round that pays for the growth request, exactly as an admission door would.
-    let mut no_roots: Vec<Eterm> = Vec::new();
-    c.collect_major(&mut no_roots).expect("the settling fullsweep");
-    assert_eq!(c.young_space_count(), 1, "the settling round collapsed the chain");
     let cells = 200;
     let mut roots = build_list(&mut c, cells);
-    fill_with_garbage(&mut c, 4);
     let live = 2 * cells;
     assert_eq!(size_object(roots[0]), live);
+    c.grow_nursery(1_100).expect("grow");
+    // The round that pays for the growth request, one-shot.
+    let paid = policy
+        .young_target_words_with_need(live, 1_100)
+        .min(YOUNG_SHRINK_FACTOR * policy.young_target_words(live));
+    assert_eq!(paid, 4_185, "next_words(2 * (400 + 1_100) + 64 = 3_064) = 4_185");
+    let stats = c.collect_major(&mut roots).expect("the settling fullsweep");
+    assert_eq!(stats.words_copied, live);
+    assert_eq!(c.young_space_count(), 1, "the settling round collapsed the chain");
+    fill_with_garbage(&mut c, 4);
     let collected_capacity = c.heap_size_words();
     assert_eq!(
-        collected_capacity,
-        policy.young_target_words_with_need(0, 1_100),
-        "the settling round installed the need-augmented empty-live-set target, one space"
+        collected_capacity, paid,
+        "the settling round installed the need-augmented target, one space"
     );
     let target = policy.young_target_words(live);
     assert_eq!(target, 987, "next_words(2 * 400 + 64 = 864) = 987");
@@ -798,32 +812,26 @@ fn a_fixed_demand_converges_to_one_constant_post_fullsweep_capacity() {
         // collection saw — a property of the workload, not a function of the iteration count (a
         // creep would show up as a rising tail above).
         //
-        // The settling round is the door's **first** collection: the nursery is the 233-word birth
-        // space plus the space the door's own request grew it to (`next_words(300) = 376`, chain
-        // 609), the live set is the one op that is still rooted, and that growth's request rides in
-        // as the `need` term. (The round escalates to a fullsweep because the 300-word promotion
-        // cannot fit the birth mature generation.) Every later collection asks the plain rule and
-        // keeps that capacity, so the single settled figure is `settled` below.
+        // The settling round is the door's **first** collection: the nursery is the birth space
+        // plus the space the door's own request grew it to, and the live set is the one op that is
+        // still rooted. (The round escalates to a fullsweep because the 300-word promotion cannot
+        // fit the birth mature generation.) The door's own growth records **no** carriage: that
+        // request is the door's pending allocation, which the sizing rules already stand in for
+        // through `need_reserve_words`, so the settling round is the **plain** live-set rule and
+        // every later collection keeps the capacity it installed.
         let policy = HeapPolicy::default();
         let live = size_object(roots[0]);
-        let settled = policy.young_after_fullsweep_with_need(
-            233 + policy.next_words(OP_WORDS, 0),
-            live,
-            OP_WORDS,
-        );
+        let settled = policy.young_target_words(live);
         assert_eq!(
             tail[0], settled,
-            "{kind:?}: the converged capacity {} must be the policy's answer for the settling \
-             geometry: collected 233 + next_words({OP_WORDS}) with {live} live and the door's \
-             {OP_WORDS}-word request ({settled})",
+            "{kind:?}: the converged capacity {} must be the plain live-set target for the \
+             settling geometry ({live} live: next_words(2 * {live} + 64) = {settled})",
             tail[0]
         );
-        // The request is what makes it cover the op: the plain live-set target alone is smaller.
-        let plain = policy.young_target_words(live);
+        // ... and it covers one op, which is why the door stops collecting over occupancy.
         assert!(
-            tail[0] >= OP_WORDS && plain < tail[0],
-            "{kind:?}: the converged capacity {} must cover one {OP_WORDS}-word op and be larger \
-             than the plain target {plain}",
+            tail[0] >= OP_WORDS,
+            "{kind:?}: the converged capacity {} must cover one {OP_WORDS}-word op",
             tail[0]
         );
         assert!(
@@ -848,7 +856,8 @@ fn a_fixed_demand_converges_to_one_constant_post_fullsweep_capacity() {
 /// whole difference between the strategies — but the nursery half is shared.)
 #[test]
 fn both_mature_strategies_size_the_nursery_identically() {
-    // The over-provisioned geometry of test 1: 2819 words collected, 60 words live.
+    // An over-provisioned geometry: a grown burst nursery (chain 2819 words) holding a 60-word
+    // live set.
     let mut results = Vec::new();
     for kind in [MatureKind::Copying, MatureKind::Immix] {
         let mut c = any_for(kind, HeapPolicy::default());
@@ -870,18 +879,27 @@ fn both_mature_strategies_size_the_nursery_identically() {
         results[0].1, results[1].1,
         "both strategies size the over-provisioned nursery identically: {results:?}"
     );
-    // The growth's 2500-word request rides into the fullsweep as the C's `need` term, so the size
-    // is `young_target_words_with_need(60, 2_500) = next_words(2 * (60 + 2_500) + 64) = 6772`.
+    // The growth's 2_500-word request rides into the fullsweep as the C's `need` term, whose
+    // *uncapped* answer is `young_target_words_with_need(60, 2_500) = next_words(2 * (60 + 2_500)
+    // + 64) = 6_772` — but a 60-word live set's keep band has an upper edge of
+    // `YOUNG_SHRINK_FACTOR * young_target_words(60) = 8 * 233 = 1_864`, and a carried request may
+    // never buy capacity the shrink rule would take straight back. The installed size is therefore
+    // the bound itself, identically on both strategies.
     let policy = HeapPolicy::default();
+    let bound = YOUNG_SHRINK_FACTOR * policy.young_target_words(60);
+    assert_eq!(bound, 1_864, "8 * young_target_words(60) = 8 * 233 = 1_864");
     assert_eq!(
         results[0].1,
-        policy.young_target_words_with_need(60, 2_500),
-        "and that size is the live set's need-augmented target"
+        policy.young_target_words_with_need(60, 2_500).min(bound),
+        "and that size is the live set's need-augmented target, bounded by the keep band's edge"
     );
-    assert_eq!(results[0].1, 6_772, "next_words(2 * 2_560 + 64 = 5184) = 6772");
+    assert_eq!(
+        results[0].1, bound,
+        "the request's 6_772-word ask is capped to the band's 1_864-word edge"
+    );
     assert!(
         results[0].1 > policy.young_target_words(60),
-        "the request makes the nursery larger than the plain live-set target"
+        "the request still makes the nursery larger than the plain live-set target"
     );
 }
 

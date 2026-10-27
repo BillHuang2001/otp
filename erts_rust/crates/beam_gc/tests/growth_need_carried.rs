@@ -31,9 +31,13 @@
 //!
 //! # The contract (asserted below)
 //!
-//! 1. **The request is carried.** A collection that follows a growth which really retired a space
-//!    installs exactly `HeapPolicy::young_after_collection_with_need(chain_capacity, live, W)`,
-//!    with `live` the round's own copy volume — so the surviving space covers the request.
+//! 1. **The request is carried — inside the keep band.** A collection that follows a growth which
+//!    really retired a space installs the `_with_need` rule's answer
+//!    (`HeapPolicy::young_after_collection_with_need` / `young_after_fullsweep_with_need`) with
+//!    `live` the round's own copy volume, **bounded by the keep band's own upper edge** computed
+//!    from the plain live-set target — so the surviving space covers the request, and a request
+//!    that scales with the capacity cannot make the nursery one ratio wider per round
+//!    ([`carriage_bound`], `src/nursery.rs`).
 //! 2. **It is one-shot.** A second collection with no intervening growth installs exactly the
 //!    plain rule's answer `young_after_collection(capacity, live)`: the request was spent, the
 //!    capacity does not ratchet, and it is never a function of the call count.
@@ -45,12 +49,21 @@
 //! 4. **The give-back seam still gives back.** After a grown chain, one
 //!    [`AnyCollector::trim_retired`] installs the **plain** live-set target — the pending request
 //!    is discarded, not banked.
+//! 5. **Only the no-relocation seam records.** A growth reached from
+//!    [`AnyCollector::ensure_capacity`] is the heap-admission door's own pending allocation, which
+//!    the crate deliberately does not fold into the collapse (it double-counts
+//!    `need_reserve_words`, and the trailing growth already installs the request's width), so the
+//!    collection that follows a door growth sizes on the **plain** rule.
+//! 6. **The mature clamp follows the nursery the collapse installs.** A fullsweep folds the young
+//!    occupancy in clamped to *that* capacity (never to a capacity the collapse no longer
+//!    installs), so the mature target and the installed nursery cannot disagree.
 //!
 //! Both mature strategies run every case ([`GcConfig::copying`] / [`GcConfig::immix`]), because
 //! the nursery chain and its collapse are shared. Nothing here measures time: every case is a
 //! deterministic allocation sequence plus the policy's own figures.
 use beam_gc::prelude::{
     AnyCollector, CollectionKind, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind,
+    MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR,
 };
 use beam_term::prelude::{make_small, Eterm};
 // ---------------------------------------------------------------------------
@@ -112,6 +125,42 @@ fn write_lump(c: &mut AnyCollector, words: usize) {
         .tuple(&elems)
         .expect("the lump fits the room the growth installed");
 }
+/// The bound a carried request's effect is capped at: **the keep band's own upper edge**,
+/// computed from the plain live-set target — the same edge the shrink rule compares a capacity
+/// against, so a request may buy back capacity the shrink rule would otherwise have taken, and
+/// may never buy capacity the shrink rule would take straight back
+/// (`Nursery`'s `carriage_bound`, `src/nursery.rs`).
+fn carriage_bound(policy: &HeapPolicy, kind: CollectionKind, live_words: usize) -> usize {
+    match kind {
+        CollectionKind::Minor => MINOR_SHRINK_FLOOR_WORDS
+            .max(YOUNG_SHRINK_FACTOR.saturating_mul(policy.young_minor_target_words(live_words))),
+        // The fullsweep rule has no floor; keeping it that way is part of the contract.
+        CollectionKind::Major => {
+            YOUNG_SHRINK_FACTOR.saturating_mul(policy.young_target_words(live_words))
+        }
+    }
+}
+
+/// The capacity a collapse installs when the growth seam carried `need` into it: the
+/// `_with_need` rule's answer bounded by [`carriage_bound`].
+fn carried_target(
+    policy: &HeapPolicy,
+    kind: CollectionKind,
+    capacity_words: usize,
+    live_words: usize,
+    need_words: usize,
+) -> usize {
+    let rule = match kind {
+        CollectionKind::Minor => {
+            policy.young_after_collection_with_need(capacity_words, live_words, need_words)
+        }
+        CollectionKind::Major => {
+            policy.young_after_fullsweep_with_need(capacity_words, live_words, need_words)
+        }
+    };
+    rule.min(carriage_bound(policy, kind, live_words))
+}
+
 /// The plain live-set target for the collection that ran (`need == 0`): what
 /// [`AnyCollector::trim_retired`] installs.
 fn plain_target(policy: &HeapPolicy, kind: CollectionKind, live_words: usize) -> usize {
@@ -145,39 +194,48 @@ fn the_request_is_carried_into_the_next_collection_and_spent_exactly_once() {
         // The collection that follows pays for the request it could not satisfy.
         let first = c.collect(&mut roots).expect("collect");
         let live = first.stats.words_copied;
-        let paid = policy.young_after_collection_with_need(chain, live, REQUEST);
+        let paid = carried_target(&policy, first.kind, chain, live, REQUEST);
+        let bound = carriage_bound(&policy, first.kind, live);
         assert_eq!(
             c.heap_size_words(),
             paid,
-            "{kind:?}: the collapse must carry the growth's request (chain {chain}, live {live})"
+            "{kind:?}: the collapse must carry the growth's request, bounded by the keep band \
+             (chain {chain}, live {live}, band upper edge {bound})"
         );
         assert!(
             paid >= REQUEST,
             "{kind:?}: the surviving nursery covers the request it was grown for"
         );
-        // One-shot: no growth happened since, so the request is spent and the plain rule decides.
+        assert!(
+            paid <= bound,
+            "{kind:?}: a carried request never buys past the keep band's upper edge"
+        );
+        // One-shot: no growth happened since, so the request is spent and the plain rule decides —
+        // and it stays decided, so the capacity cannot climb on the call count.
         let before = c.heap_size_words();
         let second = c.collect(&mut roots).expect("collect");
         let live_now = second.stats.words_copied;
         let plain = policy.young_after_collection(before, live_now);
         let inflated = policy.young_after_collection_with_need(before, live_now, REQUEST);
-        assert_ne!(
-            plain, inflated,
-            "{kind:?}: the two rules must differ for this case to mean anything"
-        );
         assert_eq!(
             c.heap_size_words(),
             plain,
             "{kind:?}: the request was consumed, so the capacity is the plain live-set figure"
         );
+        let third = c.collect(&mut roots).expect("collect");
+        assert_eq!(
+            c.heap_size_words(),
+            policy.young_after_collection(plain, third.stats.words_copied),
+            "{kind:?}: the settled capacity is a fixed point of the plain rule"
+        );
         assert!(
-            c.heap_size_words() < inflated,
-            "{kind:?}: the capacity does not ratchet onto the request"
+            c.heap_size_words() <= inflated,
+            "{kind:?}: the capacity does not ratchet onto the request ({plain} vs {inflated})"
         );
         eprintln!(
             "{kind:?}: chain {chain_before} -> {chain} for a {REQUEST}-word request; \
-             the collection installed {paid} (live {live}); the next one {plain} \
-             (was the need-inflated {inflated} an option it would have taken)"
+             the collection installed {paid} (live {live}, keep-band edge {bound}); \
+             the next one {plain} (the need-inflated answer would have been {inflated})"
         );
     }
 }
@@ -311,4 +369,181 @@ fn the_give_back_seam_installs_the_plain_target_after_a_grown_chain() {
             collection.kind, plain
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 4. a request that scales with the capacity cannot widen the nursery per round
+// ---------------------------------------------------------------------------
+/// A caller that asks for **twice the current capacity** every round — the shape
+/// `beam_process`'s `collection_debt` gate drives (`Process::grow_nursery(2 * heap_size)` and then
+/// a collection, eight times) — must not turn the carriage into a ladder.
+///
+/// Uncapped, the collapse installs `next_words(live + 2C + need_reserve_words)`: a target
+/// proportional to the capacity it replaces, so the nursery multiplies by ~4.2 per round. Capped
+/// at the keep band's own upper edge the installed capacity is a function of the **live set**
+/// (and of one bounded request), so the tail is one constant figure no matter how long the run
+/// is.
+#[test]
+fn a_request_that_scales_with_the_capacity_stays_inside_the_keep_band() {
+    const ROUNDS: usize = 8;
+    for kind in KINDS {
+        let policy = roomy_policy(233);
+        let mut c = any_for(kind, policy.clone());
+        let mut roots = build_live(&mut c, LIVE_WORDS);
+        let (mut ladder, mut unbounded) = (Vec::new(), Vec::new());
+        for round in 0..ROUNDS {
+            let need = 2 * c.heap_size_words();
+            c.grow_nursery(need).expect("the growth seam grants the request");
+            let chain = c.heap_size_words();
+            let collection = c.collect(&mut roots).expect("collect");
+            let live = collection.stats.words_copied;
+            let bound = carriage_bound(&policy, collection.kind, live);
+            let installed = c.heap_size_words();
+            // The regression gate: the *relation* the cap states, never a ladder figure.
+            assert!(
+                installed <= bound,
+                "{kind:?}: round {round} installed {installed} words, past the keep band's own \
+                 upper edge {bound} (chain {chain}, live {live})"
+            );
+            ladder.push(installed);
+            unbounded.push(match collection.kind {
+                CollectionKind::Minor => {
+                    policy.young_after_collection_with_need(chain, live, need)
+                }
+                CollectionKind::Major => policy.young_after_fullsweep_with_need(chain, live, need),
+            });
+        }
+        // No ratchet: once the chain has settled, the capacity is one constant figure — it is a
+        // function of the live set and the bounded request, never of the round count.
+        let tail = &ladder[2..];
+        assert!(
+            tail.iter().all(|w| *w == tail[0]),
+            "{kind:?}: the settled capacity must be constant, got {ladder:?}"
+        );
+        // ... and the uncapped rule would have laddered, which is exactly what the cap prevents.
+        let (last, uncapped) = (ladder[ROUNDS - 1], unbounded[ROUNDS - 1]);
+        assert!(
+            uncapped > last,
+            "{kind:?}: the unbounded rule would have installed {uncapped} words where the band \
+             allowed {last} (ladder {ladder:?}, uncapped {unbounded:?})"
+        );
+        eprintln!("{kind:?}: capacity ladder {ladder:?}; uncapped it would be {unbounded:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. the heap-admission door's own growth records nothing
+// ---------------------------------------------------------------------------
+/// `ensure_capacity` collects and **then** grows. That grown request is the door's own pending
+/// allocation — the C `need` term this crate deliberately does not fold in (its
+/// `need_reserve_words` is the term's stand-in and the trailing growth already installs the
+/// request's width) — so the collection after it takes the **plain** live-set decision, and the
+/// door can never be the route by which a capacity-scaled request ratchets.
+#[test]
+fn the_heap_admission_door_s_own_growth_carries_nothing() {
+    for kind in KINDS {
+        let policy = roomy_policy(233);
+        let mut c = any_for(kind, policy.clone());
+        let mut roots = build_live(&mut c, LIVE_WORDS);
+        let entered = c
+            .ensure_capacity(REQUEST, &mut roots)
+            .expect("collect, then grow");
+        let chain = c.heap_size_words();
+        assert!(
+            chain > REQUEST,
+            "{kind:?}: the door installs room for its own request ({chain} words)"
+        );
+
+        let collection = c.collect(&mut roots).expect("collect");
+        let live = collection.stats.words_copied;
+        let plain = match collection.kind {
+            CollectionKind::Minor => policy.young_after_collection(chain, live),
+            CollectionKind::Major => policy.young_after_fullsweep(chain, live),
+        };
+        let carried = carried_target(&policy, collection.kind, chain, live, REQUEST);
+        assert_eq!(
+            c.heap_size_words(),
+            plain,
+            "{kind:?}: the door's request is not carried (chain {chain}, live {live})"
+        );
+        // ... and the reason the door must not carry is visible right here: its own growth
+        // already installed the request's width, so a carried request could buy nothing. (That is
+        // why the two rules coincide on this route, and why the only route on which they differ is
+        // the root-free no-relocation one — cases 1..4.)
+        assert!(
+            plain >= REQUEST,
+            "{kind:?}: the door's growth already covers its {REQUEST}-word request ({plain})"
+        );
+        eprintln!(
+            "{kind:?}: {:?} door -> {chain} words; the next collection {plain} words (the carried \
+             rule would answer {carried}; the door already installed the request's width)",
+            entered.kind
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. the mature clamp follows the nursery the collapse installs
+// ---------------------------------------------------------------------------
+/// A fullsweep folds the young occupancy into the mature target **clamped to the capacity the
+/// collapse installs** — not to the plain `young_after_fullsweep` answer, which is a nursery that
+/// no longer exists once the collapse carries a growth request. The accessor is the collapse's own
+/// (`Nursery::capacity_after_fullsweep`), so the two figures cannot disagree by construction; this
+/// case re-derives both from the public policy and pins the equality.
+#[test]
+fn a_full_sweep_sizes_the_mature_space_against_the_nursery_it_installs() {
+    let policy = roomy_policy(233);
+    let mut c = any_for(MatureKind::Copying, policy.clone());
+    let mut roots = build_live(&mut c, LIVE_WORDS);
+    // A grown chain the mutator then filled with dead words: the second growth retires the filled
+    // space while carrying its request, so the collapse will install a capacity well above the
+    // plain live-set target and the dead occupancy lands far above that.
+    c.grow_nursery(REQUEST).expect("grow");
+    fill_to(c.young_mut(), 16);
+    c.grow_nursery(REQUEST).expect("grow");
+    assert!(c.collection_debt(), "the grown chain is collection debt");
+    let chain = c.heap_size_words();
+    let used = c.total_heap_used_words();
+    let old_mature = c.mature_capacity_words();
+    let collection = c
+        .collect_kind(CollectionKind::Major, &mut roots)
+        .expect("fullsweep");
+    let live = collection.stats.words_copied;
+    let installed = c.heap_size_words();
+    let plain_nursery = policy.young_target_words(live);
+    // The collapse installs the carried request's bounded target — above the plain one, and below
+    // the dead occupancy (so the clamp is doing real work).
+    assert_eq!(
+        installed,
+        carried_target(&policy, CollectionKind::Major, chain, live, REQUEST),
+        "the fullsweep installs the carried request's bounded target (chain {chain}, live {live})"
+    );
+    assert!(
+        installed > plain_nursery,
+        "the carried request must install more than the plain live-set target \
+         ({installed} vs {plain_nursery})"
+    );
+    assert!(
+        used > installed,
+        "the dead occupancy must exceed the installed nursery for the clamp to bite \
+         ({used} vs {installed})"
+    );
+    // The defect-3 gate: the mature target reads the *installed* capacity.
+    let expected = policy.mature_after_fullsweep(old_mature, live, used.min(installed));
+    let plain_clamp = policy.mature_after_fullsweep(old_mature, live, used.min(plain_nursery));
+    assert_eq!(
+        c.mature_capacity_words(),
+        expected,
+        "the mature space is sized against the nursery the collapse installed"
+    );
+    assert_ne!(
+        expected, plain_clamp,
+        "the plain clamp is a different figure, so this case pins the accessor \
+         ({expected} vs {plain_clamp})"
+    );
+    eprintln!(
+        "fullsweep: chain {chain} (used {used}) -> nursery {installed} (plain target \
+         {plain_nursery}); mature {old_mature} -> {} (the plain clamp would say {plain_clamp})",
+        c.mature_capacity_words()
+    );
 }

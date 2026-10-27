@@ -459,32 +459,36 @@ fn a_larger_single_request_grows_the_nursery_to_just_cover_it() {
             "{kind:?}: the growth is bounded by the smallest curated size covering the request"
         );
 
-        // A grown nursery is not a permanent one, but the room is given back one round later.
-        //
-        // The collection that follows the growth is the one place the request can be paid for:
-        // the growth holds no root set, so it cannot collect, and it recorded the request it
-        // could not satisfy. That round therefore sizes the nursery to cover the surviving live
-        // set **plus** the request (`young_after_collection_with_need`) — which here is exactly
-        // the chain it collected, so the capacity is kept rather than re-installed.
+        // An `ensure_capacity` growth deliberately does **not** carry its request into the next
+        // collection: that request is the door's own pending allocation, which the crate does not
+        // fold into the collapse (`need_reserve_words` and the growth's strict-progress width
+        // already stand for it). The round that follows therefore sizes on the **plain** live-set
+        // rule, and — having collected the chain — gives the request-sized capacity back straight
+        // away. Only the no-relocation `grow_nursery` route (the root-free copy-out) carries.
         let chain = expected + NURSERY;
         let collection = c.collect(&mut roots).expect("collect");
         let live = collection.stats.words_copied;
-        let paying = policy().young_after_collection_with_need(chain, live, REQUEST);
+        let plain = policy().young_after_collection(chain, live);
         assert_eq!(
             c.young().capacity_words(),
-            paying,
-            "{kind:?}: the collection after a growth pays for the request"
+            plain,
+            "{kind:?}: the door's growth is not carried, so the collection sizes on the live set"
         );
-        // The round after that has no growth before it, so the request is spent and the nursery
-        // is bounded by the live set alone — back under the request-sized capacity.
+        let inflated = policy().young_after_collection_with_need(chain, live, REQUEST);
+        assert!(
+            plain < inflated,
+            "{kind:?}: a carried request would have paid for more ({plain} vs {inflated})"
+        );
+        // A grown nursery is not a permanent one: the room is given back one round later.
         c.collect(&mut roots).expect("collect");
         assert!(
             c.young().capacity_words() < expected,
-            "{kind:?}: the nursery shrinks back once the request has been paid for"
+            "{kind:?}: the nursery shrinks back once the request has been spent"
         );
         eprintln!(
             "{kind:?}: {NURSERY} words -> {expected} words for a {REQUEST}-word request -> \
-             {paying} words after the paying collection -> {} words once the request is spent",
+             {plain} words after the next collection (a carried request would have installed \
+             {inflated}) -> {} words a round later",
             c.young().capacity_words()
         );
     }

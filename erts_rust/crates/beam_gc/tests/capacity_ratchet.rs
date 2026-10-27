@@ -889,12 +889,17 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             drive_growth(&mut c, hint, 6);
             let collected_chain = c.heap_size_words();
             // The chain was grown for `hint` words of room before this fullsweep, so the
-            // whole-heap target carries that request as the one-shot `need` term.
+            // whole-heap target carries that request as the one-shot `need` term — **bounded by
+            // the keep band's own upper edge** (`YOUNG_SHRINK_FACTOR` x the *plain* whole-heap
+            // target for this live set), so a request that scales with the capacity it replaces
+            // can never ratchet the nursery.
             let target = policy.young_target_words_with_need(live_words, hint);
+            let bound = YOUNG_SHRINK_FACTOR * policy.young_target_words(live_words);
+            let installed = target.min(bound);
             assert!(
-                collected_chain > YOUNG_SHRINK_FACTOR * target,
+                collected_chain > YOUNG_SHRINK_FACTOR * installed,
                 "{kind:?}: the shrink branch must hold: the {collected_chain}-word chain is past \
-                 {} x the {target}-word target",
+                 {} x the {installed}-word target",
                 YOUNG_SHRINK_FACTOR
             );
             let stats = c.collect_major(&mut roots).expect("the fullsweep collapse");
@@ -907,12 +912,13 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             assert_eq!(
                 policy.young_after_fullsweep_with_need(collected_chain, live_words, hint),
                 target,
-                "{kind:?}: a fullsweep from above the band installs the whole-heap target"
+                "{kind:?}: a fullsweep from above the band asks for the whole-heap target"
             );
             assert_eq!(
                 c.heap_size_words(),
-                policy.young_target_words_with_need(stats.words_copied, hint),
-                "{kind:?}: the fullsweep collapses onto the whole-heap live set's target"
+                target.min(YOUNG_SHRINK_FACTOR * policy.young_target_words(stats.words_copied)),
+                "{kind:?}: the fullsweep collapses onto the whole-heap live set's target, bounded \
+                 by the keep band's upper edge"
             );
         }
     }

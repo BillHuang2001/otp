@@ -521,8 +521,12 @@ impl GenImmixCollector {
     /// and `heap_size_words() <= max_heap_words` after every successful growth. A retired space a
     /// previous growth left provably **empty** (`used_words() == 0`) is re-adopted instead of
     /// replaced, which consumes no budget at all.
+    ///
+    /// As on the copying strategy, the request a retirement was forced for is **carried** into
+    /// the next collapse (bounded by the policy's keep band); the door's own
+    /// [`ensure_capacity`](Self::ensure_capacity) growth is the plain form and records nothing.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
-        self.nursery.grow(&self.policy, need_words)
+        self.nursery.grow_for_one_off(&self.policy, need_words)
     }
 
     /// Whether `ptr` addresses a word of **any** nursery space — the current one or a retired
@@ -698,12 +702,14 @@ impl GenImmixCollector {
         // up without bound (see [`crate::live`]).
         //
         // The young occupancy is clamped to the capacity the nursery will **actually** have
-        // after this round's collapse — `young_after_fullsweep(capacity, live)`, the same
-        // `Nursery::collapse_after_fullsweep` applies below — which restores the C's premise for
-        // the same term: `HEAP_TOP(p) - HEAP_START(p)` is one young block's usage, bounded by
-        // that block's `HEAP_SIZE`, and the C sizes the young block from the live set at every
-        // collection (`erl_gc.c:1875-1888`, `:2061-2098`). That capacity is a function of the
-        // live set alone, upper-bounded by `YOUNG_SHRINK_FACTOR` (8) times
+        // after this round's collapse, read through the one accessor that answers exactly what
+        // `Nursery::collapse_after_fullsweep` will install — the same inputs (chain capacity,
+        // live set, the carried growth request, the keep band's upper edge), so the region's size
+        // and the installed nursery cannot disagree by construction. That restores the C's
+        // premise for the same term: `HEAP_TOP(p) - HEAP_START(p)` is one young block's usage,
+        // bounded by that block's `HEAP_SIZE`, and the C sizes the young block from the live set
+        // at every collection (`erl_gc.c:1875-1888`, `:2061-2098`). That capacity is a function
+        // of the live set alone and is upper-bounded by `YOUNG_SHRINK_FACTOR` (8) times
         // `HeapPolicy::young_target_words(live)` (past which the collapse installs the target
         // itself). `Nursery::used_words()` is the chain-summed occupancy of every nursery space,
         // so unclamped it also counts every dead word the mutator (or a host's unrooted BIF
@@ -716,8 +722,8 @@ impl GenImmixCollector {
             crate::live::live_full_with(&mut self.scratch, &self.nursery, &self.mature, roots);
         let capacity = self.mature.capacity_words();
         let young_capacity_after = self
-            .policy
-            .young_after_fullsweep(self.nursery.capacity_words(), live.words);
+            .nursery
+            .capacity_after_fullsweep(&self.policy, live.words);
         let young_occupancy = self.nursery.used_words().min(young_capacity_after);
         let target = self
             .policy
