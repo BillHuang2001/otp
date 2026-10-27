@@ -232,7 +232,7 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
   property/fuzz (`property_roundtrip`/`property_oracle` + `property_support/`, splitmix64 seed
   `0x5EED_F00D_1234_5678`), hardening (`decode_hostile`, `decode_depth`), identity/`[safe]` seams
   (`local_node`, `local_identity_roundtrip`, `export_gate`, `export_arity_oracle`), deterministic
-  attribution (`alloc_count` + `attrib_support/`: **1** allocation per encode, **13** fresh / **3**
+  attribution (`alloc_count` + `attrib_support/`: **1** allocation per encode, **26** fresh / **3**
   warm per decode, image 101 bytes — counts, never timings), per-tag suites (`tag_coverage`'s 41-row
   coverage + 66-row exact-`BeamError` tables, `tag_space_audit`'s exhaustive 256-row disposition
   sweep + no-panic `[131,byte]` sweep, and the roundtrip/scalar/legacy/record/map/`COMPRESSED`

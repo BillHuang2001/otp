@@ -33,6 +33,7 @@ The fair ratio is therefore **~2.4–2.7×**, not 136.3×.
 Two codec optimizations landed; both are pinned deterministically by `tests/alloc_count.rs`.
 - **Decode container buffers are pre-sized** from the wire count clamped to `const CONTAINER_PREALLOC_CAP = 64` (`src/decode/mod.rs`).
   The deterministic allocation effect: warm decode **4 → 3**, fresh decode **14 → 13**; encode is unchanged at **1**.
+  Those two **deltas** are the codec's own contribution; the pin's *absolute* fresh figure also carries the atom store's per-name share, so it moves when `beam_term` retunes `INDEX_SHARDS` (currently **26** = codec floor 3 + 23 for the payload's 6 novel atoms). Read the deltas here; read `tests/alloc_count.rs` for the live pin.
 - **`encode_list` is single-pass** (`src/encode/mod.rs`), rewinding the sink with `Writer::truncate` / `Writer::patch_u16be` (`src/writer.rs`) instead of buffering; it adds no allocation.
 - Controlled interleaved measurement — 3 release binaries built from the same tree, round-robin pinned to core 3, min over n=20 across two rotation orders:
 

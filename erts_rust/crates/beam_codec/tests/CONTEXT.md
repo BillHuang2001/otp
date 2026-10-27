@@ -54,8 +54,11 @@ The crate-level Intent / API Surface / Constraints / Known Issues are [`../CONTE
 - `export_arity_oracle.rs` — the `EXPORT_EXT` arity truncation against a live oracle.
 **Deterministic attribution**
 - `alloc_count.rs` over `attrib_support/` (a thread-local counting `#[global_allocator]`) pins the
-  **exact** allocations for the `copy_bound` bench payload: **1** per encode, **13** fresh / **3**
-  warm per decode, image 101 bytes. Counts, never timings.
+  **exact** allocations for the `copy_bound` bench payload: **1** per encode, **26** fresh / **3**
+  warm per decode, image 101 bytes. Counts, never timings. The fresh figure is the codec's own
+  container floor (3) plus the atom store's share (one string plus one shard container pair per
+  novel name, 6 names ⇒ 23), so `beam_term`'s `INDEX_SHARDS` tuning moves it — the pin's prose
+  states the model; re-derive with `--nocapture` rather than re-typing a number.
 **Per-tag suites**
 - `tag_coverage.rs` — a 41-row per-tag coverage table (round-trip + decode-only rows incl. the
   `ATOM_INTERNAL_REF2`/`_REF3` seeded rows) with live oracle byte cross-checks, plus a 66-row
