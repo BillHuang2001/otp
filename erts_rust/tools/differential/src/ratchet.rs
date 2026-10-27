@@ -18,15 +18,24 @@
 //
 // %CopyrightEnd%
 
-//! The **ratcheted** strict gate: classify the current capability gaps against the
-//! allowlist, render a `GAPS.md`, and derive the suite's exit code.
+//! The **ratcheted** strict gate: classify the current capability gaps (and the host-oracle
+//! drift) against their allowlists, render a `GAPS.md`, and derive the suite's exit code.
 //!
-//! A **gap** is a non-agreeing case whose verdict is `Unsupported` *or* `Skipped`. A
-//! `Mismatch` is never a gap — it is always a hard failure. With an allowlist the gate
-//! tolerates the gaps it records and fails the moment an *unauthorized* gap appears (the
-//! allowlist must be widened deliberately) or an entry goes *stale* (its case is no longer
-//! a gap — the allowlist must be tightened). Without an allowlist the behaviour is exactly
-//! as before (`strict` escalates any `unsupported`/`skipped` case to a failure).
+//! Two non-agreeing classes are ratcheted, and they are deliberately separate:
+//!
+//! * A **gap** is a case whose verdict is `Unsupported` *or* `Skipped` — a capability our
+//!   runtime does not have yet.
+//! * An **oracle drift** is a case whose verdict is [`Verdict::OracleDrift`] — our side
+//!   reproduced the committed golden and the oracle did not, so the golden depends on the
+//!   **host oracle's release** (its `erts` version is not the tree's pinned one).
+//!
+//! A `Mismatch` is never a gap and never a drift — it is always a hard failure. With an
+//! allowlist the gate tolerates the entries it records and fails the moment an
+//! *unauthorized* one appears (the allowlist must be widened deliberately) or an entry goes
+//! *stale* (its case no longer reproduces — the allowlist must be tightened). Each class has
+//! its own allowlist; an oracle drift is never tolerated by the gaps allowlist, and vice
+//! versa. Without an allowlist the behaviour is exactly as before (`strict` escalates any
+//! `unsupported`/`skipped`/`oracle_drift` case to a failure).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -42,9 +51,19 @@ use crate::report::{CaseReport, RunReport};
 
 /// Whether `verdict` is a capability gap the allowlist may tolerate.
 ///
-/// `Mismatch` is deliberately excluded: a differing observable result is never a gap.
+/// `Mismatch` is deliberately excluded: a differing observable result is never a gap. So is
+/// [`Verdict::OracleDrift`] — it has its own allowlist ([`is_drift`]).
 fn is_gap(verdict: Verdict) -> bool {
     matches!(verdict, Verdict::Unsupported | Verdict::Skipped)
+}
+
+/// Whether `verdict` is a host-oracle drift the **drift** allowlist may tolerate.
+///
+/// Positive-evidence only: our side reproduced the committed golden and the oracle did not, so
+/// the case's golden depends on the host oracle's release. It is never a gap and never a
+/// mismatch.
+fn is_drift(verdict: Verdict) -> bool {
+    matches!(verdict, Verdict::OracleDrift)
 }
 
 /// Whether `report` contains a case whose observable result actually diverged.
@@ -59,27 +78,50 @@ fn has_mismatch(report: &RunReport) -> bool {
     report.summary.mismatch > 0 || report.cases.iter().any(|case| case.verdict.is_mismatch())
 }
 
-/// The current run's gap classification against the allowlist.
+/// The current run's gap and oracle-drift classification against the two allowlists.
 ///
 /// This is the top-level `ratchet` key of a [`RunReport`] produced with an allowlist; it is
 /// omitted entirely from a run without one, so that report is byte-for-byte unchanged.
+///
+/// The `drift_*` fields are `None` (and omitted from the JSON) unless a drift allowlist was
+/// given, which keeps the key's serialized shape identical for a run that only ratchets gaps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RatchetReport {
-    /// The allowlist path as given (verbatim), when there was one.
+    /// The gaps allowlist path as given (verbatim), when there was one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist: Option<String>,
-    /// Gaps whose case id is recorded in the allowlist.
+    /// Gaps whose case id is recorded in the gaps allowlist.
     pub allowed: usize,
     /// Gaps whose case id is *not* recorded — the ratchet must be updated.
     pub unauthorized: usize,
-    /// Allowlist entries whose case did not reproduce as a gap (a closed gap, a renamed id
+    /// Gaps allowlist entries whose case did not reproduce as a gap (a closed gap, a renamed id
     /// or a typo) — the ratchet must be tightened.
     pub stale: usize,
+    /// The drift allowlist path as given (verbatim), when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_allowlist: Option<String>,
+    /// Oracle drifts whose case id is recorded in the drift allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_allowed: Option<usize>,
+    /// Oracle drifts whose case id is *not* recorded — the drift ratchet must be widened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_unauthorized: Option<usize>,
+    /// Drift allowlist entries whose case did not reproduce as a drift — the drift ratchet must
+    /// be tightened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_stale: Option<usize>,
 }
 
 impl RatchetReport {
-    /// Classify the case reports of a run against `allowlist`.
-    pub fn classify(cases: &[CaseReport], allowlist: &Allowlist) -> RatchetReport {
+    /// Classify the case reports of a run against the gaps allowlist and, when given, the
+    /// (separate) drift allowlist.
+    ///
+    /// A `Mismatch` lands in neither classification; a case is never counted under both.
+    pub fn classify(
+        cases: &[CaseReport],
+        allowlist: &Allowlist,
+        drift_allowlist: Option<&Allowlist>,
+    ) -> RatchetReport {
         let mut allowed = 0;
         let mut unauthorized = 0;
         let mut gap_ids: BTreeSet<&str> = BTreeSet::new();
@@ -99,19 +141,59 @@ impl RatchetReport {
             .iter()
             .filter(|entry| !gap_ids.contains(entry.case_id.as_str()))
             .count();
+        let (drift_allowlist_path, drift_allowed, drift_unauthorized, drift_stale) =
+            match drift_allowlist {
+                Some(drift_list) => {
+                    let mut drift_allowed = 0;
+                    let mut drift_unauthorized = 0;
+                    let mut drift_ids: BTreeSet<&str> = BTreeSet::new();
+                    for case in cases {
+                        if !is_drift(case.verdict) {
+                            continue;
+                        }
+                        drift_ids.insert(case.case_id.as_str());
+                        if drift_list.contains(&case.case_id) {
+                            drift_allowed += 1;
+                        } else {
+                            drift_unauthorized += 1;
+                        }
+                    }
+                    let drift_stale = drift_list
+                        .entries()
+                        .iter()
+                        .filter(|entry| !drift_ids.contains(entry.case_id.as_str()))
+                        .count();
+                    (
+                        drift_list.path().map(|path| path.display().to_string()),
+                        Some(drift_allowed),
+                        Some(drift_unauthorized),
+                        Some(drift_stale),
+                    )
+                }
+                None => (None, None, None, None),
+            };
         RatchetReport {
             allowlist: allowlist.path().map(|path| path.display().to_string()),
             allowed,
             unauthorized,
             stale,
+            drift_allowlist: drift_allowlist_path,
+            drift_allowed,
+            drift_unauthorized,
+            drift_stale,
         }
     }
 }
 
-/// Build the run report of a suite run, carrying the ratchet classification of `allowlist`.
-pub fn report_from_suite(suite: &SuiteOutcome, allowlist: &Allowlist) -> RunReport {
+/// Build the run report of a suite run, carrying the ratchet classification of `allowlist`
+/// (the gaps) and, when given, `drift_allowlist` (the host-oracle drift).
+pub fn report_from_suite(
+    suite: &SuiteOutcome,
+    allowlist: &Allowlist,
+    drift_allowlist: Option<&Allowlist>,
+) -> RunReport {
     let cases: Vec<CaseReport> = suite.cases.iter().map(CaseReport::from_outcome).collect();
-    let ratchet = RatchetReport::classify(&cases, allowlist);
+    let ratchet = RatchetReport::classify(&cases, allowlist, drift_allowlist);
     RunReport::new_with_ratchet(
         "suite",
         &suite.context.oracle,
@@ -126,22 +208,31 @@ pub fn report_from_suite(suite: &SuiteOutcome, allowlist: &Allowlist) -> RunRepo
 /// * `1` on any `mismatch` (always a hard failure — see [`has_mismatch`], which reads the
 ///   case verdicts so a mismatch can never be hidden by the summary *or* tolerated by an
 ///   allowlist);
-/// * with a ratchet: `1` when an unauthorized gap appeared or an entry went stale, else `0`
-///   (an allowlisted gap set is tolerated);
-/// * without a ratchet (today's behaviour): `1` under `strict` when any `unsupported`/
-///   `skipped` case remains, else `0`.
+/// * with a ratchet: `1` when a gaps entry is unauthorized or stale, **or** when the drift is not
+///   tolerated — an unauthorized or stale drift entry, or a run that carries oracle drift but no
+///   drift allowlist at all (an unrecorded drift must never pass). Otherwise `0`;
+/// * without a ratchet: `1` under `strict` when any `unsupported`/`skipped`/`oracle_drift` case
+///   remains, else `0`.
 pub fn suite_exit_code(report: &RunReport, strict: bool) -> i32 {
     if has_mismatch(report) {
         return 1;
     }
     if let Some(ratchet) = &report.ratchet {
-        return if ratchet.unauthorized > 0 || ratchet.stale > 0 {
+        let gaps_not_clean = ratchet.unauthorized > 0 || ratchet.stale > 0;
+        let drift_not_tolerated = ratchet.drift_unauthorized.unwrap_or(0) > 0
+            || ratchet.drift_stale.unwrap_or(0) > 0
+            || (ratchet.drift_allowlist.is_none() && report.summary.oracle_drift > 0);
+        return if gaps_not_clean || drift_not_tolerated {
             1
         } else {
             0
         };
     }
-    if strict && (report.summary.unsupported > 0 || report.summary.skipped > 0) {
+    if strict
+        && (report.summary.unsupported > 0
+            || report.summary.skipped > 0
+            || report.summary.oracle_drift > 0)
+    {
         1
     } else {
         0
@@ -156,9 +247,17 @@ fn cell(text: &str) -> String {
 /// Render the generated `GAPS.md` document of a run.
 ///
 /// One table lists every current gap (in `report.cases` order), classified `allowed` or
-/// `unauthorized`; stale allowlist entries follow with status `stale`.
-pub fn gaps_markdown(report: &RunReport, allowlist: &Allowlist) -> String {
-    let ratchet = RatchetReport::classify(&report.cases, allowlist);
+/// `unauthorized`; stale allowlist entries follow with status `stale`. The `Run:` line carries
+/// the `oracle_drift` count. Only when a `drift_allowlist` is given does a second,
+/// `## Oracle drift` section follow: a short note that an oracle drift is a host-oracle release
+/// difference (our side reproduced the golden, the oracle did not — never a divergence) and a
+/// table of the drift cases plus stale drift entries.
+pub fn gaps_markdown(
+    report: &RunReport,
+    allowlist: &Allowlist,
+    drift_allowlist: Option<&Allowlist>,
+) -> String {
+    let ratchet = RatchetReport::classify(&report.cases, allowlist, drift_allowlist);
     let summary = &report.summary;
     let mut out = String::new();
     out.push_str("# Known capability gaps\n\n");
@@ -168,8 +267,13 @@ pub fn gaps_markdown(report: &RunReport, allowlist: &Allowlist) -> String {
     );
     let _ = writeln!(
         out,
-        "Run: total={} agree={} mismatch={} unsupported={} skipped={}\n",
-        summary.total, summary.agree, summary.mismatch, summary.unsupported, summary.skipped
+        "Run: total={} agree={} mismatch={} unsupported={} skipped={} oracle_drift={}\n",
+        summary.total,
+        summary.agree,
+        summary.mismatch,
+        summary.unsupported,
+        summary.skipped,
+        summary.oracle_drift
     );
     let _ = writeln!(
         out,
@@ -220,6 +324,78 @@ pub fn gaps_markdown(report: &RunReport, allowlist: &Allowlist) -> String {
             cell(&entry.reason)
         );
     }
+    if let Some(drift_list) = drift_allowlist {
+        out.push_str(&drift_section(report, drift_list, &ratchet));
+    }
+    out
+}
+
+/// The `## Oracle drift` section: what the class means, then the drift table.
+///
+/// A drift row's `Oracle version note` is the oracle's own observed stdout on that case (the
+/// value the golden disagrees with), so a reader can see the host release difference directly. A
+/// stale drift entry has no case, so its note is `—` and its reason comes from the allowlist.
+fn drift_section(report: &RunReport, drift_list: &Allowlist, ratchet: &RatchetReport) -> String {
+    let mut out = String::new();
+    out.push_str("\n## Oracle drift\n\n");
+    out.push_str(
+        "An `oracle_drift` case is one where OUR runtime reproduced the committed golden and the\n\
+         ORACLE did not, with the two sides' observables differing: the golden depends on the\n\
+         host oracle's `erts` release (the tree pins a different one), so it is a host-version\n\
+         difference and never a divergence of our runtime. It is never a `mismatch` and never a\n\
+         pass.\n\n",
+    );
+    let _ = writeln!(
+        out,
+        "Drift ratchet: {} entries={} allowed={} unauthorized={} stale={}\n",
+        ratchet.drift_allowlist.as_deref().unwrap_or("(none)"),
+        drift_list.len(),
+        ratchet.drift_allowed.unwrap_or(0),
+        ratchet.drift_unauthorized.unwrap_or(0),
+        ratchet.drift_stale.unwrap_or(0)
+    );
+    out.push_str("| Case ID | Oracle version note | Status | Reason |\n");
+    out.push_str("|---|---|---|---|\n");
+    for case in &report.cases {
+        if !is_drift(case.verdict) {
+            continue;
+        }
+        let entry = drift_list.get(&case.case_id);
+        let (status, reason) = match entry {
+            Some(entry) => ("allowed", entry.reason.as_str()),
+            None => ("unauthorized", "—"),
+        };
+        let note = match (&case.oracle.stdout, &case.oracle.reason) {
+            (Some(stdout), _) => stdout.trim_end().to_string(),
+            (None, Some(reason)) => format!("oracle unavailable: {reason}"),
+            (None, None) => "—".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            cell(&case.case_id),
+            cell(&note),
+            status,
+            cell(reason)
+        );
+    }
+    let drift_ids: BTreeSet<&str> = report
+        .cases
+        .iter()
+        .filter(|case| is_drift(case.verdict))
+        .map(|case| case.case_id.as_str())
+        .collect();
+    for entry in drift_list.entries() {
+        if drift_ids.contains(entry.case_id.as_str()) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "| {} | — | stale | {} |",
+            cell(&entry.case_id),
+            cell(&entry.reason)
+        );
+    }
     out
 }
 
@@ -230,14 +406,20 @@ pub fn gaps_markdown(report: &RunReport, allowlist: &Allowlist) -> String {
 /// ends with the ledger. Its absence leaves the generated output byte-for-byte unchanged.
 pub const DIVERGENCES_FILE: &str = "divergences.md";
 
-/// Write the `--gaps` document: the generated gap table (see [`gaps_markdown`]) plus, when a
-/// divergences ledger sits beside `path`, that ledger appended verbatim after a blank line.
+/// Write the `--gaps` document: the generated gap table (see [`gaps_markdown`], plus the
+/// `## Oracle drift` section when a `drift_allowlist` is given) and, when a divergences ledger
+/// sits beside `path`, that ledger appended verbatim after a blank line.
 ///
 /// The file read is deliberately confined here (never in the pure [`gaps_markdown`] renderer),
-/// so the renderer stays a pure function of the report and the allowlist. Only a *missing*
+/// so the renderer stays a pure function of the report and the allowlists. Only a *missing*
 /// ledger is tolerated (the section is then omitted); any other IO error is loud.
-pub fn write_gaps(path: &Path, report: &RunReport, allowlist: &Allowlist) -> Result<()> {
-    let mut text = gaps_markdown(report, allowlist);
+pub fn write_gaps(
+    path: &Path,
+    report: &RunReport,
+    allowlist: &Allowlist,
+    drift_allowlist: Option<&Allowlist>,
+) -> Result<()> {
+    let mut text = gaps_markdown(report, allowlist, drift_allowlist);
     if let Some(ledger) = read_divergences(path)? {
         text.push('\n');
         text.push_str(&ledger);
@@ -359,6 +541,10 @@ mod tests {
                 matched: true,
                 diffs: Vec::new(),
             },
+            rust_golden: crate::compare::GoldenCheck {
+                matched: true,
+                diffs: Vec::new(),
+            },
             golden_asserted: true,
             verdict,
             diffs: Vec::new(),
@@ -377,7 +563,7 @@ mod tests {
         ];
         // `a/gap` is allowed; `a/skipped` is NOT; `stale/case` is not reproduced at all.
         let list = allowlist("a/gap  crate_a  allowed reason\nstale/case  crate_b  a closed gap\n");
-        let ratchet = RatchetReport::classify(&cases, &list);
+        let ratchet = RatchetReport::classify(&cases, &list, None);
         assert_eq!(ratchet.allowed, 1, "{ratchet:?}");
         assert_eq!(ratchet.unauthorized, 2, "{ratchet:?}");
         assert_eq!(ratchet.stale, 1, "{ratchet:?}");
@@ -388,7 +574,7 @@ mod tests {
     fn a_mismatch_is_never_a_gap() {
         let cases = vec![case("a/bad", Verdict::Mismatch, None)];
         let list = allowlist("a/bad  crate  tolerated\n");
-        let ratchet = RatchetReport::classify(&cases, &list);
+        let ratchet = RatchetReport::classify(&cases, &list, None);
         assert_eq!(ratchet.allowed, 0, "{ratchet:?}");
         assert_eq!(ratchet.unauthorized, 0, "{ratchet:?}");
         // The entry did not reproduce as a gap → stale (the allowlist must be tightened).
@@ -405,7 +591,7 @@ mod tests {
             case("a/bad", Verdict::Mismatch, Some("oracle said x, rust said y")),
         ];
         let list = allowlist("a/bad  crate  this entry must never tolerate a mismatch\n");
-        let ratchet = RatchetReport::classify(&cases, &list);
+        let ratchet = RatchetReport::classify(&cases, &list, None);
         assert_eq!(ratchet.allowed, 0, "a mismatch is never an allowed gap: {ratchet:?}");
         assert_eq!(ratchet.unauthorized, 0, "a mismatch is no gap at all: {ratchet:?}");
         assert_eq!(ratchet.stale, 1, "the recorded id did not reproduce as a gap: {ratchet:?}");
@@ -419,11 +605,13 @@ mod tests {
     }
 
     /// A per-verdict matrix proving only `unsupported`/`skipped` reach the gap counters, so a
-    /// `mismatch` can never be recorded as an allowed (or unauthorized) gap.
+    /// `mismatch` — and an `oracle_drift`, which has its own allowlist — can never be recorded
+    /// as an allowed (or unauthorized) gap.
     #[test]
     fn a_mismatch_never_contributes_to_the_gap_counters() {
         for (verdict, is_gap) in [
             (Verdict::Agree, false),
+            (Verdict::OracleDrift, false),
             (Verdict::Mismatch, false),
             (Verdict::Unsupported, true),
             (Verdict::Skipped, true),
@@ -431,8 +619,8 @@ mod tests {
             let cases = vec![case("a/x", verdict, Some("a reason"))];
             let recorded = allowlist("a/x  crate  recorded\n");
             let unrecorded = allowlist("# nothing recorded\n");
-            let allowed = RatchetReport::classify(&cases, &recorded);
-            let unauthorized = RatchetReport::classify(&cases, &unrecorded);
+            let allowed = RatchetReport::classify(&cases, &recorded, None);
+            let unauthorized = RatchetReport::classify(&cases, &unrecorded, None);
             if is_gap {
                 assert_eq!(
                     (allowed.allowed, allowed.unauthorized, allowed.stale),
@@ -475,6 +663,7 @@ mod tests {
             mismatch: 0,
             unsupported: 0,
             skipped: 0,
+            oracle_drift: 0,
         };
         assert_eq!(suite_exit_code(&run, true), 1);
         assert_eq!(suite_exit_code(&run, false), 1);
@@ -483,9 +672,145 @@ mod tests {
     #[test]
     fn classify_records_the_allowlist_path() {
         let list = Allowlist::parse("", Some(PathBuf::from("known-gaps.txt"))).expect("parses");
-        let ratchet = RatchetReport::classify(&[], &list);
+        let ratchet = RatchetReport::classify(&[], &list, None);
         assert_eq!(ratchet.allowlist.as_deref(), Some("known-gaps.txt"));
         assert_eq!((ratchet.allowed, ratchet.unauthorized, ratchet.stale), (0, 0, 0));
+        // No drift allowlist ⇒ no drift classification at all (and no JSON keys either).
+        assert_eq!(ratchet.drift_allowlist, None);
+        assert_eq!(ratchet.drift_allowed, None);
+        assert_eq!(ratchet.drift_unauthorized, None);
+        assert_eq!(ratchet.drift_stale, None);
+        let json = serde_json::to_value(&ratchet).expect("serialize");
+        assert!(
+            json.get("drift_allowlist").is_none(),
+            "the drift fields are additive-and-omitted: {json}"
+        );
+    }
+
+    /// A drift case is classified against the **drift** allowlist only, and a recorded drift is
+    /// tolerated by the gate — the whole point of the third verdict class.
+    #[test]
+    fn a_recorded_oracle_drift_is_tolerated_and_never_a_gap_or_a_mismatch() {
+        let cases = vec![
+            case("a/agree", Verdict::Agree, None),
+            case("sys/version", Verdict::OracleDrift, None),
+        ];
+        let gaps = allowlist("other/gap  crate  a recorded gap\n");
+        let drift = Allowlist::parse(
+            "sys/version  differential  a host-version golden\n",
+            Some(PathBuf::from("known-drift.txt")),
+        )
+        .expect("parses");
+        let ratchet = RatchetReport::classify(&cases, &gaps, Some(&drift));
+        // Never a gap, never a mismatch.
+        assert_eq!((ratchet.allowed, ratchet.unauthorized), (0, 0), "{ratchet:?}");
+        assert_eq!(ratchet.drift_allowed, Some(1), "{ratchet:?}");
+        assert_eq!(ratchet.drift_unauthorized, Some(0), "{ratchet:?}");
+        // The gaps allowlist's entry reproduces neither ⇒ it is stale (a ratchet update).
+        assert_eq!(ratchet.stale, 1, "{ratchet:?}");
+        assert_eq!(ratchet.drift_stale, Some(0), "{ratchet:?}");
+        assert_eq!(ratchet.drift_allowlist.as_deref(), Some("known-drift.txt"));
+
+        // Without the stale gap entry the ratchet is clean ⇒ exit 0.
+        let clean_gaps = allowlist("# nothing recorded\n");
+        let ratchet = RatchetReport::classify(&cases, &clean_gaps, Some(&drift));
+        let run = report(cases, Some(ratchet));
+        assert_eq!(run.summary.oracle_drift, 1);
+        assert_eq!(run.summary.mismatch, 0, "a drift is never counted as a mismatch");
+        assert_eq!(suite_exit_code(&run, true), 0, "a recorded drift is tolerated");
+
+        // An UNRECORDED drift fails the gate: it must be recorded deliberately.
+        let empty_drift = allowlist("# nothing recorded\n");
+        let ratchet = RatchetReport::classify(
+            &[case("sys/version", Verdict::OracleDrift, None)],
+            &clean_gaps,
+            Some(&empty_drift),
+        );
+        assert_eq!(ratchet.drift_unauthorized, Some(1), "{ratchet:?}");
+        let run = report(
+            vec![case("sys/version", Verdict::OracleDrift, None)],
+            Some(ratchet),
+        );
+        assert_eq!(suite_exit_code(&run, true), 1);
+        assert_eq!(suite_exit_code(&run, false), 1);
+    }
+
+    /// A drift that no longer reproduces makes its recorded entry stale: the ratchet must be
+    /// tightened, so the gate fails.
+    #[test]
+    fn a_recorded_drift_that_no_longer_occurs_is_stale_and_fails_the_gate() {
+        let gaps = allowlist("# nothing recorded\n");
+        let drift = allowlist("sys/version  differential  a host-version golden\n");
+        let ratchet = RatchetReport::classify(
+            &[case("sys/version", Verdict::Agree, None)],
+            &gaps,
+            Some(&drift),
+        );
+        assert_eq!(ratchet.drift_allowed, Some(0), "{ratchet:?}");
+        assert_eq!(ratchet.drift_stale, Some(1), "{ratchet:?}");
+        let run = report(vec![case("sys/version", Verdict::Agree, None)], Some(ratchet));
+        assert_eq!(suite_exit_code(&run, true), 1);
+        assert_eq!(suite_exit_code(&run, false), 1);
+    }
+
+    /// A drift carried by a report whose ratchet has **no** drift allowlist must never pass: an
+    /// unrecorded drift is a ratchet update, not agreement.
+    #[test]
+    fn oracle_drift_without_a_drift_allowlist_never_passes() {
+        let cases = vec![case("sys/version", Verdict::OracleDrift, None)];
+        let gaps = allowlist("# nothing recorded\n");
+        // (1) A ratchet without a drift allowlist, with a drift in the cases.
+        let ratchet = RatchetReport::classify(&cases, &gaps, None);
+        let run = report(cases.clone(), Some(ratchet));
+        assert_eq!(run.summary.oracle_drift, 1);
+        assert_eq!(suite_exit_code(&run, true), 1);
+        assert_eq!(suite_exit_code(&run, false), 1);
+
+        // (2) No ratchet at all: `--strict` escalates the drift, a non-strict run does not.
+        let run = report(cases, None);
+        assert_eq!(suite_exit_code(&run, true), 1);
+        assert_eq!(suite_exit_code(&run, false), 0);
+    }
+
+    /// The drift table is only rendered when a drift allowlist is given, and the gap table stays
+    /// byte-identical either way.
+    #[test]
+    fn the_oracle_drift_section_is_rendered_only_with_a_drift_allowlist() {
+        let cases = vec![
+            case("a/agree", Verdict::Agree, None),
+            case("sys/version", Verdict::OracleDrift, None),
+        ];
+        let gaps = allowlist("# nothing recorded\n");
+        let drift = allowlist("sys/version  differential  the host answers 17.1.1\nstale/drift  differential  a closed drift\n");
+        let ratchet = RatchetReport::classify(&cases, &gaps, Some(&drift));
+        let run = report(cases, Some(ratchet));
+
+        let without = gaps_markdown(&run, &gaps, None);
+        assert!(!without.contains("## Oracle drift"), "{without}");
+        assert!(
+            without.contains("Run: total=2 agree=1 mismatch=0 unsupported=0 skipped=0 oracle_drift=1"),
+            "{without}"
+        );
+
+        let with = gaps_markdown(&run, &gaps, Some(&drift));
+        assert!(with.starts_with(&without), "the gap table is unchanged: {with}");
+        assert!(with.contains("## Oracle drift"), "{with}");
+        assert!(with.contains("| Case ID | Oracle version note | Status | Reason |"), "{with}");
+        assert!(
+            with.contains(
+                "| sys/version | ok | allowed | the host answers 17.1.1 |"
+            ),
+            "{with}"
+        );
+        assert!(
+            with.contains("| stale/drift | — | stale | a closed drift |"),
+            "{with}"
+        );
+        assert!(
+            with.contains("Drift ratchet: (none) entries=2 allowed=1 unauthorized=0 stale=1"),
+            "{with}"
+        );
+        assert!(!with.contains("| a/agree |"), "only drift rows are listed: {with}");
     }
 
     #[test]
@@ -501,6 +826,10 @@ mod tests {
                 allowed: 1,
                 unauthorized: 0,
                 stale: 0,
+                drift_allowlist: None,
+                drift_allowed: None,
+                drift_unauthorized: None,
+                drift_stale: None,
             }),
         );
         assert_eq!(suite_exit_code(&with_mismatch, true), 1);
@@ -513,6 +842,10 @@ mod tests {
                 allowed: 0,
                 unauthorized: 1,
                 stale: 0,
+                drift_allowlist: None,
+                drift_allowed: None,
+                drift_unauthorized: None,
+                drift_stale: None,
             }),
         );
         assert_eq!(suite_exit_code(&unauthorized, true), 1);
@@ -524,6 +857,10 @@ mod tests {
                 allowed: 0,
                 unauthorized: 0,
                 stale: 1,
+                drift_allowlist: None,
+                drift_allowed: None,
+                drift_unauthorized: None,
+                drift_stale: None,
             }),
         );
         assert_eq!(suite_exit_code(&stale, true), 1);
@@ -538,6 +875,10 @@ mod tests {
                 allowed: 1,
                 unauthorized: 0,
                 stale: 0,
+                drift_allowlist: None,
+                drift_allowed: None,
+                drift_unauthorized: None,
+                drift_stale: None,
             }),
         );
         assert_eq!(suite_exit_code(&clean, true), 0);
@@ -573,8 +914,8 @@ mod tests {
             case("a/unauth", Verdict::Skipped, Some("no erlc")),
         ];
         let list = allowlist("a/gap|piped  crate_a  an allowed gap\nstale/case  crate_b  a closed gap\n");
-        let run = report(cases, Some(RatchetReport::classify(&[], &list)));
-        let markdown = gaps_markdown(&run, &list);
+        let run = report(cases, Some(RatchetReport::classify(&[], &list, None)));
+        let markdown = gaps_markdown(&run, &list, None);
 
         assert!(markdown.starts_with("# Known capability gaps"), "{markdown}");
         assert!(markdown.contains("| Case ID | Verdict | Owning crate | Status | Reason |"));
@@ -606,9 +947,11 @@ mod tests {
             None,
         );
         let list = allowlist("a/gap  some_crate  why\n");
-        let markdown = gaps_markdown(&run, &list);
+        let markdown = gaps_markdown(&run, &list, None);
         assert!(
-            markdown.contains("Run: total=1 agree=0 mismatch=0 unsupported=1 skipped=0"),
+            markdown.contains(
+                "Run: total=1 agree=0 mismatch=0 unsupported=1 skipped=0 oracle_drift=0"
+            ),
             "{markdown}"
         );
         assert!(
@@ -631,11 +974,11 @@ mod tests {
         std::fs::write(scratch.dir.join("divergences.md"), ledger).expect("write the ledger");
 
         let gaps_path = scratch.dir.join("GAPS.md");
-        write_gaps(&gaps_path, &run, &list).expect("writes the gaps report");
+        write_gaps(&gaps_path, &run, &list, None).expect("writes the gaps report");
         let written = std::fs::read_to_string(&gaps_path).expect("the report was written");
 
         // The pure renderer's table, then a blank line, then the ledger verbatim.
-        assert_eq!(written, format!("{}\n{}", gaps_markdown(&run, &list), ledger));
+        assert_eq!(written, format!("{}\n{}", gaps_markdown(&run, &list, None), ledger));
         assert!(written.ends_with(ledger), "the document ends with the ledger: {written}");
     }
 
@@ -650,11 +993,11 @@ mod tests {
         let list = allowlist("a/gap  crate_a  why\n");
 
         let gaps_path = scratch.dir.join("GAPS.md");
-        write_gaps(&gaps_path, &run, &list).expect("writes the gaps report");
+        write_gaps(&gaps_path, &run, &list, None).expect("writes the gaps report");
         let written = std::fs::read_to_string(&gaps_path).expect("the report was written");
 
         // No ledger beside the report → byte-for-byte the pure renderer's output.
-        assert_eq!(written, gaps_markdown(&run, &list));
+        assert_eq!(written, gaps_markdown(&run, &list, None));
     }
     #[test]
     fn report_from_suite_carries_the_ratchet_and_the_suite_exit_code_still_gates() {
@@ -674,7 +1017,7 @@ mod tests {
             exit_code: 1,
         };
         let list = allowlist("a/gap  c  r\n");
-        let report = report_from_suite(&suite, &list);
+        let report = report_from_suite(&suite, &list, None);
         let ratchet = report.ratchet.clone().expect("the report carries a ratchet");
         assert_eq!(ratchet.allowed, 1);
         assert_eq!(ratchet.unauthorized, 1);
@@ -683,7 +1026,7 @@ mod tests {
         assert_eq!(suite_exit_code(&report, true), 1);
         // Allowlisting the second gap makes the ratchet clean → exit 0.
         let list = allowlist("a/gap  c  r\na/agree_ish  c  r\n");
-        let report = report_from_suite(&suite, &list);
+        let report = report_from_suite(&suite, &list, None);
         assert_eq!(suite_exit_code(&report, true), 0);
     }
 
@@ -706,7 +1049,7 @@ mod tests {
         };
         // The allowlist records BOTH the real gap and the mismatching case.
         let list = allowlist("a/gap  c  r\na/bad  c  this must never tolerate a mismatch\n");
-        let report = report_from_suite(&suite, &list);
+        let report = report_from_suite(&suite, &list, None);
         let ratchet = report.ratchet.clone().expect("the report carries a ratchet");
         assert_eq!(ratchet.allowed, 1, "only the real gap is allowed: {ratchet:?}");
         assert_eq!(ratchet.unauthorized, 0, "{ratchet:?}");
@@ -733,7 +1076,7 @@ mod tests {
             )],
             None,
         );
-        let merged = RunReport::merge(vec![agree, gap.clone(), gap], None).expect("merge");
+        let merged = RunReport::merge(vec![agree, gap.clone(), gap], None, None).expect("merge");
 
         assert_eq!(merged.mode, "merge");
         assert_eq!(merged.schema, crate::report::SCHEMA);
@@ -764,6 +1107,7 @@ mod tests {
                 ),
             ],
             Some(&list),
+            None,
         )
         .expect("merge");
         let ratchet = merged.ratchet.clone().expect("the allowlist attached a ratchet");
@@ -773,9 +1117,11 @@ mod tests {
         );
         assert_eq!(suite_exit_code(&merged, true), 0, "a recorded gap is tolerated");
 
-        let markdown = gaps_markdown(&merged, &list);
+        let markdown = gaps_markdown(&merged, &list, None);
         assert!(
-            markdown.contains("Run: total=2 agree=1 mismatch=0 unsupported=1 skipped=0"),
+            markdown.contains(
+                "Run: total=2 agree=1 mismatch=0 unsupported=1 skipped=0 oracle_drift=0"
+            ),
             "{markdown}"
         );
         assert!(
@@ -794,12 +1140,13 @@ mod tests {
                 None,
             )],
             Some(&empty),
+            None,
         )
         .expect("merge");
         assert_eq!(merged.ratchet.as_ref().expect("ratchet").unauthorized, 1);
         assert_eq!(suite_exit_code(&merged, true), 1);
 
         // An empty fold is a loud usage error, never an empty pass.
-        assert!(RunReport::merge(Vec::new(), None).is_err());
+        assert!(RunReport::merge(Vec::new(), None, None).is_err());
     }
 }

@@ -26,8 +26,8 @@
 //! differential <SUBCOMMAND> [OPTIONS]
 //!   run     <case-id> [--json] [--out <dir>] [--out-file <path>]
 //!   compare <expr> [--pa <dir>]… [--json] [--out <dir>]
-//!   suite   [--strict] [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>]
-//!   merge   --from <dir> [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>] [--out-file <path>]
+//!   suite   [--strict] [--allowlist <file>] [--drift-allowlist <file>] [--gaps <path>] [--json] [--out <dir>]
+//!   merge   --from <dir> [--allowlist <file>] [--drift-allowlist <file>] [--gaps <path>] [--json] [--out <dir>] [--out-file <path>]
 //!   list    [--by-contract] [--json] [--out <dir>]
 //!   help    [topic]
 //! ```
@@ -72,6 +72,10 @@ pub enum Command {
         /// A known-gaps allowlist: tolerates the gaps it records, fails on an unauthorized
         /// gap or a stale entry. Requires `strict`.
         allowlist: Option<PathBuf>,
+        /// A known-drift allowlist: tolerates the host-oracle drift it records (a case our side
+        /// reproduces and the oracle does not because the host `erts` release differs from the
+        /// tree's pinned one), fails on an unrecorded or stale drift entry. Requires `strict`.
+        drift_allowlist: Option<PathBuf>,
         /// Also write the generated `GAPS.md` document to this path.
         gaps: Option<PathBuf>,
         /// Print the JSON report to stdout.
@@ -95,6 +99,8 @@ pub enum Command {
         from: PathBuf,
         /// A known-gaps allowlist: classify the merged cases' gaps against it (the ratchet).
         allowlist: Option<PathBuf>,
+        /// A known-drift allowlist: classify the merged cases' host-oracle drift against it.
+        drift_allowlist: Option<PathBuf>,
         /// Also write the generated `GAPS.md` document to this path.
         gaps: Option<PathBuf>,
         /// Print the JSON report to stdout.
@@ -168,12 +174,13 @@ pub fn usage(topic: Option<&str>) -> String {
              -h, --help    show this help\n"
         ),
         Some("suite") => format!(
-            "differential suite [--strict] [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>]\n\n\
+            "differential suite [--strict] [--allowlist <file>] [--drift-allowlist <file>] [--gaps <path>] [--json] [--out <dir>]\n\n\
              Run the whole built-in conformance corpus and compare every case.\n\n\
              OPTIONS:\n  \
-             --strict            treat `unsupported`/`skipped` cases as failures (exit 1)\n  \
-             --allowlist <file>  ratchet: tolerate the known capability gaps recorded in <file>\n                      (requires --strict); fail on an unauthorized gap or a stale entry\n  \
-             --gaps <path>       also write the generated GAPS.md document to <path>\n  \
+             --strict              treat `unsupported`/`skipped`/`oracle_drift` cases as failures (exit 1)\n  \
+             --allowlist <file>    ratchet: tolerate the known capability gaps recorded in <file>\n                        (requires --strict); fail on an unauthorized gap or a stale entry\n  \
+             --drift-allowlist <file>\n                        ratchet: tolerate the known host-oracle drift recorded in <file>\n                        (requires --strict); fail on an unrecorded or stale drift entry\n  \
+             --gaps <path>         also write the generated GAPS.md document to <path>\n  \
              --json              print the JSON report to stdout\n  \
              --out <dir>         also write <dir>/report.json\n  \
              -h, --help          show this help\n"
@@ -189,7 +196,7 @@ pub fn usage(topic: Option<&str>) -> String {
              -h, --help    show this help\n"
         ),
         Some("merge") => format!(
-            "differential merge --from <dir> [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>] [--out-file <path>]\n\n\
+            "differential merge --from <dir> [--allowlist <file>] [--drift-allowlist <file>] [--gaps <path>] [--json] [--out <dir>] [--out-file <path>]\n\n\
              Fold the per-case reports written by `run <case-id> --out-file <path>` into one\n\
              suite-shaped report, without re-running any case. The cases are deduped by\n\
              case id (first occurrence wins) and sorted by it, so the merged document is\n\
@@ -200,6 +207,7 @@ pub fn usage(topic: Option<&str>) -> String {
              OPTIONS:\n  \
              --from <dir>      the directory holding the per-case *.json reports (required)\n  \
              --allowlist <file> classify the merged gaps against this allowlist (the ratchet)\n  \
+             --drift-allowlist <file>\n                        classify the merged host-oracle drift against this allowlist\n  \
              --gaps <path>     also write the generated GAPS.md document to <path>\n  \
              --json            print the JSON report to stdout\n  \
              --out <dir>       also write <dir>/report.json\n  \
@@ -236,6 +244,7 @@ OPTIONS (per subcommand):
   --out-file <path> (run, merge) write the report to exactly <path> instead of <dir>/report.json
   --strict        (suite) treat unsupported/skipped cases as failures
   --allowlist <file> (suite, with --strict; merge) tolerate the recorded known capability gaps
+  --drift-allowlist <file> (suite, with --strict; merge) tolerate the recorded host-oracle drift
   --gaps <path>   (suite, merge) also write the generated GAPS.md document to <path>
   --from <dir>    (merge) the directory of per-case `run --out-file` reports to fold
   --by-contract   (list) group the listing by compatibility contract
@@ -249,8 +258,9 @@ ENVIRONMENT:
   ERLC            module compiler for the module-run cases; defaults to `erlc`
                   resolved on $PATH (a missing `erlc` skips those cases)
 EXIT CODES:
-  0  every executed case agreed (unsupported/skipped are reported, not fatal)
-  1  at least one mismatch (including oracle-vs-its-own-golden corpus drift)
+  0  every executed case agreed (ratcheted gaps and host-oracle drift are reported, not fatal)
+  1  at least one mismatch, or --strict with a remaining gap/drift, or a ratchet that must be
+     updated (an unauthorized or stale entry)
   2  usage, environment or IO error
 ";
 
@@ -326,6 +336,40 @@ fn consume_out_file(
             )));
         }
         *out_file = Some(PathBuf::from(value));
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Handle the `--drift-allowlist <file>` option (`suite` and `merge`).
+///
+/// Returns `true` when the option was consumed.
+fn consume_drift_allowlist(
+    arg: &str,
+    args: &[String],
+    index: &mut usize,
+    drift_allowlist: &mut Option<PathBuf>,
+    subcommand: &str,
+) -> Result<bool> {
+    if arg == "--drift-allowlist" {
+        *index += 1;
+        let value = args.get(*index).ok_or_else(|| {
+            Error::usage(format!(
+                "option '--drift-allowlist' requires a file argument\n\n{}",
+                usage(Some(subcommand))
+            ))
+        })?;
+        *drift_allowlist = Some(PathBuf::from(value));
+        return Ok(true);
+    }
+    if let Some(value) = arg.strip_prefix("--drift-allowlist=") {
+        if value.is_empty() {
+            return Err(Error::usage(format!(
+                "option '--drift-allowlist' requires a file argument\n\n{}",
+                usage(Some(subcommand))
+            )));
+        }
+        *drift_allowlist = Some(PathBuf::from(value));
         return Ok(true);
     }
     Ok(false)
@@ -445,6 +489,7 @@ fn parse_compare(args: &[String]) -> Result<Command> {
 fn parse_suite(args: &[String]) -> Result<Command> {
     let (mut json, mut out, mut strict) = (false, None, false);
     let mut allowlist: Option<PathBuf> = None;
+    let mut drift_allowlist: Option<PathBuf> = None;
     let mut gaps: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
@@ -479,6 +524,10 @@ fn parse_suite(args: &[String]) -> Result<Command> {
                 )));
             }
             allowlist = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if consume_drift_allowlist(arg, args, &mut index, &mut drift_allowlist, "suite")? {
             index += 1;
             continue;
         }
@@ -517,9 +566,16 @@ fn parse_suite(args: &[String]) -> Result<Command> {
             usage(Some("suite"))
         )));
     }
+    if drift_allowlist.is_some() && !strict {
+        return Err(Error::usage(format!(
+            "option '--drift-allowlist' requires '--strict'\n\n{}",
+            usage(Some("suite"))
+        )));
+    }
     Ok(Command::Suite {
         strict,
         allowlist,
+        drift_allowlist,
         gaps,
         json,
         out,
@@ -533,6 +589,7 @@ fn parse_merge(args: &[String]) -> Result<Command> {
         Option<PathBuf>,
         Option<PathBuf>,
     ) = (None, None, None);
+    let mut drift_allowlist: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -587,6 +644,10 @@ fn parse_merge(args: &[String]) -> Result<Command> {
             index += 1;
             continue;
         }
+        if consume_drift_allowlist(arg, args, &mut index, &mut drift_allowlist, "merge")? {
+            index += 1;
+            continue;
+        }
         if arg == "--gaps" {
             index += 1;
             let value = args.get(index).ok_or_else(|| {
@@ -629,6 +690,7 @@ fn parse_merge(args: &[String]) -> Result<Command> {
     Ok(Command::Merge {
         from,
         allowlist,
+        drift_allowlist,
         gaps,
         json,
         out,
@@ -837,6 +899,7 @@ mod tests {
             Command::Merge {
                 from: PathBuf::from("reports"),
                 allowlist: None,
+                drift_allowlist: None,
                 gaps: None,
                 json: false,
                 out: None,
@@ -854,6 +917,7 @@ mod tests {
                 "--out",
                 "/tmp/o",
                 "--allowlist=/tmp/known-gaps.txt",
+                "--drift-allowlist=/tmp/known-drift.txt",
                 "--out-file",
                 "/tmp/o/merged.json",
             ]))
@@ -861,6 +925,7 @@ mod tests {
             Command::Merge {
                 from: PathBuf::from("reports"),
                 allowlist: Some(PathBuf::from("/tmp/known-gaps.txt")),
+                drift_allowlist: Some(PathBuf::from("/tmp/known-drift.txt")),
                 gaps: Some(PathBuf::from("GAPS.md")),
                 json: true,
                 out: Some(PathBuf::from("/tmp/o")),
@@ -966,6 +1031,7 @@ mod tests {
             Command::Suite {
                 strict: true,
                 allowlist: None,
+                drift_allowlist: None,
                 gaps: None,
                 json: true,
                 out: None,
@@ -976,6 +1042,7 @@ mod tests {
             Command::Suite {
                 strict: false,
                 allowlist: None,
+                drift_allowlist: None,
                 gaps: None,
                 json: false,
                 out: None,
@@ -999,6 +1066,7 @@ mod tests {
             Command::Suite {
                 strict: true,
                 allowlist: Some(PathBuf::from("known-gaps.txt")),
+                drift_allowlist: None,
                 gaps: Some(PathBuf::from("GAPS.md")),
                 json: false,
                 out: None,
@@ -1010,11 +1078,13 @@ mod tests {
                 "--strict",
                 "--gaps=out/GAPS.md",
                 "--allowlist=known-gaps.txt",
+                "--drift-allowlist=known-drift.txt",
             ]))
             .unwrap(),
             Command::Suite {
                 strict: true,
                 allowlist: Some(PathBuf::from("known-gaps.txt")),
+                drift_allowlist: Some(PathBuf::from("known-drift.txt")),
                 gaps: Some(PathBuf::from("out/GAPS.md")),
                 json: false,
                 out: None,
@@ -1026,6 +1096,7 @@ mod tests {
             Command::Suite {
                 strict: false,
                 allowlist: None,
+                drift_allowlist: None,
                 gaps: Some(PathBuf::from("GAPS.md")),
                 json: false,
                 out: None,
@@ -1137,6 +1208,7 @@ mod tests {
             Command::Suite {
                 strict: true,
                 allowlist: None,
+                drift_allowlist: None,
                 gaps: None,
                 json: false,
                 out: None,

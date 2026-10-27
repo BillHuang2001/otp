@@ -1,0 +1,21 @@
+# Known host-oracle drift — the drift ratchet allowlist for `differential suite --strict`.
+#
+# One entry per line:  <case-id> <owning-crate> <reason…>
+# Blank lines and `#`-comment lines are ignored. The reason is free-form prose.
+#
+# An entry here means: on an oracle release whose erts version differs from the tree's
+# pinned erts-17.1, this golden is host-version-dependent — our runtime reproduces it and
+# the oracle does not, with the two sides' observables differing. That is a property of the
+# installed oracle build, never a divergence of our runtime.
+#
+# It is a ratchet, exactly like `known-gaps.txt`: an unrecorded drift means the ratchet must
+# be widened deliberately, and a recorded drift that no longer occurs means it must be
+# tightened. A drift is NEVER a mismatch and NEVER a pass.
+#
+# Because these entries are scoped to the HOST ORACLE's release, a host whose oracle `erts`
+# version matches the tree's pin reproduces every golden and therefore makes all of them
+# stale. On such a host pass an explicit empty allowlist instead of this file
+# (`gate.sh --drift-allowlist <a file with only comments>`): then no drift may occur at all.
+system_info/version  differential  the golden pins erlang:system_info(version) "17.1" (the tree's erts-17.1); an oracle at erts-17.1.1 answers "17.1.1"
+boot_extra/system_info_version_is_frozen_17_1  differential  the golden pins system_info(version) == "17.1"; an oracle at erts-17.1.1 answers false
+nif_abi/system_info_frozen_fields  differential  the C fixture's selector 79 strcmp's si.erts_version against "17.1"; an oracle at erts-17.1.1 answers 0

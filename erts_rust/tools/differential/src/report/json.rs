@@ -180,7 +180,7 @@ mod tests {
         assert!(rust["reason"].as_str().unwrap().contains("beam_rt"));
         assert!(
             rust.get("matched_golden").is_none(),
-            "the Rust side never checks a golden: {rust}"
+            "our side checks a golden only when one was asserted and it ran: {rust}"
         );
         assert!(rust["stdout"].is_null(), "{rust}");
         assert!(rust["exit_code"].is_null(), "{rust}");

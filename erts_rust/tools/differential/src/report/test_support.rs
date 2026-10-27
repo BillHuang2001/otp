@@ -64,6 +64,10 @@ pub(crate) fn report(verdict: Verdict, rust: SideResult, matched_golden: Option<
             matched: matched_golden.unwrap_or(true),
             diffs: Vec::new(),
         },
+        rust_golden: GoldenCheck {
+            matched: matched_golden.unwrap_or(true),
+            diffs: Vec::new(),
+        },
         golden_asserted: matched_golden.is_some(),
         verdict,
         diffs: vec![FieldDiff::new("stdout", "ok 1", "ok 2")],
@@ -93,6 +97,10 @@ pub(crate) fn case(verdict: Verdict, contracts: Vec<Contract>) -> CaseReport {
             matched: true,
             diffs: Vec::new(),
         },
+        rust_golden: GoldenCheck {
+            matched: true,
+            diffs: Vec::new(),
+        },
         golden_asserted: true,
         verdict,
         diffs: Vec::new(),
@@ -108,5 +116,9 @@ pub(crate) fn ratchet_report() -> RatchetReport {
         allowed: 9,
         unauthorized: 0,
         stale: 0,
+        drift_allowlist: None,
+        drift_allowed: None,
+        drift_unauthorized: None,
+        drift_stale: None,
     }
 }

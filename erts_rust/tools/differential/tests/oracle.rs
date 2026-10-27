@@ -24,6 +24,14 @@
 //! reproduces the corpus goldens, oracle-vs-oracle agrees, and a missing Rust runtime
 //! degrades to `unsupported` instead of a fabricated pass.
 //!
+//! "Reproduces the corpus goldens" is host-adaptive without losing strictness: the goldens are
+//! frozen against the tree's pinned `erts` release, so an installed oracle at a **different**
+//! release legitimately misses a few of them (the three `system_info(version)` cases, whose
+//! golden pins `"17.1"`). A miss is tolerated **only** when the case id is recorded in the
+//! committed `known-drift.txt` (with a reason) — see [`assert_oracle_golden_miss_is_recorded`] —
+//! and the converse is not asserted: on a matching oracle those cases reproduce their golden, and
+//! a stale entry is the gate's ratchet job (`--drift-allowlist`), not this test's.
+//!
 //! Everything here **skips loudly** (`eprintln!("SKIP: …")`, never a silent pass) when
 //! the oracle cannot be resolved, so `cargo test` stays honest on a machine without
 //! Erlang. Nothing here requires a functional `beam_rt`.
@@ -53,6 +61,58 @@ fn oracle_or_skip() -> Option<RuntimeSpec> {
     }
 }
 
+/// Load the committed **host-oracle drift** allowlist (`known-drift.txt`).
+///
+/// The corpus goldens are frozen against the tree's pinned `erts` release. An installed oracle
+/// at a *different* `erts` release therefore legitimately fails a handful of them — the
+/// `system_info(version)` cases, whose golden pins `"17.1"` — while our own runtime still
+/// reproduces them; that is exactly what [`Verdict::OracleDrift`] and the drift ratchet
+/// (`differential suite --strict --drift-allowlist <file>`, `gate.sh`) are for. This is the
+/// **committed** list, so "every case's oracle side reproduces its golden" holds *modulo* it — and
+/// a case that misses its golden without being recorded here is a loud failure, never a silent
+/// pass.
+///
+/// A missing/unparsable file is a panic: it is committed next to this crate, and a test that
+/// cannot tell drift from divergence cannot run honestly.
+fn known_drift() -> differential::allowlist::Allowlist {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("known-drift.txt");
+    differential::allowlist::Allowlist::load(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot load the committed drift allowlist {}: {error}",
+            path.display()
+        )
+    })
+}
+
+/// Assert that an oracle-side golden miss for `case_id` is a **recorded** host-oracle drift.
+///
+/// A case whose oracle side misses its committed golden is honest only when its id is in
+/// `known-drift.txt` with a reason: the golden is then host-version-dependent (our own runtime
+/// still reproduces it, which is what makes the miss drift rather than a divergence). An
+/// unrecorded miss fails loudly — the fix is a deliberate allowlist entry, never a silent pass.
+///
+/// The converse is deliberately **not** asserted: on an oracle whose `erts` version matches the
+/// tree's these cases reproduce their golden, so a recorded entry may legitimately not drift.
+/// Staleness is the gate's ratchet job (`--drift-allowlist`), not this test's.
+fn assert_oracle_golden_miss_is_recorded(
+    case_id: &str,
+    recorded: &differential::allowlist::Allowlist,
+    diffs: &[differential::compare::FieldDiff],
+) {
+    assert!(
+        recorded.contains(case_id),
+        "the oracle drifted from a committed golden for `{case_id}`: {diffs:?}\n\
+         A case whose oracle side misses its golden is only honest as a *host-oracle drift* \
+         (our runtime reproduces the golden, the installed oracle's release does not), so a \
+         deliberate `known-drift.txt` entry — `<case-id> <owning-crate> <reason…>` — is \
+         required. An unrecorded oracle golden miss must never pass."
+    );
+    eprintln!(
+        "NOTE: case {case_id}: the host oracle misses its committed golden — recorded as a drift \
+         in known-drift.txt"
+    );
+}
+
 #[test]
 fn oracle_reproduces_the_ok_42_golden() {
     let Some(oracle) = oracle_or_skip() else {
@@ -75,7 +135,12 @@ fn oracle_reproduces_the_ok_42_golden() {
     );
 
     let golden = check_golden(&observation, &case.golden);
-    assert!(golden.matched, "golden drift: {:?}", golden.diffs);
+    // The canonical `{ok,42}` ETF image is host-independent (contract A.2), so a miss here is a
+    // corpus bug — but it still has to be *recorded* to be tolerated, exactly like every other
+    // oracle-side golden miss (see `assert_oracle_golden_miss_is_recorded`).
+    if !golden.matched {
+        assert_oracle_golden_miss_is_recorded(case.id, &known_drift(), &golden.diffs);
+    }
 
     // Observe the real Rust runtime through an explicit context so the freshly built debug
     // `beam_rt` is used, never the (stale-prone) `release`-first workspace default.
@@ -84,7 +149,21 @@ fn oracle_reproduces_the_ok_42_golden() {
         rust: common::fresh_rust_spec(),
     };
     let outcome = run_case_in(&context, case).expect("harness run");
-    assert!(outcome.golden.matched, "{:?}", outcome.golden.diffs);
+    if !outcome.golden.matched {
+        assert_oracle_golden_miss_is_recorded(case.id, &known_drift(), &outcome.golden.diffs);
+    }
+    // Our own side's check is never drift-aware: a golden our runtime fails is a mismatch.
+    assert!(
+        outcome.rust_golden.matched,
+        "our runtime must reproduce the canonical ETF golden: {:?}",
+        outcome.rust_golden.diffs
+    );
+    assert_ne!(
+        outcome.verdict,
+        Verdict::Mismatch,
+        "the canonical ETF case may only agree, drift or be unsupported (a missing runtime): {:?}",
+        outcome.diffs
+    );
     assert_eq!(outcome.eval, case.eval());
 }
 
@@ -104,12 +183,16 @@ fn oracle_against_itself_agrees() {
         compare_observations(&first, &second)
     );
 
-    // The same comparison through the real verdict path: oracle vs oracle ⇒ Agree.
+    // The same comparison through the real verdict path: oracle vs oracle ⇒ Agree. Both sides
+    // are checked against the same case golden, so the verdict takes that one check twice — the
+    // comparison can never fabricate agreement: the two observations are byte-identical and the
+    // oracle's own golden check is the corpus's self-test.
     let golden = check_golden(&first, &case.golden);
     assert!(golden.matched, "{:?}", golden.diffs);
     let verdict = differential::compare::verdict(
         &SideResult::observed(first),
         &SideResult::observed(second),
+        &golden,
         &golden,
     );
     assert_eq!(verdict, Verdict::Agree);
@@ -186,8 +269,13 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
     let Some(oracle) = oracle_or_skip() else {
         return;
     };
+    // The committed host-oracle drift allowlist: a case whose golden is host-version-dependent
+    // may miss under *this* oracle while our runtime still reproduces it. Anything else that
+    // misses is a failure (see `assert_oracle_golden_miss_is_recorded`).
+    let recorded = known_drift();
     let mut checked = 0;
     let mut checked_env = 0;
+    let mut drifted = 0;
     for case in differential::corpus::cases() {
         // Module-run cases (including the environment-variable `ModuleEnv` ones, whose
         // environment embeds a `{dir}` placeholder that only exists after the compile) are
@@ -210,25 +298,34 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
         let observation = run_with_env(&oracle, &argv, &own_env(case.env()))
             .unwrap_or_else(|error| panic!("case {}: failed to run the oracle: {error}", case.id));
         let golden = check_golden(&observation, &case.golden);
-        assert!(
-            golden.matched,
-            "case {} drifted from its golden: {:?} (stdout={:?})",
-            case.id,
-            golden.diffs,
-            String::from_utf8_lossy(&observation.stdout)
-        );
-        assert_eq!(
-            observation.exit_code,
-            Some(case.golden.exit_code),
-            "case {}: unexpected exit status",
-            case.id
-        );
+        if golden.matched {
+            assert_eq!(
+                observation.exit_code,
+                Some(case.golden.exit_code),
+                "case {}: unexpected exit status",
+                case.id
+            );
+        } else {
+            // The golden is *not* reproduced by this oracle. That is only honest as a recorded
+            // host-oracle drift; its exit-status expectation comes from the very golden the
+            // oracle just missed, so it is equally host-dependent and is not asserted.
+            drifted += 1;
+            assert_oracle_golden_miss_is_recorded(case.id, &recorded, &golden.diffs);
+            eprintln!(
+                "NOTE: case {}: oracle stdout={:?}",
+                case.id,
+                String::from_utf8_lossy(&observation.stdout)
+            );
+        }
     }
     assert!(checked > 0, "the corpus must contain expression cases");
     assert!(
         checked_env > 0,
         "the corpus must carry ERL_*FLAGS environment cases"
     );
+    if drifted > 0 {
+        eprintln!("NOTE: {drifted} eval case(s) miss their golden on this oracle (recorded drift)");
+    }
 }
 
 /// Every module-run case must reproduce its golden under the oracle too: the embedded
@@ -250,8 +347,10 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
         Err(error) => panic!("$ERLC is set but unusable: {error}"),
     };
 
+    let recorded = known_drift();
     let mut checked = 0;
     let mut skipped = 0;
+    let mut drifted = 0;
     for case in differential::corpus::cases() {
         let module_run = match &case.kind {
             CaseKind::Module(module_run) => module_run,
@@ -297,14 +396,19 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
             panic!("case {}: failed to run the oracle: {error}", case.id)
         });
         let golden = check_golden(&observation, &case.golden);
-        assert!(
-            golden.matched,
-            "case {} drifted from its golden: {:?} (stdout={:?})",
-            case.id,
-            golden.diffs,
-            String::from_utf8_lossy(&observation.stdout)
-        );
-        assert_eq!(observation.exit_code, Some(0), "case {}", case.id);
+        if golden.matched {
+            assert_eq!(observation.exit_code, Some(0), "case {}", case.id);
+        } else {
+            // A module-run golden the installed oracle misses (a C fixture strcmp'ing the oracle's
+            // own `erts` version, say) is host-version-dependent: recorded drift or a failure.
+            drifted += 1;
+            assert_oracle_golden_miss_is_recorded(case.id, &recorded, &golden.diffs);
+            eprintln!(
+                "NOTE: case {}: oracle stdout={:?}",
+                case.id,
+                String::from_utf8_lossy(&observation.stdout)
+            );
+        }
     }
     assert!(
         checked >= 2,
@@ -312,6 +416,11 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
     );
     if skipped > 0 {
         eprintln!("NOTE: {skipped} module-run case(s) skipped for a missing host tool");
+    }
+    if drifted > 0 {
+        eprintln!(
+            "NOTE: {drifted} module-run case(s) miss their golden on this oracle (recorded drift)"
+        );
     }
 }
 
@@ -326,7 +435,9 @@ fn command_cases_reproduce_their_golden_under_the_oracle() {
     let Some(oracle) = oracle_or_skip() else {
         return;
     };
+    let recorded = known_drift();
     let mut checked = 0;
+    let mut drifted = 0;
     for case in differential::corpus::cases() {
         let CaseKind::Command(run) = &case.kind else {
             continue;
@@ -358,22 +469,32 @@ fn command_cases_reproduce_their_golden_under_the_oracle() {
             panic!("case {}: failed to run the oracle: {error}", case.id)
         });
         let golden = check_golden(&observation, &case.golden);
-        assert!(
-            golden.matched,
-            "case {} drifted from its golden: {:?} (stdout={:?})",
-            case.id,
-            golden.diffs,
-            String::from_utf8_lossy(&observation.stdout)
-        );
-        assert_eq!(
-            observation.exit_code,
-            Some(case.golden.exit_code),
-            "case {}: unexpected exit status (stderr={:?})",
-            case.id,
-            String::from_utf8_lossy(&observation.stderr)
-        );
+        if golden.matched {
+            assert_eq!(
+                observation.exit_code,
+                Some(case.golden.exit_code),
+                "case {}: unexpected exit status (stderr={:?})",
+                case.id,
+                String::from_utf8_lossy(&observation.stderr)
+            );
+        } else {
+            // A command case's golden can be host-dependent too (a `dist_probe`/`erl` line
+            // carrying the runtime's own release): recorded drift, or a loud failure.
+            drifted += 1;
+            assert_oracle_golden_miss_is_recorded(case.id, &recorded, &golden.diffs);
+            eprintln!(
+                "NOTE: case {}: oracle stdout={:?}",
+                case.id,
+                String::from_utf8_lossy(&observation.stdout)
+            );
+        }
     }
     assert!(checked > 0, "the corpus must carry command cases");
+    if drifted > 0 {
+        eprintln!(
+            "NOTE: {drifted} command case(s) miss their golden on this oracle (recorded drift)"
+        );
+    }
 }
 
 #[test]
@@ -381,6 +502,7 @@ fn exception_cases_are_observable_through_the_probe() {
     let Some(oracle) = oracle_or_skip() else {
         return;
     };
+    let recorded = known_drift();
     for (id, expected) in [
         ("errors/error_boom", "exception error boom"),
         ("errors/badarith", "exception error badarith"),
@@ -394,7 +516,12 @@ fn exception_cases_are_observable_through_the_probe() {
             "case {id}: the probe must make the exception observable"
         );
         assert_eq!(observation.exit_code, Some(1), "case {id}: probe exit status");
-        assert!(check_golden(&observation, &case.golden).matched);
+        let golden = check_golden(&observation, &case.golden);
+        if !golden.matched {
+            // Never a silent pass: an exception case's golden it cannot reproduce is a drift that
+            // must be recorded explicitly.
+            assert_oracle_golden_miss_is_recorded(case.id, &recorded, &golden.diffs);
+        }
     }
 }
 

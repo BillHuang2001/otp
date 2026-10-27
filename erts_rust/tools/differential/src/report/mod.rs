@@ -24,7 +24,9 @@
 //! An observable that does not apply is `null` (`stdout`/`stdout_hex`/`exit_code` for a
 //! side that did not run, `matched_golden` where no golden was asserted), and the two
 //! optional keys are omitted rather than guessed: `reason` only appears for an
-//! `unsupported` side and `matched_golden` only where a golden was actually checked.
+//! `unsupported` side and `matched_golden` only where a golden was actually checked. Both
+//! sides carry `matched_golden` — they are checked against the **same** case golden, which is
+//! what makes an `oracle_drift` verdict (our side reproduced it, the oracle did not) legible.
 //! Reports are written under the crate's gitignored `out/` directory unless `--out <dir>`
 //! overrides it.
 //!

@@ -38,8 +38,13 @@ pub fn render_human(report: &RunReport, out: &mut impl Write) -> std::io::Result
     let summary = &report.summary;
     writeln!(
         out,
-        "summary: total={} agree={} mismatch={} unsupported={} skipped={}",
-        summary.total, summary.agree, summary.mismatch, summary.unsupported, summary.skipped
+        "summary: total={} agree={} mismatch={} unsupported={} skipped={} oracle_drift={}",
+        summary.total,
+        summary.agree,
+        summary.mismatch,
+        summary.unsupported,
+        summary.skipped,
+        summary.oracle_drift
     )?;
     if let Some(ratchet) = &report.ratchet {
         writeln!(
@@ -50,14 +55,31 @@ pub fn render_human(report: &RunReport, out: &mut impl Write) -> std::io::Result
             ratchet.unauthorized,
             ratchet.stale
         )?;
+        // The drift ratchet is a second, independent line: present only when the run classified
+        // host-oracle drift against a drift allowlist.
+        if let Some(drift_allowed) = ratchet.drift_allowed {
+            writeln!(
+                out,
+                "drift: allowlist={} allowed={} unauthorized={} stale={}",
+                ratchet.drift_allowlist.as_deref().unwrap_or("(none)"),
+                drift_allowed,
+                ratchet.drift_unauthorized.unwrap_or(0),
+                ratchet.drift_stale.unwrap_or(0)
+            )?;
+        }
     }
     if !report.by_contract.is_empty() {
         writeln!(out, "by contract:")?;
         for (id, counts) in &report.by_contract {
             writeln!(
                 out,
-                "  {id} total={} agree={} mismatch={} unsupported={} skipped={}",
-                counts.total, counts.agree, counts.mismatch, counts.unsupported, counts.skipped
+                "  {id} total={} agree={} mismatch={} unsupported={} skipped={} oracle_drift={}",
+                counts.total,
+                counts.agree,
+                counts.mismatch,
+                counts.unsupported,
+                counts.skipped,
+                counts.oracle_drift
             )?;
         }
     }
@@ -180,9 +202,51 @@ mod tests {
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("by contract:"), "{text}");
         assert!(
-            text.contains("A.2 total=1 agree=0 mismatch=0 unsupported=1 skipped=0"),
+            text.contains("A.2 total=1 agree=0 mismatch=0 unsupported=1 skipped=0 oracle_drift=0"),
             "{text}"
         );
+    }
+
+    /// The drift ratchet is a second, additive line: absent without a drift allowlist, present
+    /// with one, and the `oracle_drift` counts ride the summary and the by-contract lines.
+    #[test]
+    fn render_human_shows_the_drift_ratchet_only_when_it_was_classified() {
+        use crate::ratchet::RatchetReport;
+        let base = report(Verdict::Unsupported, SideResult::unsupported("no beam_rt"), Some(true));
+        let cases = base.cases.clone();
+        let mut ratchet = crate::report::test_support::ratchet_report();
+        ratchet.drift_allowed = Some(0);
+        ratchet.drift_unauthorized = Some(0);
+        ratchet.drift_stale = Some(0);
+        ratchet.drift_allowlist = Some("known-drift.txt".to_string());
+        let with = crate::report::RunReport::new_with_ratchet(
+            "suite",
+            &crate::report::test_support::spec(
+                crate::runtime::RuntimeId::Oracle,
+                "/x/erl",
+                crate::runtime::RuntimeSource::Path,
+            ),
+            None,
+            cases,
+            Some(ratchet),
+        );
+        let mut buf = Vec::new();
+        render_human(&with, &mut buf).expect("render");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(
+            text.contains("drift: allowlist=known-drift.txt allowed=0 unauthorized=0 stale=0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("summary: total=1 agree=0 mismatch=0 unsupported=1 skipped=0 oracle_drift=0"),
+            "{text}"
+        );
+        // Without the drift classification the line is absent (the gap ratchet is unchanged).
+        let mut buf = Vec::new();
+        render_human(&base, &mut buf).expect("render");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(!text.contains("drift:"), "{text}");
+        let _ = RatchetReport::classify(&[], &crate::allowlist::Allowlist::empty(), None);
     }
 
     #[test]
