@@ -93,7 +93,7 @@ pub fn find(id: &str) -> Option<Box<dyn Workload>>;
 Runner rule: every selected **(workload × runtime)** pair yields **exactly one** `WorkloadResult`.
 `runtimes()` gates scheduling; a workload scheduled under a runtime it does not support ⇒ `Skipped("runtime-unsupported")`; a `Probe::Skipped(reason)` ⇒ `Skipped(reason)` without running.
 
-### Built-in workloads — 15 (9 `Runtimes::Both`, 6 `SysOnly`)
+### Built-in workloads — 17 (11 `Runtimes::Both`, 6 `SysOnly`)
 | id | category | target repo / tool | today | skip reason(s) |
 |---|---|---|---|---|
 | `baseline` | startup | oracle `erl` | **runs** (sys+rust) | `runtime-unsupported` |
