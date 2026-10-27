@@ -1134,6 +1134,40 @@ impl<'a> Walk<'a> {
     /// (see [`reaches_an_unscanned_word`] and [`is_inert_reference`]) — otherwise a container to
     /// expand so a foreign → foreign → scanned chain is still found.
     fn reach_foreign(&mut self, process: &Process, word: Eterm) {
+        // TEMPORARY INSTRUMENTATION (not to be committed).
+        if std::env::var_os("BEAM_RT_VALVE_FOREIGN_DUMP").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let pid = process.pid();
+            if pid.number() == 10 && pid.serial() == 0 {
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 24 {
+                    let addr = ptr_val(word) as usize;
+                    let mut extra = String::new();
+                    if is_list(word) {
+                        extra.push_str(" list");
+                    } else {
+                        // SAFETY: temporary diagnostics on a word the walk just classified.
+                        unsafe {
+                            let h = *(addr as *const usize);
+                            extra.push_str(&format!(" header={h:#x}"));
+                        }
+                        for i in 0..3u8 {
+                            // SAFETY: as above (payload words of a classified container).
+                            unsafe {
+                                extra.push_str(&format!(" w{i}={:#x}", *((addr as *const usize).add(1 + i as usize))));
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[foreign-dump] pid={pid:?} word={:#x} addr={addr:#x} bounds=[{:#x},{:#x}){extra}",
+                        word.raw(),
+                        process.collector().scanned_bounds().base(),
+                        process.collector().scanned_bounds().limit()
+                    );
+                }
+            }
+        }
         self.foreign_reached = true;
         if self.criterion == Criterion::PayloadPrune {
             // The prune frees off-heap payloads, and a foreign container may name one through a
