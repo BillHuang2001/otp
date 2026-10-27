@@ -1,0 +1,15 @@
+start loadavg: 14.62 15.31 14.48 3/911 5
+round=1 side=sys exit=0 load_before=[14.62 15.31 14.48] load_after=[13.69 15.11 14.42]
+round=1 side=rust exit=0 load_before=[13.69 15.11 14.42] load_after=[12.91 14.92 14.36]
+round=2 side=rust exit=0 load_before=[12.91 14.92 14.36] load_after=[12.44 14.79 14.32]
+round=2 side=sys exit=0 load_before=[12.44 14.79 14.32] load_after=[12.44 14.79 14.32]
+round=3 side=sys exit=0 load_before=[12.44 14.79 14.32] load_after=[13.45 14.96 14.38]
+round=3 side=rust exit=0 load_before=[13.45 14.96 14.38] load_after=[12.61 14.76 14.32]
+round=4 side=rust exit=0 load_before=[12.61 14.76 14.32] load_after=[11.76 14.55 14.25]
+round=4 side=sys exit=0 load_before=[11.76 14.55 14.25] load_after=[11.76 14.55 14.25]
+round=5 side=sys exit=0 load_before=[11.76 14.55 14.25] load_after=[10.98 14.34 14.18]
+round=5 side=rust exit=0 load_before=[10.98 14.34 14.18] load_after=[10.34 14.15 14.12]
+round=6 side=rust exit=0 load_before=[10.34 14.15 14.12] load_after=[9.59 13.93 14.05]
+round=6 side=sys exit=0 load_before=[9.59 13.93 14.05] load_after=[9.59 13.93 14.05]
+end loadavg: 9.59 13.93 14.05 2/992 4244
+budgetprobe exit=0 load_before=[9.99 13.80 14.01] load_after=[12.69 14.26 14.16]
