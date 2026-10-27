@@ -327,6 +327,102 @@ pub fn oracle_eval(oracle: &Path, code_dir: Option<&Path>, expr: &str) -> Option
 }
 
 // ---------------------------------------------------------------------------------------
+// The `-eval` differential: one expression, both runtimes, code + stdout compared
+// ---------------------------------------------------------------------------------------
+
+/// One `-eval` probe run under **both** runtimes: its exit code and its raw stdout/stderr
+/// bytes.
+///
+/// The bytes are kept un-trimmed on purpose — a probe's rendering is the whole observable, so
+/// a trimmed comparison could hide a trailing-newline or empty-payload regression.
+#[allow(dead_code)]
+pub struct EvalProbe {
+    /// This runtime's exit code (`-1` when killed by a signal).
+    pub code: i32,
+    /// This runtime's stdout, verbatim.
+    pub stdout: Vec<u8>,
+    /// This runtime's stderr, verbatim.
+    pub stderr: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl EvalProbe {
+    /// stdout as a lossy string, for diagnostics and pinned comparisons.
+    pub fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+
+    /// stderr as a lossy string, for diagnostics.
+    pub fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+}
+
+/// Runs `expr` under the built **`beam_rt`** (`-noshell -eval`, like every other contract suite)
+/// and under the **oracle** (`erl -noshell -eval <expr> -s init stop`), asserting that the
+/// **exit code** and the **stdout bytes** are equal.
+///
+/// The oracle is the expected value, so a divergence shows up as a mismatch instead of being
+/// hardcoded away; the caller normally pins the exact bytes as well, so the probe still
+/// discriminates when no toolchain is installed. A missing `erl` is a **loud** skip
+/// ([`require_oracle`]), never a silent pass.
+///
+/// stderr is deliberately **not** compared: this runtime's CLI prefixes a runtime error with
+/// `beam_rt: ` where the oracle starts a crash report, so the two stderrs of a failing probe can
+/// never be byte-equal. A caller that needs a stderr observation asserts it on
+/// [`EvalProbe::stderr`] alone (and says so where it does).
+///
+/// # Panics
+///
+/// When either child could not be run to completion (it was killed at [`PROBE_TIMEOUT`]), or
+/// when the two runs disagree.
+#[allow(dead_code)]
+pub fn differential_eval(banner: &str, what: &str, expr: &str) -> EvalProbe {
+    let binary = Path::new(env!("CARGO_BIN_EXE_beam_rt"));
+    let ours = probe(what, binary, &["-noshell", "-eval", expr]);
+    let Some(oracle) = require_oracle(banner) else {
+        return ours;
+    };
+    let theirs = probe(
+        what,
+        &oracle,
+        &["-noshell", "-eval", expr, "-s", "init", "stop"],
+    );
+    assert_eq!(
+        ours.code, theirs.code,
+        "{what}: exit codes differ (beam_rt {} vs oracle {}) — beam_rt stderr: {}",
+        ours.code,
+        theirs.code,
+        ours.stderr_text()
+    );
+    assert_eq!(
+        ours.stdout,
+        theirs.stdout,
+        "{what}: stdout bytes differ — beam_rt {:?} vs oracle {:?}",
+        ours.stdout_text(),
+        theirs.stdout_text()
+    );
+    ours
+}
+
+/// One bounded probe ([`run_bounded`]), failing loudly when the child could not answer.
+#[allow(dead_code)]
+fn probe(what: &str, program: &Path, args: &[&str]) -> EvalProbe {
+    let output = run_bounded(program, args).unwrap_or_else(|| {
+        panic!(
+            "{what}: `{}` {args:?} could not be run to completion (killed at the {}s bound)",
+            program.display(),
+            PROBE_TIMEOUT.as_secs()
+        )
+    });
+    EvalProbe {
+        code: output.status.code().unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // A fixture compiled at test time, and this runtime driven under it
 // ---------------------------------------------------------------------------------------
 
