@@ -164,6 +164,7 @@ use beam_term::prelude::*;
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::native::prim;
+use crate::native::io::convert::{characters_to_binary, Chars};
 use crate::native::prim_file::take_open_file;
 use crate::native::{improper_list_head, tuple_fields};
 use crate::runtime::Runtime;
@@ -294,12 +295,31 @@ impl FileServices {
     /// device process dying closes the descriptor, and the pid is kept in drain coverage for
     /// the runtime's lifetime (see [`FileServices::retired`]). A request that lands in its
     /// mailbox at any later moment is answered `{error, terminated}`, never parked.
+    /// Whether `service` is a **live** io-device of this service (a pid `file:open/2` handed
+    /// out and that has not retired).
+    pub(crate) fn owns_device(&self, service: ProcessId) -> bool {
+        self.devices.contains_key(&service)
+    }
+    /// Whether `service` is an io-device that has **retired** (`close`, or a device-killing
+    /// request) — the oracle's dead io-device process.
+    pub(crate) fn is_retired_device(&self, service: ProcessId) -> bool {
+        self.retired.contains(&service)
+    }
     fn retire(&mut self, service: ProcessId) {
         self.devices.remove(&service);
         self.retired.insert(service);
     }
 }
 
+/// The payload an `{put_chars, Enc, Mod, Func, Args}` request's `apply/3` produced: either
+/// character data, or the **function** atom the oracle's `{error, Func}` reply names.
+enum Payload {
+    /// A char list or binary — the `put_chars` payload.
+    Chars(Eterm),
+    /// `apply/3` answered something that is not character data (or raised): reply
+    /// `{error, Func}`.
+    Failed(Eterm),
+}
 impl Runtime {
     /// Drains every native file service's mailbox: the `file_server_2` requests and the
     /// per-device `{file_request,…}`/`{io_request,…}` requests, delivering each reply into
@@ -700,6 +720,73 @@ impl Runtime {
         }
     }
 
+    /// Serves one `io` request addressed to the **file device** `device` — the route that
+    /// makes `io:format(Fd, …)` on a `file:open/2` handle work ([`crate::native::io`]'s
+    /// [`Device::File`](crate::native::io) arm), without any `{io_request, …}` round trip: the
+    /// io-device protocol's request is served **synchronously** here and its reply value
+    /// returned, exactly as the device process would have answered.
+    ///
+    /// A retired (dead) device answers `{error, terminated}`; a request this module cannot
+    /// serve faithfully answers the device's own catch-all `{error, {request, Request}}`
+    /// (`file_io_server.erl:418-421`) rather than a fabricated `ok`.
+    ///
+    /// # Errors
+    ///
+    /// The term builders' allocation diagnostics; every *request* outcome is a reply value.
+    pub(crate) fn serve_io_request(&mut self, device: ProcessId, request: Eterm) -> Result<Eterm> {
+        if self.file_services.is_retired_device(device) {
+            let terminated = self.atom("terminated")?;
+            return self.error_of(terminated);
+        }
+        match self.serve_io_request_value(device, request) {
+            Ok((reply, retire)) => {
+                if retire {
+                    self.file_services.retire(device);
+                }
+                Ok(reply)
+            }
+            Err(BeamError::Raise(_)) => {
+                let tag = self.atom("request")?;
+                let reason = self.tuple(&[tag, request])?;
+                self.error_of(reason)
+            }
+            Err(err) => Err(err),
+        }
+    }
+    /// Serves one io-device request, `{requests, List}` included, returning `(reply, retire)`.
+    fn serve_io_request_value(
+        &mut self,
+        device: ProcessId,
+        request: Eterm,
+    ) -> Result<(Eterm, bool)> {
+        if let Some(fields) = tuple_fields(request) {
+            if fields.len() == 2 && self.atom_name(fields[0]).as_deref() == Some("requests") {
+                // `io_request({requests, Requests}, State) -> io_request_loop(Requests,
+                // {reply, ok, State})` (`file_io_server.erl:412-414`, `:423-430`): each request
+                // runs in order and the **last** reply is the answer; a reply that is not the
+                // device's own `ok` stops the loop.
+                let Some(items) = terms::list_elements(fields[1]) else {
+                    let tag = self.atom("request")?;
+                    let reason = self.tuple(&[tag, request])?;
+                    let reply = self.error_of(reason)?;
+                    return Ok((reply, false));
+                };
+                let mut reply = self.atom("ok")?;
+                for item in items {
+                    let (item_reply, retire) = self.serve_io_request_value(device, item)?;
+                    reply = item_reply;
+                    if retire {
+                        return Ok((reply, true));
+                    }
+                    if is_error_tuple(self, reply) {
+                        return Ok((reply, false));
+                    }
+                }
+                return Ok((reply, false));
+            }
+        }
+        self.serve_device_request(device, request)
+    }
     /// Serves one io-device request, returning `(reply, retire)`.
     ///
     /// A request this module cannot serve faithfully is the typed capability gap described
@@ -767,7 +854,7 @@ impl Runtime {
             ("read_handle_info", 1) => self.reply_read_handle_info(service, args[0]),
             // -- io_request --------------------------------------------------------------
             ("get_chars", 3) => self.reply_get_chars(service, args),
-            ("put_chars", 2) => self.reply_put_chars(service, args),
+            ("put_chars", 1..=4) => self.reply_put_chars(service, args),
             // The incremental reader: `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}`
             // (`file_io_server.erl:362-364`) and its legacy 5-tuple form, which defaults the
             // encoding to `latin1` (`:395-396`).
@@ -913,22 +1000,167 @@ impl Runtime {
         Ok((data, false))
     }
 
-    /// `{put_chars, Enc, Chars}` → `ok` (`file_io_server.erl:420-445`).
+    /// `{put_chars, …}` — `file_io_server`'s `put_chars/3` and its `{requests, …}` sibling
+    /// (`file_io_server.erl:356-372`, `:420-445`):
+    ///
+    /// | Request | Behaviour |
+    /// |---|---|
+    /// | `{put_chars, Enc, Chars}` | transcode `Chars` from `Enc` to the **device's** encoding and write |
+    /// | `{put_chars, Enc, Mod, Func, Args}` | `apply(Mod, Func, Args)`; a char list/binary result is the payload, anything else replies `{error, Func}` (the **function** atom, `:364`) |
+    /// | `{put_chars, Chars}` / `{put_chars, Mod, Func, Args}` | the pre-R13 forms, encoding `latin1` (`:405-410`) |
+    ///
+    /// The device's encoding is the one `file:open/2`'s mode list selected
+    /// ([`Device::encoding`]). A `latin1` request on a **`latin1`** device is the direct
+    /// `?CALL_FD(write, [Chars])` (`:422-430`): the bytes are written as they are, and a
+    /// non-iodata payload is the NIF's `{error, badarg}` — which the device **stops** on
+    /// (`{stop, badarg, {error, badarg}, State}`), so the caller sees `{error, badarg}` and
+    /// the device is dead afterwards. Every other combination transcodes with
+    /// `unicode:characters_to_binary(Chars, In, Out)`:
+    ///
+    /// * a binary result is written;
+    /// * `{error, _, _}`/`{incomplete, _, _}` is the `{stop, no_translation,
+    ///   {error, {no_translation, In, Out}}, …}` clause (`:441-445`) — the caller sees
+    ///   `{error, {no_translation, In, Out}}` and the device is dead;
+    /// * a **raise** (a payload that is not character data at all, or an unknown encoding
+    ///   name) escapes `io_request/2`, so the device dies **without a reply** and its
+    ///   monitored caller sees the oracle's `{error, terminated}`.
+    ///
+    /// All of it is measured against OTP 29.1.2 (see the oracle table in
+    /// [`crate::native::io`]'s module docs).
     fn reply_put_chars(&mut self, service: ProcessId, args: &[Eterm]) -> Result<(Eterm, bool)> {
-        if self.atom_name(args[0]).as_deref() != Some("latin1") {
-            return Err(error::unsupported(
-                "file_server: a non-latin1 `put_chars` encoding is not supported",
-            ));
-        }
-        let Some(bytes) = iodata_bytes(args[1]) else {
-            return Err(error::unsupported("file_server: a non-latin1 `put_chars` payload"));
+        let (encoding, chars) = match args.len() {
+            // `{put_chars, Chars}` — the pre-R13 form (`file_io_server.erl:405-406`).
+            1 => (Encoding::Latin1, args[0]),
+            2 => match self.request_encoding(args[0]) {
+                Ok(encoding) => (encoding, args[1]),
+                Err(_) => return self.device_died(),
+            },
+            // `{put_chars, Mod, Func, Args}` — pre-R13 `apply` form (`:407-408`).
+            3 => match self.applied_chars(args[0], args[1], args[2])? {
+                Payload::Chars(chars) => (Encoding::Latin1, chars),
+                Payload::Failed(func) => return self.put_chars_failed(func),
+            },
+            4 => {
+                let encoding = match self.request_encoding(args[0]) {
+                    Ok(encoding) => encoding,
+                    Err(_) => return self.device_died(),
+                };
+                match self.applied_chars(args[1], args[2], args[3])? {
+                    Payload::Chars(chars) => (encoding, chars),
+                    Payload::Failed(func) => return self.put_chars_failed(func),
+                }
+            }
+            _ => {
+                return Err(error::unsupported(
+                    "file_server: an unexpected `put_chars` arity",
+                ))
+            }
         };
-        self.device_file(service)?.write_all(&bytes).map_err(io_error)?;
-        let ok = self.atom("ok")?;
-        Ok((ok, false))
+        self.write_chars(service, encoding, chars)
     }
-
-    /// The io-device's open file.
+    /// The `{put_chars, Enc, …}` request's encoding atom (`:356`).
+    ///
+    /// An encoding name this host does not model raises inside the device exactly as
+    /// `unicode:characters_to_binary/3` does for an unknown atom, so it answers the caller
+    /// the oracle's `{error, terminated}` and retires the device.
+    fn request_encoding(&mut self, encoding: Eterm) -> Result<Encoding> {
+        let name = self.atom_name(encoding);
+        match name.as_deref().and_then(crate::native::io::convert::encoding_of) {
+            Some(encoding) => Ok(encoding),
+            // The device raises (it can neither name nor transcode), so it dies without a
+            // reply: the caller sees the oracle's `{error, terminated}`.
+            None => Err(BeamError::BadArg),
+        }
+    }
+    /// `apply(Mod, Func, Args)` for the `{put_chars, Enc, Mod, Func, Args}` arm.
+    ///
+    /// `case catch apply(Mod, Func, Args) of Chars when is_list(Chars); is_binary(Chars) ->
+    /// …; _ -> {error, {error, Func}, State}` (`file_io_server.erl:362-370`): a char list or
+    /// binary is the payload, **everything else** — a raise included — is the `{error, Func}`
+    /// reply, whose reason atom is the **function** name, not the module.
+    fn applied_chars(&mut self, module: Eterm, function: Eterm, args: Eterm) -> Result<Payload> {
+        let (Some(module_name), Some(function_name), Some(arguments)) = (
+            self.atom_name(module),
+            self.atom_name(function),
+            terms::list_elements(args),
+        ) else {
+            return Ok(Payload::Failed(function));
+        };
+        let mut ctx = RuntimeContext::new(&mut *self);
+        match ctx.call_bif(&module_name, &function_name, arguments.len() as u32, &arguments) {
+            Ok(value) if is_list(value) || is_binary(value) => Ok(Payload::Chars(value)),
+            Ok(_) => Ok(Payload::Failed(function)),
+            Err(_) => Ok(Payload::Failed(function)),
+        }
+    }
+    /// The reply a request that makes the device **die without answering** leaves its
+    /// caller: `{error, terminated}` (the caller's monitor on the device fires), and the
+    /// device is retired.
+    fn device_died(&mut self) -> Result<(Eterm, bool)> {
+        let terminated = self.atom("terminated")?;
+        let reply = self.error_of(terminated)?;
+        Ok((reply, true))
+    }
+    /// `{error, Func}` — the `{put_chars, Enc, Mod, Func, Args}` failure reply.
+    fn put_chars_failed(&mut self, func: Eterm) -> Result<(Eterm, bool)> {
+        let reply = self.error_of(func)?;
+        Ok((reply, false))
+    }
+    /// Writes `chars` to the device, `chars` being tagged `encoding` — the transcode the
+    /// `{put_chars, …}` arms share. See [`Runtime::reply_put_chars`] for the rule.
+    fn write_chars(
+        &mut self,
+        service: ProcessId,
+        encoding: Encoding,
+        chars: Eterm,
+    ) -> Result<(Eterm, bool)> {
+        let device_encoding = self.device_mut(service)?.encoding;
+        if encoding == Encoding::Latin1 && device_encoding == Encoding::Latin1 {
+            return match iodata_bytes(chars) {
+                Some(bytes) => {
+                    self.device_file(service)?.write_all(&bytes).map_err(io_error)?;
+                    self.device_mut(service)?.buf.clear();
+                    let ok = self.atom("ok")?;
+                    Ok((ok, false))
+                }
+                None => {
+                    let badarg = self.atom("badarg")?;
+                    let reply = self.error_of(badarg)?;
+                    Ok((reply, true))
+                }
+            };
+        }
+        match characters_to_binary(chars, encoding, device_encoding) {
+            Chars::Bytes(bytes) => {
+                self.device_file(service)?.write_all(&bytes).map_err(io_error)?;
+                self.device_mut(service)?.buf.clear();
+                let ok = self.atom("ok")?;
+                Ok((ok, false))
+            }
+            Chars::NoTranslation => {
+                let from = self.atom(crate::native::io::encoding_name(encoding))?;
+                let to = self.atom(crate::native::io::encoding_name(device_encoding))?;
+                let tag = self.atom("no_translation")?;
+                let reason = self.tuple(&[tag, from, to])?;
+                let reply = self.error_of(reason)?;
+                Ok((reply, true))
+            }
+            // The device raises instead of replying: its caller sees `terminated`.
+            Chars::BadArg => {
+                let terminated = self.atom("terminated")?;
+                let reply = self.error_of(terminated)?;
+                Ok((reply, true))
+            }
+        }
+    }
+    /// Whether `reply` is the `{error, Reason}` shape that stops a `{requests, …}` loop.
+fn is_error_tuple(runtime: &Runtime, reply: Eterm) -> bool {
+    let Some(fields) = tuple_fields(reply) else {
+        return false;
+    };
+    fields.len() == 2 && runtime.atom_name(fields[0]).as_deref() == Some("error")
+}
+/// The io-device's open file.
     fn device_file(&mut self, service: ProcessId) -> Result<&mut std::fs::File> {
         Ok(&mut self.device_mut(service)?.file)
     }
