@@ -322,17 +322,20 @@ impl Row {
         println!("  minor                    {:>12}", k.minors);
         println!("  major                    {:>12}", k.majors);
         println!("words copied (total)       {:>12}", k.words_copied);
-        println!("words copied/op            {:>12.3}", k.words_copied as f64 / ops);
         println!(
-            "words reclaimed (total)    {:>12}",
-            k.words_reclaimed
+            "words copied/op            {:>12.3}",
+            k.words_copied as f64 / ops
         );
+        println!("words reclaimed (total)    {:>12}", k.words_reclaimed);
         println!(
             "words reclaimed/op         {:>12.3}",
             k.words_reclaimed as f64 / ops
         );
         println!("objects copied (total)     {:>12}", k.objects_copied);
-        println!("heap_size_words      final {:>8}  peak {:>8}", self.heap_size, k.peak_heap_size);
+        println!(
+            "heap_size_words      final {:>8}  peak {:>8}",
+            self.heap_size, k.peak_heap_size
+        );
         println!(
             "total_heap_size_words final {:>7}  peak {:>8}",
             self.total_heap_size, k.peak_total_heap_size
