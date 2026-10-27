@@ -102,11 +102,18 @@ const POLL_SLICE: Duration = Duration::from_millis(20);
 const INET_REQ_OPEN: u32 = 1;
 const INET_REQ_NAME: u32 = 5;
 const INET_REQ_BIND: u32 = 6;
+const INET_REQ_SETOPTS: u32 = 7;
 const INET_REQ_FDOPEN: u32 = 13;
 const INET_REQ_GETSTATUS: u32 = 16;
 const INET_REQ_ACCEPT: u32 = 26;
 const INET_REQ_LISTEN: u32 = 27;
 const TCP_REQ_RECV: u32 = 42;
+/// The `{deliver, …}` option code (`INET_LOPT_DELIVER`, `inet_drv.c:900`); the value `0` in the
+/// record below is `{deliver, port}` (`INET_DELIVER_PORT`, `:783`).
+///
+/// The crate re-exports the wire vocabulary and the `{active, …}`/`{packet, …}` codes but not this
+/// driver-state code, so the suite states it the way `tests/udp_inet.rs` does.
+const INET_LOPT_DELIVER: u8 = 25;
 /// `ERTS_INET_DRV_CONTROL_MAGIC_NUMBER` (`erts/emulator/beam/sys.h:1466`): what
 /// `erlang:port_control/3` adds to every opcode, and what the drivers subtract again.
 const CONTROL_MAGIC: u32 = 0x03f1_a300;
@@ -1178,6 +1185,12 @@ fn a_bare_or_closed_port_is_refused_and_a_pending_accept_drains_closed() {
 /// completion channel ([`CompletionEvent`]), and the `{Port, {data, …}}`/port-exit enum keeps its
 /// two arms — the active-mode delivery channel another agent owns must not need a third variant
 /// here. A real notification of each kind is classified through the match, so neither arm is dead.
+///
+/// The `Data` arm comes from `{deliver, port}`, whose `inet_port_data` branch
+/// (`inet_drv.c:4287`) hands a read's payload to the port as `{Port, {data, …}}` instead of the
+/// `{inet_async, …}` completion — **not** from an eager passive read: a passive socket with no
+/// queued receive is never read, so the read below is the queued `TCP_REQ_RECV`(42) answered by
+/// its own control call.
 #[test]
 fn the_completion_channel_stayed_frozen() {
     fn classify_notification(notification: &PortNotification) -> &'static str {
@@ -1217,19 +1230,51 @@ fn the_completion_channel_stayed_frozen() {
     assert_eq!(classify_completion(&done.event), "inet_async", "a real accept completion");
     let (_, fd) = accepted(done.event, "the accept completes");
     let connection = adopt_with_from_socket(&mut ports, &mut poller, fd);
-    // A real `Data` notification: bytes with no pending receive take the passive path into the
-    // port's input queue (`{Port, {data, …}}`), never the completion channel.
+    // A real `Data` notification: `{deliver, port}` routes a read's payload to the port
+    // (`inet_port_data`, `inet_drv.c:4287`) as `{Port, {data, …}}`, never through the completion
+    // channel. The read is the queued `TCP_REQ_RECV`(42), which attempts it inside its own control
+    // call — a passive socket with no receive queued is never read.
+    assert_eq!(
+        control(
+            &mut ports,
+            &mut poller,
+            connection,
+            INET_REQ_SETOPTS,
+            &[INET_LOPT_DELIVER, 0, 0, 0, 0]
+        ),
+        ctl_ok(),
+        "SETOPTS(7) sets {{deliver, port}}"
+    );
     peer.write_all(b"plain").expect("the peer writes");
+    let reply = control(
+        &mut ports,
+        &mut poller,
+        connection,
+        TCP_REQ_RECV,
+        &recv_operand(5000, 0),
+    );
+    assert_eq!(reply.len(), 3, "the reply is the async id: {reply:?}");
+    assert_eq!(reply[0], INET_REP_OK, "the receive is accepted: {reply:?}");
     let deadline = Instant::now() + WAIT;
     let mut seen = Vec::new();
     while seen.is_empty() {
         assert!(Instant::now() < deadline, "no data notification arrived");
-        seen.extend(round(&mut poller, &mut ports).notifications);
+        let round = round(&mut poller, &mut ports);
+        assert!(
+            round.completions.is_empty(),
+            "deliver=port answers on the port channel, never the completion channel: {:?}",
+            round.completions
+        );
+        seen.extend(round.notifications);
     }
     assert_eq!(seen.len(), 1, "one read message: {seen:?}");
     match &seen[0] {
         PortNotification::Data { port, read } => {
             assert_eq!(*port, connection, "the notification names the connection");
+            assert!(
+                read.header.is_empty(),
+                "the body-only read carries no header: {read:?}"
+            );
             assert_eq!(read.flattened(), b"plain".to_vec(), "the peer's bytes");
         }
         other => panic!("the passive path reports a Data: {other:?}"),

@@ -26,9 +26,9 @@
 //!
 //! * `a_tcp_port_round_trips_bytes_over_loopback` — a `"tcp_inet"` port created through the
 //!   [`DriverRegistry`], `open`/`bind`/`listen` on `127.0.0.1:0`, a client connection
-//!   `accept`ed, bytes read **peer → port input queue** through the poller (draining to
-//!   `EAGAIN`, the backend is edge-triggered) and written **port → peer** through the
-//!   `send` verb;
+//!   `accept`ed, bytes read **peer → port input queue** through the `recv` verb (the one read the
+//!   C would have made for a passive socket; it drains to `EAGAIN`) and written **port → peer**
+//!   through the `send` verb;
 //! * `a_stalled_write_arms_write_readiness_and_an_unknown_verb_is_bad_arg` — a peer that
 //!   never reads stalls the write, the remainder stays in the port output queue and write
 //!   readiness is armed (a forged write-ready event then schedules an `OUTPUT` task, which
@@ -39,7 +39,8 @@
 //!   its socket answers `[0] ++ "exbadseq"` (`inet_ctl_open`'s `state != INET_STATE_CLOSED`
 //!   guard), the socket survives it, and the reply is the one the oracle's own second `open`
 //!   gives. If `erl` is absent the check **skips loudly**, never fails.
-//! * `the_covered_control_replies_agree_with_the_erl_oracle` — the **compatibility gate** for//!   the verbs this floor covers: the same control sequence is run against the *real* system
+//! * `the_covered_control_replies_agree_with_the_erl_oracle` — the **compatibility gate** for
+//!   the verbs this floor covers: the same control sequence is run against the *real* system
 //!   `tcp_inet` driver through `erl` and the reply bytes are compared. The oracle's own reply
 //!   encodings are the C's `ctl_reply`/`ctl_reply_ok`/`ctl_error` (`inet_drv.c:2260`-`:2311`)
 //!   and its verb integers are the `INET_REQ_*`/`TCP_REQ_*` constants, so this pins the
@@ -50,8 +51,8 @@
 //! peer has gone must stop behaving like a live one. `a_recv_after_the_peer_closes_answers_the_c_closed_shape`
 //! pins the reply sequence (`closed` once per direction, `enotconn` after that, the oracle's
 //! `R,R,S,S`), `a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed` pins the
-//! reactor side — the edge-triggered poller *does* read a passive socket's end-of-file, but such a
-//! read is not one the C would have made: it applies nothing, the owner hears nothing and the
+//! reactor side — `ready_input` performs **no read at all** for a passive socket with no queued
+//! receive, so the readiness event is dispatched and ignored: the owner hears nothing and the
 //! reactor quiesces; the next `recv` is the read that owes the `closed`, and only that read
 //! releases the dead socket's registration — and `the_peer_close_replies_agree_with_the_erl_oracle`
 //! cross-checks the two reply bytes against a real `gen_tcp` connection in the system Erlang.
@@ -177,8 +178,13 @@ fn accept(poller: &mut Poller, ports: &mut PortRegistry, id: PortId) -> i32 {
     }
 }
 
-/// Drives the reactor (retrying a poll the kernel interrupted) until port `id`'s input queue
-/// holds at least `want` bytes, returning everything it read.
+/// Reads `want` bytes out of port `id` through the **`recv` verb**.
+///
+/// A passive socket with no queued receive is never read — the C selects a socket's read side only
+/// for a waiting `TCP_REQ_RECV` (`inet_drv.c:12317`) or a granted `{active, …}` (`:7966`) — so
+/// pumping the poller delivers nothing here: the peer's bytes stay in the kernel until a read
+/// somebody asked for takes them. The `recv` verb is that read, and it drains the socket to
+/// `EAGAIN` in one call.
 fn read_into_queue(
     poller: &mut Poller,
     ports: &mut PortRegistry,
@@ -189,14 +195,11 @@ fn read_into_queue(
     let mut got = Vec::new();
     while got.len() < want {
         assert!(Instant::now() < deadline, "no input arrived");
-        let events = match poller.poll(Some(Duration::from_millis(100))) {
-            Ok(events) => events,
-            Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => panic!("poll failed: {err:?}"),
-        };
-        ports
-            .handle_events(poller, &events)
-            .expect("dispatch the ready events");
+        assert_eq!(
+            control(ports, poller, id, "recv", b""),
+            vec![INET_REP_OK],
+            "the passive recv verb reads the buffered bytes"
+        );
         got.extend(ports.get_mut(id).expect("live").drain_input());
     }
     got
@@ -279,7 +282,8 @@ fn a_tcp_port_round_trips_bytes_over_loopback() {
     let accepted_fd = accept(&mut poller, &mut ports, id);
     assert!(accepted_fd >= 0, "the reply carried a real descriptor");
 
-    // Peer -> port: the reactor reads the bytes into the port's input queue.
+    // Peer -> port: the `recv` verb is the read that moves the bytes into the port's input
+    // queue — a passive socket with no queued receive is never read by the reactor.
     client.write_all(b"ping").expect("the client writes");
     assert_eq!(
         read_into_queue(&mut poller, &mut ports, id, 4),
@@ -489,6 +493,8 @@ fn a_recv_after_the_peer_closes_answers_the_c_closed_shape() {
     client.read_exact(&mut echo).expect("the peer reads");
     assert_eq!(&echo, b"up");
     client.write_all(b"ok").expect("the peer writes");
+    // The `recv` verb is the read that takes the peer's bytes: no poller read happens for a
+    // passive socket whose receive queue is empty.
     assert_eq!(read_into_queue(&mut poller, &mut ports, id, 2), b"ok");
 
     // The peer goes away. The first `recv` that observes the end-of-file is the one that
@@ -518,31 +524,31 @@ fn a_recv_after_the_peer_closes_answers_the_c_closed_shape() {
     ports.close(&mut poller, id).expect("closes the port");
 }
 
-/// **The reactor consumes a passive socket's end-of-file without applying it, then quiesces; the
+/// **The reactor consumes a passive socket's end-of-file without reading it, then quiesces; the
 /// next `recv` is the read that owes the `closed` — and only that read tears the port down.**
 ///
 /// This floor's poller is edge-triggered and keeps the accepted socket's `READABLE` registration
-/// for its whole life (the passive `{Port, {data, …}}` delivery shortcut), so `ready_input` really
-/// reads the peer's end-of-file. The C selects a socket's read side in exactly two states — a
-/// waiting `TCP_REQ_RECV` (`sock_select(INETP(desc),(FD_READ|FD_CLOSE),1)`, `inet_drv.c:12317`)
-/// and a granted `{active, …}` (`:7966`) — so a passive socket with no receive queued is a read it
-/// would **not** have made: that read is `ReadReport::Unselected` (`src/drivers/inet/mod.rs`), it
-/// delivers the bytes it reads and applies **nothing**. The observation stays in
-/// `TcpInetDriver::pending_close`, the descriptor stays `INET_STATE_CONNECTED` (`5`:
-/// `INET_F_OPEN|INET_F_ACTIVE`, `:1028`), the owner is told nothing — the C sends neither a
-/// `{Port, {data, …}}` (a zero-byte read mints no read) nor a close message — and the reactor
+/// for its whole life, so a hang-up really does surface as a readiness event — but `ready_input`
+/// performs **no read at all** for a passive socket with no queued receive. The C selects a
+/// socket's read side in exactly two states — a waiting `TCP_REQ_RECV`
+/// (`sock_select(INETP(desc),(FD_READ|FD_CLOSE),1)`, `inet_drv.c:12317`) and a granted
+/// `{active, …}` (`:7966`) — so the event is dispatched and ignored: the registration stays armed,
+/// `TcpInetDriver::pending_close` stays unset, the descriptor stays `INET_STATE_CONNECTED` (`5`:
+/// `INET_F_OPEN|INET_F_ACTIVE`, `:1028`), the owner is told nothing — no `{Port, {data, …}}` (a
+/// read nobody asked for makes no `driver_output*` call) and no close message — and the reactor
 /// settles: the dead descriptor produces no further readiness.
 ///
-/// The close is the **next** read's to answer. `verb_recv` reads through
-/// `read_available(Answered)`, which applies the pending observation through `latch_peer_close`,
-/// and the C's `tcp_recv_closed` reply is the *first* call's `[0] ++ "closed"` — every later one
-/// `[0] ++ "enotconn"`. That read is also the teardown: under the default `{exit_on_close, true}`
-/// the descriptor is closed and de-registered, so the registration really is released and
-/// `GETSTATUS` reports the `0` of `INET_STATE_CLOSED` (`:1026`) from then on.
+/// The close is the **next** read's to answer, because that is the first read the C would have
+/// made. `verb_recv` reads through `read_available(Answered)`, which applies the close its own
+/// read discovers through `latch_peer_close`, and the C's `tcp_recv_closed` reply is the *first*
+/// call's `[0] ++ "closed"` — every later one `[0] ++ "enotconn"`. That read is also the teardown:
+/// under the default `{exit_on_close, true}` the descriptor is closed and de-registered, so the
+/// registration really is released and `GETSTATUS` reports the `0` of `INET_STATE_CLOSED`
+/// (`:1026`) from then on.
 ///
 /// Quiescence — not an empty registration set — is the stop condition (the same rule as
-/// `src/drivers/inet/peer_close_tests.rs::drive_reactor`): an unselected read leaves the
-/// registration in place by design, so the invariant to pin is "no readiness is produced", not
+/// `src/drivers/inet/peer_close_tests.rs::drive_reactor`): a readiness event read by nobody leaves
+/// the registration in place by design, so the invariant to pin is "no readiness is produced", not
 /// "the socket is out of the poll set". [`QUIET_ROUNDS`] explains why that is a bound.
 #[test]
 fn a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed() {
@@ -558,9 +564,10 @@ fn a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed() {
         "the accepted connection is CONNECTED before the peer leaves"
     );
 
-    // The peer goes away and the reactor's read readiness fires. `ready_input` reads the
-    // end-of-file with no `TCP_REQ_RECV` queued and no `{active, …}` grant in force, so the
-    // observation is recorded (`pending_close`), not applied — and the reactor then goes quiet.
+    // The peer goes away and the reactor's read readiness fires. `ready_input` performs no read
+    // for a passive socket with no `TCP_REQ_RECV` queued and no `{active, …}` grant in force, so
+    // the event is dispatched and ignored — the registration stays armed, nothing is recorded —
+    // and the reactor then goes quiet.
     client.shutdown(Shutdown::Both).expect("the peer shuts down");
     let deadline = Instant::now() + WAIT;
     let mut rounds = 0usize;
@@ -594,17 +601,17 @@ fn a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed() {
         "the reactor observed the peer's end-of-file (otherwise this test is vacuous)"
     );
 
-    // Nothing was invented for the owner: the C never discovered this close, so it sends neither a
-    // `{Port, {data, …}}` nor a close message.
+    // Nothing was invented for the owner: no read was made, so no close was discovered either —
+    // the driver sends neither a `{Port, {data, …}}` nor a close message.
     assert!(
         notifications.is_empty(),
-        "an unselected read owes the owner no message at all: {notifications:?}"
+        "a readiness event nobody reads owes the owner no message at all: {notifications:?}"
     );
 
     // The close was not applied either: the latch is untouched and the descriptor is still open.
     assert!(
         !ports.port_closed(id).expect("the port is live"),
-        "an unselected read must not latch the peer's close"
+        "a readiness event nobody reads must not latch the peer's close"
     );
     assert_eq!(
         status(&mut poller, &mut ports, id),
@@ -612,9 +619,9 @@ fn a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed() {
         "the C keeps the descriptor CONNECTED until a read it would have made finds the close"
     );
 
-    // The read the C *would* have made owes the close, on its first call: `read_available` applies
-    // the pending observation and answers `tcp_recv_closed`'s `closed`; the ladder's next rung is
-    // the operational `enotconn`.
+    // The read the C *would* have made owes the close, on its first call: `read_available` finds
+    // the end-of-file itself, applies it and answers `tcp_recv_closed`'s `closed`; the ladder's
+    // next rung is the operational `enotconn`.
     assert_eq!(
         control(&mut ports, &mut poller, id, "recv", b""),
         ctl_xerror("closed"),
