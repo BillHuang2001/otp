@@ -96,6 +96,7 @@ mod nif_select;
 mod nif_send;
 pub mod perf_map;
 pub mod port;
+mod report;
 pub mod runtime;
 mod runner;
 pub mod seq_trace;

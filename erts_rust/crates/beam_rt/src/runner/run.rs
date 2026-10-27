@@ -37,6 +37,7 @@ use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutc
 
 use crate::context::gc;
 use crate::context::RuntimeContext;
+use crate::report;
 use crate::runtime::Runtime;
 
 use super::budget::{BudgetContext, BudgetProbe};
@@ -1725,6 +1726,22 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 } else {
                     exit_reason(self.runtime, &error)
                 };
+                // **The crash report**, emitted here — the one point where this runtime knows a
+                // process is terminating of its own accord, and the faithful place for it: ERTS
+                // logs from `terminate_proc` *before* the death is performed
+                // (`../../erts/emulator/beam/beam_common.c:686-717`), so the process is still
+                // alive in the eyes of the report. `report::report_crash` decides *whether*
+                // ERTS would say anything (an `error`/`throw` class termination, never an
+                // `exit`-class one, never the `run` action's own target), so the normal path —
+                // a returning process, a park, an `exit` — formats nothing at all.
+                //
+                // A `max_heap_size` **kill** is not an exception termination (the raise the
+                // collection latched is replaced by the `killed` exit reason), so it reports
+                // nothing here; the C logs its own, different `max_heap_size` message, which this
+                // runtime does not emit (see `crate::report`'s *Known gaps*).
+                if !kill {
+                    report::report_crash(self.runtime, pid, reason, &error);
+                }
                 self.state.exits.insert(pid, reason);
                 // Keep the error as well: it carries the raise class and the `unsupported`
                 // classification the CLI keys off (see `RunnerState::errors`) — now with a
