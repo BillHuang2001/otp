@@ -142,15 +142,28 @@ reader, so the guard is what makes those cheap.
   name), so removing them needs a `beam_term` API, i.e. a **sibling node's** surface. Not done
   here.
 - **The whole-table copy the load hands `lower::build_module` is `AtomTable::fork`**
-  (`codeserver.rs:921`): it shares the `Arc<str>` name handles and preserves every index and the
+  (`codeserver.rs:927`): it shares the `Arc<str>` name handles and preserves every index and the
   generation, so it costs two allocations (one `Vec` of handles, one index bucket array) and
   nothing per atom — it has no attributable share of its own in the census above (that is a *time* statement:
-  in *memory* the fork is ≈37 B per already-interned atom **per loaded module**, retained for the module's life
-  in `Module.atom_table` — `../../../beam_loader/CONTEXT.md:65`, `../../CONTEXT.md` *The dominant consumer*). This is only a
+  in *memory* the fork's index buckets are ≈37 B per already-interned atom — `../../../beam_loader/CONTEXT.md:65`,
+  `../../CONTEXT.md` *The dominant consumer*). This is only a
   *copy* change: every index of the module's table names exactly what a deep clone named, because
   a fork starts at the same length and appends in index order, which is the protocol the
-  merge-back loop rides (`beam_term`'s `a_fork_serves_the_lower_then_merge_back_protocol`). The
-  fork's **fresh instance** is deliberate and unobserved here: `appended_since` is `false` in both
+  merge-back loop rides (`beam_term`'s `a_fork_serves_the_lower_then_merge_back_protocol`).
+- **A module's retained table is a fork of the *merged* shared store, never of the load-time
+  fork** (`codeserver.rs:949`).
+  The load-time fork is discarded once the merge-back has put its literal-only atoms on the shared
+  table, so a module pins no diverged copy of its own and the shard copies its literal appends made
+  are dropped at load.
+  Interning is append-only and index-stable, so the fresh fork names exactly the same atoms at
+  exactly the same indices as the discarded one — the re-fork changes no observable index, it only
+  drops copies (the index is copy-on-write per shard, so a kept fork would retain one private copy
+  per shard its literals touched for the module's whole life, and would make every later intern copy
+  a shard again).
+  A later intern copies only the shards it touches, and the generation it supersedes stays alive
+  through the modules loaded before it — one shard copy per generation, shared by every module of
+  that generation, rather than one per module.
+  The **fresh instance** is deliberate and unobserved here: `appended_since` is `false` in both
   directions between a fork and its parent, and no memo in this crate witnesses a module's own
   table (the two decode memos — `../nif.rs`'s `with_decode_scratch` and
   `beam_bifs`'s — witness the **shared** table only).

@@ -924,7 +924,7 @@ impl CodeServer {
         // allocations instead of one name string per atom. Any atom that appeared only in
         // a literal is appended after the fork's prefix at exactly `atoms.len()..`, so
         // merging them back in index order keeps the shared indices identical.
-        let module = lower::build_module(&chunks, &raw, self.atoms.fork())?;
+        let mut module = lower::build_module(&chunks, &raw, self.atoms.fork())?;
         let base = self.atoms.len();
         for index in base..module.atom_table.len() {
             if let Some(name) = module.atom_table.name(Atom::from_raw(index as u32)) {
@@ -932,6 +932,21 @@ impl CodeServer {
             }
         }
 
+        // The load-time fork has diverged (the literal-only atoms were appended to it) and the
+        // merge-back above put every one of them on the shared table, so the module's table is
+        // re-forked from the **merged** store and the diverged copy is dropped rather than
+        // retained for the module's whole life.
+        // Interning is append-only and index-stable, so a fork taken now names exactly the same
+        // atoms at exactly the same indices as the one it replaces: the only thing it discards
+        // is the shard copies the literal appends made on the load-time fork.
+        // Dropping them matters because the index is copy-on-write per shard: a module that kept
+        // its fork would keep one private shard copy per shard its literals touched, and every
+        // later intern into the shared table would copy a shard again, because that fork would
+        // still hold the previous generation.
+        // Re-forking instead leaves the module's table pointing into the shared store's live
+        // index, so what it retains is that store's own generation instead of a private one
+        // (`beam_term::atom::store`).
+        module.atom_table = self.atoms.fork();
         Ok(module)
     }
 
@@ -1651,8 +1666,9 @@ mod tests {
     /// The per-module load hands `lower::build_module` a **fork** of the shared table, not a
     /// deep copy: every atom the shared table already held is the very same name allocation
     /// in the module's own table, at the same index (a `clone` would have re-allocated one
-    /// `String` per atom). The literal-only atoms a fork may append stay its own — the
-    /// merge-back loop puts them back on the shared table afterwards.
+    /// `String` per atom). The literal-only atoms a fork may append are merged back onto the
+    /// shared table, and the module's table is then re-forked from it, so its handles are the
+    /// shared table's own for those atoms too.
     #[test]
     fn a_loaded_module_shares_the_shared_tables_name_allocations() {
         let Some(mut server) = system_server() else {
@@ -1687,6 +1703,19 @@ mod tests {
             lists.atom_table.lookup("reverse"),
             server.atoms().lookup("reverse")
         );
+        // The module's table is a fork of the *merged* store, so it agrees with it over its
+        // whole length — the prefix above and every literal-only atom the merge-back appended.
+        // That agreement is the re-fork's safety argument: appending is index-stable, so the
+        // fresh fork names exactly what the discarded load-time fork named.
+        assert_eq!(lists.atom_table.len(), server.atoms().len());
+        for index in 0..lists.atom_table.len() {
+            let atom = Atom::from_raw(index as u32);
+            assert_eq!(
+                lists.atom_table.name(atom).map(str::to_owned),
+                server.atoms().name(atom).map(str::to_owned),
+                "index {index} must name the same atom in the module's and the shared table"
+            );
+        }
     }
 
     #[test]
