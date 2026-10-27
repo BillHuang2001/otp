@@ -288,7 +288,10 @@ pub(super) fn start_kernel_process(
 ///   scheduler has nothing it can advance *now* (every process is blocked or gone), so the
 ///   drive stops and reports what it ran; the caller decides what that means (a
 ///   `{kernelProcess, …}` burst simply continues, a blocked `{apply, …}` reports the engine's
-///   [`beam_engine::blocked`] when the total is `0`);
+///   [`beam_engine::blocked`] when the total is `0`). A `0` step **while a driver owes this
+///   runtime an answer** is not that condition — the runtime cannot schedule a port's child
+///   process, so the poll slice the pass just spent is not a bound on it — and the drive
+///   keeps going (see the loop body);
 /// * `now >= deadline` — the boot's one wall-clock bound is spent, reported as a typed
 ///   [`error::message`], never awaited.
 ///
@@ -308,6 +311,22 @@ pub(super) fn drive_scheduler(runtime: &mut Runtime, deadline: Instant, slices: 
         let ran = runtime.pump_scheduler_boot(slices)?;
         total += ran;
         if ran == 0 {
+            // A round that ran nothing has **not** necessarily got nothing that could
+            // advance: a driver mid-exchange owes this runtime bytes only a later poll
+            // round can deliver, and the pass's own port poll blocks a
+            // [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE) for them. The booted
+            // kernel's `inet_gethost` helper is exactly that shape — the hostname lookup
+            // is answered by a **child process** the runtime cannot schedule, so one poll
+            // slice is not a bound on it (measured on a loaded host: the helper's reply
+            // missed the slice, this drive reported `0`, and `apply_boot_call` turned a
+            // live `{apply,{application,start_boot,…}}` into the `beam_engine::blocked`
+            // capability gap). So keep driving while a driver owes an answer; the
+            // [`DRIVE_DEADLINE`] above still bounds it, and the reply's own wake is what
+            // ends it (the poll that delivers the answer runs no slice, so `total` moves
+            // only once the waiting process is resumed).
+            if runtime.a_driver_owes_an_answer() {
+                continue;
+            }
             return Ok(total);
         }
     }
@@ -437,4 +456,94 @@ fn call_bif(runtime: &mut Runtime, mfa: &Mfa, args: &[Eterm]) -> Result<()> {
     let mut context = RuntimeContext::new(runtime);
     let _ = context.call_bif(&mfa.module, &mfa.function, args.len() as u32, args)?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+    use beam_bifs::PortHook;
+    use beam_process::ProcessId;
+    use beam_term::heap::Heap;
+    use beam_term::prelude::*;
+    use crate::port::RuntimePorts;
+    /// A `0`-step drive is only a stall when **nothing owes an answer**.
+    ///
+    /// The sharp half of [`drive_scheduler`]'s stop condition. A drive step that runs no slice has
+    /// not necessarily got nothing that could advance: a driver mid-exchange owes this runtime
+    /// bytes only a **later** poll round can deliver, and the pass spends one
+    /// `PORT_POLL_SLICE` on them. The booted kernel's `inet_gethost` helper is exactly that shape —
+    /// its answer comes from a child process the runtime cannot schedule — so treating the
+    /// `0`-step report as a stall folded a live `{apply,{application,start_boot,…}}` into
+    /// `beam_engine::blocked()` under host load (measured: CLI exit 3).
+    ///
+    /// The port here is opened **through the runtime's own registry**, so the question the drive
+    /// asks is the one the production port table answers. Its child (`sleep 1`) never answers the
+    /// bytes written to it, so the debt stands on its own; both halves are pinned — the drive keeps
+    /// going while the driver owes (spending the caller's deadline, never reporting a false stall),
+    /// and stops at `0` at once once the obligation is discharged by closing the port.
+    #[test]
+    fn a_zero_step_drive_is_not_a_stall_while_a_driver_owes_an_answer() {
+        let mut atoms = AtomTable::new();
+        crate::boot::seed_core_atoms(&mut atoms);
+        atoms.intern("spawn");
+        let atoms = Rc::new(atoms);
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        // Nothing is runnable in a fresh runtime (its four runtime-owned processes are never
+        // enqueued), so a step of this drive reports `0` for everything but its port poll.
+        let mut hook = RuntimePorts::new(
+            Rc::clone(&runtime.ports),
+            Rc::clone(&atoms),
+            ProcessId::new(7, 0),
+        );
+        let mut heap = Heap::new(64);
+        let mut command = NIL;
+        for byte in b"sleep 1".iter().rev() {
+            command = heap
+                .cons(make_small(i64::from(*byte)), command)
+                .expect("a charlist cell");
+        }
+        let tag = make_atom(atoms.lookup("spawn").expect("interned"));
+        let name = heap.tuple(&[tag, command]).expect("a name tuple");
+        let port = hook
+            .open_port(name, NIL)
+            .expect("open_port({spawn, \"sleep 1\"}, [])");
+        assert!(
+            !runtime.a_driver_owes_an_answer(),
+            "a child that was never written to owes nothing"
+        );
+        // The write is the obligation: `output` is credited at the write instant and this child
+        // answers nothing at all, so the debt stands until the port is gone.
+        runtime
+            .ports
+            .borrow_mut()
+            .write_command(port, b"hi")
+            .expect("port_command");
+        assert!(
+            runtime.a_driver_owes_an_answer(),
+            "two written bytes and no answer: the driver owes"
+        );
+        let stalled = drive_scheduler(
+            &mut runtime,
+            Instant::now() + Duration::from_millis(200),
+            256,
+        );
+        assert!(
+            matches!(&stalled, Err(err) if format!("{err}").contains("still runnable")),
+            "a drive with a driver mid-exchange must not report a stall; got {stalled:?}"
+        );
+        // Discharging the obligation is what makes the next drive stop — with `0` slices run, as
+        // on an idle boot.
+        runtime.ports.borrow_mut().close(port).expect("port_close");
+        assert!(
+            !runtime.a_driver_owes_an_answer(),
+            "a closed port owes nothing"
+        );
+        let ran = drive_scheduler(
+            &mut runtime,
+            Instant::now() + Duration::from_millis(200),
+            256,
+        )
+        .expect("a drive with nothing pending");
+        assert_eq!(ran, 0, "nothing ran, and nothing was owed: the drive stops");
+    }
 }

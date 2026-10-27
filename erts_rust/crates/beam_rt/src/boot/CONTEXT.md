@@ -97,7 +97,14 @@ these eight directives, the full modelled set:
   between deadline checks and **one** wall-clock `DRIVE_DEADLINE` (10 s) shared by the whole `execute`
   pass, plus a 1 s `KERNEL_BURST_DEADLINE` cap per burst. An exhausted deadline is a typed
   `error::message`; a blocked apply whose drive ran nothing is the engine's typed `error::blocked()`; a
-  drive stops as soon as a `pump_scheduler_boot` call reports `0`.
+  drive stops as soon as a `pump_scheduler_boot` call reports `0` **and** no driver still owes
+  this runtime an answer (`Runtime::a_driver_owes_an_answer`). A `0`-step report alone only means
+  nothing was *schedulable*: a driver mid-exchange is answered by **another process** this runtime
+  cannot schedule, so one `PORT_POLL_SLICE` is not a bound on it — a drive that treated it as one
+  turned a live `{apply,{application,start_boot,…}}` into `beam_engine::blocked()` under host load
+  (the booted kernel's `inet_gethost` helper; pinned by `drive.rs`'s
+  `a_zero_step_drive_is_not_a_stall_while_a_driver_owes_an_answer`). The drive keeps stepping while
+  the debt stands and `DRIVE_DEADLINE` remains its one wall-clock bound.
   A capability gap stays an `error::unsupported` raise.
   `pump_scheduler_boot` is `pump_scheduler` with an **imminent-only** sleep policy
   (`TimerWait::ImminentWithin(TIMER_PUMP_SLICE)`): a step sleeps the remaining time to the earliest
@@ -301,7 +308,10 @@ which
   `lib/kernel/src/application_controller.erl:271-284`; directive 20's `c:erlangrc/0` file-server call),
   so those five steps are where an ungated poll would cost ≈ 125 ms of pure latency after the lookup.
   The reply's own wake is untouched: until the helper answers, its request bytes are outstanding
-  (`output > input`), so the poll that delivers `{Port,{data,<<RID:32,Bin>>}}` still blocks as it must.
+  (`output > input`), so the poll that delivers `{Port,{data,<<RID:32,Bin>>}}` still blocks as it must
+  — and a **zero-slice step that still has such an obligation is not the drive's stop condition**
+  (`drive_scheduler` keeps stepping, bounded only by `DRIVE_DEADLINE`), because the answer arrives in
+  a later round and not inside the one poll slice the step just spent.
   The `-eval` action itself adds no pass (`erlang:halt` returns the halt through the native floor, no
   trailing pump).
   Both sides of the comparison and the reproduction recipe are in
@@ -480,8 +490,11 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   state (`runtime.module`, `whereis`, the `runtime.eval` side effects). No spawn sites in `boot.rs`,
   `drive.rs` or `preloaded.rs` (whose `system_server()` skips on a `CodeServer::add_system_paths()`
   error, a pure filesystem probe).
-- `boot/drive.rs`: **no in-file `#[cfg(test)]` module** (0 `#[test]`s) — the bounded burst/`drive_scheduler`
-  logic is pinned indirectly by `bootscript.rs`'s synthetic-script tests
+- `boot/drive.rs`: **one in-file `#[test]`** — `a_zero_step_drive_is_not_a_stall_while_a_driver_owes_an_answer`
+  pins the drive's stop condition directly (a port opened on the runtime's own registry whose child
+  never answers its bytes: the drive spends its deadline instead of reporting a stall, and returns `0`
+  once the port is closed); the bounded burst/`drive_scheduler`
+  logic is otherwise pinned by `bootscript.rs`'s synthetic-script tests
   (`a_boot_spawned_process_answers_a_blocked_apply`, `a_kernel_process_registers_its_own_directive_name`,
   `a_kernel_process_burst_waits_for_the_directive_to_return`, `registering_a_live_boot_name_is_badarg`)
   and by `../tests/boot.rs` (`the_boot_chains_kernel_processes_survive_their_directive_processes`).

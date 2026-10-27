@@ -661,6 +661,25 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    /// Whether a **live port still owes this runtime an answer** — bytes a driver has not
+    /// replied to ([`Runtime::awaits_port_reply`]) or an asynchronous operation a driver
+    /// holds ([`Runtime::ports_awaiting_async`]).
+    ///
+    /// The two are one question with two halves (the C's `desc->caller` obligation and
+    /// `opp->caller`, `../../erts/emulator/beam/io.c`), and this is the pairing the
+    /// scheduler pass itself reads to decide whether its **port poll blocks**
+    /// ([`Runtime::scheduler_pass`]'s `port_timeout`: a pass that may not sleep on a timer
+    /// still blocks [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE) on a driver that owes
+    /// it one). Any *other* caller that treats "a round ran nothing" as "nothing can ever
+    /// advance" must ask the same question, or it declares a live process stalled while the
+    /// driver that will wake it is mid-exchange — which is exactly what a loaded host makes
+    /// visible: the booted kernel's `inet_gethost` helper answers the hostname lookup from a
+    /// **child process**, so its reply can exceed one poll slice (`crate::boot::drive`'s
+    /// drive is the caller that must not give up on it).
+    pub(crate) fn a_driver_owes_an_answer(&self) -> bool {
+        self.awaits_port_reply() || self.ports_awaiting_async()
+    }
+
     /// How many port messages this runtime has **delivered** since it started — the monotone
     /// progress signal a nested port wait reads around its own round.
     ///
@@ -1025,8 +1044,7 @@ impl Runtime {
             // where the reply lands as a fragment on about half the ops.
             let progressed = round_slices > 0 || !self.fragment_wakes.is_empty();            let port_timeout = if progressed
                 || (matches!(wait, TimerWait::ImminentWithin(_))
-                    && !self.awaits_port_reply()
-                    && !self.ports_awaiting_async())
+                    && !self.a_driver_owes_an_answer())
             {
                 Duration::ZERO
             } else {
