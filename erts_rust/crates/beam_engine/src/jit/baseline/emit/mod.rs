@@ -310,30 +310,85 @@ fn emit_refresh_y(buffer: &mut CodeBuffer) -> Result<()> {
     buffer.call_r(Reg::R11)
 }
 
+/// Whether a helper sequence must first store the block's dirty cached x-registers back
+/// into `machine.x`.
+///
+/// The store ([`spill`]) is the tier's publication step: it makes `machine.x` the
+/// authoritative copy of the register file for anything a helper hands back to the
+/// **host** — the driver's `Err` park (which may decorate a stacktrace or hand a
+/// collecting `ExecutionContext` a root set), a deopt, a `Step::Wait`/`Suspend`, or the
+/// helper reading the register file itself. Every helper that can reach such a path
+/// therefore requires it unconditionally.
+///
+/// [`SpillPolicy::NotRequired`] is the exception, and it is a **proof obligation on the
+/// helper**, never a preference. It may be passed only when all three hold:
+///
+/// 1. **the helper is total** — the emitted call site can never take an error or a
+///    transfer arm, i.e. the Rust body has no `Err` reachable from the arguments the
+///    emitter can pass (a `Result`-typed internals whose only constructor is `Ok` counts
+///    as total);
+/// 2. it reaches **neither the host, nor a collector, nor a deopt** (no
+///    `ExecutionContext`/`Machine::ensure_heap*` call, no `jit_step_one` fallback);
+/// 3. it **reads no x-register** — its marshalled arguments arrive in machine registers,
+///    never through `machine.x`.
+///
+/// Such a helper leaves the block **continuing in-block** on every path, and a continuing
+/// block's cached registers stay authoritative exactly as they do across an inline
+/// instruction: nothing is published, and nothing needs to be.
+///
+/// Two consequences a caller must respect:
+///
+/// * the block's dirty set is **not** cleared by such a call, because nothing synced the
+///   cache — the per-`pc` model ([`Allocation::spill_sets`](super::Allocation) /
+///   `regalloc::spill_sets`) must agree, or a later spill would skip a genuinely
+///   divergent register and leave `machine.x` stale for a helper that *does* publish it
+///   (`regalloc::spill_free_helper` is that shared classification);
+/// * the helper must not produce an [`ERROR`] word — the continue arm's `jcc` to the
+///   block epilogue carries `rax` to the driver, and that epilogue performs the frame
+///   teardown only, so the store this policy skips is not re-emitted there.
+///
+/// [`ERROR`]: super::runtime::ERROR
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SpillPolicy {
+    /// Store the block's dirty cached x-registers before the call (the default: the
+    /// helper can observe or hand back `machine.x`).
+    Required,
+    /// Skip the store — only for a helper that meets all three conditions above.
+    NotRequired,
+}
+
 /// Emit the spill-then-helper sequence for `helper` — **without** the block exit, so
 /// the caller decides what to do with the helper's word.
 ///
-/// The spill comes **first**: every helper reads `machine.x` (the interpreter itself
-/// for [`jit_step_one`], the frame discipline of `call_ext_last` for
-/// [`jit_ext_call`](super::jit_ext_call)), which must already hold the values the inline prefix produced.
-/// The `rt` slot is reloaded into `rdi` (every helper's first argument) and `args`
-/// fills the remaining integer argument registers in ABI order (`rsi`, `rdx`, `rcx`,
-/// `r8`, `r9`); a helper preserves the callee-saved registers, so `rbx` (the
-/// `machine.x` base) survives the call — but the block must **not** spill after it:
-/// the helper legitimately wrote `machine.x`.
+/// The spill comes **first** under [`SpillPolicy::Required`]: every such helper reads or
+/// publishes `machine.x` (the interpreter itself for [`jit_step_one`], the frame
+/// discipline of `call_ext_last` for [`jit_ext_call`](super::jit_ext_call)), which must
+/// already hold the values the inline prefix produced. The `rt` slot is reloaded into
+/// `rdi` (every helper's first argument) and `args` fills the remaining integer argument
+/// registers in ABI order (`rsi`, `rdx`, `rcx`, `r8`, `r9`); a helper preserves the
+/// callee-saved registers, so `rbx` (the `machine.x` base) survives the call — but the
+/// block must **not** spill after it: the helper legitimately wrote `machine.x`.
 ///
 /// The helper's result word is left in `rax` (the block ABI's return register) for
 /// the caller's continuation check. Passing the helper as a raw pointer keeps the
 /// call sites' own function-pointer types (`StepHelper`, `ExtCallHelper`) as the
 /// type check on its signature.
+///
+/// `policy` is the per-site publication policy ([`SpillPolicy`]); it changes **only**
+/// whether the leading stores are emitted — the `rt` load, the argument immediates, the
+/// call and the block ABI are identical either way, so a spill-free site is the same call
+/// sequence with a shorter prefix.
 pub(super) fn emit_helper_call(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     helper: *const (),
     args: &[i64],
     pc: u32,
+    policy: SpillPolicy,
 ) -> Result<()> {
-    spill(buffer, allocation, SpillSite::Helper, pc)?;
+    if policy == SpillPolicy::Required {
+        spill(buffer, allocation, SpillSite::Helper, pc)?;
+    }
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     emit_helper_invoke(buffer, helper, args)
 }
@@ -354,6 +409,12 @@ pub(super) fn emit_helper_call(
 /// `rdi` is loaded with the block's `rt` before the store (the store reads
 /// `JitRuntime::current_code` through it) and the visit sequence below reuses that load
 /// for the call, so the store costs no extra `rt` fetch.
+///
+/// Every caller of this form is **spill-required**: the position it publishes exists for a
+/// path that can hand the block back (`fallback`'s deopt, or a raise the helper reports),
+/// and such a path is exactly what the leading store makes `machine.x` correct for. It
+/// therefore has no [`SpillPolicy`] parameter — a spill-free helper never needs a position
+/// store in front of it either (nothing can observe it).
 pub(super) fn emit_positioned_helper_call(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
@@ -417,7 +478,9 @@ pub(super) fn emit_step_and_continue(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    pc)?;
+        pc,
+        SpillPolicy::Required,
+    )?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 

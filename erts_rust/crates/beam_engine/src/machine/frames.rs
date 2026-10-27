@@ -488,6 +488,43 @@ mod tests {
         assert!(machine.pop_frame().is_err());
     }
 
+    /// **A frame push never fails** — the invariant the baseline tier's one
+    /// spill-free helper call rests on.
+    ///
+    /// `jit_allocate` (`src/jit/baseline/runtime.rs`) lowers `Instr::Allocate` over
+    /// [`Machine::push_frame_window`], and `emit/heap.rs::emit_allocate` passes
+    /// `SpillPolicy::NotRequired` because the helper is **total**: the push constructs no
+    /// error at all, so the emitted `jcc Ne, done` land on the `ERROR` word is
+    /// unreachable. If this pin ever fails, the skipped spill would let the driver park
+    /// with a stale `machine.x` — so the assertion is the *invariant*, not a count: every
+    /// `y_count` the emitter can bake as an immediate (`Instr::Allocate`'s `stack_need`,
+    /// a `u32`) answers `Ok`, and the returned window describes exactly the slots the
+    /// push appended.
+    #[test]
+    fn a_frame_push_never_fails() {
+        let mut machine = Machine::new();
+        // 0 is the frame-less entry's shape and the one arm that skips the `resize`; the
+        // rest cross it, include a large frame, and re-push on top of a live frame (the
+        // `sum/1` recursion of the `list_walk` workload does exactly that).
+        for y_count in [0u32, 1, 2, 3, 8, 255, 4096, 0, 1] {
+            let stack_before = machine.stack_depth();
+            let frames_before = machine.frame_depth();
+            let window = machine.push_frame_window(y_count);
+            assert!(
+                window.is_ok(),
+                "push_frame_window({y_count}) must be infallible"
+            );
+            let (y_base, y) = window.expect("checked above");
+            assert_eq!(y, y_count);
+            assert_eq!(y_base, stack_before);
+            assert_eq!(machine.stack_depth(), stack_before + y_count as usize);
+            assert_eq!(machine.frame_depth(), frames_before + 1);
+            // The `Result`-returning wrapper the tier's frame helpers use is the same
+            // push, so it is total too.
+            assert!(machine.push_frame(0).is_ok());
+        }
+    }
+
     #[test]
     fn y_slots_are_scoped_to_the_current_frame() {
         let mut machine = Machine::new();

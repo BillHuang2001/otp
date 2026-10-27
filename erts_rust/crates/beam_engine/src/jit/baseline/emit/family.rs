@@ -34,7 +34,9 @@ use crate::jit::emitter::{CodeBuffer, Label as CodeLabel};
 use super::super::bitstr::jit_bitstr;
 use super::super::family::jit_family;
 use super::super::runtime::StepHelper;
-use super::{emit_continue_check, emit_helper_call, emit_positioned_helper_call, Allocation};
+use super::{
+    emit_continue_check, emit_helper_call, emit_positioned_helper_call, Allocation, SpillPolicy,
+};
 
 /// Emit the native arm for one family-owned instruction: the
 /// [`jit_family`](super::super::family::jit_family) helper followed by the same
@@ -122,7 +124,16 @@ fn emit_step_helper(
             pc,
         )?;
     } else {
-        emit_helper_call(buffer, allocation, helper as *const (), &args, pc)?;
+        // Spill-required: both family helpers (`jit_step_one` behind the generic arm,
+        // `jit_bitstr`) read `machine.x` and can report a typed error.
+        emit_helper_call(
+            buffer,
+            allocation,
+            helper as *const (),
+            &args,
+            pc,
+            SpillPolicy::Required,
+        )?;
     }
     emit_continue_check(buffer, done, allocation, func, pc)
 }

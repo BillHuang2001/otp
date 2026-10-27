@@ -49,6 +49,30 @@ them.
   block writes before it reads is never loaded at entry (an absent table falls back to the whole cache).
   The cache itself lives in `regs.rs` (`Allocation`/`spill`/`fill`); the call sites are in `mod.rs`
   (`emit_helper_call`) and the block/link emitters.
+- **A helper call's leading spill is the cache's publication step, so `emit_helper_call` takes a
+  `SpillPolicy`.** `SpillPolicy::Required` (the default for every site) emits
+  `spill(.., SpillSite::Helper, pc)` before the `mov rdi, [rsp+RUNTIME_SLOT_DISP]` + indirect call, which
+  is what makes `machine.x` authoritative for an **exit out of the helper**: an `Err` the driver parks
+  on (it may then decorate a stacktrace or hand the host a root set), a deopt back to
+  `jit_step_one`, a `Wait`/`Suspend`, or a helper that reads `machine.x` itself.
+  `SpillPolicy::NotRequired` skips the store, and the only site that may take it is one whose helper
+  satisfies all three of: (a) **total** — no `Err` reachable from the call, so the `ERROR` arm the
+  emitter still emits is dead; (b) reaches **nothing** — no `ExecutionContext`, no heap admission, no
+  collector, no deopt, no host callback; (c) reads **no x-register** (its arguments are immediates baked
+  into `rsi`/`rdx`/`rcx`). The set is exactly **one** helper: `jit_allocate` (`heap.rs::emit_allocate`),
+  because `Machine::push_frame_window` constructs no error (pinned by
+  `src/machine/frames.rs::tests::a_frame_push_never_fails`) and the only other call is
+  `JitRuntime::publish_y_window`, a pure store.
+  The two spill-required neighbours in the same family are the reason the classification is per-helper
+  and not per-family: `jit_allocate_heap`/`jit_test_heap` cross the host's heap admission (which may
+  collect), and `jit_trim` forwards `Machine::trim`, which answers a typed `Err` on an over-trim.
+  A spill-free call is **not an exit path**, so it touches no `ExitSpill` state: `Done` still means only
+  "the preceding helper call at this same `pc` already stored", and a later `emit_exit` on a path that
+  skipped the spill stores the full dirty set (the dirty set **carries over** the call — there is nothing
+  to clear, `regalloc.rs::spill_free_helper` keeps the per-`pc` `spill_sets` model in agreement with the
+  emitter's classification, and a disagreement there would drop a still-divergent register).
+  Pinned by `heap.rs::tests::allocate_is_the_one_spill_free_heap_helper_call` (the same lowering is
+  **byte-identical** over a dirty and a clean cache, while spill-required `trim` is not).
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
   `MOVE_SCRATCH_2`=`r10` (`mod.rs`); `Y_SCRATCH`=`r9` and `SWAP_END`=`rax` (`r#move.rs`);
   `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10`, `FAST_R`=`r11` (`arith.rs`);
@@ -280,11 +304,13 @@ by construction).
   into it, so a return chain does not grow the native stack; otherwise the word leaves for the driver),
   plus its unit tests (the frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
-  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
+  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers, `emit_allocate`
+  the tier's one `SpillPolicy::NotRequired` site) and the private
   `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
   `encode_target(func, pc+1)`, no register refill and no emitted refresh — the helper re-published the
-  Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
-  split, and `a_frame_changing_helper_emits_no_separate_refresh_call`).
+  Y window), plus its unit tests (the spill-first call order for the three spilling helpers, the
+  frame-only-vs-heap-admitting refill split, `allocate_is_the_one_spill_free_heap_helper_call`, and
+  `a_frame_changing_helper_emits_no_separate_refresh_call`).
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
   `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`) and `emit_bitstr` (the same
   arm for the `Bs*` family through `../bitstr.rs::jit_bitstr`, plus the inline position store its

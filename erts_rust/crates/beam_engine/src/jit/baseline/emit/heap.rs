@@ -79,7 +79,7 @@ use super::super::runtime::{
     FrameSizeHelper, HeapNeedHelper,
 };
 use super::{
-    emit_continue_check, emit_continue_check_helper_refresh, emit_helper_call, Allocation,
+    emit_continue_check, emit_continue_check_helper_refresh, emit_helper_call, Allocation, SpillPolicy,
 };
 
 /// Lower `allocate StackNeed Live` — push a stack frame, then continue in-block at
@@ -91,6 +91,32 @@ use super::{
 /// analogue [`super::emit_deallocate`]: no register refill (the push touches no
 /// x-register), but the frame changed, so the Y window is re-published when a later
 /// instruction of this block still accesses a Y slot.
+///
+/// # The one spill-free helper call
+///
+/// This is the tier's only [`SpillPolicy::NotRequired`] site, and the three conditions
+/// that license it are:
+///
+/// 1. **`jit_allocate` is total.** Its `match` on
+///    [`Machine::push_frame_window`](crate::Machine::push_frame_window) has an `Err` arm
+///    only because that call is `Result`-typed; its body constructs **no** error (a zero-Y
+///    frame skips the `resize` and a frame push is an infallible `Vec::push`), so the
+///    emitted `jcc Ne, done` arm is unreachable and the helper can never hand the driver
+///    the `ERROR` word that would make the skipped store observable (`src/machine/`'s
+///    `a_frame_push_never_fails` is the pin).
+/// 2. It reaches **nothing**: no `ExecutionContext`, no `ensure_heap`, no collector, no
+///    deopt — `push_frame_window` grows `machine.stack` and pushes a `Frame`, and the only
+///    other call is `JitRuntime::publish_y_window`, a pure store of the pair the push just
+///    returned.
+/// 3. It **reads no x-register**: its three arguments are immediates baked into the
+///    emitted `rsi`/`rdx`/`rcx`, and it touches `machine.x` neither directly nor through a
+///    helper.
+///
+/// So the block continues in-block on every path with its cached registers untouched —
+/// exactly as across an inline instruction — and the leading stores published nothing
+/// anyone could read. The dirty set therefore **carries over** the call
+/// (`regalloc::spill_free_helper` keeps the per-`pc` model in agreement), so the registers
+/// it would have stored are still stored by the next site that does publish them.
 ///
 /// [`Machine::push_frame`]: crate::Machine
 pub(super) fn emit_allocate(
@@ -107,7 +133,9 @@ pub(super) fn emit_allocate(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(stack_need)],
-    pc)?;
+        pc,
+        SpillPolicy::NotRequired,
+    )?;
     emit_frame_change_continue(buffer, done, func, pc)
 }
 
@@ -141,7 +169,11 @@ pub(super) fn emit_allocate_heap(
             i64::from(heap_need),
             i64::from(live),
         ],
-    pc)?;
+        pc,
+        // Spill-required: the admission may run a collection, so `machine.x` must be
+        // authoritative before the host sees it (and the helper can report an error).
+        SpillPolicy::Required,
+    )?;
     // The push inside the helper is a frame change, so the helper re-publishes the Y
     // window itself (see `jit_allocate_heap`): the continue arm keeps its register refill
     // but emits no separate refresh call.
@@ -175,7 +207,10 @@ pub(super) fn emit_test_heap(
             i64::from(heap_need),
             i64::from(live),
         ],
-    pc)?;
+        pc,
+        // Spill-required: the whole point of `test_heap` is the host's admission door.
+        SpillPolicy::Required,
+    )?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 
@@ -201,7 +236,14 @@ pub(super) fn emit_trim(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(n)],
-    pc)?;
+        pc,
+        // Spill-required, unlike its sibling `allocate`: `Machine::trim` reports a typed
+        // error for an over-trim (`n` past the live frame's Y count, or no frame at all),
+        // and the emitter can be handed such an `n` by a hand-built/malformed module. That
+        // `Err` parks the machine for the driver, so the cached registers must already be
+        // in `machine.x` — a total helper's argument, not a given.
+        SpillPolicy::Required,
+    )?;
     emit_frame_change_continue(buffer, done, func, pc)
 }
 
@@ -293,16 +335,9 @@ mod tests {
     }
 
     #[test]
-    fn each_heap_family_helper_is_called_with_the_spill_first() {
+    fn each_spilling_heap_family_helper_is_called_with_the_spill_first() {
         let allocation = cached_allocation();
         let cases: Vec<(&str, *const (), Vec<u8>)> = vec![
-            (
-                "allocate",
-                jit_allocate as *const (),
-                lowered(|buffer, done| {
-                    emit_allocate(buffer, &allocation, done, 4, 7, 2)
-                }),
-            ),
             (
                 "allocate_heap",
                 jit_allocate_heap as *const (),
@@ -341,6 +376,36 @@ mod tests {
                 "{label}: the continue arm compares against `encode_target(func, pc + 1)`"
             );
         }
+    }
+
+    /// `allocate` is the tier's one **spill-free** helper call, and the assertion is the
+    /// invariant that makes the classification honest rather than a byte count: a
+    /// lowering that publishes nothing cannot depend on *what* is published, so it must
+    /// be byte-identical over a dirty cache and over a clean one. A spill-required
+    /// sibling of the same family must differ, which is what makes the first assertion
+    /// meaningful instead of vacuous.
+    #[test]
+    fn allocate_is_the_one_spill_free_heap_helper_call() {
+        let allocation = cached_allocation();
+        let spill = spill_bytes(&allocation);
+        assert!(!spill.is_empty(), "the probe allocation must spill a register");
+
+        let dirty = lowered(|buffer, done| emit_allocate(buffer, &allocation, done, 4, 7, 2));
+        let clean = lowered(|buffer, done| emit_allocate(buffer, &Allocation::default(), done, 4, 7, 2));
+        assert!(!dirty.starts_with(&spill), "allocate must not spill");
+        assert_eq!(
+            dirty, clean,
+            "a spill-free helper call's emission cannot depend on the dirty set"
+        );
+
+        // The spill-required sibling of the very same family does depend on it, so the
+        // equality above is a property of the policy and not of the emitter.
+        let dirty = lowered(|buffer, done| emit_trim(buffer, &allocation, done, 4, 7, 1));
+        let clean = lowered(|buffer, done| emit_trim(buffer, &Allocation::default(), done, 4, 7, 1));
+        assert_ne!(
+            dirty, clean,
+            "trim is spill-required: a dirty cache must emit its stores"
+        );
     }
 
     #[test]

@@ -74,7 +74,8 @@ use super::super::runtime::{
 use super::super::{jit_ext_call, jit_local_call};
 use super::test::try_inline_test;
 use super::{
-    emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, MOVE_SCRATCH,
+    emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, SpillPolicy,
+    MOVE_SCRATCH,
 };
 
 /// Emit `init_yregs Registers` natively, or report that the block must helper it.
@@ -751,6 +752,7 @@ pub(crate) fn emit_block(
                             i64::from(*arity),
                         ],
                         pc,
+                        SpillPolicy::Required,
                     )?;
                     buffer.mov_ri(Reg::R11, CALL_STORED)?;
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
@@ -1487,7 +1489,9 @@ fn emit_local_call_probe(
             i64::from(kind),
             i64::from(deallocate),
         ],
-    pc)?;
+        pc,
+        SpillPolicy::Required,
+    )?;
     buffer.mov_ri(Reg::R11, LOCAL_DECLINE)?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)
@@ -1531,7 +1535,9 @@ fn emit_ext_call(
             i64::from(kind),
             i64::from(deallocate),
         ],
-    pc)?;
+        pc,
+        SpillPolicy::Required,
+    )?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 
@@ -1564,7 +1570,9 @@ fn emit_receive(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-    pc)?;
+        pc,
+        SpillPolicy::Required,
+    )?;
     emit_continue_check(buffer, done, allocation, func, pc)
 }
 
