@@ -377,22 +377,22 @@ impl RuntimeContext<'_> {
             ("erlang", "halt", 0) => Some(Err(self.record_halt(0))),
             ("erlang", "halt", 1) => Some(self.halt_1(args)),
             ("erlang", "halt", 2) => Some(self.halt_2(args)),
-            ("io", "put_chars", 1) => Some(self.io_put_chars(args, 1)),
-            ("io", "put_chars", 2) => Some(self.io_put_chars(args, 2)),
+            ("io", "put_chars", 1) => self.io_output("put_chars", 1, args),
+            ("io", "put_chars", 2) => self.io_output("put_chars", 2, args),
             // The rest of the `io` **device** surface — the `io.erl` wrappers over
             // `o_request/2`/`execute_request/3`, which this runtime cannot complete against
             // itself (its own root process's group leader is itself, so `io.erl` answers
             // `{ErrorTag, calling_self}`). Serving them here removes `io.erl` from the path
             // and answers the device question natively; the rendering still goes through the
             // registered `io_lib:format/2` BIF. See [`io`].
-            ("io", "nl", 0) => Some(self.io_nl(args, 0)),
-            ("io", "nl", 1) => Some(self.io_nl(args, 1)),
-            ("io", "fwrite", 1) => Some(self.io_fwrite(args, 1)),
-            ("io", "fwrite", 2) => Some(self.io_fwrite(args, 2)),
-            ("io", "fwrite", 3) => Some(self.io_fwrite(args, 3)),
-            ("io", "write", 1) => Some(self.io_write(args, 1)),
-            ("io", "write", 2) => Some(self.io_write(args, 2)),
-            ("io", "format", 3) => Some(self.io_format_3(args)),
+            ("io", "nl", 0) => self.io_output("nl", 0, args),
+            ("io", "nl", 1) => self.io_output("nl", 1, args),
+            ("io", "fwrite", 1) => self.io_output("fwrite", 1, args),
+            ("io", "fwrite", 2) => self.io_output("fwrite", 2, args),
+            ("io", "fwrite", 3) => self.io_output("fwrite", 3, args),
+            ("io", "write", 1) => self.io_output("write", 1, args),
+            ("io", "write", 2) => self.io_output("write", 2, args),
+            ("io", "format", 3) => self.io_output("format", 3, args),
             // `io:request/1,2` and `io:requests/1,2` are the *device* entry points of the same
             // protocol (`io.erl:1646-1700`, `-doc false`); `io.erl` exports exactly these two
             // names (there is no `io:request/3,4`, so an unregistered one would have to be
@@ -1091,6 +1091,60 @@ impl RuntimeContext<'_> {
     /// `call_ext` shape takes through [`io_route`](crate::context::io_route). A stream and a
     /// **file device** are served here directly (no round trip), and a dead pid / unregistered
     /// atom / non-atom device answers exactly as `io.erl` does.
+    /// The `io` **output** arms of the device floor: serve the key, or **decline** (`None`) when
+    /// the call names a device that only the in-machine `io.erl` body can serve.
+    ///
+    /// Declining is what routes the call to the OTP protocol — [`Self::io_output_needs_the_protocol`]
+    /// is the same predicate [`crate::context::RuntimeContext::call_bif_routed`] consults, so the
+    /// floor and that route can never disagree about a call.
+    fn io_output(
+        &mut self,
+        function: &'static str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Option<Result<Eterm>> {
+        if self.io_output_needs_the_protocol("io", function, arity, args) {
+            return None;
+        }
+        Some(match (function, arity) {
+            ("put_chars", 1) => self.io_put_chars(args, 1),
+            ("put_chars", 2) => self.io_put_chars(args, 2),
+            ("nl", 0) => self.io_nl(args, 0),
+            ("nl", 1) => self.io_nl(args, 1),
+            ("fwrite", 1) => self.io_fwrite(args, 1),
+            ("fwrite", 2) => self.io_fwrite(args, 2),
+            ("fwrite", 3) => self.io_fwrite(args, 3),
+            ("write", 1) => self.io_write(args, 1),
+            ("write", 2) => self.io_write(args, 2),
+            ("format", 3) => self.io_format_3(args),
+            _ => return None,
+        })
+    }
+    /// Whether the `io` output call `(module, function, arity)` with `args` must take the OTP
+    /// `{io_request, …}`/`{io_reply, …}` protocol **because of its explicit device**.
+    ///
+    /// True only when the caller **may pump** the scheduler
+    /// ([`RuntimeContext::may_pump_scheduler`](Self::may_pump_scheduler)): the round trip is a
+    /// `receive`, which only the in-machine `lib/stdlib/src/io.erl` body can sit out. Inside a
+    /// scheduler slice (`crate::runner`) the floor keeps the key and answers the documented typed
+    /// gap instead of parking the process on a message the slice cannot deliver.
+    pub(crate) fn io_output_needs_the_protocol(
+        &self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> bool {
+        if module != "io" || !self.may_pump_scheduler() {
+            return false;
+        }
+        match Self::io_device_arg_index(function, arity) {
+            Some(index) => args
+                .get(index)
+                .is_some_and(|device| self.io_device_needs_the_protocol(*device)),
+            None => false,
+        }
+    }
     fn io_native_request(
         &mut self,
         args: &[Eterm],

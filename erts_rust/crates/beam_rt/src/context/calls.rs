@@ -2134,7 +2134,9 @@ impl RuntimeContext<'_> {
         // (`may_pump_scheduler() == false`, i.e. inside a slice) folds the wait into the typed
         // `blocked()` gap rather than writing the request to the wrong stream — the compiled
         // `call_ext*` shape never reaches this arm, the seam enters it in-machine instead.
-        if self.io_routes_through_the_protocol(module, function, arity) {
+        if self.io_routes_through_the_protocol(module, function, arity)
+            || self.io_output_needs_the_protocol(module, function, arity, args)
+        {
             perf_counters::bump(|c| &mut c.external);
             return self.load_and_run(module, function, arity, args);
         }

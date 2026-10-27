@@ -470,6 +470,41 @@ impl RuntimeContext<'_> {
         };
         self.io_target(device) != Device::Unreachable
     }
+    /// The index of the **explicit device** argument of an `io` **output** key, or `None` for a
+    /// key whose device is `default_output()` (`group_leader()`).
+    ///
+    /// `io.erl` passes the device **first** in every explicit-device arity — `put_chars/2`
+    /// (`io.erl:186`), `nl/1` (`:246`), `write/2` (`:289`), `fwrite/2,3` (`:361-374`) and
+    /// `format/3` (`:1350`) — and `request/2`/`requests/2` are the same protocol with the device
+    /// named by the caller.
+    pub(super) fn io_device_arg_index(function: &str, arity: u32) -> Option<usize> {
+        matches!(
+            (function, arity),
+            ("put_chars", 2)
+                | ("nl", 1)
+                | ("write", 2)
+                | ("fwrite", 2)
+                | ("fwrite", 3)
+                | ("format", 3)
+                | ("request", 2)
+                | ("requests", 2)
+        )
+        .then_some(0)
+    }
+    /// Whether `device` is a **live** io-device process this runtime does not own, so the call can
+    /// only be served by the in-machine `io.erl` body's `{io_request, …}` round trip
+    /// ([`Device::Unreachable`]).
+    ///
+    /// This is the **argument-aware** half of
+    /// [`RuntimeContext::io_routes_through_the_protocol`](crate::context::RuntimeContext):
+    /// that predicate decides by the *group leader* because the external-call seam never sees the
+    /// arguments, while the floor has them in hand and can classify the device itself. `file:open/2`
+    /// on a boot-script route hands out a **real** `file_io_server` process (`kernel_sup` starts
+    /// OTP's own `file_server_2`), so `io:format(Fd, …)` — `common_test`'s `ct_run` shape — is
+    /// exactly this case.
+    pub(super) fn io_device_needs_the_protocol(&self, device: Eterm) -> bool {
+        self.io_target(Some(device)) == Device::Unreachable
+    }
 
     /// The [`Device`] a request's **effective device** selects.
     ///
