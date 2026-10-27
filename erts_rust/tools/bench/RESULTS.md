@@ -5,6 +5,11 @@ This is the definitive summary of the **current** measurement session (`m19`, 20
 `results/m19-*`; regenerate with the Runbook (§7) rather than quoting a stale copy.
 Raw JSON is authoritative — this file never edits a metric value.
 
+**§9 is a later, narrower session (`m21`)**: it *adds* two workloads (`jsone`, `bbmustache`) and measures
+**only** those two, against a different oracle build (OTP 29.1.2 rather than m19's 29.1.1). It supersedes
+nothing in §0–§8 and restates no other workload's figure — read it as a new pair of rows, never as a
+re-run of the record.
+
 ## 0. The two sides, named
 
 | side | program | version |
@@ -25,6 +30,11 @@ in §2/§3 is transcribed from it), `m19-budgetprobe-all.json` + `.txt` and
 `m19-ext-{erlc_compiler,elixir_compiler,cowboy,khepri,plb}-r{1,2,3}.json` + `m19-ext-emqx.json` +
 `m19-ext-load.log` + `m19-ext-notes.md`, and — from the earlier activation stage —
 `m19-target-{plb,khepri,emqx,ext}.json` + `m19-target-notes.md`.
+
+§9's session (`m21`, the two eunit workloads only) is `results/m21-eunit-{sys,rust}-r{1..6}.json` (the
+twelve matched single-side `--quick` passes), `m21-eunit-ratios.txt` (the derived audit table every §9
+figure is transcribed from), `m21-eunit-load.log`, and the non-timing `--runtime all` budget/ledger pass
+`m21-eunit-budgetprobe-all.{json,txt}`.
 
 Two passes in this session are **not timing sources** and are labelled so wherever they appear: the
 `--runtime all` budget-evaluation pass (`m19-budgetprobe-all-cowboy.json`; runtime-major, i.e. all `sys`
@@ -359,6 +369,18 @@ BEAM_RT_TIER=interpreter taskset -c 3 setsid -w erts_rust/target/release/bench r
 
 # 6. diffs
 erts_rust/target/release/bench compare results/m19-xab-sys-r1.json results/m19-xab-rust-r1.json
+
+# 7. the two eunit workloads (m21, §9) — same matched-round shape, two ids, ~4 s per pass
+for r in 1 2 3 4 5 6; do
+  # alternate the side order round by round, exactly as in step 1
+  taskset -c 3 erts_rust/target/release/bench run --quick --runtime sys  --workloads jsone,bbmustache \
+      --out-file erts_rust/tools/bench/results/m21-eunit-sys-r$r.json
+  taskset -c 3 erts_rust/target/release/bench run --quick --runtime rust --workloads jsone,bbmustache \
+      --out-file erts_rust/tools/bench/results/m21-eunit-rust-r$r.json
+done
+# then the budget/ledger pass (both sides in one report; NOT a timing source) and its verbatim block:
+taskset -c 3 erts_rust/target/release/bench run --quick --runtime all --workloads jsone,bbmustache \
+    --out-file erts_rust/tools/bench/results/m21-eunit-budgetprobe-all.json
 ```
 
 The standing warnings, unchanged:
@@ -437,3 +459,83 @@ history, as do `m15-*`, `m14-*` and `m13-*`…`m4-*`/`b54-*`/`b55-*`. Every earl
 figures are **superseded by the current record** (a different load band and, for some cases, a different
 `N`; before m15, a different estimator) — never quote or diff them as current. Their external-target rows,
 load records and `baseline`/`slice` figures remain useful provenance.
+
+## 9. `jsone` + `bbmustache` — the two pure-Erlang eunit workloads (m21, new rows only)
+
+Two real-world pure-Erlang projects, each driven as its **own application test suite**: `jsone` (pure-Erlang
+JSON encode/decode) and `bbmustache` (pure-Erlang Mustache rendering). Both are staged read-only into a
+scratch copy, compiled once with the system `erlc`, then run as `eunit:test([…])` under **both** runtimes
+with the **identical argv**
+(`-noshell -pa <ebin> -eval 'case eunit:test([<mods>]) of ok -> halt(0); _ -> halt(1) end.'`) — so the
+suite, the OTP modules it calls and the work it does are the same on both sides, and the only variable is
+the runtime.
+
+**The suite result is a measured, verified agreement, not an assumption.** Every sampled run on every side
+printed the same summary line, and the driver refuses to publish a count that differs from the intended one
+(`90` / `79`) or from the other side's:
+
+| workload | eunit summary line, **both** sides, every run | `tests_passed` |
+|---|---|---|
+| `jsone` | `  All 90 tests passed.` | **90** |
+| `bbmustache` | `  All 79 tests passed.` | **79** |
+
+**The two sides, named (m21).** The oracle here is a **different OTP build than m19's 29.1.1**, so these
+rows are a self-consistent m21 pair — do not diff them against an m19 row and call the difference code:
+
+| side | program | version |
+|---|---|---|
+| **sys** | the oracle `erl` on `PATH` (`/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl`) | **Erlang/OTP 29.1.2 / erts-17.1.1** |
+| **rust** | `erts_rust/target/release/beam_rt`, default execution tier (native baseline JIT, lazily per function) | reports `otp_release` `30` |
+
+**Medians over the six matched single-side rounds** (transcribed from `results/m21-eunit-ratios.txt`; ratio
+= **median of the six per-round ratios**, not the ratio of medians — both are printed in that file):
+
+| workload | metric | sys | rust | rust/sys |
+|---|---|---|---|---|
+| `jsone` | `wall_ms` p50 | **408.04 ms** | **506.20 ms** | **1.2216×** |
+| `jsone` | `wall_ms` p99 | 434.39 ms | 513.53 ms | 1.2146× |
+| `jsone` | `compile_ms` (one `erlc` stage) | 494.41 | 502.84 | 0.9941 (sanity check only) |
+| `jsone` | `tests_passed` | **90** | **90** | 1.0000 |
+| `jsone` | OS peak RSS (`VmHWM`) | 71 907 328 B (71.91 MB) | 189 990 912 B (189.99 MB) | **2.6417×** |
+| `bbmustache` | `wall_ms` p50 | **359.93 ms** | **380.08 ms** | **1.0652×** |
+| `bbmustache` | `wall_ms` p99 | 399.09 ms | 397.58 ms | 1.0254× |
+| `bbmustache` | `compile_ms` (one `erlc` stage) | 296.49 | 294.72 | 0.9983 (sanity check only) |
+| `bbmustache` | `tests_passed` | **79** | **79** | 1.0000 |
+| `bbmustache` | OS peak RSS (`VmHWM`) | 64 380 928 B (64.38 MB) | 111 181 824 B (111.18 MB) | **1.7271×** |
+
+**Per-round stability** (the six per-round ratios, the load evidence behind each median):
+`jsone` p50 **1.1830 1.2141 1.2208 1.2224 1.2456 1.2622** (spread ±3 % of the median — the tightest
+cross-runtime row in the suite), p99 1.1265–1.2656; `bbmustache` p50 **1.0325 1.0491 1.0511 1.0794 1.0853
+1.1480**, p99 0.9303–1.1736 (a 3-sample quantile, so the tail row is the noisier of the two).
+
+**How to read these rows — the caveats travel with the numbers:**
+
+- **`wall_ms` is a whole-program time, not a per-unit figure.** One sample is one VM process running the
+  entire suite (≈0.35–0.5 s, of which a meaningful part is boot), three samples per pass (`--quick`;
+  `--full` takes ten). So the ratio is *dominated by suite execution but not isolated to it*, and it is
+  **not** comparable with the startup-cancelled per-unit rows of §3 (`ns/element`, `ns/op`).
+- **`tests_passed` is the contention-immune companion** — the deterministic counter for these workloads,
+  exactly as `case_*_ops`/`_calls`/`_elements` are for the loop workloads. It is `90`/`79` on **both** sides
+  of **all twelve** passes and of the `--runtime all` pass: `24/24` rows `ok`, nothing withheld, no `failed`
+  row, no `skipped` row (the runtime **is** supported for both projects — no `runtime-unsupported` skip and
+  no oracle-only figure).
+- **`compile_ms` is the same external `erlc` on both sides**, so its ratio sits at ~1.0 by construction; it
+  is recorded to prove the stage is bounded and to keep it out of `wall_ms`, never as a runtime comparison.
+  jsone's `erlc` emits a `nowarn_deprecated_catch` deprecation warning at **compile** time (exit 0); the row
+  quotes it in `notes` and does not treat it as a failure.
+- **The rust peak-RSS gap (2.64× `jsone`, 1.73× `bbmustache`) is a real whole-process footprint** and is
+  reported without softening — but it is a boot/load-dominated peak of a per-process measurement, so its
+  attribution belongs to the runtime (`crates/beam_rt/PERF.md`), not to this driver.
+- **The load record is not quiet:** 26 `/proc/loadavg` readings over the 13 passes span a 1-min load of
+  **9.59 → 14.62** (m19's band was 0.54–4.53). Read the ratios and `tests_passed`; never quote an absolute
+  wall time from this session as a constant.
+- **No budget row was added for either workload, deliberately.** The one equality-shaped quantity here
+  (`tests_passed` must match on both sides) does not fit the `AtMost`/`RatioAtMost` budget vocabulary, and
+  the Compute class already carries its first-pass regression alarm (`list_walk`, §8). So
+  `m21-eunit-budgetprobe-all.txt` honestly reads **0 met / 0 exceeded / 11 not measured**: the pass selected
+  only these two workloads, and no existing limit was re-tuned.
+- **Harness honesty for these two ids:** a missing checkout ⇒ `skipped(repo-missing)` (also what a bad
+  `--repo`/`$BENCH_JSONE_REPO`/`$BENCH_BBMUSTACHE_REPO` override produces), `erlc` absent ⇒
+  `skipped(erlc-absent)`, a checkout that will not compile ⇒ `failed(module-compile-failed)` with the
+  compiler's stderr quoted — never a skip; a count that disagrees with the intended one or with the other
+  side ⇒ `failed(...)` with **no metric published**.
