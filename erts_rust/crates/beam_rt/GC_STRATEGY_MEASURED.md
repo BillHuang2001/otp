@@ -192,6 +192,8 @@ The volatile per-round series (session B) — this is the **anti-order-effect** 
 | peak `VmHWM` | 17 656 kB | 17 564 kB | +12 | **1.001** |
 | wall | 2 073.8 ms | 2 291.0 ms | +244.5 | **1.119** |
 
+This `ets_copy` section is a **historical record** of the run that produced it — an earlier tree, whose peak 4 183 is not even a growth-table image — so its nursery rows (mean 1 406 / 1 039, peak 4 183 / 1 598) are that run's sampled capacities and are not re-measured here; re-run `tests/gc_strategy_classes.rs::c3_ets_copy_under_both_mature_strategies` for a current figure.
+
 Wall ratios across the three sessions: **1.123 / 1.119 / 1.124**; peak-RSS ratios **0.999 / 1.001 / 1.009**.
 `mature_capacity_words` is the *last sample*: the mark-region space reports block-granular capacity, so it ends
 at 7 × 256 = 1 792 words against the 2 048 configured (the arm's geometry is asserted through

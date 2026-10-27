@@ -146,13 +146,17 @@
 //!   (`should_grow`: `capacity < target` or `3 × capacity < 4 × target`) or above
 //!   `YOUNG_SHRINK_FACTOR` (8) × the target, and **keeps** it otherwise;
 //! * `HeapPolicy::young_after_collection_with_need` does the same against
-//!   `young_minor_target_words(live)` — once the young live set — with `MINOR_SHRINK_FLOOR_WORDS`
-//!   (3 000) as its broadened upper edge, so its band is `[target, max(3 000, 8 × target)]`.
+//!   `young_minor_target_words_with_need(live, need)` — the young live set once over plus the
+//!   growth request a copy-out's forced growth recorded — clamped above by the keep band's edge
+//!   `max(MINOR_SHRINK_FLOOR_WORDS /* 3 000 */, 8 × young_minor_target_words(live))`, so its band
+//!   is `[target, that edge]`.
 //!
-//! Both runs below come to rest **on** the fullsweep target (4 185 words; each run's last sample
-//! sits one fullsweep past the previous one), which that rule reproduces unchanged — so "the
-//! capacity a run settles on must be smaller than the largest it ever held" is not a law of the
-//! policy and never was. What *is* a consequence of the mechanism is that the **series** takes
+//! Both runs below come to rest **on** the same capacity (4 185 words) — the **carried** minor
+//! target, i.e. the `need`-augmented minor rule clamped by the keep band's upper edge, which the
+//! fullsweep rule keeps unchanged as well (the plain fullsweep target of this workload's ~768-word
+//! live set is 2 586 words, one growth-table step below it) — so "the capacity a run settles on
+//! must be smaller than the largest it ever held" is not a law of the policy and never was. What
+//! *is* a consequence of the mechanism is that the **series** takes
 //! more than one value: the workload runs both kinds of collection, each installs its own target,
 //! so the mean of the per-slice samples lies strictly below the largest sample. That — with
 //! `settled <= peak` beside it — is what `assert_measured` pins.
@@ -189,7 +193,8 @@
 //! come from (`→ nursery capacities (words × samples)`, ascending): Copying
 //! `233×1, 376×4, 610×2, 2 586×36, 4 185×22` of 65 samples, Immix `2 586×42, 4 185×23` of 65.
 //! Both runs therefore spend their time in the **same two consecutive growth-table steps** —
-//! 2 586 and 4 185 — and **come to rest on the same one** (4 185, the fullsweep target); they
+//! 2 586 (the plain fullsweep target) and 4 185 (the carried minor target) — and **come to rest on
+//! the same one** (4 185); they
 //! differ in the mix (58 of Copying's 65 samples in the two dominant steps against 65 of Immix's,
 //! and Copying's first samples still growing through 233/376/610). That mix is what makes the
 //! copying run collect 47 more times (605 against 558) while admitting the same allocation: its
@@ -344,11 +349,13 @@ struct Measured {
     settled_nursery_words: usize,
     /// The largest current-space nursery capacity observed at any slice boundary.
     ///
-    /// On this workload it is the capacity the **fullsweep** rule installs: both runs' last sample
-    /// sits one fullsweep past the previous one, and `HeapPolicy::young_after_fullsweep_with_need`
-    /// installs `young_target_words(live)` = `YOUNG_TARGET_LIVE_MULTIPLE` (2) × the whole-heap
-    /// live set. A run may legitimately come to **rest** on it as well (its keep band
-    /// `[⌈4/3 × target⌉, YOUNG_SHRINK_FACTOR × target]` reproduces `target` unchanged), which is
+    /// On this workload it is the **carried** minor target: a minor collapse spends the growth
+    /// request a copy-out's forced growth recorded (`Nursery::pending_growth_need` →
+    /// `minor_collapse_target`) through the `need`-augmented minor rule, clamped by the keep
+    /// band's upper edge, so it installs a larger
+    /// space than the plain live-set target. Both sizing rules keep that capacity unchanged (the
+    /// fullsweep band `[⌈4/3 × target⌉, YOUNG_SHRINK_FACTOR × target]` and the minor band
+    /// `[target, max(3 000, 8 × target)]` each reproduce a capacity inside them), which is
     /// why the pin is on the sampled series rather than on `peak > settled`.
     peak_nursery_words: usize,
     /// The distinct nursery capacities the per-slice samples took, as `(words, samples)` in
@@ -622,11 +629,13 @@ fn assert_measured(m: &Measured, expected: MatureKind) {
     //   `3 × capacity < 4 × target`) or when the capacity exceeds `YOUNG_SHRINK_FACTOR` (8) × the
     //   target — so its keep band is `[⌈4/3 × target⌉, 8 × target]`;
     // * a minor's `HeapPolicy::young_after_collection_with_need` does the same against
-    //   `young_minor_target_words(live)` (1 × the young live set), with `MINOR_SHRINK_FLOOR_WORDS`
-    //   as its broadened upper edge — its keep band is `[target, max(3 000, 8 × target)]`.
+    //   `young_minor_target_words_with_need(live, need)` (1 × the young live set plus the
+    //   growth request a copy-out's forced growth recorded), clamped above by
+    //   `MINOR_SHRINK_FLOOR_WORDS`/`YOUNG_SHRINK_FACTOR` × that target — its keep band is
+    //   `[target, max(3 000, 8 × target)]`.
     //
-    // A capacity equal to the fullsweep target therefore reproduces itself: it is a **fixed
-    // point** of the rule, so a run legitimately comes to rest *on* the fullsweep target and
+    // A capacity equal to either target therefore reproduces itself: it is a **fixed
+    // point** of the rule, so a run legitimately comes to rest *on* the carried minor target and
     // `peak == settled` is a convergence, not a defect. What the mechanism does guarantee is
     // movement — the samples are the run's own history of installed capacities, and a workload
     // that reaches both kinds of collection visits more than one of them — so the mean over the
@@ -724,8 +733,8 @@ fn the_runtime_shaped_workload_under_both_strategies() {
     // over (`young_target_words`), so a run that reaches more fullsweeps drives its nursery to the
     // larger fullsweep target more often — a larger **mean** capacity, and therefore fewer
     // collections to admit the same words. The mature generation reaches the nursery's sizing only
-    // through that escalation decision. (Both runs' *settled* capacity is the fullsweep target
-    // 4 185; what the mix moves is the series' mean, not the end state — see
+    // through that escalation decision. (Both runs' *settled* capacity is the carried minor
+    // target, 4 185; what the mix moves is the series' mean, not the end state — see
     // [the nursery-cycle pin](#the-nursery-cycle-pin-is-a-statement-about-the-series).)
     //
     // So the two counts are *not* compared to each other: a percentage band on them was a number
