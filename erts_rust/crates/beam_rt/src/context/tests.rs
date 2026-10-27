@@ -244,9 +244,51 @@ fn a_failed_calls_reason_atom_is_interned_into_the_shared_table() {
     );
 }
 
-/// The three shapes that must leave the shared table **byte-identical**: a capability gap (whose
-/// uncatchability is a CLI contract), an error with no nameable atom, and a name the boot seed
-/// already holds.
+/// A **capability gap** is named like any other raise, and it stays classified as one.
+///
+/// The naming is what makes the raise *land* in a live catch frame — the engine declines to
+/// spell a reason atom neither the live namespace nor the module snapshot knows, so before this
+/// every runtime diagnostic escaped a program's own `try … catch` and killed the process. The
+/// CLI's exit-3 rendering is a **classification** ([`crate::error::unsupported_reason`]), not a
+/// naming gate, so it is unchanged: this test pins both halves together, because the pair is the
+/// contract (catchable in user code, still `unsupported: …` when uncaught).
+#[test]
+fn a_capability_gaps_reason_atom_is_named_and_still_classified() {
+    use beam_common::{ExitReason, Raise};
+
+    let mut rt = runtime();
+    let name = "unsupported: some_future_feature";
+    assert!(
+        rt.atoms().lookup(name).is_none(),
+        "premise: the boot seed does not hold the name"
+    );
+    let base = rt.atoms().len();
+    let error = BeamError::Raise(Raise::error(ExitReason::atom(name)));
+    assert!(
+        crate::error::unsupported_reason(&error).is_some(),
+        "premise: the reason is a capability gap"
+    );
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.name_raise_reason_atom(&error);
+    }
+    assert_eq!(
+        rt.atoms().lookup(name).map(|atom| atom.raw() as usize),
+        Some(base),
+        "the gap's reason atom lands at exactly the index the interner predicted"
+    );
+    assert_eq!(rt.atoms().len(), base + 1);
+    // Classification is untouched by the naming: the CLI still reports the gap (exit 3) when
+    // nothing catches it.
+    assert_eq!(
+        crate::error::unsupported_reason(&error).as_deref(),
+        Some("some_future_feature"),
+        "naming a gap's reason atom never reclassifies it"
+    );
+}
+
+/// The two shapes that must leave the shared table **byte-identical**: an error with no nameable
+/// atom, and a name the boot seed already holds.
 #[test]
 fn a_failed_calls_reason_atom_is_left_alone_when_it_must_be() {
     use beam_common::{ExitReason, Raise};
@@ -254,13 +296,9 @@ fn a_failed_calls_reason_atom_is_left_alone_when_it_must_be() {
     let mut rt = runtime();
     let base = rt.atoms().len();
     let cases = [
-        // A capability gap must stay uncatchable: interning it would let a program's own
-        // `try … catch` swallow the runtime's honest gap.
-        BeamError::Raise(Raise::error(ExitReason::atom(
-            "unsupported_opcode: some_future_op",
-        ))),
         // No atom to name at all.
-        BeamError::TermNotFound,        BeamError::Raise(Raise::error(ExitReason::Structured)),
+        BeamError::TermNotFound,
+        BeamError::Raise(Raise::error(ExitReason::Structured)),
         // Already seeded at boot.
         BeamError::Raise(Raise::error(ExitReason::atom("badarg"))),
         BeamError::BadArith,
@@ -276,10 +314,6 @@ fn a_failed_calls_reason_atom_is_left_alone_when_it_must_be() {
             "`{error}` must not add an atom to the shared table"
         );
     }
-    assert!(
-        rt.atoms().lookup("unsupported_opcode: some_future_op").is_none(),
-        "a capability gap's reason atom stays unnameable, so it stays uncatchable"
-    );
 }
 
 #[test]

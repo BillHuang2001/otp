@@ -45,11 +45,11 @@
 //! another node is the typed capability gap `error:unsupported_bif`
 //! (`beam_bifs`'s `external_channel_gap`: an external identifier's leading component is the
 //! receiving VM's *node-table index*, which no term carries), and `~p`/`~w` of one has no
-//! external arm in this runtime's printer either. A capability gap is **uncatchable** — it
-//! is deliberately given a reason atom nothing interns, so a program's own
-//! `try … catch` cannot swallow the runtime's honest gap — which means the `try … catch`
-//! in [`FIXTURE_ERL`]'s `pid_text/1`/`ref_text/1` does **not** rescue a rust peer: it would
-//! terminate the actor with exit 3.
+//! external arm in this runtime's printer either. The `try … catch` in [`FIXTURE_ERL`]'s
+//! `pid_text/1`/`ref_text/1` therefore answers its fallback on a rust peer — `"remote-pid"` /
+//! `"remote-ref"`, where the oracle renders `<node.number.serial>` — because a capability gap's
+//! reason atom is interned like any other raise, so compiled code catches it
+//! (`tests/gap_raise_catch.rs`).
 //!
 //! So every actor and responder in section 4 asserts identity by **pattern match and
 //! `=:=`** against the handle it was handed, and prints only booleans, atoms and reasons.

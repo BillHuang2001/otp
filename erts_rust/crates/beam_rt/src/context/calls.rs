@@ -1375,15 +1375,24 @@ impl<'a> RuntimeContext<'a> {
     /// reason variant whose atom is likewise outside the boot seed is covered too:
     /// [`BeamError::Alloc`] names `out_of_memory` and is caught by the same hash lookup.
     ///
+    /// # Every atom-reasoned error is named, a capability gap included
+    ///
+    /// A **capability gap** ([`crate::error::unsupported_reason`]: a raise whose reason atom
+    /// starts with `unsupported`) is named here like any other raise. Leaving it unnameable
+    /// would let *any* runtime diagnostic escape a program's own `try … catch`, because the
+    /// engine declines to land a raise whose reason atom neither the live namespace nor the
+    /// module snapshot can spell — so a user-level `try` around a typed gap would kill the
+    /// process instead of observing `{error, Reason}`. The gap's **classification** is
+    /// [`crate::error::unsupported_reason`]'s job and is unchanged by the naming: an
+    /// **uncaught** gap raise still renders `beam_rt: unsupported: <reason>` on stderr and
+    /// still exits [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED), while a caught one is
+    /// the ordinary `error`-class exception the oracle would deliver.
+    ///
     /// # What is deliberately left alone
     ///
     /// * an error with **no** atom name (a live structured reason term, `TermNotFound`, `Io`, a
     ///   `Raise` whose [`ExitReason::Structured`](beam_common::ExitReason::Structured) slot holds
     ///   nothing nameable) — there is nothing to name;
-    /// * a **capability gap** ([`crate::error::unsupported_reason`]: every runtime diagnostic
-    ///   whose reason atom starts with `unsupported`) — those must stay **uncatchable**, or a
-    ///   program's own `try … catch` could swallow the runtime's honest gap and the CLI would
-    ///   report a wrong result instead of the `unsupported` exit code;
     /// * a name the shared table **already** holds (the overwhelmingly common case: every
     ///   core reason atom is seeded at boot) — one hash lookup, no borrow of the table, so the
     ///   cost of a raise that already lands is unchanged.
@@ -1398,9 +1407,6 @@ impl<'a> RuntimeContext<'a> {
         let Some(name) = name else {
             return;
         };
-        if crate::error::unsupported_reason(error).is_some() {
-            return;
-        }
         if self.runtime.code_server.atoms().lookup(name).is_some() {
             return;
         }

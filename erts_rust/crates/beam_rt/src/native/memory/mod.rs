@@ -1363,9 +1363,10 @@ impl RuntimeContext<'_> {
         // `Exiting`/`Terminated` window (the crash reporter runs *before* the reaper), so
         // treat that window as absent here too. Without this
         // `process_info(Pid, current_function)` on a just-dead neighbour raised the
-        // **uncatchable** `unsupported` capability gap — which `proc_lib:get_process_info/2`'s
-        // `try … catch _:_ -> undefined` cannot catch — and killed the crash reporter instead
-        // of letting it report the neighbour.
+        // `unsupported` capability gap and killed the crash reporter instead of letting it
+        // report the neighbour. (A gap is catchable now — `context/calls.rs` names its reason
+        // atom for the engine — but this window must still answer the oracle's `undefined`, so
+        // the fix stands on its own.)
         match process.state() {
             beam_process::ProcessState::Exiting | beam_process::ProcessState::Terminated => {
                 return None

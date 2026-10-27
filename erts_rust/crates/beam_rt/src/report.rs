@@ -304,7 +304,11 @@ mod tests {
         Runtime::with_defaults().expect("the default runtime")
     }
     /// An `error` raise carrying one frame with a source position.
-    fn error_with_frame(reason: &str) -> BeamError {
+    ///
+    /// `reason` is `&'static str` because `ExitReason::atom` converts through the
+    /// `From<&'static str> for AtomName` impl: a report's reason atom is a fixed name here,
+    /// never an owned string.
+    fn error_with_frame(reason: &'static str) -> BeamError {
         let mut stacktrace = StackTrace::new();
         let mut frame = StackFrame::new("crash1", "nested", 0);
         frame.location = Some(SourceLocation {
@@ -317,6 +321,11 @@ mod tests {
         )
     }
     /// The report body after the header line (the timestamp is not part of any assertion).
+    ///
+    /// The block ends with a **blank line** — the formatter's template appends one newline to
+    /// the emulator message's own (`=ERROR REPORT==== … ==\n` + `Error in process … value:\n` +
+    /// `Term\n` + `\n`), so the trailing empty line `lines()` yields is dropped here and the
+    /// block's own terminating shape is asserted by the caller that cares.
     fn body(text: &str) -> String {
         let mut lines = text.lines();
         let header = lines.next().expect("a header line");
@@ -330,14 +339,20 @@ mod tests {
             .trim_start_matches("=ERROR REPORT==== ")
             .trim_end_matches(" ===");
         let (date, time) = stamp.split_once("::").expect("date::time");
-        let (day, month, year) = date.split_once('-').expect("D-Mon-Y");
+        // `D-Mon-YYYY`: two separators, so the first split yields the day and the rest.
+        let (day, rest) = date.split_once('-').expect("D-Mon-Y");
+        let (month, year) = rest.split_once('-').expect("D-Mon-Y");
         assert!(day.parse::<u32>().is_ok(), "an unpadded day: {day}");
         assert_eq!(month.len(), 3, "the abbreviated month: {month}");
         assert_eq!(year.len(), 4, "a four-digit year: {year}");
         let (clock, micros) = time.split_once('.').expect("S.micros");
         assert_eq!(clock.split(':').count(), 3, "HH:MM:SS: {clock}");
         assert_eq!(micros.len(), 6, "microsecond precision: {micros}");
-        lines.collect::<Vec<_>>().join("\n")
+        lines
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end_matches('\n')
+            .to_string()
     }
     #[test]
     fn an_uncaught_error_reports_its_reason_and_stacktrace() {
@@ -356,7 +371,10 @@ mod tests {
                 pid_text(pid)
             )
         );
-        assert!(text.ends_with('\n'), "the terminating newline: {text:?}");
+        assert!(
+            text.ends_with("\n\n"),
+            "the block ends with the formatter's blank line: {text:?}"
+        );
     }
     #[test]
     fn an_uncaught_throw_is_reported_as_a_nocatch_error() {
@@ -437,10 +455,14 @@ mod tests {
         let mut rt = runtime();
         // The reason is rendered from the term the termination carries, never re-derived from
         // the error, so a structured reason keeps whatever the process built.
+        //
+        // The heap is **hoisted** out of the block: `reason` points into it, so a heap scoped to
+        // the block would be freed while the term is still read by the printer (the crash-report
+        // path is handed a term the caller owns and does not copy it).
+        let mut heap = Heap::new(16).expect("a scratch heap");
         let reason = {
             let badkey = rt.intern("badkey");
             let key = rt.intern("nokey");
-            let mut heap = Heap::new(8).expect("a scratch heap");
             heap.tuple(&[badkey, key]).expect("the reason tuple")
         };
         let mut stacktrace = StackTrace::new();
