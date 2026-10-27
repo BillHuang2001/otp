@@ -38,6 +38,13 @@ A provider is asked **once per `Local` fun the walk reaches** (a closure nested 
 included), answers `Ok(None)` for "I cannot attribute this term", and may report its own failure
 (`TermResult`), so a failing provider surfaces its own error instead of a substituted hash.
 
+### The internal-reference operand (`internal_ref_hash_word`)
+The C mixes `internal_ref_numbers(t)[0]` (`erl_term_hashing.c:288-290` for `make_hash`, `:1454-1458` for `make_hash2`), the low `u32` of the reference's **node container** — `id & REF_MASK`, its 18-bit wire number.
+The M1 internal-reference thing carries no node container: it is `[make_header(3, REF_SUBTAG), node, serial, id]` with `node`/`serial` zeroed, so its whole identity is the `id` word `beam_common::next_ref_id` mints and `boxed::internal_ref_id` reads back.
+A literal port would therefore mix `0` for every local reference of a process, collapsing `phash2/1`'s 27-bit result onto one value and making every `dict`/`gb_trees` keyed by a reference collide.
+The substitution mixes the **id word's low 32 bits** in the C's `UINT32_HASH_RET`/`UINT32_HASH` shape (nothing of the identity dropped, same `u32` width the macros take), and is the single definition in `common.rs` both ports call.
+Two consequences are deliberate: the value is **not oracle-comparable** (ERTS's own id comes from its per-VM reference space, so no two VMs agree even on the C's exact formula — only structural properties are asserted), and an internal reference does not join the bucket of an **external** spelling of the same wire numbers (the external arm keeps the C-exact `num[0]`, since a wire id array genuinely is packed).
+A `REF_SUBTAG` thing of any other layout (a C-layout `ErtsORefThing`, header arity 2, no id word) is the typed `TermError::BadRef` — a shape failure, never a mixed-in zero.
 ### `term_hash` — internal, NOT compatibility-pinned
 `term_hash(a, atoms) -> u64` is deterministic and guarantees only `eq(a,b,atoms) ⇒ equal hashes`; its exact
 values are not part of any contract.
