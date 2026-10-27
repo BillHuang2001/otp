@@ -853,12 +853,12 @@ unsafe fn retain_object_if_alive(obj: *mut c_void) -> bool {
     // SAFETY: `obj` is a payload pointer, so its header is the `RESOURCE_HEADER_SIZE` bytes before it
     // and lies in the same live block (caller contract).
     let header = unsafe { header_ptr(obj) };
-    // SAFETY: `header` points at a live block; `fetch_update` reads and conditionally writes the count
+    // SAFETY: `header` points at a live block; `try_update` reads and conditionally writes the count
     // atomically, so a concurrent release cannot interleave between the test and the increment.
     unsafe {
         (*header)
             .refcount
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count != 0).then_some(count + 1)
             })
     }
@@ -873,7 +873,7 @@ unsafe fn retain_object_if_alive(obj: *mut c_void) -> bool {
 /// (synchronously, see [`destroy`]) and the block was freed. `false` means the count was already
 /// **zero**: the object is dying, so nothing is dropped and a second destructor can never run.
 ///
-/// The decrement is a `fetch_update`, not a `fetch_sub`, so a concurrent release can neither underflow
+/// The decrement is a `try_update`, not a `fetch_sub`, so a concurrent release can neither underflow
 /// the count nor drive an already-destroyed object's destructor twice.
 ///
 /// # Safety
@@ -886,16 +886,16 @@ unsafe fn release_object_if_alive(obj: *mut c_void) -> bool {
     // SAFETY: `obj` is a payload pointer, so its header is the `RESOURCE_HEADER_SIZE` bytes before it
     // and lies in the same live block (caller contract).
     let header = unsafe { header_ptr(obj) };
-    // The pre-decrement count of the *committed* update. `fetch_update` may run the closure more than
+    // The pre-decrement count of the *committed* update. `try_update` may run the closure more than
     // once (one retry per lost race) and the invocation whose result is stored is always the last one,
     // so this cell holds exactly the value the successful CAS matched.
     let previous = core::cell::Cell::new(0usize);
-    // SAFETY: `header` points at a live block; `fetch_update` reads and conditionally writes the count
+    // SAFETY: `header` points at a live block; `try_update` reads and conditionally writes the count
     // atomically, so a concurrent release cannot interleave between the test and the decrement.
     let dropped = unsafe {
         (*header)
             .refcount
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 previous.set(count);
                 (count != 0).then(|| count - 1)
             })
