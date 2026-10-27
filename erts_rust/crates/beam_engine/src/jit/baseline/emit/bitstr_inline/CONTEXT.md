@@ -175,6 +175,15 @@ The source gate is **any byte-aligned bitstring window** — an on-heap `ErlHeap
   `raw::make_binary` **allocates** a fresh result (an on-heap `ErlHeapBits` or the refc pair)
   through the rooted seam, which a straight-line helper-free sequence cannot do without an
   admission point. It stays on `jit_bitstr`.
+  This is a deliberate refusal, not an unexplored gap: a fresh build's payload is a *new* term, so
+  any lowering of it is one **rooted helper call** plus two frame-window guards — a *dispatch*
+  change, not a *build* change — and the family route it would displace is already the prepared
+  program's one allocation. Measured on the only `foreign` kernel carrying the shape
+  (`emqx_base62:decode/2`, three temps per call), such an arm is a **wash**: within ±0.05 % of the
+  family path it replaces, because the helper call costs what the dispatch it removes costs.
+  A cheaper `decode` needs a cheaper *build* (the allocation and the match path), never a cheaper
+  dispatch; the figures and the isolating probe are
+  `../../../../MEASURED.md`'s "rejected fresh whole-byte `bs_create_bin` arm" block.
 - **`BitGranular` + `ConstBytes`** in one plan: refused by the predicate (`CreateBinShape::of`
   -> `None`), because the aligned half would commit a window end before the bit fields have
   passed their own room check.

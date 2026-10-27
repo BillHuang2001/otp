@@ -439,7 +439,7 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
                 .map_or(false, |shape| shape.uses_y())
         }
         Instr::BsCreateBin { dst, segments, .. } => {
-            super::bitstr_inline::CreateArm::of(module, dst, segments)
+            super::bitstr_inline::CreateBinShape::of(module, dst, segments)
                 .map_or(false, |shape| shape.uses_y())
         }
         Instr::BsMatchString {

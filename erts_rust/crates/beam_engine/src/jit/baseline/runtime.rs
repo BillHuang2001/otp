@@ -38,11 +38,10 @@ use std::mem;
 
 use beam_common::BeamError;
 use beam_loader::{ImportRef, Instr, Module};
-use beam_term::{is_small, signed_value, Eterm};
+use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::families::bitstrings::create::seam;
 use crate::machine::{Continuation, Machine};
 use crate::Step;
 
@@ -2551,107 +2550,6 @@ pub(crate) extern "C" fn jit_test_heap(
         Ok(()) => encode_target(func, pc + 1),
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
-}
-
-/// The **fresh whole-byte `bs_create_bin`** helper: build `Dst = <<Value:N>>` for one
-/// whole-byte field of `nbytes` (`1..=8`) bytes, or hand the instruction to the
-/// interpreter's own step.
-///
-/// The shape ([`seam::fresh_plan`]) is the compiler's temp binary — `emqx_base62:decode/2`'s
-/// `<<DecodeChar>>` — whose entire payload is the value's low `nbytes * 8` bits, MSB
-/// first. The term is built through
-/// [`make_heap_binary_rooted`](crate::terms::make_heap_binary_rooted), the same rooted
-/// reservation every other construction arm uses (`RootSet::ALL_LIVE`), so a collecting
-/// host admits it exactly as it admits the family's own `raw::make_binary`, and the result
-/// is word-identical to the family's on-heap `ErlHeapBits` — including the on-heap-vs-refc
-/// decision, because a fresh field is at most one machine word (8 bytes), far below
-/// [`beam_term::ERL_ONHEAP_BINARY_LIMIT`](beam_term::ERL_ONHEAP_BINARY_LIMIT).
-///
-/// **Every decline is the interpreter's own step**, never a substituted term: an
-/// instruction that is no longer this shape, a value operand whose read would allocate (a
-/// bignum constant), a non-small value, a negative or too-wide value (whose truncation the
-/// family — or the oracle's `badarg` — decides), or a built term the rooted door refuses.
-/// Nothing is committed before the destination write, so a decline leaves the machine
-/// untouched for [`jit_step_one`]'s re-execution of the whole instruction.
-pub(crate) extern "C" fn jit_fresh_heap_binary(
-    rt: *mut JitRuntime<'_>,
-    func: u32,
-    pc: u32,
-    nbytes: u32,
-) -> i64 {
-    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
-    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
-    // holds points at an object the driver owns and keeps alive for the whole loop.
-    let runtime = unsafe { &mut *rt };
-    let built = {
-        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`;
-        // no other `&mut Machine` exists while the helper runs (the driver is blocked in
-        // the block call that reached us).
-        let machine = unsafe { &mut *runtime.machine };
-        // SAFETY: `runtime.module` points at the module the driver is running, which
-        // outlives the loop.
-        let module = unsafe { &*runtime.module };
-        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as
-        // a raw pointer; the driver holds no `&mut` to it while the helper runs.
-        let ctx = unsafe { &mut *runtime.ctx };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
-        build_fresh_binary(machine, module, ctx, func, pc, nbytes as usize)
-    };
-    match built {
-        Some(()) => encode_target(func, pc + 1),
-        None => jit_step_one(rt, func, pc),
-    }
-}
-
-/// The Rust body of [`jit_fresh_heap_binary`] — separate from the `extern "C"` helper so the
-/// runtime borrows are provably dead before the exit path hands the instruction back to
-/// [`jit_step_one`] (the same split `super::bif_helper` uses).
-///
-/// `Some(())` = the built term is in the destination; `None` = the interpreter's own step.
-fn build_fresh_binary(
-    machine: &mut Machine,
-    module: &Module,
-    ctx: &mut dyn ExecutionContext,
-    func: u32,
-    pc: u32,
-    nbytes: usize,
-) -> Option<()> {
-    let instr = module
-        .functions
-        .get(func as usize)
-        .and_then(|function| function.code.get(pc as usize))?;
-    let Instr::BsCreateBin { dst, segments, .. } = instr else {
-        return None;
-    };
-    // The shape, re-derived from the very module image the code was sealed from: an
-    // instruction the plan no longer recognises (or one whose width moved) is the
-    // interpreter's step, never a wrongly sized binary.
-    let plan = seam::fresh_plan(module, segments)?;
-    if plan.nbytes != nbytes {
-        return None;
-    }
-    // A non-small `Integer` operand would make `read_operand` materialize a bignum (an
-    // allocation outside the built term) — not this fast path.
-    if !super::bif_helper::read_is_allocation_free(&plan.value) {
-        return None;
-    }
-    let term = crate::operand::read_operand(machine, ctx, &plan.value).ok()?;
-    if !is_small(term) {
-        return None;
-    }
-    let value = signed_value(term);
-    // The family writes the value's low `nbytes * 8` bits, MSB first. Accept exactly the
-    // non-negative values that fit in the field, so any other value keeps the family's own
-    // (possibly raising) path rather than this truncation.
-    if value < 0 || (nbytes < 8 && value >= (1i64 << (8 * nbytes as u32))) {
-        return None;
-    }
-    let be = (value as u64).to_be_bytes();
-    // The build may collect: the destination write re-reads its slot afterwards (and the
-    // payload is the helper's own copy of the bytes), so no pre-collection pointer survives.
-    let built = crate::terms::make_heap_binary_rooted(machine, ctx, &be[8 - nbytes..]).ok()?;
-    crate::operand::write_operand(machine, dst, built).ok()
 }
 
 /// The **`trim`** helper: shrink the current frame with the interpreter's exact

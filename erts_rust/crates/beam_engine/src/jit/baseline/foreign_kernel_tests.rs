@@ -1488,6 +1488,17 @@ fn the_to_lower_append_construction_lowers_its_y_slot_accumulator() {
 /// family route is a `claimed` helper arm, not an `emit_deopt`, so it reads 0 whether or not a
 /// build lowers. The load-bearing evidence is the `SHAPE_CREATE_BIN` `inlined` delta over a
 /// cache-free compile plus the per-build `CreateBinShape::of` verdicts.
+///
+/// **The `(lowered, declined) == (2, 4)` split is total for a reason, not by luck.** There is
+/// exactly one arm decision (`CreateBinShape::of` -> `Some(route)`/`None`), so every instance
+/// gets a verdict, and the four declined ones are accounted for by name rather than left over:
+/// the three `<<DecodeChar>>` **fresh whole-byte** builds and the one runtime-width append. The
+/// fresh shape has no arm *deliberately* — a fresh build is a new term, so lowering it is one
+/// rooted helper call plus two frame-window guards, a *dispatch* change displaced against the
+/// family's single allocation, and it was built, measured a wash (±0.05 % on this kernel) and
+/// rejected; the figures and the isolating probe are `MEASURED.md`'s "rejected fresh whole-byte
+/// `bs_create_bin` arm" block. A fresh build landing here later must therefore update this row
+/// (and the `(appends, wrappers)` row below) rather than silently pass it.
 #[test]
 fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtime_width() {
     let Some(staged) = stage_or_skip("base62_decode_create_bin", &EMQX) else {
@@ -1554,8 +1565,9 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
     assert_eq!(
         (lowered, declined),
         (2, 4),
-        "decode/2: the two 6-bit appends are lowered and the other four instances (the three \
-         `<<DecodeChar>>` wrappers and the runtime-width append) stay where they were"
+        "decode/2: the two 6-bit appends are lowered and the other four instances stay where \
+         they were — the three `<<DecodeChar>>` fresh whole-byte builds (a deliberate refusal, \
+         `MEASURED.md`) and the runtime-width append"
     );
     assert_eq!(
         lowered, lowered_instances,

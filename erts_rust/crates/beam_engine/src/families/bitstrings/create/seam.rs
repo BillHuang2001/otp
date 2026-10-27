@@ -53,17 +53,6 @@
 //! [`open_append_any`] on a shape the family never enters is exactly as harmless as a
 //! speculative read).
 //!
-//! # The second shape: a **fresh** whole-byte build
-//!
-//! [`fresh_plan`] answers the first question for the compiler's *other* construction
-//! shape — one segment and **no** accumulator, `<<Value:N>>` with a static whole-byte `N`
-//! (the temp `<<DecodeChar>>` of a base62 decoder, the one-byte binary a JSON writer hands
-//! to `erlang:iolist_to_binary/1`). It shares [`plan_field`] with [`append_plan`], so the
-//! two recognise exactly the same field shapes and a lowering cannot tell the routes
-//! apart by what they accept; the only difference is that a fresh build's payload is the
-//! value's low `N * 8` bits **MSB-first with no prefix**, so a tier writes it with one
-//! big-endian truncation instead of a field at an offset.
-//!
 //! # Two-level gating — neither side decides for the other
 //!
 //! * The **family** owns *what the shape means*: [`append_plan`] answers `Some` only for
@@ -234,111 +223,6 @@ pub(crate) struct AppendPlan {
     pub(crate) binary_all: Option<Operand>,
 }
 
-/// The one field a `(segment, group)` pair writes, with its width in bits — or `None` when
-/// its shape is not one a lowering may emit bytes for.
-///
-/// Shared by [`append_plan`] and [`fresh_plan`] so both recognise **exactly** the same
-/// field shapes: a byte-for-byte identical term must not depend on which route a build
-/// takes.
-fn plan_field(module: &Module, segment: &PreparedSeg, group: &[Operand]) -> Option<(Field, u32)> {
-    let field = match segment {
-        // A 1/2/4/8-byte field: prepare settled the width and the store shape.
-        PreparedSeg::ByteInt {
-            value,
-            bytes,
-            little: false,
-        } => {
-            let flags = decode_flags(module, &group[3]).ok()?;
-            if flags & (BSF_LITTLE | BSF_SIGNED | BSF_NATIVE) != 0 {
-                return None;
-            }
-            Field::Bits {
-                value: locatable_operand(value)?,
-                bits: u32::from(*bytes) * 8,
-            }
-        }
-        // Any other static width (1..=64 bits, whole-byte or bit-granular): accepted
-        // with no flag that changes the layout, because a `Bits` field is written
-        // MSB-first as the value's low `nbits` bits either way.
-        PreparedSeg::Integer {
-            flags,
-            value,
-            width: Width::Imm(nbits),
-        } => {
-            if *flags & (BSF_LITTLE | BSF_SIGNED | BSF_NATIVE) != 0 {
-                return None;
-            }
-            if *nbits == 0 || *nbits > 64 {
-                return None;
-            }
-            Field::Bits {
-                value: locatable_operand(value)?,
-                bits: *nbits as u32,
-            }
-        }
-        // A `string` constant: its window is already resolved and range-checked, so
-        // the bytes are a compile-time fact.
-        PreparedSeg::String { start, end } => Field::ConstBytes {
-            bytes: module.strings.get(*start..*end)?.to_vec(),
-        },
-        // Everything else: an `append`, `binary`, `float`, `utf*`, a dynamic or
-        // `all` width, a second `private_append` — not this shape.
-        _ => return None,
-    };
-    let field_bits = match &field {
-        Field::Bits { bits, .. } => *bits,
-        // A `StrT` window is a whole number of bytes (`prepare` resolves it from a
-        // byte offset and a byte count).
-        Field::ConstBytes { bytes } => u32::try_from(bytes.len()).ok()?.checked_mul(8)?,
-    };
-    Some((field, field_bits))
-}
-
-/// The compile-time half of a **fresh** whole-byte build: one integer segment and no
-/// accumulator (`<<Value:N>>`, the compiler's temp `<<DecodeChar>>` in
-/// `emqx_base62:decode/2`).
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FreshPlan {
-    /// The field's value operand, exactly as the instruction carries it.
-    pub(crate) value: Operand,
-    /// The field's width in **bytes** (`1..=8`, a whole number of bytes by construction).
-    pub(crate) nbytes: usize,
-}
-
-/// Recognise a **fresh** whole-byte build and resolve its one field, or `None`.
-///
-/// The shape is exactly one segment that [`plan_field`] accepts as a [`Field::Bits`] whose
-/// width is a positive whole number of **bytes** and at most one machine word: on that
-/// shape the value's low `nbytes * 8` bits are the built term's whole payload, MSB first,
-/// so a lowering reproduces the family's bytes with one big-endian truncation. The
-/// endianness/signedness flags are already refused by [`plan_field`], and a bit-granular
-/// width is refused here (it has no whole-byte payload to truncate).
-///
-/// A `string`-only build is refused: its payload is a compile-time constant, so it is a
-/// literal rather than a value the build reads at run time, and no fresh arm writes one.
-pub(crate) fn fresh_plan(module: &Module, segments: &[Operand]) -> Option<FreshPlan> {
-    let program = prepare(module, segments)?;
-    // Exactly one segment: a second one is an accumulator build ([`append_plan`]'s shape)
-    // or a list no single-field lowering reproduces.
-    let mut prepared = program.segments.iter();
-    let (segment, group) = prepared.next().zip(first_group(segments))?;
-    if prepared.next().is_some() {
-        return None;
-    }
-    let (field, bits) = plan_field(module, segment, group)?;
-    // A `string` constant is not a field value; only a run-time integer is this shape.
-    let Field::Bits { value, .. } = field else {
-        return None;
-    };
-    if bits == 0 || bits > 64 || bits % 8 != 0 {
-        return None;
-    }
-    Some(FreshPlan {
-        value,
-        nbytes: (bits / 8) as usize,
-    })
-}
-
 /// The compile-time half: recognise an in-place accumulator `bs_create_bin` and resolve
 /// its fields, or `None` when the shape is not one a lowering may emit bytes for.
 ///
@@ -392,7 +276,58 @@ pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<Appen
     // field is indistinguishable from an unsigned one there, and a `Bits` field a
     // lowering writes MSB-first as an unsigned value must never be signed.
     for (segment, group) in prepared.zip(segment_groups(segments)) {
-        let (field, field_bits) = plan_field(module, segment, group)?;
+        let field = match segment {
+            // A 1/2/4/8-byte field: prepare settled the width and the store shape.
+            PreparedSeg::ByteInt {
+                value,
+                bytes,
+                little: false,
+            } => {
+                let flags = decode_flags(module, &group[3]).ok()?;
+                if flags & (BSF_LITTLE | BSF_SIGNED | BSF_NATIVE) != 0 {
+                    return None;
+                }
+                Field::Bits {
+                    value: locatable_operand(value)?,
+                    bits: u32::from(*bytes) * 8,
+                }
+            }
+            // Any other static width (1..=64 bits, whole-byte or bit-granular): accepted
+            // with no flag that changes the layout, because a `Bits` field is written
+            // MSB-first as the value's low `nbits` bits either way.
+            PreparedSeg::Integer {
+                flags,
+                value,
+                width: Width::Imm(nbits),
+            } => {
+                if *flags & (BSF_LITTLE | BSF_SIGNED | BSF_NATIVE) != 0 {
+                    return None;
+                }
+                if *nbits == 0 || *nbits > 64 {
+                    return None;
+                }
+                Field::Bits {
+                    value: locatable_operand(value)?,
+                    bits: *nbits as u32,
+                }
+            }
+            // A `string` constant: its window is already resolved and range-checked, so
+            // the bytes are a compile-time fact.
+            PreparedSeg::String { start, end } => Field::ConstBytes {
+                bytes: module.strings.get(*start..*end)?.to_vec(),
+            },
+            // Everything else: an `append`, `binary`, `float`, `utf*`, a dynamic or
+            // `all` width, a second `private_append` — not this shape.
+            _ => return None,
+        };
+        let field_bits = match &field {
+            Field::Bits { bits, .. } => *bits,
+            // A `StrT` window is a whole number of bytes (`prepare` resolves it from a
+            // byte offset and a byte count).
+            Field::ConstBytes { bytes } => {
+                u32::try_from(bytes.len()).ok()?.checked_mul(8)?
+            }
+        };
         tail_bits = tail_bits.checked_add(field_bits)?;
         fields.push(field);
     }
@@ -549,13 +484,6 @@ fn append_unit_allows(position_bits: usize, unit: usize) -> bool {
 /// with the prepared segments it is paired with.
 fn segment_groups(segments: &[Operand]) -> impl Iterator<Item = &[Operand]> {
     segments.chunks_exact(SEGMENT_OPERANDS).skip(1)
-}
-
-/// The **first** operand group — the accumulator's own on an accumulator build, the only
-/// segment's on a fresh one. `None` for a list shorter than one group (which `prepare`
-/// refuses anyway).
-fn first_group(segments: &[Operand]) -> Option<&[Operand]> {
-    segments.chunks_exact(SEGMENT_OPERANDS).next()
 }
 
 /// The operand itself when it addresses a register a lowering can bind without a
