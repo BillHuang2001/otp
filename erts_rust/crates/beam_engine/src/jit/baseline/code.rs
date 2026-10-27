@@ -110,12 +110,16 @@ enum Layout {
 struct EagerLayout {
     /// The sealed code mapping every entry points into.
     buffer: CodeBuffer,
-    /// The native entry point of the block starting at `[func][pc]`, or `None` when
+    /// The native entry point of the block starting at `[func][pc]`, or null when
     /// that address compiled no block. A flat index (not a `HashMap`) because the
     /// driver probes it on every cross-block jump.
-    entries: Vec<Vec<Option<*const u8>>>,
+    ///
+    /// A null **sentinel** rather than `Option<*const u8>`: `Option<*const u8>` is 16
+    /// bytes on this toolchain (a raw pointer carries no null niche), so the sentinel
+    /// halves every table and drops the tag load from the hot probe.
+    entries: Vec<Vec<*const u8>>,
     /// The native entry point of the **continuation sub-block** starting at `[func][pc]`,
-    /// or `None` (indexed `[func][pc]`).
+    /// or null (indexed `[func][pc]`).
     ///
     /// The eager twin of [`CompiledFunction::sub_entries`]: the `pc + 1` a
     /// frame-preserving call stores in the live frame is generally *not* a block start
@@ -125,7 +129,7 @@ struct EagerLayout {
     /// IR-block start always wins.
     ///
     /// [`Instr::Label`]: beam_loader::Instr::Label
-    sub_entries: Vec<Vec<Option<*const u8>>>,
+    sub_entries: Vec<Vec<*const u8>>,
     /// The whole-module register/block summary.
     summary: Summary,
 }
@@ -158,11 +162,11 @@ struct LazyLayout {
 pub(crate) struct CompiledFunction {
     /// This function's sealed code mapping.
     pub(crate) buffer: CodeBuffer,
-    /// The native entry point of the block starting at `pc`, or `None` (indexed by
+    /// The native entry point of the block starting at `pc`, or null (indexed by
     /// `pc`, so the driver's block probe stays two `Vec` loads).
-    pub(crate) entries: Vec<Option<*const u8>>,
+    pub(crate) entries: Vec<*const u8>,
     /// The native entry point of the **continuation sub-block** starting at `pc`, or
-    /// `None` (indexed by `pc`).
+    /// null (indexed by `pc`).
     ///
     /// The loader cuts a function into blocks only at [`Instr::Label`]s, so the `pc + 1`
     /// a frame-preserving call stores in the live frame — where the driver resumes once
@@ -173,7 +177,7 @@ pub(crate) struct CompiledFunction {
     /// only after `entries` came up empty, so a compiled IR-block start always wins.
     ///
     /// [`Instr::Label`]: beam_loader::Instr::Label
-    pub(crate) sub_entries: Vec<Option<*const u8>>,
+    pub(crate) sub_entries: Vec<*const u8>,
     /// This function's own register/block summary.
     pub(crate) summary: Summary,
 }
@@ -232,8 +236,8 @@ impl CompiledModule {
     /// the pre-split guard gave (see [`CompiledModule::native_entry`]).
     pub(crate) fn eager(
         buffer: CodeBuffer,
-        entries: Vec<Vec<Option<*const u8>>>,
-        sub_entries: Vec<Vec<Option<*const u8>>>,
+        entries: Vec<Vec<*const u8>>,
+        sub_entries: Vec<Vec<*const u8>>,
         summary: Summary,
         labels: crate::interpreter::LabelMap,
         fingerprint: Option<u64>,
@@ -683,8 +687,8 @@ impl CompiledModule {
             Layout::Eager(eager) => {
                 let mut blocks: Vec<(usize, u32, u32)> = Vec::new();
                 for (func, row) in eager.entries.iter().enumerate() {
-                    for (pc, slot) in row.iter().enumerate() {
-                        if let Some(entry) = slot {
+                    for (pc, entry) in row.iter().enumerate() {
+                        if !entry.is_null() {
                             blocks.push((*entry as usize, func as u32, pc as u32));
                         }
                     }
@@ -706,7 +710,7 @@ impl CompiledModule {
                     let Some(function) = slot else { continue };
                     let mut blocks: Vec<(usize, u32, u32)> = Vec::new();
                     for (pc, entry) in function.entries.iter().enumerate() {
-                        if let Some(entry) = entry {
+                        if !entry.is_null() {
                             blocks.push((*entry as usize, func as u32, pc as u32));
                         }
                     }
@@ -757,7 +761,7 @@ fn eager_entry(eager: &EagerLayout, func: u32, pc: u32) -> Option<*const u8> {
         .get(func as usize)?
         .get(pc as usize)
         .copied()
-        .flatten()
+        .filter(|p| !p.is_null())
     {
         return Some(entry);
     }
@@ -766,7 +770,7 @@ fn eager_entry(eager: &EagerLayout, func: u32, pc: u32) -> Option<*const u8> {
         .get(func as usize)?
         .get(pc as usize)
         .copied()
-        .flatten()
+        .filter(|p| !p.is_null())
 }
 
 /// The lazy block-table probe for one already-compiled function: `entries[pc]` first (so
@@ -781,8 +785,14 @@ fn lazy_entry(function: &CompiledFunction, pc: u32) -> Option<*const u8> {
         .entries
         .get(pc as usize)
         .copied()
-        .flatten()
-        .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())
+        .filter(|p| !p.is_null())
+        .or_else(|| {
+            function
+                .sub_entries
+                .get(pc as usize)
+                .copied()
+                .filter(|p| !p.is_null())
+        })
 }
 /// Turn `blocks` — `(address, func, pc)` in ascending address order, all inside the
 /// mapping that ends at `end` — into contiguous [`CodeRegion`]s named from `module`.

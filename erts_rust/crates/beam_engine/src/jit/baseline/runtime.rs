@@ -324,13 +324,17 @@ pub(crate) struct EntryTables {
     /// The function these tables belong to — a continuation in **another** function is a
     /// different mapping, which only the driver may switch to.
     pub(crate) func: u32,
-    /// `entries[pc]`: the block's native entry, or `None` for an address this function
+    /// `entries[pc]`: the block's native entry, or null for an address this function
     /// compiled no block start for.
-    pub(crate) entries: *const Option<*const u8>,
+    ///
+    /// A null **sentinel** rather than `Option<*const u8>` (16 bytes on this toolchain —
+    /// a raw pointer carries no null niche), so the table is half the width and the probe
+    /// pays no tag load.
+    pub(crate) entries: *const *const u8,
     /// The number of slots in `entries` (the function's code length).
     pub(crate) entries_len: usize,
-    /// `sub_entries[pc]`: the **continuation sub-block** starting at `pc`, or `None`.
-    pub(crate) sub_entries: *const Option<*const u8>,
+    /// `sub_entries[pc]`: the **continuation sub-block** starting at `pc`, or null.
+    pub(crate) sub_entries: *const *const u8,
     /// The number of slots in `sub_entries`.
     pub(crate) sub_entries_len: usize,
 }
@@ -360,8 +364,8 @@ impl EntryTables {
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
     pub(crate) fn of(
         func: u32,
-        entries: &[Option<*const u8>],
-        sub_entries: &[Option<*const u8>],
+        entries: &[*const u8],
+        sub_entries: &[*const u8],
     ) -> EntryTables {
         EntryTables {
             func,
@@ -385,15 +389,19 @@ impl EntryTables {
         if pc < self.entries_len {
             // SAFETY: `entries` points at the `entries_len`-slot vector of the compiled
             // function this table was published for (see the struct docs), and `pc` is in
-            // bounds of it.
-            if let Some(entry) = unsafe { *self.entries.add(pc) } {
+            // bounds of it. A slot is null when that address compiled no block start.
+            let entry = unsafe { *self.entries.add(pc) };
+            if !entry.is_null() {
                 return Some(entry);
             }
         }
         if pc < self.sub_entries_len {
             // SAFETY: as above — `sub_entries` points at that function's
             // `sub_entries_len`-slot continuation table and `pc` is in bounds of it.
-            return unsafe { *self.sub_entries.add(pc) };
+            let entry = unsafe { *self.sub_entries.add(pc) };
+            if !entry.is_null() {
+                return Some(entry);
+            }
         }
         None
     }

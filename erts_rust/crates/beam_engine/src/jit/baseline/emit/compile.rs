@@ -62,18 +62,18 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     // the hot path of every cross-block jump — a `fib`-style loop re-enters the driver
     // once per iteration — so SipHash on a `(u32, u32)` key is a measurable share of the
     // run. Two indexed `Vec` loads replace it.
-    let mut entries: Vec<Vec<Option<*const u8>>> = module
+    let mut entries: Vec<Vec<*const u8>> = module
         .functions
         .iter()
-        .map(|function| vec![None; function.code.len()])
+        .map(|function| vec![std::ptr::null(); function.code.len()])
         .collect();
     // The eager twin of the lazy layout's `CompiledFunction::sub_entries`: the native
     // entry of the continuation sub-block starting at `[func][pc]`, filled by
     // [`emit_shared_sub_blocks`] after every IR block (see that function).
-    let mut sub_entries: Vec<Vec<Option<*const u8>>> = module
+    let mut sub_entries: Vec<Vec<*const u8>> = module
         .functions
         .iter()
-        .map(|function| vec![None; function.code.len()])
+        .map(|function| vec![std::ptr::null(); function.code.len()])
         .collect();
 
     // Reserve one entry label per non-empty compiled block **before** emitting any
@@ -177,7 +177,7 @@ pub(crate) fn compile_function(
             + sub_blocks_capacity_estimate(&function.code, &function.blocks)
             + DEFAULT_CAPACITY,
     )?;
-    let mut entries: Vec<Option<*const u8>> = vec![None; function.code.len()];
+    let mut entries: Vec<*const u8> = vec![std::ptr::null(); function.code.len()];
     let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
     for block in &function.blocks {
         let start = block.start;
@@ -188,7 +188,7 @@ pub(crate) fn compile_function(
         block_labels.insert((func, start as u32), buffer.label());
     }
     let mut summary = emit_function(&mut buffer, module, labels, &block_labels, func, &mut entries)?;
-    let mut sub_entries: Vec<Option<*const u8>> = vec![None; function.code.len()];
+    let mut sub_entries: Vec<*const u8> = vec![std::ptr::null(); function.code.len()];
     emit_sub_blocks(
         &mut buffer,
         module,
@@ -319,7 +319,7 @@ fn emit_sub_blocks(
     code: &[Instr],
     blocks: &[Block],
     summary: &mut Summary,
-    sub_entries: &mut [Option<*const u8>],
+    sub_entries: &mut [*const u8],
 ) -> Result<()> {
     for (pc, instr) in code.iter().enumerate() {
         if !stores_continuation(instr) {
@@ -366,7 +366,7 @@ fn emit_sub_blocks(
         // enforced by every emission call.
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
-        sub_entries[start] = Some(entry);
+        sub_entries[start] = entry;
     }
     Ok(())
 }
@@ -422,7 +422,7 @@ fn emit_shared_sub_blocks(
     func: u32,
     code: &[Instr],
     blocks: &[Block],
-    sub_entries: &mut [Option<*const u8>],
+    sub_entries: &mut [*const u8],
 ) -> Result<()> {
     for (pc, instr) in code.iter().enumerate() {
         if !stores_continuation(instr) {
@@ -469,7 +469,7 @@ fn emit_shared_sub_blocks(
         // enforced by every emission call.
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
-        sub_entries[start] = Some(entry);
+        sub_entries[start] = entry;
     }
     Ok(())
 }
@@ -490,7 +490,7 @@ fn emit_function(
     labels: &LabelMap,
     block_labels: &BTreeMap<(u32, u32), CodeLabel>,
     func: u32,
-    entries: &mut [Option<*const u8>],
+    entries: &mut [*const u8],
 ) -> Result<Summary> {
     let function = &module.functions[func as usize];
     let code = &function.code;
@@ -533,7 +533,7 @@ fn emit_function(
         // `offset + emitted < capacity` was enforced by every emission call.
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
-        entries[start] = Some(entry);
+        entries[start] = entry;
         summary.block_count += 1;
     }
     summary.cached_registers.sort_unstable();

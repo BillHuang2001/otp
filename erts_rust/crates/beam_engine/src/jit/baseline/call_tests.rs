@@ -317,11 +317,11 @@ fn the_lowered_call_still_gives_its_continuation_a_native_sub_block() {
 
     // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
     // continuation pc 4 is strictly inside that block.
-    assert!(function.entries[4].is_none(), "pc 4 is not an IR block start");
-    assert!(function.sub_entries[4].is_some(), "pc 4 has a sub-block entry");
+    assert!(function.entries[4].is_null(), "pc 4 is not an IR block start");
+    assert!(!function.sub_entries[4].is_null(), "pc 4 has a sub-block entry");
     // An IR block start is still served by the block table, and gains no sub-block.
-    assert!(function.entries[1].is_some(), "pc 1 is the `Label(2)` block start");
-    assert!(function.sub_entries[1].is_none(), "a block start needs no sub-block");
+    assert!(!function.entries[1].is_null(), "pc 1 is the `Label(2)` block start");
+    assert!(function.sub_entries[1].is_null(), "a block start needs no sub-block");
     // A sub-block is not a block: the summary counts the two IR blocks only.
     assert_eq!(function.summary.block_count, 2, "only the IR blocks are counted");
 
