@@ -67,7 +67,8 @@ use super::counters;
 use super::emit::bitstr_inline::{
     self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_BS_MATCH_STRING, SHAPE_COUNT, SHAPE_CREATE_BIN,
     SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_GET_UTF16, SHAPE_GET_UTF32, SHAPE_GET_UTF8,
-    SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF16, SHAPE_SKIP_UTF32, SHAPE_SKIP_UTF8,
+    SHAPE_FRESH_BIN, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF16, SHAPE_SKIP_UTF32,
+    SHAPE_SKIP_UTF8,
     SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
@@ -504,6 +505,36 @@ fn module_create_bin() -> Module {
     )
 }
 
+/// `bs_create_bin`'s **fresh** arm: `f(V) -> <<V:8>>`, one static whole-byte integer
+/// segment and no accumulator — the shape `emqx_base62:decode/2` builds per character
+/// (`<<DecodeChar>>`).
+///
+/// The value operand is `x(0)` and the destination is also `x(0)`, which is exactly what
+/// the compiler emits for the character temp; the row proves the fresh arm emits for it.
+fn module_create_bin_fresh() -> Module {
+    bitstr_module("inline_bs_create_bin_fresh", &["integer"], 1, |module| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsCreateBin {
+                fail: NO_FAIL,
+                alloc: 0,
+                live: 1,
+                unit: 8,
+                dst: Operand::X(0),
+                segments: vec![
+                    Operand::Atom(atom(module, "integer")),
+                    Operand::Integer(1),
+                    Operand::Integer(1),
+                    Operand::Nil,
+                    Operand::X(0),
+                    Operand::Integer(8),
+                ],
+            },
+            Instr::Return,
+        ]
+    })
+}
 /// `bs_match_string`: a nine-byte (72-bit) pattern compare out of the context — the shape the
 /// system compiler emits for a binary literal **longer than 64 bits** in a pattern
 /// (`tests/fixtures/bsmatch.erl`'s `strlong/1`), and well under the shape's own
@@ -846,6 +877,12 @@ pub(crate) const INLINE_SHAPE_CASES: [ShapeCase; SHAPE_COUNT] = [
     ("bs_get_utf16", SHAPE_GET_UTF16, "BsGetUtf16", module_get_utf16),
     ("bs_skip_utf8", SHAPE_SKIP_UTF8, "BsSkipUtf8", module_skip_utf8),
     ("bs_get_utf8", SHAPE_GET_UTF8, "BsGetUtf8", module_get_utf8),
+    (
+        "bs_create_bin (fresh)",
+        SHAPE_FRESH_BIN,
+        "BsCreateBin",
+        module_create_bin_fresh,
+    ),
 ];
 
 /// The `Instr` variant the static-deopt census keys `shape` by — the **one** mapping, so a

@@ -633,7 +633,14 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     highest_touched: &mut Option<u32>,
 ) -> Result<bool> {
     let Some(shape) = CreateBinShape::of(module, dst, segments) else {
-        return Ok(false);
+        // Not an in-place accumulator build. The construction family's **other** inline
+        // arm is the fresh whole-byte build (`<<Value:N>>`, one rooted helper call — see
+        // [`super::fresh`]); it in turn declines, emitting zero bytes, when the shape is
+        // neither.
+        let Some(fresh) = super::FreshBinShape::of(module, dst, segments) else {
+            return Ok(false);
+        };
+        return super::try_inline_bs_fresh_bin(buffer, &fresh, allocation, done, func, pc);
     };
     let Some(prepared) = prepare_fields(&shape) else {
         return Ok(false);

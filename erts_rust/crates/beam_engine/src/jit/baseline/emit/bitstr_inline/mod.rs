@@ -102,6 +102,7 @@ use super::operands::Loc;
 
 mod bs_match;
 mod create;
+mod fresh;
 mod integer;
 mod match_string;
 mod position;
@@ -148,6 +149,8 @@ pub(crate) use bs_match::{bs_match_shape, BsMatchShape};
 pub(crate) use bs_match::{bs_match_group_len, bs_match_integer_flags, bs_match_static_size};
 pub(super) use create::try_inline_bs_create_bin;
 pub(crate) use create::CreateBinShape;
+pub(in crate::jit::baseline::emit) use fresh::try_inline_bs_fresh_bin;
+pub(crate) use fresh::{CreateArm, FreshBinShape};
 /// The route split, re-exported for the arm's own tests (the emitter reaches it through
 /// [`CreateBinShape::route`]).
 #[cfg(test)]
@@ -274,7 +277,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 16;
+pub(crate) const SHAPE_COUNT: usize = 17;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -323,6 +326,9 @@ pub(crate) const SHAPE_SKIP_UTF8: usize = 14;
 /// The `bs_get_utf8` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_UTF8: usize = 15;
+/// The fresh whole-byte `bs_create_bin` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_FRESH_BIN: usize = 16;
 #[cfg(test)]
 thread_local! {
     /// How often each shape's native lowering was **emitted** (a compile-time count, so it
