@@ -144,6 +144,7 @@ impl FreshBinShape {
     /// The field width in bytes, for the arm's own tests (the emitter bakes it into the
     /// helper call).
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn nbytes(&self) -> usize {
         self.nbytes
     }
@@ -250,6 +251,7 @@ impl CreateArm {
     }
     /// Which arm this is, for the refusal census's three-way split.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn arm_name(&self) -> &'static str {
         match self {
             CreateArm::Append(_) => "append",
