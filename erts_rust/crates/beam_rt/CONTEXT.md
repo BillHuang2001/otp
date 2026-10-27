@@ -189,6 +189,29 @@ A handle built in `call_registered` must be gated by a `uses_*` predicate, and t
 * **Processes, not reservations, are what the heap counts**: each live process costs one `Machine` (written at construction) + a `Process` PCB (~9.3 KiB, its `XRegs`) + a 233+233-word heap inside a shared 1 MiB carrier — there is no per-process `beam_alloc::Heap` reservation, and nothing pins how many processes a boot leaves live (`src/boot/CONTEXT.md:267-276` enumerates them, `src/runtime.rs:5419` pins only `Runtime::new`'s four).
 * Measured record: `STARTUP_COST.md` (1 473.3 M retired instructions, ≈116 MB `VmHWM`); per-route detail in `src/boot/CONTEXT.md`, `src/context/CONTEXT.md`, `src/runner/CONTEXT.md`, `src/eval/CONTEXT.md`; the store/arena ceilings in `src/context/pump/CONTEXT.md`.
 
+### What the 51 eagerly-booted modules retain (measured against the host oracle)
+The 51 eagerly loaded modules are **3 016 872 B (2.88 MiB) of `.beam`** on the host oracle (22 preloaded 758 296 B, the 29-name `primLoad` batch 2 258 576 B; largest `erl_parse` 707 236, `erl_lint` 289 356, `erlang` 249 592, `erl_eval` 125 520, `lists` 124 144).
+Retained after the load, per `Module` (`../beam_loader/src/ir.rs:283`), with the consumer that justifies it:
+
+| Retained item | Size at boot (51 modules) | Consumed later? | By whom |
+|---|---|---|---|
+| `Function::code` (`Vec<Instr>`, 64 B, `../beam_loader/src/instr.rs:1205`) | **10 455 808 B ≈ 9.97 MiB** (163 372 instructions, `beam_disasm` census) | yes | every tier (`beam_engine/src/jit/…`, `interpreter`) |
+| `Block` vecs (24 B) | 744 960 B ≈ 727 KiB (31 040 blocks) | yes | the JIT's block linker |
+| `exports`/`imports`/`funs`/`records`/`types`/`line` | ≈ 20 916 + 25 476 + 9 984 + 4 637 + 37 297 B ≈ 98 KiB | yes (imports/exports/funs; `line` for stacktraces) | `families/funs`, `beam_engine` trace |
+| `literals: Arc<LiteralArea>` | 28 664 decoded words = 223.9 KiB live inside a `4×chunk+64`-word reservation (1.7 MiB address space) | yes | `literal` op / its `Eterm` operands |
+| `attribute_table`/`compile_info_table`/`meta_table` (decoded `DecodedTerm`) | 27 375 words ≈ 214 KiB live, in heaps sized `4 words/byte` (≈ 300 KiB for `erl_parse` alone) | **no reader outside `beam_loader` tests** | — (dead retention) |
+| raw `attributes` (`Attr`) | 81 592 B chunk ⇒ ≈ 70.5 KiB stripped (`erl_parse` 74 886 B) | `context/module_info.rs:119` + hashed at `jit/cache/key.rs:217` | `get_module_info(M,attributes)` |
+| raw `compile_info` (`CInf`) | 15 669 B | `context/module_info.rs:120` + `jit/cache/key.rs:218` | `get_module_info(M,compile)` |
+| raw `meta` (`Meta`) | 2 250 B | **nowhere** (not hashed, no reader) | — (dead retention) |
+| `locals` (`LocT`) | 3 716 × 12 B = 44 592 B | **zero workspace readers** | — (dead retention; the C keeps it for `erts_jit_asm_dump` only) |
+| `strings` (`StrT`) | 61 B total | yes | `bs_match_string`/`bs_create_bin` string segments (`families/bitstrings/…`) |
+| `atoms: Vec<Atom>` + `atom_table` fork | 9 501 atoms / 107 190 name bytes; the fork is `Arc` chunk/user-shard clones (zero bytes) | yes | `ExecutionContext::atoms` |
+| `checksum: [u8;16]` | 16 B | yes (JIT cache digest) | `jit/cache/key.rs:181` |
+
+**The 5.5 MiB Massif attribution at `codeserver.rs:825,927` is a mid-boot *transient*, not steady state.** `read_image`'s `std::fs::read` buffer is dropped (`src/codeserver.rs:821`), so the `.beam` image is never retained; at the snapshot both the whole-file bytes, `Chunks`' raw+decoded copies, and the `Module` being built are live at once.
+**Post-boot retention by the code server is therefore ≈ 11.3 MiB, of which 10.7 MiB is the IR.** The dead share is small but free: `locals` 44.6 KiB + raw `meta` 2.2 KiB + the three decoded tables ≈ 214 KiB live (≈ 0.3–0.4 MiB of heap) with no consumer.
+`get_module_info(M, attributes|compile)` does **not** read the decoded tables — it re-decodes the raw bytes through a fresh 8 192-word scratch `Heap` per call (`src/context/module_info.rs:257-261`).
+
 ## Test Strategy
 The crate's test strategy — the colocated unit suites, the seam/GC/owner-death suites, the one-per-contract integration suites, the per-call harnesses, the gate commands, the gate-equivalent full-corpus sweep and the test-hygiene rules — is **[`TEST_STRATEGY.md`](TEST_STRATEGY.md)**; per-suite routing and the distribution (A.5) evidence are **[`tests/CONTEXT.md`](tests/CONTEXT.md)**.
 The two-strategy workload-class A/B is `tests/gc_strategy_classes.rs` (the intended `MatureKind` asserted **inside** the measured process), with `tests/gc_strategy.rs`/`tests/gc_immix_payload.rs` the selection and scale controls — record in [`GC_STRATEGY_MEASURED.md`](GC_STRATEGY_MEASURED.md); the in-process `compile:file/2` (A.9) harness is `examples/compile_bench.rs`.
