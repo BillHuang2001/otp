@@ -14,6 +14,8 @@ A context is a **borrow-only** struct over `&'a mut Runtime` holding `output` (`
 It owns no heap at all, so dropping it frees only its inline `dispatch_memo` slots and the boxes a miss put in them.
 Constructors/accessors: `new`, `with_output`, `heap_available()`, `for_process`/`for_process_with_engines` (runs **as** the given pid — the scheduler seam), `pid()`, `eval_heap()`, `enter_module`, `run_export`, `arm_gc`, `process_table`/`process_table_mut`, `owns_process_table`, `resync_parked_roots` (the resume half of the runner's parked-machine root hand-off).
 `lent_tables` is set only by `FunBridge::nested`; `new`/`with_output`/`for_process` set it `None`.
+**There is no per-process context.** A context is built per scheduler slice (`runner/run.rs:410`, `:993`), per `-eval`/`-s`/`-run`/single-pass entry and per nested run (`FunBridge::nested`), and dropped at the end of it; all per-process state is `runner/entry.rs`'s `ProcessEngine` plus `beam_process::Process`.
+Its footprint is ~400 bytes of fields plus the inline `[Option<Box<DispatchEntry>>; 128]` memo table (~1 KiB of `None`s; a box is allocated only on a miss, `dispatch.rs:423-483`) and a lazily allocated `Option<String>` for the caller module, whose buffer `enter_module` reuses (`clear` + `push_str`, `runtime_context.rs:580`); no `size_of` assertion pins these figures — the 744 → 10 344-byte history is prose in `dispatch.rs:430-434`.
 `wants_reduce` returns `false` (the default `reduce` is a no-op), so the per-instruction reduction hook is skipped on every non-budgeted run; the one host declaring `true` is the runner's `BudgetContext`.
 
 ### `call_bif` — the dispatch order, and the precedence gotcha
