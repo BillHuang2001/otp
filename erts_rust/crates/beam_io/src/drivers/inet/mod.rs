@@ -726,12 +726,11 @@ pub struct TcpInetDriver {
     /// only site that arms the reply ladders, drops the queued output and tears the descriptor
     /// down — clears it.
     ///
-    /// Two callers deliberately leave it pending for a later reader:
-    ///
-    /// * a **queued receive** (`try_complete_recv`) that read data **and** the peer's end of file
-    ///   in one drain must hand the data over first — the C's `tcp_recv` answers a complete unit
-    ///   before it ever reaches the `n == 0` arm (`inet_drv.c:13216`, `:13206`), so
-    ///   `{error, closed}` is owed to the *next* receive;
+    /// One caller deliberately leaves it pending for a later reader: a **queued receive**
+    /// (`try_complete_recv`) that read data **and** the peer's end of file in one drain must hand
+    /// the data over first — the C's `tcp_recv` answers a complete unit before it ever reaches the
+    /// `n == 0` arm (`inet_drv.c:13216`, `:13206`), so `{error, closed}` is owed to the *next*
+    /// receive, and [`TcpInetDriver::latch_pending`] runs the moment nothing complete is left.
     pending_close: Option<CloseSource>,
     /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
     /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
@@ -1484,12 +1483,11 @@ impl TcpInetDriver {
     /// Applies the close a [`TcpInetDriver::read_bytes`] recorded but no reader has applied yet,
     /// answering whether it ran.
     ///
-    /// Two callers reach it rather than latching straight away: a queued receive that read its
+    /// One caller reaches it rather than latching straight away: a queued receive that read its
     /// payload and the peer's end of file in one drain defers the close
     /// ([`TcpInetDriver::pending_close`]) so the payload reaches the operation first and runs this
-    /// the moment nothing complete is left to deliver; and the reactor's eager passive read leaves
-    /// the observation for the first read the C would have made, which is answered by this same
-    /// latch.
+    /// the moment nothing complete is left to deliver. Every other read this driver makes is one the
+    /// C would have made, so it applies its own observation on the spot.
     fn latch_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<bool> {
         match self.pending_close {
             Some(source) => {

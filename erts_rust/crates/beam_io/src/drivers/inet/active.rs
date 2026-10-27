@@ -22,11 +22,11 @@
 //! (`tcp_deliver`/`tcp_recv`, `erts/emulator/drivers/common/inet_drv.c:13045`-`:13130`,
 //! `:13130`-`:13260`).
 //!
-//! A passive socket's bytes wait in the port's **input queue** for the owner's next read — the
-//! `{Port, {data, Data}}` path
-//! ([`PortNotification::Data`](crate::PortNotification::Data)), which
-//! [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) drives (they wait in the kernel
-//! instead while a spent grant has the read side deselected — see *Arming*). An **active** socket
+//! A passive socket's bytes wait in the **kernel** receive queue for the next read somebody answers
+//! — a queued `TCP_REQ_RECV` or an explicit `recv` verb; the driver never reads one on mere
+//! readiness (see *Arming*). What such a read delivers reaches the owner as `{Port, {data, Data}}`
+//! ([`PortNotification::Data`](crate::PortNotification::Data)) under `{deliver, port}` and as the
+//! completion of the operation it answers under `{deliver, term}`, the default. An **active** socket
 //! (`{active, true}`, `{active, once}`, `{active, N}`) instead sends its owner a **message** per
 //! delivered unit — `tcp_message` (`:3979`), `{tcp, S, [H1..Hsz | Data]}` — which the runtime
 //! renders from an [`ActiveInputEvent::Data`] on the active-input channel
@@ -38,7 +38,9 @@
 //!
 //! # What a delivered unit is
 //!
-//! One unit is one [`ActiveInputEvent::Data`]:
+//! One unit is one [`ReadMessage`](crate::port_task::ReadMessage), handed up as an
+//! [`ActiveInputEvent::Data`] under `{deliver, term}` or straight to the port queue as
+//! `{Port, {data, …}}` under `{deliver, port}`:
 //!
 //! * under a framing `{packet, N}` it is **one frame**, and the framing header is stripped before
 //!   delivery — `packet_get_length`/`packet_get_body` (`packet_parser.c:248`, called from
@@ -140,12 +142,11 @@ impl TcpInetDriver {
     ///
     /// This crate splits that single read path into two bodies —
     /// [`TcpInetDriver::active_delivery`] (the active channel) and
-    /// [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) (the accept ladder, the queued
-    /// `TCP_REQ_RECV` completion and the passive port-input read) — so the callback has to pick
-    /// the one the C's state arm would have reached. Running both, or the passive one first, would
-    /// let `read_available` drain the socket into the port input queue
-    /// ([`TcpInetDriver::pending_input`](super::TcpInetDriver) under a framing `{packet, N}`)
-    /// before the active half could read a single byte.
+    /// [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) (the accept ladder and the queued
+    /// `TCP_REQ_RECV` completion) — so the callback has to pick the one the C's state arm would have
+    /// reached. The two are mutually exclusive by their own predicates (this one requires no queued
+    /// receive, the passive one requires one), so exactly one can produce a unit and neither can
+    /// starve the other.
     ///
     /// `true` exactly in the state [`TcpInetDriver::active_delivery`] can serve: a **connected**
     /// socket, an **active** mode, and **no** queued `TCP_REQ_RECV` operation (which owns the
