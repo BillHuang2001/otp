@@ -345,6 +345,24 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - The route chosen was the **reservation bound**, not a taller ladder: extending the ladder to 2048 would have moved every genuinely-large object in the 1–2 KiB *request* band onto slab carriers (~256 B of page-fault-resident memory per live object instead of an exact pooled block) and would still not cover a 4×-reserved 512 B hint, whereas the bound targets exactly the small-capacity case with one constant derived from `large_threshold` and `HEADER_SIZE` (its unit test asserts the relation, so a future ladder change keeps them in step).
 - The request count is **one per output binary, not per append**: the append loop writes into the reservation (`beam_engine`'s `raw::InPlace`), so a 30 B result out of a 256 B capacity makes 0 grows and 0 moves; `compact()`/high-water trimming is never called for an accumulator. A *growing* accumulator (`binary_append`'s 32 KiB output) now starts from a 256 B reservation instead of 1024 B and takes one extra in-place grow before entering the geometric zone — the same block count, less zero-fill (measured below).
 
+### Measured: the exact small-capacity reservation (paired A/B, instructions/call)
+The route was adopted on the routing argument above, then **measured against the pre-change runtime** with
+a round-interleaved paired A/B (`perf stat -e instructions:u`, `taskset -c 3`, min of 3 samples per
+(binary, N), slope over N = 20 000/100 000 calls; both binaries built `--release -p beam_rt` from the
+same tree, only `binary.rs`/`binary/growth.rs`/`lib.rs` reverted in the "before" build; host loadavg
+138–159 during the run, so absolute wall times are meaningless but a paired instruction slope is not):
+- `bstr_to_lower` (`cowboy_bstr:to_lower/1`, 30 B in/out): **54 790 → 66 201 instr/call (+20.8 %)**;
+- `bstr_capitalize` (`cowboy_bstr:capitalize_token/1`): **54 356 → 65 712 instr/call (+20.8 %)**.
+So on these two kernels the slab route is **more** instructions per call than the pooled one, not fewer —
+the opposite of the routing argument's expectation, and reproducible (two independent paired runs). The
+cost is per *output binary*, so it is a plausible mechanism (e.g. the class-256 carrier's full 1 MiB is
+touched at subdivision, where the MBC carrier touches ~2 pages, and/or the smaller `reserved` bound
+changes how often the engine's append sink calls `ensure_capacity`), but the attribution is **not
+established**: **this reservation policy must not be adopted on the strength of the routing argument
+alone** — the ladder route (b) and the `set_len_unwritten` adoption (a free ~256 B/call of zero fill in
+`beam_engine`, still inert here) both remain open, and reverting `reservation_for` to the purely
+geometric form is the safe default until the mechanism is attributed with callgrind.
+
 ### When a free actually unmaps (pointer-invalidation map)
 `Heap::drop` (heap.rs:242) never unmaps anything itself — it only calls `AllocRef::dealloc` →
 `CarrierAllocator::dealloc_impl` (allocator/core.rs:484), whose routing decides everything below.
