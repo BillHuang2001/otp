@@ -464,6 +464,14 @@ A.9's differential coverage is boot/version **observability** plus the in-proces
      `beam_process::Process`), but `{get_until,…}`/`{get_line,…}` ARE served for regular files.
   5. **`init:restart/0`, `init:boot/1`, `init:stop/0,1` and `init:get_arguments/0` are implemented** and
      oracle-cross-checked.
+     `restart/0` **clears the live system before it re-boots** — every process except the calling action, the
+     root and the native `erl_prim_loader`/`file_server_2`/`net_kernel` services is terminated `shutdown`, and
+     a dead owner's ports / `enif_select` watchers / file services are released — so the re-boot's
+     `application_controller:start/1` registers cleanly instead of colliding with the previous boot's
+     still-live server (which raised `badarg` from `register/2` and surfaced as an `=ERROR REPORT====` block).
+     Residuals: no code unload, a borrowed port registry (ports stay open), stale pid-keyed probe entries, and
+     a restart requested from **inside a scheduler slice** is the typed
+     `unsupported: init:restart/0 inside a scheduled slice` gap (never a silent no-op).
   Per-node detail: `beam_rt/CONTEXT.md`, `beam_rt/src/boot/CONTEXT.md`, `beam_rt/src/native/CONTEXT.md`.
 
 ## Known Structural Debt (candidates for the next pass)
