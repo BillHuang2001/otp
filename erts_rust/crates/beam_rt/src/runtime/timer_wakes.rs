@@ -209,6 +209,17 @@ impl Runtime {
         std::mem::replace(&mut self.run_wake_pid, pid)
     }
 
+    /// Whether `pid` is **the process the CLI's `run` action is waiting for** — the only
+    /// process whose abnormal termination is *not* reported as a crash report.
+    ///
+    /// That process's exit **is** the action's result: the CLI classifies it and prints
+    /// `beam_rt: error …` on stderr, exactly as the oracle's `-eval`/`-s` route exits `1` with
+    /// empty stdout when the expression raises. Every *other* process that dies of an uncaught
+    /// `error` reports ([`crate::report`]).
+    pub(crate) fn is_run_target(&self, pid: ProcessId) -> bool {
+        self.run_wake_pid == Some(pid)
+    }
+
     /// Removes the deadlines that have passed *and* forgets each one in the wake records —
     /// the fire path must not leave a stale "this pid can still be woken" behind.
     pub(crate) fn take_due_timers(&mut self, now: Instant) -> Vec<FiredTimer> {

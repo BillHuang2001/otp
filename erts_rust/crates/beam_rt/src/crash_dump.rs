@@ -539,17 +539,19 @@ fn ctime_now() -> String {
     format_ctime(seconds)
 }
 
+/// The three-letter month abbreviations, shared by the crash dump's `ctime` line and the
+/// error-logger header ([`crate::report`]), so the two renderings of a month cannot drift.
+pub(crate) const MONTH_ABBREV: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 /// Formats Unix `seconds` as a `ctime`-style string in UTC.
 fn format_ctime(seconds: i64) -> String {
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     let days = seconds.div_euclid(86_400);
     let rem = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     let weekday = DAYS[(days + 4).rem_euclid(7) as usize];
-    let month_name = MONTHS[(month - 1) as usize];
+    let month_name = MONTH_ABBREV[(month - 1) as usize];
     format!(
         "{weekday} {month_name} {day:2} {:02}:{:02}:{:02} {year}",
         rem / 3600,
@@ -559,7 +561,10 @@ fn format_ctime(seconds: i64) -> String {
 }
 
 /// Converts days since the Unix epoch to `(year, month, day)` (Hinnant's algorithm).
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+///
+/// `pub(crate)` because the error-logger header ([`crate::report`]) needs the same civil-date
+/// conversion the crash dump's `ctime` line uses; there is one implementation, not two.
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
