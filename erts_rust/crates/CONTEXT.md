@@ -286,8 +286,9 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
 
 ## Status
-- **All 15 crates architected, implemented and tested.** The workspace build is warning-free and the test suite
-  is green — re-run `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
+- **All 15 crates architected, implemented and tested.** The workspace build is warning-free; the test suite
+  is green apart from one stale `beam_rt` io-device pin (see Test Strategy) and the OTP-version-skew tests —
+  re-run `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
   --no-fail-fast` for the current count. CI: `.github/workflows/erts_rust.yml` builds, tests, runs a
   non-blocking clippy and runs `../tools/differential/gate.sh` (exit-3 "capability gaps, no mismatch" is
   non-blocking).
