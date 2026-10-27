@@ -42,7 +42,7 @@ this process itself produced, so there is no untrusted input to flood the table 
   `&mut scratch.field` disjoint from the raw `*mut Eterm` payload reads.
 - `size_object_bounded_with`'s `OverLimit` arm re-walks the graph through `is_acyclic` (a `done` set on top of
   the path set) to tell `Cyclic` from `TooLarge`, so a consumer that then re-runs the walk for the exact
-  count (the shape `beam_message::copy::preflight_words` uses) pays **three** graph traversals; the fitting
+  count (the shape `beam_message::preflight::preflight_words` uses) pays **three** graph traversals; the fitting
   case is one. Over a warm scratch those are three traversals of the *same* buffers, not three sets of
   allocations.
 - Each boxed object's slots are enumerated **once** (`classify` → `for_each_sizing_child_slot`);
