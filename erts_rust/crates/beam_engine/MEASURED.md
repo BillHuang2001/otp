@@ -358,3 +358,26 @@ Paired per-round cycle ratios (after/before): **0.992 / 0.950 / 0.812 / 1.020 / 
 - **Honest negative — an absolute reading does not resolve this change at all.** `median_ns_per_call` from the same runs and whole-process `perf stat` cycles both read **flat to noise, within ±1 %**, at load 7: the loop is latency-bound, so removing instructions does not convert one-for-one into time, and the within-run K-slope is the only instrument on this host that resolved the delta.
 - **What did not change** (identical on both sides, so they price the absolute, never the delta): `driver_round_trips_per_call` **2.00**, `in_block_calls_per_call` **21.00**, `in_block_call_declines_per_call` **0.00**, `block_entry_hits` **200** / `block_entry_misses` **0** — the wave removed per-transfer work, not transfers.
 - Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib --release --no-run`, then `taskset -c 3 erts_rust/target/release/deps/beam_engine-<hash> --exact bench::list_walk::list_walk_decomposition --ignored --nocapture` with `BENCH_K=1` and with `BENCH_K=21` (`BENCH_ITERS=40`), once per build of the pair.
+
+### The same wave on the cross-row driver, with an A/A noise floor
+Seven paired rounds of `bench run --quick --runtime rust --workloads list_walk,copy_bound,file_io,slice` under `taskset -c 3`, the two archived binaries driven by the **same** `bench` binary through `BEAM_RT=`, order alternated every round (odd round old→new, even round new→old) so a monotone load ramp cannot bias one side.
+| row | median new/old | per-round ratios |
+|---|---|---|
+| `list_walk_ns_per_element` | **0.946** | 0.675 0.689 0.948 0.980 0.661 0.950 0.946 |
+| `etf_roundtrip_ns_per_op` | 0.987 | 0.949 0.815 1.190 1.095 1.099 0.889 0.987 |
+| `ets_copy_ns_per_op` | 0.781 | 0.650 0.755 0.922 0.799 0.763 1.001 |
+| `send_recv_ns_per_op` | 0.588 | 0.410 0.588 0.554 0.465 0.840 0.835 1.030 |
+| `send_recv_plain_ns_per_op` | 0.897 | 0.901 0.868 0.434 0.897 0.928 0.843 1.042 |
+| `handle_rw_ns_per_op` | 0.732 | 0.325 1.099 0.364 1.303 |
+| `write_read_ns_per_op` | 0.843 | 0.330 0.551 1.205 0.843 0.700 3.498 1.027 |
+| `add_wall_ms` (`slice`) | 0.976 | 0.736 0.460 1.059 1.020 0.849 0.976 1.485 |
+| `fib_wall_ms` (`slice`) | 0.881 | 0.376 0.863 0.824 1.011 0.902 0.881 1.822 |
+- **The A/A control sets the floor, and it is wide**: two legs of the *same* (pre-change) binary, back to back at 1-min load 13.9→26.3, read `list_walk` **1.224**, `etf_roundtrip` **1.123**, `ets_copy` **0.910**, `send_recv` **1.053**, `handle_rw` **1.287**, `write_read` **1.210** — a ±10–29 % per-row floor on this host. No single ratio above is therefore claimed as a win except `list_walk`, whose **seven ratios are all ≤ 0.98**; every other row is a non-regression check whose median sits inside the A/A floor, and `etf_roundtrip` (0.987) is a non-regression rather than the +12 % a 5-round set at higher load once suggested.
+- Loads per round, old/new 1-min: 118/82, 53/54, 68/65, 40/51, 48/39, 14/31, 18/12 — the host moved by up to 8× between rounds, which is why only the pairs are read and never the absolutes (`list_walk_ns_per_element` absolute reads 28.9 ns old / 19.9 ns new here against 14.8 ns in the earlier quiet-window run).
+- Work done was identical on both sides: `case_list_walk_elements` 50 000 000, `etf_roundtrip_ops` 500 000, `send_recv_plain_ops` 300 000, `write_read_ops` 20 000.
+
+### The wave's three-tier differential gate
+Full corpus, one `differential run <case-id>` per case at 8-way parallelism, every non-zero exit re-run serially (see the load caveat), on the pre-change and post-change builds and on all three tiers.
+The verdict is the same on every tier: of **3463** cases, **3460 agree**, the recorded `wire/new_fun_ext_encode` gap answers `unsupported`, and the only three non-agreeing cases are the pre-existing oracle drift below — `unsupported` and `mismatch` are otherwise 0, `skipped` 0 (`BEAM_RT_TIER=interpreter` / unset = baseline / `cranelift` on a `--features cranelift` build).
+- **The three are oracle drift in this sandbox, not this wave:** `system_info/version`, `boot_extra/system_info_version_is_frozen_17_1` and `nif_abi/system_info_frozen_fields` all report `erlang:system_info(version)`, and the sandbox oracle is `/nix/store/…-erlang-29.1.2/…/erts-17.1.1/bin/erl`, which answers `"17.1.1"` where the frozen constant and the goldens say `"17.1"` (the harness records `matched_golden: false` on the **oracle** side). They fail identically on the **pre-change** binary on all three tiers.
+- **A parallel sweep on a loaded host is not a verdict.** At 1-min load 145–283 the three sweeps produced 3 / 43 / 101 non-zero exits — nearly all `unsupported: opcode: run: process blocked (no message available)` — and **every one** of them passed on a serial re-run of the same binary. The gate verdict is the serial re-run.
