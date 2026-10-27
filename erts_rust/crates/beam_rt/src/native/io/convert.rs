@@ -205,33 +205,42 @@ pub(crate) fn encoding_of(name: Option<&str>) -> Option<Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::RuntimeContext;
+    use crate::native::test_support::runtime;
+    use crate::runtime::Runtime;
 
-    /// A test arena holding the terms under test.
-    struct Arena {
-        heap: beam_term::heap::Heap,
+    /// Runs `f` with a [`RuntimeContext`] over `runtime` — the crate's own term builders,
+    /// which take an [`ExecutionContext`](beam_engine::ExecutionContext).
+    fn in_context<T>(runtime: &mut Runtime, f: impl FnOnce(&mut RuntimeContext<'_>) -> T) -> T {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        f(&mut context)
     }
 
-    impl Arena {
-        fn new() -> Arena {
-            Arena {
-                heap: beam_term::heap::Heap::new(1024),
-            }
-        }
+    /// A proper list of `elements` on the runtime's heap.
+    fn list(runtime: &mut Runtime, elements: &[Eterm]) -> Eterm {
+        in_context(runtime, |context| {
+            terms::make_list(context, elements).expect("list")
+        })
+    }
 
-        fn list(&mut self, elements: &[Eterm]) -> Eterm {
-            terms::make_list(&mut self.heap, elements).expect("list")
-        }
+    /// `text` as an Erlang char list.
+    fn string(runtime: &mut Runtime, text: &str) -> Eterm {
+        let codes: Vec<Eterm> = text.chars().map(|c| make_small(i64::from(c as u32))).collect();
+        list(runtime, &codes)
+    }
 
-        fn string(&mut self, text: &str) -> Eterm {
-            let codes: Vec<Eterm> = text.chars().map(|c| make_small(i64::from(c as u32))).collect();
-            self.list(&codes)
-        }
+    /// A small (on-heap) binary of `bytes`.
+    fn heap_binary(runtime: &mut Runtime, bytes: &[u8]) -> Eterm {
+        in_context(runtime, |context| {
+            terms::make_heap_binary(context, bytes).expect("binary")
+        })
     }
 
     #[test]
     fn latin1_input_is_transcoded_to_utf8() {
-        let mut arena = Arena::new();
-        let chars = arena.list(&[make_small(233)]);
+        let mut runtime = runtime();
+        let chars = list(&mut runtime, &[make_small(233)]);
         assert_eq!(
             characters_to_binary(chars, Encoding::Latin1, Encoding::Unicode),
             Chars::Bytes(vec![195, 169])
@@ -240,8 +249,8 @@ mod tests {
 
     #[test]
     fn unicode_input_is_narrowed_to_one_latin1_byte() {
-        let mut arena = Arena::new();
-        let chars = arena.list(&[make_small(233)]);
+        let mut runtime = runtime();
+        let chars = list(&mut runtime, &[make_small(233)]);
         assert_eq!(
             characters_to_binary(chars, Encoding::Unicode, Encoding::Latin1),
             Chars::Bytes(vec![233])
@@ -250,8 +259,8 @@ mod tests {
 
     #[test]
     fn a_code_point_above_latin1_is_no_translation() {
-        let mut arena = Arena::new();
-        let chars = arena.list(&[make_small(1000)]);
+        let mut runtime = runtime();
+        let chars = list(&mut runtime, &[make_small(1000)]);
         assert_eq!(
             characters_to_binary(chars, Encoding::Unicode, Encoding::Latin1),
             Chars::NoTranslation
@@ -260,11 +269,8 @@ mod tests {
 
     #[test]
     fn an_atom_payload_is_the_badarg_raise() {
-        let mut arena = Arena::new();
-        let atom = beam_term::AtomTable::new()
-            .lookup("foo")
-            .map(make_atom)
-            .unwrap_or_else(|| make_atom(beam_term::AtomTable::new().intern("foo")));
+        let mut table = beam_term::AtomTable::new();
+        let atom = make_atom(table.intern("foo"));
         assert_eq!(
             characters_to_binary(atom, Encoding::Unicode, Encoding::Latin1),
             Chars::BadArg
@@ -273,10 +279,10 @@ mod tests {
 
     #[test]
     fn adjacent_binaries_are_one_utf8_stream() {
-        let mut arena = Arena::new();
-        let first = terms::make_heap_binary(&mut arena.heap, &[195]).expect("binary");
-        let second = terms::make_heap_binary(&mut arena.heap, &[169]).expect("binary");
-        let chars = arena.list(&[first, second]);
+        let mut runtime = runtime();
+        let first = heap_binary(&mut runtime, &[195]);
+        let second = heap_binary(&mut runtime, &[169]);
+        let chars = list(&mut runtime, &[first, second]);
         assert_eq!(
             characters_to_binary(chars, Encoding::Unicode, Encoding::Latin1),
             Chars::Bytes(vec![233])
@@ -285,10 +291,10 @@ mod tests {
 
     #[test]
     fn an_integer_between_binaries_breaks_the_utf8_stream() {
-        let mut arena = Arena::new();
-        let first = terms::make_heap_binary(&mut arena.heap, &[195]).expect("binary");
-        let second = terms::make_heap_binary(&mut arena.heap, &[169]).expect("binary");
-        let chars = arena.list(&[first, make_small(65), second]);
+        let mut runtime = runtime();
+        let first = heap_binary(&mut runtime, &[195]);
+        let second = heap_binary(&mut runtime, &[169]);
+        let chars = list(&mut runtime, &[first, make_small(65), second]);
         assert_eq!(
             characters_to_binary(chars, Encoding::Unicode, Encoding::Latin1),
             Chars::NoTranslation
@@ -297,8 +303,8 @@ mod tests {
 
     #[test]
     fn an_ascii_string_round_trips() {
-        let mut arena = Arena::new();
-        let chars = arena.string("abc");
+        let mut runtime = runtime();
+        let chars = string(&mut runtime, "abc");
         assert_eq!(
             characters_to_binary(chars, Encoding::Latin1, Encoding::Unicode),
             Chars::Bytes(b"abc".to_vec())

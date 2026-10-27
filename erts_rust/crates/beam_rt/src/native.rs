@@ -217,13 +217,16 @@ pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
 fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
     match module {
         // The `io` **device** surface: `put_chars/1,2` plus the `io.erl` request wrappers
-        // `nl/0,1`, `fwrite/1,2,3`, `write/1,2` and `format/3`, which this runtime serves
-        // natively because `io.erl`'s own `{io_request, …}`/`{io_reply, …}` round trip
-        // against the caller's group leader (itself) answers `calling_self` (see [`io`]).
-        // Every arm resolves its device through the one model in that module.
-        // Every *other* `io:*` (`io:getopts/1`, `io:setopts/2`, `io:request/2`,
-        // `io:scan_erl_form/4`, `io:format/1,2`, `io:printable_range/0`, …) is an ordinary
-        // body in `lib/stdlib/src/io.erl` or a `beam_bifs` registry BIF.
+        // `nl/0,1`, `fwrite/1,2,3`, `write/1,2`, `format/3` and the two explicit request
+        // entry points `request/1,2` / `requests/1,2`, which this runtime serves natively
+        // because `io.erl`'s own `{io_request, …}`/`{io_reply, …}` round trip against the
+        // caller's group leader (itself) answers `calling_self` (see [`io`]). Every arm
+        // resolves its device through the one model in that module (`#[io]::Device`), whose
+        // `File` arm is the native file service's `file_io_server` — the route that makes
+        // `io:format(Fd, …)` on a `file:open/2` handle work.
+        // Every *other* `io:*` (`io:getopts/1`, `io:setopts/2`, `io:scan_erl_form/4`,
+        // `io:format/1,2`, `io:printable_range/0`, …) is an ordinary body in
+        // `lib/stdlib/src/io.erl` or a `beam_bifs` registry BIF.
         "io" => Some(&[
             ("put_chars", 1),
             ("put_chars", 2),
@@ -235,6 +238,10 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("write", 1),
             ("write", 2),
             ("format", 3),
+            ("request", 1),
+            ("request", 2),
+            ("requests", 1),
+            ("requests", 2),
         ]),
         // `prim_tty` is a NIF library served whole from the floor: its `NIF_KEYS` list is
         // exactly the `-nifs` surface of `lib/kernel/src/prim_tty.erl`, so the stubs are
@@ -386,6 +393,17 @@ impl RuntimeContext<'_> {
             ("io", "write", 1) => Some(self.io_write(args, 1)),
             ("io", "write", 2) => Some(self.io_write(args, 2)),
             ("io", "format", 3) => Some(self.io_format_3(args)),
+            // `io:request/1,2` and `io:requests/1,2` are the *device* entry points of the same
+            // protocol (`io.erl:1646-1700`, `-doc false`); `io.erl` exports exactly these two
+            // names (there is no `io:request/3,4`, so an unregistered one would have to be
+            // invented). They answer the device's **reply value** — `{error, Reason}` included —
+            // rather than raising, which is why they are separate arms from the wrappers above.
+            // A device this host does not own declines (`None`) and falls through to the
+            // module body's round trip — see [`RuntimeContext::io_native_request`].
+            ("io", "request", 1) => self.io_native_request(args, 1, false),
+            ("io", "request", 2) => self.io_native_request(args, 2, false),
+            ("io", "requests", 1) => self.io_native_request(args, 1, true),
+            ("io", "requests", 2) => self.io_native_request(args, 2, true),
             ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
@@ -1058,6 +1076,35 @@ impl RuntimeContext<'_> {
             return Ok(());
         }
         Err(BeamError::BadArg)
+    }
+
+    /// The `io:request/1,2` / `io:requests/1,2` **floor** arm: the device's reply value, or
+    /// `None` when the device is a **live** process this host does not own.
+    ///
+    /// The declined case is the one the floor genuinely cannot serve: `io.erl`'s
+    /// `execute_request/3` posts `{io_request, Self, Mref, Request}` and blocks in a
+    /// `receive`, which a BIF may not do. Declining here lets the call fall through to
+    /// [`io_routes_through_the_protocol`](crate::context::RuntimeContext) in
+    /// [`call_bif_routed`](crate::context::RuntimeContext::call_bif_routed), whose tail is the
+    /// **in-machine** `io.erl` body — the route `epp`'s `io:request/2` to its own reader
+    /// process takes (the in-process compile path), and the same round trip the compiled
+    /// `call_ext` shape takes through [`io_route`](crate::context::io_route). A stream and a
+    /// **file device** are served here directly (no round trip), and a dead pid / unregistered
+    /// atom / non-atom device answers exactly as `io.erl` does.
+    fn io_native_request(
+        &mut self,
+        args: &[Eterm],
+        which: usize,
+        requests: bool,
+    ) -> Option<Result<Eterm>> {
+        if !self.io_request_is_host_served(args, which) {
+            return None;
+        }
+        Some(if requests {
+            self.io_requests(args, which)
+        } else {
+            self.io_request(args, which)
+        })
     }
 }
 

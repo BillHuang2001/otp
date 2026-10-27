@@ -451,14 +451,48 @@ impl RuntimeContext<'_> {
         self.atom(name).ok()
     }
 
+    /// Whether the floor can serve `io:request/1,2` / `io:requests/1,2` **natively**.
+    ///
+    /// `which` is the arity: `/1` addresses `default_output()` and `/2` takes the device first.
+    ///
+    /// True for every device class this host owns or can answer exactly — a stream, a file
+    /// device, a dead pid, an unregistered atom, the caller itself, a non-atom/non-pid. The one
+    /// exception is [`Device::Unreachable`]: a **live** process that is neither, which only
+    /// `io.erl`'s own `{io_request, …}`/`{io_reply, …}` round trip can serve. The floor arm
+    /// declines for it (see [`crate::native::RuntimeContext::io_native_request`]) rather than
+    /// answering the typed gap, so `epp`'s `io:request/2` to its own reader process — the
+    /// in-process compile path — keeps the body's round trip.
+    pub(super) fn io_request_is_host_served(&self, args: &[Eterm], which: usize) -> bool {
+        let device = match which {
+            1 => None,
+            2 => args.first().copied(),
+            _ => return false,
+        };
+        self.io_target(device) != Device::Unreachable
+    }
+
     /// The [`Device`] a request's **effective device** selects.
     ///
     /// `None` is the omitted (default) device: `default_output/0` is `group_leader()`, so the
     /// caller's group leader decides ([`Self::io_pid_device`]) rather than this runtime's
     /// output stream being assumed.
+    ///
+    /// A leader that **is the caller itself** is this runtime's own output stream: OTP's
+    /// `init`/`user` terminal is the root process here, and
+    /// [`Runtime::group_leader_of`](crate::runtime::Runtime::group_leader_of)'s default makes
+    /// the root its own leader, so the omitted device of the runtime's own process resolves
+    /// to itself. That is a **stream**, not `io.erl`'s `calling_self` — which is reserved for
+    /// an *explicit* `io:put_chars(self(), …)` (`execute_request/3`'s first clause), where the
+    /// oracle really does raise `error:calling_self`.
     fn io_target(&self, device: Option<Eterm>) -> Device {
         match device {
-            None => self.io_pid_device(self.runtime.group_leader_of(self.pid())),
+            None => {
+                let leader = self.runtime.group_leader_of(self.pid());
+                if leader == self.pid() {
+                    return Device::Stream(Stream::Output);
+                }
+                self.io_pid_device(leader)
+            }
             Some(device) => self.io_device(device),
         }
     }
@@ -739,8 +773,9 @@ mod tests {
 
     /// `io:put_chars/2`'s device is resolved by the **same** model as the other arms: an
     /// unregistered atom is the oracle's `badarg`, a non-atom/non-pid is the bare
-    /// `function_clause`, and a live non-stdio device is the typed `unsupported` — never a
-    /// silent redirect to stdout.
+    /// `function_clause`, a **dead** pid is the oracle's `error:terminated` (no round trip
+    /// needed: a send to a dead pid is a no-op and its monitor fires at once), and a **live**
+    /// non-stdio device is the typed `unsupported` — never a silent redirect to stdout.
     #[test]
     fn put_chars_honours_the_device_rules() {
         let mut unknown_atom = runtime();
@@ -756,17 +791,27 @@ mod tests {
             .expect_err("put_chars/2");
         assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
 
-        // A pid that is neither the caller's group leader nor the `standard_error` device:
-        // `io.erl` would post an `{io_request, …}` and block, which a BIF may not do.
-        let mut live = runtime();
+        // A pid naming no live process: `io.erl`'s `execute_request/3` sends (nothing is
+        // delivered) and its monitor answers `'DOWN'` at once — the oracle's `terminated`
+        // clause of `o_request/2` (measured on OTP 29.1.2).
+        let mut dead = runtime();
         let own = {
             let mut sink = beam_bifs::NullSink;
-            let context = RuntimeContext::with_output(&mut live, &mut sink);
+            let context = RuntimeContext::with_output(&mut dead, &mut sink);
             context.pid()
         };
         let device = ProcessId::new(own.number() + 1000, own.serial()).to_eterm();
+        let text = chars(&mut dead, "x");
+        let error = call(&mut dead, "io", "put_chars", &[device, text]).expect_err("put_chars/2");
+        assert_eq!(error.as_atom(), Some("terminated"), "{error}");
+
+        // A **live** process that is neither a stream nor a file device: `io.erl` would post
+        // an `{io_request, …}` and block, which a BIF may not do, so it stays the typed gap.
+        let mut live = runtime();
+        let device = live_child(&mut live);
         let text = chars(&mut live, "x");
-        let error = call(&mut live, "io", "put_chars", &[device, text]).expect_err("put_chars/2");
+        let error = call(&mut live, "io", "put_chars", &[device.to_eterm(), text])
+            .expect_err("put_chars/2");
         let reason = crate::error::unsupported_reason(&error).unwrap_or_else(|| {
             panic!("a live non-stdio device must be the typed capability gap: {error}")
         });
@@ -922,8 +967,8 @@ mod tests {
             let mut sink = beam_bifs::NullSink;
             let context = RuntimeContext::with_output(&mut runtime, &mut sink);
             assert_eq!(
-                context.io_stream(None).expect("the default device"),
-                Stream::Stderr,
+                context.io_target(None),
+                Device::Stream(Stream::Stderr),
                 "`default_output/0` is `group_leader()`, which is the standard_error device"
             );
             assert_eq!(

@@ -82,8 +82,12 @@ use super::RuntimeContext;
 /// The `io` **output** functions — the ones whose body is an `o_request/2` to a device.
 ///
 /// `io:format/3`, `io:put_chars/2` and `io:nl/1` are the explicit-device arities; the rest
-/// address `group_leader()` (`default_output/0`). `io_lib:format/2,3` is **not** here: it is
-/// the renderer, it writes nothing.
+/// address `group_leader()` (`default_output/0`). `io:request/1,2` and `io:requests/1,2` are
+/// the bare protocol entry points (`io.erl:1646-1700`, `-doc false`) that `o_request/2`
+/// itself calls: they name their device explicitly and are the same round trip, so a caller
+/// whose **leader** is a device must take the module body for them too (the floor serves them
+/// for a stream leader, where no round trip is needed). `io_lib:format/2,3` is **not** here:
+/// it is the renderer, it writes nothing.
 pub(super) fn is_output_call(function: &str, arity: u32) -> bool {
     matches!(
         (function, arity),
@@ -99,6 +103,10 @@ pub(super) fn is_output_call(function: &str, arity: u32) -> bool {
             | ("write", 2)
             | ("nl", 0)
             | ("nl", 1)
+            | ("request", 1)
+            | ("request", 2)
+            | ("requests", 1)
+            | ("requests", 2)
     )
 }
 impl RuntimeContext<'_> {
@@ -122,7 +130,15 @@ impl RuntimeContext<'_> {
         if module != "io" || !is_output_call(function, arity) {
             return false;
         }
-        let protocol = self.io_leader_needs_the_protocol();
+        // The two bare protocol entry points name their device **explicitly**, and this seam
+        // receives only `(module, function, arity)` — the device cannot be classified here, so
+        // it must not be assumed to be one of this runtime's streams. They always take the
+        // module body: its `execute_request/3` posts the request and blocks, which is the only
+        // shape that serves a **live** device (`epp`'s own reader process is exactly that), and
+        // a file device is answered by the native file service's mailbox drain. The floor
+        // serves the same keys for the routes that reach it with the arguments in hand (see
+        // `native::io`'s `Device` model).
+        let protocol = matches!(function, "request" | "requests") || self.io_leader_needs_the_protocol();
         if protocol && crate::debug_trace::enabled() {
             crate::debug_trace::trace(format_args!(
                 "io-route [{:?}] io:{function}/{arity} -> the {{io_request,_}} protocol \
@@ -169,8 +185,13 @@ impl RuntimeContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::is_output_call;
-    /// The output keys are exactly OTP's `o_request/2` wrappers — and the renderer
-    /// (`io_lib:format/2,3`) is deliberately not one of them.
+    /// The output keys are exactly OTP's `o_request/2` wrappers plus the two bare protocol
+    /// entry points it calls — and the renderer (`io_lib:format/2,3`) is deliberately not one
+    /// of them.
+    ///
+    /// `io.erl` exports `request/1,2` and `requests/1,2` and nothing else of that family, so
+    /// the `request/3,4` forms are absent by construction (they are not `io` functions at
+    /// all); the test pins that too, so a typo cannot resurrect a key the oracle does not have.
     #[test]
     fn the_output_key_table_is_the_o_request_wrappers() {
         for (function, arity) in [
@@ -186,6 +207,10 @@ mod tests {
             ("write", 2),
             ("nl", 0),
             ("nl", 1),
+            ("request", 1),
+            ("request", 2),
+            ("requests", 1),
+            ("requests", 2),
         ] {
             assert!(is_output_call(function, arity), "io:{function}/{arity}");
         }
@@ -193,10 +218,9 @@ mod tests {
             ("format", 4),
             ("getopts", 1),
             ("setopts", 2),
-            ("request", 2),
             ("request", 3),
             ("request", 4),
-            ("requests", 1),
+            ("requests", 3),
             ("get_chars", 1),
             ("get_line", 1),
             ("read", 1),
