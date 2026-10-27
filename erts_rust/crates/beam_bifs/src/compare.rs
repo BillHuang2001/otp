@@ -72,24 +72,26 @@
 //! hash this runtime cannot reproduce **faithfully**, and the BIF contract here is the
 //! crate-wide one — a **typed** `unsupported_bif` capability gap, never a wrong number
 //! and never a plain `badarg` — so every `TermError` is mapped to `unsupported_bif`
-//! ([`hashing_gap`]). One refusal is *identity*, not layout, and it names exactly one
-//! missing capability:
+//! ([`hashing_gap`]).
 //!
-//! * **An internal reference** needs no new data at all: the C mixes
+//! * **An internal reference is not a gap.** It used to be one: the C mixes
 //!   `internal_ref_numbers(term)[0]` (`erl_term_hashing.c:288-290` for `make_hash`,
 //!   `:1454-1458` for `make_hash2`), i.e. `id & REF_MASK` — a pure projection of the
 //!   `id` word the M1 reference thing stores (`beam_term::boxed::internal_ref_id`), the
 //!   same word `beam_codec::ref_wire::ref_id_to_numbers` spells as the first reference
-//!   number. Nothing the C mixes is absent from the term, so the LCA *could* reproduce
-//!   it — which is also why an internal and an external spelling of the same three
-//!   numbers hash identically on the oracle — and it only does not yet
-//!   (`TermError::RefIdentityUnavailable`,
-//!   `beam_term/src/hashing/make_hash2.rs:507`, `beam_term/src/hashing/make_hash.rs:334`).
+//!   number, so nothing the C mixes is absent from the term. The LCA now mixes it
+//!   itself (`beam_term/src/hashing/common.rs::internal_ref_hash_word`, the single
+//!   definition both ports call), so `TermError::RefIdentityUnavailable` — still a live
+//!   variant, still mapped below — is **currently unproduced**. The value is *not*
+//!   oracle-comparable (a reference's id comes from the running VM's own reference
+//!   space), so what is asserted is the range each reduction implies, stability for one
+//!   term and distinctness across mints — never a number.
 //!
-//! The other refusal a well-formed term can reach — a `make_fun3` (`FunKind::Local`)
-//! fun — is **closed** by a fun-identity provider, and this module is that provider's
-//! only wiring: [`SeamFunIdentity`] forwards the crate's [`crate::LocalFunIdentity`]
-//! seam into `beam_term`'s [`make_hash_with_identity`]/[`make_hash2_with_identity`]
+//! The one refusal a well-formed term can still reach is a `make_fun3`
+//! (`FunKind::Local`) fun, and it is **closed** by a fun-identity provider — this
+//! module is that provider's only wiring: [`SeamFunIdentity`] forwards the crate's
+//! [`crate::LocalFunIdentity`] seam into `beam_term`'s
+//! [`make_hash_with_identity`]/[`make_hash2_with_identity`]
 //! (`beam_term/src/hashing/identity.rs`). With that provider a `Local` fun hashes
 //! exactly like the equivalent `NEW_FUN_EXT` image, because the C mixes the same four
 //! fields (`erl_term_hashing.c:238-265` for `make_hash`, `:1219-1245` for `make_hash2`
@@ -280,13 +282,17 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 /// contract ([`crate::error::unsupported_bif`]) is a typed raise instead.
 ///
 /// One class of refusal remains reachable from a well-formed term:
-/// [`TermError::RefIdentityUnavailable`] for an internal reference, whose C mix is
-/// `internal_ref_numbers(term)[0]` (`:288-290`/`:1454-1458`) — a pure projection of the
-/// `id` word the M1 reference thing stores, so the LCA can close it without new data
-/// (module docs, Handoffs). The other — [`TermError::FunIdentityUnavailable`] for a
-/// `make_fun3` (`FunKind::Local`) fun — is closed *for the request that carries a
-/// [`crate::LocalFunIdentity`] seam* by [`SeamFunIdentity`] below, and still raised
-/// when the seam cannot attribute the closure (no hook, or an `Ok(None)` answer).
+/// [`TermError::FunIdentityUnavailable`] for a `make_fun3` (`FunKind::Local`) fun — it
+/// is closed *for the request that carries a [`crate::LocalFunIdentity`] seam* by
+/// [`SeamFunIdentity`] below, and still raised when the seam cannot attribute the
+/// closure (no hook, or an `Ok(None)` answer).
+///
+/// A second variant, [`TermError::RefIdentityUnavailable`], still **exists** but is
+/// currently **unproduced**: an internal reference used to be refused here, and
+/// `beam_term::hashing` now mixes the reference's own `id` word instead
+/// (`beam_term/src/hashing/common.rs::internal_ref_hash_word` — the C's
+/// `internal_ref_numbers(term)[0]` projection), so `phash/2`/`phash2/1,2` answer a
+/// number for one.
 ///
 /// Mapping the whole `TermError` set — not just the classes we can name today — keeps
 /// that honest as `beam_term::hashing` grows: a new refusal there becomes a gap here
@@ -346,8 +352,8 @@ fn range_of(term: Eterm) -> Result<u32> {
 ///
 /// `badarg` for an invalid `Range`, a [`crate::LocalFunIdentity`] seam failure
 /// propagated unchanged, and the typed `unsupported_bif` gap for a term
-/// [`make_hash`](beam_term::hashing::make_hash) cannot reproduce (an internal
-/// reference, or a `make_fun3` fun no seam can attribute).
+/// [`make_hash`](beam_term::hashing::make_hash) cannot reproduce (a `make_fun3` fun
+/// no seam can attribute).
 fn phash_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let range = range_of(args[1])?;
     let hash = phash_of(ctx, args[0])?;
@@ -398,10 +404,10 @@ fn phash2_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// `beam_term::hashing` is **authoritative** here — it resolves a native record's
 /// definition hash itself and refuses only a *term identity* it cannot derive (a
-/// `make_fun3` local fun whose defining module nobody can name, an internal
-/// reference) or an input that is not a term at all, so no consumer-side pre-check is
-/// needed (module docs). The local-fun half is answered by [`SeamFunIdentity`], which
-/// forwards this crate's [`crate::LocalFunIdentity`] seam to
+/// `make_fun3` local fun whose defining module nobody can name) or an input that is
+/// not a term at all, so no consumer-side pre-check is needed (module docs). The
+/// local-fun half is answered by [`SeamFunIdentity`], which forwards this crate's
+/// [`crate::LocalFunIdentity`] seam to
 /// [`beam_term::hashing::make_hash_with_identity`].
 fn phash_of(ctx: &mut BifContext<'_>, t: Eterm) -> Result<u32> {
     let atoms = ctx.atoms();
@@ -486,9 +492,8 @@ mod tests {
     use super::*;
     use crate::access;
     use beam_alloc::Heap;
-    use beam_common::{ExceptionClass, ExitReason};
     use beam_process::ProcessId;
-    use beam_term::{make_atom, make_small, AtomTable, NIL};
+    use beam_term::{make_atom, make_small, signed_value, AtomTable, NIL};
 
     fn atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
@@ -498,17 +503,6 @@ mod tests {
         // matches the oracle's.
         atoms.seed(["false", "true", "ok", "a", "b", "rec", "r", "x", "y"]);
         atoms
-    }
-
-    /// Asserts a result is the typed `unsupported_bif` raise.
-    fn assert_gap(result: Result<Eterm>, what: &str) {
-        match result {
-            Err(BeamError::Raise(raise)) => {
-                assert_eq!(raise.class, ExceptionClass::Error, "{what}");
-                assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"), "{what}");
-            }
-            other => panic!("{what}: expected the typed unsupported_bif gap, got {other:?}"),
-        }
     }
 
     /// The boolean value of a `true`/`false` atom term (resolved via `atoms`).
@@ -792,62 +786,83 @@ mod tests {
         );
     }
 
-    /// An **internal reference** is a class `beam_term::hashing` refuses with
-    /// `TermError::RefIdentityUnavailable` (`beam_term/src/hashing/make_hash2.rs:432-441`,
-    /// `.../make_hash.rs:264-272`), so `erlang:phash/2` and `erlang:phash2/1,2` must
-    /// answer the typed `unsupported_bif` capability gap at **every** nesting depth the
-    /// two hashes reach — never a number.
+    /// An **internal reference** hashes from its own `id` word, so `erlang:phash/2`
+    /// and `erlang:phash2/1,2` answer a number for one instead of the typed
+    /// `unsupported_bif` capability gap they used to.
     ///
-    /// The missing capability is small and named: the C mixes
-    /// `internal_ref_numbers(term)[0]` (`erl_term_hashing.c:288-290` for `make_hash`,
-    /// `:1454-1458` for `make_hash2`), which is `id & REF_MASK` — a pure projection of
-    /// the `id` word the M1 reference thing stores, so the LCA could reproduce the value
-    /// from the term alone (module docs, Handoffs). The oracle's
-    /// `erlang:phash2(make_ref())` is environment-dependent (the id comes from the
-    /// running node's reference space), so no value is pinned; the contract asserted
-    /// here is the typed refusal.
+    /// The C mixes `internal_ref_numbers(term)[0]` (`erl_term_hashing.c:288-290` for
+    /// `make_hash`, `:1454-1458` for `make_hash2`), a projection of the reference's
+    /// node container. The M1 reference thing carries no container, so the LCA mixes
+    /// the `id` word it does store (`beam_term/src/hashing/common.rs::internal_ref_hash_word`)
+    /// — which is why `TermError::RefIdentityUnavailable`, the refusal this contract
+    /// used to be, still exists as a variant but is no longer produced.
+    ///
+    /// Nothing numeric is pinned: a reference's `id` comes from the running VM's own
+    /// reference space (`value = esdp->ref++`, `erl_bif_unique.h:169-178`), so no two
+    /// VMs agree even on the C's exact formula — `erlang:phash2(make_ref())` is
+    /// environment-dependent. What is pinned is the invariant the refusal stood in
+    /// for: every port answers a number **in the range its own reduction implies**,
+    /// stably for one term, and **distinctly for two different mints** (the property
+    /// every `dict`/`gb_trees` keyed by a reference relies on).
+    ///
+    /// * `phash2/1` is `make_hash2(Term)`'s low 27 bits (`bif.c:5407`) ⇒ `0..=2^27-1`;
+    /// * `phash2/2` is `make_hash2(Term) % Range` (`bif.c:5434-5438`) ⇒ `0 .. Range-1`;
+    /// * `phash/2` is `1 + make_hash(Term) % Range` (`bif.c:5376-5385`) ⇒ `1 ..= Range`.
     #[test]
-    fn internal_references_stay_the_typed_unsupported_bif_gap() {
+    fn internal_references_hash_in_range_instead_of_the_typed_gap() {
         let mut heap = Heap::new(512).unwrap();
         let table = atoms();
         let a_term = make_atom(table.lookup("a").expect("seeded"));
         let r = access::make_ref_thing(&mut heap, 7).unwrap();
+        // A second mint: the same reference shape over a different id word.
+        let other = access::make_ref_thing(&mut heap, 8).unwrap();
 
         let mut ctx = BifContext::new(&mut heap, &table, ProcessId::new(1, 0));
         let one = make_small(1);
         let range = make_small(1_000_000);
 
-        let in_tuple = ctx.tuple(&[one, r]).unwrap();
-        let in_list = ctx.list(&[r, one]).unwrap();
-        let in_map = access::make_flatmap(ctx.heap(), &[(a_term, r)]).unwrap();
-        // A record whose *field* holds the reference: the record's value walk reaches
-        // it, so the record too is a gap.
-        let rec_with_ref = access::native_record_write(
-            ctx.heap(),
-            table.lookup("rec").expect("seeded"),
-            table.lookup("r").expect("seeded"),
-            false,
-            &[(a_term, r)],
-        )
-        .unwrap();
+        let p2 = signed_value(phash2_1(&mut ctx, &[r]).expect("a reference hashes"));
+        assert!(
+            (0..=0x07FF_FFFF).contains(&p2),
+            "phash2/1 of a reference is outside the 27-bit range: {p2}"
+        );
+        let p2_range = signed_value(phash2_2(&mut ctx, &[r, range]).expect("a reference hashes"));
+        assert!(
+            (0..1_000_000).contains(&p2_range),
+            "phash2/2 of a reference is not below its range: {p2_range}"
+        );
+        let p1_range = signed_value(phash_2(&mut ctx, &[r, range]).expect("a reference hashes"));
+        assert!(
+            (1..=1_000_000).contains(&p1_range),
+            "phash/2 of a reference is outside 1..=range: {p1_range}"
+        );
 
-        for (t, what) in [
-            (r, "reference"),
-            (in_tuple, "{1, reference}"),
-            (in_list, "[reference, 1]"),
-            (in_map, "#{a => reference}"),
-            (rec_with_ref, "a record with a reference field"),
-        ] {
-            assert_gap(phash2_1(&mut ctx, &[t]), &format!("phash2({what})"));
-            assert_gap(
-                phash2_2(&mut ctx, &[t, range]),
-                &format!("phash2({what}, range)"),
-            );
-            assert_gap(
-                phash_2(&mut ctx, &[t, range]),
-                &format!("phash({what}, range)"),
-            );
-        }
+        // Stable: hashing the same term again answers the same numbers.
+        assert_eq!(signed_value(phash2_1(&mut ctx, &[r]).unwrap()), p2);
+        assert_eq!(
+            signed_value(phash2_2(&mut ctx, &[r, range]).unwrap()),
+            p2_range
+        );
+        assert_eq!(signed_value(phash_2(&mut ctx, &[r, range]).unwrap()), p1_range);
+
+        // Distinct mints hash distinctly: the mix really carries the identity (a
+        // literal `0` operand would collapse every local reference of a process onto
+        // one hash, and therefore onto one `dict` key).
+        assert_ne!(
+            signed_value(phash2_1(&mut ctx, &[other]).unwrap()),
+            p2,
+            "two distinct reference mints share a phash2/1 value"
+        );
+        assert_ne!(
+            signed_value(phash2_2(&mut ctx, &[other, range]).unwrap()),
+            p2_range,
+            "two distinct reference mints share a phash2/2 value"
+        );
+        assert_ne!(
+            signed_value(phash_2(&mut ctx, &[other, range]).unwrap()),
+            p1_range,
+            "two distinct reference mints share a phash/2 value"
+        );
 
         // A control: the same containers *without* a reference still hash.
         let clean = ctx.tuple(&[one, a_term]).unwrap();

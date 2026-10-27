@@ -1311,9 +1311,11 @@ fn phash_maps_and_funs_match_the_oracle() {
 /// one-field shape is the one whose oracle definition hash is stable run-to-run.
 ///
 /// A *reference* cannot be built from this integration test (there is no public
-/// internal-reference constructor), so the reference-refusal contract lives in the
+/// internal-reference constructor), so the reference contract lives in the
 /// `src/compare.rs` in-module test
-/// `internal_references_stay_the_typed_unsupported_bif_gap`.
+/// `internal_references_hash_in_range_instead_of_the_typed_gap`: a reference hashes
+/// from its own `id` word, and only its range / stability / per-mint distinctness are
+/// pinnable (reference numbering is per-VM).
 #[test]
 fn records_hash_to_the_oracle_definition_hash() {
     run(|reg, ctx| {

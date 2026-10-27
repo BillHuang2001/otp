@@ -39,6 +39,15 @@
 //!
 //! * `io:format/1,2` write the rendered text to the context's [`OutputSink`]
 //!   ([`crate::context::BifContext::write_output`]) and return the atom `ok`.
+//!   That is this BIF's own behaviour, i.e. the destination of the runtime's **own
+//!   output stream**; it is not the only route an `io` output call takes on the
+//!   runtime. OTP's `io` output functions are `{io_request, …}` messages to the
+//!   caller's `group_leader()`, and the runtime drives that protocol in-machine
+//!   whenever the leader is a real io device (a capture process, a `user` device, a
+//!   file's `file_io_server`), so those calls never reach this BIF at all —
+//!   `../../beam_rt/src/context/io_route.rs` is the route predicate and the measured
+//!   oracle table. Use the sink for the text this BIF renders, not as the
+//!   assumption that every `io:format` writes to it.
 //! * `io_lib:format/2,3` return the rendering as the oracle's **deep list** and
 //!   write nothing: literal format characters and the "small" controls (`~s` of an
 //!   atom, `~e`/`~f`/`~g`, `~b`/`~B`, `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) are
