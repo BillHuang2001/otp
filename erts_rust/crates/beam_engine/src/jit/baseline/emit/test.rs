@@ -39,10 +39,7 @@ use super::link::{ExitSpill, Linker};
 use super::operands::{
     emit_guarded_y_load, small_word, x_offset, x_register, y_addressable, y_register,
 };
-use super::{
-    emit_helper_call, emit_refresh_y, emit_step_and_continue, fill, touch, Allocation, FillSite,
-    SpillPolicy,
-};
+use super::{emit_helper_call, emit_refresh_y, emit_step_and_continue, fill, touch, Allocation, FillSite};
 use crate::jit::baseline::runtime::StepHelper;
 use crate::jit::baseline::test_helper::{jit_test, TEST_FALSE, TEST_TRUE};
 
@@ -950,11 +947,7 @@ fn emit_test_helper_branch(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-        pc,
-        // Spill-required: `jit_test` reads the operands out of `machine.x` and can
-        // report a comparison's own typed error.
-        SpillPolicy::Required,
-    )?;
+    pc)?;
 
     buffer.mov_ri(Reg::R11, TEST_TRUE)?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;

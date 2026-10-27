@@ -44,20 +44,18 @@
 //!   loaded, and the rule is self-containment (each block and continuation sub-block
 //!   loads its own cache) — so every register the block reads before it writes starts
 //!   the block clean; and
-//! * **any helper call's spill** (a [`super::emit_helper_call`] passed
-//!   [`super::SpillPolicy::Required`] begins with a [`super::regs::spill`]) followed by
-//!   the helper running: the spill writes the dirty registers out, so afterwards every
-//!   cached register equals its `machine.x` slot — and a helper that *wrote* `machine.x`
-//!   is followed by a refilling [`super::emit_continue_check`] (or the equivalent `test`
-//!   helper `fill`), which reads it back.
+//! * **any helper call's spill** (a [`super::emit_helper_call`] begins with a
+//!   [`super::regs::spill`]) followed by the helper running: the spill writes the dirty
+//!   registers out, so afterwards every cached register equals its `machine.x` slot — and
+//!   a helper that *wrote* `machine.x` is followed by a refilling
+//!   [`super::emit_continue_check`] (or the equivalent `test` helper `fill`), which reads
+//!   it back.
 //!
-//! So the true dirty set is empty at every **spilling** helper boundary and grows only
-//! across the inline lowerings between them. [`Allocation::spill_sets`] models exactly
-//! that: a **forward walk** over the block's pcs that starts empty, unions each
-//! instruction's inline **write** set ([`cacheable_writes`]) when the instruction inlines,
-//! and resets to empty at an instruction whose emission is entirely a helper — except the
-//! **spill-free** helpers ([`spill_free_helper`]), which publish nothing and therefore
-//! leave the dirty set standing.
+//! So the true dirty set is empty at every helper boundary and grows only across the
+//! inline lowerings between them. [`Allocation::spill_sets`] models exactly that: a
+//! **forward walk** over the block's pcs that starts empty, unions each instruction's
+//! inline **write** set ([`cacheable_writes`]) when the instruction inlines, and resets to
+//! empty at an instruction whose emission is entirely a helper.
 //!
 //! ## Why the model can only be *conservative*, never wrong
 //!
@@ -79,9 +77,7 @@
 //! are the ones whose emission unconditionally reaches a helper (the family-owned set, the
 //! receive family, the cross-module calls, the three local call forms, the frame-discipline
 //! trio, the heap family, and the `_`-arm sentinel); for those the reset is *exact*, because
-//! the helper's spill provably synced the whole cache — minus the one instruction
-//! [`spill_free_helper`] names, whose helper call is emitted under
-//! [`super::SpillPolicy::NotRequired`] and therefore syncs nothing.
+//! the helper's spill provably synced the whole cache.
 //!
 //! The model reproduces the classic "already-clean-aware" store elimination a handwritten
 //! JIT's register cache does — see `ERTS_RUST_REWRITE_DEEPDIVE.md` §F (the baseline/hot
@@ -365,9 +361,7 @@ pub(crate) fn allocate_registers_with_labels(
 /// The block's per-`pc` store set ([`Allocation::spill_sets`]): the cached x-registers
 /// that an inline lowering has diverged from `machine.x` by that pc. Computed by the
 /// forward walk documented on the module — union [`cacheable_writes`] for an inlined
-/// instruction, reset for a purely-helper one whose emission spills the cache first, and
-/// **carry over** for the one spill-free helper ([`spill_free_helper`], which stores
-/// nothing, so what was dirty stays dirty) — biased toward "inlined" so a missed reset
+/// instruction, reset for a purely-helper one, biased toward "inlined" so a missed reset
 /// only costs a redundant store (never a dropped dirty value). The walk emits one entry
 /// per pc in `[start, end)` plus the block exit pc `end`, so every spill site (whose pcs
 /// lie in that range) resolves.
@@ -395,34 +389,15 @@ fn spill_sets(
                     dirty.push(x);
                 }
             }
-        } else if !spill_free_helper(instr) {
+        } else {
             // A purely-helper instruction: its own spill synced the whole cache, so
-            // nothing is dirty afterwards. A **spill-free** helper call ([`Instr::Allocate`],
-            // emitted under `super::SpillPolicy::NotRequired`) stores nothing, so the dirty
-            // set stands and the next site that does publish the cache stores it — dropping
-            // it here would leave `machine.x` stale for that site, i.e. a wrong result.
+            // nothing is dirty afterwards.
             dirty.clear();
         }
     }
     // The block exit pc `end` (the fall-through exit).
     sets.push(dirty);
     sets
-}
-
-/// Whether `instr` is lowered as a helper call emitted under
-/// [`super::SpillPolicy::NotRequired`] — a helper that is total, reaches neither the host
-/// nor a collector nor a deopt, and reads no x-register, so
-/// [`super::emit_helper_call`] skips its leading store ([`Instr::Allocate`] /
-/// [`super::heap::emit_allocate`]: `jit_allocate` calls `Machine::push_frame_window`,
-/// which constructs no error, and `JitRuntime::publish_y_window`).
-///
-/// The one consumer is [`spill_sets`], and the classification must stay in lockstep with
-/// the emitter's own site: treating a spill-free helper as a syncing reset would drop a
-/// register that is still divergent, while treating a *spilling* helper as spill-free only
-/// costs a redundant store. `is_inlined` still reports `false` for these variants — they
-/// are helper calls, not inline lowerings — so the second table is the reset gate.
-pub(crate) fn spill_free_helper(instr: &Instr) -> bool {
-    matches!(instr, Instr::Allocate { .. })
 }
 
 /// Whether [`super::emit_block`] emits an **inline lowering** for `instr` (as opposed to

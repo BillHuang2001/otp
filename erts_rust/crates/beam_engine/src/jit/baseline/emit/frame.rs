@@ -86,7 +86,7 @@ use super::super::runtime::{
     ReturnHelper, RUNTIME_RESUME_DISP,
 };
 use super::link::emit_frame_teardown;
-use super::{emit_helper_call, Allocation, SpillPolicy, RUNTIME_SLOT_DISP};
+use super::{emit_helper_call, Allocation, RUNTIME_SLOT_DISP};
 
 /// Lower `deallocate N` — the frame pop, then continue in-block at `pc + 1`.
 ///
@@ -111,9 +111,7 @@ pub(super) fn emit_deallocate(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(deallocate)],
-        pc,
-        SpillPolicy::Required,
-    )?;
+    pc)?;
     // `rax` holds the helper's word; only "the next instruction" continues here.
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
@@ -149,9 +147,7 @@ pub(super) fn emit_return(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-        pc,
-        SpillPolicy::Required,
-    )?;
+    pc)?;
     emit_resume_or_exit(buffer, allocation, done)
 }
 
@@ -204,9 +200,6 @@ pub(super) fn emit_deallocate_return(
             i64::from(deallocate),
         ],
         store_pc,
-        // Spill-required: `pop_frame_checked`'s mismatch is a typed error, and the
-        // in-block tail transfer below relies on this store having published the cache.
-        SpillPolicy::Required,
     )?;
     emit_resume_or_exit(buffer, allocation, done)
 }

@@ -77,8 +77,8 @@ use super::arith::import_names;
 use super::operands::{constant_word, Loc, Y_ADDR_SCRATCH};
 use super::super::runtime::StepHelper;
 use super::{
-    emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, SpillPolicy,
-    MOVE_SCRATCH, MOVE_SCRATCH_2,
+    emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, MOVE_SCRATCH,
+    MOVE_SCRATCH_2,
 };
 use crate::jit::baseline::bif_helper::jit_bif_value;
 
@@ -427,10 +427,7 @@ fn try_inline_bif_value(
         allocation,
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
-        pc,
-        // Spill-required: the accessor helper reads `machine.x` and reports `badarg`.
-        SpillPolicy::Required,
-    )?;
+    pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)?;
     Ok(true)
 }
