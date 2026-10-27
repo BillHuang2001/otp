@@ -69,6 +69,12 @@
 //! * **a legitimately deopting shape is still idempotent** — the root-cause pin: a command
 //!   list whose field extraction really does decline to the fallback must answer exactly
 //!   what the interpreter tier answers. Reintroducing a per-command commit fails that row.
+//! * **the subject's two readable forms are both native** — an on-heap `ErlHeapBits` *and* a
+//!   refc window (an `ErlSubBits` whose `orig` is a `BinRef`, which is what a match over a
+//!   binary above `ERL_ONHEAP_BINARY_LIMIT` gets, i.e. every binary comprehension's
+//!   subject). A **run-time** deopt count of zero per form is the assertion, because an arm
+//!   that declines answers the same value through the interpreter step — and a non-refc
+//!   `ErlSubBits` subject still declines, on both tiers.
 
 use beam_common::ExceptionClass;
 use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
@@ -838,5 +844,286 @@ fn a_legitimately_deopting_shape_is_still_idempotent() {
         "the 16-bit field must really deopt (jit_step_one ran {} times): otherwise this row \
          does not exercise the fallback it exists to pin",
         snapshot.step_one
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. A refc-window subject — the binary-comprehension inner loop
+// ---------------------------------------------------------------------------
+/// Build an off-heap (**refc**) bitstring term over `payload_bytes` with the window
+/// `[offset_bits, offset_bits + size_bits)`.
+///
+/// This is the subject form a match over a binary **larger than
+/// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`]** (64) bytes gets: the payload is off-heap and
+/// the term is an `ErlSubBits` whose `orig` is a `BinRef`. The payload words are answered
+/// beside the term because the term only *names* them — the caller keeps them alive for as
+/// long as the run reads the subject, which is `raw::subject_bytes`' ownership contract.
+#[allow(unsafe_code)]
+fn refc_window(
+    ctx: &mut MinimalContext,
+    payload_bytes: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+) -> (beam_term::Eterm, Vec<beam_term::Eterm>) {
+    use crate::context::ExecutionContext;
+    let word_bytes = core::mem::size_of::<beam_term::Eterm>();
+    let words = payload_bytes.len().div_ceil(word_bytes).max(1);
+    let mut payload: Vec<beam_term::Eterm> = vec![beam_term::Eterm::default(); words];
+    // SAFETY: `payload` owns `words * size_of::<Eterm>() >= payload_bytes.len()` bytes and is
+    // exclusively borrowed here, so the whole payload fits.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            payload_bytes.as_ptr(),
+            payload.as_mut_ptr().cast::<u8>(),
+            payload_bytes.len(),
+        );
+    }
+    let base = payload.as_ptr().cast::<u8>();
+    let val = payload.as_mut_ptr();
+    let hp = ctx
+        .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+        .expect("arena words");
+    // SAFETY: `hp` is 8 exclusively-owned arena words (the `BinRef` + `ErlSubBits` pair),
+    // `val`/`base` point at the live word-aligned payload and `next` is the null chain link.
+    let term = unsafe {
+        beam_term::refc::write_refc_binary(
+            hp,
+            val,
+            core::ptr::null_mut(),
+            base,
+            offset_bits,
+            size_bits,
+        )
+    };
+    (term, payload)
+}
+
+/// [`run_counting_bytes`]'s refc-subject twin: one run of `f/1` over a refc window with the
+/// deopt counters on.
+#[allow(unsafe_code)]
+fn run_counting_refc(
+    module: &Module,
+    name: Atom,
+    payload: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+    tier: Tier,
+) -> (beam_common::Result<RunOutcome>, counters::Counters) {
+    counters::reset();
+    counters::set_enabled(true);
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let (subject, payload_words) = refc_window(&mut ctx, payload, offset_bits, size_bits);
+    let outcome =
+        machine.run_export_outcome_with_tier(module, name, 1, &[subject], &mut ctx, tier);
+    counters::set_enabled(false);
+    drop(payload_words);
+    (outcome, counters::snapshot())
+}
+
+/// Run `f/1` over a refc window on **both** tiers, assert the two agree, and answer the
+/// baseline tier's integer result.
+#[allow(unsafe_code)]
+fn refc_value(
+    label: &str,
+    module: &Module,
+    payload: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+) -> i64 {
+    let name = atom(module, "f");
+    let (interpreted, _) = run_counting_refc(
+        module,
+        name,
+        payload,
+        offset_bits,
+        size_bits,
+        Tier::Interpreter,
+    );
+    let (baseline, snapshot) = run_counting_refc(
+        module,
+        name,
+        payload,
+        offset_bits,
+        size_bits,
+        Tier::BaselineJit,
+    );
+    assert!(
+        snapshot.deopts_by_variant.get("BsMatch").copied().unwrap_or(0) == 0,
+        "{label}: a refc-window subject must be read by the `bs_match` arm itself, never through \
+         the family helper (run-time deopts {:?})",
+        snapshot.deopts_by_variant
+    );
+    assert_same_outcome(label, &interpreted, &baseline, &module.atom_table);
+    let returned = baseline
+        .as_ref()
+        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+    let RunOutcome::Returned(value) = returned else {
+        panic!("{label}: unexpected outcome {returned:?}");
+    };
+    beam_term::signed_value(*value)
+}
+
+/// **A `refc`-window subject is read by the arm, not by the family helper.**
+///
+/// The subject here is the shape a compiled **binary comprehension** matches element by
+/// element: a 16 KiB (i.e. far above [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`]) off-heap
+/// payload, so the match context's `orig` is a refc `ErlSubBits`. The command list is the
+/// comprehension's own `[ensure_at_least 8 1, integer 8 1 x(2)]`.
+///
+/// Before the subject view learned the refc arm this row still answered correctly — through
+/// [`super::runtime::jit_step_one`], one full interpreter step **per element**, which is
+/// exactly the measured 72 % of a `binary_append` iteration. So the value alone proves
+/// nothing: the assertion that matters is the deopt counter, checked in [`refc_value`], plus
+/// the cache-free emission pin below. A regression that drops the refc arm answers the same
+/// number and fails here.
+#[test]
+fn a_refc_window_subject_inlines_and_agrees_with_the_interpreter() {
+    let module = match_module_with(
+        "bsm_refc_subject",
+        &["ensure_at_least", "integer"],
+        |module| {
+            let mut commands = ensure_at_least_command(module, 8, 1);
+            commands.extend(integer_command(module, 8, 1, Operand::X(2)));
+            commands
+        },
+        vec![Instr::Move {
+            src: Operand::X(2),
+            dst: Operand::X(0),
+        }],
+    );
+    assert_inlinable("refc subject", &module);
+    // The comprehension's subject size, filled with a byte pattern whose first field is
+    // distinguishable from every neighbour (`0x5a`).
+    let payload = vec![0x5au8; 16 * 1024];
+    let bits = payload.len() * 8;
+    assert_eq!(
+        refc_value("refc subject", &module, &payload, 0, bits),
+        0x5a,
+        "the first 8 bits of a refc-window subject must be its first payload byte"
+    );
+    // The shape is still claimed *statically* too: a cache-free compile emits the arm and
+    // records no static deopt for `BsMatch` (a shape-level regression fails here, a
+    // subject-level one in `refc_value`).
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_BS_MATCH),
+        "a cache-free compile must still emit the `bs_match` arm (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsMatch"),
+        0,
+        "the arm must be lowered, never statically deopted (deopts {:?})",
+        snapshot.instr_deopts
+    );
+}
+
+/// **A refc window that starts at a non-zero bit offset reads the right bits.**
+///
+/// The window's `start` word is what moves the payload's byte base and rotates the field's
+/// bit position (`base = payload + (start + pos) / 8`, `bit_pos = (start + pos) % 8`), so a
+/// byte-aligned row alone cannot pin the arithmetic — an arm that ignored `start` would pass
+/// it. Here the window begins 4 bits into the payload, so the first whole byte spans two
+/// payload bytes: bits 4..12 of `0x12 0x34 …` are `0x23`.
+#[test]
+fn a_refc_window_at_a_bit_offset_reads_the_right_bits() {
+    let module = match_module_with(
+        "bsm_refc_offset_subject",
+        &["ensure_at_least", "integer"],
+        |module| {
+            let mut commands = ensure_at_least_command(module, 8, 1);
+            commands.extend(integer_command(module, 8, 1, Operand::X(2)));
+            commands
+        },
+        vec![Instr::Move {
+            src: Operand::X(2),
+            dst: Operand::X(0),
+        }],
+    );
+    assert_inlinable("refc offset subject", &module);
+    let mut payload = vec![0x12u8, 0x34, 0x56, 0x78];
+    payload.resize(256, 0xff);
+    let offset = 4;
+    let bits = payload.len() * 8 - offset;
+    assert_eq!(
+        refc_value("refc offset subject", &module, &payload, offset, bits),
+        0x23,
+        "bits 4..12 of the payload must read `0x23` (the low nibble of 0x12 then the high \
+         nibble of 0x34)"
+    );
+}
+
+/// **A non-refc `ErlSubBits` subject still declines, and both tiers answer the same thing.**
+///
+/// [`super::emit::bitstr_inline::emit_subject_view`] claims the refc form by testing the
+/// subject's `orig` word for a boxed `BinRef`. An `ErlSubBits` whose `orig` is *not* one — a
+/// match context used as a subject, a sub-bitstring over a heap block: here the widest form,
+/// a non-boxed `orig` — is not readable by the family either
+/// (`raw::heap_bits` refuses it), so the arm must fall through to the family helper and the
+/// two tiers must agree on its typed refusal. Without this row, "accept every `ErlSubBits`"
+/// would look like a simplification instead of the wrong answer it is.
+#[test]
+#[allow(unsafe_code)]
+fn a_non_refc_sub_bits_subject_still_declines_to_the_family() {
+    let module = match_module_with(
+        "bsm_non_refc_subject",
+        &["ensure_at_least", "integer"],
+        |module| {
+            let mut commands = ensure_at_least_command(module, 8, 1);
+            commands.extend(integer_command(module, 8, 1, Operand::X(2)));
+            commands
+        },
+        vec![Instr::Move {
+            src: Operand::X(2),
+            dst: Operand::X(0),
+        }],
+    );
+    assert_inlinable("non-refc subject", &module);
+    let name = atom(&module, "f");
+    let run = |tier: Tier| {
+        use crate::context::ExecutionContext;
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let hp = ctx
+            .alloc_words(beam_term::ERL_SUB_BITS_SIZE)
+            .expect("arena words");
+        // SAFETY: `hp` is 5 exclusively-owned arena words (one `ErlSubBits`), and this term is
+        // the widest non-refc form: its `orig` word is a small int, so neither the arm nor the
+        // family ever dereferences the `base_flags` word this term also carries.
+        let subject = unsafe {
+            beam_term::bitstring::write_sub_bits(
+                hp,
+                beam_term::Eterm::from_raw(0),
+                beam_term::make_small(0),
+                beam_term::make_small(8),
+                beam_term::make_small(0),
+            )
+        };
+        let outcome = machine.run_export_outcome_with_tier(
+            &module,
+            name,
+            1,
+            &[subject],
+            &mut ctx,
+            tier,
+        );
+        outcome
+    };
+    let interpreted = run(Tier::Interpreter);
+    counters::reset();
+    counters::set_enabled(true);
+    let baseline = run(Tier::BaselineJit);
+    counters::set_enabled(false);
+    let snapshot = counters::snapshot();
+    assert!(
+        snapshot.deopts_by_variant.get("BsMatch").copied().unwrap_or(0) >= 1,
+        "the arm must decline a non-refc `ErlSubBits` subject (run-time deopts {:?})",
+        snapshot.deopts_by_variant
+    );
+    assert_same_outcome(
+        "non-refc subject",
+        &interpreted,
+        &baseline,
+        &module.atom_table,
     );
 }
