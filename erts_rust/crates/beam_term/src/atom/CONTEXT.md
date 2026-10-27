@@ -10,7 +10,9 @@ own copy-on-write container:
   `NameChunk`s. O(1) random access, and an append never renumbers an existing index.
 - **name → index** (which index does `"ok"` have?) — `IndexShards`, the map hash-sharded into
   `INDEX_SHARDS` independent shards, so an append copies one shard (about `len / INDEX_SHARDS`
-  entries) instead of the whole bucket array.
+  entries) instead of the whole bucket array. The shard array itself is the other half of that
+  trade — `8 · INDEX_SHARDS` B per non-empty table — so the shard count has an interior optimum;
+  the cost model below states it.
 
 Each direction sits behind exactly one `Arc`, which is what makes `AtomTable::fork` two `Arc`
 clones (zero allocations) instead of a `Vec::clone` plus a `HashMap::clone` (the boot's largest
@@ -24,8 +26,10 @@ allocation pins can derive their budget instead of hard-coding a slack.
 
 - `pub const NAMES_PER_CHUNK: usize = 128` — names per `NameChunk`; also the `names%` modulus that
   turns an index into `(chunk, slot)`.
-- `pub const INDEX_SHARDS: usize = 128` — the shard count; **must** be a power of two (a
-  `const` assertion pins it, because `shard_of` masks with `INDEX_SHARDS - 1`).
+- `pub const INDEX_SHARDS: usize = 1024` — the shard count; **must** be a power of two (a
+  `const` assertion pins it, because `shard_of` masks with `INDEX_SHARDS - 1`). Chosen by the
+  boot measurement in the cost model, not by the copy granularity alone: the array it sizes grows
+  with `INDEX_SHARDS`, the shard clone it avoids shrinks with it.
 - `NameChunk { names: Vec<Arc<str>> }` — `with_capacity()`, `push(Arc<str>)` (keeps a full chunk's
   headroom, so a cloned chunk whose capacity is its length does not regrow per name), `len()`;
   test-only `name_arc(slot)`.
@@ -61,10 +65,28 @@ allocation pins can derive their budget instead of hard-coding a slack.
 - The first append after a fork — at most one chunk (≤ `NAMES_PER_CHUNK` handles) and one shard
   (≈ `len / INDEX_SHARDS` entries) are materialized, i.e. O(size of the touched containers), never
   O(table). Each `Arc::make_mut` step is two allocations (the cloned payload + the new `Arc`
-  block); measured at **9 allocations** for a fork-then-intern at both 300 and 3 000 atoms
-  (`../../../tests/intern_alloc.rs`, case (f), which pins the bound as flat).
+  block), so the array's `8 · INDEX_SHARDS` bytes move bytes rather than allocation *count*;
+  measured at **9 allocations** for a fork-then-intern at 300 atoms and **10** at 3 000
+  (`../../../tests/intern_alloc.rs`, case (f), which pins the bound as flat — budget 11).
 - `get`/`len`/`insert` — one shard hash plus one map probe; `len` is O(1) (`split_last` of the
   chunk list).
+- **The shard array is the second term of the trade.** A non-empty table's `shards` block is
+  `8 · INDEX_SHARDS` B (8 KB at 1024), and it is *retained* by every table whose array has diverged
+  from its parent — i.e. by every loaded module's `fork` on its first intern — as well as
+  transiently copied by that same first append (one `Arc::make_mut` step, two allocations at any
+  size: the array's size moves bytes, not allocation count).
+- **Why 1024** — the measurement that sizes it. A `beam_rt -noshell -eval 'halt().'` boot loads 99
+  modules, each holding a module `fork`; the diverged `IndexShards` generations they retain are the
+  dominant store cost, because a retained shard clone is one map sized `name_count / INDEX_SHARDS`.
+  At 128 shards that was 7.39 MiB of the 64.48 MiB peak (4 747 shard containers + 97 shard arrays +
+  170 name chunks, against the ~0.55 MiB the one shared store needs). Median peak RSS, 5
+  interleaved runs each, `taskset -c 3`: 128 → 64.48 MiB, 512 → 60.16, **1024 → 59.37**, 2048 →
+  59.68 (past 1024 the 8 KB→16 KB per-table array outgrows what the smaller shard clone saves);
+  massif's store subtree 7.90 → 3.06 MiB, its peak heap 44.06 → 36.97 MB.
+  Nothing observable moves with the count: `shard_of` is a pure function of the name bytes, so
+  indices, fork/COW isolation, generations, the `snapshot`/`instance` witness and `Arc<str>`
+  pointer identity are unchanged, and `system_info(atom_count)`, `maps:to_list`, `phash2`,
+  `term_to_binary` and `code:all_loaded` are byte-identical to the oracle's.
 
 ## Routing Table
 - `store.rs` → `NAMES_PER_CHUNK`, `INDEX_SHARDS`, `NameChunk`, `NameChunks`, `IndexShard`,

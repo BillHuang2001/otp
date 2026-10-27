@@ -48,7 +48,23 @@ use super::Atom;
 pub const NAMES_PER_CHUNK: usize = 128;
 
 /// Hash shards in the name→index direction (`pub`, same reason). MUST be a power of two.
-pub const INDEX_SHARDS: usize = 128;
+///
+/// The shard count is a **memory** knob as much as a copy-granularity one, and it trades two costs
+/// against each other:
+///
+/// * a non-empty table's shard array is `INDEX_SHARDS` `Option<Arc<IndexShard>>` handles — `8 ·
+///   INDEX_SHARDS` B, retained by every table whose array has diverged from its parent (a module's
+///   `fork` detaches the array on its first intern) and transiently copied on that first append;
+/// * the *retained* cost of a diverged table is the shard maps it cloned, and one shard's map holds
+///   about `name_count / INDEX_SHARDS` entries — so a larger shard count shrinks exactly the clone
+///   the copy-on-write step exists to keep small.
+///
+/// Measured on `beam_rt -noshell -eval 'halt().'` (median peak RSS, 5 interleaved runs each,
+/// `taskset -c 3`): 128 → 64.48 MiB, 512 → 60.16, **1024 → 59.37 (−5.11 MiB)**, 2048 → 59.68 —
+/// past 1024 the per-table array (8 KB at 1024, 16 KB at 2048) outgrows what the smaller shard clone
+/// saves. At the boot's ~9 500-atom table a shard holds ~9 names, so the array is the dominant term
+/// and 1024 is the optimum. Detail and the byte-level breakdown: `src/atom/CONTEXT.md`.
+pub const INDEX_SHARDS: usize = 1024;
 
 /// The shard selector masks the hash with this; a non-power-of-two `INDEX_SHARDS` would make
 /// [`shard_of`] collapse onto a subset of the shards (a correctness bug, not just a slow one).

@@ -46,9 +46,11 @@
 //!    is *flat* in the table size while `clone`'s is linear: (d) and (e) are the two halves of
 //!    that contrast — one pinning that `clone` still scales, the other that `fork` does not.
 //! 6. **(f) the copy-on-write step a fork pays on its first append is bounded and flat** — one
-//!    name chunk (≤ `NAMES_PER_CHUNK` handles), one index shard (about `len / INDEX_SHARDS`
-//!    entries) and the new string, at 300 atoms exactly as at 3 000. Without this the fork would
-//!    only move the whole-table copy from fork time to the first append.
+//!    name chunk (≤ `NAMES_PER_CHUNK` handles), the shard array (its `8 · INDEX_SHARDS` bytes move
+//!    bytes, not allocation *count*), one index shard (about `len / INDEX_SHARDS` entries) and the
+//!    new string, at 300 atoms exactly as at 3 000. Without this the fork would only move the
+//!    whole-table copy from fork time to the first append.
+
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -164,13 +166,15 @@ const SMALL: usize = 300;
 /// * the chunk containers — one `Arc<NameChunk>` plus one `Vec<Arc<str>>` buffer per chunk
 ///   (`NAMES.div_ceil(NAMES_PER_CHUNK)` of them), plus the chunk list's `Arc` and its one
 ///   reserved buffer;
-/// * the shard containers — the shard array's `Arc` and its buffer, one `Arc<IndexShard>` per
-///   shard, and each shard map's own growth events. A shard holds about `NAMES / INDEX_SHARDS`
-///   names, so it doubles a handful of times rather than scaling with the table; the allowance is
-///   per shard, not per name.
+/// * the shard containers — the shard array (`Arc` + buffer), one `Arc<IndexShard>` per shard a
+///   name lands in, and up to six map-growth events per such shard.
 ///
-/// The point of the budget is the shape, not the constant: it counts *containers*, so it stays put
-/// when the name count grows.
+/// This is a deliberate **upper bound**, counted in containers rather than names so it stays put
+/// when the name count grows. It is an *over*-allowance by construction, not a derivation to be
+/// re-fitted: it charges every shard the six growth events of a densely loaded map, while at
+/// `INDEX_SHARDS = 1024` a `NAMES`-name seed leaves only ~3 names in each (one or two events), and
+/// at any shard count a map that holds `n` names grows `O(log n)` times, never `O(n)`. The property
+/// the budget states is the shape — one string per name plus a bounded number of *containers*.
 fn seed_slack() -> usize {
     let chunks = NAMES.div_ceil(NAMES_PER_CHUNK);
     let chunk_containers = chunks * 2 + 2;
