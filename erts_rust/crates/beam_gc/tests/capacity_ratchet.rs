@@ -80,8 +80,11 @@
 //! 6. **A collection still collapses the chain onto its live-set target** (the green control) —
 //!    after [`AnyCollector::collect`] / [`AnyCollector::collect_minor`] the chain is exactly one
 //!    space ([`AnyCollector::young_space_count`] == 1), its capacity is what
-//!    [`HeapPolicy::young_after_collection`] / [`HeapPolicy::young_after_fullsweep`] prescribe
-//!    for that chain, and [`AnyCollector::collection_debt`] is false.
+//!    [`HeapPolicy::young_after_collection_with_need`] /
+//!    [`HeapPolicy::young_after_fullsweep_with_need`] prescribe for that chain **and the room
+//!    request the growth seam recorded** (the one-shot `need` term a growth carries into the next
+//!    collection, so a copy-out's request is not handed straight back), and
+//!    [`AnyCollector::collection_debt`] is false.
 //! 7. **A provably empty retired space is re-adopted, not replaced** — the smallest adequate one,
 //!    allocating nothing and consuming none of the capacity budget (the `O(log)`-indexed
 //!    [`Nursery::empty_retired_for`] path that keeps a growth from scanning the chain).
@@ -449,8 +452,12 @@ fn the_reported_figures_are_the_installed_capacities() {
             c.heap_size_words()
         );
 
-        // The collapse gives the whole figure back: one space, the live set's target.
-        let expected = policy.young_after_collection(c.heap_size_words(), 0);
+        // The collapse gives the whole figure back: one space, the live set's target. The chain
+        // was grown for a `SMALL_REQUEST`-word room request, so that request rides into the
+        // collapse as the policy's one-shot `need` term — the capacity is the live set's target
+        // **plus** room for the request the seam could not collect to satisfy.
+        let expected =
+            policy.young_after_collection_with_need(c.heap_size_words(), 0, SMALL_REQUEST);
         let stats = c.collect_minor(&mut []).expect("the collapse");
         assert_eq!(stats.words_copied, 0, "{kind:?}: nothing live");
         assert_eq!(c.young_space_count(), 1, "{kind:?}: the collection collapses the chain");
@@ -548,8 +555,9 @@ fn the_chain_grows_with_the_interval_and_only_a_collection_bounds_it() {
         assert!(!c.collection_debt(), "{kind:?}: the collection settles the debt");
         assert_eq!(
             c.heap_size_words(),
-            policy.young_minor_target_words(0),
-            "{kind:?}: and lands on the live set's floor"
+            policy.young_minor_target_words_with_need(0, hint),
+            "{kind:?}: and lands on the live set's floor plus the {hint}-word request that grew \
+             the chain (the one-shot `need` term)"
         );
     }
 }
@@ -819,7 +827,10 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             // (6a) A **minor** over an empty young live set: the policy's own answer for the
             // collected chain — its target when the chain is past the keep band, the chain's own
             // capacity when it is inside it.
-            let expected = policy.young_after_collection(chained_words, 0);
+            // The chain was grown for `hint` words of room, so that request rides into the
+            // collapse as the policy's one-shot `need` term.
+            let expected =
+                policy.young_after_collection_with_need(chained_words, 0, hint);
             let stats = c.collect_minor(&mut []).expect("the minor collapse");
             assert_eq!(
                 stats.words_copied, 0,
@@ -835,7 +846,8 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             assert_eq!(
                 c.young().capacity_words(),
                 expected,
-                "{kind:?}: the collapsed capacity is young_after_collection({chained_words}, 0)"
+                "{kind:?}: the collapsed capacity is \
+                 young_after_collection_with_need({chained_words}, 0, {hint})"
             );
             assert_eq!(
                 c.heap_size_words(),
@@ -876,7 +888,9 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             let mut roots = build_live(&mut c, live_words);
             drive_growth(&mut c, hint, 6);
             let collected_chain = c.heap_size_words();
-            let target = policy.young_target_words(live_words);
+            // The chain was grown for `hint` words of room before this fullsweep, so the
+            // whole-heap target carries that request as the one-shot `need` term.
+            let target = policy.young_target_words_with_need(live_words, hint);
             assert!(
                 collected_chain > YOUNG_SHRINK_FACTOR * target,
                 "{kind:?}: the shrink branch must hold: the {collected_chain}-word chain is past \
@@ -891,13 +905,13 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             assert_eq!(c.young_space_count(), 1, "{kind:?}");
             assert!(!c.collection_debt(), "{kind:?}");
             assert_eq!(
-                policy.young_after_fullsweep(collected_chain, live_words),
+                policy.young_after_fullsweep_with_need(collected_chain, live_words, hint),
                 target,
                 "{kind:?}: a fullsweep from above the band installs the whole-heap target"
             );
             assert_eq!(
                 c.heap_size_words(),
-                policy.young_target_words(stats.words_copied),
+                policy.young_target_words_with_need(stats.words_copied, hint),
                 "{kind:?}: the fullsweep collapses onto the whole-heap live set's target"
             );
         }

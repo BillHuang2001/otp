@@ -459,18 +459,32 @@ fn a_larger_single_request_grows_the_nursery_to_just_cover_it() {
             "{kind:?}: the growth is bounded by the smallest curated size covering the request"
         );
 
-        // A grown nursery is not a permanent one: a collection that keeps almost nothing
-        // brings it straight back down.
+        // A grown nursery is not a permanent one, but the room is given back one round later.
+        //
+        // The collection that follows the growth is the one place the request can be paid for:
+        // the growth holds no root set, so it cannot collect, and it recorded the request it
+        // could not satisfy. That round therefore sizes the nursery to cover the surviving live
+        // set **plus** the request (`young_after_collection_with_need`) — which here is exactly
+        // the chain it collected, so the capacity is kept rather than re-installed.
+        let chain = expected + NURSERY;
+        let collection = c.collect(&mut roots).expect("collect");
+        let live = collection.stats.words_copied;
+        let paying = policy().young_after_collection_with_need(chain, live, REQUEST);
+        assert_eq!(
+            c.young().capacity_words(),
+            paying,
+            "{kind:?}: the collection after a growth pays for the request"
+        );
+        // The round after that has no growth before it, so the request is spent and the nursery
+        // is bounded by the live set alone — back under the request-sized capacity.
         c.collect(&mut roots).expect("collect");
         assert!(
             c.young().capacity_words() < expected,
-            "{kind:?}: the nursery shrinks back after a collection"
+            "{kind:?}: the nursery shrinks back once the request has been paid for"
         );
-
         eprintln!(
-            "{kind:?}: {NURSERY} words -> {} words for a {REQUEST}-word request -> {} words \
-             after the next collection",
-            expected,
+            "{kind:?}: {NURSERY} words -> {expected} words for a {REQUEST}-word request -> \
+             {paying} words after the paying collection -> {} words once the request is spent",
             c.young().capacity_words()
         );
     }

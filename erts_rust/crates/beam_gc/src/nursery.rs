@@ -29,7 +29,7 @@
 //! the allocator at a fresh, larger one: live words stay addressable at their original
 //! address and nothing is moved.
 //!
-//! Five properties keep the chain from becoming a cost:
+//! Six properties keep the chain from becoming a cost:
 //!
 //! * **Containment is indexed, not scanned.** [`contains`](Nursery::contains) — the per-word
 //!   range test a host's *unscanned-root* valve runs at every heap admission — answers from
@@ -66,6 +66,15 @@
 //!   chain cannot be driven past the ceiling by a loop of small requests. The empty spaces are
 //!   **indexed by capacity** ([`empty_retired`](Nursery::empty_retired)), so selecting one is
 //!   `O(log #spaces)` and no growth event scans the chain.
+//! * **The request that forced a retirement is carried into the next collection.** A growth
+//!   cannot collect, so a large one-off request is met by retiring a space; without the request
+//!   the following collection sizes the nursery from the live set alone, which is far below it,
+//!   and the *next* request retires another space — a growth + collection per request, forever.
+//!   [`grow`](Nursery::grow) therefore remembers the request
+//!   ([`pending_growth_need`](Nursery::pending_growth_need)) and the collapse hands it to the
+//!   sizing rule as the legacy C's `need` term, **one-shot** (taken, never accumulated), so the
+//!   settled capacity covers the request instead of the request re-driving the chain. The chain's
+//!   remembered live-set target stays the plain one.
 //!
 //! Every superseded space is **retained until a collection evacuates it**, never freed by the
 //! growth itself: it may hold live words (they were handed to the mutator) and only a
@@ -184,7 +193,32 @@ pub(crate) struct Nursery {
     /// space the very next collection gives back; the remembered target caps every fresh space at
     /// `max(one_step, live_target)`, which bounds the installed capacity by the same rule the
     /// collection applies while still granting a genuinely large request its own `one_step` size.
+    ///
+    /// It is deliberately the **plain** live-set target
+    /// ([`HeapPolicy::young_minor_target_words`] / [`HeapPolicy::young_target_words`]), never the
+    /// `need`-augmented one: the growth seam's upper bound must not be inflated by a one-off
+    /// request ([`pending_growth_need`](Nursery::pending_growth_need)).
     live_target_words: Option<usize>,
+    /// The legacy C's `need` term, as the **no-relocation growth** seam saw it: the largest
+    /// **room** request (`grow`'s `need_words`) that forced a space to be retired since the last
+    /// collection, or `0` when no growth intervened.
+    ///
+    /// *Why the seam has to remember it.* [`grow`](Nursery::grow) cannot collect — its caller
+    /// holds no root set — so it grants a large one-off request by retiring the current space and
+    /// installing a larger one. The collection that follows then sizes the nursery from the
+    /// **live set alone**, which is far below the request the growth was made for, so the next
+    /// request retires another space: one collection plus one space allocate/free per large
+    /// request, and a chain that never settles. The request the seam saw is exactly the request
+    /// the collection must leave room for (the C carries it into the collection as `need`,
+    /// `erts_garbage_collect(p, need, objv, nobj)`; `erl_gc.c:1490-1555` / `:2061-2098`), so it
+    /// is remembered here and handed to the sizing rule at the collapse.
+    ///
+    /// *Why it cannot ratchet.* It is **one-shot**: the collapse takes it
+    /// ([`core::mem::take`]), so a following collection with no intervening growth sizes exactly
+    /// as it does without the term, and it is the **largest** such request rather than a sum, so
+    /// it is never a function of the call count. A non-zero value therefore means "a growth event
+    /// is waiting to be paid for", not "this nursery is big".
+    pending_growth_need: usize,
 }
 
 impl Nursery {
@@ -201,7 +235,9 @@ impl Nursery {
             retired_serial: 0,
             extent,
             live_target_words: None,
-        })    }
+            pending_growth_need: 0,
+        })
+    }
 
     /// The space the mutator allocates in.
     pub(crate) fn current(&self) -> &HeapSpace {
@@ -363,6 +399,17 @@ impl Nursery {
     /// and the caller never has to grow twice for one window. Only a ceiling can refuse it,
     /// and that refusal comes before anything is allocated.
     ///
+    /// # The request is carried into the next collection
+    ///
+    /// Both paths that **retire** a space (step 2's re-adoption and step 3's fresh space) record
+    /// `need_words` as the chain's [`pending_growth_need`](Nursery::pending_growth_need), which
+    /// the next [collapse](Nursery::collapse) hands to the policy as the legacy C's `need` term
+    /// and takes back. That is what keeps the seam from being re-driven by the same request
+    /// forever: the collection sizes the nursery to cover what survived **plus** the request, so
+    /// the following call is a step-1 no-op instead of another retirement. The step-1 no-op
+    /// records nothing (it retired nothing), and the record is a maximum rather than a sum, so
+    /// the term never becomes a function of the growth count.
+    ///
     /// # The ceiling bounds the chain's SUMMED capacity
     ///
     /// [`capacity_words`](Nursery::capacity_words) is the chain's size, so that is what
@@ -417,6 +464,9 @@ impl Nursery {
         // no occupancy adjustment here.
         if let Some(key) = self.empty_retired_for(need_words) {
             self.readopt_retired(key);
+            // The swap retired the space this request had outgrown, so the request is one the
+            // next collection must leave room for ([`pending_growth_need`](Nursery::pending_growth_need)).
+            self.record_growth_need(need_words);
             return Ok(());
         }
         let capacity = self.current.capacity_words();
@@ -486,6 +536,10 @@ impl Nursery {
         // advances because the set of spaces did.
         self.install(fresh);
         self.widen_extent();
+        // One of the two paths that actually retire a space, so the room request is the next
+        // collection's `need` term ([`pending_growth_need`](Nursery::pending_growth_need)). The
+        // step-1 no-op above records nothing: it retired nothing and installed nothing.
+        self.record_growth_need(need_words);
         Ok(())
     }
     /// The **smallest** retired space that never handed the mutator a word
@@ -536,6 +590,17 @@ impl Nursery {
         self.extent = self
             .extent
             .with_generation(self.extent.generation().saturating_add(1));
+    }
+
+    /// Records `need_words` as the one-shot `need` term the next collection sizes the nursery
+    /// with — the largest request that forced a space to be retired since the last collection.
+    ///
+    /// The **maximum**, not a sum: the next collection has to leave room for *one* such request
+    /// (they are granted one at a time, and a later larger request supersedes an earlier smaller
+    /// one — the space the earlier one installed is already on the chain for the collection to
+    /// free), so the term stays a function of the request rather than of the growth count.
+    fn record_growth_need(&mut self, need_words: usize) {
+        self.pending_growth_need = self.pending_growth_need.max(need_words);
     }
 
     /// Installs `space` as the current space and retires the one it replaces, keeping the
@@ -589,9 +654,30 @@ impl Nursery {
     /// capacity instead of climbing one growth-table step per collection. The target is
     /// remembered ([`live_target_words`](Nursery::live_target_words)) so the growth seam
     /// ([`grow`](Nursery::grow)) is bounded by it too.
+    ///
+    /// # The `need` term — the one thing the live set alone cannot say
+    ///
+    /// The round is sized with [`HeapPolicy::young_after_collection_with_need`], whose `need` is
+    /// the room request a **growth** had to retire a space for since the last collection
+    /// ([`pending_growth_need`](Nursery::pending_growth_need)) — the legacy C's `need` term,
+    /// carried into the collection exactly as `erts_garbage_collect(p, need, objv, nobj)` carries
+    /// it (`erl_gc.c:1490-1555`). It is **taken**, so it applies to this one collection: a
+    /// following round with no intervening growth is `need == 0` and reproduces the plain rule's
+    /// figures byte for byte. What it buys is the difference between "the nursery is as large as
+    /// what survived" and "the nursery is as large as what survived plus the copy-out the caller
+    /// could not make room for" — without it, a copy-out that forces a growth is followed by a
+    /// collection that hands the room straight back, so every copy-out costs a collection and a
+    /// space allocate/free.
     pub(crate) fn collapse(&mut self, policy: &HeapPolicy, live_words: usize) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        let target = policy.young_after_collection(collected_capacity, live_words);
+        // The `need` term: the largest room request a growth had to retire a space for since the
+        // last collection. Taken (not merely read), so it is **one-shot** — a following
+        // collection with no intervening growth sizes exactly as it does without the term, and
+        // the capacity stays a function of the live set and one request rather than a ratchet.
+        let need = core::mem::take(&mut self.pending_growth_need);
+        let target = policy.young_after_collection_with_need(collected_capacity, live_words, need);
+        // The growth seam's upper bound stays the **plain** live-set target: it must not be
+        // inflated by a one-off request the collection has now paid for.
         let live_target = policy.young_minor_target_words(live_words);
         self.install_collapsed(target, live_target)
     }
@@ -606,13 +692,20 @@ impl Nursery {
     /// growth decision belongs — and it shrinks a nursery the live set has outgrown back
     /// towards the target. That whole-heap target is also what the growth seam is bounded by
     /// afterwards ([`live_target_words`](Nursery::live_target_words)).
+    ///
+    /// It carries the same one-shot `need` term as [`collapse`](Nursery::collapse), through
+    /// [`HeapPolicy::young_after_fullsweep_with_need`]: a fullsweep that follows a growth must
+    /// leave room for the request that growth made, exactly as a minor does.
     pub(crate) fn collapse_after_fullsweep(
         &mut self,
         policy: &HeapPolicy,
         live_words: usize,
     ) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        let target = policy.young_after_fullsweep(collected_capacity, live_words);
+        // Same one-shot `need` term as [`collapse`](Nursery::collapse): a fullsweep pays for the
+        // growth that preceded it exactly as a minor does.
+        let need = core::mem::take(&mut self.pending_growth_need);
+        let target = policy.young_after_fullsweep_with_need(collected_capacity, live_words, need);
         let live_target = policy.young_target_words(live_words);
         self.install_collapsed(target, live_target)
     }
@@ -672,7 +765,14 @@ impl Nursery {
     /// remember it as the chain's live-set target, through the same
     /// [`install_collapsed`](Nursery::install_collapsed) body a collapse uses (so a trim and a
     /// collection can never free or re-seed differently).
+    ///
+    /// An explicit give-back **discards** the pending growth request
+    /// ([`pending_growth_need`](Nursery::pending_growth_need)): the caller has asked for the live
+    /// set's target and nothing else, so carrying a one-off request into a later collection would
+    /// be a capacity the host has just declined. The collection both trim seams run first has
+    /// already consumed it, so clearing here only makes the refusal unambiguous.
     fn install_target(&mut self, target: usize) -> Result<()> {
+        self.pending_growth_need = 0;
         self.install_collapsed(target, target)
     }
 
