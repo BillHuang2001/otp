@@ -338,16 +338,17 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   12 × 12 288 B = **147 456 B (~144 KiB)** resident; nothing else in the crate is eager (`CarrierAllocator::new`
   maps no carrier, core.rs:61-68). Everything else is address space until written: `beam_rt`'s two
   `DEFAULT_HEAP_WORDS = 1<<24` heaps are two dedicated `round_up_unit(16 + 134 217 728)` =
-  **134 217 744 B mappings (256 MiB combined VSZ)** measured at **12–48 kB RSS**
-  (`../../beam_rt/src/context/pump/CONTEXT.md:61`), the engine arena reserves 4 MiB per region with a
+  **134 217 744 B mappings (256 MiB combined VSZ)** measured at **0.04 MiB RSS each** (a 12–48 kB band,
+  `../../beam_rt/src/context/pump/CONTEXT.md:61`), the engine arena reserves 4 MiB per region with a
   64 KiB committed slice (`../../beam_engine/src/context.rs:1438,1442`), and a 1 MiB MBC carrier costs
   ~2 resident pages. So allocator *bookkeeping* cannot explain a multi-MiB RSS delta — only term payload
   the host actually wrote into a block, or the slab carriers below, can.
-- **Slab carriers are the only allocator RSS term that scales with the number of classes used.** The
-  first request in each distinct (allocator, size-class) pair maps a 1 MiB carrier that is *fully
-  resident* and retained for the allocator's lifetime, so the default 7-class ladder (`16..1024` B) over
-  12 allocators is an **84 MiB theoretical ceiling** — realistically a few MiB, since only the classes
-  the runtime actually uses get one. A freed segment gives RSS back only through a cache eviction, so
+- **Slab carriers are the allocator's only RSS term that scales with the number of classes used — and on the
+  boot path that is 7.43 MiB total, 4 carriers fully resident.** The first request in each distinct
+  (allocator, size-class) pair maps a 1 MiB carrier that is *fully resident* and retained for the
+  allocator's lifetime, so the default 7-class ladder (`16..=1024` B) over 12 allocators is an **84 MiB
+  theoretical ceiling**; what the runtime actually touches at boot is 7.43 MiB mapped / 4 resident (see
+  "Measured memory state" below). A freed segment gives RSS back only through a cache eviction, so
   up to 10 released segments of any size stay mapped and dirty (see "When a free actually unmaps").
 - **Alternating create/drop of a same-size `Heap` returns the same base address.** Three reuse layers,
   in order: the slab class free list (head insert `FreeList::insert` / head pop `take_block`), the MBC
@@ -398,9 +399,11 @@ and `RefcBinary`'s moving grow (binary/growth.rs:426).
 - The instance such a heap draws from is always `default_allocator()` = `AllocatorId::Standard`
   (`std_alloc`) — `heap.rs:59-61`, `reserved_heap.rs:151-153`, `beam_gc/src/collector.rs:84-96` — never
   `eheap_alloc`; the `EHEAP`/`HEAP`/`OLD_HEAP`/`MSG` rows (`types.rs:419-426`) are inventory only.
-- With the default policy a fresh process's **two** spaces are 233 words each (1864 B:
-  `beam_gc/src/policy.rs:341-342`), so both land in the mid band — two blocks carved from one shared
-  1 MiB MBC carrier, the first of which maps that carrier (`alloc_mid` → `mbc_size` 1 MiB).
+- With the default policy a fresh process's **two** spaces are 233 nursery + 233 mature words — **≈ 3.7 KiB
+  per process** (1864 B each: `beam_gc/src/policy.rs:341-342`) — so both land in the mid band: two blocks
+  carved from one shared 1 MiB MBC carrier, the first of which maps that carrier (`alloc_mid` → `mbc_size`
+  1 MiB). A process heap is therefore **never** one of `beam_rt`'s 128 MiB boot reservations, and the whole
+  boot set's `erlang:memory(processes)` is sub-MiB (see "Measured memory state" below).
 
 ### Residency (RSS) at allocation time — allocating never touches the payload
 Memory comes from `mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS)` (`src/mseg/mapping.rs:72-91`),
@@ -459,6 +462,40 @@ anywhere in the crate** (only doc mentions: `policy.rs:422`, `mbc.rs:105`), so f
 never zeroed by the allocator — a first-use `mmap` is zero, a recycled segment is not.
 The `std::alloc`-backed `StdlibAllocator` (`heap.rs:296-381`, `dealloc` → `std::alloc::dealloc` at
 `heap.rs:365`) is `#[cfg(test)]`-only and never on a runtime path.
+
+## Measured memory state — the allocator is ≈0 MiB of the boot peak
+Measured on the shipped boot path (`beam_rt -noshell -eval 'halt().'`, release) in this workstream; read these
+as the current *shape* of the footprint, and see `../beam_rt/CONTEXT.md` for the whole decomposition.
+- **Fragmentation/overhead (massif `mem_heap_extra`) is 1.46 MiB after the loader's one-allocation-per-body
+  fix**, against a ~64 MiB `VmHWM` boot peak — so **≈0 MiB of the peak is this crate**: the other ~98 % is
+  live payload the loader/atom store/engine holds, not allocator slack.
+- **`mallinfo2`-style in-use vs free at the boot→action boundary: ~266 kB free** — the std heap is almost
+  entirely live (retained module graph + atom store), so there is nothing to release at that point.
+- **The two 128 MiB reservations cost 0.04 MiB RSS each** (`bif_heaps`' region + `eval_heap`'s seed,
+  `DEFAULT_HEAP_WORDS = 1 << 24`): `mmap` is lazy, so a `Heap::new(1 << 24)` is address space, not memory.
+- **`malloc_trim` cannot help, so `beam_rt::release_free_pages()` returns nothing on this shape:** `VmHWM`
+  is a **high-water mark**, so even a successful trim cannot lower a recorded peak. `beam_alloc` never
+  `madvise`s (no `MADV_*` in the crate) and there is nothing to give back here anyway.
+- **Size-classed carriers: 7.43 MiB mapped across the 1 MiB carriers at boot, 4 of them fully resident.**
+  The slab ladder is `16..=1024 B` (7 classes, `SizeClasses::default_small_block`), so only genuinely
+  small, hand-sized allocations take a slab at all; the 7.43 MiB is the documented
+  retain-for-the-allocator's-lifetime policy, not live data, and no policy change reclaims it on this shape.
+- **CPU: glibc `malloc`/`free`/`mem*` is ~20 % of the boot samples and 2–15 % of the workload samples.** That
+  is *allocation volume* from the loader/atom/engine, not a `beam_alloc` policy defect — the per-object cost
+  is already dominated by volume, and the biggest single reducible volume was the loader's double-held
+  `Vec<Instr>`, which is fixed (`../beam_loader`'s one-exact-allocation-per-body rule).
+- **Per-process heaps are small `beam_alloc::Heap` blocks owned by `beam_gc`**, never `beam_rt`'s boot
+  reservations: 233 nursery + 233 mature words ≈ **3.7 KiB of floor per process**, and the whole boot set's
+  `erlang:memory(processes)` is **sub-MiB** — 445 904 B in the release probe `../beam_gc/MEASURED.md` records
+  (N = 0), 881 384 B in a dev-profile boot of the same 36-process set. That counter is reserved capacity, not
+  live payload (`../beam_gc/src/ACCOUNTING.md`), so both readings say the same thing: a boot's process heaps
+  are ≪1 MiB, and nothing here is a candidate for the boot peak.
+- **Do not re-propose** (each already measured and refuted on this shape): `madvise`-based return,
+  `malloc_trim`, MMTk/Boehm, and "the allocator is the leak". The linear-per-iteration retention measured
+  earlier on `ets_copy` (≈790 B/iteration) was the **nursery chain**, not this crate; the `beam_gc`
+  carried-growth change removed it, and rust's peak RSS now sits **at parity** with the oracle —
+  **1.011–1.014×** on `gc_bound`/`list_walk`/`ets_copy` and **~1.00×** on `slice`
+  (`../tools/bench/results/m22-memory.md`), **0.773×** on `baseline` after the loader fix.
 
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
@@ -712,3 +749,8 @@ The `std::alloc`-backed `StdlibAllocator` (`heap.rs:296-381`, `dealloc` → `std
   `push_children` reads `*base.add(i)` for `i in 0..count`, guarded only by the documented "live word"
   caller invariant (an OOB read/hang, not a wrap) — the `beam_term` owner may want an arity
   plausibility bound.
+- **`../tools/bench/RESULTS.md` still carries the superseded `baseline` peak-RSS row (rust 153.9 MB vs
+  oracle 135.2 MB = 1.137×)** — the figures `153.9`, `135.2` and `1.137` there predate the carried-growth
+  change and contradict the current record (`baseline` **0.773×**, `gc_bound`/`list_walk`/`ets_copy`
+  **1.011–1.014×**, `slice` **~1.00×**). The owner is the `../tools/bench` node (read-only from here): the
+  row and the `.md` prose around it need re-deriving, not a policy change in this crate.
