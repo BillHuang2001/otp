@@ -566,8 +566,12 @@ impl SocketOptions {
 /// The `{mode, list}` default (`INET_MODE_LIST`, `inet_drv.c:778`).
 const INET_MODE_LIST: i32 = 0;
 
-/// The `{deliver, term}` default (`INET_DELIVER_TERM`, `inet_drv.c:783`).
-const INET_DELIVER_TERM: i32 = 1;
+/// The `{deliver, term}` default (`INET_DELIVER_TERM`, `inet_drv.c:783`) — a delivered unit
+/// reaches the owner on the driver's own message channel (the completion or `{tcp, S, Data}`).
+pub(super) const INET_DELIVER_TERM: i32 = 1;
+/// `{deliver, port}` (`INET_DELIVER_PORT`, `inet_drv.c:782`) — a delivered unit is handed to the
+/// port as `{Port, {data, …}}` (`inet_port_data`, `:2753`), whichever channel it came from.
+pub(super) const INET_DELIVER_PORT: i32 = 0;
 
 /// The `{read_packets, N}` default (`INET_PACKET_POLL`, `inet_drv.c:1072`).
 const INET_PACKET_POLL: i32 = 5;

@@ -97,6 +97,7 @@ use beam_common::Result;
 use super::accept::AcceptQueue;
 use super::frame;
 use super::header;
+use super::opt::INET_DELIVER_PORT;
 use super::stat;
 use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
 use super::{Interest, TcpInetDriver};
@@ -458,17 +459,23 @@ impl TcpInetDriver {
                     // add, so this is the C's `len` too.
                     self.stat.input(payload.len());
                 }
-                // The passive reply splits on `{header, N}` exactly as the active message does:
-                // `inet_async_data` (`:3162`) applies `desc->hsz` to the **body**
-                // `packet_get_body` left behind, including its flat-list branch when `hsz > len`
-                // (`:3175`-`:3190`) — one rule, [`header::split_payload`].
-                ctx.deliver_completion(CompletionEvent::InetAsync {
-                    id: op.id,
-                    result: InetAsyncResult::Data(header::split_payload(
-                        self.options.header,
-                        payload,
-                    )),
-                })?;
+                // `{header, N}` splitting is the same rule on both channels: `inet_async_data`
+                // (`:3162`) and `inet_port_data` (`:2753`) both apply `desc->hsz` to the **body**
+                // `packet_get_body` left behind, including the flat-list branch when `hsz > len`
+                // (`:3175`-`:3190` / `:2760`) — one rule, [`header::split_payload`].
+                let read = header::split_payload(self.options.header, payload);
+                if self.options.deliver == INET_DELIVER_PORT {
+                    // `tcp_reply_data`'s first branch (`:4287`): `{deliver, port}` hands the unit
+                    // to `inet_port_data` instead of `inet_async_data`, so it arrives as
+                    // `{Port, {data, …}}` and the id the control reply carried is **never**
+                    // answered by an `{inet_async, …}` completion (the operation is spent here).
+                    ctx.deliver_read(&read.header, read.body.as_deref())?;
+                } else {
+                    ctx.deliver_completion(CompletionEvent::InetAsync {
+                        id: op.id,
+                        result: InetAsyncResult::Data(read),
+                    })?;
+                }
                 return Ok(true);
             }
             if self.peer_close.seen {

@@ -110,7 +110,7 @@ use crate::port_task::{ActiveInputEvent, ActiveSpend};
 
 use super::frame;
 use super::header;
-use super::opt::{set_options_tracked, OptScope};
+use super::opt::{set_options_tracked, OptScope, INET_DELIVER_PORT};
 use super::stat;
 use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, TcpInetDriver};
 
@@ -278,16 +278,27 @@ impl TcpInetDriver {
     /// Splits one payload by the `{header, N}` option and delivers it, then applies the C's
     /// per-delivery `{active, …}` accounting.
     ///
-    /// The order is the C's: `tcp_message` sends the term (`:3979`) and
-    /// `INET_CHECK_ACTIVE_TO_PASSIVE` runs **after** it (`tcp_reply_data`, `:4302`), so a
-    /// `{tcp_passive, S}` always follows the data message it followed from, never precedes it.
+    /// Which channel carries it is `{deliver, …}`'s choice (`INET_DELIVER_PORT` ⇒ the port's
+    /// `{Port, {data, …}}`, `inet_drv.c:4287`), and the order is the C's: the data message is
+    /// sent first (`tcp_message`, `:3979`) and `INET_CHECK_ACTIVE_TO_PASSIVE` runs **after** it
+    /// (`tcp_reply_data`, `:4302`), so a `{tcp_passive, S}` always follows the data message it
+    /// followed from, never precedes it.
     fn deliver_data(
         &mut self,
         ctx: &mut DriverContext<'_>,
         payload: Vec<u8>,
     ) -> Result<()> {
         let read = header::split_payload(self.options.header, payload);
-        ctx.deliver_active_input(ActiveInputEvent::Data(read))?;
+        if self.options.deliver == INET_DELIVER_PORT {
+            // `tcp_reply_data`'s **first** branch (`inet_drv.c:4287`) — it is tested before any
+            // active/passive or framing decision: `{deliver, port}` hands the body to
+            // `inet_port_data` (`:2753`), so the unit arrives as `{Port, {data, …}}` instead of
+            // `tcp_message`'s `{tcp, S, Data}`. `INET_CHECK_ACTIVE_TO_PASSIVE` (`:4302`) still
+            // runs afterwards, so the grant is spent either way.
+            ctx.deliver_read(&read.header, read.body.as_deref())?;
+        } else {
+            ctx.deliver_active_input(ActiveInputEvent::Data(read))?;
+        }
         self.count_delivery(ctx)
     }
     /// `INET_CHECK_ACTIVE_TO_PASSIVE` (`:1552`-`:1561`): spends one `{active, …}` grant after

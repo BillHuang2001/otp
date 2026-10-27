@@ -975,6 +975,7 @@ impl TcpInetDriver {
     /// For a **listener** the two coincide — the C's `sock_select(FD_ACCEPT, 1/0)` is
     /// [`TcpInetDriver::async_accept`]'s `set_interest(READABLE)` and `disarm_accepts`'s
     /// [`TcpInetDriver::deregister`] — which is what `accept_tests.rs` observes.
+    #[cfg(test)]
     pub(crate) fn is_registered(&self) -> bool {
         self.token.is_some()
     }

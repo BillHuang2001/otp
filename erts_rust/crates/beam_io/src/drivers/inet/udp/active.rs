@@ -77,9 +77,8 @@ use crate::driver::DriverContext;
 use crate::poller::Interest;
 use crate::port_task::{ActiveInputEvent, ActiveSpend, ReadMessage};
 
-/// `{deliver, term}` (`INET_DELIVER_TERM`, `inet_drv.c:783`) — the default, and the only
-/// delivery mode this channel can express (see the module docs).
-const INET_DELIVER_TERM: i32 = 1;
+use super::super::opt::INET_DELIVER_TERM;
+
 
 /// One non-blocking `recvfrom(2)`, retrying an interrupted wait.
 ///
