@@ -10,6 +10,7 @@ Build/release metadata:
 - `Makefile` — `SUB_DIRECTORIES = src doc examples`, `VSN = $(STDLIB_VSN)`, `DIA_PLT_APPS=compiler crypto`, `TEST_NEEDS_RELEASE=true`; its `test` target re-invokes `make/app_targets.mk` with `ERL_ARGS="-enable-feature maybe_expr"`.
 - `vsn.mk` — `STDLIB_VSN = 8.1` (substituted for `%VSN%` in the generated `stdlib.app`/`stdlib.appup`).
 - `src/stdlib.app.src` — app resource: `{applications,[kernel]}`; `runtime_dependencies` is much wider (`sasl-3.0 kernel-11.0 erts-16.0.3 crypto-4.5 compiler-5.0 syntax_tools-3.2.1`) because those calls are optional/late-bound; registers `timer_server`, `rsh_starter`, `take_over_monitor`, `pool_master`, `dets`.
+  It has no `{mod,{M,A}}` key (no callback module, no supervision tree), so `application:start_boot(stdlib, permanent)` creates **zero** processes — not even an `application_master`.
 - `src/stdlib.appup.src` — release-upgrade instruction template (also `%VSN%`-substituted).
 - `include/` — the six public headers other applications compile against: `assert.hrl`, `erl_bits.hrl`, `erl_compile.hrl`, `ms_transform.hrl`, `qlc.hrl`, `zip.hrl`.
 - `examples/erl_id_trans.erl` is compiled into `ebin` by a rule in `src/Makefile` although its source lives outside `src/` and it is absent from `MODULES`/`stdlib.app`.
