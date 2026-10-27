@@ -366,6 +366,9 @@ so pages are zero-fill-on-first-touch. What each path actually *writes* at alloc
   link words in the payload head per block (`src/carrier.rs:270-297`, `src/free_list.rs:507-525`).
   Because a class stride (16–1024 B payload) is below the page size, **all pages of the 1 MiB slab
   carrier are touched** → a fresh slab carrier is ~fully resident.
+  A `Heap::new(0)` is therefore not free: a 0-byte request lands in class 0
+  (`SizeClasses::class_for(0) == Some(0)`, `src/size_class.rs:245-257`, `src/allocator/core.rs:139-149`),
+  so the first zero-capacity heap a process makes maps and fully touches a 1 MiB slab carrier.
 - **mid / multi-block** (`alloc_mid`): a fresh `MbcCarrier` writes one 16-byte block header at the base
   plus the two link words of its single spanning free block (`src/mbc.rs:211-243`) — ~2 touched pages
   of a 1 MiB carrier; the handed-out block is not written at all.
