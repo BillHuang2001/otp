@@ -359,8 +359,15 @@ and `RefcBinary`'s moving grow (binary/growth.rs:426).
 
 ### Residency (RSS) at allocation time — allocating never touches the payload
 Memory comes from `mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS)` (`src/mseg/mapping.rs:72-91`),
-with **no** `MAP_POPULATE` and no `madvise` (`MADV_WILLNEED`/`DONTNEED` appear nowhere in the crate),
-so pages are zero-fill-on-first-touch. What each path actually *writes* at allocation time:
+with **no** `MAP_POPULATE`, no `MAP_NORESERVE` and no `madvise` (`MADV_WILLNEED`/`DONTNEED` appear nowhere in the crate),
+so pages are zero-fill-on-first-touch and a mapping is charged as VSZ only until written.
+After `map_aligned`'s trimming (`src/mseg/mapping.rs:124-163`) a segment retains exactly `1 + ceil(size/page)` pages:
+the payload's pages plus the one page holding the `MSEG_HEADER_SIZE = 64` header, because for any `align <= page` the
+front slack (64 or 96 bytes before the payload) is below a page, so `front_trim` is always 0.
+There is **no supercarrier / superblock**: every carrier is its own segment and its own `mmap`;
+`SUPER_ALIGNED_SIZE = 1 << 14` (16 KiB, `src/mseg/mapping.rs:40-43`) is only an alignment granularity
+(`MsegAllocator::unit_size()`, `src/mseg/allocator.rs:287-289`), never a mapping size.
+What each path actually *writes* at allocation time:
 - **slab** (`alloc_small`): the whole carrier (default 1 MiB, or `block_size` if larger) is subdivided
   and every free block is pushed onto its class's intrusive list — a 16-byte `BlockHdr` plus the two
   link words in the payload head per block (`src/carrier.rs:270-297`, `src/free_list.rs:507-525`).
