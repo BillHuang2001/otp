@@ -43,6 +43,12 @@ Per-suite routing: [`tests/CONTEXT.md`](tests/CONTEXT.md). Every measured figure
 `env_default()` reads the variable once (a `OnceLock`), so a long-running process pays one `getenv`; `mode_from_value` itself is pure (no environment read), which is how a test pins the semantics without `set_var` (edition 2024 makes it `unsafe`).
 `jit-cranelift` is accepted because it is exactly `Tier::Cranelift::name()`'s spelling, so a value copied from a tier report selects that tier back; `hot` is deliberately **not** a value — it names no tier.
 
+### When the machine exists (the first slice does not build one)
+The `Machine` is built **eagerly at engine registration**: the one engine constructor `RunnerState::spawn_with_stability` (`entry.rs:504-535`) inserts `ProcessEngine { machine: Machine::new(), .. }` (`entry.rs:511-514`), so a process owns its machine from spawn — its pid enters `RunnerState::engines` before `Runtime::spawn_process_with_policy` enqueues it — and no engine ever shares or recycles its machine.
+The first slice only selects the **tier** into that existing machine (`select_entry_tier`, `run.rs:979-983`); the slice path has no machine construction site, and the nested-run recycling pool is `../context/machine_pool.rs`, not this node.
+A process the runtime creates **without an engine** — the `Runtime::new` service stand-ins and the `-eval` action process, spawned straight into the process table — has no `ProcessEngine` and therefore no `Machine`.
+The engine is the machine's only holder after the slice re-inserts it, so `RunnerState::prune_dead` (`entry.rs:947-968`) dropping a dead pid's engine is what releases that machine.
+
 ### How and when the tier is chosen
 ```text
 tier = match engine.parked { Some(_) => engine.tier,            // a resume re-uses the remembered tier
@@ -143,6 +149,17 @@ Beyond the `BudgetContext` charges (a per-instruction `reduce` on the interprete
 * **Amortized O(1):** the off-heap trigger (see the prune section) — a slice that built no payload pays one cached observation, and the payloads need no per-slice work because no slot is ever handed out on the process's own table.
 * **First entry / flag-gated only:** `record_baseline_code` (`+JPperf`), the `Arc::clone` of the entry module, `describe_site` (debug-trace). `source_payloads` runs only on the terminating `Returned`/`Err` arms.
 * **No production time read:** `Instant` appears only in `tests.rs`; the slice path makes no `sys` call of its own.
+
+## Per-process host cost (the engine's memory, and the heap policy at creation)
+`RunnerState::spawn`/`spawn_stable`/`spawn_fun` is the **only** engine creator (`entry.rs:504-535`), so every process the runtime *executes* carries one `ProcessEngine` (`entry.rs:173-303`) in `RunnerState::engines` (`entry.rs:415`); the runtime's never-enqueued service pids (`init`/root/`erl_prim_loader`/`file_server_2`, `runtime.rs:1365-1478`) carry a PCB only, because they are spawned through `ProcessTable::spawn` and never registered here.
+Per engine the machine dominates: `Machine` by value (`entry.rs:177`) holds `x: Vec<Eterm>` = `MAX_REGISTER` 1024 words = **8 KiB** and `fr: Vec<Eterm>` = `MAX_FLOAT_REGISTER` 1024 words = **8 KiB** (`../beam_engine/src/machine/registers.rs:39,49`, sized by `reset` `:337-356`), plus `stack` with_capacity(256) = **2 KiB**, `frames` with_capacity(256) = **8 KiB** (`Frame` is 32 B) and `catch_frames` with_capacity(8) (`../beam_engine/src/machine/mod.rs:841-849,866-868`).
+Everything else in the machine starts empty and grows on demand: `args` (capacity = the spawn arity), `contexts` (two `Vec`s, `machine/context.rs:129-141`), `refc_binaries`/`writable_payloads`/`args_scratch` (`machine/mod.rs:496,531,581`), `raise_snapshot`, and `label_maps` — a `Vec`-backed LRU bounded at `LABEL_MAP_CAPACITY` 32 entries, filled per module entered (`machine/label_cache.rs:160,193-207`).
+`off_heap: Option<OffHeapReclaimer>` (`entry.rs:302`, `../context/gc/bin_vheap.rs:294-320`) is `None` until the first park that reaches the reclamation; it is a `BinVheap` (one `usize`) plus two `usize` figures.
+`RuntimeRunner` holds no per-process state (two references, `run.rs:286-291`) and never builds a machine: it `remove`s it from `engines` and re-inserts it.
+`results`/`exits`/`errors`/`unrunnable` are deliberately **not** pruned (`entry.rs:400-447`), so a dead process leaves one recorded `Eterm` (or `BeamError`) per map entry for the runtime's life.
+**The heap is not the runner's:** `ProcessTable::spawn` → `Process::with_policy` → `AnyCollector::new(policy)` → `Collector::with_allocator` allocates the young space at `policy.initial_heap_words()` and the mature space at `initial_mature_words` (`../../beam_gc/src/collector.rs:94-96`), so a default process is born with **233 words young (1 864 B) + 233 words mature (1 864 B)**, each an eagerly `alloc_bytes`-ed carrier block (`../../beam_alloc/src/heap.rs:64-74`).
+Policy at creation: a boot/runtime-owned process gets `system_spawn_policy` = the configured policy with `max_heap_words = 0` (`runtime.rs:227-231`), a user/action process `default_spawn_policy` (`runtime.rs:4250-4256`) = `config.heap.policy()`, whose default is `HeapOptions::default()`'s 233-word floor (`config.rs:124-131`, `../beam_gc/src/policy.rs:38,335-344,405`); `spawn_opt` narrows it through `HeapPolicy::spawn_policy` (`native/process.rs:148-158`, `../beam_gc/src/policy.rs:442-462`), and `max_heap_size` is a PCB setting rather than a policy field.
+No per-process reservation here reaches 64 KiB: the largest fixed ones are the two 8 KiB register files and the 8 KiB frame reserve.
 
 ## A process's own signal work before it sleeps
 A signal a process queues on **itself** is delivered before its next schedule-in, through two mechanisms because the C has both.

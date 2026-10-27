@@ -157,6 +157,15 @@ byte delta the live block moved by); `reset`; `alloc_words`/`alloc_tuple`/`cons`
 `committed_words`, `capacity`, `used`, `available`, `peak_used`, `allocator`. Plus
 `pub enum GrowOutcome { GrewInPlace, MoveRequired }`. Re-exported at the crate root and in the prelude.
 
+**Adoption — no per-process `ReservedHeap` exists today.** The only constructing host is the engine's
+pointer-stable term arena (`beam_engine`'s `ContextHeap`, `src/context.rs:1509`, `fresh_region` at
+`:1781-1791`, plus the survivor region at `src/context/reclaim.rs:315`), which backs the
+`-eval`/table-less route, not a process heap; `beam_process` and `beam_gc` never construct one, and
+`beam_rt`'s mention (`src/runtime/retention.rs:27`) is a description of that arena. A fresh process's
+heap is instead a fixed-capacity [`Heap`] inside `beam_gc`'s `HeapSpace` (`beam_gc/src/space.rs:58-61`),
+so growth is by GC replacement (`beam_gc/src/nursery.rs:191-192`). Grep `ReservedHeap` before claiming
+otherwise.
+
 **Host-adoption contract (the point of the type):**
 1. On an `AllocKind::Heap` exhaustion the host calls `try_grow(n)` and retries. `GrewInPlace` ⇒ the
    committed limit was raised (to exactly `used + n`), the bump pointer did **not** move — a cached
@@ -310,6 +319,36 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   variable-size MBC** carrier (`alloc_mid`); `>= 512 KiB` (or align > `UNIT_SIZE`) → a **dedicated
   single-block carrier** (`alloc_large`). A GC-sized heap (`N` words × 8) therefore only takes the
   size-class ladder when it is ≤ 128 words.
+- **Eager cost of a heap block, by band.** A 4096-word (32 KiB) `Heap` is `alloc_mid`: one **pooled
+  1 MiB MBC carrier** is mapped (`mbc_size` clamps the preferred size to `smbcs` = 1 MiB,
+  core.rs:408-416) and only two 16-byte block headers plus two link words are written
+  (mbc.rs:236-242, :293-306) → ~1 MiB of address space, a handful of resident pages, and the carrier
+  is reusable by every later 1025 B–512 KiB request. A heap at/above `sbct` (e.g. `beam_rt`'s
+  `DEFAULT_HEAP_WORDS = 1<<24` = 128 MiB) is `alloc_large`: one dedicated
+  `round_up_unit(16 + size)` mapping (core.rs:220-292) with ~2 resident pages, since neither
+  `Heap::with_allocator` (heap.rs:64-74) nor the routing writes the payload. A heap of ≤ 128 words is a
+  slab block, but subdividing its 1 MiB carrier writes a 16-byte header plus two link words **per
+  block** (carrier.rs:270-297), so the whole carrier becomes resident and is retained for the
+  allocator's lifetime.
+- **The one eager registry cost:** the first `default_allocator()` initialises all 12 allocators
+  (registry.rs:54-67), each carrying an inline `[TypeCounters; STATS_TYPE_SLOTS]` = 512 × 24 B ≈ 12 KiB
+  (stats.rs:267-300) → ~150 KiB of process heap touched before any carrier is mapped; `mseg` itself maps
+  nothing at construction (mseg/allocator.rs:66-77).
+- **Startup attribution — bookkeeping vs address space vs payload.** The exact eager figure is
+  12 × 12 288 B = **147 456 B (~144 KiB)** resident; nothing else in the crate is eager (`CarrierAllocator::new`
+  maps no carrier, core.rs:61-68). Everything else is address space until written: `beam_rt`'s two
+  `DEFAULT_HEAP_WORDS = 1<<24` heaps are two dedicated `round_up_unit(16 + 134 217 728)` =
+  **134 217 744 B mappings (256 MiB combined VSZ)** measured at **12–48 kB RSS**
+  (`../../beam_rt/src/context/pump/CONTEXT.md:61`), the engine arena reserves 4 MiB per region with a
+  64 KiB committed slice (`../../beam_engine/src/context.rs:1438,1442`), and a 1 MiB MBC carrier costs
+  ~2 resident pages. So allocator *bookkeeping* cannot explain a multi-MiB RSS delta — only term payload
+  the host actually wrote into a block, or the slab carriers below, can.
+- **Slab carriers are the only allocator RSS term that scales with the number of classes used.** The
+  first request in each distinct (allocator, size-class) pair maps a 1 MiB carrier that is *fully
+  resident* and retained for the allocator's lifetime, so the default 7-class ladder (`16..1024` B) over
+  12 allocators is an **84 MiB theoretical ceiling** — realistically a few MiB, since only the classes
+  the runtime actually uses get one. A freed segment gives RSS back only through a cache eviction, so
+  up to 10 released segments of any size stay mapped and dirty (see "When a free actually unmaps").
 - **Alternating create/drop of a same-size `Heap` returns the same base address.** Three reuse layers,
   in order: the slab class free list (head insert `FreeList::insert` / head pop `take_block`), the MBC
   pool (`take_mbc_fit`, first fit), and the **process-global `mseg` reuse cache** (`Segment::drop` →
@@ -356,6 +395,12 @@ and `RefcBinary`'s moving grow (binary/growth.rs:426).
   (`alloc_calls`/`free_calls` cumulative, `live_bytes`, `peak_live_bytes`, `carriers`, `carrier_bytes`)
   plus `AllocStats::mseg` (`cached`, `reused`, `unmaps`, `calls.create/destroy`, `mapped_bytes`).
   Both `MsegStats` and `stats.carriers` are process-global across allocator instances.
+- The instance such a heap draws from is always `default_allocator()` = `AllocatorId::Standard`
+  (`std_alloc`) — `heap.rs:59-61`, `reserved_heap.rs:151-153`, `beam_gc/src/collector.rs:84-96` — never
+  `eheap_alloc`; the `EHEAP`/`HEAP`/`OLD_HEAP`/`MSG` rows (`types.rs:419-426`) are inventory only.
+- With the default policy a fresh process's **two** spaces are 233 words each (1864 B:
+  `beam_gc/src/policy.rs:341-342`), so both land in the mid band — two blocks carved from one shared
+  1 MiB MBC carrier, the first of which maps that carrier (`alloc_mid` → `mbc_size` 1 MiB).
 
 ### Residency (RSS) at allocation time — allocating never touches the payload
 Memory comes from `mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS)` (`src/mseg/mapping.rs:72-91`),
@@ -373,6 +418,9 @@ What each path actually *writes* at allocation time:
   link words in the payload head per block (`src/carrier.rs:270-297`, `src/free_list.rs:507-525`).
   Because a class stride (16–1024 B payload) is below the page size, **all pages of the 1 MiB slab
   carrier are touched** → a fresh slab carrier is ~fully resident.
+  A `Heap::new(0)` is therefore not free: a 0-byte request lands in class 0
+  (`SizeClasses::class_for(0) == Some(0)`, `src/size_class.rs:245-257`, `src/allocator/core.rs:139-149`),
+  so the first zero-capacity heap a process makes maps and fully touches a 1 MiB slab carrier.
 - **mid / multi-block** (`alloc_mid`): a fresh `MbcCarrier` writes one 16-byte block header at the base
   plus the two link words of its single spanning free block (`src/mbc.rs:211-243`) — ~2 touched pages
   of a 1 MiB carrier; the handed-out block is not written at all.
