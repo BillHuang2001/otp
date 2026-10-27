@@ -334,6 +334,21 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   (registry.rs:54-67), each carrying an inline `[TypeCounters; STATS_TYPE_SLOTS]` = 512 × 24 B ≈ 12 KiB
   (stats.rs:267-300) → ~150 KiB of process heap touched before any carrier is mapped; `mseg` itself maps
   nothing at construction (mseg/allocator.rs:66-77).
+- **Startup attribution — bookkeeping vs address space vs payload.** The exact eager figure is
+  12 × 12 288 B = **147 456 B (~144 KiB)** resident; nothing else in the crate is eager (`CarrierAllocator::new`
+  maps no carrier, core.rs:61-68). Everything else is address space until written: `beam_rt`'s two
+  `DEFAULT_HEAP_WORDS = 1<<24` heaps are two dedicated `round_up_unit(16 + 134 217 728)` =
+  **134 217 744 B mappings (256 MiB combined VSZ)** measured at **12–48 kB RSS**
+  (`../../beam_rt/src/context/pump/CONTEXT.md:61`), the engine arena reserves 4 MiB per region with a
+  64 KiB committed slice (`../../beam_engine/src/context.rs:1438,1442`), and a 1 MiB MBC carrier costs
+  ~2 resident pages. So allocator *bookkeeping* cannot explain a multi-MiB RSS delta — only term payload
+  the host actually wrote into a block, or the slab carriers below, can.
+- **Slab carriers are the only allocator RSS term that scales with the number of classes used.** The
+  first request in each distinct (allocator, size-class) pair maps a 1 MiB carrier that is *fully
+  resident* and retained for the allocator's lifetime, so the default 7-class ladder (`16..1024` B) over
+  12 allocators is an **84 MiB theoretical ceiling** — realistically a few MiB, since only the classes
+  the runtime actually uses get one. A freed segment gives RSS back only through a cache eviction, so
+  up to 10 released segments of any size stay mapped and dirty (see "When a free actually unmaps").
 - **Alternating create/drop of a same-size `Heap` returns the same base address.** Three reuse layers,
   in order: the slab class free list (head insert `FreeList::insert` / head pop `take_block`), the MBC
   pool (`take_mbc_fit`, first fit), and the **process-global `mseg` reuse cache** (`Segment::drop` →
