@@ -104,7 +104,7 @@ use super::bitstr_inline::{
     match_string_shape,
     bs_match_shape, get_integer2_shape, get_position_shape, get_utf16_shape, get_utf32_shape,
     get_utf8_shape, set_position_shape, skip_bits2_shape, skip_utf16_shape, skip_utf32_shape,
-    skip_utf8_shape, start_match3_shape, start_match4_shape, test_tail2_shape, CreateArm,
+    skip_utf8_shape, start_match3_shape, start_match4_shape, test_tail2_shape, CreateBinShape,
 };
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
@@ -515,7 +515,7 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
             bs_match_shape(labels, module, *fail, ctx, commands).is_some()
         }
         Instr::BsCreateBin { dst, segments, .. } => {
-            CreateArm::of(module, dst, segments).is_some()
+            CreateBinShape::of(module, dst, segments).is_some()
         }
         Instr::BsMatchString {
             fail,
@@ -779,7 +779,7 @@ pub(crate) fn cacheable_touches(
             }
         }
         Instr::BsCreateBin { dst, segments, .. } => {
-            if let Some(shape) = CreateArm::of(module, dst, segments) {
+            if let Some(shape) = CreateBinShape::of(module, dst, segments) {
                 touches.extend(shape.registers());
             }
         }
@@ -990,7 +990,7 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
             }
         }
         Instr::BsCreateBin { dst, segments, .. } => {
-            if let Some(shape) = CreateArm::of(module, dst, segments) {
+            if let Some(shape) = CreateBinShape::of(module, dst, segments) {
                 reads.extend(shape.reads());
             }
         }
@@ -1210,7 +1210,7 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         // `bs_create_bin` writes its destination (the accumulator term — the instruction's
         // own value on the in-place route). Charged for the same reason as the shapes above.
         Instr::BsCreateBin { dst, segments, .. } => {
-            CreateArm::of(module, dst, segments)
+            CreateBinShape::of(module, dst, segments)
                 .map(|shape| shape.writes())
                 .unwrap_or_default()
         }
