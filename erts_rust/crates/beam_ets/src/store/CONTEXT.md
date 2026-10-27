@@ -54,6 +54,13 @@ Parent: `../CONTEXT.md` (the `Table` seam). Contract source: `../../CONTEXT.md` 
 - **`take` retention.** Repeated `ets:take/2` keeps every checked-out object's words alive until `reset`/drop (see `relinquish`); ERTS frees the table's copy at take.
 - **Stale-root footgun** (see Design Decisions) is a documented caller contract, not a check.
 
+## Cost shape of one `copy` (measured against the `copy_bound/ets_copy` payload)
+- `copy` is a **single-pass recursive** deep copy (`copy_term`/`copy_boxed`): it reserves each destination block with `alloc_words(n)` *as it reaches it*, so there is **no** `size_object`/`preflight_words` pricing walk, no destination capacity check, and no intermediate `Vec<Vec<Eterm>>` — the destination words are exactly the graph's.
+- The bench payload `{k, #{a => [1..10], b => {ok, <<"hello world">>, 3.5}, c => <<1..12>>, d => "a char list", e => -42}}` costs **71 destination words in 28 `alloc_words` reservations** by layout arithmetic (3 outer tuple + 8 flat map (`n+3`) + 6 keys tuple + 20 list + 4 inner tuple + 3 + 2 leaf + 3 leaf + 22 char list; the two 11/12-byte binaries are on-heap `HeapBits` leaves, `-42`/`k`/`ok` are free immediates) — `PERF.md` §1 records **73** live words for the same loop, so 2 words of that figure come from the measurement's own shape, not the object.
+- Bookkeeping is **per copy**: one `commit` (`pending.push`, 24 B per entry) per reservation, then one `tracked.insert(root, runs)`; `free(root)` is one `tracked.remove` plus one `release` per run, each a linear scan of `free_runs` by exact word count.
+- `pending` is handed to `tracked` with `mem::take`, which leaves it at **capacity 0**, so every copy re-grows it (1→2→4→8→16→32 = six reallocations for this payload) — the store never keeps a reusable work buffer.
+- Address reuse makes the round trip word-stable: after the first op the same 5 exact-size free-run buckets serve every later copy, so `used` stops moving (`blocks` = 3 flat, `words` = 73 flat for the bench loop).
+
 ## Test Strategy
 - `tests.rs` (in-module `#[cfg(test)]`) covers every copied kind and the accounting invariant:
   - immediates by value (0 words/blocks); cons/tuple/nested-tuple deep copy (distinct storage + structural `eq`);
