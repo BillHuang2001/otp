@@ -250,6 +250,9 @@ tests) + `binary/growth.rs` (capacity growth, counters, the relocation protocol)
   Private `#[repr(C)] BinaryHeader { refc, len, capacity, reserved }` = 4 words = 32 bytes sits
   immediately before the payload (`data_ptr` = first payload byte; `data_ptr - HEADER_SIZE` recovers
   the base; `HEADER_SIZE % UNIT_SIZE == 0` keeps `data_ptr` `MIN_ALIGN`-aligned). `Send` but not `Sync`.
+- **A `RefcBinary` payload is one ordinary allocator block of `HEADER_SIZE (32) + reserved` bytes**, so on the registry default config it routes by that total: `<= 1024` → slab class, `1024 < total < sbct (512 KiB)` → a block of the pooled 1 MiB variable-size MBC carrier (shared, first-fit, coalescing), `>= sbct` → a dedicated SBC mapping (`src/allocator/core.rs:314-328`; bands at `src/allocator/core.rs:321-327`).
+- **Growth never calls `realloc_impl`/`realloc_typed`**: `relocate` does `alloc_typed` → `copy_nonoverlapping` → `dealloc_typed` (`src/binary/growth.rs:393-426`), so the probe-only block (`realloc_calls` in `stats.rs`) stays 0 on this path and each move costs one `state.lock()` take + a linear `take_mbc_fit` pool scan per side (`src/allocator/core.rs:320,493`; `src/allocator/state.rs:124-135`).
+- **Per-append is free of this crate**: the writable-accumulator sink writes straight through `data_ptr()` and consults `ensure_capacity` only on a capacity shortfall, so an append loop touches `beam_alloc` once per *growth*, never per append (`src/binary/growth.rs:246-253` early-returns without even a counter bump).
 
 ### `mseg` — the mmap-backed segment allocator (`erl_mseg.c`)
 Facade + submodules `mseg/{mapping,header,config,state,allocator}.rs`.
