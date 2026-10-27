@@ -177,7 +177,13 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   version-aware scan, wall 67.7 s); `emqx` skips honestly (`skipped(emqx-requires-otp-28)` — the
   checkout pins OTP 28, the host is OTP 29.1.1). Load is recorded before/after every run: **the host
   is shared**, so read the ratios and the deterministic `case_*_ops/calls/elements` counters, never
-  the absolute wall times.
+  the absolute wall times. The four `foreign/*` rows are **engine-tier**: per call they cross **0**
+  BIFs (`to_lower`, `capitalize_token`), **4** (`iolist_to_binary/1`, `encode`) and **16**
+  (`bit_size/1`, `decode`), so ~90–100 % of each residual is the baseline tier's per-instruction
+  machinery and `beam_bifs`/`beam_term`/`beam_alloc` cannot close it — the live per-frame split is
+  `crates/beam_engine/src/jit/baseline/measure/CONTEXT.md` §*The create arm's helpers*, not
+  `BOTTLENECKS.md` §B3 (whose `dispatch` 12.6 %, `push_bit` 6.5 % and `alloc_impl` 17.31 % shares
+  predate the create-arm landing and no longer reproduce).
 - **Contract A.9 (build/bootstrapping) — boot COMPLETES; no self-hosted build yet.** `beam_rt`
   loads the 22 preloaded modules on startup, and its boot-script executor drives the real
   `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 directives) **through the final
