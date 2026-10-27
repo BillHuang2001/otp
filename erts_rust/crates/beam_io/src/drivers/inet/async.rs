@@ -396,7 +396,10 @@ impl TcpInetDriver {
     ///
     /// This is the C's `tcp_recv(desc, n)` (`inet_drv.c:13130`): it decodes one `{packet, N}`
     /// frame, or takes "exactly `n` bytes", or takes whatever the socket holds, and stages the
-    /// result as `{inet_async, Port, Id, {ok, Data}}`. Returns whether an operation completed.
+    /// result as `{inet_async, Port, Id, {ok, Data}}` — or, under `{deliver, port}`, hands it to the
+    /// port's input queue as `{Port, {data, …}}` (`INET_DELIVER_PORT` first, exactly as
+    /// `tcp_reply_data` does at `:4287`, so the id the control reply carried is never answered by a
+    /// completion). Returns whether an operation completed.
     ///
     /// The bytes live in [`TcpInetDriver::pending_input`], which is also where
     /// `TCP_REQ_UNRECV`'s `tcp_push_buffer` puts them, so a pushed buffer is delivered first.
