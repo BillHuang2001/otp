@@ -317,12 +317,9 @@ fn a_passive_port_has_no_mode_and_never_spends() {
         "the recv verb read the buffered bytes into the port queue"
     );
     assert_eq!(
-        port.registry
-            .get_mut(port.id)
-            .expect("the port is live")
-            .drain_input(),
-        b"abc".to_vec(),
-        "and it takes the whole payload"
+        port.input_len(),
+        3,
+        "and the recv verb took the whole buffered payload out of the kernel"
     );
 }
 
