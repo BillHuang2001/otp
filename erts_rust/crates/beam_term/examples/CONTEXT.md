@@ -24,6 +24,7 @@ read the **retired-instruction count** or a ratio between two measured quantitie
 - A frozen `mod retired` copy inside an example is the **A/B oracle**; it is not dead code and must not be
   "cleaned up" into the live implementation.
 - Every figure these produce is a measurement, not a test: nothing here runs in CI and nothing here asserts.
+- `atom_fork_bench`'s `DEFAULT_SIZE` (3 009 atoms, described in its header as "roughly `atom.names`' own count") is **below the real boot table**: `atom.names` holds ~740 declarations (~773 name tokens) and the booted shared table is ≈9 000 atoms, so one real per-module fork pays 16 384 buckets (≈393 KB) where the default size pays 4 096 (≈98 KB) — pass a ~9 000 size to reproduce a boot fork, and read the default only as the `clone`-vs-`fork` instruction ratio.
 
 ## Routing Table
 - `atom_fork_bench.rs` → `clone` vs `fork` in retired instructions
