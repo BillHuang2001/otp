@@ -509,14 +509,16 @@ difference the reason the two ratios do not coincide exactly.
 | 1 | `src/store/mod.rs` `copy`/`free`/`tracked` | the run list a `copy` filled was allocated from capacity 0 and dropped by `free` on every op (6 reallocations/op); the drained list is now pooled (`spare_runs`, capped at `SPARE_RUN_BUFFERS = 4`) and taken at the *start* of the next copy, and `tracked`'s SipHash (548 instr/op) is replaced by `RootHasher`, a finalising multiply over the store's own object roots | **−1 864** |
 | 3 | `src/table/mod.rs` `insert_stored`, `src/table/interior.rs`, `champ_interior.rs`, `hash_interior/mod.rs` | the key was hashed twice per upsert (replace probe + insert) and the probe built a throwaway `vec![object]`; `insert_hashed`/`lookup_one_hashed` thread **one** `term_hash` through both halves and answer an `Option` | **−182** |
 | — | — | after levers 1–3 | **20 801** |
-| 4 | `crates/beam_bifs/src/ets.rs` `selection_objects` | `vec![selection]` per single-object `ets:insert/2` — **not applied** (outside this node's write scope) | open |
+| 4 | `crates/beam_bifs/src/ets.rs` `selection_objects` | `vec![selection]` per single-object `ets:insert/2` — **landed in `beam_bifs`**: `selection_objects` now returns a two-variant `Selection` (`Single(Eterm)` → `core::slice::from_ref`, `List(Vec<Eterm>)`), both call sites consume it as a slice, so a single-object `ets:insert/2` makes **0 allocations** for its selection (`crates/beam_bifs/tests/ets_insert_alloc.rs`) | not isolated here (this table's split predates it) |
 
 The lever-2 and lever-1 splits were isolated by rebuilding with each change reverted in turn
 (lever 2 restored: **25 394** instr/op; lever 3 measured on top of 1+2: 20 990 → 20 808). Lever 4
-is a real allocation on the same caller's path — one malloc/free per `ets:insert` — but it is
-`beam_bifs`'s to make: `selection_objects` should return a two-variant `Selection`
-(`Single(Eterm)` → `core::slice::from_ref`, `List(Vec<Eterm>)`), which both of its call sites
-already consume as a slice.
+was the one lever outside this node's write scope, and it has since landed in `beam_bifs`: the
+single-object `ets:insert/2` selection is now a `Selection::Single` borrowed through
+`core::slice::from_ref` instead of a `vec![selection]`, i.e. **zero allocations** for the selection
+(pinned by `crates/beam_bifs/tests/ets_insert_alloc.rs`). Its per-op instruction effect is not
+isolated in the table above, whose split was taken before the change and whose baseline differs from
+the current tree.
 
 Lever 3 is small *because the key is an immediate*: `term_hash` of an atom or small int is a few
 instructions, so one of three hashes per op was never the expensive one — the profiling pass's
