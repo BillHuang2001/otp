@@ -1,0 +1,95 @@
+m21 cross-runtime per-project record — derived table (auditable intermediate)
+Sources: results/m21-eunit-{sys,rust}-r{1..6}.json (twelve single-side `--quick` matched
+passes: six rounds with the side order alternating round by round, each pass pinned with
+`taskset -c 3` and run one process at a time). No metric value was edited: every figure
+below is recomputed from the archived JSON.
+Figure quoted = median of the six per-round values; ratio = median of the six per-round ratios.
+Ratio > 1 => rust slower. A row is one whole `eunit:test([...])` suite, so wall_ms is a
+whole-program time (3 runs per pass, summary count=3), NOT a per-unit figure: the
+deterministic work companion is `tests_passed`, not an ops/calls counter.
+
+A. runtime resolution (both sides, every pass)
+  sys  : /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl  version=29 supported=true
+  rust : erts_rust/target/release/beam_rt  version=30 supported=true
+  profile quick — 3 whole-process rounds of the same argv per workload per pass; six matched
+  passes per side (twelve passes total), workloads jsone and bbmustache.
+
+B1. per-round whole-program wall time (ms) — jsone
+round   sys_p50   rust_p50   ratio |   sys_p99   rust_p99   ratio
+r1     409.3434    509.8778  1.2456 |   430.9958    518.9579  1.2041
+r2     443.6179    538.6103  1.2141 |   457.2283    578.6601  1.2656
+r3     405.6229    511.9740  1.2622 |   426.2141    525.1070  1.2320
+r4     402.3229    491.7829  1.2224 |   402.3853    492.9600  1.2251
+r5     406.7404    496.5492  1.2208 |   442.6609    498.6716  1.1265
+r6     424.7943    502.5177  1.1830 |   437.7861    508.0922  1.1606
+
+B2. per-round whole-program wall time (ms) — bbmustache
+round   sys_p50   rust_p50   ratio |   sys_p99   rust_p99   ratio
+r1     393.7865    452.0603  1.1480 |   399.6399    469.0164  1.1736
+r2     368.6330    397.8987  1.0794 |   399.6060    398.0755  0.9962
+r3     363.7538    375.5843  1.0325 |   411.7748    383.0800  0.9303
+r4     356.1102    374.2934  1.0511 |   363.9198    376.8193  1.0354
+r5     355.8895    373.3579  1.0491 |   398.5662    404.6533  1.0153
+r6     354.3700    384.5843  1.0853 |   356.1940    397.0769  1.1148
+
+C1. per-project medians — jsone
+quantity                          rust(med)        sys(med)  rust/sys  per-round ratios
+wall_ms[p50]                           506.20          408.04    1.2216   1.2456 1.2141 1.2622 1.2224 1.2208 1.1830
+wall_ms[p99]                           513.53          434.39    1.2146   1.2041 1.2656 1.2320 1.2251 1.1265 1.1606
+compile_ms                             502.84          494.41    0.9941   0.8190 1.2852 0.9795 0.9983 0.9899 1.0314
+tests_passed                            90.00           90.00    1.0000   1.0000 1.0000 1.0000 1.0000 1.0000 1.0000
+peak_memory_bytes                 189,990,912      71,907,328    2.6417   2.6372 2.6408 2.6447 2.6416 2.6418 2.6440
+  median of the six per-round ratios, exact: wall_ms[p50] 1.221580  wall_ms[p99] 1.214592  compile_ms 0.994063  tests_passed 1.000000  peak_memory_bytes 2.641716
+  ratio of the two medians (rust_med / sys_med): wall_ms[p50] 1.240553, wall_ms[p99] 1.182173, peak_memory_bytes 2.642163
+
+C2. per-project medians — bbmustache
+quantity                          rust(med)        sys(med)  rust/sys  per-round ratios
+wall_ms[p50]                           380.08          359.93    1.0652   1.1480 1.0794 1.0325 1.0511 1.0491 1.0853
+wall_ms[p99]                           397.58          399.09    1.0254   1.1736 0.9962 0.9303 1.0354 1.0153 1.1148
+compile_ms                             294.72          296.49    0.9983   1.0125 0.9995 0.9972 0.9909 1.0109 0.9774
+tests_passed                            79.00           79.00    1.0000   1.0000 1.0000 1.0000 1.0000 1.0000 1.0000
+peak_memory_bytes                 111,181,824      64,380,928    1.7271   1.7113 1.7281 1.7258 1.7281 1.7281 1.7261
+  median of the six per-round ratios, exact: wall_ms[p50] 1.065225  wall_ms[p99] 1.025359  compile_ms 0.998321  tests_passed 1.000000  peak_memory_bytes 1.727094
+  ratio of the two medians (rust_med / sys_med): wall_ms[p50] 1.055989, wall_ms[p99] 0.996217, peak_memory_bytes 1.726937
+
+D. reading notes
+  - wall_ms p50/p99 are the summary quantiles over the 3 whole-process runs of one pass; the six
+    per-round rows in B are the stability evidence, and the quoted cross-runtime figure is the
+    MEDIAN OF THE SIX PER-ROUND RATIOS (section C `rust/sys` column), computed from the unrounded
+    per-round values. It is not the ratio of the two medians — both are printed per project so a
+    transcription can name which one it quotes (they differ: medians of ratios and ratios of
+    medians are different estimators).
+  - `tests_passed` is the deterministic work companion: 90 (jsone) / 79 (bbmustache) on BOTH sides
+    of every round, so the identical suite ran under both runtimes.
+  - `compile_ms` is the SAME external `erlc` (the system erlc named in each report notes) on both
+    sides, so its rust/sys ratio is a compile-stage sanity check, not a runtime figure.
+  - `peak_memory_bytes` is the max VmHWM observed across the 3 runs of a pass (the report note
+    also carries the compile stage peak); it is a whole-process footprint, like-for-like here
+    because both sides run the identical suite.
+  - wall_ms and peak_memory_bytes are whole-program quantities: this session measures suite wall
+    time, so there is no per-op/per-element normalisation to compare across the two sides.
+  - `bbmustache wall_ms[p50]` sits on a 4-dp knife edge: the exact median of the six unrounded
+    per-round ratios is 1.065225 (-> 1.0652), while averaging the six per-round values rounded as
+    printed in B gives exactly 1.06525, which a decimal half-up formatter prints as 1.0653.
+    The exact figure is the one quoted in C2; name the route if a transcription uses the other.
+  - the host is shared and heavily loaded this session (see F): read the ratios and `tests_passed`
+    rather than absolute wall times.
+
+E. status / withheld audit
+  rows not ok: 0 — all 24 (6 rounds x 2 sides x 2 projects) rows are status=ok.
+  withheld marginals: none (every selected pass reports a wall_ms summary with count=3).
+
+F. load band (results/m21-eunit-load.log, /proc/loadavg at every pass boundary)
+  26 loadavg readings over 13 passes, 1-min load min 9.59, max 14.62
+  This session ran on a heavily loaded host (1-min load ~10-15 throughout, far above the
+  0.5-4.5 of m19): the ratios are the signal, the absolute wall times are host-load-sensitive.
+
+G. the budget-evaluation pass (NOT a timing source)
+  results/m21-eunit-budgetprobe-all.json is one `--runtime all --quick` pass over the same two
+  workloads, run only so the latency-budget rows can be evaluated (it is the only pass that
+  carries BOTH sides in one report). It is runtime-major (all sys rows, then all rust rows), so
+  it samples the two sides minutes apart and is subject to the documented ordering bias; no
+  figure above comes from it. Its driver-printed verdict block is archived verbatim as
+  results/m21-eunit-budgetprobe-all.txt: 0 met / 0 exceeded / 11 not measured (none of the
+  budgeted workloads — baseline, cowboy, list_walk, copy_bound, gc_bound, file_io, gc_class —
+  is selected by this session, so every row is honestly not-measured).
