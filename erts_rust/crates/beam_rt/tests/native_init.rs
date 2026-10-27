@@ -451,6 +451,38 @@ fn init_restart_reboots_the_node_and_keeps_it_answering() {
     assert_eq!(ours.out.trim(), "ok\nstarting\ntrue", "beam_rt: {}", ours.err);
 }
 
+/// A restart **replaces** the system instead of re-registering over it: the boot script's
+/// `{kernelProcess, application_controller, …}` directive starts a *new* server, and the one
+/// the first boot started is gone.
+///
+/// `lib/kernel/src/application_controller.erl:530-531` opens `init/2` with
+/// `register(application_controller, self())`, so a surviving first server would make the second
+/// directive process die of a `badarg` it cannot catch — and `src/report.rs` would then prefix
+/// stdout with an `=ERROR REPORT====` block. The expected stdout below is therefore **exact**
+/// (no `trim`, no `contains`): a single report line fails it.
+///
+/// The three facts the program prints are the invariant, never a pid or a timestamp: the name
+/// resolved to a live pid before the restart, the name still resolves after it, the pid is a
+/// **different** one, the new one is alive and the old one is not.
+#[test]
+fn init_restart_replaces_the_system_instead_of_re_registering_over_it() {
+    let expr = "AC0 = whereis(application_controller), \
+                io:format(\"~p ~p~n\", [is_pid(AC0), is_process_alive(AC0)]), \
+                io:format(\"~p~n\", [catch init:restart()]), \
+                AC1 = whereis(application_controller), \
+                io:format(\"~p ~p ~p ~p~n\", \
+                          [is_pid(AC1), AC0 =/= AC1, is_process_alive(AC1), \
+                           is_process_alive(AC0)]), \
+                halt(0).";
+    let ours = beam_rt(expr);
+    assert_eq!(ours.code, 0, "beam_rt: {}", ours.err);
+    assert_eq!(
+        ours.out, "true true\nok\ntrue true true false\n",
+        "a restarted system must have replaced `application_controller`, with no crash report \
+         on stdout: {}",
+        ours.err
+    );
+}
 /// `init:boot(BootArgs)` runs the boot script named by the `-boot <Script>` flag
 /// (`init.erl:585-597,1257-1269`) — resolved with the very rule the CLI's `-boot FILE` action
 /// uses, so the two can never disagree.

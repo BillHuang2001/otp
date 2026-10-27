@@ -4336,6 +4336,57 @@ impl Runtime {
         };
         Ok(registry.note_driver_monitor_exits(table))
     }
+    /// Closes every live port whose owning process `table` no longer holds, returning how many
+    /// were closed.
+    ///
+    /// This is the **port half** of a system teardown
+    /// ([`Runtime::clear_system`](crate::runtime::Runtime)): `init:restart/0` takes the whole
+    /// system down, so a port the torn-down system owned must release its OS descriptors (a
+    /// socket, a pty, the `inet_gethost` child a booted kernel keeps open) instead of outliving
+    /// its owner. Each close runs the runtime's own [`PortRegistry::close`] path, so the driver's
+    /// `port_exit` notification, the teardown, the id release and the retirement of the number
+    /// all happen exactly as they do for an explicit `erlang:port_close/1`.
+    ///
+    /// The `'EXIT'`/`'DOWN'`/`{data, …}` messages a close owes go to processes the same teardown
+    /// has already terminated; they are staged like any other completion and dropped by the
+    /// delivery step's liveness check, never misdelivered to a recycled identity.
+    ///
+    /// The `enif_select`/`tty_select` registrations of the dead processes are pruned in the same
+    /// breath ([`PortRegistry::prune_dead_select`]), so the poller cannot keep polling for a
+    /// process that no longer exists.
+    ///
+    /// # Residual (honest)
+    ///
+    /// A port registry that is **borrowed** at the moment of the teardown (an in-flight port BIF,
+    /// which a teardown outside a scheduler slice cannot be reached from) is left alone and
+    /// answers `Ok(0)`: those ports stay open. Nothing is faked or half-closed.
+    ///
+    /// # Errors
+    ///
+    /// A close's own failure (a driver teardown that reported one). The first such failure is
+    /// propagated, after the ports before it have been closed.
+    pub(crate) fn close_ports_of_dead_owners(&mut self, table: &ProcessTable) -> Result<usize> {
+        // The `Rc` is cloned **first** (the same shape `drain_port_monitor_exits` and
+        // `port_monitors` use), so the borrow is of the clone, not of the runtime field.
+        let cell = Rc::clone(&self.ports);
+        let Ok(mut registry) = cell.try_borrow_mut() else {
+            return Ok(0);
+        };
+        let mut numbers: Vec<u64> = registry
+            .meta
+            .iter()
+            .filter(|(_, meta)| !table.contains(meta.owner))
+            .map(|(number, _)| *number)
+            .collect();
+        numbers.sort_unstable();
+        let mut closed = 0usize;
+        for number in numbers {
+            registry.close(PortId::new(number))?;
+            closed += 1;
+        }
+        registry.prune_dead_select(|owner| table.contains(owner))?;
+        Ok(closed)
+    }
 
     /// Drives the port poller for up to `timeout` and **delivers** every message the ports
     /// produced into its owning process's mailbox in `table`, returning how many were

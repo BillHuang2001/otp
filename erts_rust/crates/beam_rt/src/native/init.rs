@@ -341,9 +341,15 @@ impl RuntimeContext<'_> {
     /// atom `ok` is answered, which is exactly what the oracle's caller sees.
     ///
     /// The observable end state is the same — the node is booted again (preloaded set, default
-    /// code path and the loaded boot script re-run) and still answers `init:*`/`code:*`. The
-    /// mechanism differs where this runtime has nothing to tear down; the honest fidelity note
-    /// is on [`Runtime::restart`].
+    /// code path and the loaded boot script re-run) and still answers `init:*`/`code:*`.
+    /// [`Runtime::restart`] performs the oracle's `clear_system` first: every process but the
+    /// calling action and this runtime's own services is terminated with the reason `shutdown`
+    /// (which frees the names the boot script's `{kernelProcess, …}` directives register), and
+    /// the ports and open io-devices those processes owned are released with them; the
+    /// residuals are documented there.
+    ///
+    /// A restart requested from **inside a scheduler slice** — where the pass owns the real
+    /// process table — is the typed `unsupported` capability gap, never a half-restarted node.
     ///
     /// [`Runtime::restart`]: crate::Runtime::restart
     pub(super) fn restart_0(&mut self) -> Result<Eterm> {

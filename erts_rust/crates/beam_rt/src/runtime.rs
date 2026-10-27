@@ -4060,39 +4060,73 @@ impl Runtime {
     /// performed here, reaching the same **observable** end state — the node is booted again
     /// and keeps answering:
     ///
-    /// 1. the code path is reset to its **boot-time default**
+    /// 1. the **system is cleared** ([`Runtime::clear_system`]): every live process of the
+    ///    process table that the running action does not itself need is terminated with the
+    ///    reason `shutdown` (the oracle's `do_stop` reason), which releases every name the
+    ///    torn-down system held — so the `{kernelProcess, …}` directives a re-run boot script
+    ///    issues start onto free names instead of colliding with a survivor;
+    /// 2. the code path is reset to its **boot-time default**
     ///    ([`CodeServer::reset_paths_to_defaults`]): the `-pa`/`-pz` directories the runtime
     ///    was configured with plus the system `ebin` directories, dropping whatever a boot
     ///    script's `{path, …}` directive or a later [`Runtime::add_code_path`] appended;
-    /// 2. the boot sequence is re-run **forcibly** — the `booted` flag is what makes
+    /// 3. the boot sequence is re-run **forcibly** — the `booted` flag is what makes
     ///    [`Runtime::boot`] idempotent, so it is cleared first — re-establishing the whole
     ///    preloaded set;
-    /// 3. the boot script this runtime loaded, if any, is executed again
+    /// 4. the boot script this runtime loaded, if any, is executed again
     ///    ([`Runtime::boot_from_script`]), exactly as the oracle's `do_restart/3` re-runs
     ///    `boot(Start, Flags, Args)` (`init.erl:951-954`).
-    ///
-    /// # Fidelity limit (honest, not hidden)
-    ///
-    /// The oracle's restart first **clears the system** — it takes every application down,
-    /// unloads all code and closes every port (`init.erl:929-962`). This runtime models no
-    /// application-owned process or port to take down, and never unloads a module, so that
-    /// teardown is *approximated* by re-running the boot sequence: the module cache and any
-    /// live boot-spawned process are left in place. What a caller can observe — the node is
-    /// booted again, the code path is back to its default and `init:*`/`code:*` still answer
-    /// — is therefore reproduced, with the documented difference that re-running the real
-    /// `start.boot` re-runs its `{kernelProcess, …}` directives against servers that are
-    /// **already** registered (a re-registration is the process table's `badarg`, which the
-    /// boot drive tolerates; the existing server keeps the name).
     ///
     /// A failure at any step is reported as its typed error — never a silently half-restarted
     /// runtime.
     ///
+    /// # What survives the clear, and why
+    ///
+    /// Terminated (with the reason `shutdown`, so nothing reports: only an `error`-class
+    /// reason is reported, `crate::report`): every live process except the keep-set below —
+    /// in particular the whole `kernel_sup`/`application_controller` tree a boot script
+    /// started.
+    ///
+    /// Kept:
+    ///
+    /// * [`Runtime::self_pid`] — the process whose expression is still running and has to
+    ///   answer `ok`; the oracle kills its caller here and this runtime deliberately does
+    ///   not (a documented divergence: killing it would make a `-eval`/`-s`/`-run` restart
+    ///   unobservable), and [`Runtime::root_pid`] when it differs;
+    /// * the `init` stand-in ([`Runtime::init_pid`]), which holds the name `init`;
+    /// * the native `erl_prim_loader` service (resolved through the process table's name
+    ///   registry — its pid is no `Runtime` field), the native `file_server_2` service and,
+    ///   on a distributed node, the native `net_kernel` service.
+    ///
+    /// That teardown is the whole point of it: the second boot's
+    /// `application_controller:init/2` starts with `register(application_controller, self())`
+    /// (`lib/kernel/src/application_controller.erl:530-531`), so a surviving first one would
+    /// make the new directive process die of a `badarg` it cannot catch.
+    ///
+    /// # Residuals (current state, honest)
+    ///
+    /// * The module cache is not unloaded: a purge/unload of the old code (`code:purge/1` /
+    ///   `code:delete/1` semantics) is not modelled by the code server, and no module is ever
+    ///   removed from it.
+    /// * A port whose owning process was torn down is closed with it
+    ///   ([`Runtime::close_ports_of_dead_owners`]); a port registry that is **borrowed** at
+    ///   that moment (only reachable from an in-flight port BIF) keeps its ports open.
+    /// * An open `file:open/2` device is retired with its process
+    ///   ([`FileServices::retire_dead`](crate::native::file_server::FileServices)), so its
+    ///   `std::fs::File` is dropped and a later request answers `{error, terminated}`.
+    /// * The pid-keyed **probe** maps (`trace`, `group_leaders`, `parents`, `mailboxes`,
+    ///   `timer_resumes`) and the deadline heap keep an entry for a torn-down pid; none can
+    ///   mis-fire on a recycled identity (`ProcessId` carries a serial), and every consumer
+    ///   checks liveness before delivering or resuming.
+    ///
     /// # Errors
     ///
-    /// [`Runtime::boot`]'s errors (an unresolvable system installation, an unparsable
-    /// preloaded `.beam`) and [`Runtime::boot_from_script`]'s (a script that cannot be read,
-    /// parsed or executed).
+    /// The typed `unsupported` capability gap when the process table is **not the live one**
+    /// (the clear runs inside a scheduler slice, where the pass owns the real table — see
+    /// [`Runtime::clear_system`]); [`Runtime::boot`]'s errors (an unresolvable system
+    /// installation, an unparsable preloaded `.beam`) and [`Runtime::boot_from_script`]'s (a
+    /// script that cannot be read, parsed or executed).
     pub fn restart(&mut self) -> Result<()> {
+        self.clear_system()?;
         self.code_server.reset_paths_to_defaults();
         self.booted = false;
         self.boot()?;
@@ -4101,7 +4135,95 @@ impl Runtime {
         }
         Ok(())
     }
-
+    /// Takes the **system** down for [`Runtime::restart`]: terminates every process the
+    /// running action does not need, discharges the obligations those deaths create, and
+    /// releases what they owned (the oracle's `clear_system`, `init.erl:925-962`).
+    ///
+    /// The keep-set is [`Runtime::self_pid`], [`Runtime::root_pid`], the `init` stand-in
+    /// ([`Runtime::init_pid`]) and the native `erl_prim_loader`/`file_server_2`/`net_kernel`
+    /// services; every other live process is terminated with the reason `shutdown` through
+    /// [`ProcessTable::terminate`], which reclaims the slot, **drops its registered names**,
+    /// cascades its links and monitors and notifies the process-exit observer (the ETS owner
+    /// index). A pid a link cascade already took (`TermNotFound`) is skipped; any other
+    /// termination failure is propagated.
+    ///
+    /// The consequence drains of a scheduler round then run, because a death outside a pass
+    /// has nobody else to discharge them:
+    /// [`Runtime::drain_ets_owner_exits`] (owner-death ETS reclamation — a recorded **heir**
+    /// that the same teardown made dead is skipped by that drain, so no transfer message is
+    /// delivered into a terminated process and the gift is dropped with the system),
+    /// [`Runtime::drain_port_monitor_exits`] and [`Runtime::drain_driver_monitor_exits`].
+    /// The run queue those drains may resume into is a **throw-away**
+    /// [`Scheduler`](beam_process::Scheduler): the only runnable processes left are the kept
+    /// ones, which the caller drives itself.
+    ///
+    /// The process table is taken out of the runtime for the duration
+    /// ([`Runtime::take_processes`]) — the same seam a scheduler pass uses, because the drains
+    /// take `&mut self` **and** `&mut ProcessTable` — and is put back on every path.
+    ///
+    /// # The table must be the live one
+    ///
+    /// Inside a scheduler slice the runtime's own table is an empty placeholder (the pass owns
+    /// the real one), so a teardown would be a silent no-op while the pass's table was dropped
+    /// afterwards. That is answered as a typed capability gap — the honest refusal — instead of
+    /// a half-restart.
+    ///
+    /// # Errors
+    ///
+    /// The typed `unsupported` capability gap described above, a termination failure the link
+    /// cascade did not explain, and the drains' own errors (a heap exhaustion building a
+    /// transfer message, a port monitor that vanished between `contains` and `demonitor`).
+    pub(crate) fn clear_system(&mut self) -> Result<()> {
+        // The cheap, honest test that the table this runtime holds is the live one: the running
+        // process is always live in it, and the pass's placeholder holds nobody.
+        if !self.processes.contains(self.self_pid) {
+            return Err(error::unsupported("init:restart/0 inside a scheduled slice"));
+        }
+        let mut table = self.take_processes();
+        let result = self.clear_system_in(&mut table);
+        self.put_processes(table);
+        result
+    }
+    /// [`Runtime::clear_system`]'s body, over the **taken-out** process table.
+    fn clear_system_in(&mut self, table: &mut ProcessTable) -> Result<()> {
+        // The oracle's `do_stop` reason. An `error`-class reason is what the crash reporter
+        // reports, so `shutdown` keeps a teardown silent (`crate::report`).
+        let reason = self.intern("shutdown");
+        let mut keep: FastHashSet<ProcessId> = FastHashSet::default();
+        keep.insert(self.self_pid);
+        keep.insert(self.root_pid);
+        keep.insert(self.init_pid);
+        // The native services: the loader stand-in is looked up by **name** (its pid is not a
+        // `Runtime` field), the other two are the services' own recorded pids.
+        if let Some(name) = self.code_server.atoms().lookup("erl_prim_loader") {
+            keep.extend(table.whereis(name));
+        }
+        keep.insert(self.file_services.server());
+        if let Some(service) = self.net_kernel.as_ref() {
+            keep.insert(service.server());
+        }
+        let dead: Vec<ProcessId> = table.pids().filter(|pid| !keep.contains(pid)).collect();
+        for pid in dead {
+            // A pid the cascade of an earlier termination already took is not an error.
+            if !table.contains(pid) {
+                continue;
+            }
+            match table.terminate(pid, reason) {
+                Ok(()) | Err(BeamError::TermNotFound) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        // The death obligations, at the one point where the ETS/port registries are free.
+        let mut scheduler = Scheduler::new();
+        self.drain_ets_owner_exits(table, &mut scheduler)?;
+        self.drain_port_monitor_exits()?;
+        self.drain_driver_monitor_exits(table)?;
+        // What the dead processes owned goes with them: the ports (their OS descriptors and the
+        // `inet_gethost` helper a booted kernel keeps open) and the io-devices' open files.
+        self.close_ports_of_dead_owners(table)?;
+        self.file_services.retire_dead(table);
+        Ok(())
+    }
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
     /// `args` and returns `x(0)`.
     ///

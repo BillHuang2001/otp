@@ -1797,13 +1797,13 @@ impl Runtime {
     /// The placeholder is an equivalent **empty** table sharing the runtime's atom table
     /// (so its signal atoms are the runtime's); it is only ever observed by a runtime-side
     /// accessor during the pass, never by the running code, which sees the real table.
-    fn take_processes(&mut self) -> ProcessTable {
+    pub(crate) fn take_processes(&mut self) -> ProcessTable {
         let placeholder = ProcessTable::new(SignalAtoms::from_table(self.code_server.atoms_mut()));
         std::mem::replace(&mut self.processes, placeholder)
     }
 
     /// Puts back the process table taken by [`Runtime::take_processes`].
-    fn put_processes(&mut self, table: ProcessTable) {
+    pub(crate) fn put_processes(&mut self, table: ProcessTable) {
         self.processes = table;
     }
 

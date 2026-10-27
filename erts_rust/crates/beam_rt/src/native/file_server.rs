@@ -305,6 +305,25 @@ impl FileServices {
     pub(crate) fn is_retired_device(&self, service: ProcessId) -> bool {
         self.retired.contains(&service)
     }
+    /// Retires every io-device whose process `table` no longer holds — the **io-device half** of
+    /// a system teardown ([`Runtime::clear_system`](crate::runtime::Runtime)).
+    ///
+    /// A device's process is not a runtime service, so `init:restart/0` terminates it with the
+    /// rest of the system; retiring here drops its open `std::fs::File` exactly as the device
+    /// process dying closes its descriptor, and records the pid in [`FileServices::retired`] so a
+    /// request that still reaches it answers the oracle's `{error, terminated}` rather than
+    /// reading a descriptor no process owns any more.
+    pub(crate) fn retire_dead(&mut self, table: &ProcessTable) {
+        let dead: Vec<ProcessId> = self
+            .devices
+            .keys()
+            .filter(|service| !table.contains(**service))
+            .copied()
+            .collect();
+        for service in dead {
+            self.retire(service);
+        }
+    }
     fn retire(&mut self, service: ProcessId) {
         self.devices.remove(&service);
         self.retired.insert(service);
