@@ -318,6 +318,12 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `mapped_bytes` stay flat while `cache_hits` (= `AllocStats::mseg.reused`) climbs. The address can
   only change on cache eviction (FIFO when full), or when `take_cached` picks a different smallest
   fitting cached segment (a bad fit is tail-trimmed, keeping the base).
+### Where a `bs_init_writable` accumulator payload lands (the `foreign`-kernel shape)
+- `bs_init_writable` asks for `RefcBinary::with_capacity(capacity)` with `capacity` = the compiler's hint: **256 bytes** when the comprehension's output size is not statically known (`lib/compiler/src/beam_ssa_bc_size.erl:36` "the default size of 256 bytes", the literal at `:579`; the C reads `x(0)` as bytes, `../../erts/emulator/beam/erl_bits.c:2023-2035`). The `beam_engine/src/bench/` docs' "256 bits = 32 bytes" is wrong by 8×.
+- A 256 B capacity reserves `reservation_for(256) = 1024` B (`binary.rs:145`), so the request is `HEADER_SIZE(32) + 1024 = 1056` B at `MIN_ALIGN` 16 — **32 B above `large_threshold` (1024)**, hence `alloc_mid`, not the slab ladder: a 1072 B MBC block (`mbc.rs::want_block_size`) carved from a shared 1 MiB carrier, 978 payloads per carrier.
+- So the accumulator pays the pooled-carrier good-fit scan (`state.rs::take_mbc_fit`, **oldest-first**) plus a boundary-tag split instead of one slab pop, and a fresh carrier's first-touch faults land on `MbcCarrier::alloc`'s header store (inlined into `alloc_impl`). A ladder whose top reaches 2048, or a smaller reservation factor for tiny capacities, puts the same request on the slab path. Everything else on this path is O(1): one mutex, one `LazyLock` type id, one `Arc` clone, `note_alloc_typed`.
+- The request count is **one per output binary, not per append**: the append loop writes into the reservation (`beam_engine`'s `raw::InPlace`), so a 30 B result out of a 256 B capacity makes 0 grows and 0 moves; `compact()`/high-water trimming is never called for an accumulator.
+
 ### When a free actually unmaps (pointer-invalidation map)
 `Heap::drop` (heap.rs:242) never unmaps anything itself — it only calls `AllocRef::dealloc` →
 `CarrierAllocator::dealloc_impl` (allocator/core.rs:484), whose routing decides everything below.
