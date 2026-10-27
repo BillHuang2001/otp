@@ -69,6 +69,9 @@ references and on-heap bin refs use an opaque raw-word fallback (not stable acro
 ## Test Strategy
 `../../tests/record_ref_hash.rs` pins offline `(make_hash2, make_hash, definition_hash)` triples for a native
 record and the reference shapes, plus a real `-record` fixture cross-check.
+The reference half asserts structure only — both ports `Ok`, stable for one term, distinct per mint, not the
+identity of the integer spelling of the id, external refs (incl. a zero-id one) hashing from their wire
+words, and a C-layout block answering the typed `BadRef` — because reference numbering is per-VM.
 `mod.rs`'s in-module suites pin the structural hash's `eq ⇒ equal hash` invariant and carry the
 oracle-derived vectors; `../../tests/map_hash.rs` and `../../tests/oracle.rs` cross-check the map/bignum
 shapes against a live `erl` (skip loudly when absent).
