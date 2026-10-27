@@ -706,7 +706,7 @@ fn enter_compiled_cached(
     }
     // Publish the function's block-entry tables so a **return** inside it can resolve its
     // own continuation and jump there instead of leaving the block for the driver
-    // (`runtime::EntryTables`, `runtime::resume_in_block`). Published on exactly the
+    // (`runtime::EntryTables`, `runtime::enter_in_block`). Published on exactly the
     // iterations that enter native code, so it always names the function whose blocks may
     // be executing; the driver clears it on the iterations that take an interpreter step
     // instead.

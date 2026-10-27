@@ -453,7 +453,7 @@ impl CompiledModule {
     /// function it belongs to.
     ///
     /// This is what an in-block **cross-function** return resolves through
-    /// ([`super::runtime::resume_in_block`]): a call into another function of the same
+    /// ([`super::runtime::cross_function_enter`]): a call into another function of the same
     /// module returns into the *caller's* function, whose blocks may live in a different
     /// executable mapping of this artifact, and the fixed jump is a legal tail transfer
     /// because the module (code *and* label map and literal area) is the one the block is

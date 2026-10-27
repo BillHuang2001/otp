@@ -269,12 +269,13 @@ pub(crate) struct JitRuntime<'a> {
     /// which tail-jumps to it (leaving the block's native frame first, so the target's own
     /// prologue rebuilds one) instead of returning a word for the driver to decode. The
     /// skipped driver iteration's work is performed by the helper *before* the transfer —
-    /// see [`resume_in_block`] — so the resumed block is entered exactly as a
+    /// see [`commit_in_block_entry`] — so the resumed block is entered exactly as a
     /// driver-entered one. Read by generated code at [`RUNTIME_RESUME_DISP`]; always null
     /// for every other helper.
     pub(crate) resume_entry: *const u8,
     /// The block-entry tables of the function the driver last entered natively
-    /// ([`EntryTables`]) — what [`resume_in_block`] resolves a continuation through first.
+    /// ([`EntryTables`]) — what [`enter_in_block`] resolves a continuation through first, on
+    /// the same-function fast path that needs no artifact lookup at all.
     ///
     /// Published by the driver at every driver-loop iteration in which it enters native
     /// code, and set to [`EntryTables::NONE`] at every iteration that takes an interpreter
@@ -282,7 +283,7 @@ pub(crate) struct JitRuntime<'a> {
     /// and written **only by Rust**.
     pub(crate) tables: EntryTables,
     /// The compiled artifact whose code is currently executing, or null when no native code
-    /// is running — what [`resume_in_block`] resolves a **cross-function** continuation
+    /// is running — what [`cross_function_enter`] resolves a **cross-function** continuation
     /// through (see [`CompiledModule::native_entry_tables`]).
     ///
     /// The driver owns the artifact for the whole slice (the caller-owned one in module
@@ -2016,6 +2017,13 @@ pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, dea
 /// the run's entry module, so `func`/`pc` and that module name every live frame, while
 /// a raise inside a cross-module callee is left bare for the driver, which knows the
 /// true entry module.
+///
+/// Out of line and `#[cold]`: it is the failure path of the frame-discipline and
+/// heap/frame-admission helpers, and inlining it into them (which is where `objdump` used
+/// to find it) charged every one of those hot helpers, and every block that calls one, for
+/// a body only a raising run reaches.
+#[cold]
+#[inline(never)]
 fn report_frame_error(
     runtime: &mut JitRuntime<'_>,
     func: u32,
@@ -2060,7 +2068,7 @@ fn report_frame_error(
 /// the arm keeps today's return-to-driver path for a `Halt`, a cross-context continuation,
 /// an artifact that holds no code for the address and every declined bound.
 ///
-/// There are two servable shapes, both resolved by [`resume_in_block`]:
+/// There are two servable shapes, one arm each in [`enter_in_block`]:
 ///
 /// * the **same function** the driver last entered — the shape **every** non-tail call
 ///   returns in when the callee is that same function, since the stored continuation is the
@@ -2107,7 +2115,7 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
 ///
 /// * a **resolved** entry is stored in [`JitRuntime::resume_entry`] and the target's
 ///   `(func, pc)` word is returned — the arm tail-jumps to the entry;
-/// * a **decline** ([`resume_in_block`]'s `Ok(None)`: no published artifact, an address no
+/// * a **decline** ([`cross_function_enter`]'s no-hit: no published artifact, an address no
 ///   block covers, a missing function, a failed lazy compile, an unsatisfied register-file
 ///   bound) returns the same word with `resume_entry` still null — the arm leaves the word
 ///   for the driver, which decodes it exactly as it did before the transfer existed;
@@ -2115,76 +2123,64 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
 ///   returns [`ERROR`] — with **no** uncaught-raise funnel, exactly as the driver loop
 ///   head's own `ctx.reduce(1)?` applies none on that path.
 ///
+/// # The hot/cold split
+///
+/// The **same-function** transfer is the hot shape — a call's own `pc + 1` returns in the
+/// function that made it — and the published tables ([`EntryTables`]) answer it with two
+/// `Vec` indexings and no artifact lookup, no table re-publication and no bound re-check.
+/// That arm is `#[inline]` and shares [`commit_in_block_entry`] with the cold one, so an
+/// emitted `return`/`call` arm gets the whole same-function path merged into its own body.
+/// Everything the artifact is needed for — a **different** function of the same artifact,
+/// which a call into another function returns into — is the `#[cold]`
+/// [`cross_function_enter`], kept out of line because it is not the shape a hot loop takes.
+///
 /// The position the transfer publishes is the target's entry — the address a driver
 /// iteration would have published — so a `ctx.reduce` refusal parks the machine exactly
 /// where a driver-side refusal parks it and the resumed slice executes each instruction
 /// exactly once.
+#[inline]
 pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     runtime.resume_entry = std::ptr::null();
     let word = encode_target(func, pc);
-    match resume_in_block(runtime, func, pc) {
-        Ok(Some(entry)) => {
-            runtime.resume_entry = entry;
-            word
-        }
-        Ok(None) => word,
-        Err(err) => {
-            runtime.error = Some(err);
-            ERROR
-        }
+    match runtime.tables.entry(func, pc) {
+        // The same-function shape: the published tables already describe this function, so
+        // there is nothing to re-publish and no artifact to ask.
+        Some(entry) => match commit_in_block_entry(runtime, func, pc) {
+            Ok(()) => {
+                runtime.resume_entry = entry;
+                word
+            }
+            Err(err) => {
+                runtime.error = Some(err);
+                ERROR
+            }
+        },
+        None => cross_function_enter(runtime, func, pc, word),
     }
 }
 
-/// Resolve a return's continuation to a **block entry of this artifact** and perform the
-/// driver work the in-block transfer replaces — or answer `None` and leave everything to
-/// the driver.
+/// Perform the driver iteration the in-block transfer replaces — the step both halves of
+/// [`enter_in_block`] share, in the driver loop head's own order:
 ///
-/// This is the one place the tier skips a driver round-trip, so it reproduces the skipped
-/// iteration's work exactly, in the driver loop head's own order:
-///
-/// 1. the target entry is resolved — from the published tables when they already name the
-///    target function ([`EntryTables`]), else from the artifact
-///    ([`cross_function_entry`]). The answer declines unless the address names a block
-///    (real block start first, then continuation sub-block) of **this artifact's** code —
-///    the resolution is [`CompiledModule::native_entry_tables`], the same precedence
-///    [`CompiledModule::entry`] gives the driver — and, for a function other than the one
-///    the tables describe, unless the machine's register file satisfies that function's
-///    bound;
-/// 2. `Machine::set_current_code(func, pc)` — the address the driver would have published,
+/// 1. `Machine::set_current_code(func, pc)` — the address the driver would have published,
 ///    stored **before** the charge, so a refusal parks the machine exactly where a
 ///    driver-side refusal would have (the block about to run is untouched);
-/// 3. `Machine::reductions` bumped by one, the engine-side slice counter the driver bumps
-///    in the same step as the hook;
-/// 4. `ExecutionContext::reduce(1)` when the run latched [`Machine::reduce_on`] — the
+/// 2. `Machine::reductions` bumped by one, the engine-side slice counter the driver bumps in
+///    the same step as the hook;
+/// 3. `ExecutionContext::reduce(1)` when the run latched [`Machine::reduce_on`] — the
 ///    per-block-entry pre-emption charge. A refusal is returned **unchanged** and the
-///    transfer is not taken;
-/// 5. for a **cross-function** transfer, the target function's block-entry tables replace
-///    the published ones, so a nested return inside the new function resolves through them
-///    instead of falling back to the driver.
-///
-/// The register-file bound is not re-checked for the **same-function** shape, and that is
-/// sound by construction: the bound is a property of the **function**, checked when the
-/// driver entered it, and this transfer stays inside it — for a lazy artifact that is the
-/// entered function's own highest natively-touched register, which covers every one of its
-/// blocks, and for an eager artifact it is the whole-module maximum. `machine.x` never
-/// shrinks during a run, so a bound that held then still holds now. A **different**
-/// function's bound is a different number, so [`cross_function_entry`] checks it.
+///    transfer is not taken.
 ///
 /// The block has already spilled its cached x-registers into `machine.x` before calling the
 /// helper ([`super::emit::emit_helper_call`]'s pre-call spill), so a `reduce` that inspects
 /// the machine sees the interpreter's exact root set — the same state the driver's own
 /// charge runs in.
-///
-/// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
-/// [`CompiledModule::entry`]: super::code::CompiledModule::entry
-fn resume_in_block(
+#[inline]
+fn commit_in_block_entry(
     runtime: &mut JitRuntime<'_>,
     func: u32,
     pc: u32,
-) -> std::result::Result<Option<*const u8>, BeamError> {
-    let Some((entry, tables)) = resolve_resume_entry(runtime, func, pc) else {
-        return Ok(None);
-    };
+) -> std::result::Result<(), BeamError> {
     // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`; no
     // other `&mut Machine` exists while the helper runs (the driver is blocked in the block
     // call that reached us).
@@ -2200,12 +2196,46 @@ fn resume_in_block(
         let ctx = unsafe { &mut *runtime.ctx };
         ctx.reduce(1)?;
     }
-    if let Some(tables) = tables {
-        // The transfer is taken: the function whose blocks are about to run is the one the
-        // tables describe from here on.
-        runtime.tables = tables;
+    Ok(())
+}
+
+/// The **cold** half of [`enter_in_block`]: resolve an entry the published tables do not
+/// describe — an address in **another function of the same artifact** — and commit it.
+///
+/// Kept out of line (`#[cold]`, `#[inline(never)]`) because it is not the shape a hot loop
+/// takes: a `call`'s own continuation returns in the calling function, which the published
+/// tables already describe, and every other shape either declines here or never returns.
+///
+/// It declines — answering the unchanged target `word` with `resume_entry` still null, no
+/// artifact publication and nothing committed — on exactly the shapes the driver's fallback
+/// must keep; see [`cross_function_entry`] for the list and for why the register-file bound
+/// is checked here but not for the same-function shape.
+///
+/// On a hit the target function's block-entry tables replace the published ones **after** the
+/// commit, so a nested return inside the new function resolves through them instead of
+/// falling back to the driver, and [`JitRuntime::resume_entry`] carries the entry the emitted
+/// arm tail-jumps to.
+#[cold]
+#[inline(never)]
+fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: i64) -> i64 {
+    let Some((entry, tables)) = cross_function_entry(runtime, func, pc) else {
+        return word;
+    };
+    match commit_in_block_entry(runtime, func, pc) {
+        Ok(()) => {
+            if let Some(tables) = tables {
+                // The transfer is taken: the function whose blocks are about to run is the
+                // one the tables describe from here on.
+                runtime.tables = tables;
+            }
+            runtime.resume_entry = entry;
+            word
+        }
+        Err(err) => {
+            runtime.error = Some(err);
+            ERROR
+        }
     }
-    Ok(Some(entry))
 }
 
 /// Resolve `(func, pc)` to a native entry plus, when the target is a function the published
@@ -2221,6 +2251,14 @@ fn resume_in_block(
 /// published (an interpreter step's iteration), an address the artifact compiled no block
 /// for, an address in a function this module does not have, and a function whose
 /// register-file bound the machine does not satisfy.
+///
+/// The register-file bound is not re-checked for the **same-function** shape
+/// ([`enter_in_block`]), and that is sound by construction: the bound is a property of the
+/// **function**, checked when the driver entered it, and such a transfer stays inside it —
+/// for a lazy artifact that is the entered function's own highest natively-touched register,
+/// which covers every one of its blocks, and for an eager artifact it is the whole-module
+/// maximum. `machine.x` never shrinks during a run, so a bound that held then still holds
+/// now. A **different** function's bound is a different number, so it is checked here.
 fn cross_function_entry(
     runtime: &JitRuntime<'_>,
     func: u32,
@@ -2288,19 +2326,6 @@ fn note_native_write_extent(runtime: &JitRuntime<'_>, artifact: &CompiledModule)
     machine.note_x_dirty(extent);
 }
 
-/// [`cross_function_entry`] behind the published-tables fast path: the same-function shape
-/// answers without touching the artifact, and no tables need re-publishing (they already
-/// describe that function).
-fn resolve_resume_entry(
-    runtime: &JitRuntime<'_>,
-    func: u32,
-    pc: u32,
-) -> Option<(*const u8, Option<EntryTables>)> {
-    match runtime.tables.entry(func, pc) {
-        Some(entry) => Some((entry, None)),
-        None => cross_function_entry(runtime, func, pc),
-    }
-}
 /// The **`deallocate`** helper: pop the current frame with the interpreter's exact
 /// `Instr::Deallocate` semantics and hand the block the address to continue at.
 ///
