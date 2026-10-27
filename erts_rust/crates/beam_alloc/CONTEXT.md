@@ -157,6 +157,15 @@ byte delta the live block moved by); `reset`; `alloc_words`/`alloc_tuple`/`cons`
 `committed_words`, `capacity`, `used`, `available`, `peak_used`, `allocator`. Plus
 `pub enum GrowOutcome { GrewInPlace, MoveRequired }`. Re-exported at the crate root and in the prelude.
 
+**Adoption — no per-process `ReservedHeap` exists today.** The only constructing host is the engine's
+pointer-stable term arena (`beam_engine`'s `ContextHeap`, `src/context.rs:1509`, `fresh_region` at
+`:1781-1791`, plus the survivor region at `src/context/reclaim.rs:315`), which backs the
+`-eval`/table-less route, not a process heap; `beam_process` and `beam_gc` never construct one, and
+`beam_rt`'s mention (`src/runtime/retention.rs:27`) is a description of that arena. A fresh process's
+heap is instead a fixed-capacity [`Heap`] inside `beam_gc`'s `HeapSpace` (`beam_gc/src/space.rs:58-61`),
+so growth is by GC replacement (`beam_gc/src/nursery.rs:191-192`). Grep `ReservedHeap` before claiming
+otherwise.
+
 **Host-adoption contract (the point of the type):**
 1. On an `AllocKind::Heap` exhaustion the host calls `try_grow(n)` and retries. `GrewInPlace` ⇒ the
    committed limit was raised (to exactly `used + n`), the bump pointer did **not** move — a cached
@@ -356,6 +365,12 @@ and `RefcBinary`'s moving grow (binary/growth.rs:426).
   (`alloc_calls`/`free_calls` cumulative, `live_bytes`, `peak_live_bytes`, `carriers`, `carrier_bytes`)
   plus `AllocStats::mseg` (`cached`, `reused`, `unmaps`, `calls.create/destroy`, `mapped_bytes`).
   Both `MsegStats` and `stats.carriers` are process-global across allocator instances.
+- The instance such a heap draws from is always `default_allocator()` = `AllocatorId::Standard`
+  (`std_alloc`) — `heap.rs:59-61`, `reserved_heap.rs:151-153`, `beam_gc/src/collector.rs:84-96` — never
+  `eheap_alloc`; the `EHEAP`/`HEAP`/`OLD_HEAP`/`MSG` rows (`types.rs:419-426`) are inventory only.
+- With the default policy a fresh process's **two** spaces are 233 words each (1864 B:
+  `beam_gc/src/policy.rs:341-342`), so both land in the mid band — two blocks carved from one shared
+  1 MiB MBC carrier, the first of which maps that carrier (`alloc_mid` → `mbc_size` 1 MiB).
 
 ### Residency (RSS) at allocation time — allocating never touches the payload
 Memory comes from `mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS)` (`src/mseg/mapping.rs:72-91`),
