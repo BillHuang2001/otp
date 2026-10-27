@@ -118,26 +118,35 @@ fn dispatch(command: Command) -> Result<i32> {
         Command::Suite {
             strict,
             allowlist,
+            drift_allowlist,
             gaps,
             json,
             out,
         } => {
-            // Load the allowlist FIRST: a missing/unreadable file is a fast usage/env exit 2
-            // with no corpus run.
+            // Load both allowlists FIRST: a missing/unreadable file is a fast usage/env exit 2
+            // with no corpus run. The drift allowlist uses the identical 3-token file format.
             let list = match &allowlist {
                 Some(path) => Some(Allowlist::load(path)?),
                 None => None,
             };
+            let drift = match &drift_allowlist {
+                Some(path) => Some(Allowlist::load(path)?),
+                None => None,
+            };
             let suite = harness::run_suite(strict)?;
-            let report = match &list {
-                Some(list) => ratchet::report_from_suite(&suite, list),
-                None => RunReport::from_suite(&suite),
+            let report = if list.is_none() && drift.is_none() {
+                RunReport::from_suite(&suite)
+            } else {
+                // Either allowlist makes the run a ratcheted one; a missing gaps allowlist is an
+                // empty one, so every real gap still shows up as unauthorized.
+                let empty = Allowlist::empty();
+                ratchet::report_from_suite(&suite, list.as_ref().unwrap_or(&empty), drift.as_ref())
             };
             emit_report(&report, json, out, None)?;
             if let Some(gaps_path) = &gaps {
                 let empty = Allowlist::empty();
                 let list = list.as_ref().unwrap_or(&empty);
-                ratchet::write_gaps(gaps_path, &report, list)?;
+                ratchet::write_gaps(gaps_path, &report, list, drift.as_ref())?;
                 eprintln!("differential: wrote {}", gaps_path.display());
             }
             Ok(ratchet::suite_exit_code(&report, strict))
@@ -145,26 +154,31 @@ fn dispatch(command: Command) -> Result<i32> {
         Command::Merge {
             from,
             allowlist,
+            drift_allowlist,
             gaps,
             json,
             out,
             out_file,
         } => {
             // Fold the per-case `run --out-file` reports into ONE suite-shaped report, then
-            // classify the gaps and (optionally) regenerate `GAPS.md` with the SAME renderer
-            // `suite --gaps` uses, so the generated document is identical. This never runs a
-            // case, so it is the cheap route to regenerate the document.
+            // classify the gaps and the host-oracle drift and (optionally) regenerate `GAPS.md`
+            // with the SAME renderer `suite --gaps` uses, so the generated document is
+            // identical. This never runs a case, so it is the cheap route to regenerate it.
             let reports = read_reports(&from)?;
             let list = match &allowlist {
                 Some(path) => Some(Allowlist::load(path)?),
                 None => None,
             };
-            let report = RunReport::merge(reports, list.as_ref())?;
+            let drift = match &drift_allowlist {
+                Some(path) => Some(Allowlist::load(path)?),
+                None => None,
+            };
+            let report = RunReport::merge(reports, list.as_ref(), drift.as_ref())?;
             emit_report(&report, json, out, out_file)?;
             if let Some(gaps_path) = &gaps {
                 let empty = Allowlist::empty();
                 let list = list.as_ref().unwrap_or(&empty);
-                ratchet::write_gaps(gaps_path, &report, list)?;
+                ratchet::write_gaps(gaps_path, &report, list, drift.as_ref())?;
                 eprintln!("differential: wrote {}", gaps_path.display());
             }
             Ok(ratchet::suite_exit_code(&report, true))
@@ -352,6 +366,7 @@ mod tests {
         Command::Suite {
             strict: false,
             allowlist: None,
+            drift_allowlist: None,
             gaps: None,
             json: false,
             out: None,
@@ -363,6 +378,7 @@ mod tests {
         Command::Merge {
             from: std::path::PathBuf::from("reports"),
             allowlist: None,
+            drift_allowlist: None,
             gaps: None,
             json: false,
             out: None,

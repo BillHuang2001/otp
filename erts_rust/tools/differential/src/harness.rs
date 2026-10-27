@@ -63,8 +63,11 @@
 //!   ([`caught_unsupported_reason`]) is deliberately narrow — only the runtime's documented
 //!   `unsupported` reason convention can trigger it — so a genuine Erlang reason (`badarg`,
 //!   `system_limit`, `'erlang:open_port/2 is not a BIF'`, …) stays an observation.
-//! * A case whose *oracle* disagrees with its own golden is **corpus drift** and is a
-//!   mismatch even when no Rust runtime exists — the corpus is self-testing.
+//! * A case whose *oracle* disagrees with its own golden is host-oracle **drift**: when our side
+//!   reproduces that same golden and the two sides' observables differ, the case is
+//!   [`Verdict::OracleDrift`] — a property of the installed oracle release, ratcheted by the
+//!   drift allowlist and never a divergence of our runtime. When our side did not run (or did not
+//!   reproduce the golden) the case is `unsupported` / a mismatch respectively.
 //!
 //! [`UNSUPPORTED_EXIT_CODE`]: crate::runtime::UNSUPPORTED_EXIT_CODE
 
@@ -111,8 +114,15 @@ pub struct CaseOutcome {
     pub oracle: SideResult,
     /// The Rust side.
     pub rust: SideResult,
-    /// The oracle's check against the case golden (not asserted for ad-hoc comparisons).
+    /// The oracle's check against the case golden (not asserted for ad-hoc comparisons, and for
+    /// a case that was skipped before it could run).
     pub golden: GoldenCheck,
+    /// Our side's check against the **same** case golden — the second input the verdict rule
+    /// needs to tell a host-oracle drift apart from a divergence of our runtime.
+    ///
+    /// [`GoldenCheck::not_asserted`] when no golden was asserted or our side did not run (an
+    /// unobserved side is classified by [`SideResult::Unsupported`], never by this check).
+    pub rust_golden: GoldenCheck,
     /// Whether a golden was actually checked (`false` for [`compare_expr`], and for a case
     /// that was skipped before it could run).
     pub golden_asserted: bool,
@@ -128,6 +138,9 @@ pub struct CaseOutcome {
 
 impl CaseOutcome {
     /// The process exit code this single outcome implies (`--strict` is a suite concept).
+    ///
+    /// An [`Verdict::OracleDrift`] is treated exactly like a capability gap: non-fatal here, and
+    /// escalated only by the suite's `--strict` rule ([`Verdict::exit_contribution`]).
     pub fn exit_code(&self) -> i32 {
         self.verdict.exit_contribution(false)
     }
@@ -143,7 +156,7 @@ pub struct SuiteOutcome {
     /// Whether `--strict` was requested.
     pub strict: bool,
     /// The process exit code: `1` on any mismatch (or, under `--strict`, any
-    /// unsupported/skipped case); `0` otherwise.
+    /// unsupported/skipped/oracle-drift case); `0` otherwise.
     pub exit_code: i32,
 }
 
@@ -328,7 +341,19 @@ fn execute(
         }
         _ => Vec::new(),
     };
-    let derived_verdict = verdict_with(&oracle, &rust, &golden_check, plan.observables);
+    // Our side's own check against the same golden — the second input of the verdict rule. A
+    // side that did not run is never checked (it is `Unsupported`, not a golden miss).
+    let rust_golden_check = match (&plan.golden, rust.observation()) {
+        (Some(golden), Some(observation)) => check_golden(observation, golden),
+        _ => GoldenCheck::not_asserted(),
+    };
+    let derived_verdict = verdict_with(
+        &oracle,
+        &rust,
+        &golden_check,
+        &rust_golden_check,
+        plan.observables,
+    );
 
     Ok(CaseOutcome {
         case_id: plan.case_id,
@@ -340,6 +365,7 @@ fn execute(
         oracle,
         rust,
         golden: golden_check,
+        rust_golden: rust_golden_check,
         golden_asserted: plan.golden.is_some(),
         verdict: derived_verdict,
         diffs,
@@ -625,6 +651,7 @@ fn skipped_plan_outcome(context: &RuntimeContext, plan: &RunPlan, reason: &str) 
         oracle: side.clone(),
         rust: side,
         golden: GoldenCheck::not_asserted(),
+        rust_golden: GoldenCheck::not_asserted(),
         golden_asserted: false,
         verdict: Verdict::Skipped,
         diffs: Vec::new(),

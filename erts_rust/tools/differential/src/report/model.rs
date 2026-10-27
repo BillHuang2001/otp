@@ -144,12 +144,17 @@ impl RunReport {
     /// (they are identical across one sweep), dedupes the cases by `case_id` (first
     /// occurrence wins, so re-running a case is harmless) and orders them by `case_id` so
     /// the merged document is deterministic regardless of file order. The summary and the
-    /// per-contract rollup are recomputed from the merged cases, and — when an allowlist is
-    /// given — the ratchet is classified exactly as the `suite` gate does, so the generated
-    /// `GAPS.md` is identical to the one the serial gate would have written.
+    /// per-contract rollup are recomputed from the merged cases, and — when either allowlist is
+    /// given — the ratchet is classified exactly as the `suite` gate does (the gaps against
+    /// `allowlist`, the host-oracle drift against `drift_allowlist`), so the generated `GAPS.md`
+    /// is identical to the one the serial gate would have written.
     ///
     /// An empty input is a loud [`Error::Usage`] (there is nothing to merge).
-    pub fn merge(reports: Vec<RunReport>, allowlist: Option<&Allowlist>) -> Result<RunReport> {
+    pub fn merge(
+        reports: Vec<RunReport>,
+        allowlist: Option<&Allowlist>,
+        drift_allowlist: Option<&Allowlist>,
+    ) -> Result<RunReport> {
         let mut oracle = None;
         let mut rust = None;
         let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -170,7 +175,16 @@ impl RunReport {
         let oracle = oracle.ok_or_else(|| Error::usage("merge: no report to fold"))?;
         let rust = rust.ok_or_else(|| Error::usage("merge: no report to fold"))?;
         cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
-        let ratchet = allowlist.map(|list| RatchetReport::classify(&cases, list));
+        let ratchet = if allowlist.is_some() || drift_allowlist.is_some() {
+            let empty = Allowlist::empty();
+            Some(RatchetReport::classify(
+                &cases,
+                allowlist.unwrap_or(&empty),
+                drift_allowlist,
+            ))
+        } else {
+            None
+        };
         Ok(RunReport {
             schema: SCHEMA,
             mode: "merge",
@@ -223,12 +237,20 @@ pub struct Summary {
     pub total: usize,
     /// Cases where both sides agreed.
     pub agree: usize,
-    /// Cases where the sides (or the oracle and its golden) disagreed.
+    /// Cases where our side failed the golden, or the two sides' observables differed without our
+    /// side proving the golden is still reproducible.
     pub mismatch: usize,
     /// Cases where a side could not be observed.
     pub unsupported: usize,
     /// Cases that were intentionally not executed.
     pub skipped: usize,
+    /// Cases where our side reproduced the committed golden, the oracle did not, and the two
+    /// sides' observables differ — a host-oracle release difference, never a divergence.
+    ///
+    /// The field is additive with a default, so a report written before it existed still parses
+    /// (the schema id stays [`SCHEMA`]).
+    #[serde(default)]
+    pub oracle_drift: usize,
 }
 
 impl Summary {
@@ -240,6 +262,7 @@ impl Summary {
             mismatch: 0,
             unsupported: 0,
             skipped: 0,
+            oracle_drift: 0,
         }
     }
 
@@ -248,6 +271,7 @@ impl Summary {
         self.total += 1;
         match verdict {
             Verdict::Agree => self.agree += 1,
+            Verdict::OracleDrift => self.oracle_drift += 1,
             Verdict::Mismatch => self.mismatch += 1,
             Verdict::Unsupported => self.unsupported += 1,
             Verdict::Skipped => self.skipped += 1,
@@ -306,9 +330,20 @@ pub struct CaseReport {
 
 impl CaseReport {
     /// Project a [`CaseOutcome`] onto the report schema.
+    ///
+    /// Both sides carry their own golden check: the oracle's and ours, against the same case
+    /// golden. Either is omitted (`null`) when no golden was asserted — an ad-hoc `compare`
+    /// asserts none — and a side that did not run never carries one.
     pub fn from_outcome(outcome: &CaseOutcome) -> CaseReport {
         let matched_golden = if outcome.golden_asserted {
             Some(outcome.golden.matched)
+        } else {
+            None
+        };
+        // Only an **observed** side can have checked a golden: a side that did not run carries
+        // `GoldenCheck::not_asserted()`, whose `matched` must never be published as agreement.
+        let rust_matched_golden = if outcome.golden_asserted && outcome.rust.is_observed() {
+            Some(outcome.rust_golden.matched)
         } else {
             None
         };
@@ -319,7 +354,7 @@ impl CaseReport {
             eval: outcome.eval.clone(),
             verdict: outcome.verdict,
             oracle: SideReport::of(&outcome.oracle, matched_golden),
-            rust: SideReport::of(&outcome.rust, None),
+            rust: SideReport::of(&outcome.rust, rust_matched_golden),
             diffs: outcome.diffs.clone(),
         }
     }
@@ -339,8 +374,12 @@ pub struct SideReport {
     pub stdout_hex: Option<String>,
     /// The process exit code (`null` when the side did not run, or when signalled).
     pub exit_code: Option<i32>,
-    /// Whether the observation reproduced the case golden (key omitted when no golden was
-    /// asserted, and for the Rust side).
+    /// Whether this side's observation reproduced the case golden (key omitted when no golden
+    /// was asserted, and for a side that did not run).
+    ///
+    /// Both sides are checked against the same golden: the oracle's value is the corpus's own
+    /// self-test, and our side's value is what distinguishes a host-oracle drift
+    /// ([`Verdict::OracleDrift`]) from a divergence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_golden: Option<bool>,
 }
@@ -509,6 +548,7 @@ impl<'de> Deserialize<'de> for Verdict {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "agree" => Ok(Verdict::Agree),
+            "oracle_drift" => Ok(Verdict::OracleDrift),
             "mismatch" => Ok(Verdict::Mismatch),
             "unsupported" => Ok(Verdict::Unsupported),
             "skipped" => Ok(Verdict::Skipped),
@@ -667,6 +707,7 @@ mod tests {
         let mut cases = Vec::new();
         for verdict in [
             Verdict::Agree,
+            Verdict::OracleDrift,
             Verdict::Mismatch,
             Verdict::Unsupported,
             Verdict::Skipped,
@@ -675,11 +716,117 @@ mod tests {
             cases.append(&mut base.cases);
         }
         let summary = Summary::of(&cases);
-        assert_eq!(summary.total, 4);
+        assert_eq!(summary.total, 5);
         assert_eq!(summary.agree, 1);
+        assert_eq!(summary.oracle_drift, 1);
         assert_eq!(summary.mismatch, 1);
         assert_eq!(summary.unsupported, 1);
         assert_eq!(summary.skipped, 1);
+        // The four older counts plus the drift count partition the total exactly.
+        assert_eq!(
+            summary.agree + summary.oracle_drift + summary.mismatch + summary.unsupported
+                + summary.skipped,
+            summary.total
+        );
+    }
+
+    /// `oracle_drift` is an **additive-with-default** summary field: a report written before the
+    /// verdict class existed still parses and reads 0, and a case whose verdict is
+    /// `"oracle_drift"` parses back into [`Verdict::OracleDrift`]. That is why the schema id is
+    /// not bumped.
+    #[test]
+    fn oracle_drift_is_additive_in_the_json_and_parses_back() {
+        let pre_change = serde_json::json!({
+            "schema": SCHEMA,
+            "mode": "suite",
+            "oracle": {"id": "oracle", "available": true, "program": "/x/erl", "source": "$PATH"},
+            "rust": {"id": "rust", "available": true, "program": "/x/beam_rt", "source": "$BEAM_RT"},
+            "summary": {"total": 1, "agree": 1, "mismatch": 0, "unsupported": 0, "skipped": 0},
+            "cases": [{
+                "case_id": "a/agree",
+                "description": "an agreeing case",
+                "contracts": ["A.2"],
+                "eval": "try (ok) of V -> ok end.",
+                "verdict": "agree",
+                "oracle": {"available": true, "stdout": "ok\n", "stdout_hex": "6f6b0a", "exit_code": 0},
+                "rust": {"available": true, "stdout": "ok\n", "stdout_hex": "6f6b0a", "exit_code": 0},
+                "diffs": []
+            }]
+        });
+        let parsed: RunReport =
+            serde_json::from_value(pre_change).expect("a pre-change report must still parse");
+        assert_eq!(parsed.summary.oracle_drift, 0, "the absent key defaults to zero");
+        assert_eq!(parsed.summary.total, 1);
+        assert_eq!(parsed.cases[0].verdict, Verdict::Agree);
+
+        // A `"oracle_drift"` case verdict parses, and the summary key round-trips.
+        let drift = serde_json::json!({
+            "schema": SCHEMA,
+            "mode": "suite",
+            "oracle": {"id": "oracle", "available": true, "program": "/x/erl", "source": "$PATH"},
+            "rust": {"id": "rust", "available": true, "program": "/x/beam_rt", "source": "$BEAM_RT"},
+            "summary": {
+                "total": 1, "agree": 0, "mismatch": 0, "unsupported": 0, "skipped": 0,
+                "oracle_drift": 1
+            },
+            "cases": [{
+                "case_id": "system_info/version",
+                "description": "a drifting case",
+                "contracts": ["A.8"],
+                "eval": "try (ok) of V -> ok end.",
+                "verdict": "oracle_drift",
+                "oracle": {
+                    "available": true, "stdout": "ok 17.1.1\n", "stdout_hex": "6f6b0a",
+                    "exit_code": 0, "matched_golden": false
+                },
+                "rust": {
+                    "available": true, "stdout": "ok 17.1\n", "stdout_hex": "6f6b0a",
+                    "exit_code": 0, "matched_golden": true
+                },
+                "diffs": []
+            }]
+        });
+        let parsed: RunReport =
+            serde_json::from_value(drift).expect("an oracle_drift case must parse");
+        assert_eq!(parsed.cases[0].verdict, Verdict::OracleDrift);
+        assert_eq!(parsed.summary.oracle_drift, 1);
+        assert_eq!(parsed.by_contract["A.8"].oracle_drift, 1);
+        assert_eq!(parsed.cases[0].rust.matched_golden, Some(true));
+        assert_eq!(parsed.cases[0].oracle.matched_golden, Some(false));
+    }
+
+    /// `matched_golden` on our side means a golden our side **really checked**: an unobserved
+    /// side carries `GoldenCheck::not_asserted()`, whose `matched` must never be published as
+    /// agreement.
+    #[test]
+    fn our_sides_matched_golden_is_published_only_when_it_really_ran() {
+        use crate::runtime::Observation;
+        let observed = SideResult::observed(Observation {
+            runtime: RuntimeId::Rust,
+            program: std::path::PathBuf::from("/x/beam_rt"),
+            argv: vec!["-noshell".to_string()],
+            stdout: b"ok 17.1\n".to_vec(),
+            stderr: Vec::new(),
+            exit_code: Some(0),
+        });
+
+        // (1) Our side ran and matched: the check is published as `true`.
+        let report = report_by(observed.clone(), Some(true));
+        assert_eq!(report.cases[0].rust.matched_golden, Some(true));
+
+        // (2) Our side ran and missed: the check is published as `false` (never hidden).
+        let report = report_by(observed, Some(false));
+        assert_eq!(report.cases[0].rust.matched_golden, Some(false));
+
+        // (3) Our side did not run: no check happened, so nothing is published.
+        let report = report_by(SideResult::unsupported("no beam_rt"), Some(true));
+        assert_eq!(report.cases[0].rust.matched_golden, None);
+        assert_eq!(report.cases[0].oracle.matched_golden, Some(true));
+    }
+
+    /// A single-case report whose golden was asserted, with our side set to `rust`.
+    fn report_by(rust: SideResult, golden: Option<bool>) -> RunReport {
+        report(Verdict::Unsupported, rust, golden)
     }
 
     /// A real (oracle-backed) run must never report *fabricated* agreement.
@@ -735,8 +882,13 @@ mod tests {
             }
         };
         let report = RunReport::from_case("run", &outcome);
-        let rederived =
-            verdict_with(&outcome.oracle, &outcome.rust, &outcome.golden, Observables::All);
+        let rederived = verdict_with(
+            &outcome.oracle,
+            &outcome.rust,
+            &outcome.golden,
+            &outcome.rust_golden,
+            Observables::All,
+        );
         assert_eq!(report.cases[0].verdict, rederived);
         if rederived == Verdict::Agree {
             let oracle_obs = outcome.oracle.observation().expect("oracle observed");

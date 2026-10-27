@@ -38,6 +38,12 @@
 //! A Rust-side observation that exits with [`runtime::UNSUPPORTED_EXIT_CODE`] (`3`) is a
 //! documented **capability gap** and is reported `unsupported` — never a `mismatch`.
 //!
+//! Both sides are checked against the case golden. When **our** side reproduces it and the
+//! **oracle** does not, with the two sides' observables differing, the verdict is
+//! [`Verdict::OracleDrift`] — the golden depends on the host oracle's `erts` release, not on our
+//! runtime. It is never a `mismatch` and never an `agree`; it is ratcheted by its own drift
+//! allowlist (`known-drift.txt`).
+//!
 //! This crate is a pure **driver/observer**: it never modifies a runtime and never
 //! inspects its internals — the only contract with `beam_rt` is its documented external
 //! CLI. It depends on no workspace crate internals (only `serde`/`serde_json`) and
@@ -82,8 +88,11 @@
 //!
 //! # Exit codes
 //!
-//! * `0` — every executed case agreed (unsupported/skipped cases are reported, not fatal)
-//! * `1` — at least one mismatch (including oracle-vs-its-own-golden corpus drift)
+//! * `0` — every executed case agreed, or its `unsupported`/`skipped`/`oracle_drift` verdict is
+//!   ratcheted by the allowlist the run was given
+//! * `1` — at least one mismatch (always), or `--strict` with a remaining unratcheted
+//!   `unsupported`/`skipped`/`oracle_drift` case, or a ratchet that must be updated (an
+//!   unauthorized or stale entry)
 //! * `2` — usage, environment or IO error (see [`Error::exit_code`])
 
 #![forbid(unsafe_code)]

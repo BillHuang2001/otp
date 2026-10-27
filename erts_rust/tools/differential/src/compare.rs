@@ -22,8 +22,16 @@
 //!
 //! The harness compares only what a black-box observer can see (contract A.2/A.8):
 //! the **exact stdout bytes** and the **exit status** of the two runtimes, plus the case's
-//! own **golden** (an independent expectation that makes the corpus self-testing — a
-//! golden miss by the *oracle* is corpus drift, i.e. a real failure, never a skip).
+//! own **golden** (an independent expectation that makes the corpus self-testing).
+//!
+//! Both sides are checked against that same golden ([`GoldenCheck`]), which is what makes a
+//! [`Verdict::OracleDrift`] classifiable: a case where **our side** reproduced the committed
+//! golden and the **oracle** did not is a *host-oracle* difference (the installed release's
+//! `erts` version is not the tree's pinned one), never a divergence of our runtime.
+//!
+//! * An **oracle** golden miss is corpus/host drift — a real failure unless our side proves
+//!   the golden is still reproducible ([`Verdict::OracleDrift`]).
+//! * A **Rust** golden miss is always a [`Verdict::Mismatch`]; it is never downgraded.
 //!
 //! Stderr is compared too for the expression cases ([`Observables::All`]), but through a
 //! deliberately **narrow classifier**: only the Rust runtime's documented one-line
@@ -91,7 +99,9 @@ pub fn significant_stderr(stderr: &[u8]) -> Vec<u8> {
 /// What one runtime contributed to a comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideResult {
-    /// The runtime ran and produced an observation.
+    /// The runtime ran and produced an observation. Each observed side is checked against the
+    /// case golden separately ([`check_golden`]), because the verdict needs to know which of
+    /// the two reproduced it.
     Observed(Observation),
     /// The runtime could not be run (e.g. no `beam_rt` binary exists). This is reported
     /// as `unsupported` and is **never** turned into agreement or a pass.
@@ -161,7 +171,11 @@ impl FieldDiff {
     }
 }
 
-/// The result of checking an observation against a case's golden expectation.
+/// The result of checking one observation against a case's golden expectation.
+///
+/// Both sides of a case are checked against the **same** golden, and the verdict rule
+/// ([`verdict_with`]) reads both checks: the oracle's miss is a host-oracle difference when our
+/// side reproduces the golden, while our side's miss is always a [`Verdict::Mismatch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoldenCheck {
     /// `true` when the observation reproduced every asserted golden field.
@@ -171,7 +185,11 @@ pub struct GoldenCheck {
 }
 
 impl GoldenCheck {
-    /// A check that asserted nothing (used for ad-hoc comparisons without a golden).
+    /// A check that asserted nothing — no golden exists (an ad-hoc comparison), or the side did
+    /// not run so nothing was checked.
+    ///
+    /// It reports `matched: true` because it proves nothing *against* the observation; a side
+    /// that did not run is classified by [`SideResult::Unsupported`], never by this check.
     pub fn not_asserted() -> GoldenCheck {
         GoldenCheck {
             matched: true,
@@ -183,9 +201,19 @@ impl GoldenCheck {
 /// The outcome of comparing the two sides of one case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Both sides ran and every observable (and the golden) agreed.
+    /// Both sides ran, the golden was reproduced by **both**, and every observable agreed.
     Agree,
-    /// The sides disagreed, or the oracle disagreed with its own golden (corpus drift).
+    /// Our side reproduced the committed golden and the oracle did not, and the two sides'
+    /// observables differ: a golden that is dependent on the **host oracle's release** (its
+    /// `erts` version is not the tree's pinned one), not a divergence of our runtime.
+    ///
+    /// It requires **all three** of (a) our side matched the golden, (b) the oracle did not,
+    /// and (c) the observables differ — positive evidence only, no text heuristics. It is never
+    /// a [`Verdict::Mismatch`] and never a [`Verdict::Agree`]; it is ratcheted by a separate
+    /// drift allowlist and is non-fatal without `--strict`.
+    OracleDrift,
+    /// A real divergence: the sides disagreed, or our side failed the golden (our side's golden
+    /// miss is **always** a mismatch and is never downgraded).
     Mismatch,
     /// At least one side could not run; nothing was proven either way.
     Unsupported,
@@ -198,6 +226,7 @@ impl Verdict {
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Agree => "agree",
+            Verdict::OracleDrift => "oracle_drift",
             Verdict::Mismatch => "mismatch",
             Verdict::Unsupported => "unsupported",
             Verdict::Skipped => "skipped",
@@ -205,20 +234,29 @@ impl Verdict {
     }
 
     /// Whether this verdict is a hard failure regardless of `--strict`.
+    ///
+    /// Only [`Verdict::Mismatch`] is: an [`Verdict::OracleDrift`] is a host-oracle difference,
+    /// ratcheted like a capability gap, never a divergence of our runtime.
     pub fn is_mismatch(&self) -> bool {
         matches!(self, Verdict::Mismatch)
     }
 
+    /// Whether this verdict is an [`Verdict::OracleDrift`].
+    pub fn is_oracle_drift(&self) -> bool {
+        matches!(self, Verdict::OracleDrift)
+    }
+
     /// This verdict's contribution to the process exit code.
     ///
-    /// A [`Verdict::Mismatch`] always contributes `1`; [`Verdict::Unsupported`] and
-    /// [`Verdict::Skipped`] contribute `1` only under `--strict` (so a capability gap in
-    /// the Rust runtime does not fail CI before the feature lands).
+    /// A [`Verdict::Mismatch`] always contributes `1`; [`Verdict::OracleDrift`],
+    /// [`Verdict::Unsupported`] and [`Verdict::Skipped`] contribute `1` only under `--strict`
+    /// (so a capability gap in the Rust runtime, or a golden tied to the host oracle's release,
+    /// does not fail a non-strict run before it is ratcheted).
     pub fn exit_contribution(&self, strict: bool) -> i32 {
         match self {
             Verdict::Agree => 0,
             Verdict::Mismatch => 1,
-            Verdict::Unsupported | Verdict::Skipped => i32::from(strict),
+            Verdict::OracleDrift | Verdict::Unsupported | Verdict::Skipped => i32::from(strict),
         }
     }
 }
@@ -341,12 +379,17 @@ pub fn normalize_probe_stdout(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
-/// Derive the [`Verdict`] of one case from its two sides and the oracle's golden check.
+/// Derive the [`Verdict`] of one case from its two sides and both golden checks.
 ///
 /// Equal to [`verdict_with`]`(…, `[`Observables::All`]`)` — the full comparison used by the
 /// expression corpus cases.
-pub fn verdict(oracle: &SideResult, rust: &SideResult, golden: &GoldenCheck) -> Verdict {
-    verdict_with(oracle, rust, golden, Observables::All)
+pub fn verdict(
+    oracle: &SideResult,
+    rust: &SideResult,
+    oracle_golden: &GoldenCheck,
+    rust_golden: &GoldenCheck,
+) -> Verdict {
+    verdict_with(oracle, rust, oracle_golden, rust_golden, Observables::All)
 }
 
 /// [`verdict`] restricted to the observables selected by `observables`.
@@ -354,24 +397,46 @@ pub fn verdict(oracle: &SideResult, rust: &SideResult, golden: &GoldenCheck) -> 
 /// The comparison used to decide agreement MUST match the comparison whose
 /// [`FieldDiff`]s are reported, otherwise a case could show an empty diff list yet be a
 /// `Mismatch` (or vice versa).
+///
+/// The rule, applied only when **both** sides were observed:
+///
+/// * both sides reproduced the golden and the observables agree ⇒ [`Verdict::Agree`];
+/// * `oracle_golden` missed, `rust_golden` matched **and** the observables differ ⇒
+///   [`Verdict::OracleDrift`] — our side proves the committed golden is still reproducible, so
+///   the oracle's miss is a property of the host oracle's release, not of our runtime;
+/// * everything else ⇒ [`Verdict::Mismatch`]. In particular a **Rust** golden miss is always a
+///   mismatch (never downgraded), "both sides missed" is a mismatch, and "our side matched, the
+///   oracle missed, but the two observables agree" is a mismatch too — a case cannot be drift
+///   while its own two sides agree, because then the golden is simply satisfied twice over and
+///   the oracle's miss does not describe the diverging value.
+///
+/// When either side could not be observed the verdict is [`Verdict::Unsupported`] regardless of
+/// the golden checks: an oracle-vs-own-golden miss is only *classifiable* once our side ran. With
+/// our side unobservable the case is a capability gap ratcheted by the gaps allowlist, never a
+/// pass — and never a `Mismatch`, because a mismatch must mean our runtime produced a differing
+/// observable, which it cannot have done when it did not run.
+///
+/// No text heuristics are involved anywhere: every branch is decided by a byte-level observable
+/// comparison and the two golden checks.
 pub fn verdict_with(
     oracle: &SideResult,
     rust: &SideResult,
-    golden: &GoldenCheck,
+    oracle_golden: &GoldenCheck,
+    rust_golden: &GoldenCheck,
     observables: Observables,
 ) -> Verdict {
-    if !golden.matched {
-        // The oracle itself did not reproduce the expectation: the corpus has drifted.
-        return Verdict::Mismatch;
-    }
     match (oracle, rust) {
         (SideResult::Observed(oracle), SideResult::Observed(rust)) => {
-            if compare_observations_with(oracle, rust, observables).is_empty() {
+            let observables_agree = compare_observations_with(oracle, rust, observables).is_empty();
+            if oracle_golden.matched && rust_golden.matched && observables_agree {
                 Verdict::Agree
+            } else if !oracle_golden.matched && rust_golden.matched && !observables_agree {
+                Verdict::OracleDrift
             } else {
                 Verdict::Mismatch
             }
         }
+        // A side could not be observed: nothing was proven about our runtime.
         _ => Verdict::Unsupported,
     }
 }
@@ -435,13 +500,17 @@ mod tests {
         let oracle = observation(RuntimeId::Oracle, b"out\n", Some(0));
         let rust = observation(RuntimeId::Rust, b"out\n", Some(0));
         assert!(compare_observations(&oracle, &rust).is_empty());
-        let golden = check_golden(&oracle, &Golden { stdout: Some("out"), exit_code: 0 });
-        assert!(golden.matched, "{:?}", golden.diffs);
+        let golden = Golden { stdout: Some("out"), exit_code: 0 };
+        let oracle_check = check_golden(&oracle, &golden);
+        let rust_check = check_golden(&rust, &golden);
+        assert!(oracle_check.matched, "{:?}", oracle_check.diffs);
+        assert!(rust_check.matched, "{:?}", rust_check.diffs);
         assert_eq!(
             verdict(
                 &SideResult::observed(oracle.clone()),
                 &SideResult::observed(rust),
-                &golden
+                &oracle_check,
+                &rust_check
             ),
             Verdict::Agree
         );
@@ -460,13 +529,15 @@ mod tests {
         assert_eq!(diffs[1].oracle, "0");
         assert_eq!(diffs[1].rust, "1");
 
-        let golden = check_golden(&oracle, &Golden { stdout: Some("ok 7"), exit_code: 0 });
-        assert!(golden.matched);
+        let golden = Golden { stdout: Some("ok 7"), exit_code: 0 };
+        let oracle_check = check_golden(&oracle, &golden);
+        assert!(oracle_check.matched);
         assert_eq!(
             verdict(
                 &SideResult::observed(oracle),
                 &SideResult::observed(rust),
-                &golden
+                &oracle_check,
+                &GoldenCheck::not_asserted()
             ),
             Verdict::Mismatch
         );
@@ -499,6 +570,7 @@ mod tests {
             verdict(
                 &SideResult::observed(oracle),
                 &SideResult::observed(rust),
+                &GoldenCheck::not_asserted(),
                 &GoldenCheck::not_asserted()
             ),
             Verdict::Agree
@@ -540,6 +612,7 @@ mod tests {
             verdict(
                 &SideResult::observed(oracle),
                 &SideResult::observed(rust),
+                &GoldenCheck::not_asserted(),
                 &GoldenCheck::not_asserted()
             ),
             Verdict::Mismatch
@@ -711,19 +784,112 @@ mod tests {
         assert_eq!(check.diffs[1].rust, "1");
     }
 
+    /// The real-world shape of the drift class: the tree pins `erts-17.1`, the host oracle is
+    /// `erts-17.1.1`, and a golden that records `system_info(version)` therefore fails on the
+    /// oracle while our runtime reproduces it exactly. Both checks come from the **same** golden
+    /// through [`check_golden`], so the class needs no synthesised input.
     #[test]
-    fn oracle_golden_drift_is_a_mismatch_not_a_skip() {
+    fn a_host_oracle_version_difference_is_drift_not_a_divergence() {
+        let golden = Golden {
+            stdout: Some("ok \"17.1\""),
+            exit_code: 0,
+        };
+        let oracle = observation(RuntimeId::Oracle, b"ok \"17.1.1\"\n", Some(0));
+        let rust = observation(RuntimeId::Rust, b"ok \"17.1\"\n", Some(0));
+        let oracle_check = check_golden(&oracle, &golden);
+        let rust_check = check_golden(&rust, &golden);
+        assert!(!oracle_check.matched, "the host oracle answers 17.1.1");
+        assert!(rust_check.matched, "our side reproduces the pinned golden");
+        assert_eq!(
+            verdict(
+                &SideResult::observed(oracle),
+                &SideResult::observed(rust),
+                &oracle_check,
+                &rust_check
+            ),
+            Verdict::OracleDrift
+        );
+    }
+
+    /// Every row of the verdict rule, with the two golden checks as the only inputs that vary.
+    #[test]
+    fn the_verdict_table_is_positive_evidence_only() {
+        let matched = GoldenCheck::not_asserted();
+        let missed = GoldenCheck {
+            matched: false,
+            diffs: vec![FieldDiff::new("stdout", "observed", "golden")],
+        };
+        let oracle_same = SideResult::observed(observation(RuntimeId::Oracle, b"v\n", Some(0)));
+        let oracle_other = SideResult::observed(observation(RuntimeId::Oracle, b"v2\n", Some(0)));
+        let rust_same = SideResult::observed(observation(RuntimeId::Rust, b"v\n", Some(0)));
+        let rust_other = SideResult::observed(observation(RuntimeId::Rust, b"v2\n", Some(0)));
+
+        // both matched + observables agree ⇒ Agree.
+        assert_eq!(
+            verdict(&oracle_same, &rust_same, &matched, &matched),
+            Verdict::Agree
+        );
+        // our side matched + the oracle missed + the observables differ ⇒ OracleDrift.
+        assert_eq!(
+            verdict(&oracle_other, &rust_same, &missed, &matched),
+            Verdict::OracleDrift
+        );
+        // our side matched + the oracle missed + the observables AGREE ⇒ Mismatch, not drift:
+        // drift must be visible in the observables, never inferred from the checks alone.
+        assert_eq!(
+            verdict(&oracle_same, &rust_same, &missed, &matched),
+            Verdict::Mismatch
+        );
+        // our side failed the golden while the oracle matched ⇒ Mismatch (never downgraded).
+        assert_eq!(
+            verdict(&oracle_same, &rust_same, &matched, &missed),
+            Verdict::Mismatch
+        );
+        assert_eq!(
+            verdict(&oracle_same, &rust_other, &matched, &missed),
+            Verdict::Mismatch
+        );
+        // both failed ⇒ Mismatch (never drift).
+        assert_eq!(
+            verdict(&oracle_other, &rust_other, &missed, &missed),
+            Verdict::Mismatch
+        );
+        // both matched but the observables differ ⇒ Mismatch.
+        assert_eq!(
+            verdict(&oracle_same, &rust_other, &matched, &matched),
+            Verdict::Mismatch
+        );
+        // A side that did not run proves nothing: Unsupported whatever the checks say.
+        let unsupported = SideResult::unsupported("no beam_rt");
+        for checks in [(&matched, &matched), (&missed, &matched), (&matched, &missed), (&missed, &missed)] {
+            assert_eq!(
+                verdict(&oracle_other, &unsupported, checks.0, checks.1),
+                Verdict::Unsupported,
+                "an unobservable Rust side is never agreement and never a mismatch"
+            );
+            assert_eq!(
+                verdict(&unsupported, &rust_same, checks.0, checks.1),
+                Verdict::Unsupported
+            );
+        }
+    }
+
+    /// An oracle golden miss cannot be a hard failure once our side is unobservable: nothing was
+    /// proven about our runtime, so the case is a capability gap (ratcheted by the gaps
+    /// allowlist), never a `Mismatch`.
+    #[test]
+    fn an_oracle_golden_miss_without_our_side_is_unsupported_not_a_mismatch() {
         let oracle = observation(RuntimeId::Oracle, b"ok 3\n", Some(0));
         let drifted = check_golden(&oracle, &Golden { stdout: Some("ok 99"), exit_code: 0 });
         assert!(!drifted.matched);
-        // Even with no Rust side at all, drift in the oracle is a hard failure.
         assert_eq!(
             verdict(
                 &SideResult::observed(oracle),
                 &SideResult::unsupported("no beam_rt"),
-                &drifted
+                &drifted,
+                &GoldenCheck::not_asserted()
             ),
-            Verdict::Mismatch
+            Verdict::Unsupported
         );
     }
 
@@ -743,13 +909,19 @@ mod tests {
         assert!(rust.observation().is_none());
         assert_eq!(rust.unsupported_reason(), Some("no Rust runtime found"));
         assert_eq!(
-            verdict(&SideResult::observed(oracle), &rust, &golden),
+            verdict(
+                &SideResult::observed(oracle),
+                &rust,
+                &golden,
+                &GoldenCheck::not_asserted()
+            ),
             Verdict::Unsupported
         );
         assert_eq!(
             verdict(
                 &SideResult::observed(observation(RuntimeId::Oracle, b"x\n", Some(0))),
                 &rust,
+                &GoldenCheck::not_asserted(),
                 &GoldenCheck::not_asserted()
             ),
             Verdict::Unsupported
@@ -770,6 +942,7 @@ mod tests {
                     &SideResult::observed(oracle.clone()),
                     &SideResult::observed(banner.clone()),
                     &golden,
+                    &golden,
                     observables
                 ),
                 Verdict::Agree,
@@ -786,6 +959,7 @@ mod tests {
                 &SideResult::observed(oracle.clone()),
                 &SideResult::observed(noise.clone()),
                 &golden,
+                &golden,
                 Observables::All
             ),
             Verdict::Mismatch
@@ -794,6 +968,7 @@ mod tests {
             verdict_with(
                 &SideResult::observed(oracle),
                 &SideResult::observed(noise),
+                &golden,
                 &golden,
                 Observables::StdoutAndExit
             ),
@@ -804,6 +979,8 @@ mod tests {
     #[test]
     fn verdict_exit_contributions_follow_the_strict_rule() {
         assert_eq!(Verdict::Agree.exit_contribution(true), 0);
+        assert_eq!(Verdict::OracleDrift.exit_contribution(false), 0);
+        assert_eq!(Verdict::OracleDrift.exit_contribution(true), 1);
         assert_eq!(Verdict::Mismatch.exit_contribution(false), 1);
         assert_eq!(Verdict::Mismatch.exit_contribution(true), 1);
         assert_eq!(Verdict::Unsupported.exit_contribution(false), 0);
@@ -811,7 +988,12 @@ mod tests {
         assert_eq!(Verdict::Skipped.exit_contribution(false), 0);
         assert_eq!(Verdict::Skipped.exit_contribution(true), 1);
         assert!(Verdict::Mismatch.is_mismatch());
+        assert!(!Verdict::OracleDrift.is_mismatch(), "drift is never a mismatch");
+        assert!(Verdict::OracleDrift.is_oracle_drift());
+        assert!(!Verdict::Mismatch.is_oracle_drift());
+        assert!(!Verdict::Agree.is_oracle_drift());
         assert_eq!(Verdict::Agree.as_str(), "agree");
+        assert_eq!(Verdict::OracleDrift.as_str(), "oracle_drift");
     }
 
     #[test]
