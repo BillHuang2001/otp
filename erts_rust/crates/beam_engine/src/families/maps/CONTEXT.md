@@ -77,7 +77,7 @@ instead of a substituted atom.
   everything the runtime must be able to name when the module never mentions it must be interned
   *before* the module is loaded, since the host clones that table into each module.
   - `beam_rt`: `boot::CORE_ATOMS` contains `badmap`, `badkey` and `function_clause`; `Runtime::new`
-    seeds it before any load, and `CodeServer::load_bytes` clones the shared table into each module —
+    seeds it before any load, and `CodeServer::load_bytes` forks the shared table into each module (`beam_rt/src/codeserver.rs:927` — an index-preserving shallow copy, not a deep clone) —
     and with the `atoms` override the live namespace answers regardless.
   - engine test host: `SEED_ATOMS` (`../../../tests/support/atoms.rs`) is appended to every module
     loaded through it.
