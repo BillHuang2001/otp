@@ -106,7 +106,7 @@ Host-side detail: `machine/CONTEXT.md` and `../tests/CONTEXT.md`.
 
 ## Execution position (`Machine::current_code`) — the complete store set
 The position is **one packed `u64`** (`func << 32 | pc`) with sentinels for "no position", so a store is one word write and every reader unpacks it.
-Two writers plus the `reset` clear: `Machine::step_instruction_with_entry` (`interpreter/dispatch.rs`) writes it at every interpreted instruction's entry — the instruction-granular store every suspension and raise relies on — and `Machine::set_current_code` (`machine/location.rs`) is the accessor `src/jit/**` reaches.
+Two writers plus the `reset` clear: `Machine::step_instruction_with_entry` (`interpreter/dispatch.rs`) writes it at every interpreted instruction's entry — the instruction-granular store every suspension and raise relies on — and `Machine::set_current_code` (`machine/location.rs`) is the accessor `src/jit/**` reaches (`set_current_code_word(word)` is the same store for a caller that already holds the packed word — the in-block transfer, whose exit word and position word are the one bit pattern).
 Every store is an instruction boundary, but not every store happens before the thing it names runs.
 Interpreter: `Machine::drive` stores **before** the charge and the body, so a `reduce` refusal parks on the not-yet-executed instruction.
 Native baseline driver head: once per iteration, in the order `set_current_code` → the reduction bump → `reduce(1)` → `code.enter`.

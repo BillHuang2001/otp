@@ -98,6 +98,11 @@ The only tables that outlive a compile are `compile.rs`'s entry tables and the `
   `entries`/`sub_entries` (`Vec<Vec<*const u8>>` for the eager layout's `[func][pc]`, `Vec<*const u8>`
   for a lazy function's `[pc]`, each slot null when that address compiled no block — **flat
   indexing**, chosen over a `HashMap` because the driver probes it on every cross-block jump).
+  The **last** step of each layout, after `emit_sub_blocks`/`emit_shared_sub_blocks` and before
+  `buffer.seal()`, folds the two into one: `merge_sub_entries` null-fills each block-start table with
+  the continuation sub-block entry at the same pc (a pc is at most one of the two, and a block start
+  still wins), so the published table answers both shapes with one lookup. Addresses do not move —
+  the fold runs after every label is bound and only rewrites slot contents.
   `Linker` (`link.rs:229`) holds only `&BTreeMap<(u32, u32), CodeLabel>`; it owns no fixup table — the
   `rel32` patching is the `CodeBuffer`'s own label machinery.
 - **`LabelMap`** (`../../interpreter/mod.rs:88`) is the one *pre-decoded* table stored **in** the

@@ -62,8 +62,8 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `return_word` for the continuation→word mapping and `report_frame_error` for the typed diagnostic, with
   the `FrameExitHelper`/`ReturnHelper` fn-pointer types; `return_word` also resolves a continuation block
   entry in-block so a `return` need not round-trip the driver — `enter_in_block` is `#[inline]` and its
-  **same-function** fast path answers from the published `EntryTables` (one indexed word load per table,
-  entries first, no artifact lookup), while a miss goes to the `#[cold] #[inline(never)]`
+  **same-function** fast path answers from the published `EntryTables` (one bounds check and **one**
+  indexed word load out of **one folded** table, no artifact lookup), while a miss goes to the `#[cold] #[inline(never)]`
   `cross_function_enter` → `cross_function_entry`, which resolves the address through
   `CompiledModule::native_entry_tables` on the artifact the driver published in
   `JitRuntime::compiled` and checks **that function's** register-file bound in Rust (the same-function
@@ -72,8 +72,10 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   driver's order, so a refusal parks exactly where a driver-side refusal would — a cross-function
   transfer re-publishes the target function's tables, and the emitted arm tail-jumps to the entry with
   `JitRuntime::resume_entry` carrying it, while every other outcome leaves the word for the driver.
-  `EntryTables::of` is the one place an `EntryTables` is built, used by both the driver's publication
-  and a re-publication), `jit_allocate`/`jit_allocate_heap`/
+  `EntryTables::of(func, entries)` is the one place an `EntryTables` is built, used by both the
+  driver's publication and a re-publication, and it publishes **one** table: the compiler folds each
+  continuation sub-block entry into the block-start table (`emit::compile::merge_sub_entries`), so a
+  null slot means "that address compiled no entry at all", `jit_allocate`/`jit_allocate_heap`/
   `jit_test_heap`/`jit_trim` (the **heap / frame-admission** family: the interpreter's own
   `ensure_heap` / `trim` calls in the interpreter's own order, and for the two `allocate` helpers
   `Machine::push_frame_window` — the push that also hands back the new frame's `(y_base, y_count)`, so
@@ -165,10 +167,10 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 Nothing under `src/jit/baseline/**` is keyed by a **machine-code address**, and nothing indexes the IR by anything but `(func, pc)` / `pc` / a label id.
 - `CompiledModule`: `labels: LabelMap` (label id → packed `func<<32|code_index`), `fingerprint: u64`, `layout: Layout`.
 - `EagerLayout`: `buffer: CodeBuffer`, `entries`/`sub_entries: Vec<Vec<*const u8>>` indexed `[func][pc]`, `summary: Summary`.
-- `CompiledFunction` (lazy, one mapping per function): `buffer`, `entries`/`sub_entries: Vec<*const u8>` indexed `[pc]`, `summary`; probed by `lazy_entry` (entries first, sub_entries second) — two `Vec` loads, never a `HashMap`.
+- `CompiledFunction` (lazy, one mapping per function): `buffer`, `entries`/`sub_entries: Vec<*const u8>` indexed `[pc]`, `summary`; probed by `lazy_entry` — never a `HashMap`. `entries` is the **folded** table the driver and the in-block transfer publish (a block start, else the continuation sub-block at that pc); `sub_entries` survives as the raw sub-block table, so the artifact probe's entries-first-then-sub_entries order is unchanged and now redundant at a continuation pc.
 - Both entry tables use a **null sentinel**: a slot is `std::ptr::null()` when that address compiled no block, because `size_of::<Option<*const u8>>() == 16` on this toolchain (a raw pointer carries no null niche), so an `Option` slot was a `(tag, pointer)` pair and every probe paid a tag load and a scaling-by-16. The probe signatures (`CompiledModule::entry`/`native_entry`/`native_entry_cached`, `eager_entry`/`lazy_entry`) still answer `Option<*const u8>` — the sentinel is an interior representation only.
 - `Summary { block_count, cached_registers: Vec<u32>, highest_cached_register, highest_native_register }` — the register-file guard and the `Machine::note_x_dirty` extent.
-- `runtime::EntryTables`: the function index plus a raw `*const *const u8` and a length over **the same** two vectors, published into `JitRuntime::tables` so an in-block return resolves its own continuation without the artifact; `EntryTables::entry(func, pc)` reads one word per table, tests it for the null sentinel and keeps the entries-first precedence, `EntryTables::of` is the one builder and `EntryTables::NONE` (`func == u32::MAX`) the "no native code" value.
+- `runtime::EntryTables`: the function index plus a raw `*const *const u8` and a length over **the folded** vector, published into `JitRuntime::tables` so an in-block return resolves its own continuation without the artifact; `EntryTables::entry(func, pc)` is one bounds check, one word load and one null test (`EntryTables::of(func, entries)` is the one builder, `EntryTables::NONE` (`func == u32::MAX`) the "no native code" value). The load count is the point: the pre-fold table probed up to two vectors, and a continuation pc lives in the second one, i.e. on a different cache line from the block-start table.
 - `emit/regs.rs::Allocation` (compile-time only, dropped with the block): `spill_sets`/`fill_sets: Vec<Vec<u32>>` indexed `pc - block_start` (`spill_sets` also covers the exit pc), `slots: Vec<(u32, Reg)>` scanned linearly, `written`, `y_last`/`y_first`/`frame_republish_first`, `entry_fill`.
 - `(func, pc) → CodeLabel` as a `BTreeMap` exists only **during** a compilation (`emit/compile.rs` → `emit/link.rs`'s `Linker`), never in the artifact.
 - Driver-side carries: `ResolvedFunction = Option<(u32, Rc<CompiledFunction>)>` (`DriverContext::entry_cached` for context 0, one per `CalleeCode`), and `DriverContext::callees: Vec<CalleeCode>` keyed by module **context** id.
