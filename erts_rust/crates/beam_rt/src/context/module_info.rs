@@ -51,15 +51,38 @@
 //! by name — so a chunk whose atoms are all seeded (see `crate::boot::CORE_ATOMS`) is
 //! reproduced exactly, and one whose atoms are not is an honest gap.
 //!
-//! # The `exports` ordering divergence (documented)
+//! # The `exports` order: reverse `ExpT` (measured, not sorted)
 //!
-//! The oracle's `exports` is the **global ERTS export-table** order
-//! (`../../erts/emulator/beam/erl_bif_info.c:8434-8471` walks `export_list`) — not the
-//! file `ExpT` order, not sorted, and not reconstructible from a single module. This
-//! bridge therefore returns the module's **real export set in the loader's
-//! `Module::exports` order** (real data, possibly a different order than the oracle for
-//! some modules). It never fabricates or drops an entry; the differential tests compare
-//! `exports` as an unordered **set** for exactly this reason.
+//! `exports` is the one item whose *order* is observable: `eunit` walks
+//! `Module:module_info(exports)` (`eunit_autoexport.erl`) to find a module's `*_test_/0`
+//! generators, so the transcript order of a test run follows it.
+//!
+//! ERTS's rule is **not** the file order and **not** sorted. `exported_from_module`
+//! (`../../erts/emulator/beam/erl_bif_info.c:5838-5862`, unchanged since OTP 24) walks the
+//! **global** export list from index `0` (`export_list(i, code_ix)`, an insertion-ordered
+//! `IndexTable`, `../../erts/emulator/beam/index.c:79-107`) and **cons**es each matching
+//! entry onto the result — so the answer is the module's entries in **reverse insertion
+//! order**. A module's entries are inserted in `ExpT`-chunk order by the loader
+//! (`../../erts/emulator/beam/emu/emu_load.c:693-726`, JIT: `jit/asm_load.c:1186`), hence:
+//!
+//! > **`Module:module_info(exports)` is the module's `ExpT` chunk order, reversed.**
+//!
+//! Measured against the OTP 29 oracle over eight `erlc`-compiled probes (multi-`-export`
+//! attributes, several arities per name, source order ≠ sorted order): the answer is always
+//! `reverse(ExpT)` element for element, and it is **stable** under a shifted atom table
+//! (5 000 junk atoms interned first), which rules out any hash/atom-index dependence. Since
+//! `erlc` writes `ExpT` in reverse code order, `reverse(ExpT)` is also the module's
+//! *function* (code) order restricted to its exports — that is why the oracle and
+//! `module_info(functions)` (code order, [`function_list`]) agree on their relative
+//! ordering.
+//!
+//! Residual, documented: an MFA whose export entry already existed in the global table
+//! *before* the module was loaded (a BIF, entered at startup by
+//! `emu/beam_emu.c::install_bifs`) keeps its older, lower index and therefore renders at
+//! the **end** of the C's list rather than at its reverse-`ExpT` position. This bridge
+//! derives the order from the module alone (a loaded `Module` is all it can see), so a
+//! module that *implements* BIFs (`erlang`, `maps`, …) can differ there; every pure-Erlang
+//! module — and every module `eunit` iterates — agrees element for element.
 
 use beam_alloc::Heap;
 use beam_bifs::ModuleInfo;
@@ -154,11 +177,12 @@ fn module_atom_name(module: &Module, atom: beam_term::Atom) -> Result<&str> {
     })
 }
 
-/// The `exports` item: `[{Function, Arity}]` over the module's real export set, in the
-/// loader's order (see the module docs on the ordering divergence).
+/// The `exports` item: `[{Function, Arity}]` in ERTS's order — the module's real export set
+/// in **reverse `ExpT` order** (see the module docs: the C conses over an insertion-ordered
+/// global export list, and the loader inserts in `ExpT` order).
 fn export_list(heap: &mut Heap, atoms: &AtomTable, module: &Module) -> Result<Eterm> {
     let mut elements = Vec::with_capacity(module.exports.len());
-    for export in &module.exports {
+    for export in module.exports.iter().rev() {
         elements.push(callable_pair(heap, atoms, module, export)?);
     }
     build_list(heap, elements)
@@ -410,6 +434,62 @@ mod tests {
                 .expect("slice is loaded");
             assert_eq!(value, NIL, "`{item}` must be the empty list");
         }
+    }
+
+    /// Walks a `[{Name, Arity}]` callable list into `"name/arity"` strings.
+    fn callables(atoms: &AtomTable, list: Eterm) -> Vec<String> {
+        let mut got = Vec::new();
+        let mut cursor = list;
+        while !is_nil(cursor) {
+            let pair = term::cons_head(cursor).expect("a cons cell");
+            let name = atoms
+                .name(atom_val(term::tuple_element(pair, 0).expect("head name")))
+                .expect("a name")
+                .to_string();
+            let arity = beam_term::signed_value(term::tuple_element(pair, 1).expect("arity"));
+            got.push(format!("{name}/{arity}"));
+            cursor = term::cons_tail(cursor).expect("a cons tail");
+        }
+        got
+    }
+
+    /// The `exports` item is the export set in **ERTS's order**: the `ExpT` chunk order
+    /// reversed (see the module docs). For the `slice` fixture that is the oracle's exact
+    /// list — recorded from the OTP 29 oracle — and it is *not* the loader's order (which
+    /// starts at `module_info/1`, the old, reversed divergence).
+    #[test]
+    fn the_exports_item_is_the_oracles_order() {
+        let cs = loaded();
+        let module = cs.module("slice").expect("slice is loaded");
+        let mut reversed_expt: Vec<String> = module
+            .exports
+            .iter()
+            .map(|export| {
+                format!(
+                    "{}/{}",
+                    module.atom_name(export.function).expect("a name"),
+                    export.arity
+                )
+            })
+            .collect();
+        reversed_expt.reverse();
+        assert_eq!(
+            reversed_expt,
+            ["add/2", "fib/1", "pick/1", "module_info/0", "module_info/1"],
+            "reverse ExpT is the oracle's order for the fixture"
+        );
+        let mut bridge = ModuleInfoBridge { code_server: &cs };
+        let mut heap = Heap::new(4096).expect("a heap");
+        let atoms = cs.atoms();
+        let value = bridge
+            .module_info(&mut heap, atoms, "slice", "exports")
+            .expect("exports")
+            .expect("slice is loaded");
+        assert_eq!(
+            callables(atoms, value),
+            reversed_expt,
+            "`exports` is the oracle's order, element for element"
+        );
     }
 
     #[test]
