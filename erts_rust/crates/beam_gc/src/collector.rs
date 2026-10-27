@@ -130,6 +130,12 @@ impl Collector {
     pub(crate) fn nursery(&self) -> &Nursery {
         &self.nursery
     }
+    /// The nursery chain, mutably — the seam the explicit capacity-give-back entry point
+    /// ([`Collector::trim_retired`]) installs the live set's target through, on a nursery it has
+    /// just evacuated.
+    pub(crate) fn nursery_mut(&mut self) -> &mut Nursery {
+        &mut self.nursery
+    }
 
     /// The mature space.
     pub fn mature(&self) -> &HeapSpace {

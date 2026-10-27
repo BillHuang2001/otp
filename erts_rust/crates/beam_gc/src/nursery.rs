@@ -70,7 +70,9 @@
 //! Every superseded space is **retained until a collection evacuates it**, never freed by the
 //! growth itself: it may hold live words (they were handed to the mutator) and only a
 //! [collection](Nursery::collapse) proves them dead. Nothing in this module ever frees a
-//! retired space outside [`collapse`](Nursery::collapse).
+//! retired space outside a collection [collapse](Nursery::collapse) or an explicit
+//! [trim](Nursery::trim_after_minor) — and a trim is sound only because it runs on a nursery a
+//! collection has just evacuated.
 //! [`retains_old_spaces`](Nursery::retains_old_spaces) reports such a retained chain — the
 //! "collection debt" a growth accumulates and only a collection can clear, exported to hosts
 //! as [`Collector::collection_debt`](crate::Collector::collection_debt).
@@ -613,6 +615,65 @@ impl Nursery {
         let target = policy.young_after_fullsweep(collected_capacity, live_words);
         let live_target = policy.young_target_words(live_words);
         self.install_collapsed(target, live_target)
+    }
+
+    /// Installs the **young live set's target** unconditionally after a **minor** — the explicit
+    /// "give the capacity back" seam.
+    ///
+    /// [`collapse`](Nursery::collapse) asks [`HeapPolicy::young_after_collection`], whose keep
+    /// band deliberately **retains** a capacity inside
+    /// `[target, max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × target)]`: a live set that
+    /// swings within one operation must not oscillate the nursery, and a small heap is never
+    /// handed back at all. This seam bypasses that band and installs
+    /// [`HeapPolicy::young_minor_target_words`] itself, so every word the band would have kept
+    /// is reclaimed. The installed capacity is remembered as the chain's live-set target
+    /// ([`live_target_words`](Nursery::live_target_words)), so the growth seam
+    /// ([`grow`](Nursery::grow)) is bounded by it exactly as after a collapse.
+    ///
+    /// `live_words` is the **young** live set the round evacuated — its copy volume,
+    /// [`GcStats::words_copied`](crate::GcStats::words_copied), the same figure a
+    /// [`collapse`](Nursery::collapse) is given.
+    ///
+    /// # Soundness — a nursery whose live words are already out of it
+    ///
+    /// This installs a single space (or rewinds the current one when it already has the target
+    /// capacity) and **drops the retired chain**, freeing words without moving any. It is
+    /// therefore sound **only on an empty nursery**, i.e. straight after a collection evacuated
+    /// the whole chain: a nursery that still holds a live word would strand it, and this crate
+    /// cannot check that (the root slice is the caller's claim).
+    /// [`Collector::trim_retired`](crate::Collector::trim_retired) is the safe entry point: it
+    /// collects first and trims with the figure that collection reports.
+    pub(crate) fn trim_after_minor(
+        &mut self,
+        policy: &HeapPolicy,
+        live_words: usize,
+    ) -> Result<()> {
+        self.install_target(policy.young_minor_target_words(live_words))
+    }
+
+    /// Installs the **whole-heap live set's target** unconditionally after a **fullsweep** — the
+    /// [`trim_after_minor`](Nursery::trim_after_minor) counterpart for the kind that measured
+    /// the whole live set, so the figure is [`HeapPolicy::young_target_words`] rather than the
+    /// young-only target.
+    ///
+    /// Identical in every other respect: it bypasses
+    /// [`HeapPolicy::young_after_fullsweep`]'s band, installs the target as the chain's single
+    /// space, remembers it as the live-set target, and is sound only on a nursery a collection
+    /// has just evacuated.
+    pub(crate) fn trim_after_fullsweep(
+        &mut self,
+        policy: &HeapPolicy,
+        live_words: usize,
+    ) -> Result<()> {
+        self.install_target(policy.young_target_words(live_words))
+    }
+
+    /// The shared body of the two trim seams: install `target` as the chain's single space and
+    /// remember it as the chain's live-set target, through the same
+    /// [`install_collapsed`](Nursery::install_collapsed) body a collapse uses (so a trim and a
+    /// collection can never free or re-seed differently).
+    fn install_target(&mut self, target: usize) -> Result<()> {
+        self.install_collapsed(target, target)
     }
 
     /// The shared body of the two collapse seams: install (or rewind to) a single space of
