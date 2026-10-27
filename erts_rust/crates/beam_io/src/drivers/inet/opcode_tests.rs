@@ -173,10 +173,11 @@ impl Rig {
     /// Runs exactly **one** port-task round — [`crate::PortRegistry::execute_port_tasks`] under the
     /// default readiness budget — with no command queued first.
     ///
-    /// This is the point an asynchronous socket operation's completion is produced: the round
-    /// drives [`Driver::drive_async`], so a queued `recv`/`accept` that the socket can already
-    /// satisfy is answered here, never inside its control call. A driver that refuses the write it
-    /// was handed reports it as an error, exactly as `erlang:port_command/2` would.
+    /// This is the **level-triggered net** under an asynchronous socket operation: the round drives
+    /// [`Driver::drive_async`], so a queued `recv`/`accept` the socket can satisfy is answered here
+    /// even when its readiness edge was missed — an operation the control call could already satisfy
+    /// is answered by that call, before it ever arms. A driver that refuses the write it was handed
+    /// reports it as an error, exactly as `erlang:port_command/2` would.
     pub(super) fn round(&mut self) -> Result<()> {
         self.registry
             .execute_port_tasks(&mut self.poller, crate::port::DEFAULT_READINESS_RED_BUDGET)

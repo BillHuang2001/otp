@@ -327,9 +327,10 @@ fn numeric_getladdrs_and_getpaddrs_fall_back_to_the_socket() {
 /// receive delivers those bytes **before** anything the socket holds (`tcp_push_buffer`,
 /// `inet_drv.c:12326`-`:12338`).
 ///
-/// The receive itself is the C's asynchronous one: the control call answers `[1] ++ <<Id:16/big>>`
-/// and the data arrives later, as `{inet_async, Port, Id, {ok, Data}}` — here the round's async
-/// drive point ([`Driver::drive_async`]) completes it from the buffer the `unrecv` pushed.
+/// The receive is the C's asynchronous one, but the control call attempts it **first**
+/// (`tcp_recv(desc, n)`, `inet_drv.c:12310`): the buffer `unrecv` pushed is already a complete
+/// answer, so the control reply `[1] ++ <<Id:16/big>>` and the `{inet_async, Port, Id, {ok, Data}}`
+/// completion are produced by the **same** call — no readiness is armed and no round is needed.
 #[test]
 fn numeric_tcp_unrecv_pushes_the_bytes_back_in_front() {
     // The `Connection` is held for the whole test: dropping it would close the far end and the
@@ -345,13 +346,12 @@ fn numeric_tcp_unrecv_pushes_the_bytes_back_in_front() {
         vec![1, 0, 0],
         "the async recv answers [1] ++ <<Id:16/big>>"
     );
-    assert!(
-        conn.port.completions().is_empty(),
-        "the control reply comes first; the completion is produced by a later round"
-    );
-    conn.port.round().expect("a port-task round");
     let completions = conn.port.completions();
-    assert_eq!(completions.len(), 1, "exactly one completion: {completions:?}");
+    assert_eq!(
+        completions.len(),
+        1,
+        "the control call attempts the read and finds the pushed bytes: {completions:?}"
+    );
     match &completions[0].event {
         crate::completion::CompletionEvent::InetAsync { id, result } => {
             assert_eq!(*id, 0, "the id the control reply carried");

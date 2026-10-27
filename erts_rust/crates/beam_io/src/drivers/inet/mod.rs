@@ -47,7 +47,7 @@
 //! | `accept` | `INET_REQ_ACCEPT` (`:12144`) | — | `[1, fd_be32]`, or `[1]` when nothing is pending † |
 //! | `connect` | `INET_REQ_CONNECT` (`:12064`) | `Timeout(4) ++` packed address | `[1]`, or `[0] ++ errno` / `[0]etimedout` |
 //! | `send` | `tcp_inet_command` (`:12629`) | the bytes to send | `[1]` |
-//! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` † |
+//! | `recv` | `TCP_REQ_RECV` (`:12268`) | `Timeout(4) ++ Length(4)` | `[1] ++ <<Id:16/big>>` † |
 //! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]`, or `[0]enotconn` / `[0]einval` |
 //! | `close` | `INET_REQ_CLOSE` (`:12259`) | — | `[1]` |
 //! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
@@ -55,8 +55,9 @@
 //!
 //! † The rows marked with a dagger describe the **named** verbs, this floor's own read-now
 //! vocabulary for a direct caller. The **numeric** C requests `INET_REQ_ACCEPT`(26) and
-//! `TCP_REQ_RECV`(42) are asynchronous: they answer `[1] ++ <<Id:16/big>>` and complete later
-//! through the completion channel — see *The asynchronous-operation queue* below.
+//! `TCP_REQ_RECV`(42) are asynchronous: they answer `[1] ++ <<Id:16/big>>` and report the outcome
+//! through the completion channel under that id — a receive the socket can already satisfy delivers
+//! it **inside** this control call (see *The asynchronous-operation queue* below).
 //!
 //! A reply is the C's `ctl_reply` shape: a one-byte result tag ([`INET_REP_OK`] or
 //! [`INET_REP_ERROR`], `:869-871`) followed by a payload — `ctl_reply`/`ctl_reply_ok`/
@@ -156,11 +157,13 @@
 //!
 //! # The asynchronous-operation queue
 //!
-//! The C's `recv`/`accept` cannot be answered by their control call — the data (or the
-//! connection) is not there yet — so they are request/reply exchanges: the reply is an **id**
-//! (`[1] ++ <<Id:16/big>>`) and the outcome arrives later through the crate's
-//! [`completion`](crate::completion) channel as `{inet_async, Port, Id, Result}`. That queue is
-//! implemented for **both** numeric requests ([`self::op_queue`], with the accept list itself in
+//! The C's `recv`/`accept` are request/reply exchanges: the reply is an **id**
+//! (`[1] ++ <<Id:16/big>>`) and the outcome arrives through the crate's
+//! [`completion`](crate::completion) channel as `{inet_async, Port, Id, Result}`. The control call
+//! attempts the operation first — `tcp_recv(desc, n)` for a receive (`inet_drv.c:12310`), one
+//! non-blocking `accept(2)` for an accept — so data (or a connection) already there is delivered by
+//! that call and only a would-block one arms readiness and the timer. That queue is implemented for
+//! **both** numeric requests ([`self::op_queue`], with the accept list itself in
 //! [`self::accept`]):
 //!
 //! * `TCP_REQ_RECV`(42) takes the C's `Timeout(4), Length(4)` operand and occupies the
@@ -177,12 +180,13 @@
 //!
 //! The id counter is the C's `NEW_ASYNC_ID` (`op_ref++ & 0xffff`, `:1549`): it starts at `0` and
 //! is taken *before* the capacity check, so a refused enqueue still advances it. A completion is
-//! produced at exactly three points — socket readiness ([`Driver::ready_input`]), the port timer
-//! ([`Driver::next_timeout`]/[`Driver::timeout`], armed from the operation's deadline), and the
-//! round's async drive point ([`Driver::drive_async`], which serves data that arrived *before* the
-//! operation was enqueued) — never inside the control call. A close drains every pending
-//! operation with `{error, closed}` (`async_error_am_all`, `:2597`-`:2608`) before the descriptor
-//! goes away. A command's `[n:be16][n ETF bytes]` **caller tag** is likewise answered through it
+//! produced at **four** points: the control call's own attempt (the C's try-first — `tcp_recv`
+//! `:12310`, `packet_inet_input` `:14980`), socket readiness ([`Driver::ready_input`]), the port
+//! timer ([`Driver::next_timeout`]/[`Driver::timeout`], armed from the operation's deadline), and
+//! the round's async drive point ([`Driver::drive_async`] — the level-triggered net that also
+//! serves data that arrived *before* the operation was enqueued, so a missed readiness edge cannot
+//! strand a queued operation). A close drains every pending operation with `{error, closed}`
+//! (`async_error_am_all`, `:2597`-`:2608`) before the descriptor goes away. A command's `[n:be16][n ETF bytes]` **caller tag** is likewise answered through it
 //! (`{inet_reply, Port, Reply, Tag}`, `inet_reply_finish` `:2614`-`:2637`).
 //!
 //! **Divergence:** the C addresses a completion to `desc->caller`; the frozen [`crate::Driver`]

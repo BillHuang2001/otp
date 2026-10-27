@@ -67,8 +67,15 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-/// The `TCP_REQ_RECV`(42) operand of a passive, raw, zero-length, no-deadline receive.
-const RECV_OPERAND: [u8; 8] = [0; 8];
+/// The `TCP_REQ_RECV`(42) operand of a passive, raw, zero-length receive with **no deadline**
+/// (`Timeout = -1`, the C's `INET_INFINITY`).
+///
+/// A zero `Timeout` cannot be used here: `tcp_inet_ctl`'s arm answers an operation that would block
+/// with `{error, timeout}` **inside the control call** (`if (timeout == 0) async_error_am(am_timeout)`,
+/// `inet_drv.c:12311`), so nothing would ever be queued for the reactor's discovery to answer.
+/// With `INET_INFINITY` the operation parks, declares no deadline (`add_multi_timer` is skipped), and
+/// stays queued until the close ladder or a delivery answers it.
+const RECV_OPERAND: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 
 /// `{show_econnreset,true}`: the `INET_LOPT_TCP_SHOW_ECONNRESET`(39) five-byte setopts record.
 const SHOW_ECONNRESET: [u8; 5] = [39, 0, 0, 0, 1];

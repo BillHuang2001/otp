@@ -31,29 +31,34 @@
 //! The C's shape, arm by arm (`erts/emulator/drivers/common/inet_drv.c`):
 //!
 //! * `tcp_inet_ctl`'s `TCP_REQ_RECV` arm (`:12265`-`:12325`) takes the id (`NEW_ASYNC_ID`,
-//!   `:1549`), enqueues the operation (`enq_async`, `:12307`), arms read readiness with
-//!   `sock_select(INETP(desc), (FD_READ|FD_CLOSE), 1)` (`:12315`), arms the port timer with
-//!   `driver_set_timer` when the operand is not `INET_INFINITY`, and answers `ctl_reply_ok` +
-//!   `<<Id:16/big>>` (`:12319`) — **before** any byte has been read;
-//! * the read side then really does nothing when the socket is empty: `tcp_recv` (`:13130`) leaves
-//!   the operation enqueued on `EWOULDBLOCK` and only the next readiness callback retries it;
-//! * a deadline expires through the port timer (`tcp_inet_recv_timeout`, `:12480`), which attempts
-//!   the receive once more and otherwise answers `{error, timeout}`;
+//!   `:1549`), enqueues the operation (`enq_async`, `:12307`), then **attempts the read from inside
+//!   the control call** (`tcp_recv(desc, n)`, `:12310`) and only arms read readiness
+//!   (`sock_select(INETP(desc), (FD_READ|FD_CLOSE), 1)`, `:12315`) and the port timer
+//!   (`add_multi_timer`, `:12313`) when that attempt would block; the reply is `ctl_reply_ok` +
+//!   `<<Id:16/big>>` (`:12319`) either way;
+//! * a **`Timeout` of `0`** that would block is answered `{error, timeout}` from inside the same
+//!   call (`if (timeout == 0) async_error_am(am_timeout)`, `:12311`) — no timer, no readiness;
+//! * a deadline that later expires through the port timer (`tcp_inet_recv_timeout`, `:12480`)
+//!   attempts the receive once more and otherwise answers `{error, timeout}`;
 //! * a teardown answers every pending operation with `{error, closed}`
 //!   (`async_error_am_all(am_closed)`, `:2597`-`:2608`, reached from `tcp_close_check` `:11887`,
 //!   `tcp_recv_closed` `:12829` and `tcp_recv_error` `:12877`).
 //!
-//! Two consequences are the whole point of this suite and are asserted here rather than assumed:
+//! Three consequences are the whole point of this suite and are asserted here rather than assumed:
 //!
-//! 1. **A would-block is a park, not an error.** Nothing is delivered on the control reply, nothing
+//! 1. **A buffered unit is delivered by the control call itself.** The read runs before the arm, so
+//!    a payload (or a complete `{packet, N}` frame) already sitting in the socket buffer completes
+//!    the operation there — the reply is still only the id, and the `{inet_async, Port, Id, {ok,
+//!    Data}}` is already staged on the completion channel when `port_control/3` returns.
+//! 2. **A would-block is a park, not an error.** Nothing is delivered on the control reply, nothing
 //!    lands on the port's passive `{Port, {data, …}}` channel (the driver's input queue stays
 //!    empty), and no completion exists until the socket has something to say — however many
 //!    port-task rounds run in between.
-//! 2. **The completion is produced at a later round, never inside the control call**, and exactly
-//!    once. Both of the crate's drive points are pinned: the reactor's readiness edge
-//!    (`Driver::ready_input` → `async_ready_input`) and the round's own poll
-//!    (`Driver::drive_async` → `drive_async_ops`, run once per round by
-//!    [`PortRegistry::execute_port_tasks`](crate::PortRegistry::execute_port_tasks)).
+//! 3. **A parked completion is produced later, exactly once.** Both of the crate's drive points are
+//!    pinned: the reactor's readiness edge (`Driver::ready_input` → `async_ready_input`) and the
+//!    round's own poll (`Driver::drive_async` → `drive_async_ops`, run once per round by
+//!    [`PortRegistry::execute_port_tasks`](crate::PortRegistry::execute_port_tasks)) — the
+//!    level-triggered net that services a parked socket when no edge is reported.
 //!
 //! Every wait is a **condition** under a hang guard, never a wall-clock budget tuned for an idle
 //! host: a loop rounds, drains and re-rounds until the condition holds or the guard expires.
@@ -299,32 +304,23 @@ fn a_second_passive_receive_is_ealready_while_the_first_parks() {
 // Row 3 — the deadline
 // ---------------------------------------------------------------------------
 
-/// **A zero-timeout receive parks and then fails with `{error, timeout}`**: the reply is still just
-/// the id (`inet_drv.c:12319`), the deadline is declared to the port (`Driver::next_timeout`, the
-/// C's `driver_set_timer`), and the outcome arrives on the completion channel at a later round —
-/// once, from `tcp_inet_recv_timeout` (`:12480`). An exhausted deadline clears the port's timer.
+/// **A zero-timeout receive that would block answers `{error, timeout}` inside the control call.**
+/// The C's would-block arm is `if (timeout == 0) async_error_am(am_timeout)`
+/// (`inet_drv.c:12311`), so the outcome is already staged when `port_control/3` returns, the reply
+/// is still only the id (`:12319`), no timer is declared (`add_multi_timer`, `:12313`, is never
+/// reached) and no operation stays queued.
 #[test]
-fn a_zero_timeout_parks_then_completes_with_a_timeout() {
+fn a_zero_timeout_answers_timeout_inside_the_control_call() {
     let (mut port, _peer) = linked();
     assert_eq!(arm_receive(&mut port, 0), 0, "a zero deadline still answers the id");
-    assert!(
-        port.completions().is_empty(),
-        "and still reports nothing from the control call"
-    );
-    assert!(
-        port.next_timeout().is_some(),
-        "a pending operation declares its deadline to the port's single TIMEOUT task"
-    );
-
-    let events = await_events(&mut port, 1);
     assert_eq!(
-        events,
+        async_events(&port.completions()),
         vec![(0, InetAsyncResult::Error(InetReason::Timeout))],
-        "the timer answers the operation's own id"
+        "the would-block arm answers the operation from inside the control call"
     );
     assert!(
         port.next_timeout().is_none(),
-        "an empty queue declares no deadline, so the port clears its TIMEOUT task"
+        "no operation is left queued, so no deadline reaches the port's TIMEOUT task"
     );
     assert!(
         park_window(&mut port, PARK_WINDOW).is_empty(),
