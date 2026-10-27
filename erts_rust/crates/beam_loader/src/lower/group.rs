@@ -141,21 +141,21 @@ pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
             .get(i + 1)
             .map_or(instrs.len(), |next| next.func_label_idx);
         let body = &instrs[cut.func_label_idx..end];
-        // The one allocation of this body, sized for the post-fusion length so the
-        // peephole pass below has nothing to grow into.
-        let mut code: Vec<Instr> = Vec::with_capacity(body.len() - count_fusable_pairs(body));
-        for raw in body {
-            code.push(lower_instr(raw)?);
-        }
-        // The one peephole pass: `deallocate N; return` -> `DeallocateReturn(N)`.
-        // `blocks`/`labels` must be derived from the FUSED code so a block's
-        // `start..end` slice indexes the same vector the engine dispatches on.
-        super::fuse::fuse_in_place(&mut code);
-        // The pre-count is exact; the shrink is the defence against it ever not
-        // being, and leaves the retained body with no slack.
-        if code.len() != code.capacity() {
-            code.shrink_to_fit();
-        }
+        // The one allocation of this body, sized to the FUSED length: [`emit_fused`]
+        // applies the peephole rule as it lowers, so it emits `body.len() -
+        // count_fusable_pairs(body)` instructions and the vector never grows.
+        let fused_len = body.len() - count_fusable_pairs(body);
+        let mut code: Vec<Instr> = Vec::with_capacity(fused_len);
+        emit_fused(body, &mut code)?;
+        // The capacity is exact by construction. If a future change breaks that, the
+        // retained body carries slack (a memory regression, never a wrong
+        // instruction), so the invariant is asserted here in debug builds and pinned
+        // over the whole install by `tests/real_modules.rs::slack_tables` — a
+        // `shrink_to_fit` here would instead put a second, transient copy of every
+        // function's instruction vector back into the boot peak.
+        debug_assert_eq!(code.len(), code.capacity());
+        // `blocks`/`labels` are derived from the FUSED code so a block's `start..end`
+        // slice indexes the same vector the engine dispatches on.
         let (blocks, labels) = build_blocks(&code);
         functions.push(Function {
             func_label: cut.func_label,
@@ -171,6 +171,46 @@ pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
     Ok(functions)
 }
 
+/// Lowers `body` into `out`, applying the fuse rule as each pair closes.
+///
+/// `out` must have room for exactly `body.len() - count_fusable_pairs(body)`
+/// instructions — the length of the fused sequence — so it never reallocates and the
+/// body it becomes has no slack. The rule itself is
+/// [`super::fuse::fuses`], the same predicate [`super::fuse::fuse_in_place`] applies,
+/// so a body lowered here is element-for-element the body that pass produces:
+/// [`lower_instr`] lowers `Opcode::deallocate`/`Opcode::r#return` to
+/// [`Instr::Deallocate`]/[`Instr::Return`] and every other opcode to exactly one
+/// instruction, so the lowered adjacency the predicate tests is the raw body's.
+///
+/// Fusing during the emit rather than afterwards is what lets the one allocation be
+/// exact: emitting the pre-fusion sequence would overrun a capacity sized for the
+/// post-fusion one (by exactly the fused pair count) and grow to twice the final
+/// size. Errors are reported in stream order — an instruction is lowered in the
+/// iteration that visits it, whether or not its predecessor is still pending.
+fn emit_fused(body: &[RawInstr], out: &mut Vec<Instr>) -> Result<()> {
+    // The lowered instruction whose successor decides whether the pair fuses. Only a
+    // `Deallocate` can start a pair, but keeping `Option<Instr>` unconditional is what
+    // makes this exactly the adjacency `fuse_in_place` sees.
+    let mut pending: Option<Instr> = None;
+    for raw in body {
+        let instr = lower_instr(raw)?;
+        match pending.take() {
+            None => pending = Some(instr),
+            Some(prev) => match super::fuse::fuses(&prev, &instr) {
+                Some(n) => out.push(Instr::DeallocateReturn(n)),
+                None => {
+                    out.push(prev);
+                    pending = Some(instr);
+                }
+            },
+        }
+    }
+    if let Some(prev) = pending {
+        out.push(prev);
+    }
+    Ok(())
+}
+
 /// The number of adjacent `deallocate`/`return` pairs in a raw body.
 ///
 /// [`lower_instr`] maps `Opcode::deallocate` to [`Instr::Deallocate`] and nothing
@@ -178,8 +218,8 @@ pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
 /// other opcode produces exactly one instruction — so a lowered body is
 /// element-for-element its raw body and the adjacent pairs sit at the same
 /// positions. Two pairs can never overlap (`deallocate` cannot also be the `return`
-/// half of a pair), so this is exactly the number of instructions
-/// [`super::fuse::fuse_in_place`] removes. A wrong count would only make the body's
+/// half of a pair), so this is exactly the number of instructions [`emit_fused`] (and
+/// [`super::fuse::fuse_in_place`]) removes. A wrong count would only make the body's
 /// allocation the wrong size, never change the instructions.
 fn count_fusable_pairs(body: &[RawInstr]) -> usize {
     body.windows(2)
@@ -515,5 +555,122 @@ mod tests {
             group_functions(&instrs).unwrap_err(),
             BeamError::BadArg
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // The fused emit: one exact allocation, and the same body `fuse_in_place`
+    // produces
+    // -----------------------------------------------------------------------
+
+    /// The two routes to a fused body, for `body`: (a) lower every instruction and
+    /// run [`crate::lower::fuse::fuse_in_place`] over the result, (b) [`emit_fused`]
+    /// into an exactly-sized vector.
+    fn both_routes(body: &[RawInstr]) -> (Vec<Instr>, Vec<Instr>) {
+        let mut reference: Vec<Instr> = body.iter().map(|r| lower_instr(r).unwrap()).collect();
+        crate::lower::fuse::fuse_in_place(&mut reference);
+        let mut emitted: Vec<Instr> = Vec::with_capacity(body.len() - count_fusable_pairs(body));
+        emit_fused(body, &mut emitted).unwrap();
+        // The exactness invariant the whole change rests on: the pre-count is the
+        // emitted length, so the vector has no slack and never reallocated.
+        assert_eq!(
+            emitted.len(),
+            emitted.capacity(),
+            "the fused emit must fill its allocation exactly"
+        );
+        (reference, emitted)
+    }
+
+    /// One instruction of a body, from a 2-bit alphabet: `deallocate`, `return`,
+    /// `label`, `move` — enough to exercise every adjacency the rule can see.
+    fn alphabet(kind: u8) -> RawInstr {
+        match kind {
+            0 => deallocate(1),
+            1 => ret(),
+            2 => label(2),
+            _ => raw(Opcode::r#move, vec![Operand::X(0), Operand::X(1)]),
+        }
+    }
+
+    #[test]
+    fn emit_fused_agrees_with_lower_then_fuse_over_every_short_body() {
+        // Exhaustive over all 4^6 = 4096 six-instruction bodies: every position a
+        // `deallocate`/`return` pair can occupy, including a pair split by a `Label`,
+        // back-to-back pairs, a dangling `deallocate` and no pair at all.
+        const LEN: usize = 6;
+        let mut bodies = 0usize;
+        let mut fused_pairs = 0usize;
+        for pattern in 0..4u32.pow(LEN as u32) {
+            let body: Vec<RawInstr> = (0..LEN)
+                .map(|i| alphabet(((pattern >> (2 * i)) & 0b11) as u8))
+                .collect();
+            let (reference, emitted) = both_routes(&body);
+            assert_eq!(emitted, reference, "pattern {pattern:06b}");
+            bodies += 1;
+            fused_pairs += count_fusable_pairs(&body);
+        }
+        assert_eq!(bodies, 4096);
+        // The sweep really did cover the fusion path, not just copy-throughs.
+        assert!(fused_pairs > 0);
+    }
+
+    #[test]
+    fn emit_fused_fuses_adjacent_pairs_and_keeps_a_lone_deallocate() {
+        let body = vec![
+            label(1),
+            deallocate(1),
+            ret(),
+            label(2),
+            deallocate(2),
+            label(3),
+            ret(),
+            deallocate(3),
+        ];
+        let (_, emitted) = both_routes(&body);
+        assert_eq!(
+            emitted,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::DeallocateReturn(1),
+                Instr::Label(Label(2)),
+                // The `Label` between these two blocks the fuse.
+                Instr::Deallocate(2),
+                Instr::Label(Label(3)),
+                Instr::Return,
+                Instr::Deallocate(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn emit_fused_reports_the_first_unlowerable_instruction() {
+        let body = vec![deallocate(1), ret(), raw(Opcode::jump, vec![]), label(2)];
+        let mut out: Vec<Instr> = Vec::new();
+        assert!(matches!(
+            emit_fused(&body, &mut out),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// `group_functions` leaves every body's allocation exact — the invariant a
+    /// `shrink_to_fit` used to restore (and which put a second copy of every body in
+    /// the boot peak).
+    #[test]
+    fn group_functions_allocates_each_body_exactly() {
+        let (module, function) = atoms();
+        let instrs = vec![
+            label(1),
+            func_info(module, function, 1),
+            label(2),
+            deallocate(1),
+            ret(),
+            label(3),
+            func_info(module, function, 2),
+            label(4),
+            deallocate(2),
+            ret(),
+        ];
+        for f in group_functions(&instrs).unwrap() {
+            assert_eq!(f.code.len(), f.code.capacity());
+        }
     }
 }

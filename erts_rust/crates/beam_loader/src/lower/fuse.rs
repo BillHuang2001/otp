@@ -47,6 +47,21 @@ pub fn fuse(code: Vec<Instr>) -> Vec<Instr> {
     code
 }
 
+/// The fuse rule, applied to one adjacent pair: `Deallocate(n)` immediately followed
+/// by `Return` yields `Some(n)`, and every other pair `None`.
+///
+/// This is the **only** statement of the rule. [`fuse_in_place`] applies it to the
+/// already-lowered body an owning caller hands over; `group::emit_fused` applies it
+/// while it lowers, so the body it emits is the body this pass would have produced —
+/// and each body's allocation can be sized to the fused length up front instead of
+/// being shrunk (reallocated) afterwards.
+pub fn fuses(prev: &Instr, next: &Instr) -> Option<u32> {
+    match *prev {
+        Instr::Deallocate(n) if matches!(*next, Instr::Return) => Some(n),
+        _ => None,
+    }
+}
+
 /// `deallocate N; return` -> `DeallocateReturn(N)`, compacted in place.
 /// Only an ADJACENT pair with no intervening `Instr::Label` is fused (a `Label`
 /// is the only branch target, so two adjacent non-`Label` instructions are
@@ -67,9 +82,9 @@ pub fn fuse_in_place(code: &mut Vec<Instr>) {
         // The next instruction is the `Return` (any `Label` between the two would
         // have been that next instruction instead, so the pair is adjacent by
         // construction). Binds only the `Copy` word, so nothing is moved out.
-        let pop = match code[read] {
-            Instr::Deallocate(n) if matches!(code.get(read + 1), Some(Instr::Return)) => Some(n),
-            _ => None,
+        let pop = match code.get(read + 1) {
+            Some(next) => fuses(&code[read], next),
+            None => None,
         };
         match pop {
             Some(n) => {
