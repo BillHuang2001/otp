@@ -185,7 +185,7 @@ fn command_of(ctx: &RuntimeContext<'_>, request: Eterm) -> Option<(String, Vec<E
         let name = ctx.atom_name(request)?;
         return Some((name, Vec::new()));
     }
-    let fields = crate::native::tuple_fields(request).ok()?;
+    let fields = crate::native::tuple_fields(request)?;
     let command = ctx.atom_name(fields[0])?;
     Some((command, fields[1..].to_vec()))
 }
@@ -235,7 +235,8 @@ fn put_chars_bad_encoding(
 /// `file_io_server.erl:366-374` answers `{error, {error, Func}}` (the **function**, not the
 /// module), which `io.erl`'s `conv_reason/1` turns into `badarg`.
 fn applied_bad_payload(ctx: &mut RuntimeContext<'_>, _stream: Stream, func: Eterm) -> Result<Eterm> {
-    let inner = ctx.tuple(&[ctx.atom("error")?, func])?;
+    let tag = ctx.atom("error")?;
+    let inner = ctx.tuple(&[tag, func])?;
     error_reply(ctx, inner)
 }
 
@@ -290,10 +291,10 @@ fn requests(
 
 /// Whether `term` is `{error, _}`.
 fn is_error_tuple(ctx: &RuntimeContext<'_>, term: Eterm) -> bool {
-    match crate::native::tuple_fields(term) {
-        Ok(fields) => fields.len() == 2 && ctx.atom_name(fields[0]).as_deref() == Some("error"),
-        Err(_) => false,
-    }
+    let Some(fields) = crate::native::tuple_fields(term) else {
+        return false;
+    };
+    fields.len() == 2 && ctx.atom_name(fields[0]).as_deref() == Some("error")
 }
 
 /// `{error, Reason}` — the shared shape of every served failure reply.
@@ -345,12 +346,14 @@ fn setopts(ctx: &mut RuntimeContext<'_>, stream: Stream, options: Eterm) -> Resu
     };
     for item in items {
         let accepted = match crate::native::tuple_fields(item) {
-            Ok(fields) if fields.len() == 2 => match (ctx.atom_name(fields[0]).as_deref(), stream) {
-                (Some("encoding"), _) => encoding_of(ctx.atom_name(fields[1]).as_deref()).is_some(),
-                (Some("binary"), Stream::Output) => true,
-                (Some("terminal" | "onlcr" | "log" | "expand_fun" | "echo"), _) => true,
-                _ => false,
-            },
+            Some(fields) if fields.len() == 2 => {
+                match (ctx.atom_name(fields[0]).as_deref(), stream) {
+                    (Some("encoding"), _) => encoding_of(ctx.atom_name(fields[1]).as_deref()).is_some(),
+                    (Some("binary"), Stream::Output) => true,
+                    (Some("terminal" | "onlcr" | "log" | "expand_fun" | "echo"), _) => true,
+                    _ => false,
+                }
+            }
             _ => false,
         };
         if !accepted {

@@ -331,7 +331,8 @@ impl RuntimeContext<'_> {
         if let Some(reason) = self.device_failure_reason(target) {
             return self.error_of(reason);
         }
-        let list = self.tuple(&[self.atom("requests")?, requests])?;
+        let tag = self.atom("requests")?;
+        let list = self.tuple(&[tag, requests])?;
         self.serve_request(target, list)
     }
 
@@ -371,7 +372,7 @@ impl RuntimeContext<'_> {
     /// [`Self::conv_reason`]; any other reply is the call's value.
     fn o_request_to(&mut self, target: Device, request: Eterm) -> Result<Eterm> {
         let reply = self.serve_request(target, request)?;
-        if let Ok(fields) = crate::native::tuple_fields(reply) {
+        if let Some(fields) = crate::native::tuple_fields(reply) {
             if fields.len() == 2 && self.atom_name(fields[0]).as_deref() == Some("error") {
                 return Err(self.conv_reason(fields[1]));
             }
@@ -390,7 +391,7 @@ impl RuntimeContext<'_> {
                 _ => BeamError::BadArg,
             };
         }
-        if let Ok(fields) = crate::native::tuple_fields(reason) {
+        if let Some(fields) = crate::native::tuple_fields(reason) {
             if fields.len() == 3 && self.atom_name(fields[0]).as_deref() == Some("no_translation") {
                 return raise_atom("no_translation");
             }
@@ -406,7 +407,7 @@ impl RuntimeContext<'_> {
                 Some(reply) => Ok(reply),
                 None => request::unknown_request(self, stream, request),
             },
-            Device::File(device) => self.runtime.file_services.serve_io_request(device, request),
+            Device::File(device) => self.runtime.serve_io_request(device, request),
             Device::Retired(_) | Device::DeadPid => {
                 let terminated = self.atom("terminated")?;
                 self.error_of(terminated)
@@ -610,7 +611,7 @@ pub(crate) const fn encoding_name(encoding: Encoding) -> &'static str {
 }
 
 /// A bare `error:<atom>` raise (the `no_translation` of `conv_reason/1`).
-fn raise_atom(name: &str) -> BeamError {
+fn raise_atom(name: &'static str) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(name)))
 }
 

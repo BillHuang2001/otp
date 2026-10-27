@@ -155,7 +155,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use beam_common::{BeamError, Result};
-use beam_engine::terms;
+use beam_engine::{terms, ExecutionContext};
 use beam_gc::HeapPolicy;
 use beam_io::io_device::Encoding;
 use beam_process::{ProcessId, ProcessTable};
@@ -765,7 +765,7 @@ impl Runtime {
                 // {reply, ok, State})` (`file_io_server.erl:412-414`, `:423-430`): each request
                 // runs in order and the **last** reply is the answer; a reply that is not the
                 // device's own `ok` stops the loop.
-                let Some(items) = terms::list_elements(fields[1]) else {
+                let Some(items) = terms::list_elements(fields[1]).ok() else {
                     let tag = self.atom("request")?;
                     let reason = self.tuple(&[tag, request])?;
                     let reply = self.error_of(reason)?;
@@ -1065,7 +1065,7 @@ impl Runtime {
     /// the oracle's `{error, terminated}` and retires the device.
     fn request_encoding(&mut self, encoding: Eterm) -> Result<Encoding> {
         let name = self.atom_name(encoding);
-        match name.as_deref().and_then(crate::native::io::convert::encoding_of) {
+        match crate::native::io::convert::encoding_of(name.as_deref()) {
             Some(encoding) => Ok(encoding),
             // The device raises (it can neither name nor transcode), so it dies without a
             // reply: the caller sees the oracle's `{error, terminated}`.
@@ -1082,13 +1082,15 @@ impl Runtime {
         let (Some(module_name), Some(function_name), Some(arguments)) = (
             self.atom_name(module),
             self.atom_name(function),
-            terms::list_elements(args),
+            terms::list_elements(args).ok(),
         ) else {
             return Ok(Payload::Failed(function));
         };
         let mut ctx = RuntimeContext::new(&mut *self);
         match ctx.call_bif(&module_name, &function_name, arguments.len() as u32, &arguments) {
-            Ok(value) if is_list(value) || is_binary(value) => Ok(Payload::Chars(value)),
+            Ok(value) if is_list(value) || terms::binary_bytes(value).is_ok() => {
+                Ok(Payload::Chars(value))
+            }
             Ok(_) => Ok(Payload::Failed(function)),
             Err(_) => Ok(Payload::Failed(function)),
         }
@@ -1153,14 +1155,7 @@ impl Runtime {
             }
         }
     }
-    /// Whether `reply` is the `{error, Reason}` shape that stops a `{requests, …}` loop.
-fn is_error_tuple(runtime: &Runtime, reply: Eterm) -> bool {
-    let Some(fields) = tuple_fields(reply) else {
-        return false;
-    };
-    fields.len() == 2 && runtime.atom_name(fields[0]).as_deref() == Some("error")
-}
-/// The io-device's open file.
+    /// The io-device's open file.
     fn device_file(&mut self, service: ProcessId) -> Result<&mut std::fs::File> {
         Ok(&mut self.device_mut(service)?.file)
     }
@@ -1301,6 +1296,16 @@ fn is_error_tuple(runtime: &Runtime, reply: Eterm) -> bool {
         let ctx = RuntimeContext::new(&mut *self);
         ctx.encode_path(term)
     }
+}
+
+/// Whether `reply` is the `{error, Reason}` shape that stops a `{requests, …}` loop
+/// (`file_io_server:io_request_loop/2`: a reply that is not the device's own `ok` ends the
+/// run, and the `{requests, …}` caller sees it).
+fn is_error_tuple(runtime: &Runtime, reply: Eterm) -> bool {
+    let Some(fields) = tuple_fields(reply) else {
+        return false;
+    };
+    fields.len() == 2 && runtime.atom_name(fields[0]).as_deref() == Some("error")
 }
 
 /// The `SeekFrom` a `{position, At}` request denotes (`file_io_server.erl:268-273`).///
