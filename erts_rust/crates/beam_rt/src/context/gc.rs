@@ -2322,8 +2322,8 @@ fn alloc_words_rooted_commit(
         return runtime.alloc_words(n);
     }
     // The latch's closing half, exactly as at [`ensure_heap_full`]: this door also handed the
-    // valve the machine's whole root set, so a descent that reached no foreign container says the
-    // process's graph holds none and the bit can be retired.
+    // valve the machine's whole root set, so a descent that reached no hazardous foreign
+    // container says the process's graph holds none and the bit can be retired.
     if verdict.foreign_free {
         runtime.close_foreign_reachable(pid);
     }
@@ -3899,6 +3899,90 @@ mod tests {
         assert!(
             rt.foreign_reachable(pid),
             "the BIF-result seam only opens the latch; a clean result cannot close it"
+        );
+    }
+    /// **An inert foreign container does not keep the descent latch open across a full-root door.**
+    ///
+    /// That door-driven retirement is what bounds the `O(live)` root descent to the events that can
+    /// introduce a *hazard*: [`ensure_heap_full`] hands the valve the machine's **whole** root set,
+    /// so a descent that reached no container a relocation could leave dangling retires `pid`'s bit
+    /// ([`Runtime::close_foreign_reachable`]) and the next admission pays the per-word phase alone.
+    /// Before the verdict was refined to the hazard ([`forwards_scanned_word`]) rather than "any
+    /// foreign container at all", a process keeping one inert foreign term alive — a `make_ref/0`
+    /// block, an arena tuple of small integers, exactly what the boot-setup process `<0.10.0>`
+    /// holds — re-proved the same fact at **every** admission
+    /// (`descents_per_collection` 1.000), and that whole-graph descent was ≈8 % of the boot
+    /// profile's samples.
+    ///
+    /// Both halves are driven through the real door, never a re-derivation of its valve call:
+    ///
+    /// 1. **hazard** — the machine root holds a foreign cons over a nursery word: the valve
+    ///    declines (collecting would relocate that word without updating the block), the latch
+    ///    stays open, and the arena fallback is the honest answer;
+    /// 2. **inert** — same process, same door, the nursery term no longer reachable: the descent
+    ///    reaches only the all-immediate foreign tuple, so the verdict is `foreign_free`, the door
+    ///    retires the latch and the collection proceeds.
+    ///
+    /// The retirement is sound by the case list of
+    /// [`a_foreign_leaf_is_not_unscanned_but_a_container_forwarding_a_young_word_is`]: an inert
+    /// container forwards no scanned word, so no relocation can leave it stale.
+    #[test]
+    fn an_inert_foreign_container_does_not_keep_the_descent_latch_open() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+        let region = ForeignRegion::new(table.get_mut(pid).expect("the spawned process"));
+        let mut x = [NIL; 4];
+        let mut stack = [NIL; 2];
+        let mut fr = [NIL; 4];
+        let door = |rt: &mut Runtime,
+                    table: &mut ProcessTable,
+                    x: &mut [Eterm],
+                    stack: &mut [Eterm],
+                    fr: &mut [Eterm]| {
+            rt.request_gc(pid);
+            let mut ctx = RuntimeContext::for_process(rt, table, pid);
+            ctx.current_module = Some("gc_foreign_latch".to_string());
+            ensure_heap_full(
+                &mut ctx,
+                0,
+                RootSet::new(x, stack, fr, 1),
+                true,
+            )
+            .expect("the heap-admission point never fails the program");
+        };
+        assert!(!rt.foreign_reachable(pid), "a fresh pid's latch is closed");
+        // (1) A foreign container forwarding a nursery word: the door declines, so the latch it
+        //     opened stays open and no collection touches the nursery word the block holds.
+        x[0] = region.cons_over_young;
+        valve_counters::reset();
+        door(&mut rt, &mut table, &mut x, &mut stack, &mut fr);
+        let hazardous = valve_counters::snapshot().ensure_heap_full;
+        assert_eq!(
+            hazardous.collections, 0,
+            "a hazardous root must decline the collection; {hazardous:?}"
+        );
+        assert!(
+            rt.foreign_reachable(pid),
+            "the declined door must leave the descent latch open"
+        );
+        // (2) The same process and door with only the **inert** foreign tuple reachable: the
+        //     descent reached no hazardous container, so the door retires the latch and collects.
+        x[0] = region.tuple;
+        valve_counters::reset();
+        door(&mut rt, &mut table, &mut x, &mut stack, &mut fr);
+        let inert = valve_counters::snapshot().ensure_heap_full;
+        assert_eq!(
+            inert.collections, 1,
+            "an inert foreign root must not decline the collection; {inert:?}"
+        );
+        assert!(
+            !rt.foreign_reachable(pid),
+            "a full-root descent that reached only an inert foreign container must retire the \
+             latch — otherwise the process re-proves the same fact at every admission for the \
+             rest of its life"
         );
     }
 }

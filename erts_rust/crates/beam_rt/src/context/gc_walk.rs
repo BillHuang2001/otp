@@ -66,7 +66,8 @@
 //! / NIF result that forwards a scanned word, the arena fallback of the allocation seams, the
 //! escape-store stabilisation, a heap-fragment message delivery, and a spawn's initial arguments
 //! or entry fun) and it is **closed again** by a descent that ran over the process's *whole* root
-//! set and reached no foreign container at all ([`ValveVerdict::foreign_free`]).
+//! set and reached no foreign container a relocation could leave dangling
+//! ([`ValveVerdict::foreign_free`]).
 //!
 //! Soundness of the gate (this is the whole argument, and it is a *one-way* argument — a wrong
 //! `false` would resurrect the corruption the walk exists to prevent):
@@ -80,8 +81,11 @@
 //!   hold one are the events listed above — each of which opens the bit. A foreign container can
 //!   likewise only be a *root word* after one of those events put it there.
 //! * the only sound way to **close** the bit is therefore a proof that the process's reachable
-//!   graph holds no foreign container at all, which is precisely what a descent over its
-//!   complete root set answers when it comes back foreign-free.
+//!   graph holds no *hazardous* foreign container — one forwarding a scanned word — which is
+//!   precisely what a descent over its complete root set answers when it comes back hazard-free.
+//!   An inert container is not enough to keep it open: it CANNOT dangle a scanned word, and a
+//!   process that holds one (a tuple of immediates on the arena, a reference block) would
+//!   otherwise pay the descent at every heap admission for the rest of its life.
 //!
 //! # Closing the gate again — the current rule, and its residual
 //!
@@ -89,7 +93,8 @@
 //! valve at roughly every heap test, so a real compile pays a walk per heap-admission point
 //! (hundreds of thousands of them — see [`seed_counters`]' measurement test). The bit is
 //! therefore cleared as soon as that is provable: [`ValveVerdict::foreign_free`] reports *"the
-//! descent ran and reached no container from a region the collector does not scan"*, and
+//! descent ran and reached no container from a region the collector does not scan that forwards a
+//! word into one it does"*, and
 //! [`Runtime::close_foreign_reachable`](crate::runtime::Runtime) retires the pid's bit on it.
 //!
 //! Two facts make that sound rather than merely plausible:
@@ -259,13 +264,19 @@ pub(crate) struct ValveVerdict {
     /// is reachable from the roots — so a collection would leave that word pointing into an
     /// evacuated from-space and must be declined.
     pub(crate) declined: bool,
-    /// The descent ran (the caller's gate was open) and reached **no** container in a region the
-    /// collector does not scan at all.
+    /// The descent ran (the caller's gate was open) and reached **no foreign container that
+    /// forwards a scanned word** — i.e. nothing a relocation could leave dangling, at any depth.
     ///
-    /// This is deliberately the *stronger* of the two clean answers: "no foreign container is
-    /// reachable" makes a hazard impossible without appealing to the forwarding test's precision,
-    /// so a caller that handed over its **whole** root set may close the process's descent latch
-    /// on it ([`crate::runtime::gc::GcState::foreign`]). A caller that handed over less (the
+    /// This is deliberately the *hazard-free* answer rather than "no foreign container is
+    /// reachable at all": a container that forwards nothing a relocation acts on imposes no
+    /// follow/update obligation ([`crate::context::gc::WordRegion`]'s soundness note), so it can
+    /// neither dangle anything nor justify declining a collection — and it must not keep the
+    /// process's descent latch open, or a process holding one inert foreign container (an
+    /// all-immediate tuple, a reference block, a tuple of immediates) would re-prove the same fact
+    /// on **every** heap admission for its whole life.
+    ///
+    /// A caller that handed over its **whole** root set may therefore close the process's descent
+    /// latch on it ([`crate::runtime::gc::GcState::foreign`]). A caller that handed over less (the
     /// narrow admission door, the park arm, the collection gate) must ignore it.
     pub(crate) foreign_free: bool,
 }
@@ -284,7 +295,8 @@ pub(crate) struct ValveVerdict {
 /// `descend` is the caller's **foreign-reachability gate** (this module's docs): when it is
 /// `false` the descent is skipped and only the cheap `O(roots)` per-word phase runs. The gate can
 /// only ever cost a collection, never allow a wrong one — and a gate that is *open* is closed
-/// again by a [verdict](ValveVerdict) that reached no foreign container at all.
+/// again by a [verdict](ValveVerdict) that reached no foreign container a relocation could leave
+/// dangling.
 // Every production caller names its own [`ValveDoor`] (the `_at` form below), so the walk it
 // issues is attributable in the invocation census. These un-doored forms are what the unit
 // suites call directly and what the sibling modules' docs link to; a production caller
@@ -373,10 +385,13 @@ where
     }
     let verdict = ValveVerdict {
         declined: walk.hit,
-        // Only a descent may claim the graph is foreign-free: the per-word phase looked at the
+        // Only a descent may claim the graph is hazard-free: the per-word phase looked at the
         // roots alone, and a foreign container nested in a scanned one is exactly what it cannot
-        // see.
-        foreign_free: descend && !walk.foreign_reached,
+        // see. `hit` is the hazard itself ([`Walk::reach_foreign`]), so this is "descended and
+        // reached no container that a relocation could leave dangling" — an **inert** foreign
+        // container (an all-immediate tuple, a reference block, a tuple of immediates) is reached
+        // but is not a hazard, and so cannot keep the latch open.
+        foreign_free: descend && !walk.hit,
     };
     super::gc_valve_trace::note_verdict(
         process.pid(),
@@ -704,10 +719,6 @@ struct Walk<'a> {
     /// foreign pointer-bearing word that is not a reference thing (the prune) — or a root that is
     /// one.
     hit: bool,
-    /// A container in a region the collector does not scan was reached at all (hazardous or not).
-    /// This is what an admission point that handed over its whole root set needs in order to
-    /// **close** the descent latch again (see [`ValveVerdict::foreign_free`]).
-    foreign_reached: bool,
     /// [`Criterion::ResourcePrune`] only: the caller's candidate raw words, **sorted**. A word
     /// equal to one of them is recorded in `reached` instead of being expanded (see
     /// [`reachable_resource_words`]).
@@ -979,7 +990,6 @@ impl<'a> Walk<'a> {
             geometry: Geometry::of(process),
             criterion,
             hit: false,
-            foreign_reached: false,
             candidates: None,
             reached: Vec::new(),
             resource_ids: Vec::new(),
@@ -1134,41 +1144,6 @@ impl<'a> Walk<'a> {
     /// (see [`reaches_an_unscanned_word`] and [`is_inert_reference`]) — otherwise a container to
     /// expand so a foreign → foreign → scanned chain is still found.
     fn reach_foreign(&mut self, process: &Process, word: Eterm) {
-        // TEMPORARY INSTRUMENTATION (not to be committed).
-        if std::env::var_os("BEAM_RT_VALVE_FOREIGN_DUMP").is_some() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let pid = process.pid();
-            if pid.number() == 10 && pid.serial() == 0 {
-                let n = N.fetch_add(1, Ordering::Relaxed);
-                if n < 24 {
-                    let addr = ptr_val(word) as usize;
-                    let mut extra = String::new();
-                    if is_list(word) {
-                        extra.push_str(" list");
-                    } else {
-                        // SAFETY: temporary diagnostics on a word the walk just classified.
-                        unsafe {
-                            let h = *(addr as *const usize);
-                            extra.push_str(&format!(" header={h:#x}"));
-                        }
-                        for i in 0..3u8 {
-                            // SAFETY: as above (payload words of a classified container).
-                            unsafe {
-                                extra.push_str(&format!(" w{i}={:#x}", *((addr as *const usize).add(1 + i as usize))));
-                            }
-                        }
-                    }
-                    eprintln!(
-                        "[foreign-dump] pid={pid:?} word={:#x} addr={addr:#x} bounds=[{:#x},{:#x}){extra}",
-                        word.raw(),
-                        process.collector().scanned_bounds().base(),
-                        process.collector().scanned_bounds().limit()
-                    );
-                }
-            }
-        }
-        self.foreign_reached = true;
         if self.criterion == Criterion::PayloadPrune {
             // The prune frees off-heap payloads, and a foreign container may name one through a
             // `BinRef` the collector's own walk can never see — whatever else it forwards. A
