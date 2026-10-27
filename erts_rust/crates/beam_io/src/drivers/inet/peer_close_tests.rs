@@ -44,18 +44,17 @@
 //! (`sock_select(FD_READ|FD_CLOSE, 1)`, `inet_drv.c:12315`), so the receive that armed it is
 //! always the party that reads the end-of-file — and `tcp_recv_closed` answers it through
 //! `async_error_am_all(am_closed)` (`:12829`) while arming only the *send* one-shot (`:12816`).
-//! This floor's poller is **edge-triggered** and keeps the socket's `READABLE` registration for its
-//! whole life, so the **reactor** (`ready_input`) also reads sockets the C would never have read —
-//! a passive connection with no `TCP_REQ_RECV` queued and no `{active, …}` grant in force. Such a
-//! read is a *delivery* shortcut, not a discovery (`ReadReport::Unselected`): the bytes it collects
-//! reach the owner, but a close it finds applies **nothing** — the C, which selects the read side
-//! only for a where-waiting receive or an active grant (`inet_drv.c:12317`, `:7966`), never observes
-//! that close, so it keeps the descriptor CONNECTED and keeps answering a zero-length `send` `ok`.
+//! This driver follows the same rule (`mod.rs`'s read-selection note): it reads **only** for a
+//! granted `{active, …}` (`inet_drv.c:7966`) or a queued `TCP_REQ_RECV` (`:12317`), so a passive
+//! connection with no receive pending performs no `read(2)` at all and never observes the peer's
+//! close — it keeps the descriptor CONNECTED and keeps answering a zero-length `send` `ok`, exactly
+//! as the C does. The socket keeps its poller **registration** for its whole life (`Interest` has no
+//! empty mask and `mio`'s epoll is edge-triggered), but a registration is not a read selection.
 //!
-//! The `a_reactor_discovered_*` and `the_reactor_rows_agree_with_the_erl_oracle` rows below
-//! therefore give the reactor a read the C **would** have made — a queued `TCP_REQ_RECV` — and pin
-//! that the answer the C gives that receive (`async_error_am_all(am_closed)`, `:12829`) is what the
-//! user sees. The earlier rows pin the route where a `recv` makes the discovery itself.
+//! Every row below therefore makes the discovery through a read the C **would** have made — a
+//! queued `TCP_REQ_RECV` — and pins that the answer the C gives that receive
+//! (`async_error_am_all(am_closed)`, `:12829`) is what the user sees. The earlier rows pin the route
+//! where a `recv` makes the discovery itself.
 use super::opcode_tests::{
     assert_agrees, erl_stdout, loopback_arg, op, open_arg, opened_port, oracle_replies, Rig, Rule,
     CONTROL_MAGIC,
@@ -67,8 +66,15 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-/// The `TCP_REQ_RECV`(42) operand of a passive, raw, zero-length, no-deadline receive.
-const RECV_OPERAND: [u8; 8] = [0; 8];
+/// The `TCP_REQ_RECV`(42) operand of a passive, raw, zero-length receive with **no deadline**
+/// (`Timeout = -1`, the C's `INET_INFINITY`).
+///
+/// A zero `Timeout` cannot be used here: `tcp_inet_ctl`'s arm answers an operation that would block
+/// with `{error, timeout}` **inside the control call** (`if (timeout == 0) async_error_am(am_timeout)`,
+/// `inet_drv.c:12311`), so nothing would ever be queued for the reactor's discovery to answer.
+/// With `INET_INFINITY` the operation parks, declares no deadline (`add_multi_timer` is skipped), and
+/// stays queued until the close ladder or a delivery answers it.
+const RECV_OPERAND: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 
 /// `{show_econnreset,true}`: the `INET_LOPT_TCP_SHOW_ECONNRESET`(39) five-byte setopts record.
 const SHOW_ECONNRESET: [u8; 5] = [39, 0, 0, 0, 1];
@@ -184,9 +190,9 @@ fn close_peer_write(rig: &mut ResetRig) {
 /// poller is **quiescent** (a poll reports nothing ready) or the driver has released the dead
 /// socket's registration.
 ///
-/// Quiescence, not an empty registration set, is the correct stop condition: the reactor reads a
-/// passive socket the C would not have selected (see [`super::ReadReport`]), and such a read
-/// applies **nothing** — not even the close it may find — so it leaves the registration in place.
+/// Quiescence, not an empty registration set, is the correct stop condition: only a read the C would
+/// have made (a queued `TCP_REQ_RECV`, an active grant) applies a peer close, and the socket's
+/// registration outlives it, so the loop stops when the poller has nothing left to report.
 fn drive_reactor(rig: &mut ResetRig) {
     let deadline = Instant::now() + HANG_GUARD;
     loop {
@@ -416,11 +422,13 @@ fn a_reactor_discovered_end_of_file_answers_closed_then_enotconn() {
     );
 }
 
-/// The named `recv` verb makes the same read itself (it is the C's `tcp_recv`, `:13130`), so it is
-/// the party the close is answered to: after the reactor's eager — unselected, applying-nothing —
-/// read has drained the end-of-file, the verb still answers `closed` and then `enotconn`.
+/// The named `recv` verb makes the read itself (it is the C's `tcp_recv`, `:13130`), so it is the
+/// party the close is answered to: a readiness round reads **nothing** for a passive socket with no
+/// queued receive (the C selects a read only for a granted `{active, …}` or a waiting
+/// `TCP_REQ_RECV`), so the end-of-file is still there for the verb, which answers `closed` and then
+/// `enotconn`.
 #[test]
-fn a_reactor_discovered_end_of_file_answers_the_named_recv_verb_the_same_way() {
+fn a_reactor_round_reads_nothing_so_the_named_recv_verb_discovers_the_close() {
     let mut rig = connected_rig(HIDE_ECONNRESET);
     rig.peer
         .as_ref()

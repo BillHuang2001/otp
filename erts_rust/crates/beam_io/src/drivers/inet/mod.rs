@@ -47,7 +47,7 @@
 //! | `accept` | `INET_REQ_ACCEPT` (`:12144`) | — | `[1, fd_be32]`, or `[1]` when nothing is pending † |
 //! | `connect` | `INET_REQ_CONNECT` (`:12064`) | `Timeout(4) ++` packed address | `[1]`, or `[0] ++ errno` / `[0]etimedout` |
 //! | `send` | `tcp_inet_command` (`:12629`) | the bytes to send | `[1]` |
-//! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` † |
+//! | `recv` | `TCP_REQ_RECV` (`:12268`) | `Timeout(4) ++ Length(4)` | `[1] ++ <<Id:16/big>>` † |
 //! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]`, or `[0]enotconn` / `[0]einval` |
 //! | `close` | `INET_REQ_CLOSE` (`:12259`) | — | `[1]` |
 //! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
@@ -55,8 +55,9 @@
 //!
 //! † The rows marked with a dagger describe the **named** verbs, this floor's own read-now
 //! vocabulary for a direct caller. The **numeric** C requests `INET_REQ_ACCEPT`(26) and
-//! `TCP_REQ_RECV`(42) are asynchronous: they answer `[1] ++ <<Id:16/big>>` and complete later
-//! through the completion channel — see *The asynchronous-operation queue* below.
+//! `TCP_REQ_RECV`(42) are asynchronous: they answer `[1] ++ <<Id:16/big>>` and report the outcome
+//! through the completion channel under that id — a receive the socket can already satisfy delivers
+//! it **inside** this control call (see *The asynchronous-operation queue* below).
 //!
 //! A reply is the C's `ctl_reply` shape: a one-byte result tag ([`INET_REP_OK`] or
 //! [`INET_REP_ERROR`], `:869-871`) followed by a payload — `ctl_reply`/`ctl_reply_ok`/
@@ -156,11 +157,13 @@
 //!
 //! # The asynchronous-operation queue
 //!
-//! The C's `recv`/`accept` cannot be answered by their control call — the data (or the
-//! connection) is not there yet — so they are request/reply exchanges: the reply is an **id**
-//! (`[1] ++ <<Id:16/big>>`) and the outcome arrives later through the crate's
-//! [`completion`](crate::completion) channel as `{inet_async, Port, Id, Result}`. That queue is
-//! implemented for **both** numeric requests ([`self::op_queue`], with the accept list itself in
+//! The C's `recv`/`accept` are request/reply exchanges: the reply is an **id**
+//! (`[1] ++ <<Id:16/big>>`) and the outcome arrives through the crate's
+//! [`completion`](crate::completion) channel as `{inet_async, Port, Id, Result}`. The control call
+//! attempts the operation first — `tcp_recv(desc, n)` for a receive (`inet_drv.c:12310`), one
+//! non-blocking `accept(2)` for an accept — so data (or a connection) already there is delivered by
+//! that call and only a would-block one arms readiness and the timer. That queue is implemented for
+//! **both** numeric requests ([`self::op_queue`], with the accept list itself in
 //! [`self::accept`]):
 //!
 //! * `TCP_REQ_RECV`(42) takes the C's `Timeout(4), Length(4)` operand and occupies the
@@ -177,12 +180,13 @@
 //!
 //! The id counter is the C's `NEW_ASYNC_ID` (`op_ref++ & 0xffff`, `:1549`): it starts at `0` and
 //! is taken *before* the capacity check, so a refused enqueue still advances it. A completion is
-//! produced at exactly three points — socket readiness ([`Driver::ready_input`]), the port timer
-//! ([`Driver::next_timeout`]/[`Driver::timeout`], armed from the operation's deadline), and the
-//! round's async drive point ([`Driver::drive_async`], which serves data that arrived *before* the
-//! operation was enqueued) — never inside the control call. A close drains every pending
-//! operation with `{error, closed}` (`async_error_am_all`, `:2597`-`:2608`) before the descriptor
-//! goes away. A command's `[n:be16][n ETF bytes]` **caller tag** is likewise answered through it
+//! produced at **four** points: the control call's own attempt (the C's try-first — `tcp_recv`
+//! `:12310`, `packet_inet_input` `:14980`), socket readiness ([`Driver::ready_input`]), the port
+//! timer ([`Driver::next_timeout`]/[`Driver::timeout`], armed from the operation's deadline), and
+//! the round's async drive point ([`Driver::drive_async`] — the level-triggered net that also
+//! serves data that arrived *before* the operation was enqueued, so a missed readiness edge cannot
+//! strand a queued operation). A close drains every pending operation with `{error, closed}`
+//! (`async_error_am_all`, `:2597`-`:2608`) before the descriptor goes away. A command's `[n:be16][n ETF bytes]` **caller tag** is likewise answered through it
 //! (`{inet_reply, Port, Reply, Tag}`, `inet_reply_finish` `:2614`-`:2637`).
 //!
 //! **Divergence:** the C addresses a completion to `desc->caller`; the frozen [`crate::Driver`]
@@ -316,8 +320,9 @@ pub use self::udp::{make_udp_inet, UdpInetDriver, UDP_DRIVER_NAME};
 // `{send_timeout_close, …}`/`{line_delim, …}`) and their value vocabulary. Its codes are
 // re-exported the same way the wire vocabulary is.
 pub use self::opt::{
-    INET_ACTIVE, INET_INFINITY, INET_LOPT_ACTIVE, INET_LOPT_LINE_DELIM, INET_LOPT_PACKET,
-    INET_LOPT_PACKET_SIZE, INET_LOPT_TCP_SEND_TIMEOUT, INET_LOPT_TCP_SEND_TIMEOUT_CLOSE,
+    INET_ACTIVE, INET_INFINITY, INET_LOPT_ACTIVE, INET_LOPT_DELIVER, INET_LOPT_LINE_DELIM,
+    INET_LOPT_PACKET, INET_LOPT_PACKET_SIZE, INET_LOPT_TCP_SEND_TIMEOUT,
+    INET_LOPT_TCP_SEND_TIMEOUT_CLOSE,
     INET_MULTI, INET_ONCE, INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PASSIVE,
     TCP_OPT_NODELAY,
 };
@@ -457,9 +462,7 @@ impl InetState {
 ///   A **read** discovery never arms it, here or in the C: the C reads a socket only while it is
 ///   selected (`{active, …}` or a waiting `TCP_REQ_RECV`), so the reader that finds the close is
 ///   always the party it is answered to, and the reply is given inline through
-///   [`PeerClose::observed_reason`]. This floor's eager passive reactor read is *not* such a
-///   reader, so a close it finds is not applied at all — it stays pending for the read the C would
-///   have made (see [`ReadReport`] and [`TcpInetDriver::pending_close`]).
+///   [`PeerClose::observed_reason`].
 /// * `DELAYED_ECONNRESET` — armed only when that write-path observation was an `ECONNRESET`
 ///   **and** `{show_econnreset,true}` was in effect at that moment (`:13615`, `:13683`-`:13685`).
 ///   It turns the `closed` of either ladder into `econnreset`.
@@ -522,48 +525,39 @@ enum CloseSource {
     },
 }
 
-/// Whether a read is one the **C would have made**, and therefore whether a close it discovers is
-/// one.
+/// The C's read-selection rule, which this driver reproduces literally: a socket is read only in
+/// two states.
 ///
-/// The C selects a socket's read side in exactly two states: while `desc->inet.active > 0`
-/// (`sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` — `inet_drv.c:7966` on `setopts`,
-/// `:12126`/`:14286` on connect, `:11146` for the `setopts` inline trigger) and while a
-/// `TCP_REQ_RECV` is waiting for bytes (`sock_select(INETP(desc),(FD_READ|FD_CLOSE),1)`,
-/// `:12317`). `tcp_deliver` deselects it when a delivery spends the grant (`:13110`), and
-/// `tcp_recv`'s own inline read runs inside the `TCP_REQ_RECV` control call. So **every** read the
-/// C performs is made on behalf of somebody who answers it: an `{active, …}` owner
-/// (`{tcp, S, Data}`/`{tcp_closed, S}`) or the waiting receive (`{error, closed}`).
+/// 1. a granted `{active, …}` — `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))`
+///    (`inet_drv.c:7966` on `setopts`, `:12126`/`:14286` on connect, `:11146` for the `setopts`
+///    inline trigger), read by [`TcpInetDriver::active_delivery`]; and
+/// 2. a waiting `TCP_REQ_RECV` — `sock_select(INETP(desc),(FD_READ|FD_CLOSE),1)` (`:12317`), read
+///    by [`TcpInetDriver::try_complete_recv`] inside the control call and from the reactor's
+///    [`TcpInetDriver::async_ready_input`].
 ///
-/// This floor's poller is **edge-triggered** and keeps the socket's `READABLE` registration for
-/// its whole life (see `src/drivers/CONTEXT.md`), so `ready_input` also reads sockets the C would
-/// not have read — a passive connection with no receive queued ([`ReadReport::Unselected`], the
-/// passive `{Port, {data, …}}` floor). Such a read is a *delivery* shortcut, not a discovery: the
-/// bytes it collects are delivered, but a close it finds has **not** been discovered in the C's
-/// terms and must not end the connection (nor tear the descriptor down under the default
-/// `{exit_on_close,true}`) — it stays pending in [`TcpInetDriver::pending_close`] for the read the
-/// C would have made.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ReadReport {
-    /// The C's own reader: a queued `TCP_REQ_RECV`
-    /// (`async_error_am_all(am_closed)`, `inet_drv.c:12829`; `async_error_am_all(error_atom(err))`,
-    /// `:12877`), this floor's synchronous `recv` verb (`tcp_recv_closed`/`tcp_recv_error`'s own
-    /// return value, `:13185`-`:13196`), or an active-mode delivery (the close is reported through
-    /// `{tcp_closed, S}`/`{tcp_error, S, Reason}`, `:12841`/`:12871`, instead of a receive reply).
-    /// It applies the close it discovers.
-    Answered,
-    /// A socket whose read side the C would **not** have selected: the **reactor**'s eager passive
-    /// read, with no `TCP_REQ_RECV` queued and no `{active, …}` grant in force. It delivers the
-    /// bytes it reads and applies nothing.
-    Unselected,
-}
-
-impl ReadReport {
-    /// Whether the C would have made this read — i.e. whether a close it discovers is a discovery.
-    fn is_selected(self) -> bool {
-        matches!(self, ReadReport::Answered)
-    }
-}
-
+/// With `{active, false}` and no queued receive the C performs **no** `read(2)` at all: the bytes
+/// stay in the kernel for the next `recv`, and `tcp_reply_data`'s
+/// `if (desc->inet.active == INET_PASSIVE) return inet_async_data(...)` (`:4287`-`:4298`) proves a
+/// passive delivery only ever *answers a queued receive*. So every read this driver makes is made
+/// on behalf of somebody who answers it: an `{active, …}` owner (`{tcp, S, Data}`) or the waiting
+/// receive (`{ok, Data}`/`{error, Reason}`).
+///
+/// The two exceptions are the **explicit** reads, which are their own caller: the named `recv`
+/// verb ([`TcpInetDriver::verb_recv`]/[`TcpInetDriver::verb_recv_framed`]) and the `setopts`
+/// inline burst. Both deliver on the channel of the mode in force, never on the passive
+/// `{Port, {data, …}}` channel for a passive socket.
+///
+/// A consequence to respect: a passive socket **discovers the peer's close only when a read
+/// somebody answers makes the discovery** — the C arms `TCP_ADDF_DELAYED_CLOSE_RECV`/`_SEND` from
+/// its own read and write sites (`:12816`-`:12829`), never from mere readability. An unread peer
+/// end-of-file therefore leaves the descriptor CONNECTED and [`TcpInetDriver::peer_closed`] false.
+///
+/// [`TcpInetDriver::active_delivery`]: TcpInetDriver
+/// [`TcpInetDriver::async_ready_input`]: TcpInetDriver
+/// [`TcpInetDriver::try_complete_recv`]: TcpInetDriver
+/// [`TcpInetDriver::verb_recv`]: TcpInetDriver
+/// [`TcpInetDriver::verb_recv_framed`]: TcpInetDriver
+/// [`TcpInetDriver::peer_closed`]: TcpInetDriver
 impl CloseSource {
     /// The reason the **discovering** operation reports, `None` being `closed`: the C's
     /// `tcp_recv_error` vs `tcp_recv_closed` split (`inet_drv.c:13190`-`:13196`) is exactly
@@ -592,8 +586,8 @@ impl PeerClose {
             // `tcp_recv_closed` (`:12810`-`:12819`) arms the *send* one-shot only — a clean
             // end-of-file owes the receive nothing beyond the reply it already gave.
             //
-            // Both assume the discovering operation took that reply, which is now guaranteed: only
-            // a read the C would have made is applied at all ([`ReadReport`]).
+            // Both assume the discovering operation took that reply, which is guaranteed: every
+            // read this floor makes is one the C would have made (see [`TcpInetDriver::read_available`]).
             CloseSource::Read { error } => {
                 if error.is_none() {
                     self.delayed_close_send = true;
@@ -733,18 +727,11 @@ pub struct TcpInetDriver {
     /// only site that arms the reply ladders, drops the queued output and tears the descriptor
     /// down — clears it.
     ///
-    /// Two callers deliberately leave it pending for a later reader:
-    ///
-    /// * a **queued receive** (`try_complete_recv`) that read data **and** the peer's end of file
-    ///   in one drain must hand the data over first — the C's `tcp_recv` answers a complete unit
-    ///   before it ever reaches the `n == 0` arm (`inet_drv.c:13216`, `:13206`), so
-    ///   `{error, closed}` is owed to the *next* receive;
-    /// * the **reactor's** eager passive read ([`ReadReport::Unselected`]): the C selects a
-    ///   socket's read side only for a granted `{active, …}` or a waiting `TCP_REQ_RECV`
-    ///   (`sock_select(…, 1)`, `inet_drv.c:12317`, `(desc->active>0)`, `:7966`), so a close this
-    ///   floor reads outside those two states has **not** been discovered in the C's terms and
-    ///   must not end the connection — the bytes are delivered, and the observation waits for the
-    ///   read that the C would have made.
+    /// One caller deliberately leaves it pending for a later reader: a **queued receive**
+    /// (`try_complete_recv`) that read data **and** the peer's end of file in one drain must hand
+    /// the data over first — the C's `tcp_recv` answers a complete unit before it ever reaches the
+    /// `n == 0` arm (`inet_drv.c:13216`, `:13206`), so `{error, closed}` is owed to the *next*
+    /// receive, and [`TcpInetDriver::latch_pending`] runs the moment nothing complete is left.
     pending_close: Option<CloseSource>,
     /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
     /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
@@ -809,30 +796,6 @@ pub struct TcpInetDriver {
     /// command and cleared where that flag is — when the output queue drains
     /// ([`TcpInetDriver::write_pending`]) — so the two per-command latches cannot drift.
     out_framed: bool,
-    /// Whether read readiness may move bytes out of the kernel on the **reactor's** behalf — the
-    /// C's `FD_READ` **selection** state.
-    ///
-    /// `tcp_deliver` deselects the socket the moment a delivery spends its `{active, …}` grant
-    /// (`if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`,
-    /// `inet_drv.c:13106`-`:13114`), so in the C a peer write during that window produces no read
-    /// callback at all and waits in the socket; `inet_set_opts` re-selects the socket when an
-    /// active grant is armed (`sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))`, `:7982`)
-    /// and a queued `TCP_REQ_RECV` selects it directly (`:12315`).
-    ///
-    /// This floor keeps the poller registration armed for the socket's whole life (`Interest` has
-    /// no empty mask and `mio`'s epoll is edge-triggered), so that gate has to live here: with
-    /// this flag `false`, [`TcpInetDriver::async_ready_input`] returns **without** reading, which
-    /// is what leaves the peer's bytes in the kernel for the next arm instead of spilling them
-    /// onto the passive [`PortNotification::Data`](crate::PortNotification::Data) channel and
-    /// losing them from the next `{active, …}` delivery.
-    ///
-    /// It is `true` by construction and on every fresh connection ([`TcpInetDriver::adopt`],
-    /// [`TcpInetDriver::adopt_prebound`], [`TcpInetDriver::mark_connected`],
-    /// [`TcpInetDriver::close_socket`]): a port that was never armed keeps this floor's eager
-    /// passive read, which is the one deliberate divergence from a C socket that is deselected
-    /// from the start. It gates the **reactor's** read only — every explicit/queued read
-    /// (the `recv` verbs, `TCP_REQ_RECV`) is unaffected.
-    read_armed: bool,
     /// The `{active, …}` grants a **delivery** has spent since the last drain, oldest first — the
     /// notification half of the seam whose read half is [`Driver::active_mode`]
     /// ([`ActiveSpend`], drained by [`Driver::take_active_spends`]).
@@ -882,7 +845,6 @@ impl TcpInetDriver {
             caller_ref: None,
             caller_stripped: false,
             out_framed: false,
-            read_armed: true,
             active_spends: Vec::new(),
         }
     }
@@ -938,8 +900,6 @@ impl TcpInetDriver {
             caller_ref: None,
             caller_stripped: false,
             out_framed: false,
-            // A freshly adopted socket starts with its read side selected (see the field's note).
-            read_armed: true,
             // Nothing has been delivered on a brand-new socket yet, so no grant is spent.
             active_spends: Vec::new(),
         })
@@ -1006,6 +966,19 @@ impl TcpInetDriver {
     pub fn state(&self) -> InetState {
         self.state
     }
+    /// Whether the socket currently holds a **poller registration** (`self.token`).
+    ///
+    /// This is *not* the C's read selection (`desc->active > 0` or a queued `TCP_REQ_RECV`), which
+    /// this driver re-derives per callback: the registration stays armed for the socket's life
+    /// because [`Interest`] has no empty mask and `mio`'s epoll is edge-triggered, while what a
+    /// readiness event is *allowed to read* is the driver's own state (see the module docs).
+    /// For a **listener** the two coincide — the C's `sock_select(FD_ACCEPT, 1/0)` is
+    /// [`TcpInetDriver::async_accept`]'s `set_interest(READABLE)` and `disarm_accepts`'s
+    /// [`TcpInetDriver::deregister`] — which is what `accept_tests.rs` observes.
+    #[cfg(test)]
+    pub(crate) fn is_registered(&self) -> bool {
+        self.token.is_some()
+    }
 
     /// Whether the socket reported end-of-file.
     pub fn eof(&self) -> bool {
@@ -1069,9 +1042,6 @@ impl TcpInetDriver {
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
                 self.pending_close = None;
-                // ... and a fresh read side: nothing has been delivered on the new socket yet, so
-                // no `{active, …}` grant can be spent (see [`TcpInetDriver::read_armed`]).
-                self.read_armed = true;
                 // The C's `inet_ctl_open` records the family and type here
                 // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close: `inet.stype`
                 // is `SOCK_STREAM` from `open` on, which is what gates the `send_timeout`
@@ -1150,8 +1120,6 @@ impl TcpInetDriver {
         // socket no longer belongs to this one.
         self.pending_input.clear();
         self.pending_close = None;
-        // The read side is selected again: the new socket has delivered nothing yet.
-        self.read_armed = true;
         self.state = if connected {
             InetState::Connected
         } else {
@@ -1176,8 +1144,6 @@ impl TcpInetDriver {
         // socket this one replaces.
         self.pending_input.clear();
         self.pending_close = None;
-        // ... and nothing has been delivered on it yet, so its read side is selected again.
-        self.read_armed = true;
     }
     /// Changes the socket's registered interest mask (registering it the first time).
     ///
@@ -1243,9 +1209,6 @@ impl TcpInetDriver {
         self.peer_close = PeerClose::default();
         self.shutdown_wr_done = false;
         self.pending_shutdown = None;
-        // A torn-down port has no spent grant left to remember (see
-        // [`TcpInetDriver::read_armed`]).
-        self.read_armed = true;
     }
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///
@@ -1314,31 +1277,22 @@ impl TcpInetDriver {
     /// not `read(2)`) and the peer's close has not already been observed. Returns the number of
     /// bytes read.
     ///
-    /// `report` says whether this read is one the **C would have made** ([`ReadReport`]): every
-    /// read of a **selected** socket applies the close it finds (the latch, then the bytes above),
-    /// while the reactor's eager read of an **unselected** one only delivers the bytes and leaves
-    /// the observation pending for the read the C would have made.
+    /// Every caller is one the C would have made this read for — a queued `TCP_REQ_RECV`
+    /// ([`TcpInetDriver::try_complete_recv`]), the named `recv` verb, or an `{active, …}`
+    /// delivery — so a close this read discovers is a discovery and is **applied** here.
     ///
     /// # Errors
     ///
     /// Returns `BeamError::Io` when the read fails irrecoverably.
-    fn read_available(
-        &mut self,
-        ctx: &mut DriverContext<'_>,
-        report: ReadReport,
-    ) -> Result<usize> {
+    fn read_available(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let mut bytes = Vec::new();
         self.read_bytes(&mut bytes)?;
         let read = bytes.len();
-        // The close is answered by **this** caller only when the C would have made this read at
-        // all; otherwise it stays pending ([`TcpInetDriver::pending_close`]) for the reader that
-        // answers it. The latch runs before the bytes are queued so that a `{packet, N}` frame
-        // read in the same call survives the teardown's `tcp_clear_input` (the C's discovery sites
-        // clear and only then deliver, `inet_drv.c:12824`-`:12829`).
-        if report.is_selected() {
-            if let Some(source) = self.pending_close {
-                self.latch_peer_close(ctx, source)?;
-            }
+        // The latch runs before the bytes are queued so that a `{packet, N}` frame read in the
+        // same call survives the teardown's `tcp_clear_input` (the C's discovery sites clear and
+        // only then deliver, `inet_drv.c:12824`-`:12829`).
+        if let Some(source) = self.pending_close {
+            self.latch_peer_close(ctx, source)?;
         }
         if self.framed().is_some() {
             // `{packet, N}`: the bytes are not a message yet — hold them for the frame decoder.
@@ -1369,8 +1323,8 @@ impl TcpInetDriver {
     /// [`TcpInetDriver::pending_close`] (with [`TcpInetDriver::read_eof`]) and is re-answered by
     /// every later call, so the caller — or a caller after it — decides when the close is latched
     /// (the C's discovery sites clear and only then deliver, `inet_drv.c:12824`-`:12829`). Keeping
-    /// it is not optional: `read(2)` reports a peer's reset **once**, so a caller that declines to
-    /// apply it ([`ReadReport::Unselected`]) would otherwise lose the reason.
+    /// it is not optional: `read(2)` reports a peer's reset **once**, so a caller that re-reads
+    /// before applying the observation would otherwise lose the reason.
     ///
     /// # Errors
     ///
@@ -1530,12 +1484,11 @@ impl TcpInetDriver {
     /// Applies the close a [`TcpInetDriver::read_bytes`] recorded but no reader has applied yet,
     /// answering whether it ran.
     ///
-    /// Two callers reach it rather than latching straight away: a queued receive that read its
+    /// One caller reaches it rather than latching straight away: a queued receive that read its
     /// payload and the peer's end of file in one drain defers the close
     /// ([`TcpInetDriver::pending_close`]) so the payload reaches the operation first and runs this
-    /// the moment nothing complete is left to deliver; and the reactor's eager passive read leaves
-    /// the observation for the first read the C would have made, which is answered by this same
-    /// latch.
+    /// the moment nothing complete is left to deliver. Every other read this driver makes is one the
+    /// C would have made, so it applies its own observation on the spot.
     fn latch_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<bool> {
         match self.pending_close {
             Some(source) => {
@@ -2515,9 +2468,10 @@ impl Driver for TcpInetDriver {
         //
         // * [`TcpInetDriver::owns_readiness_for_active`] is the C's connected-and-active arm —
         //   [`TcpInetDriver::active_delivery`] owns the socket's read;
-        // * everything else (a listener's queued `accept`, a queued `TCP_REQ_RECV`, or a passive
-        //   connection's bytes into the port input queue) stays with
-        //   [`TcpInetDriver::async_ready_input`].
+        // * everything else (a listener's queued `accept`, or a queued `TCP_REQ_RECV`) stays with
+        //   [`TcpInetDriver::async_ready_input`], which reads **nothing** for a passive socket
+        //   with no receive queued: this floor's poller registration outlives the C's read arm,
+        //   so readiness alone is never a reason to `read(2)`.
         if self.owns_readiness_for_active() {
             self.active_delivery(ctx)
         } else {

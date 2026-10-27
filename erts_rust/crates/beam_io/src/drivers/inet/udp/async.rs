@@ -34,9 +34,9 @@
 //!   `Data` the C's single flat list `[1, PortHi, PortLo, A, B, C, D, …data]`
 //!   (`inet_async_binary_data`'s `INET_MODE_LIST` arm, `:3900`) and a `[binary]` port's the
 //!   improper `[1, PortHi, PortLo, A, B, C, D | <<Payload>>]` (its `LOAD_STRING_CONS` arm);
-//! * the three production points (readiness, the port timer, the round's async drive), with
-//!   `packet_inet_recv`'s passive-mode "one datagram per operation" discipline
-//!   (`packet_inet_input`, `:15500`-`:15530`);
+//! * the four production points (the control call's own `packet_inet_input` attempt, readiness,
+//!   the port timer, the round's async drive), with `packet_inet_recv`'s passive-mode "one datagram
+//!   per operation" discipline (`packet_inet_input`, `:15500`-`:15530`);
 //! * the teardown drain — `packet_inet_stop`'s `async_error_am_all(desc, am_closed)`
 //!   (`:14548`);
 //! * the send path's `init_caller` strip and `inet_reply_finish` reply
@@ -116,9 +116,20 @@ impl UdpInetDriver {
         if !self.async_ops.enqueue_recv(op) {
             return Ok(ctl_xerror("ealready"));
         }
+        // `if (packet_inet_input(udesc, desc->event) == 0)` (`:15010`): the C attempts the read
+        // **inside the control call**, so a datagram already sitting in the socket buffer is
+        // answered from this reply. Only a would-block reaches the arming below — and unlike the
+        // stream arm there is no `timeout == 0` shortcut here, because a zero deadline is a real
+        // timer that expires on the next port round (`packet_inet_timeout`, `:15012`).
+        //
+        // The slot is the test, not the returned "completed" flag: a receive answered out of band
+        // (the socket went away, a real syscall error) empties it while reporting `Ok(false)`.
+        self.try_complete_recv(ctx)?;
+        if self.async_ops.recv().is_none() {
+            return Ok(async_ok_reply(id));
+        }
         // The C's `sock_select(desc, FD_READ, 1)` (`:15006`): keep read readiness armed so the
-        // datagram's arrival re-drives the port. The completion itself is produced at a later
-        // round — never here (see the module docs).
+        // datagram's arrival re-drives the port.
         self.set_interest(ctx, Interest::READABLE)?;
         Ok(async_ok_reply(id))
     }

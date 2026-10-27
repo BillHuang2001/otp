@@ -426,10 +426,19 @@ fn drive_until_completion(rig: &mut Rig, label: &str) -> Vec<CompletionEvent> {
     }
 }
 
-/// Whether the port's driver currently holds a **read** registration (the `PortArms` mask the
-/// reactor gates an `Input` task on).
+/// Whether the listener's driver currently holds its poller **registration**.
+///
+/// For a listener this *is* the C's selection: `FD_ACCEPT` is `ERL_DRV_READ`, so
+/// `sock_select(desc, FD_ACCEPT, 1)` is `async_accept`'s `set_interest(READABLE)` and its `0` is
+/// `disarm_accepts`'s `deregister` — unlike a connected socket, whose registration outlives its read
+/// selection (see [`super::passive_recv_tests`]).
 fn armed(rig: &Rig) -> bool {
-    rig.registry.get(rig.id).expect("the port is live").read_armed()
+    rig.registry
+        .get(rig.id)
+        .expect("the port is live")
+        .driver_as::<TcpInetDriver>()
+        .expect("the port runs tcp_inet")
+        .is_registered()
 }
 
 /// Drives readiness until the accept queued as `id` completes, then **adopts** the descriptor it

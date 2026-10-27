@@ -154,26 +154,26 @@ fn accept(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> RawFd
     }
 }
 
-/// Drives the reactor until port `id`'s input queue holds at least `want` bytes,
-/// returning everything it read.
+/// Reads `want` bytes out of port `id` through the **`recv` verb**.
+///
+/// A passive socket with no queued receive is never read — the C selects a socket's read side only
+/// for a waiting `TCP_REQ_RECV` (`inet_drv.c:12317`) or an `{active, …}` grant (`:7966`) — so pumping
+/// the poller would deliver nothing here; the verb is the read the driver answers.
 fn read_into_queue(
     poller: &mut Poller,
     registry: &mut PortRegistry,
     id: PortId,
     want: usize,
 ) -> Vec<u8> {
-    let deadline = Instant::now() + WAIT;
-    let mut got = Vec::new();
-    while got.len() < want {
-        assert!(Instant::now() < deadline, "no input arrived");
-        let events = poller
-            .poll(Some(Duration::from_millis(100)))
-            .expect("poll");
+    assert_eq!(
         registry
-            .handle_events(poller, &events)
-            .expect("dispatch the ready events");
-        got.extend(registry.get_mut(id).expect("live").drain_input());
-    }
+            .port_control(poller, id, "recv", &[])
+            .expect("a reply"),
+        ctl_ok(),
+        "the passive recv verb reads the buffered bytes"
+    );
+    let got = registry.get_mut(id).expect("live").drain_input();
+    assert_eq!(got.len(), want, "the recv delivered the whole payload");
     got
 }
 

@@ -301,7 +301,7 @@ Each driver's **close-path half is a sibling test module of its own source half*
 - `spawn_teardown_tests.rs` (4) pins the **teardown ordering** over real children and a payload larger than a pipe buffer (512 KiB): `stop` gives the child end of file before anything is killed, a closed port's whole queued command really reaches the child, a child that never reads stdin does not hang the close (the bound, the documented divergence), and the same row cross-checked against the system `erl` (`erl` absent ⇒ skips **loudly**); every wait polls a condition under the 60 s hang guard.
 - `fd_close_tests.rs` (3) pins an `FdDriver` close over a real `UnixStream::pair`: a short write parks the close **before** `stop` (the parked port still owns its write fd), the parked remainder is delivered in full by the rounds, and `a_command_queued_before_a_close_is_written_by_the_close` pins the writing that the inherited default `flush` leaves alone. Hermetic (no `cc`, no `erl`, no child).
 - `ram_file_close_tests.rs` (5) pins that a queued command **executes** in the close drain: the command's reply, a `write`'s `NUMBER` reply, a `DATA` reply keeping its header/body split, the port finishing inside the `close` call (nothing left to park — `is_closing` is the `badarg` for the gone port), and several commands queued without a round arriving as **one** payload. Hermetic.
-The `tcp_inet`/`udp_inet` close half is the **inet node's**, not this one's: `drivers/inet/flush_tests.rs` (6 — the `discard_output` matrix over real loopback sockets, incl. `udp_inet`'s surviving queue) and `drivers/inet/write_then_close_tests.rs` (5 — a write-then-close burst delivering its data before `Closed`).
+The `tcp_inet`/`udp_inet` close half is the **inet node's**, not this one's: `drivers/inet/flush_tests.rs` (6 — the `discard_output` matrix over real loopback sockets, incl. `udp_inet`'s surviving queue) and `drivers/inet/write_then_close_tests.rs` (5 — the read-path ordering, its `a_write_then_close_burst_is_read_only_by_a_queued_receive` row pinning that a burst nobody reads delivers nothing and owes the next queued receive its data).
 `ram_file.rs`'s other suites (the sibling `ram_file_tests.rs`, 23 tests, plus the reply-split pin
 `ram_file_split_tests.rs`, 6) need no OS resource: the reply
 encodings, the mode/whence bit tables, the zero-filled-gap/truncate semantics, the argument faults
@@ -340,9 +340,9 @@ The crate-level integration suites for this node are the sibling `../../tests/` 
   `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned
   subtraction, the C's three switches), `{packet, N}` framing (read + send path), and `tcp_inet`'s
   `flush`/`stop`/`desc_close` split (`mod.rs` — the only `flush` override that discards, and a
-  `stop` that is `release_socket`, never `desc_close`; `flush_tests.rs` 6,
-  `write_then_close_tests.rs` 5); the option surface is oracle-pinned byte-for-byte (child node
-  `src/drivers/inet/CONTEXT.md`)
+  `stop` that is `release_socket`, never `desc_close`; `flush_tests.rs` 6, and the read-path
+  ordering `write_then_close_tests.rs` 5, incl. `a_write_then_close_burst_is_read_only_by_a_queued_receive`);
+  the option surface is oracle-pinned byte-for-byte (child node `src/drivers/inet/CONTEXT.md`)
 - `../abi/` → the driver C-ABI host layer (sibling child node, not a built-in driver)
 
 ## See Also

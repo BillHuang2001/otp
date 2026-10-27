@@ -261,9 +261,9 @@ ioq is non-empty and the reason is not `kill` (`io.c:3946-3953`, `flush_port(prt
   `{Port,{data,…}}` is delivered before `{tcp_closed,…}`. The observation is kept in
   `TcpInetDriver::pending_close` and applied at the single latch site
   `TcpInetDriver::latch_peer_close` once nothing complete is left to deliver
-  (`TcpInetDriver::latch_pending`), and only by a read the C would have made:
-  `ReadReport::Answered` applies it, the reactor's eager passive read
-  (`ReadReport::Unselected`) merely records it.
+  (`TcpInetDriver::latch_pending`), and only by a read the C would have made: a passive socket is
+  read only for a queued `TCP_REQ_RECV` (its control call already makes the first attempt), so its
+  bytes never reach the port queue without a read somebody answers.
 - `port.rs` → `PortState::Closing` is a **real observable state** (`Port::is_closing()`/
   `is_closed()`/`state()`), not a transient: `Port::close` is two halves.
   **Begin** (always): `state = Closing`, record `closing_watermark`, `driver_flush` (the four

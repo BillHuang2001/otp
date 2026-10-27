@@ -22,11 +22,11 @@
 //! (`tcp_deliver`/`tcp_recv`, `erts/emulator/drivers/common/inet_drv.c:13045`-`:13130`,
 //! `:13130`-`:13260`).
 //!
-//! A passive socket's bytes wait in the port's **input queue** for the owner's next read — the
-//! `{Port, {data, Data}}` path
-//! ([`PortNotification::Data`](crate::PortNotification::Data)), which
-//! [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) drives (they wait in the kernel
-//! instead while a spent grant has the read side deselected — see *Arming*). An **active** socket
+//! A passive socket's bytes wait in the **kernel** receive queue for the next read somebody answers
+//! — a queued `TCP_REQ_RECV` or an explicit `recv` verb; the driver never reads one on mere
+//! readiness (see *Arming*). What such a read delivers reaches the owner as `{Port, {data, Data}}`
+//! ([`PortNotification::Data`](crate::PortNotification::Data)) under `{deliver, port}` and as the
+//! completion of the operation it answers under `{deliver, term}`, the default. An **active** socket
 //! (`{active, true}`, `{active, once}`, `{active, N}`) instead sends its owner a **message** per
 //! delivered unit — `tcp_message` (`:3979`), `{tcp, S, [H1..Hsz | Data]}` — which the runtime
 //! renders from an [`ActiveInputEvent::Data`] on the active-input channel
@@ -38,7 +38,9 @@
 //!
 //! # What a delivered unit is
 //!
-//! One unit is one [`ActiveInputEvent::Data`]:
+//! One unit is one [`ReadMessage`](crate::port_task::ReadMessage), handed up as an
+//! [`ActiveInputEvent::Data`] under `{deliver, term}` or straight to the port queue as
+//! `{Port, {data, …}}` under `{deliver, port}`:
 //!
 //! * under a framing `{packet, N}` it is **one frame**, and the framing header is stripped before
 //!   delivery — `packet_get_length`/`packet_get_body` (`packet_parser.c:248`, called from
@@ -91,15 +93,14 @@
 //! FD_READ|FD_CLOSE, desc->active > 0)`, `:7944`-`:7986`) and **deselects** it the moment a
 //! delivery spends the grant (`:13106`-`:13114`). This crate's poller has no empty-interest mask
 //! (`crate::poller::Interest` is `READABLE`/`WRITABLE`/`BOTH`) and `mio`'s epoll is
-//! **edge-triggered**, so the registration is kept armed for the socket's life and the driver
-//! reproduces the C's selection itself: [`TcpInetDriver::read_armed`](super::TcpInetDriver) is
-//! cleared by the delivery that empties a grant, and set again by an armed `{active, …}` grant
-//! (which also re-registers, so already-buffered bytes produce a fresh edge —
-//! [`TcpInetDriver::after_setopts`](super::TcpInetDriver)), by a queued `TCP_REQ_RECV`, by the
-//! synchronous `recv` verbs and on every fresh connection. While it is clear the reactor reads
-//! nothing, so a peer write during the spent window waits in the kernel for the next arm — where
-//! the C leaves it — instead of being moved onto the passive `{Port, {data, …}}` channel and
-//! going missing from the next delivery.
+//! **edge-triggered**, so the registration is kept armed for the socket's life and the *read* is
+//! the driver's selection: a delivery runs only for an armed grant
+//! ([`TcpInetDriver::active_delivery`](super::TcpInetDriver), reached from `ready_input` and from
+//! [`TcpInetDriver::after_setopts`](super::TcpInetDriver)), and a passive socket is read only by a
+//! queued `TCP_REQ_RECV` or an explicit `recv` verb. With `{active,false}` and no receive queued
+//! the peer's bytes therefore wait in the kernel for the next `recv`, exactly where the C leaves
+//! them, instead of being moved onto the passive `{Port, {data, …}}` channel and going missing from
+//! the next delivery.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`,
 //! `erts/emulator/beam/packet_parser.{c,h}`.
@@ -111,7 +112,7 @@ use crate::port_task::{ActiveInputEvent, ActiveSpend};
 
 use super::frame;
 use super::header;
-use super::opt::{set_options_tracked, OptScope};
+use super::opt::{set_options_tracked, OptScope, INET_DELIVER_PORT};
 use super::stat;
 use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, TcpInetDriver};
 
@@ -141,12 +142,11 @@ impl TcpInetDriver {
     ///
     /// This crate splits that single read path into two bodies —
     /// [`TcpInetDriver::active_delivery`] (the active channel) and
-    /// [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) (the accept ladder, the queued
-    /// `TCP_REQ_RECV` completion and the passive port-input read) — so the callback has to pick
-    /// the one the C's state arm would have reached. Running both, or the passive one first, would
-    /// let `read_available` drain the socket into the port input queue
-    /// ([`TcpInetDriver::pending_input`](super::TcpInetDriver) under a framing `{packet, N}`)
-    /// before the active half could read a single byte.
+    /// [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) (the accept ladder and the queued
+    /// `TCP_REQ_RECV` completion) — so the callback has to pick the one the C's state arm would have
+    /// reached. The two are mutually exclusive by their own predicates (this one requires no queued
+    /// receive, the passive one requires one), so exactly one can produce a unit and neither can
+    /// starve the other.
     ///
     /// `true` exactly in the state [`TcpInetDriver::active_delivery`] can serve: a **connected**
     /// socket, an **active** mode, and **no** queued `TCP_REQ_RECV` operation (which owns the
@@ -279,16 +279,27 @@ impl TcpInetDriver {
     /// Splits one payload by the `{header, N}` option and delivers it, then applies the C's
     /// per-delivery `{active, …}` accounting.
     ///
-    /// The order is the C's: `tcp_message` sends the term (`:3979`) and
-    /// `INET_CHECK_ACTIVE_TO_PASSIVE` runs **after** it (`tcp_reply_data`, `:4302`), so a
-    /// `{tcp_passive, S}` always follows the data message it followed from, never precedes it.
+    /// Which channel carries it is `{deliver, …}`'s choice (`INET_DELIVER_PORT` ⇒ the port's
+    /// `{Port, {data, …}}`, `inet_drv.c:4287`), and the order is the C's: the data message is
+    /// sent first (`tcp_message`, `:3979`) and `INET_CHECK_ACTIVE_TO_PASSIVE` runs **after** it
+    /// (`tcp_reply_data`, `:4302`), so a `{tcp_passive, S}` always follows the data message it
+    /// followed from, never precedes it.
     fn deliver_data(
         &mut self,
         ctx: &mut DriverContext<'_>,
         payload: Vec<u8>,
     ) -> Result<()> {
         let read = header::split_payload(self.options.header, payload);
-        ctx.deliver_active_input(ActiveInputEvent::Data(read))?;
+        if self.options.deliver == INET_DELIVER_PORT {
+            // `tcp_reply_data`'s **first** branch (`inet_drv.c:4287`) — it is tested before any
+            // active/passive or framing decision: `{deliver, port}` hands the body to
+            // `inet_port_data` (`:2753`), so the unit arrives as `{Port, {data, …}}` instead of
+            // `tcp_message`'s `{tcp, S, Data}`. `INET_CHECK_ACTIVE_TO_PASSIVE` (`:4302`) still
+            // runs afterwards, so the grant is spent either way.
+            ctx.deliver_read(&read.header, read.body.as_deref())?;
+        } else {
+            ctx.deliver_active_input(ActiveInputEvent::Data(read))?;
+        }
         self.count_delivery(ctx)
     }
     /// `INET_CHECK_ACTIVE_TO_PASSIVE` (`:1552`-`:1561`): spends one `{active, …}` grant after
@@ -329,10 +340,9 @@ impl TcpInetDriver {
         }
         // `if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`
         // (`inet_drv.c:13106`-`:13114`): the delivery that emptied the grant deselects the socket's
-        // read side, so a peer write during the spent window is never read by the reactor.
-        if !self.is_active_mode() {
-            self.read_armed = false;
-        }
+        // read side. The registration itself stays armed (no empty `Interest`, edge-triggered), but
+        // nothing reads for it: `ready_input` only calls into this module while a grant is in force,
+        // so a peer write during the spent window waits in the kernel for the next arm or `recv`.
         Ok(())
     }
 
@@ -414,10 +424,9 @@ impl TcpInetDriver {
         if self.state.is_connected() && self.has_socket() && before_active == INET_PASSIVE {
             if self.is_active_mode() {
                 self.set_interest(ctx, Interest::READABLE)?;
-                // `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` (`:7982`): an armed
-                // grant selects the socket's read side again, ending any spent-grant window
-                // (see [`TcpInetDriver::read_armed`](super::TcpInetDriver)).
-                self.read_armed = true;
+                // `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` (`:7982`): an armed grant
+                // selects the socket's read side, and the re-registration makes already-buffered
+                // bytes produce a fresh edge for the inline burst below.
             }
         }
         if self.inline_burst(before_active, before_htype) {

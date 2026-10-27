@@ -112,14 +112,14 @@ fn accept_operand(timeout_ms: i32) -> Vec<u8> {
 }
 
 /// One five-byte socket-option record, `[code, value_be32]` (`inet_set_opts`, `:6908`).
-fn option_record(code: u8, value: i32) -> Vec<u8> {
+pub(crate) fn option_record(code: u8, value: i32) -> Vec<u8> {
     let mut record = vec![code];
     record.extend_from_slice(&value.to_be_bytes());
     record
 }
 
 /// Sets one socket option through `INET_REQ_SETOPTS`(7), asserting the `[1]` reply.
-fn set_option(port: &mut Rig, code: u8, value: i32) {
+pub(crate) fn set_option(port: &mut Rig, code: u8, value: i32) {
     assert_eq!(
         port.control(&op(INET_REQ_SETOPTS), &option_record(code, value)),
         ctl_ok(),
@@ -765,25 +765,31 @@ fn a_receive_timeout_completes_after_its_reply() {
     );
 }
 
-/// A **zero** timeout is a deadline of "now": the reply is unchanged and the operation fails at the
-/// next round — never inside the control call.
+/// A **zero** timeout on a read that would block is the C's `async_error_am(am_timeout)` from
+/// *inside* the control call (`if (timeout == 0) async_error_am(am_timeout)`, `inet_drv.c:12311`):
+/// the reply stays `[1] ++ <<Id:16/big>>` and the `{error, timeout}` is already staged, with no
+/// deadline declared and no operation left queued.
 #[test]
-fn a_zero_timeout_is_due_at_the_next_round() {
+fn a_zero_timeout_answers_timeout_inside_the_control_call() {
     let (mut port, _peer) = linked();
     assert_eq!(
         port.control(&op(TCP_REQ_RECV), &recv_operand(0, 0)),
         vec![1, 0, 0],
         "a zero deadline does not change the reply"
     );
+    assert_eq!(
+        async_events(&port.completions()),
+        vec![(0, InetAsyncResult::Error(InetReason::Timeout))],
+        "the would-block arm answers the operation without arming anything"
+    );
+    assert!(
+        port.next_timeout().is_none(),
+        "no deadline is declared, so the port clears its TIMEOUT task"
+    );
+    port.round().expect("a round after the control call");
     assert!(
         port.completions().is_empty(),
-        "and does not report from the control call either"
-    );
-
-    let events = await_events(&mut port, 1);
-    assert_eq!(
-        events,
-        vec![(0, InetAsyncResult::Error(InetReason::Timeout))]
+        "the timeout is reported exactly once"
     );
 }
 

@@ -670,24 +670,28 @@ fn a_spent_grant_leaves_the_peers_bytes_in_the_kernel_and_the_rearm_delivers_the
     assert_eq!(port.input_len(), 0, "still nothing on the passive channel");
 }
 
-/// `{active, false}`: the bytes take the **passive** path into the port input queue, so the
-/// active channel stays empty and the existing `recv` route is unchanged.
+/// `{active, false}`: a passive socket with **no** receive queued is never read at all, so the bytes
+/// stay in the kernel — nothing on the active channel and nothing in the port's input queue. That is
+/// the C's own selection rule: it selects a socket's read side only for `active > 0`
+/// (`sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))`, `inet_drv.c:7966`) or a waiting
+/// `TCP_REQ_RECV` (`:12317`). The explicit `recv` verb is the read somebody answers.
 #[test]
 fn a_passive_port_reports_nothing_on_the_active_channel() {
     let Link { mut port, mut peer } = link();
-
     assert_eq!(port.setopts(&[active_false()]), ctl_ok());
     send(&mut peer, b"abc");
-
-    let deadline = Instant::now() + GUARD;
-    while port.input_len() < 3 && Instant::now() < deadline {
-        let delivered = port.round();
-        assert!(delivered.is_empty(), "a passive port never uses the active channel");
-    }
-    assert_eq!(port.input_len(), 3, "the passive path still reads the bytes");
-    assert_eq!(port.take_input(3), b"abc".to_vec(), "and the owner can recv them");
+    assert!(
+        port.quiet(3).is_empty(),
+        "a passive port never uses the active channel"
+    );
+    assert_eq!(
+        port.input_len(),
+        0,
+        "and with no receive queued it never reads either: the bytes wait in the kernel"
+    );
+    assert_eq!(port.named("recv", &[]), ctl_ok(), "the passive recv succeeds");
+    assert_eq!(port.take_input(3), b"abc".to_vec(), "and it takes the bytes");
 }
-
 /// A queued `TCP_REQ_RECV` keeps the socket out of the active channel: the C refuses such an
 /// operation on an active port (`active || len != 8 ⇒ [0]einval`, `inet_drv.c:12273`), so the state
 /// below is only reachable when the option changes **after** the enqueue. There the queued
