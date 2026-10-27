@@ -422,11 +422,13 @@ fn a_reactor_discovered_end_of_file_answers_closed_then_enotconn() {
     );
 }
 
-/// The named `recv` verb makes the same read itself (it is the C's `tcp_recv`, `:13130`), so it is
-/// the party the close is answered to: after the reactor's eager — unselected, applying-nothing —
-/// read has drained the end-of-file, the verb still answers `closed` and then `enotconn`.
+/// The named `recv` verb makes the read itself (it is the C's `tcp_recv`, `:13130`), so it is the
+/// party the close is answered to: a readiness round reads **nothing** for a passive socket with no
+/// queued receive (the C selects a read only for a granted `{active, …}` or a waiting
+/// `TCP_REQ_RECV`), so the end-of-file is still there for the verb, which answers `closed` and then
+/// `enotconn`.
 #[test]
-fn a_reactor_discovered_end_of_file_answers_the_named_recv_verb_the_same_way() {
+fn a_reactor_round_reads_nothing_so_the_named_recv_verb_discovers_the_close() {
     let mut rig = connected_rig(HIDE_ECONNRESET);
     rig.peer
         .as_ref()

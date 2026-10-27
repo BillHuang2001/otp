@@ -235,12 +235,13 @@ rot.
   its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle).
-  `inet.rs`'s `a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed` is the
-  reactor-level pin of the **read-selection** rule (`src/drivers/inet/CONTEXT.md` › *The
-  read-selection invariant*): the edge-triggered poller does read a passive socket's end-of-file, but
-  that read is `ReadReport::Unselected`, so it owes the owner **no** notification, leaves
-  `port_closed` `false` and `INET_REQ_GETSTATUS`(16) reporting `INET_STATE_CONNECTED` (`5`), and the
-  reactor settles (five consecutive empty bounded polls — a dead descriptor would report every poll).
+  `inet.rs` reads a passive connection through the named `recv` verb: a passive socket with no queued
+  receive is **never** read, so pumping the poller delivers nothing.
+  `a_reactor_observed_peer_close_quiesces_and_owes_the_next_recv_its_closed` is the reactor-level pin of
+  that rule (`src/drivers/inet/CONTEXT.md` › *The read path*): the readiness event is dispatched and
+  ignored — no read at all — so it owes the owner **no** notification, leaves `port_closed` `false` and
+  `INET_REQ_GETSTATUS`(16) reporting `INET_STATE_CONNECTED` (`5`), and the reactor settles (five
+  consecutive empty bounded polls — a dead descriptor would report every poll).
   The next `recv` is the read the C would have made: it answers `closed` on its first call then
   `enotconn`, and only there does the registration go (`poller.is_empty()`, `INET_STATE_CLOSED` = `0`,
   the default `{exit_on_close,true}`). The opcode is sent as `16 + CONTROL_MAGIC`; a bare `16` wraps
