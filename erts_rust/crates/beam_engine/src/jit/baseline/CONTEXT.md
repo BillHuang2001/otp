@@ -59,7 +59,8 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   (`Machine::pop_frame_checked` for a linked local `call_last`),
   `jit_deallocate`/`jit_return`/`jit_deallocate_return` (the frame-discipline helpers: the checked pop
   and/or the continuation read, encoding the instruction's own outcome as the block-ABI word — sharing
-  `return_word` for the continuation→word mapping and `report_frame_error` for the typed diagnostic, with
+  `return_word` for the continuation→word mapping, `halt_word` for a `Halt` and `report_frame_error` for
+  the typed diagnostic, with
   the `FrameExitHelper`/`ReturnHelper` fn-pointer types; `return_word` also resolves a continuation block
   entry in-block so a `return` need not round-trip the driver — `enter_in_block` is `#[inline]` and its
   **same-function** fast path answers from the published `EntryTables` (one bounds check and **one**

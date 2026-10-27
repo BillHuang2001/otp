@@ -2004,10 +2004,15 @@ pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, dea
 /// a raise inside a cross-module callee is left bare for the driver, which knows the
 /// true entry module.
 ///
+/// This is where a failing frame helper publishes the failing instruction's own position —
+/// the one place that position is observable on an error — so the successful transfer paths
+/// store nothing and only a `Halt` publishes the returning instruction
+/// ([`halt_word`]).
+///
 /// Out of line and `#[cold]`: it is the failure path of the frame-discipline and
 /// heap/frame-admission helpers, and inlining it into them (which is where `objdump` used
 /// to find it) charged every one of those hot helpers, and every block that calls one, for
-/// a body only a raising run reaches.
+/// a body only a raising run reaches. The store is therefore free on every hot path.
 #[cold]
 #[inline(never)]
 fn report_frame_error(
@@ -2021,6 +2026,9 @@ fn report_frame_error(
     // `Machine`, and no other `&mut Machine` exists while the helper runs (the driver
     // is blocked in the block call that reached us).
     let machine = unsafe { &mut *runtime.machine };
+    // The same position store `Machine::step_instruction` makes at entry: the failing
+    // instruction is the address every reader of the position must name from here on.
+    machine.set_current_code(func, pc);
     let err = if machine.current_context() == 0 {
         // SAFETY: `runtime.module` points at the `&Module` the driver is running,
         // which outlives the loop; in context `0` that module is the run's entry
@@ -2065,12 +2073,21 @@ fn report_frame_error(
 ///   transfer is a legal `jmp` into another RX mapping; only the block-entry tables the
 ///   helper resolves through differ, and they are re-published for the target before the
 ///   jump so a nested return in the new function takes the same fast path.
-fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 {
+/// The position of the returning instruction is not published here: a taken transfer
+/// publishes its **target** (via [`commit_in_block_entry`]) and a decline is republished by
+/// the driver's own loop-head decode. The one shape no other store covers is a `Halt`, which
+/// ends the run, and [`halt_word`] publishes it there.
+fn return_word(
+    runtime: &mut JitRuntime<'_>,
+    continuation: Continuation,
+    func: u32,
+    pc: u32,
+) -> i64 {
     // Cleared on **every** call, so the emitted arm can never observe a stale entry from an
     // earlier return (the two arms read exactly the value their own helper wrote).
     runtime.resume_entry = std::ptr::null();
     match continuation {
-        Continuation::Halt => HALT,
+        Continuation::Halt => halt_word(runtime, func, pc),
         Continuation::Address {
             func,
             pc,
@@ -2090,6 +2107,27 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
             enter_in_block_cleared(runtime, func, pc)
         }
     }
+}
+
+/// Publish the returning instruction as the finished run's position and answer [`HALT`].
+///
+/// A `Halt` is the outermost `return`: the run is over, so the driver's loop head never
+/// republishes and nothing else in this path stores anything. The interpreter's own last
+/// recorded position for the same program is the returning instruction, and the
+/// execution-position introspection (`Machine::current_code` and the `{M,F,A}` items built
+/// from it) is readable after a completed run, so this arm publishes exactly that.
+///
+/// Cold by construction: a run reaches it once, at its outermost `return`, never in a loop,
+/// so it stays out of the per-transfer path.
+#[cold]
+#[inline(never)]
+fn halt_word(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`; no
+    // other `&mut Machine` exists while the helper runs (the driver is blocked in the block
+    // call that reached us).
+    let machine = unsafe { &mut *runtime.machine };
+    machine.set_current_code(func, pc);
+    HALT
 }
 
 /// Resolve `(func, pc)` to a native block entry of the artifact the driver published and
@@ -2386,6 +2424,11 @@ pub(crate) extern "C" fn jit_deallocate(
 /// names a block entry of the function already running, in which case
 /// [`JitRuntime::resume_entry`] carries that entry and the emitted arm tail-jumps to it
 /// (see [`return_word`]).
+///
+/// The helper stores no position of its own: a taken transfer publishes its target, a
+/// decline is republished by the driver's loop-head decode, a `Halt` publishes this
+/// instruction as the finished run's position ([`halt_word`]), and the failure path
+/// publishes it in [`report_frame_error`].
 pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
@@ -2395,12 +2438,10 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
         machine.take_continuation()
     };
     match continuation {
-        Ok(continuation) => return_word(runtime, continuation),
+        Ok(continuation) => return_word(runtime, continuation, func, pc),
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -2415,11 +2456,14 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
 /// `Instr::DeallocateReturn(N)`), so a `call`-heavy module pays it once per function
 /// exit on each tier. The two halves are the interpreter's, in the interpreter's
 /// order — [`Machine::pop_frame_checked`] first, so a mismatched operand raises from
-/// the live frame exactly as `Instr::Deallocate` does, then [`return_word`] — and the
-/// position the helper records is the fused instruction's own `(func, pc)`, which is
-/// what `step_instruction` records for `Instr::DeallocateReturn` (the emitter passes
-/// the `return`'s `pc` when it fuses a separate pair, which is the last instruction
-/// the interpreter would have recorded in that case).
+/// the live frame exactly as `Instr::Deallocate` does, then [`return_word`] — and it
+/// stores no position of its own: a taken transfer publishes its target, a decline is
+/// republished by the driver's loop-head decode, a `Halt` publishes this instruction as
+/// the finished run's position ([`halt_word`]), and the failure path publishes it in
+/// [`report_frame_error`] (the fused instruction's own `(func, pc)`, which is what
+/// `step_instruction` records for `Instr::DeallocateReturn`; the emitter passes the
+/// `return`'s `pc` when it fuses a separate pair, which is the last instruction the
+/// interpreter would have recorded in that case).
 ///
 /// Like [`jit_return`] it always transfers control, so the caller leaves the block
 /// with the helper's word in `rax` — or tail-jumps to the same-function block entry
@@ -2438,12 +2482,10 @@ pub(crate) extern "C" fn jit_deallocate_return(
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
         machine.pop_frame_take_continuation(deallocate)
     };
     match outcome {
-        Ok(continuation) => return_word(runtime, continuation),
+        Ok(continuation) => return_word(runtime, continuation, func, pc),
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
