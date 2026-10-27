@@ -144,7 +144,9 @@ reader, so the guard is what makes those cheap.
 - **The whole-table copy the load hands `lower::build_module` is `AtomTable::fork`**
   (`codeserver.rs:921`): it shares the `Arc<str>` name handles and preserves every index and the
   generation, so it costs two allocations (one `Vec` of handles, one index bucket array) and
-  nothing per atom — it has no attributable share of its own in the census above. This is only a
+  nothing per atom — it has no attributable share of its own in the census above (that is a *time* statement:
+  in *memory* the fork is ≈37 B per already-interned atom **per loaded module**, retained for the module's life
+  in `Module.atom_table` — `../../../beam_loader/CONTEXT.md:65`, `../../CONTEXT.md` *The dominant consumer*). This is only a
   *copy* change: every index of the module's table names exactly what a deep clone named, because
   a fork starts at the same length and appends in index order, which is the protocol the
   merge-back loop rides (`beam_term`'s `a_fork_serves_the_lower_then_merge_back_protocol`). The
