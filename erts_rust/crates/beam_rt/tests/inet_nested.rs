@@ -46,32 +46,27 @@
 //! Every peer is a std [`TcpStream`]/[`TcpListener`] owned by the test, held in its own thread:
 //! an in-VM peer cannot do a bare `receive` under `-eval` (there is no scheduler for it) and
 //! cannot sleep-then-block, so it is the wrong tool for this route. The peer **stays connected
-//! after it writes** — a send-then-close peer trips the escalated EOF-ordering defect and would
-//! make the case lie about what it measured.
+//! after it writes**: each case here measures one read and the completion that answers it, so the
+//! peer-close path stays out of the measurement — a driver holding a complete buffered unit
+//! delivers it ahead of the close it owes (`inet_drv.c:13130`), and a peer that closed after
+//! writing would make a case measure that ordering instead of its own read.
 //!
 //! # Synchronisation: the run's own stdout is the clock
 //!
-//! A payload must arrive *after* the read operation is armed, otherwise it is buffered in the
-//! socket before the driver registers its interest — which is the one documented residual below.
-//! So the peer never sleeps a guessed boot delay: the fixture prints a mark immediately before it
-//! enters the blocking call, the harness reads that line **live**, waits [`ARM_MARGIN`], and only
-//! then writes. The same expression text and the same marks are used on both runtimes.
+//! The cases that measure a **completion** need the payload to arrive *after* the read operation
+//! is armed. So the peer never sleeps a guessed boot delay: the fixture prints a mark immediately
+//! before it enters the blocking call, the harness reads that line **live**, waits [`ARM_MARGIN`],
+//! and only then writes. The same expression text and the same marks are used on both runtimes.
+//! The last case deliberately does the opposite — it writes before the read arms, to pin the
+//! driver's *control-time* read attempt.
 //!
-//! # Bounds, skips and the one documented divergence
+//! # Bounds and skips
 //!
 //! Nothing here can hang: every wait on a child is bounded (a timeout kills and reaps it and
 //! panics with its captured transcript), every peer operation carries a deadline, and the
 //! deadline case asserts its own wall-clock window. A missing toolchain is a **loud** skip
 //! ([`support::skip_loudly`]): `erl` is needed for every oracle half and `erlc` for the one
 //! `-s`-route fixture.
-//!
-//! [`a_read_of_already_buffered_data_on_an_accepted_socket_answers_closed_at_the_peer_close`] is the one
-//! `#[ignore]`d case. It pins a **known `beam_io` residual** — an accepted socket whose payload
-//! was drained into the port's input queue before the read op armed raises no read event, so this
-//! runtime answers `{error,closed}` at the peer's close where the oracle answers `{ok,<<"hi">>}`
-//! from its buffer — by asserting today's answer *and* the oracle's, so closing the gap flips
-//! exactly one test. Its own waits are bounded like every other case here, so running it with
-//! `--ignored` costs a few seconds and can never hang the suite.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -173,7 +168,7 @@ const PORT_S_ROUTE: u16 = 21333;
 const PORT_SECOND_READ: u16 = 21337;
 /// [`an_accept_with_no_client_ends_at_the_port_event_deadline`].
 const PORT_DEADLINE: u16 = 21345;
-/// [`a_read_of_already_buffered_data_on_an_accepted_socket_answers_closed_at_the_peer_close`].
+/// [`a_read_of_already_buffered_data_on_an_accepted_socket_answers_it`].
 const PORT_BUFFERED: u16 = 21349;
 
 // ---------------------------------------------------------------------------------------------
@@ -251,8 +246,8 @@ const DEADLINE_EXPR: &str = "\
 R = gen_tcp:accept(L), \
 io:format(\"accept=~p~n\", [R])";
 
-/// The **residual**: the peer's payload is already buffered (the fixture sleeps between the
-/// accept and the read) before the read op arms.
+/// The buffered-payload shape: the peer's payload is already in the socket's buffer when the read
+/// op arms (the fixture sleeps 500 ms between the `accept` and the `recv`).
 const BUFFERED_EXPR: &str = "\
 {ok,L} = gen_tcp:listen($PORT, [binary, {active,false}, {reuseaddr,true}]), \
 {ok,S} = gen_tcp:accept(L), \
@@ -666,9 +661,11 @@ enum PeerRole {
 /// A peer socket owned by the test, driven from a channel.
 ///
 /// The socket lives in the peer's own thread for as long as the guard does, so "the peer holds
-/// the connection open until the test says otherwise" is structural: a send-then-close peer would
-/// trip the escalated EOF-ordering defect and make a case lie. Dropping the guard closes the
-/// socket (and the thread is bounded, so this can never hang a test).
+/// the connection open until the test says otherwise" is structural: a peer that closed after its
+/// write would make a case measure the peer-close path instead of the read and completion it
+/// pins (a complete buffered unit is delivered ahead of the close the driver owes,
+/// `inet_drv.c:13130`). Dropping the guard closes the socket (and the thread is bounded, so this
+/// can never hang a test).
 struct Peer {
     tx: Option<Sender<PeerCommand>>,
     handle: Option<thread::JoinHandle<()>>,
@@ -962,9 +959,9 @@ fn a_passive_read_of_data_sent_after_the_arm_completes_on_the_accepted_socket() 
 /// The same read on a **connect-side** socket (the test owns the listener, the fixture dials and
 /// reads) answers `{ok, <<"hi">>}` on the nested route.
 ///
-/// The connect side is the control for case 2: the identical pre-buffered payload on this socket
-/// *is* delivered (see the `#[ignore]`d residual below), so this case keeps the two paths
-/// distinguishable. The oracle prints `recv={ok,<<"hi">>}`.
+/// The connect side is the counterpart to case 2: the identical payload on this socket path is
+/// delivered too, and the last case here pins the same delivery when the payload is already
+/// buffered before the read arms. The oracle prints `recv={ok,<<"hi">>}`.
 #[test]
 fn a_passive_read_of_data_sent_after_the_arm_completes_on_a_connect_side_socket() {
     let Some(oracle) = require_oracle("inet_nested (connect-side recv)") else {
@@ -1261,86 +1258,45 @@ fn still_running_after(program: &Path, args: &[&str], window: Duration) -> Verdi
 }
 
 // ---------------------------------------------------------------------------------------------
-// 9. the documented residual (ignored)
+// 9. a payload already buffered on an accepted socket
 // ---------------------------------------------------------------------------------------------
 
-/// **Known `beam_io` residual (ignored):** a passive read on an **accepted** socket whose payload
-/// was buffered *before* the read op armed is answered from the socket's own buffer by the oracle
-/// and not by this runtime.
+/// A passive `gen_tcp:recv/2` on an **accepted** socket whose payload is already in the socket's
+/// buffer answers `{ok, <<"hi">>}` on the nested route — on **both** runtimes.
 ///
-/// | leg | printed answer |
-/// |---|---|
-/// | this runtime | `recv={error,closed}` — typed, and printed only once the peer closes |
-/// | the oracle | `recv={ok,<<"hi">>}` — immediately, from the buffer |
+/// The fixture accepts the peer's connection and then sleeps 500 ms before it calls
+/// `gen_tcp:recv/2`, so the peer's `hi` is sitting in the accepted socket's buffer well before the
+/// read operation arms: nothing about this payload arrives after the arm. Both sides still answer
+/// it, because the driver attempts the read at **control** time (`inet_drv.c:12310`) — bytes
+/// already buffered satisfy the operation before any readiness interest is armed — and a passive
+/// socket is never read on mere readiness (`inet_drv.c:4287`).
 ///
-/// Both legs are **typed and bounded**, never a hang: this runtime's reader is the socket's
-/// **owner** (the fixture opens, accepts and reads in one process), so the completion addressing
-/// is not involved — the read op simply never sees an event, and what ends the wait is the peer's
-/// FIN (`Peer::close` after [`ARM_MARGIN`]), which answers `{error,closed}`. With a peer that
-/// stays open and silent the same read ends at the nested wait's own typed diagnostic
-/// (`unsupported: port event: … within the 5 s bound`, exit 3), measured. Both runtimes exit 0 on
-/// the pinned shape; the divergence is the payload, not the shape.
-///
-/// The gap is in **`beam_io`'s `TcpInetDriver`**, and it is one missing attempt: the C reads
-/// synchronously at **control** time (`inet_drv.c:12309`), so bytes already in the kernel/port
-/// buffer satisfy the operation before any interest is armed; this driver has no control-time read
-/// attempt — it arms read interest and reads from a readiness callback or from
-/// `try_complete_recv` — and a payload the port's input queue already holds is left for nobody.
-/// The two related shapes are the same code: `TcpInetDriver::from_accepted`'s read-interest
-/// registration (a connect-side socket with the identical pre-buffered payload *is* delivered —
-/// [`a_passive_read_of_data_sent_after_the_arm_completes_on_a_connect_side_socket`]), and the
-/// destructive `latch_peer_close` that loses a send-then-close peer's bytes outright.
-///
-/// Flipping this test is the whole change: un-ignore it and its expectations become the oracle's
-/// on both legs. Run it with `--ignored --test-threads=1`; every wait it makes is bounded
+/// So the answer needs no peer close and no prompt: the case reads the `recv=` line while the peer
+/// is still connected, and its transcript must be the oracle's. Every wait is bounded
 /// ([`LINE_TIMEOUT`], [`EXIT_TIMEOUT`], [`PEER_DEADLINE`]), so it cannot hang the suite.
 #[test]
-#[ignore = "beam_io TcpInetDriver has no control-time read attempt (inet_drv.c:12309): an accepted socket's already-buffered payload raises no read event, so the read answers {error,closed} at the peer's close where the oracle answers {ok,<<\"hi\">>}"]
-fn a_read_of_already_buffered_data_on_an_accepted_socket_answers_closed_at_the_peer_close() {
-    let Some(oracle) = require_oracle("inet_nested (buffered residual)") else {
+fn a_read_of_already_buffered_data_on_an_accepted_socket_answers_it() {
+    let Some(oracle) = require_oracle("inet_nested (buffered on an accepted socket)") else {
         return;
     };
     let expr = BUFFERED_EXPR.replace("$PORT", &PORT_BUFFERED.to_string());
-
-    // This runtime: the peer writes as soon as it is connected — i.e. while the fixture is still
-    // inside `accept/1`, and certainly before the 500 ms sleep is over — so the payload is in the
-    // socket buffer before `gen_tcp:recv/2` is called. The answer only comes when the peer
-    // closes.
-    let rust = {
+    let out = both_legs("buffered payload on the nested route", |is_oracle| {
+        // The peer writes as soon as it is connected — i.e. while the fixture is still inside
+        // `accept/1`, and certainly before its 500 ms sleep is over — so the payload is in the
+        // socket's buffer before `gen_tcp:recv/2` is called.
         let peer = Peer::connect(PORT_BUFFERED);
         peer.send(b"hi");
-        let mut run = Nested::eval(Path::new(BINARY), &expr, false);
+        let mut run = Nested::eval(program(is_oracle, &oracle), &expr, is_oracle);
         run.expect("accepted=true");
         run.expect("armed");
-        thread::sleep(ARM_MARGIN);
-        peer.close();
-        run.finish()
-    };
-    rust.assert_success("buffered residual (this runtime)");
-    expect(&rust, "recv=", "{error,closed}");
-
-    // The oracle: the same buffered payload, answered from the buffer without any close.
-    let oracle_run = {
-        let peer = Peer::connect(PORT_BUFFERED);
-        peer.send(b"hi");
-        let mut run = Nested::eval(&oracle, &expr, true);
-        run.expect("accepted=true");
-        run.expect("armed");
-        // It answers on its own: no close, no prompt.
+        // It answers on its own, from the buffer: no close, no prompt.
         run.expect("recv=");
         let finished = run.finish();
         peer.close();
         finished
-    };
-    oracle_run.assert_success("buffered residual (the oracle)");
-    expect(&oracle_run, "recv=", "{ok,<<\"hi\">>}");
-
-    assert_ne!(
-        rust.lines, oracle_run.lines,
-        "the residual is a divergence: once both sides print the same transcript the gap is \
-         closed and this test should be un-ignored and its expectation flipped\n--- rust ---\n{}\n\
-         --- oracle ---\n{}",
-        rust.transcript(),
-        oracle_run.transcript()
-    );
+    });
+    expect(&out.0, "accepted=", "true");
+    expect(&out.1, "accepted=", "true");
+    expect(&out.0, "recv=", "{ok,<<\"hi\">>}");
+    expect(&out.1, "recv=", "{ok,<<\"hi\">>}");
 }

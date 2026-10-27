@@ -76,20 +76,19 @@
 //! bound, so a lost reply or a lost read shows up as a visible mismatch. [`support::PROBE_TIMEOUT`]
 //! additionally kills a child that never answers.
 //!
-//! # Where the remaining read-side residual lives
+//! # Where the read-side cases live
 //!
 //! The read twin is pinned here ([`a_read_from_a_process_that_is_not_the_controlling_process`]):
 //! a non-owner's passive `gen_tcp:recv/3` is answered because the port layer records **per
 //! operation** who issued it (`PortMeta::async_callers`, taken when that id's `{inet_async, …}` is
 //! rendered) and addresses the completion there.
 //!
-//! One read shape is still a `beam_io` residual and is **not** pinned here: a read of data that
-//! was already buffered before the read operation was issued, with a `timeout 0`. The oracle
-//! answers it from the buffer because the C attempts the receive at control time
-//! (`inet_drv.c:12309`); `TcpInetDriver` has no control-time read attempt, so it times out — for
-//! the port's **owner** as well, which is what makes it a driver gap rather than an addressing
-//! one. It is recorded, with its oracle expectation, as
-//! [`../inet_async_caller.rs`](../inet_async_caller.rs)'s `b` case (`#[ignore]`d on that row).
+//! A read of data that was already buffered before the read operation was issued, with a
+//! `timeout 0`, is [`../inet_async_caller.rs`](../inet_async_caller.rs)'s `b` case, and it answers
+//! the oracle's `{ok, <<"hi">>}` on both the owner and a non-owner reader: the driver attempts the
+//! receive **inside** its control call (the C's `tcp_recv(desc, n)`, `inet_drv.c:12310`), so the
+//! bytes are in hand before any read interest is armed and nothing is left for a readiness event
+//! to supply.
 
 // The shared harness is compiled in whole; this suite uses its bounded runner, its toolchain
 // discovery and its `-eval` differential.
@@ -172,9 +171,10 @@ const TEARDOWN: &str = "gen_tcp:close(Cl), gen_tcp:close(A), gen_tcp:close(L), "
 /// receive, the port round writes it, and the reply `{inet_reply, Cl, ok, Mref}` resumes it.
 ///
 /// The child waits 300 ms before sending so the parent's `gen_tcp:recv/3` is **armed** when the
-/// bytes arrive: a passive read of an accepted socket that is armed only *after* the payload was
-/// buffered is a separate, documented `beam_io` residual (`tests/inet_completion.rs`), not this
-/// rule.
+/// bytes arrive: this row pins the sender's own reply, while a read armed only *after* the payload
+/// was buffered is a different shape — answered from the driver's receive inside the control call
+/// (`inet_drv.c:12310`), pinned by [`../inet_async_caller.rs`](../inet_async_caller.rs)'s `b` case
+/// and by [`../inet_nested.rs`](../inet_nested.rs)'s accepted-socket case.
 #[test]
 fn a_spawned_sender_is_resumed_by_its_own_reply() {
     let expr = format!(
@@ -243,8 +243,9 @@ fn a_spawned_command_reply_carries_its_own_tag_and_never_reaches_the_owner() {
 ///
 /// The port records one `desc->caller` per command (the C's single `desc->caller` field), so a
 /// runtime that addressed the reply to the owner would answer neither of them. The receive side
-/// is deliberately not observed: two reads of one accepted socket are the arm-once residual named
-/// above, and what this row pins is the pair of *replies*.
+/// is deliberately not observed — this row pins the pair of *replies*, and the read shapes have
+/// their own suites ([`../inet_async_caller.rs`](../inet_async_caller.rs),
+/// [`../inet_nested.rs`](../inet_nested.rs)).
 #[test]
 fn two_concurrent_senders_each_get_their_reply() {
     let expr = format!(
