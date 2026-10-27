@@ -60,7 +60,12 @@ The process arm is **hinted**: the largest graph this context has been refused f
 fewer free words than the hint (plus a margin) is grown — **only while the process's root set is complete**, i.e. `!Process::is_relocation_exempt()` (`gc::may_replace_young_space`, the one predicate every growth site consults) — through the NO-RELOCATION
 `Process::grow_nursery` — **before** the attempt, so a copy-bound loop does not pay a refusal's
 five-traversal sizing walk per op; `hint == 0` (a context's first copy-out) takes the unhinted
-path, and the grow-and-retry fallback always applies (`calls.rs::hint_grow_gate`).
+path, and the grow-and-retry fallback always applies (`calls.rs::hint_grow_gate`). The retire carries
+its room request (`Nursery::grow_for_one_off` → `Nursery::pending_growth_need`) into the settlement
+that follows, where the next **minor** collapse spends it once through `minor_collapse_target`,
+clamped by `minor_carriage_bound` (the keep band's upper edge) — so the growth the gate asks for
+survives one collection instead of being undone by it, while a **fullsweep** collapse consumes the
+request without folding it in.
 See [IMPLEMENTATION.md](../IMPLEMENTATION.md#the-learned-copy-out-hint--copy_out_hint--hint_grow_gate-the-copy-bound-fix).
 The **move** is unconditional on a process route (`move_container = mailbox_table.is_some() || safe_to_rewind`): a container result left on the pooled BIF heap sits in a region no collector scans and a later call's rewind recycles, so Erlang code that stores it in a heap object would hold a dangling pointer (`compile:debug_info_chunk/1` storing `lists:filter/2`'s result inside a tuple is that shape).
 On the **table-less** route the move stays gated on `safe_to_rewind`: there is no collector to make the result collectable and a non-rewindable call never rewinds, so an unconditional move would only duplicate it into the runtime-lifetime store.

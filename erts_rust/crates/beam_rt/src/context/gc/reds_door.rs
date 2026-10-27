@@ -103,16 +103,16 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// * without it the door would collect on every pre-emption of a process whose nursery is nearly
 ///   empty (a mostly-parked or barely-allocating process), paying a Cheney traversal for nothing.
 ///
-/// **The watermark's rationing, as this tree measures it.** The churn shape's own heap-admission
+/// **The watermark's rationing, as one recorded run put it.** The churn shape's own heap-admission
 /// door already settles its collection debt every iteration, so a boundary collection here is nearly
 /// always a duplicate — and an expensive one, because `beam_gc::Collector::collect` escalates to a
 /// **major** unless the round's own live promotion fits the mature space
 /// (`Collector::minor_promotion_fits`). The `7/8` watermark rations the door to one firing in nine
-/// to ten boundary checks: measured **44 of
+/// to ten boundary checks: in that run **44 of
 /// 390** checks at N = 2 000, **83 of 780** at N = 4 000 and **196 of 1 952** at N = 10 000 (one
 /// in 8.86 / 9.40 / 9.96, inside the band), and a boundary collection leaves the boundaries
-/// after it below the watermark. Its share of that shape's own collections is **0.83 /
-/// 0.77 / 0.72 %** at the same three rows, because the capacity it collapses onto does not follow N
+/// after it below the watermark. Re-derive the firing counts per run (`--nocapture`): the occupancy
+/// arithmetic reads the space's capacity, so a `beam_gc` sizing change moves the check counts with it
 /// (`src/runner/tests/boundary_cost.rs`'s `MEASURED` table holds the counts, `src/runner/MEASURED.md`
 /// the measurement record).
 /// What the door *adds* to a run's totals is not measurable here: a door-ON/OFF delta needs a
@@ -127,10 +127,14 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// **The shape's schedule is a live-set one.** The copy-out hint gate in
 /// [`crate::context::calls`] (`hint_grow_gate`) grows the churn shape's nursery **before** its
 /// 257-word tuple copy-out instead of after a refusal, so the growth event (one retired space ⇒
-/// one collection debt) sets that shape's cadence: at N = 2 000 it measures **5 307 collections and
-/// 331 majors** over 2 001 calls (2.6522 / 0.1654 per call) on one young space of **2 585**
-/// words and a mature region of **4 185** words — fixed points of `HeapPolicy`'s live-set rules,
-/// never quantities that follow N.
+/// one collection debt) sets that shape's cadence: at N = 2 000 it measures **1 278 collections and
+/// 17 majors** over 2 001 calls (0.6387 / 0.0085 per call) on one young space of **3 000**
+/// words and a mature region of **10 958** words — fixed points of `HeapPolicy`'s live-set rules —
+/// and never quantities that follow N.
+/// The growth the copy-out forced is **carried into the next collection** (`grow_for_one_off` records
+/// it as `Nursery::pending_growth_need`, spent by the next minor collapse through
+/// `minor_collapse_target` and clamped by `minor_carriage_bound`), so the settled capacity is a
+/// function of the live set and of that bound, never of the call count.
 ///
 /// **What would regress it:** a shape whose slice-boundary occupancy sits in `[1/2, 7/8)` — it
 /// would then be collected only through the debt arm, and if its growth seam retired no space it

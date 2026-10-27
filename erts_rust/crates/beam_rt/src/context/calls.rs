@@ -1717,6 +1717,16 @@ impl<'a> RuntimeContext<'a> {
     /// free live terms. `grow_nursery` retires the space it replaces and moves no live term, which
     /// is why it is the right seam here.
     ///
+    /// The request that forced the retirement is **carried into the next collection**:
+    /// `grow_nursery` is `beam_gc`'s `Nursery::grow_for_one_off`, which records the room asked for
+    /// as `Nursery::pending_growth_need` (a maximum, one-shot), and the next **minor** collapse
+    /// spends it through `HeapPolicy::young_after_collection_with_need` — bounded by
+    /// `minor_carriage_bound`, the keep band's own upper edge. So a copy-out that could not wait
+    /// for a collection is not followed by a collapse that hands the room straight back, and the
+    /// settled capacity stays a function of the live set and that bound rather than of the call
+    /// count. A **fullsweep** collapse consumes the request without folding it in: its own 2×
+    /// whole-heap headroom plus the mature promotion room already cover it.
+    ///
     /// It is **not** however unconditionally legal: a replacement is taken only while this
     /// process's root set is complete
     /// ([`gc::may_replace_young_space`](super::gc::may_replace_young_space) — the process is not
@@ -1799,8 +1809,10 @@ impl<'a> RuntimeContext<'a> {
     /// graph and three hash tables — all to *learn* a number
     /// [`copy_shortfall_words`] then also reports for free. A copy-bound loop (the
     /// `copy_bound/ets_copy` benchmark shape) meets that cost on essentially every op,
-    /// because a collection collapses the nursery back to the `233`-word floor while the
-    /// payload in flight is already larger than what a half-full node has free.
+    /// because the destination a collection installs is sized from that shape's own
+    /// near-empty live set — the carried growth request covers only a growth that already
+    /// happened — while the payload in flight is already larger than what a half-full node
+    /// has free.
     ///
     /// So the refusal also **teaches** the context: its own word count becomes
     /// [`RuntimeContext::copy_out_hint`] (`max`, never a replacement — the hint is a lower
@@ -2417,6 +2429,14 @@ const COPY_OUT_HINT_MIN_WORDS: usize = 8;
 /// [`Process::grow_nursery`] retires the space it replaces and **moves no live term**, so it is
 /// the right seam for a BIF call, where the executing machine's x registers and Erlang stack are
 /// not published: collecting here instead would free live terms.
+///
+/// The request is **carried**: `grow_nursery` is `Nursery::grow_for_one_off`, so every retirement
+/// records this room ask as `Nursery::pending_growth_need` (a maximum, never a sum, one-shot) and
+/// the next **minor** collapse spends it through `HeapPolicy::young_after_collection_with_need`
+/// capped at `minor_carriage_bound`. A gate that grew the destination therefore leaves the
+/// following collection a nursery sized for the request instead of one handed back to the live-set
+/// target alone — the settled capacity remains a function of the live set and that bound, never of
+/// the number of gates.
 ///
 /// "Moves nothing" is not by itself a licence to replace the space, though. The replacement keeps
 /// every handed-out word addressable at its original address only until the next **collection
