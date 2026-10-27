@@ -48,16 +48,21 @@
 //! * **A periodic one-off copy-out the nursery cannot hold** ([`BURST_WORDS`] words every
 //!   [`BURST_PERIOD`] ops, allocated in one lump and abandoned immediately) — the copy-out a big
 //!   BIF result forces. It is deliberately far above the nursery the ordinary allocations settle
-//!   at, so it can only be admitted through the collector's growth seam; how often it exceeded the
-//!   free room it found is printed with the census (the exceptions are the copy-outs that follow a
-//!   fullsweep, whose whole-heap live-set target installs a nursery larger than one lump).
+//!   at, so it can only be admitted by growing the nursery; how often it exceeded the free room it
+//!   found is printed with the census (the exceptions are the copy-outs that follow a fullsweep,
+//!   whose whole-heap live-set target installs a nursery larger than one lump).
 //!
-//! Every allocation goes through the **same admission door `beam_rt` drives**
+//! The ordinary allocations go through the **same admission door `beam_rt` drives**
 //! (`src/context/gc.rs::collect_or_grow`): ask
 //! [`should_collect`](AnyCollector::should_collect) OR
 //! [`collection_debt`](AnyCollector::collection_debt), and on `true` call
 //! [`ensure_capacity`](AnyCollector::ensure_capacity) with the **current root set** — a real
 //! `&mut [Eterm]` slice the run holds, because a collection rewrites the roots it is handed.
+//! The copy-out does **not** go through the door, because the real one cannot: at
+//! `beam_rt/src/context/calls.rs::hint_grow_gate` the machine's roots are unpublished, so the
+//! collector cannot relocate — the copy-out calls
+//! [`grow_nursery`](AnyCollector::grow_nursery), the no-relocation seam that retires the space and
+//! records the request, and the **next** door admission then collects on `collection_debt()`.
 //!
 //! # What is deterministic, and what is not
 //!
@@ -236,26 +241,30 @@ fn small_transient(c: &mut AnyCollector, roots: &mut Vec<Eterm>, k: &mut Counter
 
 /// One large one-off copy-out: a single lump the nursery cannot hold, abandoned immediately.
 ///
-/// The admission must **grow** the nursery to fit it — a plain collection sizes the nursery from
-/// what it left alive, not from what the caller is about to allocate — which is exactly the
-/// grow-then-collapse cycle the compile route's big BIF results force. The request is counted
-/// against the nursery's free room (`should_collect`, a side-effect-free query) before the door,
-/// so how often the copy-out really exceeded the room it found is part of the census rather than
-/// an assumption: the exceptions are the copy-outs that follow a **fullsweep**, whose whole-heap
-/// live-set target deliberately installs a nursery larger than one copy-out.
+/// The admission is the **copy-out route**, not the door's: a BIF handing back a big result holds
+/// no published root set at that point, so it cannot collect. It grows the nursery through the
+/// **no-relocation seam** [`grow_nursery`](AnyCollector::grow_nursery) — which retires the space
+/// and records the room request — and the **next** door admission collects on the
+/// `collection_debt()` that growth created. The request is counted against the nursery's free room
+/// (`should_collect`, a side-effect-free query) before the growth, so how often the copy-out really
+/// exceeded the room it found is part of the census rather than an assumption: the exceptions are
+/// the copy-outs that follow a **fullsweep**, whose whole-heap live-set target deliberately
+/// installs a nursery larger than one copy-out.
 fn burst(c: &mut AnyCollector, roots: &mut Vec<Eterm>, k: &mut Counters) {
     k.bursts += 1;
     if c.should_collect(BURST_WORDS) {
         k.bursts_over_room += 1;
     }
-    door(c, roots, BURST_WORDS, k);
+    c.grow_nursery(BURST_WORDS)
+        .expect("the no-relocation growth seam always finds room for the copy-out");
     roots[BURST] = c
         .young_mut()
         .heap_mut()
         .tuple(&[make_small(7); BURST_ELEMS])
-        .expect("the door grew the nursery to fit the copy-out");
+        .expect("the grown nursery holds the copy-out");
     // Inspected once and dropped: the whole lump is a transient, so it is garbage before any
-    // collection sizes the nursery — which is why the next copy-out must grow the nursery again.
+    // collection sizes the nursery — the next door admission collects on the debt this growth
+    // recorded, which is why the copy-out after that must grow the nursery again.
     roots[BURST] = NIL;
 }
 
