@@ -72,10 +72,12 @@ store a return address into the wrong function's frame and only show up as a cor
   cross-function non-tail call takes on the runtime path (`CodeCache::compiled_handle`) — the arm asks for
   `call.rs::jit_call_store_linked` instead, and leaves through `link.rs::emit_in_block_call`. That helper
   stores the continuation and runs the seam **first** (a served callee must get neither a return address
-  nor a transfer), then resolves the callee's native entry through `runtime.rs::enter_in_block`, which
-  lazily compiles the function on first entry, checks its register-file bound, publishes the target's
-  `EntryTables` and performs the skipped driver iteration in the driver's own order (position store,
-  reductions bump, `ctx.reduce(1)?`). Every decline leaves `resume_entry` null and the helper's word equal
+  nor a transfer), then resolves the callee's native entry through `runtime.rs::enter_in_block` (the
+  `#[inline]` same-function fast path over the published `EntryTables`, else the `#[cold]`
+  `cross_function_enter`, which lazily compiles the function on first entry and checks its
+  register-file bound) and performs the skipped driver iteration in the driver's own order (position
+  store, reductions bump, `ctx.reduce(1)?`), re-publishing the target's `EntryTables` for a
+  cross-function transfer. Every decline leaves `resume_entry` null and the helper's word equal
   to the pre-existing `encode_target(func, pc)`, so the driver serves it exactly as before.
 Pinned by `call_tests.rs`'s five transfer tests (see `../CONTEXT.md`).
 
@@ -177,6 +179,6 @@ call-dense synthetic body costs ~4× per 4× call count (linear), pinned by
 
 ## See Also
 - `../../CONTEXT.md` → the driver loop, the block ABI words, the reduction charge a transfer reproduces.
-- `../../runtime/CONTEXT.md` → `enter_in_block`, `return_word`, `resume_in_block`, `EntryTables`.
+- `../../runtime/CONTEXT.md` → `enter_in_block`, `return_word`, `EntryTables`.
 - `../prologue/CONTEXT.md` → the prologue every entered range opens with (a sub-block included).
 - `../regalloc/CONTEXT.md` → the per-range allocation a sub-block derives for itself.

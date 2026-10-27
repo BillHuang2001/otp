@@ -95,7 +95,8 @@ The only tables that outlive a compile are `compile.rs`'s entry tables and the `
 - **Keyed by `(func, pc)`, two different structures with the same key** (`compile.rs`):
   `block_labels: BTreeMap<(u32, u32), CodeLabel>` (`:86` eager / `:179` lazy — a **label** per block
   start, so a forward branch is an ordinary `rel32` fixup) and the driver-facing entry tables
-  `entries: Vec<Vec<Option<*const u8>>>` + `sub_entries` (`:65`/`:73`, lazy `:178`/`:189` — **flat
+  `entries`/`sub_entries` (`Vec<Vec<*const u8>>` for the eager layout's `[func][pc]`, `Vec<*const u8>`
+  for a lazy function's `[pc]`, each slot null when that address compiled no block — **flat
   indexing**, chosen over a `HashMap` because the driver probes it on every cross-block jump).
   `Linker` (`link.rs:229`) holds only `&BTreeMap<(u32, u32), CodeLabel>`; it owns no fixup table — the
   `rel32` patching is the `CodeBuffer`'s own label machinery.
