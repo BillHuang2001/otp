@@ -66,7 +66,8 @@ pub type EmulatorConfig = beam_common::RuntimeConfig;
 /// address space costs ~nothing in RSS for a program that allocates little: both 128 MiB
 /// regions together sit at 12–48 kB resident (`src/context/pump/CONTEXT.md` *Capacity is not
 /// RSS*), so the bare `-eval 'halt().'` peak is set by the retained module graph, not by this
-/// reservation (measured 64.45 MiB; `CONTEXT.md` *Startup footprint*).
+/// reservation (the bare `-eval 'halt().'` peak is measured at 59.45 MiB; `CONTEXT.md`
+/// *Startup footprint*).
 pub const DEFAULT_HEAP_WORDS: usize = 1 << 24;
 
 /// The `+hmax*` boolean flags and the per-process `max_heap_size` **setting** are owned by

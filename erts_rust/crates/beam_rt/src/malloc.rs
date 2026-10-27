@@ -57,7 +57,7 @@
 //!
 //! | phase | peak RSS |
 //! |---|---|
-//! | bare boot (`-eval 'halt().'`) | 64.45 MiB |
+//! | bare boot (`-eval 'halt().'`) | 59.45 MiB |
 //!
 //! The trim existed to give back a *dead* high-water; with the boot's retained state kept
 //! alive there is none to give back, so the call's exit RSS stays within a few MB of the peak.
