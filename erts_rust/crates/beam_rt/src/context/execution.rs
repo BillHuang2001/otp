@@ -434,6 +434,16 @@ impl ExecutionContext for RuntimeContext<'_> {
             && !apply::prefers_module_code_for_fun_apply(self.may_pump_scheduler(), answer.hooks)
             && !(nests_a_fun_apply(module, answer.hooks)
                 && self.calling_process_has_collection_debt())
+            // The `io` **output** keys are host-served only while the caller's group leader is
+            // one of this runtime's own stream devices. Any other leader — a capture process, a
+            // file's io server, a `user` device, a dead pid — is addressed by the OTP
+            // `{io_request, …}`/`{io_reply, …}` protocol, whose round trip only the in-machine
+            // `lib/stdlib/src/io.erl` body can complete (its `receive` suspends this process
+            // through `RunOutcome::Wait`). This is what makes `group_leader/2`-based output
+            // capture work, and therefore `eunit`'s capture of a test's `io:format` output —
+            // [`io_route`](super::io_route) carries the whole rule, the measured oracle table
+            // and what is deliberately left to the floor.
+            && !self.io_routes_through_the_protocol(module, function, arity)
         {
             return Ok(None);
         }

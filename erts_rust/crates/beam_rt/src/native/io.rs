@@ -143,8 +143,16 @@ enum Device {
     NoClause,
     /// A **live** io device this runtime cannot serve from a BIF: `io.erl` would post an
     /// `{io_request, …}` to it and block in a `receive` for the reply, which a BIF may not
-    /// do.
+    /// do. (A scheduled process reaches such a device through the in-machine `io.erl` body
+    /// instead — see [`crate::context`]'s `io_route`, which is also what serves a capturing
+    /// group leader.)
     Unreachable,
+    /// A pid that is **not a live process**. The oracle's `execute_request/3` sends the
+    /// request (a no-op to a dead pid) and then waits on a monitor that fires immediately,
+    /// answering `{ErrorTag, terminated}` — `error:terminated` (`io.erl:200`, measured on
+    /// OTP 29.1.2). No round trip is needed to reproduce that, so this is a value rather
+    /// than a gap.
+    DeadPid,
 }
 
 /// The typed capability gap for a live device that needs the `{io_request, …}` round trip.
@@ -282,6 +290,7 @@ impl RuntimeContext<'_> {
             Device::UnknownAtom => Err(BeamError::BadArg),
             Device::NoClause => Err(prim::function_clause()),
             Device::Unreachable => Err(error::unsupported(UNREACHABLE_DEVICE)),
+            Device::DeadPid => Err(prim::terminated()),
         }
     }
 
@@ -304,11 +313,28 @@ impl RuntimeContext<'_> {
     /// `kernel` registers the name from the `standard_error` process it starts in its
     /// supervision tree (`lib/kernel/src/kernel.erl:124-129`), so the name exists on every
     /// boot-driven route and is absent on a runtime that never booted.
-    fn standard_error_pid(&self) -> Option<ProcessId> {
+    pub(crate) fn standard_error_pid(&self) -> Option<ProcessId> {
         self.runtime
             .code_server
             .atoms()
             .lookup("standard_error")
+            .and_then(|name| self.process_table().whereis(name))
+    }
+
+    /// The pid the **`user`** name resolves to — this runtime's terminal device.
+    ///
+    /// `user` is one of the two streams [`Self::io_device`] recognises **by name** (it is
+    /// [`Stream::Output`] whatever the registry holds), so the group-leader rule has to
+    /// recognise the same process by pid: a leader that *is* `whereis(user)` is this
+    /// runtime's own output stream, not a device to exchange `{io_request, …}` with
+    /// ([`RuntimeContext::io_leader_needs_the_protocol`]).
+    ///
+    /// [`RuntimeContext::io_leader_needs_the_protocol`]: crate::context::RuntimeContext
+    pub(crate) fn user_pid(&self) -> Option<ProcessId> {
+        self.runtime
+            .code_server
+            .atoms()
+            .lookup("user")
             .and_then(|name| self.process_table().whereis(name))
     }
 
@@ -358,6 +384,13 @@ impl RuntimeContext<'_> {
         }
         if pid == self.runtime.group_leader_of(self.pid()) {
             return Device::Stream(Stream::Output);
+        }
+        // A device that is not a live process answers the oracle's `error:terminated`
+        // without any round trip: `io.erl`'s `execute_request/3` sends the request (nothing
+        // is delivered to a dead pid) and its `erlang:monitor(process, Pid)` replies `'DOWN'`
+        // at once, which is the `terminated` clause of `o_request/2`.
+        if !self.process_table().is_process_alive(pid) {
+            return Device::DeadPid;
         }
         Device::Unreachable
     }

@@ -65,6 +65,10 @@
 //! * [`gc`]/[`gc_walk`] — the heap-admission point and the unscanned-root valve.
 //! * [`position`] — the **in-machine** BIF door that answers `erlang:process_info/1,2`'s
 //!   execution-position items for the process that is executing the query.
+//! * [`io_route`] — which route an `io` **output** call takes: this runtime's own
+//!   `OutputSink` (the host fast path) or the OTP `{io_request, …}`/`{io_reply, …}` protocol
+//!   with the caller's **group leader** (what makes `group_leader/2` output capture, and
+//!   hence `eunit`, work).
 //! * [`records`] — the one code-server record-table lookup (shared with the
 //!   `records:get_definition/2` bridge) and the engine's foreign-record-definition seam.
 //! * [`bridges`]/[`export_gate`]/[`fun_identity`]/[`memory_hook`]/[`module_info`]/
@@ -82,6 +86,7 @@ mod fun_identity;
 pub(crate) mod gc;
 pub(crate) mod gc_valve_trace;
 pub(crate) mod gc_walk;
+pub(crate) mod io_route;
 pub(crate) mod ir_cache;
 mod memory_hook;
 mod machine_pool;

@@ -2123,6 +2123,21 @@ impl RuntimeContext<'_> {
             // there is the same documented limit (see `error::enforce_term_heap_limit`).
             return result.map_err(error::enforce_term_heap_limit);
         }
+        // The OTP **`io` protocol** (see [`super::io_route`]): an `io` output call whose
+        // device is the caller's group leader is not a host write — OTP's `io.erl` posts
+        // `{io_request, Self, Ref, Request}` to the device and awaits `{io_reply, Ref, Reply}`,
+        // which is what makes `group_leader/2`-based capture (hence `eunit`) work. Only the
+        // module body can do that round trip, so the host-served arms are skipped and the
+        // call lands on the external-module tail below, whose `run_export` is the
+        // **blocking-aware** entry (`pump::run_export_blocking`), pumping the scheduler while
+        // the reply is outstanding whenever this context may pump. A context that may not
+        // (`may_pump_scheduler() == false`, i.e. inside a slice) folds the wait into the typed
+        // `blocked()` gap rather than writing the request to the wrong stream — the compiled
+        // `call_ext*` shape never reaches this arm, the seam enters it in-machine instead.
+        if self.io_routes_through_the_protocol(module, function, arity) {
+            perf_counters::bump(|c| &mut c.external);
+            return self.load_and_run(module, function, arity, args);
+        }
         let dispatch = self.dispatch(module, function, arity);
         // `Some` is exactly "the registry has this key" — the memo resolved it through
         // `BifRegistry::lookup`, which stays the single source of truth — and the resolved
@@ -2174,6 +2189,23 @@ impl RuntimeContext<'_> {
         // without an explicit `-pa`. A miss here is not fatal: `CodeServer::load` below
         // reports it, naming every directory searched.
         perf_counters::bump(|c| &mut c.external);
+        self.load_and_run(module, function, arity, args)
+    }
+    /// Loads `module` (probing the code path first, so a module no directory holds is still
+    /// reported by the loader) and runs its exported `function/arity` **in-machine** on a
+    /// nested [`run_export`](Self::run_export).
+    ///
+    /// This is [`Self::call_bif_routed`]'s last resort — the route a name that is neither a
+    /// NIF, nor floor-served, nor registered takes — plus the **`io` protocol**'s route
+    /// (`io_routes_through_the_protocol`, whose device round trip only `lib/stdlib/src/io.erl`'s
+    /// own body can perform).
+    fn load_and_run(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
         let _ = self.runtime.find_module_file(module);
         let loaded = match self.runtime.code_server.load(module) {
             Ok(loaded) => loaded,
