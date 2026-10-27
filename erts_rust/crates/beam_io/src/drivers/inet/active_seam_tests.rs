@@ -45,7 +45,6 @@
 //! under a hang guard, never a fixed sleep. The `erl` rows at the bottom cross-check the
 //! observable counterpart on the system driver and skip **loudly** when `erl` is absent.
 
-use std::time::Duration;
 
 use super::active_tests::{
     active_false, active_multi, active_once, active_true, link, link_with, packet, passive_count,
@@ -61,7 +60,6 @@ const INET_ONCE: i32 = 2;
 /// The `{active, N}` credit the counter cases arm with.
 const CREDIT: i16 = 5;
 /// How long a condition wait may take before the case is declared hung.
-const GUARD: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // `{active, once}` — one delivery, one silent spend

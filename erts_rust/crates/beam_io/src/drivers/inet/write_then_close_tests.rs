@@ -473,10 +473,12 @@ fn a_write_then_close_burst_is_read_only_by_a_queued_receive() {
         other => panic!("the burst was lost: {other:?}"),
     }
     // And the close is owed to the receive after it.
+    let second = port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0));
     assert_eq!(
-        port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)),
-        vec![1, 0, 0],
-        "the second receive is queued"
+        &second[..2],
+        &[1u8, 0],
+        "the second receive is queued (only the result tag and the id's high byte are pinned: the \
+         op-id counter has advanced by now)"
     );
     let events = await_any_events(&mut port, 1);
     assert_eq!(
