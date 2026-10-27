@@ -644,6 +644,16 @@ pub struct Runtime {
     pub(crate) persistent_terms: Rc<RefCell<PersistentTermStore>>,
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
+    /// The **root process** pid — what [`Runtime::self_pid`] is outside an action.
+    ///
+    /// [`Runtime::self_pid`] is temporarily *replaced* while an action runs
+    /// ([`Runtime::as_action_process`]), so it answers the action's own child, not the root.
+    /// A rule that asks "is this pid the runtime's own process?" — e.g. whether an `io` call's
+    /// group leader is the runtime's own output stream
+    /// ([`crate::context::RuntimeContext::io_leader_needs_the_protocol`]) — must read this
+    /// field instead, or it mistakes the root for a foreign capture process and posts an
+    /// `{io_request, …}` nobody answers.
+    pub(crate) root_pid: ProcessId,
     /// The **`init` stand-in** pid: the process every pid this runtime did not see being
     /// spawned reports as its `parent`, and the pid the `init` name is registered on.
     ///
@@ -1593,6 +1603,7 @@ impl Runtime {
             nif_thread_sends: None,
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
+            root_pid: self_pid,
             init_pid,
             executing: None,
             in_machine: None,
@@ -3331,6 +3342,14 @@ impl Runtime {
     /// The pid the runtime runs as.
     pub fn self_pid(&self) -> ProcessId {
         self.self_pid
+    }
+    /// The runtime's **root** process — the pid [`Runtime::self_pid`] answers outside an
+    /// action, and the group leader every process without an explicit one inherits.
+    ///
+    /// [`Runtime::self_pid`] changes while an action runs; this does not — the field's own
+    /// docs say why the distinction matters.
+    pub(crate) fn root_pid(&self) -> ProcessId {
+        self.root_pid
     }
 
     /// The **group leader** of `pid` (`erlang:group_leader/0,2`).

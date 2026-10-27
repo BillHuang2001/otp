@@ -1008,6 +1008,15 @@ pub(super) fn calling_self() -> BeamError {
     )))
 }
 
+/// The `error:terminated` an `io:*` request raises when its **device is not a live
+/// process**: `execute_request/3` (`io.erl:196-201`) sends the request and then waits on
+/// `erlang:monitor(process, Pid)`, whose `'DOWN'` fires at once for a dead pid, so
+/// `o_request/2` re-raises the reason atom `terminated` (`conv_reason/1`, `io.erl:783`).
+pub(super) fn terminated() -> BeamError {
+    BeamError::Raise(beam_common::Raise::error(beam_common::ExitReason::atom(
+        "terminated",
+    )))
+}
 /// The `[First, Second]` pattern of `prim_file:get_cwd/1` (`prim_file.erl:771-778`):
 /// `Some` only for a **proper** two-element list, so the caller's `[_|_]` clause covers
 /// every other cons cell.
