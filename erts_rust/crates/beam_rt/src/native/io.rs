@@ -840,17 +840,35 @@ mod tests {
         let error = call(&mut dead, "io", "put_chars", &[device, text]).expect_err("put_chars/2");
         assert_eq!(error.as_atom(), Some("terminated"), "{error}");
 
-        // A **live** process that is neither a stream nor a file device: `io.erl` would post
-        // an `{io_request, …}` and block, which a BIF may not do, so it stays the typed gap.
+        // A **live** process that is neither a stream nor a file device — a boot-route
+        // `file:open/2` handle, a `group_leader/2` capture process — is served by OTP's
+        // `{io_request, …}`/`{io_reply, …}` protocol, never by a host write: the floor **declines**
+        // the key (`io_output_needs_the_protocol`) and the call enters `lib/stdlib/src/io.erl`'s
+        // body, whose `receive` parks the process on a reply only a device process can send.
         let mut live = runtime();
         let device = live_child(&mut live);
         let text = chars(&mut live, "x");
+        {
+            let mut sink = beam_bifs::NullSink;
+            let context = RuntimeContext::with_output(&mut live, &mut sink);
+            assert!(
+                context.io_output_needs_the_protocol(
+                    "io",
+                    "put_chars",
+                    2,
+                    &[device.to_eterm(), text]
+                ),
+                "a live non-file device must take the {{io_request,_}} protocol"
+            );
+        }
+        // This context has no scheduler to pump, so the round trip cannot complete: the engine's
+        // typed `blocked`, never a write to the wrong stream and never a silent `ok`.
         let error = call(&mut live, "io", "put_chars", &[device.to_eterm(), text])
             .expect_err("put_chars/2");
-        let reason = crate::error::unsupported_reason(&error).unwrap_or_else(|| {
-            panic!("a live non-stdio device must be the typed capability gap: {error}")
-        });
-        assert!(reason.contains("io-device"), "{reason}");
+        assert!(
+            error.to_string().contains("blocked"),
+            "a live non-file device parks on the protocol: {error}"
+        );
     }
 
     /// `io:fwrite/1,2` renders `Format` with the registered `io_lib:format/2` and writes the
