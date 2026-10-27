@@ -335,6 +335,25 @@ pub struct Machine {
     /// starting) but **not** by a resume ([`Machine::resume_outcome`]), which must
     /// preserve it along with the machine's other suspended state.
     pub(crate) raise_snapshot: Vec<(u32, u32, u32)>,
+    /// A **one-shot latch**: `true` means "the raise currently in flight is a
+    /// **propagation** of the exception being handled, so its trace is
+    /// [`Machine::raise_snapshot`] and must not be re-derived".
+    ///
+    /// Set by [`Machine::throw_propagating`] (C's `i_raise`, which copies the saved
+    /// trace object and clears `EXF_SAVETRACE`, so `save_stacktrace` never runs at
+    /// the re-raise site) on **every** raise — a *new* raise
+    /// ([`Machine::throw_with_trace`]) clears it — and consumed by
+    /// [`Machine::with_uncaught_frames`], which renders the preserved chain for an
+    /// uncaught propagation instead of deriving one from the live call frames the
+    /// landing already unwound out of.
+    ///
+    /// The caught path needs no flag: [`Instr::BuildStacktrace`](beam_loader::Instr)
+    /// and `catch_end` cook [`Machine::raise_snapshot`] whenever it is non-empty,
+    /// and a propagation deliberately leaves it untouched.
+    ///
+    /// Cleared by [`Machine::reset`] (no raise is in flight in a run that is
+    /// starting); `resume_outcome` preserves it with the rest of the raise state.
+    pub(crate) raise_propagated: bool,
     /// A **one-shot latch**: `true` means "the next raise that actually lands was
     /// raised by a call site that knows its unresolvable callee and has published
     /// that callee's `{Module,Function,ArgList,[]}` item as the raise's raw trace".
@@ -875,6 +894,7 @@ impl Machine {
             context: 0,
             label_maps: LabelMaps::new(),
             raise_snapshot: Vec::new(),
+            raise_propagated: false,
             pending_callee_head: false,
             raise_head_item: false,
             pending_function_clause_args: None,

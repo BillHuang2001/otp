@@ -4,8 +4,9 @@
 Owns the in-VM **exception** instruction surface and the machine-side *handler*
 opcodes (the pushing/popping/folding half of the catch-frame protocol; the
 raise/unwind half lives in `src/machine/catch.rs`, which this family calls through
-`Machine::{throw, throw_error, throw_with_trace}` — the one uniform raise entry
-point).
+`Machine::{throw, throw_error, throw_with_trace}` — the **fresh**-raise entry point —
+and `Machine::throw_propagating` — the **propagating** one, reached only from
+`Instr::Raise`; see `## A propagating exception keeps its original trace` below).
 
 Read `../../CONTEXT.md` first: it holds the crate-level FROZEN API surface, the
 execution model (frames, dispatch, raise + catch-frame semantics) and the handoffs.
@@ -140,6 +141,17 @@ frames through the same code.
 The out-of-crate half of the explicit-frames flavour — `beam_bifs`'s `erlang:raise/3` decoding its third
 argument into `Raise::stacktrace` — belongs to `beam_bifs`; this family consumes the frames the `Raise`
 already carries.
+
+## A propagating exception keeps its original trace
+`Instr::Raise` (`raise Trace Value`) is the **only** propagation site: the compiler emits it both for the implicit re-raise that finishes a `try … catch` whose clauses did not match and for an `erlang:raise/3` in the caught-clause position that `sys_core_fold` folds (`beam_ssa_codegen.erl:2471`, `beam_core_to_ssa.erl:491`).
+Its arm calls `Machine::throw_propagating` — `throw_inner(.., TraceSource::Propagated)` — so the raise **keeps** the preserved `raise_snapshot` (the chain captured at the original raise site) and the four raise latches (the `undef` callee head item, the failed clause's argument list, the supplied symbolic frames, the supplied trace term) instead of re-deriving them from the live frames, which the first handler has already unwound.
+Every other raise door (`bif`, `gc_bif`, `call_ext*`, `func_info`, `Instr::RawRaise`, a host's `Raise` error) is `Machine::throw_with_trace`, i.e. `TraceSource::Fresh`, and rebuilds the snapshot there — so only a **new** raise starts a new trace.
+C's ground truth is `i_raise` copying `c_p->ftrace` verbatim with `EXF_SAVETRACE` cleared (`erts/emulator/beam/emu/instrs.tab:1236`, `erts_sanitize_freason`), versus `raw_raise`'s stored `ftrace` and `save_stacktrace`'s `EXF_SAVETRACE` guard (`beam_common.c:1148-1179`, `:505-507`).
+A one-shot `Machine::raise_propagated` latch records that the in-flight exception arrived by propagation; `Machine::with_uncaught_frames` consumes it and renders the preserved chain through `Machine::snapshot_stacktrace` (the chain-cooking the uncaught supplied-trace arm already uses) instead of `Machine::raise_stacktrace`.
+Every `Machine::reset` and every fresh raise clears the latch, so it can never decorate a later, unrelated raise.
+Measured rule and its pin (`tests/propagation.rs`, both tiers, oracle-cross-checked): a non-matching clause's implicit re-raise **keeps the raising frame**; `erlang:raise/3` in the caught clause keeps the original chain with no re-raise-site frame prepended; a matching clause raising a **new** error gets a brand-new trace; `throw` keeps the throw site's own frame; a `catch Expr` behaves identically; three nesting levels preserve the chain verbatim (it never grows); and a propagated `undef`/`function_clause` keeps its synthesized head item and argument list.
+`erlang:raise(error,R,[])` still answers the derived chain instead of `[]` — the `beam_common::Raise` supplied-trace-flag gap recorded in `../../CONTEXT.md` §Known Issues, untouched by the propagation rule.
+
 
 ## The landing order in `Machine::raise_error` (`../../interpreter/bif.rs`)
 A raise carrying a **live reason term** (a compound reason) goes through `throw_with_trace` **before** the

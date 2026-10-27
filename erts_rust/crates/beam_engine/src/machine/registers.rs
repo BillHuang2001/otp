@@ -417,6 +417,11 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // deliberately does **not** reset, so a raise that suspended the process
         // keeps its snapshot until the process resumes and raises again.
         self.raise_snapshot.clear();
+        // The propagated-raise marker describes the raise in flight, and it is
+        // consumed by whichever engine boundary renders its trace; clearing it here
+        // keeps a run that never reaches that boundary from carrying the previous
+        // run's answer into its own first uncaught raise.
+        self.raise_propagated = false;
         // The synthesized-callee-head latches belong to the raise in flight too: a
         // fresh run begins with no raise, so neither the one-shot latch nor the
         // live-raise state may survive into it (a stale `true` would make the first

@@ -171,6 +171,15 @@ pub(crate) fn exec(
         // `raise Trace Value` — the re-raise tail of a handler (`{bif,raise,...}`).
         // C's `i_raise` copies the reason + raw stacktrace but never touches
         // `freason`, so the class of the exception currently being handled is kept.
+        //
+        // It is a **propagation**, never a new raise: C stores `c_p->ftrace = x(2)`
+        // and clears `EXF_SAVETRACE`, so the exception keeps the trace it arrived
+        // with and no frame is derived at this (already unwound) site. The engine
+        // carries its raw-trace equivalent — [`Machine::raise_snapshot`] — through
+        // unchanged ([`Machine::throw_propagating`]), which is what keeps the
+        // raising frame of the original raise in the trace when a `try ... catch`
+        // clause does not match and the exception travels on to an enclosing
+        // handler (or leaves the machine uncaught).
         Instr::Raise { trace, value } => {
             let value = read_operand(machine, ctx, value)?;
             let trace = read_operand(machine, ctx, trace)?;
@@ -178,7 +187,7 @@ pub(crate) fn exec(
                 error::unsupported("exceptions: raise with no exception being handled")
             })?;
             let _ = install_class_atom(machine, module, ctx, class);
-            machine.throw_with_trace(class, value, trace).map(Some)
+            machine.throw_propagating(class, value, trace).map(Some)
         }
 
         // `try_case Frame` — the handler entry of a `try`. C:

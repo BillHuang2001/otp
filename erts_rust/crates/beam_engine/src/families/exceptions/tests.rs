@@ -145,5 +145,6 @@ mod end_to_end;
 mod function_clause;
 mod handlers;
 mod oracle;
+mod propagation;
 mod raising;
 mod stacktrace;
