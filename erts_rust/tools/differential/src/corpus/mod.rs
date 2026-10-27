@@ -92,6 +92,7 @@
 //! | [`selfhost`] | A.9/A.2 — the E0 route of the self-hosted build: an *in-process* `compile:file/2` |
 //! | [`zlib`] | A.7 — the raw-DEFLATE `zlib:zip/1` / `zlib:unzip/1` pair (byte-exact tiny bodies, the round trip, the error matrix) |
 //! | [`bits`] | A.1/A.7 — the `-eval` bit-string surface: constructed segment images and matched fields |
+//! | [`bitbin`] | A.1/A.2/A.7 — the **opcode** half of that surface: the writable binary accumulator (`bs_init_writable`/private append), `bs_match` over a refc subject at a non-zero, non-byte-aligned offset, and the ETS copy path over a large payload |
 //! | [`udp`] | A.4 — the `udp_inet` built-in driver through `open_port/2` / `port_command` / `port_info` |
 //! | [`ram_file`] | A.4 — the `ram_file_drv` built-in driver's reply encodings |
 //! | [`inet_control`] | A.4 — the built-in inet drivers' control surface through `gen_udp` / `gen_tcp` / `inet` (option store, refusal matrix, driver-name namespace, packet-framing modes) |
@@ -108,6 +109,7 @@
 mod bif_extra;
 mod bifs;
 mod binmatch;
+mod bitbin;
 mod bits;
 mod boot;
 mod boot_extra;
@@ -706,6 +708,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(selfhost_chain::group());
     cases.extend(zlib::group());
     cases.extend(bits::group());
+    cases.extend(bitbin::group());
     cases.extend(udp::group());
     cases.extend(ram_file::group());
     cases.extend(inet_control::group());
