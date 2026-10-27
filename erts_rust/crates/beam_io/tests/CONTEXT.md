@@ -88,9 +88,10 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
 bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **251
-passing / 0 failing**; the whole `-p beam_io` run is **1328 passed / 0 failed / 2 ignored** over **28
-test binaries** (1 lib + 26 integration + 1 doctest binary), i.e. **1074** lib tests + 251
-integration tests + 5 doctests (3 passing, 2 `#[ignore]`d). Per file:
+passing / 0 failing**; the whole `-p beam_io` run is **1337 passed / 0 failed / 2 ignored** over **28
+test binaries** (1 lib + 26 integration + 1 doctest binary), i.e. **1083** lib tests + 251
+integration tests + 5 doctests, of which 3 run and 2 are `ignore`-fenced examples (nothing in this
+crate carries `#[ignore]`). Per file:
 
 | Suite | Tests | Suite | Tests |
 |---|---|---|---|
@@ -119,9 +120,9 @@ packed address as the read header and the payload as the body; `{active,false}` 
 while `PACKET_REQ_RECV`(60) still completes with the same datagram (the passive-path regression
 pin, incl. its `[0]einval` operand guard); `{active,once}` delivering one datagram, silently, with
 no `Passive`; `{active,2}` delivering two datagrams then exactly one `Passive` and nothing more;
-passive→`{active,true}` delivering the already-buffered datagram (the re-arm's synthesized edge);
-`{active,true}` TCP delivering the peer's bytes with an **empty** header; `{packet,2}` TCP
-delivering the **stripped** body; an `ActiveInputEvent::Error` (a peer reset under
+passive→`{active,true}` delivering the datagram that arrived while the port was passive (the re-arm's
+readiness edge); `{active,true}` TCP delivering the peer's bytes with an **empty** header; `{packet,2}`
+TCP delivering the **stripped** body; an `ActiveInputEvent::Error` (a peer reset under
 `{show_econnreset,true}`) drained **before** the close report of the same round; two armed datagram
 ports reported in **port-number order** by one destructive drain; and the channel staying empty for a
 passive port and after a close. Waits are
@@ -199,9 +200,9 @@ rot.
   `{inet_reply, _, ok, Ref}`), and on `port_close` skip the ownership `{'EXIT', Port, normal}` that
   may precede the pending operation's `{inet_async, _, _, {error, closed}}`.
 - **The read path's ordering rule — a complete buffered unit wins over a pending peer close — is
-  pinned at the `src/drivers/inet/write_then_close_tests.rs` level, not here**; these suites see only
-  its consequence (the `{ok, Data}` a queued receive answers ahead of the `{error, closed}` the
-  *following* operations are owed), so a change to that ordering belongs in that unit suite.
+  pinned at the `src/drivers/inet/write_then_close_tests.rs` level, not here**; these suites see only the
+  reads a caller asks for (the `recv` verb's bytes, and the `closed`/`enotconn` ladder a read after the
+  peer's close answers), so a change to that ordering belongs in that unit suite.
 ## Routing Table
 - `abi_driver.rs` → the end-to-end C-driver path (incl. the driver-queue family round-trip, the
   `outputv`-over-`output` preference, the empty-queue write-readiness case, the `NULL`-`*rbuf`
@@ -233,9 +234,9 @@ rot.
 - `inet_async.rs` → the `tcp_inet` **asynchronous-op queue + completion channel** through
   `PortRegistry` (numeric opcodes, the single receive slot, the caller tag, the accept hand-off and
   its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases. Its
-  frozen-channel rows (`port_notifications_stay_exactly_two_variants`, and the accept-side twin in
-  `inet_accept.rs`) found their `PortNotification::Data` case on `{deliver, port}`, the C's one way
-  to answer a passive read on the port channel instead of the completion channel.
+  frozen-channel rows (`port_notifications_stay_exactly_two_variants` and `inet_accept.rs`'s
+  `the_completion_channel_stayed_frozen`) take their `PortNotification::Data` case from `{deliver, port}`,
+  the C's one way to answer a queued receive on the port channel instead of the completion channel.
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle).
   `inet.rs` reads a passive connection through the named `recv` verb: a passive socket with no queued
@@ -285,8 +286,11 @@ rot.
 - **`inet_accept.rs` (7)** — the **TCP accept chain** end to end over a foreign `std::net::TcpStream` peer:
   two successive loopback connections accepted through the multi-op list and adopted (`from_socket`), the
   completion arriving as `InetAsyncResult::Accepted { fd }`, the sticky `INET_F_MULTI_CLIENT` `GETSTATUS`
-  bits, the `[0]einval` ladder, the per-port accept timer (`[500, 50]` reports id 0 then id 1), and the
-  arm/disarm readiness cycle (`poll` + `handle_events` alone completes a connection that arrived while
-  nothing was queued). Detail: `src/drivers/inet/accept_tests.rs` rustdoc; the runtime's obligations
-  (second port, `{inet_async, Listener, Id, {ok, NewPort}}`, `tcp_inet_copy` inheritance) are the crate
-  doc's *Handoffs* (0).
+  bits, the `[0]einval` ladder, an accept deadline (`{error,timeout}` under its own id, exactly once) and
+  the mixed `[INET_INFINITY, 50]` queue whose finite tail's deadline fires the list's **head** (the
+  infinite accept) while the survivor completes under id 1 on a real connection, and the arm/disarm
+  readiness cycle (`poll` + `handle_events` alone completes a connection that arrived while nothing was
+  queued). `the_completion_channel_stayed_frozen` is its frozen-channel case; the port's single timer
+  across several deadlines is the unit suite's row (`src/drivers/inet/accept_tests.rs`). The runtime's
+  obligations (second port, `{inet_async, Listener, Id, {ok, NewPort}}`, `tcp_inet_copy` inheritance) are
+  the crate doc's *Handoffs* (0).
