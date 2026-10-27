@@ -34,6 +34,20 @@
 //! asks the shape function first and only classifies a genuine refusal — so the
 //! report cannot drift from what the tier actually lowers.
 //!
+//! # An `Inlined` verdict is a **shape** verdict, never a run-time promise
+//!
+//! `bitstring_verdict` answers from the shape predicates alone, so `Inlined` says the
+//! instruction's *code* is lowered — not that every execution stays native. A shape whose
+//! sequence reads a **run-time subject** carries a second, subject-form gate the static model
+//! cannot see: the field-extracting shapes (`bs_match`'s `integer` command, `bs_get_integer2`,
+//! `bs_match_string`, the three UTF skip/get pairs) accept an on-heap `ErlHeapBits` and a refc
+//! window, and jump to one interpreter step on every other form (see
+//! [`bitstr_inline`]'s `emit_subject_view`). The gate that makes `Inlined` true is therefore
+//! pinned **dynamically**, per subject form, by `../../bs_match_deopt_tests.rs`'s refc rows
+//! (a zero run-time `BsMatch` deopt count on each accepted form, and a non-refc `ErlSubBits`
+//! that must still decline) — a shape-level regression is caught here, a subject-level one
+//! there. The `-- bitstring inline accounting` section prints this caveat beside its totals.
+//!
 //! Run with `--nocapture`:
 //! `... cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine refusal -- --nocapture`
 
@@ -1082,7 +1096,13 @@ fn the_refusal_attribution_census_is_printed() {
 
     // The `inlined` half, per opcode, so a refusal count reads against its denominator.
     println!();
-    println!("-- bitstring inline accounting: inlined | refused | opcode --");
+    println!(
+        "-- bitstring inline accounting: inlined | refused | opcode --\n   \
+         (`inlined` is a SHAPE verdict: a shape that reads a run-time subject is further \
+         gated on the subject form at run time — on-heap `ErlHeapBits` or a refc window \
+         inline, everything else is one interpreter step; pinned dynamically by \
+         `bs_match_deopt_tests.rs`'s refc rows) --"
+    );
     let mut bs_ops: Vec<String> = bs_inlined.keys().chain(bs_refusals.keys()).cloned().collect();
     bs_ops.sort();
     bs_ops.dedup();
