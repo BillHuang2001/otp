@@ -66,21 +66,32 @@
 //!   chain cannot be driven past the ceiling by a loop of small requests. The empty spaces are
 //!   **indexed by capacity** ([`empty_retired`](Nursery::empty_retired)), so selecting one is
 //!   `O(log #spaces)` and no growth event scans the chain.
-//! * **The request that forced a retirement is carried into the next collection — but only by
-//!   the one-off copy-out seam, and only up to the keep band's own upper edge.** A growth cannot
-//!   collect, so a large one-off request is met by retiring a space; without the request the
-//!   following collection sizes the nursery from the live set alone, which is far below it, and
-//!   the *next* request retires another space — a growth + collection per request, forever.
-//!   [`grow_for_one_off`](Nursery::grow_for_one_off) therefore remembers the request
-//!   ([`pending_growth_need`](Nursery::pending_growth_need)) and the collapse hands it to the
-//!   sizing rule as the legacy C's `need` term, **one-shot** (taken, never accumulated), so the
-//!   settled capacity covers the request instead of the request re-driving the chain.
+//! * **The request that forced a retirement is carried into the next *minor* — but only by the
+//!   one-off copy-out seam, only into a minor collapse, and only up to the keep band's own upper
+//!   edge.** A growth cannot collect, so a large one-off request is met by retiring a space;
+//!   without the request the following minor sizes the nursery from the young live set alone,
+//!   which is far below it, and the *next* request retires another space — a growth + collection
+//!   per request, forever. [`grow_for_one_off`](Nursery::grow_for_one_off) therefore remembers the
+//!   request ([`pending_growth_need`](Nursery::pending_growth_need)) and the minor
+//!   [collapse](Nursery::collapse) hands it to the sizing rule as the legacy C's `need` term,
+//!   **one-shot** (taken, never accumulated), so the settled capacity covers the request instead
+//!   of the request re-driving the chain.
 //!   [`grow`](Nursery::grow) — the door's own post-collection step — deliberately records
 //!   nothing (see [`pending_growth_need`](Nursery::pending_growth_need)). The carried request's
-//!   effect is bounded by the keep band's **upper edge**
-//!   ([`minor_carriage_bound`] / [`fullsweep_carriage_bound`]): it may buy back capacity the
-//!   shrink rule would otherwise take, never capacity the shrink rule would take straight back.
-//!   The chain's remembered live-set target stays the plain one.
+//!   effect is bounded by the minor keep band's **upper edge**
+//!   ([`minor_carriage_bound`]): it may buy back capacity the shrink rule would otherwise take,
+//!   never capacity the shrink rule would take straight back. The chain's remembered live-set
+//!   target stays the plain one.
+//! * **The carriage is a young-side rule: a fullsweep ignores it.** A fullsweep already measures
+//!   the **whole** live set exactly and installs
+//!   [`HeapPolicy::young_target_words`](HeapPolicy::young_target_words) —
+//!   `next_words(2 * live + need_reserve_words)` — *plus* a mature space sized for
+//!   `2 * (live + young occupancy)` ([`HeapPolicy::mature_after_fullsweep`]). The young-side
+//!   room a growth could not wait for is therefore already covered by that 2× whole-heap
+//!   headroom and the promotion room, and folding the request in only inflates a capacity the
+//!   shrink rule would take straight back on the next round. The fullsweep still **consumes** the
+//!   term (see [`collapse_after_fullsweep`](Nursery::collapse_after_fullsweep)): the collection it
+//!   triggers is the one that was owed, so the request must not ride on into a later minor.
 //!
 //! Every superseded space is **retained until a collection evacuates it**, never freed by the
 //! growth itself: it may hold live words (they were handed to the mutator) and only a
@@ -141,16 +152,17 @@ fn minor_carriage_bound(policy: &HeapPolicy, live_words: usize) -> usize {
         .max(YOUNG_SHRINK_FACTOR.saturating_mul(policy.young_minor_target_words(live_words)))
 }
 
-/// The **fullsweep** counterpart of [`minor_carriage_bound`]: that rule's floor-free keep-band
-/// upper edge, `YOUNG_SHRINK_FACTOR × young_target_words(live)` (the fullsweep rule deliberately
-/// has no `MINOR_SHRINK_FLOOR_WORDS` term, and this bound does not add one).
-fn fullsweep_carriage_bound(policy: &HeapPolicy, live_words: usize) -> usize {
-    YOUNG_SHRINK_FACTOR.saturating_mul(policy.young_target_words(live_words))
-}
+/// The **fullsweep** rule is deliberately the plain one: that collection measures the whole live
+/// set and installs [`HeapPolicy::young_target_words`]'s 2× headroom plus a mature space sized for
+/// the promotion, so a one-off young-side room request is already covered there and folding it in
+/// would only inflate a capacity the shrink rule takes straight back. The carriage stays a
+/// **young-side** (minor) rule — hence no fullsweep bound exists here.
 
 /// The capacity a **minor** collapse installs: the policy's `need`-augmented rule, bounded above
 /// by [`minor_carriage_bound`] — the one expression both [`Nursery::collapse`] and any reader of
 /// "what would the collapse install" share.
+///
+/// This is the **only** collapse that spends the carried request; see [`Nursery::collapse_after_fullsweep`].
 fn minor_collapse_target(
     policy: &HeapPolicy,
     capacity_words: usize,
@@ -160,21 +172,6 @@ fn minor_collapse_target(
     policy
         .young_after_collection_with_need(capacity_words, live_words, need_words)
         .min(minor_carriage_bound(policy, live_words))
-}
-
-/// The capacity a **fullsweep** collapse installs: the policy's `need`-augmented rule, bounded
-/// above by [`fullsweep_carriage_bound`]. [`Nursery::capacity_after_fullsweep`] exposes this same
-/// expression so a caller sizing the mature generation reads the nursery the collapse will really
-/// install, not a plain-rule approximation of it.
-fn fullsweep_collapse_target(
-    policy: &HeapPolicy,
-    capacity_words: usize,
-    live_words: usize,
-    need_words: usize,
-) -> usize {
-    policy
-        .young_after_fullsweep_with_need(capacity_words, live_words, need_words)
-        .min(fullsweep_carriage_bound(policy, live_words))
 }
 
 /// The young nursery: the space the mutator allocates in (`current`) plus every space a
@@ -289,10 +286,10 @@ pub(crate) struct Nursery {
     /// that width), and carrying it would resurrect the measured `beam_rt` boot regression
     /// (384 → 414 collections) for every `ensure_capacity` caller.
     pending_growth_need: usize,
-    // (The bound the carriage is clamped by is `minor_carriage_bound` /
-    // `fullsweep_carriage_bound` below: the keep band's upper edge, computed from the **plain**
-    // live-set target, so a request that scales with the capacity it replaced cannot buy a
-    // capacity the shrink rule would take straight back.)
+    // (The bound the carriage is clamped by is `minor_carriage_bound` above: the minor keep band's
+    // upper edge, computed from the **plain** live-set target, so a request that scales with the
+    // capacity it replaced cannot buy a capacity the shrink rule would take straight back. A
+    // fullsweep does not read this term at all.)
 }
 
 impl Nursery {
@@ -551,8 +548,10 @@ impl Nursery {
     /// is the heap-admission door, whose request is the one the collection it just ran was already
     /// sized for (see [`pending_growth_need`](Nursery::pending_growth_need)).
     ///
-    /// The carried effect is bounded by the keep band's upper edge at the collapse
-    /// ([`minor_carriage_bound`] / [`fullsweep_carriage_bound`]).
+    /// The carried effect is bounded by the minor keep band's upper edge at the collapse
+    /// ([`minor_carriage_bound`]), and a **minor** collapse is the only place it is spent: a
+    /// fullsweep measures the whole live set and already installs its 2× headroom plus the mature
+    /// promotion room, so it consumes the term without folding it in.
     pub(crate) fn grow_for_one_off(
         &mut self,
         policy: &HeapPolicy,
@@ -823,21 +822,34 @@ impl Nursery {
     /// towards the target. That whole-heap target is also what the growth seam is bounded by
     /// afterwards ([`live_target_words`](Nursery::live_target_words)).
     ///
-    /// It carries the same one-shot `need` term as [`collapse`](Nursery::collapse), through
-    /// [`HeapPolicy::young_after_fullsweep_with_need`]: a fullsweep that follows a growth must
-    /// leave room for the request that growth made, exactly as a minor does — bounded by that
-    /// rule's own floor-free keep-band upper edge ([`fullsweep_carriage_bound`], the exact
-    /// counterpart of the minor's [`MINOR_SHRINK_FLOOR_WORDS`]-floored one).
+    /// It **consumes** the one-shot `need` term without folding it into the sizing rule.
+    ///
+    /// A fullsweep is the one collection that measures the **whole** live set exactly, and it
+    /// installs [`HeapPolicy::young_target_words`] — `next_words(2 * live + need_reserve_words)`,
+    /// the 2× memory-for-copy-amortisation headroom — *plus* a mature generation sized for
+    /// `2 * (live + young occupancy)` ([`HeapPolicy::mature_after_fullsweep`]). The young-side room
+    /// a growth could not wait for is therefore already covered: the 2× whole-heap headroom pays
+    /// for it, and the promotion room pays for what follows. Folding the request in a second time
+    /// only inflates a capacity the shrink rule takes straight back on the next round — the
+    /// measured consequence on `beam_rt`'s `reds_door` fixture was a plateaued `heap_size` of
+    /// **2 586 → 10 958** words for the *same* 8 boundary collections (its count is
+    /// reduction-bound), i.e. 4.24× the memory for no cadence at all.
+    ///
+    /// The term is nevertheless **taken**, because the collection this collapse ends is the one
+    /// the retired space was owed for: leaving it in place would let a later **minor** resurrect a
+    /// request this collection has already answered (and its capacity rule, being live-set keyed,
+    /// would then install a capacity on the strength of a request whose growth is two collections
+    /// old). Consuming it keeps the term exactly one-shot per growth event.
     pub(crate) fn collapse_after_fullsweep(
         &mut self,
         policy: &HeapPolicy,
         live_words: usize,
     ) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        // Same one-shot `need` term as [`collapse`](Nursery::collapse): a fullsweep pays for the
-        // growth that preceded it exactly as a minor does.
-        let need = core::mem::take(&mut self.pending_growth_need);
-        let target = fullsweep_collapse_target(policy, collected_capacity, live_words, need);
+        // Consumed, not spent: the fullsweep's own whole-heap sizing rule covers a one-off
+        // young-side request, and the term must not ride on into a later minor.
+        let _ = core::mem::take(&mut self.pending_growth_need);
+        let target = policy.young_after_fullsweep(collected_capacity, live_words);
         let live_target = policy.young_target_words(live_words);
         self.install_collapsed(target, live_target)
     }
@@ -851,20 +863,15 @@ impl Nursery {
     /// one such caller is a fullsweep sizing its fresh mature generation from the nursery's young
     /// occupancy ([`crate::Collector::collect_major`],
     /// [`GenImmixCollector::run_major`](crate::GenImmixCollector)): `Nursery::used_words()` is
-    /// the chain-summed occupancy, so it is clamped to this capacity — and the capacity the
-    /// collapse installs now depends on the carried request, so a plain
-    /// [`HeapPolicy::young_after_fullsweep`] call would size the mature generation against a
-    /// nursery that no longer exists.
+    /// the chain-summed occupancy, so it is clamped to this capacity.
     ///
-    /// The inputs are exactly the collapse's — the chain's capacity, the live set, the pending
-    /// request and the keep band's upper edge — so this is the same expression, not a re-derivation.
+    /// A fullsweep's collapse ignores the carried request (see
+    /// [`collapse_after_fullsweep`](Nursery::collapse_after_fullsweep)), so this is exactly
+    /// [`HeapPolicy::young_after_fullsweep`] of the chain's capacity — read through the accessor
+    /// rather than re-derived by the caller, so the mature clamp and the collapse stay one source
+    /// of truth.
     pub(crate) fn capacity_after_fullsweep(&self, policy: &HeapPolicy, live_words: usize) -> usize {
-        fullsweep_collapse_target(
-            policy,
-            self.capacity_words(),
-            live_words,
-            self.pending_growth_need,
-        )
+        policy.young_after_fullsweep(self.capacity_words(), live_words)
     }
 
     /// Installs the **young live set's target** unconditionally after a **minor** — the explicit

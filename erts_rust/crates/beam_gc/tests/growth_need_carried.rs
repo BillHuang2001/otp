@@ -31,13 +31,18 @@
 //!
 //! # The contract (asserted below)
 //!
-//! 1. **The request is carried — inside the keep band.** A collection that follows a growth which
-//!    really retired a space installs the `_with_need` rule's answer
-//!    (`HeapPolicy::young_after_collection_with_need` / `young_after_fullsweep_with_need`) with
-//!    `live` the round's own copy volume, **bounded by the keep band's own upper edge** computed
-//!    from the plain live-set target — so the surviving space covers the request, and a request
-//!    that scales with the capacity cannot make the nursery one ratio wider per round
-//!    ([`carriage_bound`], `src/nursery.rs`).
+//! 1. **The request is carried — by a *minor* collapse, inside the keep band.** A **minor** that
+//!    follows a growth which really retired a space installs
+//!    `HeapPolicy::young_after_collection_with_need`'s answer with `live` the round's own copy
+//!    volume, **bounded by the minor keep band's own upper edge** computed from the plain
+//!    young-live-set target — so the surviving space covers the request, and a request that scales
+//!    with the capacity cannot make the nursery one ratio wider per round ([`carriage_bound`],
+//!    `src/nursery.rs`).
+//!    A **fullsweep** never folds the request in: it measures the whole live set and installs
+//!    `young_target_words`'s 2× headroom plus a mature space sized for the promotion, which
+//!    together cover a one-off young-side request, so carrying it there would only inflate a
+//!    capacity the shrink rule takes straight back. The fullsweep still **consumes** the term
+//!    (case 7 pins both arms side by side).
 //! 2. **It is one-shot.** A second collection with no intervening growth installs exactly the
 //!    plain rule's answer `young_after_collection(capacity, live)`: the request was spent, the
 //!    capacity does not ratchet, and it is never a function of the call count.
@@ -125,40 +130,30 @@ fn write_lump(c: &mut AnyCollector, words: usize) {
         .tuple(&elems)
         .expect("the lump fits the room the growth installed");
 }
-/// The bound a carried request's effect is capped at: **the keep band's own upper edge**,
-/// computed from the plain live-set target — the same edge the shrink rule compares a capacity
-/// against, so a request may buy back capacity the shrink rule would otherwise have taken, and
-/// may never buy capacity the shrink rule would take straight back
-/// (`Nursery`'s `carriage_bound`, `src/nursery.rs`).
-fn carriage_bound(policy: &HeapPolicy, kind: CollectionKind, live_words: usize) -> usize {
-    match kind {
-        CollectionKind::Minor => MINOR_SHRINK_FLOOR_WORDS
-            .max(YOUNG_SHRINK_FACTOR.saturating_mul(policy.young_minor_target_words(live_words))),
-        // The fullsweep rule has no floor; keeping it that way is part of the contract.
-        CollectionKind::Major => {
-            YOUNG_SHRINK_FACTOR.saturating_mul(policy.young_target_words(live_words))
-        }
-    }
+/// The bound a carried request's effect is capped at: **the minor keep band's own upper edge**,
+/// computed from the plain young-live-set target — the same edge the shrink rule compares a
+/// capacity against, so a request may buy back capacity the shrink rule would otherwise have
+/// taken, and may never buy capacity the shrink rule would take straight back
+/// (`Nursery`'s `minor_carriage_bound`, `src/nursery.rs`).
+///
+/// Only a **minor** collapse spends the request, so there is no fullsweep bound: a fullsweep sizes
+/// from the whole-heap live set alone ([`HeapPolicy::young_target_words`]).
+fn minor_carriage_bound(policy: &HeapPolicy, live_words: usize) -> usize {
+    MINOR_SHRINK_FLOOR_WORDS
+        .max(YOUNG_SHRINK_FACTOR.saturating_mul(policy.young_minor_target_words(live_words)))
 }
 
-/// The capacity a collapse installs when the growth seam carried `need` into it: the
-/// `_with_need` rule's answer bounded by [`carriage_bound`].
+/// The capacity a **minor** collapse installs when the growth seam carried `need` into it: the
+/// `_with_need` rule's answer bounded by [`minor_carriage_bound`].
 fn carried_target(
     policy: &HeapPolicy,
-    kind: CollectionKind,
     capacity_words: usize,
     live_words: usize,
     need_words: usize,
 ) -> usize {
-    let rule = match kind {
-        CollectionKind::Minor => {
-            policy.young_after_collection_with_need(capacity_words, live_words, need_words)
-        }
-        CollectionKind::Major => {
-            policy.young_after_fullsweep_with_need(capacity_words, live_words, need_words)
-        }
-    };
-    rule.min(carriage_bound(policy, kind, live_words))
+    policy
+        .young_after_collection_with_need(capacity_words, live_words, need_words)
+        .min(minor_carriage_bound(policy, live_words))
 }
 
 /// The plain live-set target for the collection that ran (`need == 0`): what
@@ -193,9 +188,16 @@ fn the_request_is_carried_into_the_next_collection_and_spent_exactly_once() {
         assert!(c.collection_debt(), "{kind:?}: a retired space is collection debt");
         // The collection that follows pays for the request it could not satisfy.
         let first = c.collect(&mut roots).expect("collect");
+        // The carriage is a **young-side** rule, so the collection that spends it is a minor: the
+        // 40-word promotion fits the roomy mature generation, so the kind is the cadence's.
+        assert_eq!(
+            first.kind,
+            CollectionKind::Minor,
+            "{kind:?}: a minor is the collapse that spends the request"
+        );
         let live = first.stats.words_copied;
-        let paid = carried_target(&policy, first.kind, chain, live, REQUEST);
-        let bound = carriage_bound(&policy, first.kind, live);
+        let paid = carried_target(&policy, chain, live, REQUEST);
+        let bound = minor_carriage_bound(&policy, live);
         assert_eq!(
             c.heap_size_words(),
             paid,
@@ -396,8 +398,14 @@ fn a_request_that_scales_with_the_capacity_stays_inside_the_keep_band() {
             c.grow_nursery(need).expect("the growth seam grants the request");
             let chain = c.heap_size_words();
             let collection = c.collect(&mut roots).expect("collect");
+            assert_eq!(
+                collection.kind,
+                CollectionKind::Minor,
+                "{kind:?}: the roomy mature generation admits every one of these collections as a \
+                 minor — the only kind that spends the request"
+            );
             let live = collection.stats.words_copied;
-            let bound = carriage_bound(&policy, collection.kind, live);
+            let bound = minor_carriage_bound(&policy, live);
             let installed = c.heap_size_words();
             // The regression gate: the *relation* the cap states, never a ladder figure.
             assert!(
@@ -460,7 +468,10 @@ fn the_heap_admission_door_s_own_growth_carries_nothing() {
             CollectionKind::Minor => policy.young_after_collection(chain, live),
             CollectionKind::Major => policy.young_after_fullsweep(chain, live),
         };
-        let carried = carried_target(&policy, collection.kind, chain, live, REQUEST);
+        let carried = match collection.kind {
+            CollectionKind::Minor => carried_target(&policy, chain, live, REQUEST),
+            CollectionKind::Major => policy.young_target_words_with_need(live, REQUEST),
+        };
         assert_eq!(
             c.heap_size_words(),
             plain,
@@ -486,18 +497,22 @@ fn the_heap_admission_door_s_own_growth_carries_nothing() {
 // 6. the mature clamp follows the nursery the collapse installs
 // ---------------------------------------------------------------------------
 /// A fullsweep folds the young occupancy into the mature target **clamped to the capacity the
-/// collapse installs** — not to the plain `young_after_fullsweep` answer, which is a nursery that
-/// no longer exists once the collapse carries a growth request. The accessor is the collapse's own
-/// (`Nursery::capacity_after_fullsweep`), so the two figures cannot disagree by construction; this
-/// case re-derives both from the public policy and pins the equality.
+/// collapse installs** — never to the chain-summed occupancy, which a host's unrooted copy-out can
+/// inflate with dead words. The accessor is the collapse's own
+/// (`Nursery::capacity_after_fullsweep`), so the two figures cannot disagree by construction.
+///
+/// A fullsweep's collapse is the **plain** whole-heap rule: the carried request is consumed but not
+/// folded in (case 7 pins that asymmetry), so the accessor answers exactly
+/// `young_after_fullsweep(chain, live)`. This case re-derives both the nursery and the mature
+/// figure from the public policy and pins the equality, so the accessor stays a real seam rather
+/// than a second copy of the formula.
 #[test]
 fn a_full_sweep_sizes_the_mature_space_against_the_nursery_it_installs() {
     let policy = roomy_policy(233);
     let mut c = any_for(MatureKind::Copying, policy.clone());
     let mut roots = build_live(&mut c, LIVE_WORDS);
-    // A grown chain the mutator then filled with dead words: the second growth retires the filled
-    // space while carrying its request, so the collapse will install a capacity well above the
-    // plain live-set target and the dead occupancy lands far above that.
+    // A grown chain the mutator then filled with dead words, so the chain-summed occupancy lands
+    // far above the live set the fullsweep will measure.
     c.grow_nursery(REQUEST).expect("grow");
     fill_to(c.young_mut(), 16);
     c.grow_nursery(REQUEST).expect("grow");
@@ -510,40 +525,124 @@ fn a_full_sweep_sizes_the_mature_space_against_the_nursery_it_installs() {
         .expect("fullsweep");
     let live = collection.stats.words_copied;
     let installed = c.heap_size_words();
-    let plain_nursery = policy.young_target_words(live);
-    // The collapse installs the carried request's bounded target — above the plain one, and below
-    // the dead occupancy (so the clamp is doing real work).
+    // The fullsweep installs the policy's plain whole-heap rule for that chain and live set.
     assert_eq!(
         installed,
-        carried_target(&policy, CollectionKind::Major, chain, live, REQUEST),
-        "the fullsweep installs the carried request's bounded target (chain {chain}, live {live})"
+        policy.young_after_fullsweep(chain, live),
+        "the fullsweep installs the plain whole-heap rule's answer (chain {chain}, live {live})"
     );
+    // ... and the carried request is demonstrably not what it read: folding it in would answer a
+    // much wider nursery, which the shrink rule would then take straight back.
+    let carried_would_say = policy.young_target_words_with_need(live, REQUEST);
     assert!(
-        installed > plain_nursery,
-        "the carried request must install more than the plain live-set target \
-         ({installed} vs {plain_nursery})"
+        carried_would_say > installed,
+        "the carried request would have asked for {carried_would_say} words; the fullsweep \
+         installed {installed}"
     );
     assert!(
         used > installed,
         "the dead occupancy must exceed the installed nursery for the clamp to bite \
          ({used} vs {installed})"
     );
-    // The defect-3 gate: the mature target reads the *installed* capacity.
+    // The defect-3 gate: the mature target reads the *installed* capacity, not the occupancy.
     let expected = policy.mature_after_fullsweep(old_mature, live, used.min(installed));
-    let plain_clamp = policy.mature_after_fullsweep(old_mature, live, used.min(plain_nursery));
+    let unclamped = policy.mature_after_fullsweep(old_mature, live, used);
     assert_eq!(
         c.mature_capacity_words(),
         expected,
         "the mature space is sized against the nursery the collapse installed"
     );
     assert_ne!(
-        expected, plain_clamp,
-        "the plain clamp is a different figure, so this case pins the accessor \
-         ({expected} vs {plain_clamp})"
+        expected, unclamped,
+        "the unclamped occupancy is a different figure, so this case pins the clamp \
+         ({expected} vs {unclamped})"
     );
     eprintln!(
-        "fullsweep: chain {chain} (used {used}) -> nursery {installed} (plain target \
-         {plain_nursery}); mature {old_mature} -> {} (the plain clamp would say {plain_clamp})",
+        "fullsweep: chain {chain} (used {used}) -> nursery {installed}; mature {old_mature} -> {} \
+         (the unclamped occupancy would say {unclamped}, the carried request {carried_would_say})",
         c.mature_capacity_words()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. the asymmetry: a minor spends the request, a fullsweep ignores it
+// ---------------------------------------------------------------------------
+/// **One geometry, two collapses.** The same chain, the same live set and the same carried request
+/// produce two different nurseries, because the carriage is a **young-side** rule:
+///
+/// * a **minor** sizes from the **young** live set only (`next_words(live + 64)`), which is not the
+///   heap's whole live set, so it has no headroom to absorb a one-off young-side request — it
+///   spends the request, capped at its keep band's upper edge;
+/// * a **fullsweep** sizes from the **whole-heap** live set with a 2× multiple and installs a
+///   mature space sized for the promotion, so a one-off young-side request is already covered —
+///   it consumes the term and installs exactly `young_target_words(live)`.
+///
+/// Every figure below is derived from the public policy; the only literals are the geometry.
+#[test]
+fn a_minor_spends_the_request_where_a_full_sweep_installs_the_plain_target() {
+    let policy = roomy_policy(233);
+    // The geometry both arms share: one growth that retired the birth space and recorded its
+    // `REQUEST`-word demand, holding the same `LIVE_WORDS` live set. On it the two rules take
+    // different branches — the minor grows onto its (capped) with-need target, the fullsweep
+    // shrinks onto its plain whole-heap target.
+
+    // Arm A — the minor.
+    let mut c = any_for(MatureKind::Copying, policy.clone());
+    let mut roots = build_live(&mut c, LIVE_WORDS);
+    c.grow_nursery(REQUEST).expect("grow");
+    let chain = c.heap_size_words();
+    let minor_collection = c
+        .collect_kind(CollectionKind::Minor, &mut roots)
+        .expect("minor");
+    assert_eq!(minor_collection.kind, CollectionKind::Minor);
+    let live = minor_collection.stats.words_copied;
+    assert_eq!(live, LIVE_WORDS, "the minor promoted the whole live set");
+    let minor_installed = c.heap_size_words();
+    let spent = carried_target(&policy, chain, live, REQUEST);
+    let uncapped = policy.young_after_collection_with_need(chain, live, REQUEST);
+    assert_eq!(
+        minor_installed, spent,
+        "a minor collapse spends the request: young_after_collection_with_need({chain}, {live}, \
+         {REQUEST}) capped at the keep band's edge"
+    );
+    assert!(
+        minor_installed > policy.young_minor_target_words(live),
+        "the request really made the minor's nursery wider than the young live set's own target"
+    );
+
+    // Arm B — the fullsweep, over the identical geometry.
+    let mut c = any_for(MatureKind::Copying, policy.clone());
+    let mut roots = build_live(&mut c, LIVE_WORDS);
+    c.grow_nursery(REQUEST).expect("grow");
+    assert_eq!(c.heap_size_words(), chain, "the two arms start from one geometry");
+    let major_collection = c
+        .collect_kind(CollectionKind::Major, &mut roots)
+        .expect("fullsweep");
+    assert_eq!(major_collection.kind, CollectionKind::Major);
+    assert_eq!(major_collection.stats.words_copied, live, "the same live set");
+    let major_installed = c.heap_size_words();
+    assert_eq!(
+        major_installed,
+        policy.young_target_words(live),
+        "a fullsweep installs exactly young_target_words({live}) — the request is ignored"
+    );
+
+    // The asymmetry itself: the same request, the same live set, two capacities.
+    assert!(
+        minor_installed > major_installed,
+        "the minor's carried request ({minor_installed}) must exceed the fullsweep's plain \
+         whole-heap target ({major_installed}) on the same geometry"
+    );
+    assert_eq!(
+        major_installed,
+        policy.young_after_fullsweep(chain, live),
+        "and the fullsweep's answer is the plain rule for that chain, request or none"
+    );
+    eprintln!(
+        "chain {chain}, live {live}, request {REQUEST}: minor -> {minor_installed} (the with-need \
+         rule would say {uncapped}, capped at {}), fullsweep -> {major_installed} (plain \
+         young_target_words({live}) = {})",
+        minor_carriage_bound(&policy, live),
+        policy.young_target_words(live)
     );
 }

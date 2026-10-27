@@ -80,11 +80,13 @@
 //! 6. **A collection still collapses the chain onto its live-set target** (the green control) —
 //!    after [`AnyCollector::collect`] / [`AnyCollector::collect_minor`] the chain is exactly one
 //!    space ([`AnyCollector::young_space_count`] == 1), its capacity is what
-//!    [`HeapPolicy::young_after_collection_with_need`] /
-//!    [`HeapPolicy::young_after_fullsweep_with_need`] prescribe for that chain **and the room
+//!    [`HeapPolicy::young_after_collection_with_need`] prescribes for that chain **and the room
 //!    request the growth seam recorded** (the one-shot `need` term a growth carries into the next
-//!    collection, so a copy-out's request is not handed straight back), and
-//!    [`AnyCollector::collection_debt`] is false.
+//!    **minor**, so a copy-out's request is not handed straight back), and
+//!    [`AnyCollector::collection_debt`] is false. A **fullsweep** sizes from the whole-heap live
+//!    set alone ([`HeapPolicy::young_after_fullsweep`]) and consumes the request without folding
+//!    it in: its 2× headroom plus the mature promotion room already cover a one-off young-side
+//!    request.
 //! 7. **A provably empty retired space is re-adopted, not replaced** — the smallest adequate one,
 //!    allocating nothing and consuming none of the capacity budget (the `O(log)`-indexed
 //!    [`Nursery::empty_retired_for`] path that keeps a growth from scanning the chain).
@@ -888,18 +890,17 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             let mut roots = build_live(&mut c, live_words);
             drive_growth(&mut c, hint, 6);
             let collected_chain = c.heap_size_words();
-            // The chain was grown for `hint` words of room before this fullsweep, so the
-            // whole-heap target carries that request as the one-shot `need` term — **bounded by
-            // the keep band's own upper edge** (`YOUNG_SHRINK_FACTOR` x the *plain* whole-heap
-            // target for this live set), so a request that scales with the capacity it replaces
-            // can never ratchet the nursery.
-            let target = policy.young_target_words_with_need(live_words, hint);
-            let bound = YOUNG_SHRINK_FACTOR * policy.young_target_words(live_words);
-            let installed = target.min(bound);
+            // A fullsweep sizes its nursery from the **whole-heap live set alone**: it already
+            // installs `young_target_words`'s 2x headroom plus a mature space sized for the
+            // promotion, which together cover a one-off young-side room request, so the
+            // `hint`-word request the growth loop carried is **consumed but not folded in** (see
+            // `Nursery::collapse_after_fullsweep`). The plain whole-heap target is therefore the
+            // figure, and the request cannot ratchet the nursery from this side at all.
+            let target = policy.young_target_words(live_words);
             assert!(
-                collected_chain > YOUNG_SHRINK_FACTOR * installed,
+                collected_chain > YOUNG_SHRINK_FACTOR * target,
                 "{kind:?}: the shrink branch must hold: the {collected_chain}-word chain is past \
-                 {} x the {installed}-word target",
+                 {} x the {target}-word target",
                 YOUNG_SHRINK_FACTOR
             );
             let stats = c.collect_major(&mut roots).expect("the fullsweep collapse");
@@ -910,16 +911,31 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             assert_eq!(c.young_space_count(), 1, "{kind:?}");
             assert!(!c.collection_debt(), "{kind:?}");
             assert_eq!(
-                policy.young_after_fullsweep_with_need(collected_chain, live_words, hint),
+                policy.young_after_fullsweep(collected_chain, live_words),
                 target,
-                "{kind:?}: a fullsweep from above the band asks for the whole-heap target"
+                "{kind:?}: a fullsweep from above the band asks for the plain whole-heap target"
             );
             assert_eq!(
                 c.heap_size_words(),
-                target.min(YOUNG_SHRINK_FACTOR * policy.young_target_words(stats.words_copied)),
-                "{kind:?}: the fullsweep collapses onto the whole-heap live set's target, bounded \
-                 by the keep band's upper edge"
+                policy.young_after_fullsweep(collected_chain, stats.words_copied),
+                "{kind:?}: the fullsweep collapses onto the whole-heap live set's target"
             );
+            // ... and the carried request is demonstrably *not* what it read: the need-augmented
+            // answer is never narrower than the plain target, and for a host-sized request it is
+            // strictly wider (`tests/growth_need_carried.rs` case 7 pins both collapse arms side by
+            // side on one geometry).
+            let with_need = policy.young_target_words_with_need(live_words, hint);
+            assert!(
+                with_need >= target,
+                "{kind:?}: the need-augmented answer ({with_need}) is never narrower than the plain \
+                 target ({target})"
+            );
+            if hint > SMALL_REQUEST {
+                assert!(
+                    with_need > target,
+                    "{kind:?}: a {hint}-word request would have widened the target past {target}"
+                );
+            }
         }
     }
 }
