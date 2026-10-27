@@ -344,7 +344,7 @@ fn a_keep_defers_the_destructor_until_the_last_release() {
         // SAFETY: the fixture-shaped contract: `obj` is a live payload whose first byte is readable.
         let byte = unsafe { *(obj as *const u8) } as usize;
         // Append the tag, so the final value encodes the order the destructors ran in.
-        let _ = ORDER.fetch_update(
+        let _ = ORDER.try_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
             |prev| Some((prev << 8) | byte),

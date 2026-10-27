@@ -431,8 +431,10 @@ fn the_unserved_stubs_are_typed_unsupported_gaps() {
     }
 }
 
-/// A capability gap is **uncatchable**: `try`/`catch` cannot swallow it, so a probe cannot
-/// turn the missing width into a value and a differential case cannot mistake it for a pass.
+/// A capability gap is **fatal on the `-eval` route**: the driver turns it into its uncatchable
+/// `Flow::Fatal`, so the probe's own `catch` cannot turn the missing width into a value and a
+/// differential case cannot mistake it for a pass. (A *compiled* module's `try … catch` does
+/// catch a gap — `tests/gap_raise_catch.rs`; the two routes differ by design.)
 #[test]
 fn a_prim_tty_gap_cannot_be_caught() {
     if !installation_present() {

@@ -97,8 +97,8 @@ use header::{
 // *and* every header test — branches to the resolved `fail` label's
 // `(func, pc)` — a `(spill, return-word, exit)` — while a `NO_FAIL` test (which
 // *raises*), an unresolved label (whose exact `unknown_label` must surface) and an
-// arity operand that is not a plain `{integer,A}` (which the interpreter *raises* on)
-// keep the whole instruction on the helper.
+// arity operand that is not a plain `{integer,A}` (which the interpreter *evaluates*
+// as a term) keep the whole instruction on the helper.
 //
 // Every header test dereferences **exactly the one word** `beam_term`'s predicate
 // reads, and only after proving `(value & 3) == 2` — i.e. `beam_term::is_boxed_term`
@@ -417,7 +417,8 @@ pub(super) fn test_plan(
         // `beam_term::boxed::is_binary` (`is_bitstring` + `bitstring_size & 7 == 0`).
         TestKind::IsBinary => TestPred::IsBinary,
         // `is_function2` needs an 8-bit-slice-equal arity operand; anything else stays
-        // on the helper (which reproduces the interpreter's typed error / range).
+        // on the helper (which reproduces the interpreter's judgement of a term- or
+        // out-of-range-arity operand).
         TestKind::IsFunction2 => TestPred::IsFunArity {
             arity: arity_operand(args.get(1), FUN_ARITY_MASK)?,
         },

@@ -79,9 +79,9 @@ pub enum TermError {
     /// another kind, or a *C-layout* `ErtsORefThing` block, whose id word does not
     /// exist (reading it would run past the block).
     ///
-    /// Deliberately distinct from [`TermError::RefIdentityUnavailable`]: that one is
-    /// a perfectly well-formed M1 reference whose C hash cannot be reproduced, not a
-    /// malformed term.
+    /// Deliberately distinct from [`TermError::RefIdentityUnavailable`]: that one
+    /// names an *identity* gap on a perfectly well-formed M1 reference (currently
+    /// unproduced — see its docs), not a malformed term.
     BadRef,
     /// The operation needs identity information the term does not carry: a
     /// `make_fun3` [local fun](crate::fun::FunKind::Local) hashes through its
@@ -94,18 +94,22 @@ pub enum TermError {
     /// [`TermError::BadFun`] (see [`crate::hashing`]). Never substituted with a
     /// wrong value.
     FunIdentityUnavailable,
-    /// The operation needs identity information the term does not carry: the C
-    /// hashes an [internal reference](crate::boxed::internal_ref_numbers) through
-    /// `internal_ref_numbers(ref)[0]` — the first id of the reference's **node
-    /// container** (`erl_term_hashing.c:288-290` for `make_hash`, `:1454-1458` for
-    /// `make_hash2`) — but this tree's M1 on-heap `Ref` thing (`[header, w1, w2]`)
-    /// holds a single process-local id and no node container, so
-    /// `make_hash2`/`make_hash` cannot reproduce the oracle's value.
+    /// The operation needs identity information the term does not carry.
     ///
-    /// This is *not* a malformed term — it is a well-formed term the operation
-    /// cannot faithfully complete — so it is deliberately distinct from
-    /// [`TermError::NotATerm`] (which says "this is not a term at all"). Never
-    /// substituted with a wrong value.
+    /// **Currently unproduced.** The one condition it named — the C hashing an
+    /// [internal reference](crate::boxed::internal_ref_numbers) through
+    /// `internal_ref_numbers(ref)[0]`, the first id of the reference's **node
+    /// container** (`erl_term_hashing.c:288-290` for `make_hash`, `:1454-1458` for
+    /// `make_hash2`) — is closed: this tree's M1 `Ref` thing carries its whole
+    /// identity in its `id` word, which the two ports now mix (see the
+    /// `internal_ref_hash_word` substitution in [`crate::hashing`]). A reference of
+    /// any other layout is a shape failure and answers [`TermError::BadRef`].
+    ///
+    /// Retained as public API vocabulary rather than deleted: `beam_bifs`'s hashing
+    /// gap documentation and pattern-matching consumers name it, and an identity gap
+    /// is a legitimate *third* category next to "malformed term"
+    /// ([`TermError::BadFun`]) and "not a term at all" ([`TermError::NotATerm`]).
+    /// Never substituted with a wrong value.
     RefIdentityUnavailable,
     /// A native-record layout helper or accessor was applied to a term that is not
     /// a well-formed native record (an `ErtsRecordInstance` /
@@ -225,9 +229,8 @@ impl From<TermError> for BeamError {
             // no oracle reason to reproduce — the oracle simply never takes this
             // path, because its funs do carry the identity).
             TermError::FunIdentityUnavailable => BeamError::BadArg,
-            // Missing reference identity is the same kind of capability gap as
-            // `FunIdentityUnavailable` above: the term is well-formed, the node
-            // container the C mixes in is simply not carried here.
+            // Missing reference identity, the sibling of `FunIdentityUnavailable`
+            // above: an identity gap on a well-formed term (currently unproduced).
             TermError::RefIdentityUnavailable => BeamError::BadArg,
             // A malformed native record reached a record layout helper, or a
             // record-construction argument was invalid: an argument failure.
@@ -318,10 +321,11 @@ mod tests {
 
     #[test]
     fn ref_identity_unavailable_is_not_a_malformed_term() {
-        // Same rationale as `fun_identity_unavailable_is_not_bad_fun`: an internal
-        // reference is a perfectly well-formed term, it just does not carry the node
-        // container the C mixes into its hash — so it must be tellable from "this is
-        // not a term" and from the fun gap.
+        // Same rationale as `fun_identity_unavailable_is_not_bad_fun`: an identity gap
+        // is a third category next to "this is not a term" and "this is not the right
+        // shape", so the variant stays tellable from both (no hash port produces it
+        // since the M1 id word closed the internal-reference gap; the vocabulary is
+        // kept for the consumers that name it).
         assert_ne!(TermError::RefIdentityUnavailable, TermError::NotATerm);
         assert_ne!(TermError::RefIdentityUnavailable, TermError::BadFun);
         assert_ne!(
@@ -332,7 +336,7 @@ mod tests {
     #[test]
     fn bad_ref_is_not_ref_identity_unavailable() {
         // "this is not an M1 internal reference" (a shape failure) must be tellable
-        // from "this is one, but its C hash is unreproducible" (an identity gap).
+        // from an identity gap (`RefIdentityUnavailable`).
         assert_ne!(TermError::BadRef, TermError::RefIdentityUnavailable);
         assert_ne!(TermError::BadRef, TermError::NotATerm);
         assert_ne!(TermError::BadRef, TermError::BadFun);

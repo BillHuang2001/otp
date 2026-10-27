@@ -84,8 +84,9 @@ accessors are claimed from either variant and the three pure accessors from `Bif
   (behind the frame-window guard), a small immediate or a raw immediate word; `TestPlan::uses_y`
   gates the block's Y publish/refresh, `TestPlan::emits_guard` reports whether a run-time guard was
   emitted, and `TestPlan::needs_deopt` reports whether the plan's failure path is the interpreter
-  step. `NO_FAIL` -> `None`; unresolved fail label -> `None`; an arity operand outside the
-  interpreter's range, a module with neither `true` nor `false` interned for `is_boolean`, an
+  step. `NO_FAIL` -> `None`; unresolved fail label -> `None`; an arity operand that
+  is not an in-range integer literal (a register, a `Y` slot, a bignum or a literal-area term), a
+  module with neither `true` nor `false` interned for `is_boolean`, an
   out-of-bound register, or a bignum/float/literal operand -> `None` (the helper then reproduces the
   interpreter's exact result).
 - **`test` comparison helper** (`test.rs::emit_test_helper`): a comparison `Test` the word/header

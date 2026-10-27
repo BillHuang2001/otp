@@ -54,10 +54,10 @@
 //! external pid or reference, are a typed capability gap in this runtime: an external
 //! identifier's leading component is the *receiving* VM's node-table index, which no term
 //! carries, so `beam_bifs`'s `external_channel_gap` answers `error:unsupported_bif` and the
-//! printer has no external arm. A capability gap is **uncatchable by design** (its reason
-//! atom is never interned, so a program's own `try … catch` cannot swallow it), which
-//! means the fixture's `pid_text/1`/`ref_text/1` fallbacks do **not** rescue a `beam_rt`
-//! peer: printing one would terminate that VM with exit 3.
+//! printer has no external arm. A capability gap's reason atom **is** interned (so compiled code
+//! catches it, `tests/gap_raise_catch.rs`), which means the fixture's `pid_text/1`/`ref_text/1`
+//! fallbacks answer `"remote-pid"`/`"remote-ref"` on a `beam_rt` peer where the oracle renders
+//! `<node.number.serial>` — never canonical text.
 //!
 //! Every actor and responder this file drives therefore asserts identity by **pattern
 //! match and `=:=`** and prints only booleans, atoms and reasons:
@@ -122,8 +122,9 @@
 //!
 //! The monitor family's **demonitor** sub-arm is *not measurable* on a `beam_rt` peer: the
 //! fixture's `monitor_then_demonitor/1` renders the victim with `pid_text/1`, and
-//! `erlang:pid_to_list/1` of an external pid is an **uncatchable** capability gap (below), so
-//! the peer dies with exit 3 `beam_rt: unsupported: bif` before the relationship is armed.
+//! `erlang:pid_to_list/1` of an external pid is a capability gap — caught by the fixture's own
+//! fallback, so the line renders `"remote-pid"` where the oracle renders `<node.number.serial>`,
+//! and no rust-side actor exists to compare against.
 //! There is no `ask_victim_rust/2`-based demonitor actor yet.
 //!
 //! # Running it
@@ -836,8 +837,9 @@ fn a_rust_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_k
 /// The claim is `LINKS_FRESH 0 []` (the empty baseline, taken before the peer did anything)
 /// → `LINKS_LINKED 1 [true]` → `LINKS_UNLINKED 0 []`. Every report is the item's **shape**,
 /// `length/1` plus one `is_pid/1` per element: the entry the peer arms is an *external* pid,
-/// which this runtime cannot render at all (`beam_bifs`'s `external_channel_gap`, an
-/// uncatchable capability gap), so printing one would kill this VM with exit 3.
+/// which this runtime cannot render as the oracle's canonical text (`beam_bifs`'s
+/// `external_channel_gap`; the fixture's own `pid_text/1` fallback answers `"remote-pid"`), so
+/// the item is asserted by shape instead.
 #[test]
 #[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
 fn a_rust_peers_link_shows_up_in_the_links_item_and_clears_on_unlink() {

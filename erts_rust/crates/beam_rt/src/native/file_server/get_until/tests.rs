@@ -497,7 +497,7 @@ fn serve_boxes_a_continuation_raise_as_error_func_and_retires_the_device() {
 /// ```
 ///
 /// This runtime reports the honest typed gap instead of fabricating a user-function raise
-/// (a capability gap is uncatchable and must never be dressed up as `{error, Func}`), and
+/// (a capability gap is never dressed up as `{error, Func}`), and
 /// the device is **not** retired.
 #[test]
 fn a_typed_capability_gap_neither_retires_the_device_nor_reports_error_func() {

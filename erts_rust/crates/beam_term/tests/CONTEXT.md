@@ -26,7 +26,7 @@ the cross-module and public-surface behaviour.
 | `compare_class_order.rs` | the **full** 18-rung cross-class ladder (every adjacency and the whole `i<j ⇒ Less`/`i==j ⇒ Equal`/`i>j ⇒ Greater` matrix), the rank-order-vs-numeric split between `cmp` and `cmp_arith`, every fun kind on the fun rung, a refc binary on the bitstring rung, the six mixed internal/external boundary pairs, and a live-`erl` oracle matrix |
 | `compare_external.rs` | the external pid/port/reference and native-record structural arms with a live-`erl` check |
 | `compare_oracle.rs` | arithmetic/exact comparison vs `==`/`=:=`/`<`/`>`, including the `>2^53` asymmetry |
-| `record_ref_hash.rs` | offline `(make_hash2, make_hash, definition_hash)` triples for a native record and the reference shapes + a real `-record` fixture cross-check |
+| `record_ref_hash.rs` | offline `(make_hash2, make_hash, definition_hash)` triples for a native record, the reference shapes (structural properties only — reference numbering is per-VM) + a real `-record` fixture cross-check |
 | `size_bounded.rs` | the bounded/cycle-safe walk: cycles, budget inclusivity, non-terms ⇒ `Ok(0)`, a 100 000-element list, exact flat/HAMT sizes, per-occurrence counting |
 | `size_policy.rs` | the `DefaultSizingPolicy` differential over a 27-term corpus (literals, refc binaries, sub-binaries, flat/HAMT maps, all three fun kinds, external pid/port/ref, native record) plus each policy axis as a mutation-sensitivity control (literal sharing flips the count, flattening flips `8` ⇒ the window, a shared cyclic cell is `Ok(0)` against the default's `Err(TermGraphCyclic)`) |
 | `size_layout_agreement.rs` | the **whole header space** — every `BoxedTag` subtag plus the reserved `0x04`/`0x3C`, over the `0/1/3` arity sweep and each shape-owned interior — asserting per row that `layout::object_words`, `size_object`, `size_object_bounded` (exact budget fits, one word under refuses), the `*_with(&DefaultSizingPolicy)` forms and the sizing-child run all agree with the hand-derived count, that `for_each_child_slot` differs only for `ErlSubBits`, and that real constructors reproduce the table; named rows pin the one deliberate divergence (literal `tuple0()` ⇒ `0` vs structural `1`) |
@@ -57,5 +57,5 @@ the cross-module and public-surface behaviour.
 - `oracle.rs`, `number_oracle.rs`, `compare_oracle.rs`, `compare_external.rs`, `map_hash.rs` → the live-`erl`
   oracle cross-checks
 - `compare_terms.rs`, `compare_class_order.rs` → the term-order surface
-- `record_ref_hash.rs` → `phash2`/`phash` for the record and reference shapes
+- `record_ref_hash.rs` → `phash2`/`phash` for the record and reference shapes (internal refs hash by their `id` word, external refs by their wire numbers, a C-layout ref block is the typed `BadRef`)
 - `size_bounded.rs`, `size_policy.rs`, `size_layout_agreement.rs`, `size_scratch.rs` → the sizing walk
