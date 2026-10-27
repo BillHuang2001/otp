@@ -1,0 +1,78 @@
+m21 cross-runtime record — derived table (auditable intermediate)
+Sources: results/m21-xrun-gc-{rust,sys}-r{1..7}.json — seven matched rounds over the GC/allocator
+workload group (baseline, gc_bound, gc_class, list_walk), `--quick`, alternating the side order every
+round, one process at a time, each pass pinned with `taskset -c 3 setsid -w`. No metric value was edited.
+Figure quoted = median of the seven per-round values; ratio = median of the seven per-round ratios.
+Ratio > 1 => rust dearer. `ops`/`elements` are the deterministic N companions (identical every round).
+
+A. startup / compute / vm accounting (baseline)
+metric                                  rust(med)       sys(med)  rust/sys  per-round ratios
+startup_ms[p50]                                163.81         108.31     1.540  1.750 1.237 1.540 1.537 1.283 1.642 3.142
+startup_ms[p99]                                164.73         118.69     1.522  3.891 0.785 1.522 1.516 1.054 1.769 3.049
+compute_loop_ms[p50]                           183.70         165.86     1.110  1.224 1.061 1.110 1.144 0.961 1.097 2.342
+compute_ops_per_sec                      5,345,675.69   6,022,808.70     0.888  0.806 0.969 0.888 0.850 1.019 0.888 0.431
+vm_memory_total_bytes                    9,320,543.00  36,199,472.00     0.257  0.258 0.257 0.257 0.257 0.257 0.257 0.257
+
+B. per-case per-unit (ns) — value = median of the seven rounds (six for `churn`, where one was withheld)
+workload/case                                          rust(med)        sys(med)  rust/sys  per-round ratios | N rust/sys
+list_walk/case_list_walk_ns_per_element                     16.01           2.27     6.846  6.633 6.702 6.524 6.846 7.378 14.271 7.067 | 50,000,000/100,000,000 elements
+gc_bound/case_churn_ns_per_op                           25,685.39       4,220.30     6.080  6.787 6.032 5.967 6.128 5.962 6.138 | 10,000/200,000 ops  [1 round withheld for noise]
+gc_class/case_send_recv_ns_per_op                       19,859.64       3,344.34     5.842  6.429 5.771 5.810 5.842 5.512 5.938 7.902 | 25,000/200,000 ops
+gc_class/case_ets_copy_ns_per_op                        12,436.12       1,833.34     6.519  7.179 6.501 6.448 6.403 6.519 6.783 7.761 | 40,000/400,000 ops
+gc_class/case_compile_ns_per_op                    252,273,029.50  16,992,662.88    14.871  15.491 14.629 15.270 14.871 19.462 13.991 13.036 | 2/8 ops
+
+C. OS peak RSS per workload (VmHWM, bytes) — every loop row is rust boot-dominated
+workload                rust(med)         sys(med)  rust/sys  per-round ratios
+baseline                  128,106,496    135,168,000     0.947  0.947 0.947 0.947 0.948 0.948 0.948 0.947
+gc_bound                   96,722,944     67,661,824     1.429  1.430 1.429 1.426 1.427 1.429 1.431 1.430
+gc_class                  193,597,440     67,624,960     2.862  2.864 2.861 2.861 2.853 2.862 2.865 2.863
+list_walk                  96,694,272     67,600,384     1.430  1.426 1.430 1.432 1.430 1.434 1.435 1.430
+slice: NOT measured in this record (the session's workload set was baseline,gc_bound,gc_class,list_walk),
+       so m21 carries no like-for-like footprint row; the loop rows above are boot-dominated.
+
+D. startup_ms per round (ms) — the drivers of the p50/p99 budget rows
+round   rust_p50   sys_p50   ratio |  rust_p99   sys_p99   ratio
+r1         187.094   106.923   1.750 |    421.633   108.352   3.891
+r2         163.811   132.425   1.237 |    164.732   209.903   0.785
+r3         162.585   105.555   1.540 |    164.112   107.843   1.522
+r4         162.951   105.992   1.537 |    164.519   108.502   1.516
+r5         161.507   125.916   1.283 |    162.722   154.327   1.054
+r6         177.873   108.311   1.642 |    209.963   118.688   1.769
+r7         385.748   122.778   3.142 |    411.354   134.905   3.049
+
+E. per-round per-unit values, rust/sys (ns) — the stability evidence
+round   churn_ns/op          list_walk_ns/element   gc_class send_recv        ets_copy          compile
+r1          28,396.0/   4,183.8          16.0/       2.4      21,410.4/   3,330.3      12,766.3/   1,778.4 263,233,565.5/16,992,662.9
+r2          25,612.9/   4,246.1          15.1/       2.3      19,919.9/   3,451.7      12,176.0/   1,872.8 252,173,407.0/17,238,050.9
+r3          24,995.9/   4,189.3          15.1/       2.3      18,920.8/   3,256.5      11,336.2/   1,758.1 250,147,365.5/16,381,654.2
+r4          25,757.9/   4,203.0          15.2/       2.2      19,281.5/   3,300.4      11,190.9/   1,747.8 247,531,986.0/16,645,256.6
+r5          25,375.0/   4,256.5          16.8/       2.3      19,165.0/   3,477.2      12,446.6/   1,909.2 284,068,211.5/14,595,682.4
+r6          25,902.7/   4,220.3          31.8/       2.2      19,859.6/   3,344.3      12,436.1/   1,833.3 252,273,029.5/18,031,215.5
+r7         WITHDRAWN/   4,281.3          19.0/       2.7      27,495.2/   3,479.7      14,712.9/   1,895.7 280,473,902.0/21,515,006.0
+
+F. status / withheld audit
+  rows: 56 (7 rounds x 2 sides x 4 workloads), status=ok: 56, not-ok: 0
+  withheld marginals: 1
+    r7/rust gc_bound: case churn: marginal below timer resolution: paired median=610.776 ms min=90.393 ms max=828.351 ms noise=±322.577 ms over 3 round(s)
+  every other case reports its paired median; the deterministic counters are identical in every round.
+
+G. runtime resolution (both sides, every pass)
+  sys  : /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl  version=29 supported=true
+  rust : erts_rust/target/release/beam_rt  version=30 supported=true
+
+H. the budget-evaluation pass (NOT a timing source)
+  results/m21-budgetprobe-all.json is one `--runtime all --quick` pass over the same four workloads,
+  run only so the latency-budget rows that need BOTH sides in one report (the two `baseline` rust/sys
+  `startup_ms` ratio rows) can be evaluated, and to give `bench compare` a single report carrying both
+  sides (two single-side reports share no (workload,runtime) key, so the two-file mode reports every
+  row `only-in-a`/`only-in-b`). It is runtime-major (all `sys` rows, then all `rust` rows), so it is
+  subject to the documented ordering bias; every figure in sections A-F comes from the fourteen
+  matched single-side passes. Its driver-printed verdict block is archived verbatim as
+  results/m21-budgetprobe-all.txt, and its cross-runtime diff as results/m21-compare-cross-runtime.txt.
+
+I. load band (results/m21-xrun-load.log, /proc/loadavg at every pass boundary)
+  matched passes: 1-min load min 5.65, max 19.57, median 8.68 over 28 readings; all-pass 13.84 -> 9.58
+  The record opened while the host was still loaded (19.57 and falling) and closed in a quieter window
+  (5.65-13.90); two rust passes caught a spike (r6 list_walk, r7 everything) and those rounds are kept
+  as separate archived files — the headline is the median of all seven and the per-round column is the
+  stability evidence. Ratios are the signal; absolute wall times are host-load-sensitive.

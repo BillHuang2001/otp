@@ -8,7 +8,15 @@ The `m<session>-` prefix names the measurement session the files belong to; the 
 
 ## API Surface (what each file is)
 
-### `m15-` — the current session (2026-10-17, `/proc/loadavg` ≈2–5)
+### `m21-` — the current session: the GC/allocator workstream's *before* record (2026-10-27, `/proc/loadavg` 5.7–19.6)
+- Seven **matched** rust-only/sys-only round pairs over the group `baseline,gc_bound,gc_class,list_walk`, side order alternating every round, every pass `--quick`, pinned `taskset -c 3 setsid -w`, one process at a time: `m21-xrun-gc-r{1..7}-{rust,sys}.json` (14 reports, 56/56 rows `ok`).
+- `m21-xrun-ratios.txt` — the derived table: per-round values, per-round `rust/sys` ratios, the median ratio, the deterministic `case_*_ops`/`_elements` companions, the withheld audit and the runtime resolution (the oracle here is **OTP 29.1.2 / erts-17.1.1**, not the 29.1.1 earlier records name).
+- `m21-load-record.md` + `m21-xrun-load.log` — the per-pass `/proc/loadavg` before/after record, the command shape, the two spike-affected rounds, the single withheld figure (`r7/rust churn`) and the memory rows.
+- `m21-budgetprobe-all.json` / `.txt` — one supplementary `--runtime all --quick` pass, run **only** so the both-sides-in-one-report budget ratio rows can be judged and so `bench compare` has a report carrying both sides; it is runtime-major and ordering-biased, so it is **not** a timing source.
+- `m21-compare-cross-runtime.txt` — `bench compare m21-budgetprobe-all.json` (the driver's own cross-runtime diff of that supplementary pass).
+- Its workload set is deliberately narrow: `slice` and the six other `Runtimes::Both` workloads are **not** in m21, so a footprint or per-call figure for them still comes from `m20`/m19.
+
+### `m15-` — the superseded full-suite session (2026-10-17, `/proc/loadavg` ≈2–5)
 - `m15-bench-xrun.json` — **the full cross-runtime report**: `run --full --runtime all`, the six `Runtimes::Both` workloads × both runtimes (12/12 rows `ok`). The source of every headline number in `../RESULTS.md` §2/§3.
 - `m15-bench-xrun-interp.json` / `m15-bench-xrun-quick.json` — **the tier-effect control pair**: the same six workloads, `--runtime rust` only, `--quick` on **both** sides (a matched form) with `BEAM_RT_TIER=interpreter` vs the default baseline JIT. These are **Rust-vs-Rust** artefacts and are never a system-ERTS comparison.
 - `m15-bench-external.json` — the full sys-only external targets in one report (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`, 4/4 `ok`).
@@ -27,17 +35,20 @@ Regression baselines from the sequential-marginal era, so their per-unit loop ro
 Each session's `m*-load-record.md` / `m*-tool-targets-notes.md` pins the host conditions and per-target blockers.
 
 ## Constraints
-- **Never edit a metric value.** The one permitted normalisation is replacing an environment-specific absolute path with a portable one — the run-host worktree prefix in `runtimes[].program` becomes `erts_rust/target/release/beam_rt`, and a scratch `$TMPDIR` prefix in `notes` becomes `$TMPDIR/`; this is applied mechanically when archiving and is disclosed in `../RESULTS.md`.
+- **Never edit a metric value.** The one permitted normalisation is replacing an environment-specific absolute path with a portable one — the run-host worktree prefix in `runtimes[].program` becomes `erts_rust/target/release/beam_rt`, any other worktree prefix is removed, and a scratch `/tmp/bench-scratch-…` (or `/tmp/genesis/task_<id>/…`) prefix in `notes` becomes `$TMPDIR/…`; this is applied mechanically when archiving and is disclosed in the session's own load record (`m21-load-record.md` for m21).
 - Regenerate by re-running `../RESULTS.md`'s Runbook and copying the new JSON in — do not patch.
 - Keep `../RESULTS.md` in sync: it is the human-readable face of these files, and it must name the current session.
 
 ## Notes for Agents
 - Consume these with the driver, not by hand: `bench compare <file>` (cross-runtime) or `bench compare <a.json> <b.json>` (two file; `a` is the baseline side of each delta). The tool diffs the **mean**, and everything else is left alone. A `--runtime rust` report (the `-interp`/`-quick` artefacts) has no `sys` rows, so a one-path compare on it is not a cross-runtime diff — use the two-file form.
 - JSON schema is `Report` / `WorkloadResult` (`SCHEMA_VERSION = 1`); a row is `ok` (has metrics), `skipped` (has a `reason`, no metrics) or `failed` (has a `reason`).
-- Absolute performance depends on the host **and on its current load**: m15 ran at ≈2–5 while m14 ran at 40–145, so even the absolute times moved with the host, not only with the code. Prefer ratios, the deterministic `case_*_ops`/`calls`/`elements` companions and the recorded load over any single absolute figure.
+- Absolute performance depends on the host **and on its current load**: m21 ran at ≈5.7–19.6, m19 at 0.5–4.5 and m14 at 40–145, so even the absolute times moved with the host, not only with the code. Prefer ratios, the deterministic `case_*_ops`/`calls`/`elements` companions and the recorded load over any single absolute figure.
 - **Never compare a Rust tier column with the `sys` column without saying which is which.** The `-interp`/`-quick` pair exists precisely to keep the two Rust tiers separable from the system-ERTS column.
+- **A per-round ratio is only comparable with a record taken against the same oracle.** m21's `sys` side is OTP **29.1.2 / erts-17.1.1**; m17–m20 named 29.1.1 / erts-17.1, so quote a cross-record ratio only after checking which `erl` each side names (`m21-xrun-ratios.txt` §G).
+- **A `--runtime all` report is a supplementary artefact, never a timing source** (`BOTTLENECKS.md` §1.1 bans the runtime-major ordering as a headline): `m21-budgetprobe-all.*` exists only to judge the both-sides budget rows and to give `bench compare` one report holding both sides, because two single-side reports share no `(workload, runtime)` key and the two-file mode then reports every row `only-in-a`/`only-in-b`.
 
 ## See Also
 - `../RESULTS.md` → the m15 summary tables, exact commands, the paired-estimator record (§3.4) and the still-open items.
+- `m21-load-record.md` → the current GC/allocator record: per-pass load table, command shape, withheld audit, memory rows.
 - `../CONTEXT.md` → the workload definitions, the loop-count calibration rule and the runbook pointer.
-- `../src/marginal.rs` → the paired estimator that produced the m15 per-unit figures.
+- `../src/marginal.rs` → the paired estimator that produced the per-unit figures.
