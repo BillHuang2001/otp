@@ -9,7 +9,7 @@ Ground truth: `erl_term_hashing.c`; `erl_record.c:1041-1046` for the record defi
 | File | Owns |
 |---|---|
 | `mod.rs` | module docs + `term_hash` (internal) + the structural-hash and oracle-vector suites |
-| `common.rs` | the `pub(super)` ERTS-hash primitives both ports share |
+| `common.rs` | the `pub(super)` ERTS-hash primitives both ports share, incl. `internal_ref_hash_word` (the internal-reference operand — see below) |
 | `make_hash2.rs` | `make_hash2`/`make_hash2_with_identity` + `compute_record_definition_hash` |
 | `make_hash.rs` | `make_hash`/`make_hash_with_identity` + `hash_binary_bytes` |
 | `identity.rs` | the `LocalFunIdentity` provider trait both ports consult for a `FunKind::Local` fun |
