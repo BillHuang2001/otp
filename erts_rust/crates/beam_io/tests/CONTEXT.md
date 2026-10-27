@@ -232,7 +232,10 @@ rot.
   observes that (a parked port is still a live port with its number allocated, not a leak).
 - `inet_async.rs` → the `tcp_inet` **asynchronous-op queue + completion channel** through
   `PortRegistry` (numeric opcodes, the single receive slot, the caller tag, the accept hand-off and
-  its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
+  its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases. Its
+  frozen-channel rows (`port_notifications_stay_exactly_two_variants`, and the accept-side twin in
+  `inet_accept.rs`) found their `PortNotification::Data` case on `{deliver, port}`, the C's one way
+  to answer a passive read on the port channel instead of the completion channel.
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle).
   `inet.rs` reads a passive connection through the named `recv` verb: a passive socket with no queued

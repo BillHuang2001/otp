@@ -2468,9 +2468,10 @@ impl Driver for TcpInetDriver {
         //
         // * [`TcpInetDriver::owns_readiness_for_active`] is the C's connected-and-active arm —
         //   [`TcpInetDriver::active_delivery`] owns the socket's read;
-        // * everything else (a listener's queued `accept`, a queued `TCP_REQ_RECV`, or a passive
-        //   connection's bytes into the port input queue) stays with
-        //   [`TcpInetDriver::async_ready_input`].
+        // * everything else (a listener's queued `accept`, or a queued `TCP_REQ_RECV`) stays with
+        //   [`TcpInetDriver::async_ready_input`], which reads **nothing** for a passive socket
+        //   with no receive queued: this floor's poller registration outlives the C's read arm,
+        //   so readiness alone is never a reason to `read(2)`.
         if self.owns_readiness_for_active() {
             self.active_delivery(ctx)
         } else {
