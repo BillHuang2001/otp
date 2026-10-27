@@ -1801,10 +1801,11 @@ fn ensure_heap_full_commit(
     }
     // The **latch's closing half** (see [`root_is_unscanned`] and
     // [`Runtime::close_foreign_reachable`]): this door handed the valve the machine's whole root
-    // set, and the descent it ran reached no container from a region the collector does not scan
-    // — so the process's graph holds none, and the descent can be skipped again until an event
-    // puts one back. No other door may do this: [`ensure_heap`] cannot see the FR file, and the
-    // park arm and the signal gate run for a process whose roots are not published.
+    // set, and the descent it ran reached no container that could forward a scanned word into a
+    // region the collector does not scan (an inert foreign term does not count) — so the
+    // process's graph holds no hazard, and the descent can be skipped again until an event puts
+    // one back. No other door may do this: [`ensure_heap`] cannot see the FR file, and the park
+    // arm and the signal gate run for a process whose roots are not published.
     if verdict.foreign_free {
         runtime.close_foreign_reachable(pid);
     }

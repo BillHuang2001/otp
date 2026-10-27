@@ -274,7 +274,7 @@ pub(crate) fn collect_at_reds_boundary(
         return Ok(());
     }
     // This door handed the valve the machine's whole root set, so a descent that reached no
-    // container from a region the collector does not scan may **close** the latch (the same
+    // container able to forward a scanned word may **close** the latch (the same
     // closing half the full heap-admission door runs; see
     // [`Runtime::close_foreign_reachable`]).
     if verdict.foreign_free {
