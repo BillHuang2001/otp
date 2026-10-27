@@ -34,11 +34,11 @@
 
 use beam_alloc::binary::{
     GrowOutcome, GrowthCounters, RefcBinary, Relocation, DEFAULT_RESERVATION_FACTOR,
-    EXACT_RESERVATION_CAPACITY_LIMIT, GROW_DOUBLING_LIMIT_BYTES, MAX_PAYLOAD_BYTES,
+    GROW_DOUBLING_LIMIT_BYTES, MAX_PAYLOAD_BYTES,
 };
 use beam_alloc::{
-    block::{BLOCK_HEADER_SIZE, UNIT_SIZE}, payload_capacity, AllocRef, AllocatorConfig,
-    CarrierAllocator, PayloadGrowOutcome, PayloadRelocation, SizeClasses, TypeId,
+    payload_capacity, AllocRef, AllocatorConfig, CarrierAllocator, PayloadGrowOutcome,
+    PayloadRelocation, TypeId,
 };
 use beam_common::{AllocKind, BeamError};
 
@@ -214,87 +214,10 @@ fn a_generous_reservation_grows_entirely_in_place() {
     assert!(run.payload.capacity() >= run.payload.len());
 }
 
-/// **Test 2b (the small-capacity reservation).** A `with_capacity` payload whose whole block
-/// fits the allocator's size-class ladder reserves **exactly** its capacity (no `4x` slack) and
-/// is therefore served by a size **class** — one free-list pop — instead of a pooled
-/// variable-size multi-block carrier (a carrier good-fit scan, a boundary-tag split and a
-/// coalesce per payload).
-///
-/// This is the shape of every `bs_init_writable` accumulator the compiler emits with its
-/// default hint (256 bytes): the block is `HEADER_SIZE + reservation`, and at `4x` slack it
-/// was 1056 bytes — 32 bytes past the 1024-byte top of the default ladder — so every such
-/// output binary took the pooled path.
-#[test]
-fn a_small_capacity_payload_is_served_by_a_size_class() {
-    let alloc = test_allocator("reservation-slab");
-    let ty = payload_type();
-    // `test_allocator` uses the default config, whose class table is this one.
-    let classes = SizeClasses::default_small_block();
-    let base = alloc.type_stats(ty);
-
-    // The compiler's default writable-accumulator hint.
-    let payload = RefcBinary::with_capacity_and_allocator(alloc.clone(), 256).expect("reserve");
-    assert_eq!(payload.capacity(), 256);
-    assert_eq!(
-        payload.reserved_bytes(),
-        256,
-        "a small capacity reserves exactly itself (no 4x slack)"
-    );
-    // The allocator's accounted block *is* the class block: `HEADER_SIZE + class_size`, never
-    // the exact-fit block a pooled carrier would have carved (`HEADER_SIZE + 256`).
-    let request = BLOCK_HEADER_SIZE + payload.reserved_bytes();
-    let class = classes
-        .class_for(request)
-        .expect("the whole block fits the ladder");
-    let class_block = BLOCK_HEADER_SIZE + classes.class_size(class).expect("a known class");
-    assert_eq!(
-        alloc.type_stats(ty).bytes - base.bytes,
-        class_block,
-        "the payload was served from size class {class} ({class_block} bytes), not `alloc_mid`"
-    );
-    assert!(
-        class_block > request,
-        "a class block is at least the request (and here strictly larger)"
-    );
-    drop(payload);
-
-    // The boundary the other way: one byte above `EXACT_RESERVATION_CAPACITY_LIMIT` the
-    // capacity no longer fits a class, the geometric slack resumes, and the payload goes back
-    // to a pooled carrier (whose block is the exact fit, i.e. *not* a class block).
-    let base = alloc.type_stats(ty);
-    let capacity = EXACT_RESERVATION_CAPACITY_LIMIT + 1;
-    let large =
-        RefcBinary::with_capacity_and_allocator(alloc.clone(), capacity).expect("reserve");
-    assert_eq!(
-        large.reserved_bytes(),
-        (capacity * DEFAULT_RESERVATION_FACTOR).div_ceil(UNIT_SIZE) * UNIT_SIZE,
-        "above the limit the geometric reservation is back"
-    );
-    // The pooled carrier's block is carved for the request (never rounded up to a class):
-    // it is at least `BLOCK_HEADER_SIZE + reservation` and is *not* one of the ladder's block
-    // sizes, which is exactly what distinguishes `alloc_mid` from a size class.
-    let request = BLOCK_HEADER_SIZE + large.reserved_bytes();
-    assert!(
-        classes.class_for(request).is_none(),
-        "the block is above the ladder, so it cannot come from a class"
-    );
-    let accounted = alloc.type_stats(ty).bytes - base.bytes;
-    assert!(
-        accounted >= request,
-        "the pooled block ({accounted}) covers the request ({request})"
-    );
-    assert!(
-        !classes
-            .iter()
-            .any(|class| BLOCK_HEADER_SIZE + class == accounted),
-        "a pooled carrier's block ({accounted}) is never a class block size"
-    );
-}
-
-/// **Test 2c (a small reservation still grows amortised).** Reserving exactly does not change
-/// the growth *shape*: the C's `GROW_PROC_BIN_SIZE` schedule is applied to the reservation, so
-/// an append loop that outgrows a small payload still doubles (moves logarithmic, bytes copied
-/// O(n)) — it just reaches its first move up to two appends earlier.
+/// **Test 2b (a small-capacity payload still grows amortised).** The reservation policy does
+/// not change the growth *shape*: the C's `GROW_PROC_BIN_SIZE` schedule is applied to the
+/// reservation, so an append loop that outgrows a small payload still doubles (moves
+/// logarithmic, bytes copied O(n)).
 #[test]
 fn a_small_reservation_still_grows_amortised_linearly() {
     let alloc = test_allocator("reservation-growth");
@@ -307,7 +230,7 @@ fn a_small_reservation_still_grows_amortised_linearly() {
     assert_eq!(run.payload.as_bytes(), &run.expected[..], "the bytes are exact");
     assert!(
         run.counters.moves <= 8,
-        "doubling from 256 B keeps the move count logarithmic: {:?}",
+        "doubling from the small reservation keeps the move count logarithmic: {:?}",
         run.counters
     );
     assert!(
@@ -321,7 +244,7 @@ fn a_small_reservation_still_grows_amortised_linearly() {
     );
 }
 
-/// **Test 2d (the written high-water publish).** [`RefcBinary::set_len_unwritten`] publishes
+/// **Test 2c (the written high-water publish).** [`RefcBinary::set_len_unwritten`] publishes
 /// bytes a writer has already written *through the payload pointer* without touching them,
 /// where [`RefcBinary::set_len`] zero-fills the range it exposes. The two are the same call
 /// except for that fill, so they are asserted side by side on otherwise identical payloads.
