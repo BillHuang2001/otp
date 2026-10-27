@@ -98,14 +98,20 @@
 //! [`RuntimeContext::io_device`]: RuntimeContext
 //! [`RuntimeContext::io_stream`]: RuntimeContext
 
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::{terms, ExecutionContext};
+use beam_io::io_device::Encoding;
 use beam_process::ProcessId;
-use beam_term::{atom_val, is_atom, Eterm, NIL};
+use beam_term::{atom_val, is_atom, is_list, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::native::prim;
+
+pub(crate) mod convert;
+mod request;
+
+use convert::{characters_to_binary, Chars};
 
 /// The output stream an `io:*` request writes to.
 ///
@@ -124,12 +130,18 @@ enum Stream {
 /// The class of an `io:*` **device** argument, as resolved by
 /// [`RuntimeContext::io_device`].
 ///
-/// Mirrors what `io.erl`'s `o_request/2` + `request/3` would do with the argument, without
-/// the message round trip this runtime cannot perform from a BIF.
+/// Mirrors what `io.erl`'s `o_request/2` + `request/3` would do with the argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
     /// The device selects this stream.
     Stream(Stream),
+    /// A **file device**: the io-device process a `file:open/2` handed out. Served through the
+    /// native file service ([`crate::native::file_server`]), whose `{put_chars, …}` /
+    /// `{requests, …}` / `{get_chars, …}` arms are `file_io_server`'s.
+    File(ProcessId),
+    /// A file device that has **retired** (`close`, or a request that killed it): the oracle's
+    /// dead io-device process, whose caller sees `{error, terminated}`.
+    Retired(ProcessId),
     /// The device **is the calling process itself**, which `execute_request/3`'s first
     /// clause answers `{ErrorTag, calling_self}` (`io.erl:1665`) — surfaced as
     /// `error:calling_self` (`conv_reason/1`, `io.erl:784`).
@@ -141,11 +153,10 @@ enum Device {
     /// The argument is neither an atom nor a pid, so no `o_request/2` clause matches and
     /// the oracle raises `error:function_clause`.
     NoClause,
-    /// A **live** io device this runtime cannot serve from a BIF: `io.erl` would post an
+    /// A **live** io device this runtime cannot reach from a BIF: `io.erl` would post an
     /// `{io_request, …}` to it and block in a `receive` for the reply, which a BIF may not
     /// do. (A scheduled process reaches such a device through the in-machine `io.erl` body
-    /// instead — see [`crate::context`]'s `io_route`, which is also what serves a capturing
-    /// group leader.)
+    /// instead — see [`crate::context`]'s `io_route`.)
     Unreachable,
     /// A pid that is **not a live process**. The oracle's `execute_request/3` sends the
     /// request (a no-op to a dead pid) and then waits on a monitor that fires immediately,
@@ -155,19 +166,20 @@ enum Device {
     DeadPid,
 }
 
-/// The typed capability gap for a live device that needs the `{io_request, …}` round trip.
-const UNREACHABLE_DEVICE: &str = "io: an explicit io-device process (only `standard_io`/`user` on \
-                                   the caller's output stream and `standard_error` are served)";
+/// The typed capability gap for a live device that needs the `{io_request, …}` round trip and
+/// is neither a stream nor a file device.
+const UNREACHABLE_DEVICE: &str = "io: a live io-device process that is neither a file device nor \
+                                  one of the runtime's streams (a BIF cannot run the \
+                                  `{io_request, _}` round trip)";
 
 impl RuntimeContext<'_> {
     /// `io:put_chars/1,2` — write the characters `Chars` to the device and answer `ok`.
     ///
     /// `which` is the arity. `/1` is `o_request(default_output(), {put_chars, unicode, Chars})`
     /// (`default_output/0` is `group_leader()`) and `/2` takes the device **first**
-    /// (`io.erl:160-207`), so the argument is resolved by exactly the same
-    /// [`Self::io_stream`] the other device-taking arms use — a device this runtime serves
-    /// selects a stream, and one it cannot reach is the oracle's own raise (never a silent
-    /// redirect to stdout).
+    /// (`io.erl:160-207`). Both build the request `io.erl`'s `io_request/2` would and serve it
+    /// through [`Self::o_request`], so the payload is converted and classified exactly as the
+    /// oracle does.
     pub(super) fn io_put_chars(&mut self, args: &[Eterm], which: usize) -> Result<Eterm> {
         let (device, chars) = match which {
             1 => (None, *args.first().ok_or(BeamError::BadArg)?),
@@ -180,10 +192,12 @@ impl RuntimeContext<'_> {
         // The device is resolved *before* the payload is read, exactly as `o_request/2` +
         // `request/3` do: both `io:put_chars(foo, …)` and `io:put_chars(1, …)` raise the
         // device's own reason whatever the character data is.
-        let stream = self.io_stream(device)?;
-        let text = self.chars_to_string(chars)?;
-        self.write_stream(stream, &text)?;
-        self.atom("ok")
+        let target = self.io_target(device);
+        if let Some(error) = self.device_failure(target) {
+            return Err(error);
+        }
+        let request = self.put_chars_request(Encoding::Unicode, chars)?;
+        self.o_request_to(target, request)
     }
 
     /// `io:nl/0` / `io:nl/1` — write one newline to the device and answer `ok`.
@@ -196,9 +210,13 @@ impl RuntimeContext<'_> {
             1 => Some(*args.first().ok_or(BeamError::BadArg)?),
             _ => return Err(BeamError::BadArg),
         };
-        let stream = self.io_stream(device)?;
-        self.write_stream(stream, "\n")?;
-        self.atom("ok")
+        let target = self.io_target(device);
+        if let Some(error) = self.device_failure(target) {
+            return Err(error);
+        }
+        let newline = self.charlist("\n")?;
+        let request = self.put_chars_request(Encoding::Unicode, newline)?;
+        self.o_request_to(target, request)
     }
 
     /// `io:fwrite/1,2,3` — render `Format` with `Data` on the device and answer `ok`.
@@ -226,7 +244,11 @@ impl RuntimeContext<'_> {
             ),
             _ => return Err(BeamError::BadArg),
         };
-        self.io_emit_format(device, format, data)
+        let target = self.io_target(device);
+        if let Some(error) = self.device_failure(target) {
+            return Err(error);
+        }
+        self.io_emit_format_to(target, format, data)
     }
 
     /// `io:format/3` — the `{format, Format, Args}` request of [`Self::io_fwrite`].
@@ -246,65 +268,197 @@ impl RuntimeContext<'_> {
             ),
             _ => return Err(BeamError::BadArg),
         };
-        let stream = self.io_stream(device)?;
+        let target = self.io_target(device);
+        if let Some(error) = self.device_failure(target) {
+            return Err(error);
+        }
         // `io_lib:write(Term)` is `io_lib:format("~w", [Term])` (see the module docs).
         let control = self.charlist("~w")?;
         let data = terms::make_list(self, &[term])?;
         let rendered = self.call_bif("io_lib", "format", 2, &[control, data])?;
-        let text = self.chars_to_string(rendered)?;
-        self.write_stream(stream, &text)?;
-        self.atom("ok")
+        let request = self.put_chars_request(Encoding::Unicode, rendered)?;
+        self.o_request_to(target, request)
     }
 
-    /// The `{format, Format, Data}` request: render through the registered
-    /// `io_lib:format/2`, write the flattened text to `device`'s stream, answer `ok`.
-    fn io_emit_format(&mut self, device: Option<Eterm>, format: Eterm, data: Eterm) -> Result<Eterm> {
-        let stream = self.io_stream(device)?;
-        let rendered = self.call_bif("io_lib", "format", 2, &[format, data])?;
-        let text = self.chars_to_string(rendered)?;
-        self.write_stream(stream, &text)?;
-        self.atom("ok")
-    }
-
-    /// The stream a request's **effective device** selects, or the raise the oracle
-    /// produces for a device this runtime cannot serve.
+    /// `io:request/1,2` — serve `Request` on `Device` and answer the device's **reply
+    /// value** (`ok`, the requested data, or `{error, Reason}`).
     ///
-    /// `None` is the omitted (default) device: `default_output/0` is `group_leader()`, so the
-    /// caller's group leader decides the stream ([`Self::group_leader_stream`]) rather than
-    /// this runtime's output stream being assumed.
+    /// This is `io.erl`'s `request/2` (`:1651-1670`): the device is resolved exactly as the
+    /// output wrappers resolve it, and a device-level failure is the `{error, Reason}`
+    /// *value* (`{error, arguments}` for an unregistered name, `{error, terminated}` for a
+    /// dead or retired device) rather than a raise — `io:request/2` never raises for those,
+    /// which is measured against the oracle.
     ///
-    /// # Errors
-    ///
-    /// The `error:calling_self` of an explicit `self()` device, [`BeamError::BadArg`] for an
-    /// atom naming no registered process, the bare `function_clause` for a non-atom/non-pid
-    /// argument, and the typed `unsupported` for a live device that needs the
-    /// `{io_request, …}` round trip — each the oracle's own answer, never a silent redirect
-    /// to stdout.
-    fn io_stream(&self, device: Option<Eterm>) -> Result<Stream> {
-        let Some(device) = device else {
-            return Ok(self.group_leader_stream());
+    /// `which` is the arity: `/1` is `io.erl:1647`'s
+    /// `request(Request) -> request(Request, default_output())`.
+    pub(super) fn io_request(&mut self, args: &[Eterm], which: usize) -> Result<Eterm> {
+        let (device, request) = match which {
+            1 => (None, *args.first().ok_or(BeamError::BadArg)?),
+            2 => (
+                Some(*args.first().ok_or(BeamError::BadArg)?),
+                *args.get(1).ok_or(BeamError::BadArg)?,
+            ),
+            _ => return Err(BeamError::BadArg),
         };
-        match self.io_device(device) {
-            Device::Stream(stream) => Ok(stream),
-            Device::CallingSelf => Err(prim::calling_self()),
-            Device::UnknownAtom => Err(BeamError::BadArg),
+        let target = self.io_target(device);
+        // `io:request/2` reports a device it cannot reach as the `{error, Reason}` **value**;
+        // only the no-clause shape (a device that is not an atom and not a pid) raises, exactly
+        // as `io.erl`'s own `request/3` does not have a clause for it either.
+        if target == Device::NoClause {
+            return Err(prim::function_clause());
+        }
+        if let Some(reason) = self.device_failure_reason(target) {
+            return self.error_of(reason);
+        }
+        self.serve_request(target, request)
+    }
+
+    /// `io:requests/1,2` — serve each request of a list on the device and answer the **last**
+    /// reply (`io.erl:1690-1696` wraps `{requests, Requests}` in one `request/2` call).
+    pub(super) fn io_requests(&mut self, args: &[Eterm], which: usize) -> Result<Eterm> {
+        let (device, requests) = match which {
+            1 => (None, *args.first().ok_or(BeamError::BadArg)?),
+            2 => (
+                Some(*args.first().ok_or(BeamError::BadArg)?),
+                *args.get(1).ok_or(BeamError::BadArg)?,
+            ),
+            _ => return Err(BeamError::BadArg),
+        };
+        let target = self.io_target(device);
+        if target == Device::NoClause {
+            return Err(prim::function_clause());
+        }
+        if let Some(reason) = self.device_failure_reason(target) {
+            return self.error_of(reason);
+        }
+        let list = self.tuple(&[self.atom("requests")?, requests])?;
+        self.serve_request(target, list)
+    }
+
+    /// The `{format, Format, Data}` request on `device`'s target: render through the
+    /// registered `io_lib:format/2`, then send the text as `{put_chars, unicode, Text}`.
+    fn io_emit_format_to(&mut self, target: Device, format: Eterm, data: Eterm) -> Result<Eterm> {
+        let rendered = self.call_bif("io_lib", "format", 2, &[format, data])?;
+        let request = self.put_chars_request(Encoding::Unicode, rendered)?;
+        self.o_request_to(target, request)
+    }
+
+    /// The `{put_chars, Enc, Payload}` request `io.erl`'s `io_request/2` builds.
+    ///
+    /// A **list** payload is pre-converted by the client (`io.erl:1755-1809`) with
+    /// `unicode:characters_to_binary(Chars, Enc)` — note the two-argument form, whose output
+    /// encoding is `unicode`: the re-encoded bytes keep the **input's** tag. That is why
+    /// `io:request(Fd, {put_chars, latin1, [233]})` writes the *UTF-8* bytes `195,169` on a
+    /// latin1 file device (measured: OTP 29.1.2), and reproducing the client is what makes the
+    /// bytes agree. A binary or a non-chardata payload is passed through unchanged, so the
+    /// device derives its own answer for it.
+    fn put_chars_request(&mut self, encoding: Encoding, chars: Eterm) -> Result<Eterm> {
+        let payload = if is_list(chars) {
+            match characters_to_binary(chars, encoding, Encoding::Unicode) {
+                Chars::Bytes(bytes) => self.unicode_binary(&bytes)?,
+                Chars::NoTranslation | Chars::BadArg => chars,
+            }
+        } else {
+            chars
+        };
+        let tag = self.atom("put_chars")?;
+        let encoding = self.atom(encoding_name(encoding))?;
+        self.tuple(&[tag, encoding, payload])
+    }
+
+    /// The reply-value → raise conversion `o_request/2` applies to a device reply
+    /// (`io.erl:190-207`): an `{error, Reason}` reply is re-raised through
+    /// [`Self::conv_reason`]; any other reply is the call's value.
+    fn o_request_to(&mut self, target: Device, request: Eterm) -> Result<Eterm> {
+        let reply = self.serve_request(target, request)?;
+        if let Ok(fields) = crate::native::tuple_fields(reply) {
+            if fields.len() == 2 && self.atom_name(fields[0]).as_deref() == Some("error") {
+                return Err(self.conv_reason(fields[1]));
+            }
+        }
+        Ok(reply)
+    }
+
+    /// `conv_reason/1` (`io.erl:782-786`): `arguments` → `badarg`, `terminated` →
+    /// `terminated`, `calling_self` → `calling_self`, `{no_translation, _, _}` →
+    /// `no_translation`, anything else → `badarg`.
+    fn conv_reason(&self, reason: Eterm) -> BeamError {
+        if let Some(name) = self.atom_name(reason) {
+            return match name.as_str() {
+                "terminated" => prim::terminated(),
+                "calling_self" => prim::calling_self(),
+                _ => BeamError::BadArg,
+            };
+        }
+        if let Ok(fields) = crate::native::tuple_fields(reason) {
+            if fields.len() == 3 && self.atom_name(fields[0]).as_deref() == Some("no_translation") {
+                return raise_atom("no_translation");
+            }
+        }
+        BeamError::BadArg
+    }
+
+    /// Serves one `{io_request, …}` **request** on `target`, answering the device's reply
+    /// value.
+    fn serve_request(&mut self, target: Device, request: Eterm) -> Result<Eterm> {
+        match target {
+            Device::Stream(stream) => match request::serve(self, stream, request)? {
+                Some(reply) => Ok(reply),
+                None => request::unknown_request(self, stream, request),
+            },
+            Device::File(device) => self.runtime.file_services.serve_io_request(device, request),
+            Device::Retired(_) | Device::DeadPid => {
+                let terminated = self.atom("terminated")?;
+                self.error_of(terminated)
+            }
+            Device::CallingSelf => {
+                let reason = self.atom("calling_self")?;
+                self.error_of(reason)
+            }
+            Device::UnknownAtom => {
+                let reason = self.atom("arguments")?;
+                self.error_of(reason)
+            }
             Device::NoClause => Err(prim::function_clause()),
             Device::Unreachable => Err(error::unsupported(UNREACHABLE_DEVICE)),
-            Device::DeadPid => Err(prim::terminated()),
         }
     }
 
-    /// The stream the caller's **group leader** selects (`default_output/0`).
+    /// The **raise** a device class produces for an `o_request/2` wrapper (which raises
+    /// rather than returning the `{error, Reason}` value `io:request/2` returns).
+    fn device_failure(&self, target: Device) -> Option<BeamError> {
+        match target {
+            Device::CallingSelf => Some(prim::calling_self()),
+            Device::UnknownAtom => Some(BeamError::BadArg),
+            Device::NoClause => Some(prim::function_clause()),
+            Device::DeadPid | Device::Retired(_) => Some(prim::terminated()),
+            // `Unreachable` is raised by `serve_request`, after the reply shape is known.
+            Device::Stream(_) | Device::File(_) | Device::Unreachable => None,
+        }
+    }
+
+    /// The `{error, Reason}` reason atom a device class answers `io:request/2` with.
+    fn device_failure_reason(&mut self, target: Device) -> Option<Eterm> {
+        let name = match target {
+            Device::CallingSelf => "calling_self",
+            Device::UnknownAtom => "arguments",
+            Device::DeadPid | Device::Retired(_) => "terminated",
+            Device::Stream(_) | Device::File(_) | Device::Unreachable | Device::NoClause => {
+                return None
+            }
+        };
+        self.atom(name).ok()
+    }
+
+    /// The [`Device`] a request's **effective device** selects.
     ///
-    /// A group leader that is the pid registered as `standard_error` is the error stream —
-    /// `erl_compile`'s worker sets exactly that leader and then prints through the omitted
-    /// device — and every other group leader is this runtime's one output stream, whatever
-    /// process it is (a custom io device keeps the output stream it has always had).
-    fn group_leader_stream(&self) -> Stream {
-        if Some(self.runtime.group_leader_of(self.pid())) == self.standard_error_pid() {
-            Stream::Stderr
-        } else {
-            Stream::Output
+    /// `None` is the omitted (default) device: `default_output/0` is `group_leader()`, so the
+    /// caller's group leader decides ([`Self::io_pid_device`]) rather than this runtime's
+    /// output stream being assumed.
+    fn io_target(&self, device: Option<Eterm>) -> Device {
+        match device {
+            None => self.io_pid_device(self.runtime.group_leader_of(self.pid())),
+            Some(device) => self.io_device(device),
         }
     }
 
@@ -366,15 +520,17 @@ impl RuntimeContext<'_> {
         }
     }
 
-    /// The stream a **live** device pid selects — by **identity** first, then by the
-    /// group-leader default.
+    /// The device a **live** device pid selects — by **identity** first, then the file
+    /// service, then the group-leader default.
     ///
     /// The registered `standard_error` device is the process's standard error whatever route
     /// named it: an explicit pid, a registered name that resolves to it, or a **group leader**
-    /// that happens to be it. Only a pid that is not that device is then compared with the
-    /// caller's own group leader, which is the terminal this runtime writes to; every other
-    /// live device would need the `{io_request, …}`/`{io_reply, …}` round trip, which a BIF
-    /// cannot perform ([`Device::Unreachable`]).
+    /// that happens to be it. A pid the native file service owns is its `file_io_server`
+    /// ([`Device::File`]) — the route that makes `io:format(Fd, …)` on a `file:open/2` handle
+    /// work, which is what `common_test` needs. Only a pid that is neither is then compared
+    /// with the caller's own group leader, which is the terminal this runtime writes to; every
+    /// other live device would need a real `{io_request, …}`/`{io_reply, …}` round trip with a
+    /// process this host does not own ([`Device::Unreachable`]).
     fn io_pid_device(&self, pid: ProcessId) -> Device {
         if pid == self.pid() {
             return Device::CallingSelf;
@@ -382,8 +538,14 @@ impl RuntimeContext<'_> {
         if Some(pid) == self.standard_error_pid() {
             return Device::Stream(Stream::Stderr);
         }
+        if self.runtime.file_services.owns_device(pid) {
+            return Device::File(pid);
+        }
         if pid == self.runtime.group_leader_of(self.pid()) {
             return Device::Stream(Stream::Output);
+        }
+        if self.runtime.file_services.is_retired_device(pid) {
+            return Device::Retired(pid);
         }
         // A device that is not a live process answers the oracle's `error:terminated`
         // without any round trip: `io.erl`'s `execute_request/3` sends the request (nothing
@@ -412,6 +574,44 @@ impl RuntimeContext<'_> {
             }
         }
     }
+
+    /// Writes already-encoded **UTF-8** bytes to `stream` (the stream devices are `unicode`
+    /// devices, so every request payload is transcoded to UTF-8 first).
+    fn write_utf8(&mut self, stream: Stream, bytes: &[u8]) -> Result<()> {
+        let text = std::str::from_utf8(bytes).map_err(|_| BeamError::BadArg)?;
+        self.write_stream(stream, text)
+    }
+
+    /// A binary of `bytes` on the runtime's long-lived `-eval` heap (which, unlike
+    /// `terms::make_heap_binary`, has no 64-byte limit).
+    fn unicode_binary(&mut self, bytes: &[u8]) -> Result<Eterm> {
+        beam_codec::term::make_binary(self.eval_heap(), bytes)
+    }
+
+    /// A tuple of `elements`.
+    fn tuple(&mut self, elements: &[Eterm]) -> Result<Eterm> {
+        terms::make_tuple(self, elements)
+    }
+
+    /// `{error, Reason}` — the shape every request failure the oracle *returns* takes.
+    fn error_of(&mut self, reason: Eterm) -> Result<Eterm> {
+        let error = self.atom("error")?;
+        self.tuple(&[error, reason])
+    }
+}
+
+/// The atom name of an [`Encoding`] (`unicode` is what `file_io_server` and `standard_error`
+/// emit; `latin1` is the request default).
+pub(crate) const fn encoding_name(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Latin1 => "latin1",
+        Encoding::Unicode => "unicode",
+    }
+}
+
+/// A bare `error:<atom>` raise (the `no_translation` of `conv_reason/1`).
+fn raise_atom(name: &str) -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom(name)))
 }
 
 #[cfg(test)]
