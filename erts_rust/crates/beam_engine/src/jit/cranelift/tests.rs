@@ -169,6 +169,7 @@ fn the_compiled_function_runs_the_export_natively() {
         // reject every access" discipline documents.
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
         tables: crate::jit::baseline::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
@@ -717,6 +718,7 @@ fn a_native_entry_declares_the_register_write_extent() {
         suspend: None,
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
         tables: crate::jit::baseline::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,

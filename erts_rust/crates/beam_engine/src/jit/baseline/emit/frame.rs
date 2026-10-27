@@ -83,7 +83,7 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::runtime::{
     encode_target, jit_deallocate, jit_deallocate_return, jit_return, FrameExitHelper,
-    FrameReturnHelper, ReturnHelper,
+    ReturnHelper, RUNTIME_RESUME_DISP,
 };
 use super::link::emit_frame_teardown;
 use super::{emit_helper_call, Allocation, RUNTIME_SLOT_DISP};
@@ -189,7 +189,7 @@ pub(super) fn emit_deallocate_return(
     store_pc: u32,
     deallocate: u32,
 ) -> Result<()> {
-    let helper: FrameReturnHelper = jit_deallocate_return;
+    let helper: FrameExitHelper = jit_deallocate_return;
     emit_helper_call(
         buffer,
         allocation,
@@ -219,33 +219,29 @@ pub(super) fn emit_deallocate_return(
 /// A **non-tail call's** continuation is its own `pc + 1`, which the compiler lowered as a
 /// continuation sub-block — of the *caller's* function, which for a call into another
 /// function of the module is another executable mapping of the same artifact. The helper
-/// resolves the entry itself ([`super::super::runtime::EntryTables`], else the artifact),
-/// already having done the driver iteration's work (publish the position, bump the slice
-/// counter, offer the pre-emption hook) in the driver's own order. It answers that entry in
-/// the [`Transfer`](super::super::runtime::Transfer)'s second eightbyte, i.e. **`rdx`**
-/// (SysV returns a two-eightbyte `#[repr(C)]` struct in `rax`/`rdx`), so the arm needs no
-/// memory side channel and no sentinel — the block-ABI word space overlaps user-space code
-/// addresses, so a magic word could not stand for "no transfer":
+/// resolves the entry itself ([`super::super::runtime::EntryTables`], else the artifact) and
+/// stores it in [`JitRuntime::resume_entry`](super::super::runtime::JitRuntime) — having
+/// already done the driver iteration's work (publish the position, bump the slice counter,
+/// offer the pre-emption hook) in the driver's own order. When it did, `rax` is not consulted
+/// at all and the block transfers **in-block**:
 ///
 /// ```text
 ///   call <helper>                     ; the frame-discipline instruction; spills first
-///   test rdx, rdx                     ; the resolved block entry (same artifact)
+///   mov  rdi, [rsp + RUNTIME_SLOT_DISP] ; rt — reloaded, the helper may clobber rdi
+///   mov  r11, [rdi + RUNTIME_RESUME_DISP] ; the resolved block entry (same artifact)
+///   test r11, r11
 ///   je   <done>                       ; no entry: today's word exit, `rax` intact
-///   mov  rdi, [rsp + RUNTIME_SLOT_DISP] ; `rt` for the successor's prologue
 ///   lea  rsp, [rsp + slot] ; pop …    ; leave this block's native frame
-///   jmp  rdx                          ; the target prologue rebuilds its own frame
+///   jmp  r11                          ; the target prologue rebuilds its own frame
 /// ```
-///
-/// `rdx` and `rax` both survive the teardown: it only `lea`s `rsp` past the block's frame
-/// and pops the **callee-saved** registers the prologue saved. `rt` is re-read from this
-/// block's own slot (the helper is an ordinary `extern "C"` call, so `rdi` holds anything
-/// after it) because the target's prologue stores its first argument into *its* `rt` slot;
-/// the load is on the taken path only, and it is not on the branch's own dependency chain.
 ///
 /// This is a **tail** transfer: the block's frame is torn down before the jump, so the
 /// native stack neither grows (deep Erlang recursion stays safe) nor is left holding a stale
 /// frame, and it is exactly the shape a linked `call_only`/`jump` exit uses
-/// ([`super::link::Linker::emit_exit`]).
+/// ([`super::link::Linker::emit_exit`]) — reload `rt` into `rdi` (the one thing a target
+/// prologue needs, and a register the teardown does not pop), tear down, jump. `rdi` and
+/// `r11` are both caller-saved and the teardown only pops the block's saved callee-saved set,
+/// so both survive it.
 ///
 /// # Why the skipped checks cannot be skipped unsoundly
 ///
@@ -265,20 +261,18 @@ fn emit_resume_or_exit(
     allocation: &Allocation,
     done: CodeLabel,
 ) -> Result<()> {
+    // `rt`, reloaded from the block's own slot: the helper is an ordinary `extern "C"` call
+    // and `rdi` is caller-saved, so it may hold anything now. It is also what the resumed
+    // block's prologue stores as *its* `rt` slot.
+    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     // The entry the helper resolved, or null when the continuation must go back to the
     // driver (a bottom frame's `HALT`, another context's `ENTER`, another function, an
-    // address no block covers, a refused pre-emption charge). Nothing is read from `rt`
-    // here: the helper returns it in `rdx` and no other helper runs in between, so a
-    // caller-saved `rdx` still holds it.
-    buffer.test_rr(Reg::Rdx, Reg::Rdx)?;
+    // address no block covers, a refused pre-emption charge).
+    buffer.mov_rm(Reg::R11, Reg::Rdi, RUNTIME_RESUME_DISP)?;
+    buffer.test_rr(Reg::R11, Reg::R11)?;
     buffer.jcc(Cond::E, done)?;
-    // `rt` for the target block's prologue, which stores its first argument into *its* `rt`
-    // slot: reloaded from this block's slot (the helper is an ordinary `extern "C"` call, so
-    // `rdi` holds anything now). Emitted on the taken path only — the extra load is not on
-    // the branch's dependency chain.
-    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     emit_frame_teardown(buffer, allocation)?;
-    buffer.jmp_r(Reg::Rdx)
+    buffer.jmp_r(Reg::R11)
 }
 
 #[cfg(test)]
@@ -335,36 +329,11 @@ mod tests {
         code.windows(2).any(|w| w == [0x48, 0xB8])
     }
 
-    /// Whether `code` ends with the in-block resume transfer `jmp rdx` — the tail transfer
-    /// [`emit_resume_or_exit`] takes for a continuation of the function that is already
-    /// running, jumping to the entry the helper answered in `rdx`.
+    /// Whether `code` ends with the in-block resume transfer `jmp r11` (`41 FF E3`) — the
+    /// tail transfer [`emit_resume_or_exit`] takes for a continuation of the function that
+    /// is already running.
     fn ends_with_a_resume_jump(code: &[u8]) -> bool {
-        code.ends_with(&encoded(|buffer| buffer.jmp_r(Reg::Rdx).unwrap()))
-    }
-
-    /// The `test rdx, rdx` probe [`emit_resume_or_exit`] guards the transfer with — the
-    /// helper's answer, so no runtime slot is read for it.
-    #[test]
-    fn the_resume_probe_tests_the_helpers_rdx_answer() {
-        let exit = lowered(|buffer, done| emit_return(buffer, &Allocation::default(), done, 3, 9));
-        let probe = encoded(|buffer| {
-            let target = buffer.label();
-            buffer.test_rr(Reg::Rdx, Reg::Rdx).unwrap();
-            buffer.jcc(Cond::E, target).unwrap();
-            buffer.bind(target).unwrap();
-        });
-        assert!(
-            exit.windows(probe[..3].len()).any(|w| w == &probe[..3]),
-            "the exit tests `rdx` for the resolved entry"
-        );
-        // …and it does **not** read a runtime slot for the entry: the arm's only `rdi` load
-        // is the taken path's `rt` reload (`[rsp + RUNTIME_SLOT_DISP]`), never an indirect
-        // load *through* `rt`.
-        let slot_load = encoded(|buffer| buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP).unwrap());
-        assert!(
-            exit.windows(slot_load.len()).any(|w| w == slot_load.as_slice()),
-            "the taken path reloads `rt` from the block's own slot"
-        );
+        code.ends_with(&encoded(|buffer| buffer.jmp_r(Reg::R11).unwrap()))
     }
 
     /// The `je <done>` guard of [`emit_resume_or_exit`], as `(site offset, target offset)`.

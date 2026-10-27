@@ -252,9 +252,6 @@ mod bitstr_shapes_deopt_tests;
 #[cfg(test)]
 #[path = "foreign_kernel_tests.rs"]
 mod foreign_kernel_tests;
-#[cfg(test)]
-#[path = "transfer_abi_tests.rs"]
-mod transfer_abi_tests;
 
 // The block ABI lives in `runtime` and the artifact in `code`; re-export their names
 // here so every item path outside this module (`crate::jit::baseline::…`) stays
@@ -1191,6 +1188,7 @@ fn drive(
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
         tables: runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
         current_code,
