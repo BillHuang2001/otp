@@ -8,7 +8,16 @@ The `m<session>-` prefix names the measurement session the files belong to; the 
 
 ## API Surface (what each file is)
 
-### `m21-` — the current session: the GC/allocator workstream's *before* record (2026-10-27, `/proc/loadavg` 5.7–19.6)
+### `m22-` — the current session: the GC/allocator workstream's *after* record (2026-10-27, `/proc/loadavg` 7.0–21.9)
+- Six **matched** rust-only/sys-only round pairs over `baseline,gc_bound,gc_class,list_walk,slice`, side order alternating every round, every pass `--quick --verbose`, pinned `taskset -c 3 setsid -w`, one process at a time: `m22-xrun-r{1..6}-{rust,sys}.json` (12 reports, 60/60 rows `ok`, **zero withheld marginals**).
+- `slice` is in this session's set for the first time in a GC-workstream record (m21 had no `slice` row); it carries the N=1 footprint/boot story.
+- `m22-xrun-ratios.txt` — the derived table: per-round values, per-round `rust/sys` ratios, the median ratio, the slice p50/p99 case tables, the deterministic `case_*_ops`/`_elements` companions, the withheld audit and the runtime resolution (the oracle is **OTP 29.1.2 / erts-17.1.1**, the same store path m21 used).
+- `m22-vs-m21.txt` — **the record's headline reading**: a per-row diff of the rust/sys ratios of the two records, each named, with the noise band it was judged against (`max(1.4826·MAD)` of the two records' per-round ratios) and a per-row `OUTSIDE`/`inside` verdict, plus the raw min–max ranges and the three `inside` rows spelled out.
+- `m22-memory.md` — the RSS rows (`rust` vs `sys`, m21 alongside) and an **independent** `wait4`/`ru_maxrss` boot confirmation, median of 5 per command per side.
+- `m22-load-record.md` — the per-pass `/proc/loadavg` before/after record, the command shape, the two load-excursion rounds (r2, r6), the withheld audit (none) and the caveats that travel with the numbers.
+- `m22-budgetprobe-all.json` / `.txt` and `m22-compare-cross-runtime.txt` — the same **supplementary** `--runtime all` artefact pair as m21 (it exists only to judge the both-sides budget ratio rows and to give `bench compare` one report holding both sides; runtime-major, so never a timing source).
+
+### `m21-` — the GC/allocator workstream's *before* record (2026-10-27, `/proc/loadavg` 5.7–19.6)
 - Seven **matched** rust-only/sys-only round pairs over the group `baseline,gc_bound,gc_class,list_walk`, side order alternating every round, every pass `--quick`, pinned `taskset -c 3 setsid -w`, one process at a time: `m21-xrun-gc-r{1..7}-{rust,sys}.json` (14 reports, 56/56 rows `ok`).
 - `m21-xrun-ratios.txt` — the derived table: per-round values, per-round `rust/sys` ratios, the median ratio, the deterministic `case_*_ops`/`_elements` companions, the withheld audit and the runtime resolution (the oracle here is **OTP 29.1.2 / erts-17.1.1**, not the 29.1.1 earlier records name).
 - `m21-load-record.md` + `m21-xrun-load.log` — the per-pass `/proc/loadavg` before/after record, the command shape, the two spike-affected rounds, the single withheld figure (`r7/rust churn`) and the memory rows.
