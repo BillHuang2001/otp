@@ -18,8 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! The baseline tier's **pure-accessor BIF helper**: `erlang:byte_size/1` and
-//! `erlang:length/1` evaluated natively instead of deopting to one interpreter step.
+//! The baseline tier's **pure-accessor BIF helper**: `erlang:byte_size/1`,
+//! `erlang:bit_size/1` and `erlang:length/1` evaluated natively instead of deopting to one
+//! interpreter step.
 //!
 //! The installed corpus emits both as the collecting `{gc_bif,…}` (`Instr::GcBif`), a
 //! pure term accessor with no heap effect (the tier accepts the non-collecting
@@ -34,6 +35,9 @@
 //!
 //! * `byte_size/1` — `bits::bit_size` (`= beam_term::bitstring_size`) `.div_ceil(8)`
 //!   (`beam_bifs/src/binconv.rs:374`), `badarg` for a non-bitstring;
+//! * `bit_size/1` — the bit-length word itself (`beam_bifs/src/bits.rs:114` →
+//!   `access::bitstring_bit_size`), i.e. the **same** read `byte_size/1` rounds, so the
+//!   two share [`bitstring_bits`] rather than each dereferencing the term;
 //! * `length/1` — the number of cons cells in a **proper** list (`proper_list`,
 //!   `beam_bifs/src/term_ops.rs:84`), `badarg` for a non-list or an improper tail.
 //!
@@ -175,6 +179,7 @@ fn evaluate_bif(
     let term = read_operand(machine, ctx, arg).ok()?;
     let value = match function_name {
         "byte_size" => byte_size_value(term)?,
+        "bit_size" => bit_size_value(term)?,
         "length" => list_length(term)?,
         _ => return None,
     };
@@ -187,13 +192,51 @@ fn evaluate_bif(
 /// `terms::make_integer_unrooted` bignum path); a `Character` is a `u32` and always a
 /// small integer. Everything else — a register, a `Y` slot, a float register, a
 /// literal-area term, an atom, `[]` — is a plain read.
-fn read_is_allocation_free(operand: &Operand) -> bool {
+pub(super) fn read_is_allocation_free(operand: &Operand) -> bool {
     match operand {
         Operand::Integer(value) => (beam_term::MIN_SMALL..=MAX_SMALL).contains(value),
         _ => true,
     }
 }
 
+/// The **bit length** of `term` when it is a bitstring of any shape, else `None` (whose
+/// `badarg` the interpreter's own step raises).
+///
+/// The one read `bit_size/1` returns verbatim and `byte_size/1` rounds up, so both value
+/// accessors share it. `beam_term::bitstring_size` is the same word `beam_bifs`'s
+/// `access::bitstring_bit_size` reads, and it covers every layout the runtime can hand
+/// the helper: an on-heap `ErlHeapBits` (its size word), an `ErlSubBits` — a refc binary,
+/// a sub-binary **window** over one, or a bit-offset sub-bit-string — as `end - start`,
+/// and the empty binary as `0`.
+///
+/// # Safety
+///
+/// `is_bitstring` dereferences a boxed header only when the word is a boxed term, so a
+/// non-boxed word (an immediate, `NIL`) is a plain word compare; after it returns `true`
+/// the backing thing is live for its size words.
+fn bitstring_bits(term: Eterm) -> Option<usize> {
+    // SAFETY: see this function's `# Safety` section.
+    if !unsafe { is_bitstring(term) } {
+        return None;
+    }
+    // SAFETY: `is_bitstring` just established `term` is a live heap- or sub-bitstring
+    // whose backing thing is valid for its size words.
+    Some(unsafe { bitstring_size(term) })
+}
+/// A bit/byte count as a **small integer** term value, or `None` when it would need a
+/// bignum — whose `system_limit` the interpreter's own step raises.
+fn small_size(size: usize) -> Option<i64> {
+    let size = i64::try_from(size).ok()?;
+    (size <= MAX_SMALL).then_some(size)
+}
+/// `bit_size(Bitstring)` — the bit-length word itself, or `None` when `term` is not a
+/// bitstring (whose `badarg` the interpreter's own step raises).
+///
+/// Byte-exact with `beam_bifs`'s `bit_size/1` for every bitstring shape, including a
+/// non-byte-aligned one (`<<1:17>>` is `17`).
+fn bit_size_value(term: Eterm) -> Option<i64> {
+    small_size(bitstring_bits(term)?)
+}
 /// `byte_size(Bitstring)` — `NBYTES(bit_size)`, i.e. the bit size rounded **up** to whole
 /// bytes — or `None` when `term` is not a bitstring (whose `badarg` the interpreter's own
 /// step raises) or the size would not fit a small integer (whose `system_limit` the
@@ -203,16 +246,7 @@ fn read_is_allocation_free(operand: &Operand) -> bool {
 /// `byte_size(<<1:1>>)` is `1` and `byte_size(<<1:17>>)` is `3`, never a `badarg` for a
 /// non-byte-aligned bitstring — unlike the (dead) `bits::byte_size` helper.
 fn byte_size_value(term: Eterm) -> Option<i64> {
-    // SAFETY: `is_bitstring` dereferences a boxed header only when the word is a boxed
-    // term, so a non-boxed word (an immediate, `NIL`) is a plain word compare.
-    if !unsafe { is_bitstring(term) } {
-        return None;
-    }
-    // SAFETY: `is_bitstring` just established `term` is a live heap- or sub-bitstring
-    // whose backing thing is valid for its size words.
-    let bits = unsafe { bitstring_size(term) };
-    let bytes = i64::try_from(bits.div_ceil(8)).ok()?;
-    (bytes <= MAX_SMALL).then_some(bytes)
+    small_size(bitstring_bits(term)?.div_ceil(8))
 }
 
 /// `length(List)` — the number of cons cells in a **proper** list — or `None` when `term`
@@ -274,6 +308,63 @@ mod tests {
         assert_eq!(byte_size_value(seventeen), Some(3));
     }
 
+    /// A **sub**-bitstring window `[start, end)` over `base`, i.e. the `[BinRef][ErlSubBits]`
+    /// layout a refc binary, a sub-binary and a bit-offset sub-bit-string all share: the
+    /// 5-word `ErlSubBits` block `beam_term`'s own writer fills, over a caller-owned buffer
+    /// the returned term points into.
+    fn sub_bits(base: Eterm, start: usize, end: usize) -> (Vec<Eterm>, Eterm) {
+        let mut buffer = vec![NIL; beam_term::ERL_SUB_BITS_SIZE];
+        let term = unsafe {
+            beam_term::write_sub_bits(
+                buffer.as_mut_ptr(),
+                base,
+                Eterm::from_raw(start),
+                Eterm::from_raw(end),
+                base,
+            )
+        };
+        (buffer, term)
+    }
+    /// `bit_size/1` returns the bit-length word **verbatim** for every bitstring layout:
+    /// an on-heap `ErlHeapBits` of 0/1/8/17/24 bits, and a `[start, end)` window over one
+    /// (`end - start`), which is the same read a refc binary, a sub-binary and a
+    /// bit-offset sub-bit-string take — so a shared payload is never read outside its
+    /// window and a non-byte-aligned width is never rounded.
+    #[test]
+    fn bit_size_returns_the_bit_length_of_every_shape() {
+        let (empty, empty_term) = heap_bits(0);
+        let (aligned, aligned_term) = heap_bits(8);
+        let (one, one_bit) = heap_bits(1);
+        let (seventeen, seventeen_bits) = heap_bits(17);
+        let (twenty_four, twenty_four_bits) = heap_bits(24);
+        assert_eq!(bit_size_value(empty_term), Some(0));
+        assert_eq!(bit_size_value(aligned_term), Some(8));
+        assert_eq!(bit_size_value(one_bit), Some(1));
+        assert_eq!(bit_size_value(seventeen_bits), Some(17));
+        assert_eq!(bit_size_value(twenty_four_bits), Some(24));
+        // A sub-binary window `[8, 24)` of the 24-bit base: 16 bits, not the base's 24.
+        let (_window, window) = sub_bits(twenty_four_bits, 8, 24);
+        assert_eq!(bit_size_value(window), Some(16));
+        // A bit-offset sub-bit-string `[3, 20)`: 17 bits, byte alignment irrelevant.
+        let (_offset, offset) = sub_bits(twenty_four_bits, 3, 20);
+        assert_eq!(bit_size_value(offset), Some(17));
+        // `byte_size/1` rounds the same reads up, and never rounds a window up from 0.
+        let (_zero_window, zero_window) = sub_bits(twenty_four_bits, 5, 5);
+        assert_eq!(bit_size_value(zero_window), Some(0));
+        assert_eq!(byte_size_value(zero_window), Some(0));
+        assert_eq!(byte_size_value(window), Some(2));
+        assert_eq!(byte_size_value(offset), Some(3));
+        // The buffers stay alive for the whole test: every term above points into one.
+        let _buffers = (&empty, &aligned, &one, &seventeen, &twenty_four);
+    }
+    /// `bit_size/1` declines anything that is not a bitstring — the interpreter's own step
+    /// raises `badarg` for it.
+    #[test]
+    fn bit_size_declines_a_non_bitstring() {
+        assert_eq!(bit_size_value(make_small(42)), None);
+        assert_eq!(bit_size_value(make_atom(Atom::from_raw(1))), None);
+        assert_eq!(bit_size_value(NIL), None);
+    }
     /// `byte_size/1` declines anything that is not a bitstring — the interpreter's own
     /// step raises `badarg` for it.
     #[test]
