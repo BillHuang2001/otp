@@ -43,6 +43,7 @@ use beam_term::Atom;
 use crate::decode::RawInstr;
 use crate::error::bad_file;
 use crate::ir::{Block, Function, Instr};
+use crate::opcode::Opcode;
 use crate::operand::Label;
 
 use super::instr::lower_instr;
@@ -55,13 +56,12 @@ use super::instr::lower_instr;
 /// body and its basic blocks. A stream with no `func_info`, or with a `func_info`
 /// not preceded by its label or not followed by the entry label, yields
 /// `BeamError::BadArg`.
+///
+/// The stream is never lowered as a whole: the boundaries are found on the raw
+/// instructions, and each body is lowered straight into the one `Vec<Instr>` that
+/// becomes [`Function::code`], sized for the post-fusion length. A module-wide
+/// intermediate would hold every function's code twice over.
 pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
-    // Lower the whole module stream once; the function bodies are slices of it.
-    let mut lowered = Vec::with_capacity(instrs.len());
-    for raw in instrs {
-        lowered.push(lower_instr(raw)?);
-    }
-
     // One `func_info` boundary, with the label that introduces the function.
     struct Cut {
         func_label: Label,
@@ -72,38 +72,51 @@ pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
         arity: u32,
     }
 
+    // Pass 1: locate the cuts on the raw stream. Only the instructions whose IR
+    // shape the grouping itself needs are lowered — the `label` that names a
+    // function and the `func_info` that defines one.
     let mut cuts: Vec<Cut> = Vec::new();
     let mut last_label: Option<(Label, usize)> = None;
-    for (idx, instr) in lowered.iter().enumerate() {
-        match instr {
-            Instr::Label(label) => last_label = Some((*label, idx)),
-            Instr::FuncInfo {
-                module,
-                function,
-                arity,
-            } => {
+    for (idx, raw) in instrs.iter().enumerate() {
+        match raw.opcode {
+            Opcode::label => {
+                // The only opcode that lowers to `Instr::Label`.
+                if let Instr::Label(label) = lower_instr(raw)? {
+                    last_label = Some((label, idx));
+                }
+            }
+            Opcode::func_info => {
+                // The only opcode that lowers to `Instr::FuncInfo`.
+                let (module, function, arity) = match lower_instr(raw)? {
+                    Instr::FuncInfo {
+                        module,
+                        function,
+                        arity,
+                    } => (module, function, arity),
+                    _ => return Err(bad_file("func_info does not lower to func_info")),
+                };
                 let (func_label, func_label_idx) = last_label
                     .ok_or_else(|| bad_file("func_info without a preceding label"))?;
                 // Only line markers may sit between the function label and the
                 // `func_info` that defines the function (`beam_file.c:2502-2589`).
-                if lowered[func_label_idx + 1..idx]
-                    .iter()
-                    .any(|instr| !matches!(instr, Instr::Line(_)))
-                {
-                    return Err(bad_file("func_info is not immediately preceded by its label"));
+                for between in &instrs[func_label_idx + 1..idx] {
+                    if !matches!(lower_instr(between)?, Instr::Line(_)) {
+                        return Err(bad_file("func_info is not immediately preceded by its label"));
+                    }
                 }
                 // The entry label follows `func_info` immediately.
-                let entry_label = match lowered.get(idx + 1) {
-                    Some(Instr::Label(label)) => *label,
+                let entry_label = match instrs.get(idx + 1).map(lower_instr) {
+                    Some(Ok(Instr::Label(label))) => label,
+                    Some(Err(err)) => return Err(err),
                     _ => return Err(bad_file("func_info is not followed by an entry label")),
                 };
                 cuts.push(Cut {
                     func_label,
                     func_label_idx,
                     entry_label,
-                    module: *module,
-                    name: *function,
-                    arity: *arity,
+                    module,
+                    name: function,
+                    arity,
                 });
             }
             _ => {}
@@ -114,18 +127,35 @@ pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
         return Err(bad_file("module has no func_info"));
     }
 
+    // Everything before the first function's label belongs to no function. It is
+    // lowered only so a malformed prefix is still rejected.
+    for raw in &instrs[..cuts[0].func_label_idx] {
+        lower_instr(raw)?;
+    }
+
     let mut functions = Vec::with_capacity(cuts.len());
     for (i, cut) in cuts.iter().enumerate() {
         // A function's body runs up to the next function's label; the last one runs
         // to the end of the stream (so it carries the trailing `int_code_end`).
         let end = cuts
             .get(i + 1)
-            .map_or(lowered.len(), |next| next.func_label_idx);
-        let code = lowered[cut.func_label_idx..end].to_vec();
+            .map_or(instrs.len(), |next| next.func_label_idx);
+        let body = &instrs[cut.func_label_idx..end];
+        // The one allocation of this body, sized for the post-fusion length so the
+        // peephole pass below has nothing to grow into.
+        let mut code: Vec<Instr> = Vec::with_capacity(body.len() - count_fusable_pairs(body));
+        for raw in body {
+            code.push(lower_instr(raw)?);
+        }
         // The one peephole pass: `deallocate N; return` -> `DeallocateReturn(N)`.
         // `blocks`/`labels` must be derived from the FUSED code so a block's
         // `start..end` slice indexes the same vector the engine dispatches on.
-        let code = super::fuse::fuse(code);
+        super::fuse::fuse_in_place(&mut code);
+        // The pre-count is exact; the shrink is the defence against it ever not
+        // being, and leaves the retained body with no slack.
+        if code.len() != code.capacity() {
+            code.shrink_to_fit();
+        }
         let (blocks, labels) = build_blocks(&code);
         functions.push(Function {
             func_label: cut.func_label,
@@ -139,6 +169,22 @@ pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
         });
     }
     Ok(functions)
+}
+
+/// The number of adjacent `deallocate`/`return` pairs in a raw body.
+///
+/// [`lower_instr`] maps `Opcode::deallocate` to [`Instr::Deallocate`] and nothing
+/// else, and `Opcode::r#return` to [`Instr::Return`] and nothing else, while every
+/// other opcode produces exactly one instruction — so a lowered body is
+/// element-for-element its raw body and the adjacent pairs sit at the same
+/// positions. Two pairs can never overlap (`deallocate` cannot also be the `return`
+/// half of a pair), so this is exactly the number of instructions
+/// [`super::fuse::fuse_in_place`] removes. A wrong count would only make the body's
+/// allocation the wrong size, never change the instructions.
+fn count_fusable_pairs(body: &[RawInstr]) -> usize {
+    body.windows(2)
+        .filter(|pair| pair[0].opcode == Opcode::deallocate && pair[1].opcode == Opcode::r#return)
+        .count()
 }
 
 /// Decomposes a function body into label-delimited basic blocks.
@@ -201,6 +247,16 @@ mod tests {
                 Operand::Integer(i64::from(arity)),
             ],
         )
+    }
+
+    /// A `deallocate N` instruction.
+    fn deallocate(n: u32) -> RawInstr {
+        raw(Opcode::deallocate, vec![Operand::Integer(i64::from(n))])
+    }
+
+    /// A `return` instruction.
+    fn ret() -> RawInstr {
+        raw(Opcode::r#return, vec![])
     }
 
     fn atoms() -> (Atom, Atom) {
@@ -328,6 +384,133 @@ mod tests {
     #[test]
     fn group_functions_rejects_a_stream_without_func_info() {
         let instrs = vec![label(1), raw(Opcode::r#return, vec![])];
+        assert!(matches!(
+            group_functions(&instrs).unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    #[test]
+    fn group_functions_fuses_each_body_and_keeps_its_blocks() {
+        let (module, function) = atoms();
+        let instrs = vec![
+            // First function: two `deallocate`/`return` pairs split by a label.
+            label(1),
+            func_info(module, function, 1),
+            label(2),
+            deallocate(1),
+            ret(),
+            label(3),
+            deallocate(2),
+            ret(),
+            // The next function's label is the cut between the two bodies.
+            label(4),
+            raw(Opcode::line, vec![Operand::Integer(7)]),
+            func_info(module, function, 2),
+            label(5),
+            deallocate(0),
+            ret(),
+        ];
+        let functions = group_functions(&instrs).unwrap();
+        assert_eq!(functions.len(), 2);
+        assert_eq!(
+            functions[0].code,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::FuncInfo {
+                    module,
+                    function,
+                    arity: 1
+                },
+                Instr::Label(Label(2)),
+                Instr::DeallocateReturn(1),
+                Instr::Label(Label(3)),
+                Instr::DeallocateReturn(2),
+            ]
+        );
+        // The blocks index the FUSED body, so the trailing block ends at its length.
+        assert_eq!(
+            functions[0].blocks,
+            vec![
+                Block {
+                    label: Label(1),
+                    start: 0,
+                    end: 2
+                },
+                Block {
+                    label: Label(2),
+                    start: 2,
+                    end: 4
+                },
+                Block {
+                    label: Label(3),
+                    start: 4,
+                    end: 6
+                },
+            ]
+        );
+        assert_eq!(functions[0].labels.len(), 3);
+        assert_eq!(
+            functions[1].code,
+            vec![
+                Instr::Label(Label(4)),
+                Instr::Line(7),
+                Instr::FuncInfo {
+                    module,
+                    function,
+                    arity: 2
+                },
+                Instr::Label(Label(5)),
+                Instr::DeallocateReturn(0),
+            ]
+        );
+        assert_eq!(functions[1].blocks.len(), 2);
+    }
+
+    #[test]
+    fn group_functions_rejects_an_unlowerable_instruction_before_the_first_function() {
+        let (module, function) = atoms();
+        // A `move` with no operands cannot be lowered; it belongs to no function body.
+        let instrs = vec![
+            raw(Opcode::r#move, vec![]),
+            label(1),
+            func_info(module, function, 1),
+            label(2),
+            ret(),
+        ];
+        assert!(matches!(
+            group_functions(&instrs).unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    #[test]
+    fn group_functions_rejects_an_unlowerable_instruction_inside_a_body() {
+        let (module, function) = atoms();
+        let instrs = vec![
+            label(1),
+            func_info(module, function, 1),
+            label(2),
+            raw(Opcode::r#move, vec![]),
+            ret(),
+        ];
+        assert!(matches!(
+            group_functions(&instrs).unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    #[test]
+    fn group_functions_reports_the_first_unlowerable_instruction_of_a_body() {
+        // Error order inside a body is the stream's: the earlier failure wins.
+        let (module, function) = atoms();
+        let instrs = vec![
+            label(1),
+            func_info(module, function, 1),
+            label(2),
+            raw(Opcode::jump, vec![]),
+            raw(Opcode::r#move, vec![]),
+        ];
         assert!(matches!(
             group_functions(&instrs).unwrap_err(),
             BeamError::BadArg

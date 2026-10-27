@@ -25,11 +25,16 @@
 //! order** of the name in `erts/emulator/beam/atom.names`. Reproducing that order
 //! is required for preloaded modules, which reference atoms positionally.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::error::{TermError, TermResult};
+
+/// The table's two storage directions — [`store::NameChunks`] (index → name, chunked) and
+/// [`store::IndexShards`] (name → index, hash-sharded), each copy-on-write behind one `Arc` so
+/// that [`AtomTable::fork`] shares instead of copies. Split out because the copy granularity is a
+/// design of its own; see the module docs.
+pub mod store;
 
 /// `_TAG_IMMED2_SIZE` — the number of low bits used by the atom tag.
 pub const ATOM_INDEX_BITS: u32 = 6;
@@ -74,18 +79,26 @@ impl Atom {
 /// prefix of the table) stable for the table's lifetime, which is what lets a
 /// memoized *image* of the table be validated in O(1) against
 /// [`AtomSnapshot`] / [`AtomTable::appended_since`].
+///
+/// The two storage directions live in [`store`], each copy-on-write behind one
+/// `Arc` ([`store::NameChunks`] for index → name, [`store::IndexShards`] for
+/// name → index). That is what makes [`AtomTable::fork`] free: it shares both
+/// directions instead of copying them, and a later append detaches only the one
+/// chunk and the one shard it touches.
 #[derive(Debug)]
 pub struct AtomTable {
     /// Names in index order: `names[i]` names `Atom(i)`.
     ///
     /// The name is stored **once** as a shared, heap-allocated `Arc<str>`; `index` holds another
     /// handle to the same allocation, so interning a novel name costs exactly one string
-    /// allocation. `Arc` (not `Rc`) keeps the table `Send + Sync`.
-    names: Vec<Arc<str>>,
-    /// Name → index. Keyed by `Arc<str>`, which `Borrow<str>`s and hashes as `str`, so
+    /// allocation. `Arc` (not `Rc`) keeps the table `Send + Sync`, and putting the chunk list
+    /// behind one `Arc` lets [`AtomTable::fork`] share the whole prefix without copying a handle.
+    names: store::NameChunks,
+    /// Name → index, hash-sharded so that a copy-on-write step copies one shard rather than the
+    /// whole map. Keyed by `Arc<str>`, which `Borrow<str>`s and hashes as `str`, so
     /// `index.get(name: &str)` is allocation-free and semantically identical to the previous
     /// `HashMap<String, Atom>`.
-    index: HashMap<Arc<str>, Atom>,
+    index: store::IndexShards,
     /// A process-global monotonic identity for *this* table. Only distinctness is
     /// meaningful — never the number itself, the ordering, or the spacing. It is not
     /// observable behaviour and is not part of any compatibility contract: the only
@@ -132,25 +145,25 @@ impl Clone for AtomTable {
     ///   rebuilds its memo instead of reusing it — which is the correct trade for soundness.
     /// * The clone **owns** its name storage. Each entry is materialized as a fresh
     ///   [`Arc<str>`] rather than sharing the source's, so a clone is genuinely independent and
-    ///   a clone of an `N`-atom table allocates `Θ(N)` (one string per entry, plus the two
-    ///   container reservations). Sharing the source's `Arc`s would make the clone `Θ(1)` and
+    ///   a clone of an `N`-atom table allocates `Θ(N)` (one string per entry, plus the chunk/shard
+    ///   containers it grows into). Sharing the source's `Arc`s would make the clone `Θ(1)` and
     ///   silently break `beam_rt/tests/atom_table_commit_alloc.rs` (and
     ///   `beam_bifs/tests/decode_hot_path.rs`), which use `AtomTable::clone()` as a positive
     ///   control that *must* scale with the table.
     fn clone(&self) -> AtomTable {
         // One entry per name, in index order: `intern` assigns `Atom(names.len())` as it appends,
         // so `names[i]` always names `Atom(i)` and the index can be rebuilt positionally — no
-        // re-hashing and no lookup. The two `with_capacity` reservations mean each container
-        // allocates once, so the whole clone is one string allocation per entry plus two.
-        debug_assert_eq!(
-            self.index.len(),
-            self.names.len(),
-            "the index holds exactly one entry per interned name"
-        );
-        let mut names: Vec<Arc<str>> = Vec::with_capacity(self.names.len());
-        let mut index: HashMap<Arc<str>, Atom> = HashMap::with_capacity(self.names.len());
-        for (position, name) in self.names.iter().enumerate() {
-            let owned: Arc<str> = Arc::from(&**name);
+        // re-hashing and no lookup. Each entry is a fresh string; the containers are this
+        // table's own (never the source's `Arc`-shared ones).
+        self.debug_check();
+        let mut names = store::NameChunks::new();
+        let mut index = store::IndexShards::new();
+        for position in 0..self.names.len() {
+            let name = self
+                .names
+                .get(position)
+                .expect("every index below `len` names a name");
+            let owned: Arc<str> = Arc::from(name);
             index.insert(Arc::clone(&owned), Atom(position as u32));
             names.push(owned);
         }
@@ -165,22 +178,32 @@ impl Clone for AtomTable {
 
 impl AtomTable {
     /// A second, independent table over the **same** names: every index resolves exactly as it
-    /// does in `self`, but nothing is copied except two container headers and one handle per entry.
+    /// does in `self`, but nothing is copied at all — the fork is two `Arc` clones.
     ///
     /// This is the constructor for a consumer that must be *allowed to append* (typically one
-    /// literal-only atom while lowering a module) without paying a whole-table deep copy: unlike
-    /// [`AtomTable::clone`] it allocates **no** name string — `names` clones as `Arc<str>` handles
-    /// and `index`'s keys share those same handles — so an `N`-atom fork costs exactly **two**
-    /// allocations (one `Vec`, one hash-table bucket array) and `Θ(N)` handle/word copies instead
-    /// of `Θ(N)` string allocations, `N` re-hashes and `N` string-byte copies.
+    /// literal-only atom while lowering a module) without paying a whole-table copy. Both storage
+    /// directions are copy-on-write behind one `Arc` each ([`store::NameChunks`] for index → name,
+    /// [`store::IndexShards`] for name → index), so:
+    ///
+    /// * **a fork allocates nothing**, at any table size — not a name string, not a name handle,
+    ///   not a bucket. An `N`-atom fork is `Θ(1)` time and `Θ(1)` space beyond the two shared
+    ///   containers, where [`AtomTable::clone`] is `Θ(N)` string allocations.
+    /// * **the whole prefix stays shared**, and the two sides stay independent anyway: every
+    ///   mutating path ([`store::NameChunks::push`], [`store::IndexShards::insert`]) goes through
+    ///   `Arc::make_mut`, which *copies* a container instead of mutating one the other side can
+    ///   see. So the first append after a fork re-allocates at most **one chunk**
+    ///   (≤ [`store::NAMES_PER_CHUNK`] handles) and **one shard** (about
+    ///   `len / store::INDEX_SHARDS` entries) — O(1) in the number of newly interned names, never
+    ///   O(table).
     ///
     /// What is preserved, and why each half matters:
     ///
-    /// * **Every index.** `names` is copied positionally and `index` maps the same handles to the
-    ///   same indices, so `fork.name(a) == self.name(a)` and `fork.lookup(n) == self.lookup(n)`
-    ///   for every atom of `self`. Indices are the only thing downstream code can observe
-    ///   (`Atom` is a bare, table-relative index), so this makes a fork a drop-in replacement for
-    ///   a clone in any "lower with a private table, then merge the appended tail back" protocol.
+    /// * **Every index.** The chunked name storage is shared verbatim and the sharded index maps
+    ///   the same handles to the same indices, so `fork.name(a) == self.name(a)` (the very same
+    ///   `str` allocation) and `fork.lookup(n) == self.lookup(n)` for every atom of `self`.
+    ///   Indices are the only thing downstream code can observe (`Atom` is a bare, table-relative
+    ///   index), so this makes a fork a drop-in replacement for a clone in any "lower with a
+    ///   private table, then merge the appended tail back" protocol.
     /// * **The generation**, so the fork's `generation - len` arithmetic means the same thing as
     ///   the parent's. A producer that only needs a *prefix-stable* table can therefore hand a
     ///   fork to a decoder whose memo was validated against the parent's last snapshot.
@@ -190,32 +213,36 @@ impl AtomTable {
     ///   `fork.appended_since(self.snapshot())` and `self.appended_since(fork.snapshot())` are
     ///   both `false` — which is what keeps the O(1) witness sound.
     ///
-    /// The two tables are otherwise fully independent (each has its own `Vec` and `HashMap`), so
-    /// appending to one leaves the other's `len`/`generation`/contents untouched: a name interned
-    /// into the fork after the fork is invisible to the parent and vice versa. A name that *both*
-    /// sides intern afterwards lands at the same index (both start at the same length) but is a
-    /// separate `Arc<str>` allocation — the fork shares only the handles it was born with.
+    /// The two tables are otherwise fully independent: appending to one leaves the other's
+    /// `len`/`generation`/contents untouched, because the copy-on-write step detaches the appending
+    /// side's containers rather than writing through the shared one. A name interned into the fork
+    /// after the fork is therefore invisible to the parent and vice versa. A name that *both* sides
+    /// intern afterwards lands at the same index (both start at the same length) but is a separate
+    /// `Arc<str>` allocation — the fork shares only the names it was born with.
     ///
     /// [`AtomTable::clone`] deliberately keeps its deep-copy meaning; use this only where the
     /// copy's *independence of name storage* is not part of the contract. See the `Clone` impl's
     /// rustdoc for the two suites that pin `clone`'s scaling.
     pub fn fork(&self) -> AtomTable {
-        // Same invariant `clone` asserts: one index entry per interned name, in index order.
-        debug_assert_eq!(
-            self.index.len(),
-            self.names.len(),
-            "the index holds exactly one entry per interned name"
-        );
-        // `Vec<Arc<str>>::clone` is one allocation plus one refcount bump per entry; the strings
-        // themselves are shared. `HashMap::clone` is one bucket-array allocation; it clones the
-        // control bytes and re-places each entry, so the keys are *not* re-hashed (and the
-        // `Arc<str>` keys therefore stay pointer-identical to `self`'s).
+        self.debug_check();
         AtomTable {
-            names: self.names.clone(),
-            index: self.index.clone(),
+            names: self.names.fork(),
+            index: self.index.fork(),
             instance: next_instance(),
             generation: self.generation,
         }
+    }
+
+    /// Assert the table's structural invariant: exactly one index entry per interned name.
+    ///
+    /// `O(store::INDEX_SHARDS)` (one `HashMap::len` per shard), so it is called only from the two
+    /// whole-table constructors — never from `intern`, whose hot path must stay O(1).
+    #[inline]
+    fn debug_check(&self) {
+        debug_assert!(
+            self.index.entries() == self.names.len(),
+            "the index holds exactly one entry per interned name"
+        );
     }
 }
 
@@ -252,10 +279,13 @@ impl AtomSnapshot {
 
 impl AtomTable {
     /// An empty table.
+    ///
+    /// Allocates nothing: both storage directions start as `None` and are materialized by the
+    /// first [`AtomTable::intern`].
     pub fn new() -> AtomTable {
         AtomTable {
-            names: Vec::new(),
-            index: HashMap::new(),
+            names: store::NameChunks::new(),
+            index: store::IndexShards::new(),
             instance: next_instance(),
             generation: 0,
         }
@@ -272,21 +302,21 @@ impl AtomTable {
     /// (see [`AtomTable::generation`]) by exactly one for a newly interned name, and
     /// not at all for a name that is already present — no mutation can bypass the bump.
     pub fn intern(&mut self, name: &str) -> Atom {
-        if let Some(&atom) = self.index.get(name) {
+        if let Some(atom) = self.index.get(name) {
             return atom;
         }
-        let idx = self.names.len();
         debug_assert!(
-            idx <= u32::MAX as usize,
-            "atom table exhausted: {idx} exceeds the Atom index space"
+            self.names.len() <= u32::MAX as usize,
+            "atom table exhausted: {} exceeds the Atom index space",
+            self.names.len()
         );
-        let atom = Atom(idx as u32);
         // The name is stored **once**, in a heap-allocated shared string that both the ordered
-        // `names` view and the `index` map reference: one allocation (plus a refcount bump),
-        // not one `String` per container. A known name takes the `index.get` early return above
-        // and allocates nothing.
+        // `names` view and the `index` shards reference: one allocation (plus a refcount bump),
+        // not one per container. A known name takes the `index.get` early return above and
+        // allocates nothing; a novel name copies at most one name chunk and one index shard
+        // (the copy-on-write step), never the whole table.
         let shared: Arc<str> = Arc::from(name);
-        self.names.push(Arc::clone(&shared));
+        let atom = Atom(self.names.push(Arc::clone(&shared)));
         self.index.insert(shared, atom);
         // Exactly-one-per-append: this is the only place the table grows.
         self.generation = self.generation.wrapping_add(1);
@@ -357,12 +387,12 @@ impl AtomTable {
 
     /// Look up an already-interned name.
     pub fn lookup(&self, name: &str) -> Option<Atom> {
-        self.index.get(name).copied()
+        self.index.get(name)
     }
 
     /// The name of an interned atom, if the index is in range.
     pub fn name(&self, atom: Atom) -> Option<&str> {
-        self.names.get(atom.raw() as usize).map(|name| &**name)
+        self.names.get(atom.raw() as usize)
     }
 
     /// The number of interned atoms.
@@ -372,23 +402,24 @@ impl AtomTable {
 
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.names.len() == 0
     }
 
     /// Pre-intern a run of names in the given order.
     ///
-    /// The two containers are reserved once from the iterator's size-hint lower bound (a lower
-    /// bound on the number of names about to be seen), so seeding a large table does not
-    /// repeatedly reallocate and rehash as it grows. [`AtomTable::new`] still starts empty, so
-    /// the single-`intern` path pays no eager reservation.
+    /// The name storage is reserved once from the iterator's size-hint lower bound (a lower bound
+    /// on the number of names about to be seen), so seeding a large table does not repeatedly
+    /// regrow the chunk list. The sharded index has no single bucket array to reserve — a seed run
+    /// spreads over the shards in an order the caller cannot predict, so each shard grows itself.
+    /// [`AtomTable::new`] still starts empty, so the single-`intern` path pays no eager
+    /// reservation.
     pub fn seed<'a, I>(&mut self, ordered_names: I)
     where
         I: IntoIterator<Item = &'a str>,
     {
         let names = ordered_names.into_iter();
         let (lower, _) = names.size_hint();
-        self.names.reserve(lower);
-        self.index.reserve(lower);
+        self.names.reserve_names(lower);
         for name in names {
             self.intern(name);
         }
@@ -413,7 +444,8 @@ impl AtomTable {
         // Pass 1 — count (allocates nothing, interns nothing): the number of names that precede
         // the first malformed line. Best effort, so the error it may carry is ignored here and
         // reported authoritatively by the interning pass below. Reserving the whole run once
-        // keeps the two containers from growing (and rehashing) name by name.
+        // keeps the chunk list from growing name by name (the sharded index has no single bucket
+        // array to reserve, so each shard grows itself).
         let mut total = 0usize;
         let _ = for_each_atom_line(src, |rest| {
             let count = parse_atom_list(rest, |_| Ok(()))?;
@@ -423,8 +455,7 @@ impl AtomTable {
             total += count;
             Ok(())
         });
-        self.names.reserve(total);
-        self.index.reserve(total);
+        self.names.reserve_names(total);
 
         // Pass 2 — intern. Each line is validate-parsed *before* its names are appended, so a
         // line that turns out malformed contributes nothing (the previous behaviour).
@@ -915,36 +946,205 @@ atom nil no none
         assert_eq!(fork.name(Atom::from_raw(300)), None);
     }
 
+    /// The `Arc::strong_count` of every name handle in `table`, in index order.
+    ///
+    /// A table on its own holds exactly **two** handles per name: one in the ordered name store
+    /// (`NameChunks`) and one as an index key (`IndexShards`).
+    fn handle_counts(table: &AtomTable) -> Vec<usize> {
+        (0..table.len())
+            .map(|index| {
+                Arc::strong_count(
+                    table
+                        .names
+                        .name_arc(index)
+                        .expect("every index in range names a name"),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn fork_shares_the_arc_handles_and_copies_no_string() {
         let parent = table_of(200);
-        // A table on its own holds two handles per name: one in `names`, one as an `index` key.
-        let alone: Vec<usize> = parent
-            .names
-            .iter()
-            .map(|name| Arc::strong_count(name))
-            .collect();
+        let alone = handle_counts(&parent);
         assert!(alone.iter().all(|&count| count == 2), "{alone:?}");
+
         let fork = parent.fork();
-        for index in 0..parent.len() {
+        for (index, &alone_count) in alone.iter().enumerate() {
+            let atom = Atom::from_raw(index as u32);
+            let parent_name = parent.names.name_arc(index).expect("in range");
+            let fork_name = fork.names.name_arc(index).expect("in range");
+            // same bytes, same allocation: `name()` hands out the shared `str`'s contents
+            assert_eq!(fork.name(atom), parent.name(atom));
             assert!(
-                Arc::ptr_eq(&parent.names[index], &fork.names[index]),
-                "index {index}: a fork shares the name handle, it does not copy the string"
+                std::ptr::eq(
+                    fork.name(atom).expect("in range"),
+                    parent.name(atom).expect("in range")
+                ),
+                "index {index}: a fork shares the name allocation, it does not copy the string"
+            );
+            assert!(
+                Arc::ptr_eq(parent_name, fork_name),
+                "index {index}: the name handle itself is shared"
+            );
+            // the fork's second direction maps the shared name straight back to the same index
+            assert_eq!(
+                fork.lookup(parent.name(atom).expect("in range")),
+                Some(atom)
             );
             assert_eq!(
-                Arc::strong_count(&parent.names[index]),
-                alone[index] + 2,
-                "index {index}: a fork adds exactly two handles to the shared string — one for its \
-                 `names` slot and one for its `index` key — and copies no string"
+                Arc::strong_count(parent_name),
+                alone_count,
+                "index {index}: a fork adds **zero** `Arc<str>` handles — the whole prefix is \
+                 shared through the two containers, not re-listed"
             );
         }
-        // ... and the fork's `index` keys are those same handles, not re-materialized strings.
-        for name in &parent.names {
+        // ... and it is the containers that are shared, in both directions.
+        assert_eq!(
+            parent.names.container_ptr(),
+            fork.names.container_ptr(),
+            "a fork shares the name-storage container"
+        );
+        assert_eq!(
+            parent.index.container_ptr(),
+            fork.index.container_ptr(),
+            "a fork shares the index container"
+        );
+        assert!(parent.names.container_ptr().is_some());
+        assert!(parent.index.container_ptr().is_some());
+    }
+
+    #[test]
+    fn fork_copy_on_write_detaches_only_the_appending_side() {
+        // The isolation half of the sharing: `Arc::make_mut` copies the container a write lands
+        // in, so the *appending* side moves to a private container and the other side keeps
+        // reading the shared one, unchanged.
+        let mut parent = table_of(300);
+        let mut fork = parent.fork();
+        let shared_names = parent.names.container_ptr();
+        let shared_index = parent.index.container_ptr();
+        let fork_len = fork.len();
+        let fork_generation = fork.generation();
+        let fork_names: Vec<String> = (0..fork_len)
+            .map(|index| {
+                fork.name(Atom::from_raw(index as u32))
+                    .expect("in range")
+                    .to_string()
+            })
+            .collect();
+
+        // --- an append into the parent detaches the parent, not the fork --------------------
+        let appended = parent.intern("only_in_the_parent_after_the_fork");
+        assert_ne!(
+            parent.names.container_ptr(),
+            shared_names,
+            "the appending side gets its own name-storage container"
+        );
+        assert_ne!(
+            parent.index.container_ptr(),
+            shared_index,
+            "the appending side gets its own index container"
+        );
+        assert_eq!(
+            fork.names.container_ptr(),
+            shared_names,
+            "the fork still points at the container it shared before the append"
+        );
+        assert_eq!(fork.index.container_ptr(), shared_index);
+        // ... and nothing the fork can observe moved
+        assert_eq!(fork.len(), fork_len);
+        assert_eq!(fork.generation(), fork_generation);
+        for (index, name) in fork_names.iter().enumerate() {
+            assert_eq!(
+                fork.name(Atom::from_raw(index as u32)),
+                Some(name.as_str()),
+                "index {index} still names the same name in the untouched fork"
+            );
+        }
+        assert_eq!(fork.lookup("only_in_the_parent_after_the_fork"), None);
+        assert_eq!(
+            parent.name(appended),
+            Some("only_in_the_parent_after_the_fork")
+        );
+        // the shared prefix is still the *same allocation*, on both sides
+        for index in 0..fork_len {
+            assert!(std::ptr::eq(
+                fork.name(Atom::from_raw(index as u32)).expect("in range"),
+                parent.name(Atom::from_raw(index as u32)).expect("in range"),
+            ));
+        }
+
+        // --- and symmetrically: an append into the fork detaches only the fork --------------
+        // The parent already moved to its own container above, which left the fork the sole owner
+        // of the one it shared — so the fork mutates *that* container in place (nothing to copy)
+        // and the two sides still end up with containers of their own.
+        let parent_names = parent.names.container_ptr();
+        let parent_index = parent.index.container_ptr();
+        let parent_len = parent.len();
+        let forked = fork.intern("only_in_the_fork_after_the_fork");
+        assert_ne!(
+            fork.names.container_ptr(),
+            parent_names,
+            "after both sides append, each owns a private name-storage container"
+        );
+        assert_ne!(fork.index.container_ptr(), parent_index);
+        assert_eq!(
+            parent.names.container_ptr(),
+            parent_names,
+            "the parent keeps its own container across the fork's append"
+        );
+        assert_eq!(parent.index.container_ptr(), parent_index);
+        assert_eq!(parent.len(), parent_len);
+        assert_eq!(parent.lookup("only_in_the_fork_after_the_fork"), None);
+        assert_eq!(fork.name(forked), Some("only_in_the_fork_after_the_fork"));
+        // both appends landed at the same index (each side counted from the same length), and
+        // they are different names: separate tables, separate containers.
+        assert_eq!(appended.raw(), forked.raw());
+        assert_ne!(parent.name(appended), fork.name(forked));
+        // the shared prefix is still one allocation on both sides, though
+        for index in 0..fork_len {
+            assert!(std::ptr::eq(
+                fork.name(Atom::from_raw(index as u32)).expect("in range"),
+                parent.name(Atom::from_raw(index as u32)).expect("in range"),
+            ));
+        }
+    }
+
+    #[test]
+    fn fork_of_a_fork_is_the_same_shape() {
+        let parent = table_of(64);
+        let alone = handle_counts(&parent);
+        let fork = parent.fork();
+        let grand = fork.fork();
+        assert_eq!(grand.len(), parent.len());
+        assert_eq!(grand.generation(), parent.generation());
+        for (index, &alone_count) in alone.iter().enumerate() {
+            let atom = Atom::from_raw(index as u32);
+            assert_eq!(grand.name(atom), parent.name(atom));
             assert!(
-                Arc::ptr_eq(name, fork.index.get_key_value(&**name).expect("keyed").0),
-                "the fork's index must key on the shared handle"
+                Arc::ptr_eq(
+                    parent.names.name_arc(index).expect("in range"),
+                    grand.names.name_arc(index).expect("in range")
+                ),
+                "the name handles stay shared across generations of forks"
+            );
+            assert_eq!(
+                Arc::strong_count(parent.names.name_arc(index).expect("in range")),
+                alone_count,
+                "no fork generation adds an `Arc<str>` handle"
             );
         }
+        // one container pair, shared by all three generations
+        assert_eq!(parent.names.container_ptr(), fork.names.container_ptr());
+        assert_eq!(parent.names.container_ptr(), grand.names.container_ptr());
+        assert_eq!(parent.index.container_ptr(), fork.index.container_ptr());
+        assert_eq!(parent.index.container_ptr(), grand.index.container_ptr());
+        // three live tables, three distinct identities
+        assert_ne!(parent.snapshot(), fork.snapshot());
+        assert_ne!(fork.snapshot(), grand.snapshot());
+        assert_ne!(parent.snapshot(), grand.snapshot());
+        assert!(!grand.appended_since(parent.snapshot()));
+        assert!(!grand.appended_since(fork.snapshot()));
     }
 
     #[test]
@@ -1027,35 +1227,6 @@ atom nil no none
         assert_eq!(fork.intern("b").raw(), 0);
         assert_eq!(parent.name(Atom::from_raw(0)), Some("a"));
         assert_eq!(fork.name(Atom::from_raw(0)), Some("b"));
-    }
-
-    #[test]
-    fn fork_of_a_fork_is_the_same_shape() {
-        let parent = table_of(64);
-        let alone = Arc::strong_count(&parent.names[0]);
-        let fork = parent.fork();
-        let grand = fork.fork();
-        assert_eq!(grand.len(), parent.len());
-        assert_eq!(grand.generation(), parent.generation());
-        for index in 0..parent.len() {
-            let atom = Atom::from_raw(index as u32);
-            assert_eq!(grand.name(atom), parent.name(atom));
-            assert!(
-                Arc::ptr_eq(&parent.names[index], &grand.names[index]),
-                "the handles stay shared across generations of forks"
-            );
-            assert_eq!(
-                Arc::strong_count(&parent.names[index]),
-                alone + 4,
-                "two extra handles per fork generation (a `names` slot and an `index` key)"
-            );
-        }
-        // three live tables, three distinct identities
-        assert_ne!(parent.snapshot(), fork.snapshot());
-        assert_ne!(fork.snapshot(), grand.snapshot());
-        assert_ne!(parent.snapshot(), grand.snapshot());
-        assert!(!grand.appended_since(parent.snapshot()));
-        assert!(!grand.appended_since(fork.snapshot()));
     }
 
     #[test]

@@ -7,9 +7,9 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 
 ## Pipeline (inside `build_module`)
 1. `decode::decode_stream` → `Vec<RawInstr>` (`../decode.rs`).
-2. `group::group_functions` — split into `Function`s at the `func_info` boundary; each function gets `func_label`/`entry_label`.
+2. `group::group_functions` — split into `Function`s at the `func_info` boundary; each function gets `func_label`/`entry_label`. The boundaries are found on the *raw* stream (only the `label`/`func_info` instructions at a boundary are lowered to do so), and each body is then lowered straight into its one `code` vector, so no instruction is lowered twice and no body is held twice.
 3. `lower::instr::lower_instr` — one decoded opcode → exactly one `Instr` variant (or the lossless `Instr::Generic`).
-4. `fuse` — coalesce an **adjacent** `Deallocate(N); Return` pair into `Instr::DeallocateReturn(N)`. Runs *before* `build_blocks`, so a block's `start..end` indexes the same fused vector the engine dispatches on. `Label` is the only branch target, so the pair can never cross a block; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules.
+4. `fuse::fuse_in_place` — coalesce an **adjacent** `Deallocate(N); Return` pair into `Instr::DeallocateReturn(N)`, compacted in place. Runs *before* `build_blocks`, so a block's `start..end` indexes the same fused vector the engine dispatches on. `Label` is the only branch target, so the pair can never cross a block; everything else is carried through untouched, so `Deallocate`/`Return` stay live for hand-built modules. The body is pre-sized to `body.len() − adjacent pairs` (`group::count_fusable_pairs`), so the pass never grows or reallocates it.
 5. `group::build_blocks` — label-delimited blocks (`blocks[k]` = `code[start..end]` beginning at `blocks[k].label`); CFG construction is the engine's concern.
 6. `validate` — the post-lowering accept/reject pass below.
 
@@ -36,6 +36,7 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 ## Known Issues
 - **Looser than the C, deliberately:** an obsolete/transform-only roster opcode (`-allocate_zero/2`, `-is_constant/2`, `-make_fun2/1`; none has an `ops.tab` line) lowers to `Instr::Generic` instead of `PLEASE_RECOMPILE` (`beam_load.c:600-605`); an `f` target no `label` defines is accepted (a release-build C accepts it too) and surfaces as a typed execution error; the `bs_match` sub-instruction vocabulary is only the engine's typed `unsupported` (`beam_load.c:625-638`).
 - **Stricter than the C:** a defined label 0 is refused (the C tests only `< 0 || >= label_count`, `asm_load.c:512-518`).
+- **Which error a doubly-malformed stream reports:** the boundaries are located (and the boundary rules applied) before the bodies are lowered, so a stream that carries both a malformed `func_info` boundary and an unlowerable instruction names the boundary; a stream with one defect reports that defect, and every one of these is `BadArg` either way — the accept/reject verdict is unchanged.
 
 ## Notes for Agents
 - Read `src/lower/instr.rs` for the per-opcode table; read `src/instr.rs` (`../instr.rs`) for the variant shapes and `../CONTEXT.md` for the vocabulary summary.
@@ -43,7 +44,7 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 
 ## Routing Table
 - `instr.rs` → `lower_instr` (the opcode → `Instr` mapping, one arm per modelled opcode).
-- `group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks`.
-- `fuse.rs` → `fuse` (the only superinstruction pass, `Deallocate`+`Return`).
+- `group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks` + `count_fusable_pairs` (the exact per-body capacity pre-count).
+- `fuse.rs` → `fuse_in_place` (the only superinstruction pass, `Deallocate`+`Return`) and `fuse`, its owning-vector wrapper.
 - `validate.rs` → the post-lowering validation pass (label definitions, `function_count`, `func_info` arity, import refs, `LineRef`s).
 - `../../../tests/negative_ir.rs` → the code-level rejection suite that pins `validate.rs` (test node, read-only here).

@@ -187,10 +187,17 @@ pub fn build_module(
     let literals = if synthesized.is_empty() {
         LiteralArea::decode(&chunks.literals, &mut atom_table)?
     } else {
+        // The two sets must be decoded as one contiguous slice, so they are joined in
+        // a local view that dies with this block — the file's own payloads are only
+        // borrowed-from `chunks`, and the synthesized ones are moved into it rather
+        // than copied.
         let mut payloads = chunks.literals.clone();
         payloads.append(&mut synthesized);
         LiteralArea::decode(&payloads, &mut atom_table)?
     };
+    // The synthesized payloads are consumed by the arena; the (now empty) staging
+    // vector is released here rather than at the end of the function.
+    drop(synthesized);
     let literals = Arc::new(literals);
 
     // Literal-backed record defaults (`z,4` and bignums) resolve only now that the
