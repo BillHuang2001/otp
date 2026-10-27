@@ -502,6 +502,7 @@ The files below are consumed by the named suite; `ERL_SOURCE_FIXTURES.md` and `P
 |---|---|---|
 | `action_identity.erl` | `../action_identity.rs` | `ident/0` prints the `-s`/`-run` action process's own identity (registered name, `whereis(init)`, liveness, node) on one line |
 | `display_terms.erl` | `../display_oracle.rs` | `all/0` displays one term per line — a native record, a map, a float, an atom and a printable list — for the `%T`/CRLF comparison against the live `erl` |
+| `funmfa.erl` | `../fun_info_mfa.rs` | one exported function per `erlang:fun_info_mfa/1` shape — a single anon fun, two in one function, two in different functions, a named lambda, an `EXPORT_EXT` fun — plus the `fun_info/2` items and `fun_info(F, mfa)`'s `badarg` |
 | `funrecv.erl` / `funrecvw.erl` | `../fun_entry_receive.rs` | the fun-bodied process entry: a `make_fun3` closure entered at its own lambda label, with the blocking `receive` inline and one `call_ext` away |
 | `inet_completion_parity.erl` / `inet_completion_udp.erl` | `../inet_completion.rs` | the passive-completion parity pair (`cpl_parity:go/0`, `cpl_udp:recv/0`) over real loopback sockets |
 | `maxheap.erl` (compiled image committed as `maxheap.beam`) | `../max_heap_enforce.rs` | the `max_heap_size` kill/survive matrix |

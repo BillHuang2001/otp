@@ -2728,9 +2728,12 @@ fn the_fun_identity_gate_selects_the_image_and_introspection_bifs() {
     // The `LocalFunIdentity` seam has two consumer families. The **encoders**: the two
     // `beam_bifs` code paths that reach `binconv::encode_body`'s first statement —
     // `term_to_binary/1,2` directly and `external_size/1,2` through `plain_image_of`. And
-    // the **introspection** pair `erlang:fun_info/1,2`, which reads the seam for a fun's
-    // `name`. Every other registered BIF must skip the `Arc` clone + `PathBuf` allocation
-    // the bridge does.
+    // the **introspection** trio `erlang:fun_info/1`, `fun_info/2` and `fun_info_mfa/1`,
+    // which read the seam for a fun's `name` — and, for a `make_fun3` closure, for the
+    // whole `{Module, Function, Arity}` triple (`fun_info_mfa/1`'s `Local` arm answers the
+    // typed gap without it, since the term inlines no module atom and no lambda name).
+    // Every other registered BIF must skip the `Arc` clone + `PathBuf` allocation the
+    // bridge does.
     for (function, arity) in [
         ("term_to_binary", 1),
         ("term_to_binary", 2),
@@ -2738,6 +2741,7 @@ fn the_fun_identity_gate_selects_the_image_and_introspection_bifs() {
         ("external_size", 2),
         ("fun_info", 1),
         ("fun_info", 2),
+        ("fun_info_mfa", 1),
     ] {
         assert!(
             RuntimeContext::uses_fun_identity("erlang", function, arity),
@@ -2746,15 +2750,17 @@ fn the_fun_identity_gate_selects_the_image_and_introspection_bifs() {
     }
     // The introspection half is *wider* than `beam_bifs`' own roster, which documents that
     // crate's seam-readers (the two encoders) only: the gate is the beam_rt side of the
-    // seam, so a `fun_info` call still gets the bridge installed. That divergence is the
-    // contract, not a drift — the roster test below compares the gate to the roster's
-    // predicate only on the roster's own keys.
+    // seam, so a `fun_info`/`fun_info_mfa` call still gets the bridge installed. That
+    // divergence is the contract, not a drift — the roster test below compares the gate to
+    // the roster's predicate only on the roster's own keys.
     assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info", 1));
     assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info", 2));
+    assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info_mfa", 1));
     // The widened gate is what the dispatch memo records, so the bridge really is installed
     // on the introspection arm (`DispatchHooks::of` reads the gate, not the roster).
     assert!(DispatchHooks::of("erlang", "fun_info", 1).fun_identity());
     assert!(DispatchHooks::of("erlang", "fun_info", 2).fun_identity());
+    assert!(DispatchHooks::of("erlang", "fun_info_mfa", 1).fun_identity());
     for (module, function, arity) in [
         ("erlang", "term_to_binary", 0),
         ("erlang", "term_to_binary", 3),
@@ -2763,14 +2769,17 @@ fn the_fun_identity_gate_selects_the_image_and_introspection_bifs() {
         ("erlang", "binary_to_term", 1),
         ("erlang", "-", 2),
         ("lists", "term_to_binary", 1),
-        // `fun_info/2` is the only arity pair the introspection half claims, and it is
-        // `erlang`'s alone. `fun_info_mfa/1` is deliberately not claimed: it rejects every
-        // non-`External` fun before reading any seam, so it never calls the accessor.
+        // The introspection half claims `fun_info/1,2` and `fun_info_mfa/1` only, and they
+        // are `erlang`'s alone. (`fun_info_mfa/2` does not exist; `/1`'s other neighbours
+        // here pin that the gate is an exact key match, not a function-name prefix.)
         ("erlang", "fun_info", 0),
         ("erlang", "fun_info", 3),
-        ("erlang", "fun_info_mfa", 1),
+        ("erlang", "fun_info_mfa", 0),
+        ("erlang", "fun_info_mfa", 2),
         ("erts_internal", "fun_info", 1),
+        ("erts_internal", "fun_info_mfa", 1),
         ("lists", "fun_info", 1),
+        ("lists", "fun_info_mfa", 1),
     ] {
         assert!(
             !RuntimeContext::uses_fun_identity(module, function, arity),

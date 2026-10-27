@@ -48,6 +48,7 @@ The two-VM fixture invariants the dist suites depend on are in **Cross-cutting c
 * `multimodule.rs` — on-demand cross-module load of real stdlib (`lists`/`maps`/`ordsets`/`binary`) from a compiled fixture (`erl`).
 * `proc_lib_start.rs` — `proc_lib:start[_link]/3,4` across a module boundary (`plstart.erl`/`plwait.erl`) (`erlc`).
 * `fun_entry_receive.rs` — a fun-bodied process entry that blocks in `receive`, inline and one `call_ext` away (`erlc`).
+* `fun_info_mfa.rs` — `erlang:fun_info_mfa/1`'s `{Module, Name, Arity}` for a compiled module's own `make_fun3` fun (one, two in a function, two in different functions, a named lambda, an `EXPORT_EXT` fun), its agreement with `fun_info/2`'s `name`/`module`/`arity`/`type` items, `fun_info(F, mfa)`'s `badarg`, and the unloaded defining module's C shape `{Module, [], Arity}` (`fixtures/funmfa.erl`) (`erl`+`erlc`).
 * `scheduled_apply_seam.rs` — the `call_fun`/`call_fun2` path: a scheduled process enters a blocking closure in-machine (`erl`).
 * `spawn_from_slice.rs` — every spawn form from inside a scheduler slice, a nested spawn and a rejected option list included (`erlc`).
 * `spawn_monitor.rs` — `spawn_monitor/1,3` and the `{'DOWN',…}` it owes (`erlc`).

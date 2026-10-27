@@ -21,7 +21,9 @@
 //! The [`LocalFunIdentity`] host seam: the `NEW_FUN_EXT` (`112`) identity of a **compiled
 //! module's** local (`make_fun3`) fun — and the lambda **name** of both a local and a decoded
 //! imported (`NEW_FUN_EXT`) fun — supplied to `beam_bifs`' `term_to_binary` and to its
-//! `erlang:fun_info/1,2` introspection.
+//! `erlang:fun_info/1,2` / `erlang:fun_info_mfa/1` introspection (the `{Module, Function,
+//! Arity}` triple the C resolves through `erts_get_fun_mfa(funp->entry.fun, …)`,
+//! `erl_bif_info.c:4029-4050`, is this derivation's `module` + `function` + the header arity).
 //!
 //! A `make_fun3` closure's term inlines only its engine-internal descriptor
 //! (`[uniq: u64][index: u32]`, `beam_term::fun`) — it carries **no** module atom, no
@@ -196,11 +198,12 @@ pub(crate) fn fun_identity_for(
 
 impl LocalFunIdentity for FunIdentityBridge {
     fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
-        // This hook is consulted for **every** fun argument of `term_to_binary/1,2` and of        // the `erlang:fun_info/1,2` introspection pair. Only the two fun kinds whose term
-        // carries (or can be matched to) an `ErlFunEntry` identity are answered here: a
-        // `Local` (`make_fun3`) closure and an `Imported` (`NEW_FUN_EXT`) one. An `External`
-        // (`EXPORT_EXT`) fun needs no seam — its whole identity is the export the term
-        // inlines — and a non-fun is a clean no-op.
+        // This hook is consulted for **every** fun argument of `term_to_binary/1,2` and of
+        // the `erlang:fun_info/1,2` / `erlang:fun_info_mfa/1` introspection BIFs. Only the two
+        // fun kinds whose term carries (or can be matched to) an `ErlFunEntry` identity are
+        // answered here: a `Local` (`make_fun3`) closure and an `Imported` (`NEW_FUN_EXT`)
+        // one. An `External` (`EXPORT_EXT`) fun needs no seam — its whole identity is the
+        // export the term inlines — and a non-fun is a clean no-op.
         match beam_codec::term::fun_kind_term(term) {
             Ok(beam_codec::term::FunKind::Local) => self.local_identity(term),
             Ok(beam_codec::term::FunKind::Imported) => self.imported_identity(term),
