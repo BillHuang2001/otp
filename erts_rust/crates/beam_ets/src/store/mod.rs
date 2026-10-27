@@ -83,6 +83,7 @@
 //! map as `header + size word + keys tuple + n values`.
 
 use core::alloc::Layout;
+use core::hash::{BuildHasherDefault, Hasher};
 use core::ptr::NonNull;
 use std::collections::HashMap;
 
@@ -93,6 +94,80 @@ use beam_term::prelude::*;
 /// The number of words a fresh store block holds when the request is smaller
 /// (`CHUNK`).
 const BLOCK_WORDS: usize = 64;
+
+/// The width of the **direct-indexed** free-run buckets: `free_runs[n]` holds the
+/// free runs of exactly `n` words for every `n < FREE_RUN_BUCKETS`, so a release
+/// and a reuse both find their bucket arithmetically instead of scanning.
+///
+/// Every run a term copy asks for is a small block (a cons cell is 2 words, a
+/// tuple `arity + 1`, the largest fixed leaf a handful), so this range covers the
+/// whole hot path; a longer run (a big tuple or bignum) goes to
+/// [`TermStore::large_free_runs`], whose list stays tiny because such runs are
+/// rare. 32 words == 256 B of bucket headers, grown lazily to the widest run the
+/// store has actually seen.
+const FREE_RUN_BUCKETS: usize = 32;
+
+/// How many drained run-list buffers the store keeps for reuse.
+///
+/// A copy needs one buffer and a free drains one, so one is enough to keep the
+/// hot path from allocating; a few more cover a burst (an `insert_list`, a
+/// delivery that frees several objects) without letting a mass deletion pin an
+/// unbounded number of buffers.
+const SPARE_RUN_BUFFERS: usize = 4;
+
+/// The hasher behind [`TermStore::tracked`].
+///
+/// The keys are the store's **own** object roots: addresses it minted while
+/// copying, never caller-supplied data that could be chosen adversarially, so the
+/// only property that matters is distribution and speed — not collision
+/// resistance. `std`'s default `SipHash` cost 210 (`hash_one`) + 338
+/// (`SipHash::write`) instructions per `ets:insert` here; a finalising multiply
+/// is one. The multiply-then-fold keeps the *low* bits (which the map uses for the
+/// bucket index) varying even though every key is word-aligned and so ends in
+/// zero bits.
+#[derive(Default, Clone, Copy)]
+struct RootHasher(u64);
+
+impl RootHasher {
+    /// Spreads a word-aligned key so its low bits vary (`0x9E3779B97F4A7C15` is
+    /// the 64-bit Fibonacci constant used by splitmix/xxhash-style finalisers).
+    #[inline]
+    fn mix(word: usize) -> u64 {
+        let h = (word as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^ (h >> 32)
+    }
+}
+
+impl Hasher for RootHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // `Eterm` is a `#[repr(transparent)]` word, so `Hash` routes to
+        // `write_usize`; other widths are still handled soundly (never a panic) by
+        // folding the byte stream.
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(byte))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = RootHasher::mix(value as usize);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.0 = RootHasher::mix(value);
+    }
+}
+
+/// The runs backing every live object, keyed by the object's root word.
+type RunMap = HashMap<Eterm, Vec<AllocSlice>, BuildHasherDefault<RootHasher>>;
 
 /// One contiguous run of words handed out by [`TermStore::alloc_words`].
 ///
@@ -175,17 +250,29 @@ pub struct TermStore {
     /// [`TermStore::free`]. This is what [`TermStore::words`] reports.
     live_words: usize,
     /// Runs returned by [`TermStore::free`] (or rolled back from a failed
-    /// [`TermStore::copy`]) and available for reuse, bucketed by their **exact**
-    /// word count. An exact-fit bucket keeps a reuse perfect, so a reused run never
-    /// overlaps a live term and no word is wasted.
-    free_runs: Vec<(usize, Vec<AllocSlice>)>,
+    /// [`TermStore::copy`]) and available for reuse, **direct-indexed by their exact
+    /// word count**: `free_runs[n]` is the bucket of `n`-word runs. An exact-fit
+    /// bucket keeps a reuse perfect, so a reused run never overlaps a live term and
+    /// no word is wasted, and the bucket is found arithmetically (`free_runs[n]`)
+    /// rather than by the linear scan a `Vec<(usize, _)>` needed. Grown lazily to
+    /// the widest run seen and capped at [`FREE_RUN_BUCKETS`].
+    free_runs: Vec<Vec<AllocSlice>>,
+    /// Free runs **longer** than the direct-indexed range ([`FREE_RUN_BUCKETS`]),
+    /// bucketed by their exact word count. A long run is a big tuple/bignum, so this
+    /// list holds very few entries and its scan stays off the hot path.
+    large_free_runs: Vec<(usize, Vec<AllocSlice>)>,
     /// The runs the [`TermStore::copy`] call currently in progress has allocated.
     /// Drained when it completes (into `tracked`) or fails (back to `free_runs`).
     pending: Vec<AllocSlice>,
+    /// Drained run-list buffers taken out of `tracked` by [`TermStore::free`] /
+    /// [`TermStore::relinquish`] and recycled as the next [`TermStore::copy`]'s
+    /// `pending`, so a per-op copy never regrows one from capacity 0 (6
+    /// reallocations per `ets:insert` on the copy-bound workload before this).
+    spare_runs: Vec<Vec<AllocSlice>>,
     /// The runs backing every live object, keyed by the root [`TermStore::copy`]
     /// returned for it — the handle [`TermStore::free`] is given. An object whose
     /// copy consumed no words (an immediate) owns no storage and is not tracked.
-    tracked: HashMap<Eterm, Vec<AllocSlice>>,
+    tracked: RunMap,
 }
 
 // `unsafe impl`, not derived, because `StoreBlock` holds a `NonNull<Eterm>`: the
@@ -237,8 +324,10 @@ impl TermStore {
             blocks: Vec::new(),
             live_words: 0,
             free_runs: Vec::new(),
+            large_free_runs: Vec::new(),
             pending: Vec::new(),
-            tracked: HashMap::new(),
+            spare_runs: Vec::new(),
+            tracked: RunMap::default(),
         }
     }
 
@@ -265,23 +354,32 @@ impl TermStore {
             self.pending.is_empty(),
             "a previous `copy` left its runs pending"
         );
+        // `pending` is a **recycled** buffer: prefer the one it already holds, else
+        // any spare the last `free`/`relinquish` pooled, else a fresh one. Clearing
+        // keeps the capacity an earlier copy grew, instead of regrowing the run list
+        // from 0 on every op.
+        if self.pending.capacity() == 0 {
+            self.pending = self.take_run_buffer();
+        }
         self.pending.clear();
         match self.copy_term(root) {
             Ok(copied) => {
                 if !self.pending.is_empty() {
                     // Only a boxed/list root can have consumed words, so this is
                     // exactly the "the object owns storage" case.
-                    self.tracked
-                        .insert(copied, core::mem::take(&mut self.pending));
+                    let buffer = self.take_run_buffer();
+                    let runs = core::mem::replace(&mut self.pending, buffer);
+                    self.tracked.insert(copied, runs);
                 }
                 Ok(copied)
             }
             Err(err) => {
                 // The partial copy is unreachable — its root was never handed to a
-                // caller — so return its runs instead of leaking them.
-                for run in core::mem::take(&mut self.pending) {
-                    self.release(run);
-                }
+                // caller — so return its runs instead of leaking them. `release_all`
+                // recycles the drained buffer, which `pending` takes straight back.
+                let runs = core::mem::take(&mut self.pending);
+                self.release_all(runs);
+                self.pending = self.take_run_buffer();
                 Err(err)
             }
         }
@@ -305,16 +403,10 @@ impl TermStore {
     /// drop its handle when it frees — the table does, since it removes the object
     /// from its interior in the same step.
     pub fn free(&mut self, root: Eterm) -> usize {
-        let runs = match self.tracked.remove(&root) {
-            Some(runs) => runs,
-            None => return 0,
-        };
-        let mut words = 0;
-        for run in runs {
-            words += run.words;
-            self.release(run);
+        match self.tracked.remove(&root) {
+            Some(runs) => self.release_all(runs),
+            None => 0,
         }
-        words
     }
 
     /// Hands the storage of the object whose root [`copy`](TermStore::copy)
@@ -337,12 +429,12 @@ impl TermStore {
     /// Relinquishing a term this store never copied (an immediate, a foreign term, or
     /// a root already freed/checked out) is a harmless no-op that returns `0`.
     pub fn relinquish(&mut self, root: Eterm) -> usize {
-        let runs = match self.tracked.remove(&root) {
+        let mut runs = match self.tracked.remove(&root) {
             Some(runs) => runs,
             None => return 0,
         };
         let mut words = 0;
-        for run in runs {
+        for run in runs.drain(..) {
             words += run.words;
             self.live_words = self
                 .live_words
@@ -351,6 +443,7 @@ impl TermStore {
             // Deliberately **not** `release`d: the words stay valid and are never
             // handed out again, so a later `copy` cannot overwrite the caller's term.
         }
+        self.recycle_run_buffer(runs);
         words
     }
 
@@ -372,7 +465,9 @@ impl TermStore {
         }
         self.live_words = 0;
         self.free_runs.clear();
+        self.large_free_runs.clear();
         self.pending.clear();
+        self.spare_runs.clear();
         self.tracked.clear();
     }
 
@@ -474,13 +569,25 @@ impl TermStore {
     }
 
     /// Pops a free run of exactly `n` words, if the store has one.
+    ///
+    /// The bucket is **derived** from `n` (`free_runs[n]`), not searched for: every
+    /// run this store hands out and takes back is keyed by its exact word count, so
+    /// the release/reuse pair is O(1) for the short runs a term copy actually asks
+    /// for. Only a run longer than [`FREE_RUN_BUCKETS`] consults
+    /// [`large_free_runs`], whose list holds a handful of distinct long sizes.
     fn take_free_run(&mut self, n: usize) -> Option<AllocSlice> {
-        let bucket = self.free_runs.iter().position(|(words, _)| *words == n)?;
-        let run = self.free_runs[bucket].1.pop();
-        if self.free_runs[bucket].1.is_empty() {
+        if n < FREE_RUN_BUCKETS {
+            return self.free_runs.get_mut(n)?.pop();
+        }
+        let bucket = self
+            .large_free_runs
+            .iter()
+            .position(|(words, _)| *words == n)?;
+        let run = self.large_free_runs[bucket].1.pop();
+        if self.large_free_runs[bucket].1.is_empty() {
             // The bucket is keyed by size, so it can never be refilled by a
             // different size; dropping it keeps the list short.
-            self.free_runs.swap_remove(bucket);
+            self.large_free_runs.swap_remove(bucket);
         }
         run
     }
@@ -500,13 +607,55 @@ impl TermStore {
             .live_words
             .checked_sub(run.words)
             .expect("a released run was counted live when it was handed out");
+        self.bucket_run(run);
+    }
+
+    /// Pushes `run` onto the free bucket for its exact word count.
+    fn bucket_run(&mut self, run: AllocSlice) {
+        if run.words < FREE_RUN_BUCKETS {
+            if self.free_runs.len() <= run.words {
+                self.free_runs.resize_with(run.words + 1, Vec::new);
+            }
+            self.free_runs[run.words].push(run);
+            return;
+        }
         match self
-            .free_runs
+            .large_free_runs
             .iter_mut()
             .find(|(words, _)| *words == run.words)
         {
             Some((_, runs)) => runs.push(run),
-            None => self.free_runs.push((run.words, vec![run])),
+            None => self.large_free_runs.push((run.words, vec![run])),
+        }
+    }
+
+    /// Returns **every** run of one object to the free lists in a single pass, and
+    /// recycles the drained list so the next [`copy`](TermStore::copy) can use its
+    /// buffer instead of allocating one. Reports the number of words reclaimed.
+    fn release_all(&mut self, mut runs: Vec<AllocSlice>) -> usize {
+        let mut words = 0;
+        for run in runs.drain(..) {
+            words += run.words;
+            self.release(run);
+        }
+        self.recycle_run_buffer(runs);
+        words
+    }
+
+    /// The buffer the next [`copy`](TermStore::copy) records its runs in: a recycled
+    /// one when the store has a spare, else a fresh (empty) one.
+    fn take_run_buffer(&mut self) -> Vec<AllocSlice> {
+        self.spare_runs.pop().unwrap_or_default()
+    }
+
+    /// Offers a drained run list back for reuse by a later
+    /// [`copy`](TermStore::copy). The buffer is **cleared**, never shrunk, and the
+    /// pool is capped at [`SPARE_RUN_BUFFERS`] so a mass deletion cannot pin an
+    /// unbounded number of them.
+    fn recycle_run_buffer(&mut self, mut buffer: Vec<AllocSlice>) {
+        if self.spare_runs.len() < SPARE_RUN_BUFFERS {
+            buffer.clear();
+            self.spare_runs.push(buffer);
         }
     }
 
