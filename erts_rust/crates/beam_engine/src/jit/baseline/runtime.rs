@@ -334,10 +334,6 @@ pub(crate) struct EntryTables {
     pub(crate) entries: *const *const u8,
     /// The number of slots in `entries` (the function's code length).
     pub(crate) entries_len: usize,
-    /// `sub_entries[pc]`: the **continuation sub-block** starting at `pc`, or null.
-    pub(crate) sub_entries: *const *const u8,
-    /// The number of slots in `sub_entries`.
-    pub(crate) sub_entries_len: usize,
 }
 
 impl EntryTables {
@@ -350,11 +346,9 @@ impl EntryTables {
         func: u32::MAX,
         entries: std::ptr::null(),
         entries_len: 0,
-        sub_entries: std::ptr::null(),
-        sub_entries_len: 0,
     };
 
-    /// The tables of `func` from that function's own two entry vectors.
+    /// The entry table of `func`, from that function's own folded entry vector.
     ///
     /// The **one** place an [`EntryTables`] is built, so the driver's publication
     /// ([`CompiledModule::entry_tables`]) and an in-block transfer's re-publication
@@ -363,17 +357,15 @@ impl EntryTables {
     ///
     /// [`CompiledModule::entry_tables`]: super::code::CompiledModule::entry_tables
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
-    pub(crate) fn of(
-        func: u32,
-        entries: &[*const u8],
-        sub_entries: &[*const u8],
-    ) -> EntryTables {
+    /// `entries` must be the function's **already folded** table: the compiler fills each
+    /// block start's slot and, wherever it left a null, the continuation sub-block's entry
+    /// (`emit::compile::merge_sub_entries`). One slot therefore answers both shapes a
+    /// transfer can name, and a null slot means that address compiled no entry at all.
+    pub(crate) fn of(func: u32, entries: &[*const u8]) -> EntryTables {
         EntryTables {
             func,
             entries: entries.as_ptr(),
             entries_len: entries.len(),
-            sub_entries: sub_entries.as_ptr(),
-            sub_entries_len: sub_entries.len(),
         }
     }
     /// The native entry for `(func, pc)` in these tables — a real block start first, then a
@@ -387,24 +379,18 @@ impl EntryTables {
             return None;
         }
         let pc = pc as usize;
-        if pc < self.entries_len {
-            // SAFETY: `entries` points at the `entries_len`-slot vector of the compiled
-            // function this table was published for (see the struct docs), and `pc` is in
-            // bounds of it. A slot is null when that address compiled no block start.
-            let entry = unsafe { *self.entries.add(pc) };
-            if !entry.is_null() {
-                return Some(entry);
-            }
+        if pc >= self.entries_len {
+            return None;
         }
-        if pc < self.sub_entries_len {
-            // SAFETY: as above — `sub_entries` points at that function's
-            // `sub_entries_len`-slot continuation table and `pc` is in bounds of it.
-            let entry = unsafe { *self.sub_entries.add(pc) };
-            if !entry.is_null() {
-                return Some(entry);
-            }
+        // SAFETY: `entries` points at the `entries_len`-slot folded entry vector of the
+        // compiled function this table was published for (see the struct docs), and `pc`
+        // is in bounds of it. A slot is null when that address compiled no entry.
+        let entry = unsafe { *self.entries.add(pc) };
+        if entry.is_null() {
+            None
+        } else {
+            Some(entry)
         }
-        None
     }
 }
 impl JitRuntime<'_> {
@@ -2099,8 +2085,9 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
             }
             // The in-block transfer itself is shared with a frame-preserving `call`'s callee
             // (see [`enter_in_block`]): both are "continue the driver's loop at `(func, pc)`
-            // without going back to the driver", so they must never diverge.
-            enter_in_block(runtime, func, pc)
+            // without going back to the driver", so they must never diverge. The clear above
+            // is this path's, so it takes the twin that does not repeat it.
+            enter_in_block_cleared(runtime, func, pc)
         }
     }
 }
@@ -2141,11 +2128,23 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
 #[inline]
 pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     runtime.resume_entry = std::ptr::null();
+    enter_in_block_cleared(runtime, func, pc)
+}
+/// [`enter_in_block`] for a caller that has **already** cleared
+/// [`JitRuntime::resume_entry`] in its own first instructions — the `return` half
+/// ([`return_word`]), which must clear before its own `match` because the `HALT`/`ENTER`
+/// arms leave the field for the emitted arm to read.
+///
+/// The clear is one store and sits on the per-transfer path, so the two callers that
+/// need it (`return_word` above, a linked `call` in [`super::call`]) share this body with
+/// the clear hoisted to the one that does not already have it.
+#[inline]
+fn enter_in_block_cleared(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     let word = encode_target(func, pc);
     match runtime.tables.entry(func, pc) {
         // The same-function shape: the published tables already describe this function, so
         // there is nothing to re-publish and no artifact to ask.
-        Some(entry) => match commit_in_block_entry(runtime, func, pc) {
+        Some(entry) => match commit_in_block_entry(runtime, word) {
             Ok(()) => {
                 runtime.resume_entry = entry;
                 word
@@ -2178,8 +2177,7 @@ pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -
 #[inline]
 fn commit_in_block_entry(
     runtime: &mut JitRuntime<'_>,
-    func: u32,
-    pc: u32,
+    word: i64,
 ) -> std::result::Result<(), BeamError> {
     // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`; no
     // other `&mut Machine` exists while the helper runs (the driver is blocked in the block
@@ -2188,7 +2186,11 @@ fn commit_in_block_entry(
     // The driver loop head's order: publish the position, bump the slice counter, then
     // offer the hook. Nothing of the target block has run, so a refusal is a clean
     // pre-emption rather than a replayed prefix.
-    machine.set_current_code(func, pc);
+    //
+    // `word` **is** the `pack_current_code(func, pc)` the two-argument form would compute
+    // (`encode_target` is the same `func << 32 | pc` pattern), so the transfer packs its
+    // target once — for the exit word — and reuses it for the position store.
+    machine.set_current_code_word(word as u64);
     machine.reductions = machine.reductions.saturating_add(1);
     if machine.reduce_on {
         // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as a
@@ -2221,7 +2223,7 @@ fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: 
     let Some((entry, tables)) = cross_function_entry(runtime, func, pc) else {
         return word;
     };
-    match commit_in_block_entry(runtime, func, pc) {
+    match commit_in_block_entry(runtime, word) {
         Ok(()) => {
             if let Some(tables) = tables {
                 // The transfer is taken: the function whose blocks are about to run is the
@@ -2438,7 +2440,7 @@ pub(crate) extern "C" fn jit_deallocate_return(
         let machine = unsafe { &mut *runtime.machine };
         // The same position store `Machine::step_instruction` makes at entry.
         machine.set_current_code(func, pc);
-        machine.pop_frame_checked(deallocate).and_then(|()| machine.take_continuation())
+        machine.pop_frame_take_continuation(deallocate)
     };
     match outcome {
         Ok(continuation) => return_word(runtime, continuation),

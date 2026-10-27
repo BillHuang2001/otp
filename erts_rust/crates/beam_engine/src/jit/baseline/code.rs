@@ -425,21 +425,14 @@ impl CompiledModule {
     ) -> super::runtime::EntryTables {
         match &self.layout {
             Layout::Eager(eager) => {
-                let (Some(entries), Some(sub_entries)) = (
-                    eager.entries.get(func as usize),
-                    eager.sub_entries.get(func as usize),
-                ) else {
+                let Some(entries) = eager.entries.get(func as usize) else {
                     return super::runtime::EntryTables::NONE;
                 };
-                super::runtime::EntryTables::of(func, entries, sub_entries)
+                super::runtime::EntryTables::of(func, entries)
             }
             Layout::Lazy(_) => match cached {
                 Some((cached_func, function)) if *cached_func == func => {
-                    super::runtime::EntryTables::of(
-                        func,
-                        &function.entries,
-                        &function.sub_entries,
-                    )
+                    super::runtime::EntryTables::of(func, &function.entries)
                 }
                 // No handle for this function: publish "nothing", which only makes the
                 // return take today's return-to-driver path.
@@ -484,23 +477,18 @@ impl CompiledModule {
             Layout::Eager(eager) => {
                 let entry = eager_entry(eager, func, pc)?;
                 let entries = eager.entries.get(func as usize)?;
-                let sub_entries = eager.sub_entries.get(func as usize)?;
                 Some((
                     entry,
                     // The eager artifact's bound is the whole-module maximum for every one
                     // of its functions (see `CompiledModule::native_entry`).
                     eager.summary.highest_native_register,
-                    super::runtime::EntryTables::of(func, entries, sub_entries),
+                    super::runtime::EntryTables::of(func, entries),
                 ))
             }
             Layout::Lazy(_) => {
                 let function = self.function(module, func)?;
                 let entry = lazy_entry(&function, pc)?;
-                let tables = super::runtime::EntryTables::of(
-                    func,
-                    &function.entries,
-                    &function.sub_entries,
-                );
+                let tables = super::runtime::EntryTables::of(func, &function.entries);
                 Some((entry, function.summary.highest_native_register, tables))
             }
         }

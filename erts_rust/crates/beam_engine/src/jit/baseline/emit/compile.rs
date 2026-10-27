@@ -127,6 +127,9 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
             &mut sub_entries[func_index],
         )?;
     }
+    for func_index in 0..module.functions.len() {
+        merge_sub_entries(&mut entries[func_index], &sub_entries[func_index]);
+    }
 
     buffer.seal()?;
     // The artifact records the module's content fingerprint when its load-time digest
@@ -201,6 +204,7 @@ pub(crate) fn compile_function(
         &mut sub_entries,
     )?;
     buffer.seal()?;
+    merge_sub_entries(&mut entries, &sub_entries);
     Ok(CompiledFunction {
         buffer,
         entries,
@@ -209,6 +213,22 @@ pub(crate) fn compile_function(
     })
 }
 
+/// Fold a function's continuation **sub-block** entries into its block-start table.
+///
+/// `entries[pc]` is the native entry of the IR block starting at `pc`; `sub_entries[pc]`
+/// is the entry of the continuation sub-block emitted at `pc + 1` for a frame-preserving
+/// call. A `pc` is at most one of the two, so the fold is a null-fill and the result
+/// answers both with **one** table lookup -- the per-transfer probe in
+/// [`super::runtime::EntryTables::entry`] then needs one bounds check, one load and one
+/// null test instead of up to two of each, and never touches the second table's cache
+/// line. Precedence is unchanged (a block start still wins), so no address moves.
+fn merge_sub_entries(entries: &mut [*const u8], sub_entries: &[*const u8]) {
+    for (slot, sub) in entries.iter_mut().zip(sub_entries) {
+        if slot.is_null() {
+            *slot = *sub;
+        }
+    }
+}
 /// Whether `instr` is a **frame-preserving call** — one that stores its return address
 /// (`Continuation::Address { func, pc: pc + 1, context: current }`) in the live frame.
 ///
