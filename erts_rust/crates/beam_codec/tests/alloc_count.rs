@@ -49,6 +49,15 @@
 //!   every atom of the payload, so `DECODE_FRESH_ALLOCS - DECODE_WARM_ALLOCS` is
 //!   exactly the `AtomTable::intern` share of a cold decode.
 //!
+//! The two decode pins therefore split into a **codec floor** (the decoder's own
+//! per-container buffers, identical cold and warm) plus an **atom-store** share (zero
+//! warm by construction). The codec floor is this crate's number; the atom-store share
+//! belongs to `beam_term`, so it moves when that store's *tuning* constants move — its
+//! name→index direction is split into `beam_term::atom::store::INDEX_SHARDS` shards, and
+//! a novel name pays for a fresh shard container whenever it is the first name to land
+//! in its shard. Re-derive rather than re-type (the recipe is above); the prose on each
+//! pin states the model, so a drift tells you which half moved.
+//!
 //! Re-derive all three in seconds from the repository root:
 //!
 //! ```text
@@ -82,20 +91,37 @@ const ENCODE_ALLOCS: u64 = 1;
 
 /// One `decode_term` into a fresh `Heap` + a fresh `AtomTable`.
 ///
-/// Exactly **13**: **3** the decoder's own per-container buffers plus **10** the `AtomTable`.
-/// Each container buffer is pre-sized from its wire count clamped to
-/// `CONTAINER_PREALLOC_CAP` (64), so each of them is one allocation:
-/// the 3-tuple's element buffer (3 slots), the 5-pair map's pair buffer (5 slots)
-/// and `beam_term::map::write_map`'s dedup-and-sort buffer.
-/// The payload's two lists are byte lists, so they arrive as `STRING_EXT` and build no buffer.
-/// The binary, the float and the smalls allocate nothing.
-/// The remaining **10** belong to the `AtomTable`: one shared `Arc<str>` per novel name (6).
-/// The other 4 are the two containers' growth: two `Vec` growths and two `HashMap` growths.
-/// `intern` stores each novel name once as a shared `Arc<str>`.
-/// Both the ordered `names` view and the `index` map reference that one allocation.
-/// A per-term buffer added to the wire path would make it regress.
-/// So would an `intern` that materializes each name once per container again.
-const DECODE_FRESH_ALLOCS: u64 = 13;
+/// Exactly **26** = the decoder's floor of **3** plus the `AtomTable`'s **23**.
+///
+/// The floor is the same 3 the warm decode spends: each container buffer is pre-sized from
+/// its wire count clamped to `CONTAINER_PREALLOC_CAP` (64), so each of them is one
+/// allocation — the 3-tuple's element buffer (3 slots), the 5-pair map's pair buffer
+/// (5 slots) and `beam_term::map::write_map`'s dedup-and-sort buffer. The payload's two
+/// lists are byte lists, so they arrive as `STRING_EXT` and build no buffer; the binary,
+/// the float and the smalls allocate nothing.
+///
+/// The `AtomTable` share for the payload's **6** novel names (`a`…`e`, `ok`) is
+/// **6 × 3 + 5**:
+///
+/// * **one string per novel name** — `intern` stores the name once as a shared `Arc<str>`
+///   that both the ordered `names` view and the `index` map reference;
+/// * **one container pair per novel name** — the name→index direction is sharded
+///   (`beam_term::atom::store::INDEX_SHARDS`), and a shard holds one `Arc<IndexShard>`
+///   plus its map's first growth. For any table well under `INDEX_SHARDS` names each novel
+///   name is the *first* in its own shard, so it materializes both; with a smaller shard
+///   count several names would share one map and this term would collapse toward the
+///   string alone. The boot's ~9 473-atom table is unaffected by the retune that produced
+///   this figure: at 1024 shards it still averages ~9 names per shard;
+/// * **5 one-time container reservations** the *first* append pays — the chunk list's `Arc`
+///   and its buffer, the first `Arc<NameChunk>` and that chunk's 128-slot name buffer, and
+///   the shard array's `Arc`. They are independent of the name count, so 6 names and 6 000
+///   names differ only in the per-name terms.
+///
+/// A known name takes `intern`'s `index.get` early return and allocates nothing, which is
+/// what makes the warm decode's atom share zero. A per-term buffer added to the wire path
+/// would make this regress, and so would an `intern` that materializes each name once per
+/// container.
+const DECODE_FRESH_ALLOCS: u64 = 26;
 
 /// One `decode_term` into a `Heap` + an `AtomTable` that already holds the atoms.
 ///
