@@ -560,7 +560,7 @@ The `-mode`-is-embedded rule (`code.erl`'s `start_get_mode/0`: the **first** `-m
 - `./preloaded.rs` → the real preloaded `.beam` loading (`load_preloaded`/`load_names`)
 - `./bootscript.rs` → the OTP boot-script reader (`read`/`BootScript`/`Instruction`/`Mfa`/`Value`) + executor (`execute`/`execute_reporting`/`BootStop`)
 - `./drive.rs` → the bounded scheduler-drive helpers (`drive_scheduler`/`start_kernel_process`/`apply_boot_call`, plus `DRIVE_DEADLINE`/`KERNEL_BURST_*`/`APPLY_BLOCK_SLICES`)
-- `../runtime.rs` → `Runtime::boot` / `boot_if_needed` / `preloaded_loaded` / `is_preloaded_loaded`, the boot-script glue `boot_from_script` / `load_code_module` / `add_code_path` / `register_boot_process` / `unlink_processes`, and `Runtime::new`'s registration of the runtime's own `init` and `erl_prim_loader` names
+- `../runtime.rs` → `Runtime::boot` / `boot_if_needed` / `preloaded_loaded` / `is_preloaded_loaded`, the boot-script glue `boot_from_script` / `load_code_module` / `add_code_path` / `unlink_processes` (`register_boot_process` is test-only — the drive never registers a directive's name), and `Runtime::new`'s registration of the runtime's own `init` and `erl_prim_loader` names
 - `../cli.rs` → `boot_script_to_drive`/`boot_then` (the resolved boot script every action but `-version` drives) and the `Action::Boot` arm that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
