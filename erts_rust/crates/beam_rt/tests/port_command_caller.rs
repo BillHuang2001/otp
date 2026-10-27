@@ -171,9 +171,10 @@ const TEARDOWN: &str = "gen_tcp:close(Cl), gen_tcp:close(A), gen_tcp:close(L), "
 /// receive, the port round writes it, and the reply `{inet_reply, Cl, ok, Mref}` resumes it.
 ///
 /// The child waits 300 ms before sending so the parent's `gen_tcp:recv/3` is **armed** when the
-/// bytes arrive: a passive read of an accepted socket that is armed only *after* the payload was
-/// buffered is a separate, documented `beam_io` residual (`tests/inet_completion.rs`), not this
-/// rule.
+/// bytes arrive: this row pins the sender's own reply, while a read armed only *after* the payload
+/// was buffered is a different shape — answered from the driver's receive inside the control call
+/// (`inet_drv.c:12310`), pinned by [`../inet_async_caller.rs`](../inet_async_caller.rs)'s `b` case
+/// and by [`../inet_nested.rs`](../inet_nested.rs)'s accepted-socket case.
 #[test]
 fn a_spawned_sender_is_resumed_by_its_own_reply() {
     let expr = format!(
@@ -242,8 +243,9 @@ fn a_spawned_command_reply_carries_its_own_tag_and_never_reaches_the_owner() {
 ///
 /// The port records one `desc->caller` per command (the C's single `desc->caller` field), so a
 /// runtime that addressed the reply to the owner would answer neither of them. The receive side
-/// is deliberately not observed: two reads of one accepted socket are the arm-once residual named
-/// above, and what this row pins is the pair of *replies*.
+/// is deliberately not observed — this row pins the pair of *replies*, and the read shapes have
+/// their own suites ([`../inet_async_caller.rs`](../inet_async_caller.rs),
+/// [`../inet_nested.rs`](../inet_nested.rs)).
 #[test]
 fn two_concurrent_senders_each_get_their_reply() {
     let expr = format!(

@@ -46,8 +46,10 @@
 //! Every peer is a std [`TcpStream`]/[`TcpListener`] owned by the test, held in its own thread:
 //! an in-VM peer cannot do a bare `receive` under `-eval` (there is no scheduler for it) and
 //! cannot sleep-then-block, so it is the wrong tool for this route. The peer **stays connected
-//! after it writes** — a send-then-close peer trips the escalated EOF-ordering defect and would
-//! make the case lie about what it measured.
+//! after it writes**: each case here measures one read and the completion that answers it, so the
+//! peer-close path stays out of the measurement — a driver holding a complete buffered unit
+//! delivers it ahead of the close it owes (`inet_drv.c:13130`), and a peer that closed after
+//! writing would make a case measure that ordering instead of its own read.
 //!
 //! # Synchronisation: the run's own stdout is the clock
 //!
@@ -659,9 +661,11 @@ enum PeerRole {
 /// A peer socket owned by the test, driven from a channel.
 ///
 /// The socket lives in the peer's own thread for as long as the guard does, so "the peer holds
-/// the connection open until the test says otherwise" is structural: a send-then-close peer would
-/// trip the escalated EOF-ordering defect and make a case lie. Dropping the guard closes the
-/// socket (and the thread is bounded, so this can never hang a test).
+/// the connection open until the test says otherwise" is structural: a peer that closed after its
+/// write would make a case measure the peer-close path instead of the read and completion it
+/// pins (a complete buffered unit is delivered ahead of the close the driver owes,
+/// `inet_drv.c:13130`). Dropping the guard closes the socket (and the thread is bounded, so this
+/// can never hang a test).
 struct Peer {
     tx: Option<Sender<PeerCommand>>,
     handle: Option<thread::JoinHandle<()>>,

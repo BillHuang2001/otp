@@ -171,7 +171,10 @@ fn pinned(what: &str, label: &str, function: &str, expected: &str) {
 }
 
 /// (a) A spawned **non-owner**'s passive `gen_tcp:recv/3` returns the data that arrives after
-/// the read was issued — the defect's headline case.
+/// the read was issued.
+/// The driver's completion is addressed to the process that issued the operation
+/// (`opp->caller = driver_caller(desc->port)`, `inet_drv.c:2427`), so a spawned non-owner reader
+/// is resumed with the later data instead of waiting on a message that never reaches it.
 #[test]
 fn a_spawned_readers_recv_returns_the_data_that_arrives_after_it_arms() {
     pinned(
@@ -198,8 +201,9 @@ fn a_spawned_readers_recv_returns_data_that_was_buffered_before_it_armed() {
 }
 
 /// (c) No data at all, a spawned reader and `timeout 0` → the driver's own `{error, timeout}`,
-/// delivered to the reader. Before the fix the reader never returned: the timeout was produced
-/// but addressed to the owner.
+/// produced and addressed to the reader that issued the operation, so it is delivered and the
+/// reader returns.
+/// A completion addressed to the port's **owner** instead leaves such a reader parked.
 #[test]
 fn a_spawned_readers_zero_timeout_answers_timeout() {
     pinned(
