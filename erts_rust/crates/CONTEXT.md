@@ -462,6 +462,15 @@ A.9's differential coverage is boot/version **observability** plus the in-proces
   Per-node detail: `beam_rt/CONTEXT.md`, `beam_rt/src/boot/CONTEXT.md`, `beam_rt/src/native/CONTEXT.md`.
 
 ## Known Structural Debt (candidates for the next pass)
+- **Three capability gaps block the OTP `eunit` framework** (proven by minimal runs; with them patched out in a scratch copy, `eunit:test/1` passes a plain `_test`-function module):
+  (1) `erlang:phash/2` and `phash2/1,2` raise the typed `unsupported_bif` for an **internal reference** — `beam_term/src/hashing/make_hash.rs:334` / `make_hash2.rs:507` return `TermError::RefIdentityUnavailable`, mapped by `beam_bifs/src/compare.rs:293-295` — so `dict:store(Ref, V, D)` (which hashes unconditionally, `dict.erl:373-377` via `dict.erl:676`'s `phash/2`) kills `eunit_server` on its first job;
+  (2) `is_function2` with a **register** arity operand is refused (`beam_engine/src/interpreter/test.rs:147`), which is what `is_function(F, N)` with a variable `N` compiles to (`eunit_data.erl:552`);
+  (3) `erlang:fun_info_mfa/1` raises `unsupported_bif` for a **compiled module's own** `make_fun3` local fun (`beam_bifs/src/fun_info.rs`, `FunKind::Local` arm's `local_fun_identity(fun)? == None` branch) where the oracle answers `{M,'-f/N-fun-K',A}` — every `_test_` fun spec reaches it through `eunit_data.erl:542`.
+  Maps and ETS are unaffected: a ref key in `maps:put/3` or `ets:insert/2` works (neither goes through `make_hash`/`make_hash2`).
+- **A raise whose reason atom is in neither the host's live namespace nor the running module's load-time snapshot does not land in a live catch frame — it escapes the process.**
+  The engine declines rather than fabricating a term (`beam_engine/src/interpreter/bif.rs:555-560`, resolving through `machine/catch.rs:884`'s `namespace_atom`), and `beam_rt` deliberately does not name a **capability-gap** reason (`context/calls.rs:1401-1403` returns before interning when `error::unsupported_reason` matches).
+  Consequence: a program's `try ... catch C:R:S` cannot observe an `unsupported_bif` raise unless its own module contains that literal atom — pinned by a minimal pair, where a module naming the atom in an unrelated function catches `try erlang:phash(make_ref(),16)` and an otherwise identical module lets the same raise escape.
+- **BIF-dispatch tracing is `BEAM_RT_BOOT_TRACE`, not `BEAM_RT_DEBUG_DIST`.** `RuntimeContext::call_bif` gates both its `ENTER` and its `call_bif … -> {error:?}` line on `debug_trace::enabled()` (`beam_rt/src/context/execution.rs:166,175`; `debug_trace.rs:52` reads `BEAM_RT_BOOT_TRACE`), and the failure is rendered as `-> Raise(Raise { … })`, so grepping the trace for the word `error` finds nothing.
 - **A.4 port/driver residuals** (each a typed error, never a wrong result): (a) a **header-less** read of a
   built-in driver port (`tcp_inet`/`udp_inet` passive `recv`, still on `beam_io`'s flat
   `DriverContext::input()` sink) arrives as list elements where the C answers a binary on a `[binary]` port —
