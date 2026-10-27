@@ -462,3 +462,73 @@ improving: `8` and `16` are clearly worse on both axes, and `48`/`64` trade a de
 merge.
 This is a choice, not a contract — `Interior` promises no fanout — and the knob is the pair of
 consts in `src/ordered_interior/node.rs` (`MIN_OCCUPANCY` is derived, `ORDER / 2`).
+
+## 4. The `ets:*` copy path's *bookkeeping* cost — instructions per op, before → after
+
+`copy_bound/ets_copy` was ~**27 000 instructions/op** on rust against the oracle's ~5 390 (wall
+ratio 6.7–9.8×). The term model is not the problem: the op performs exactly **two
+materialisations** (71 words / 27 objects in, 71 / 27 out). The excess was *bookkeeping* — the
+`TermStore`'s per-object run accounting, a SipHash lookup per copied object, a linear size-bucket
+scan per released run and a second key hash per `ets:insert`. §4 records what each fix bought.
+
+### Method (deterministic, not wall time)
+
+Instructions are what the fix moves, so instructions are what is reported. The workload is the
+bench's own embedded `etf/ets_copy` module (`tools/bench/src/workloads/copy_bound.rs`
+`module_source()`, staged verbatim: 5-key map payload of 71 words / 27 objects, `ets:insert(Tab,
+{k, T})` then `ets:lookup(Tab, k)` on one `set` table with one key), run as
+
+```text
+erlc -o <scratch> bench_copy_bound.erl
+perf stat -e cpu_core/instructions/u -x, taskset -c 3 \
+    erts_rust/target/release/beam_rt -pa <scratch> run <scratch>/bench_copy_bound.beam \
+    bench_copy_bound:ets_copy/1 <N>
+```
+
+at `N = 100 000` and `N = 0`, three alternating pairs:
+`instr/op = (instr(N) − instr(0)) / N`. The subtraction cancels the whole ~1.44 G-instruction boot
+(preloaded modules + JIT), which is why the figure is stable to **±0.15 %** across repeats on a
+host whose 1-minute load moved between `5.98` and `6.38` during the runs — the same measurement on
+the same binary reproduced `20 801 / 20 808 / 20 990` across sessions. (The oracle side is not
+measured this way here; the 5 390 figure is the one the profiling pass recorded, and it is quoted
+for scale only.)
+
+The wall-clock companion is the bench's own paired marginal (§6.7 of `tools/bench/RESULTS.md` for
+the recording conventions): at `/proc/loadavg` **6.15** `case_ets_copy_ns_per_op` reads
+**1 057.4 ns** (paired median 264.341 ms over `N = 250 000`, noise ±4.672 ms, min 254.824 / max
+267.492); the pre-change record on this host (load ≈ 15) read **1 515.6 ns**, i.e. **0.70×** — the
+same direction and roughly the same size as the instruction ratio (**0.758×**), with the load
+difference the reason the two ratios do not coincide exactly.
+
+### The four levers, per lever
+
+| # | locus | change | instr/op |
+|---|---|---|---|
+| — | — | baseline (all four open) | **27 440** |
+| 2 | `src/store/mod.rs` `release`/`take_free_run` | the free runs were a `Vec<(usize, Vec<AllocSlice>)>` **scanned linearly** on every release *and* every reuse (28 releases per op, each scanning the distinct-size list); now `free_runs[n]` is the bucket of `n`-word runs — the bucket is derived, not searched (an overflow list keeps runs > `FREE_RUN_BUCKETS = 32` words) | **−4 586** |
+| 1 | `src/store/mod.rs` `copy`/`free`/`tracked` | the run list a `copy` filled was allocated from capacity 0 and dropped by `free` on every op (6 reallocations/op); the drained list is now pooled (`spare_runs`, capped at `SPARE_RUN_BUFFERS = 4`) and taken at the *start* of the next copy, and `tracked`'s SipHash (548 instr/op) is replaced by `RootHasher`, a finalising multiply over the store's own object roots | **−1 864** |
+| 3 | `src/table/mod.rs` `insert_stored`, `src/table/interior.rs`, `champ_interior.rs`, `hash_interior/mod.rs` | the key was hashed twice per upsert (replace probe + insert) and the probe built a throwaway `vec![object]`; `insert_hashed`/`lookup_one_hashed` thread **one** `term_hash` through both halves and answer an `Option` | **−182** |
+| — | — | after levers 1–3 | **20 801** |
+| 4 | `crates/beam_bifs/src/ets.rs` `selection_objects` | `vec![selection]` per single-object `ets:insert/2` — **not applied** (outside this node's write scope) | open |
+
+The lever-2 and lever-1 splits were isolated by rebuilding with each change reverted in turn
+(lever 2 restored: **25 394** instr/op; lever 3 measured on top of 1+2: 20 990 → 20 808). Lever 4
+is a real allocation on the same caller's path — one malloc/free per `ets:insert` — but it is
+`beam_bifs`'s to make: `selection_objects` should return a two-variant `Selection`
+(`Single(Eterm)` → `core::slice::from_ref`, `List(Vec<Eterm>)`), which both of its call sites
+already consume as a slice.
+
+Lever 3 is small *because the key is an immediate*: `term_hash` of an atom or small int is a few
+instructions, so one of three hashes per op was never the expensive one — the profiling pass's
+"`beam_term` hashing 5.8 %" is dominated by the payload map's five key hashes, which no ETS-side
+change touches.
+
+### What was deliberately NOT changed
+
+- **`beam_term::size` / the copy-boundary pricing walk** — 0.04 % of the op post hint-gate, and the
+  path-set drop that would have made it cheaper is unsound.
+- **Observable semantics.** Which object wins on a duplicate key, key equality/ordering, `size`,
+  `lookup`/`select`/`tab2list`/`first`/`next` and `ets:info/2` (including `lock_count` and the
+  bucket-chain histogram) are untouched: the run buckets are an *accounting* index over the same
+  runs (`TermStore::words`/`blocks`/`memory` bookkeeping is identical — every word is still counted
+  once, and a reused run is still exact-fit), and the hash is only *carried*.
