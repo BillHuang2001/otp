@@ -53,6 +53,10 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   site becomes `Step::Suspend { func, pc }` — the calling instruction left completely un-applied — while the
   non-idempotent `erlang:apply/3` route (`families/funs/mod.rs`) reports the typed `unsupported` instead.
 - `test.rs` — `Machine::eval_test` (all 25 `TestKind`s) + `eval_is_function2`/`eval_is_tagged_tuple`/`eval_test_arity`.
+  The `arity_operand` note: those three arity-shaped tests resolve their arity argument through
+  `Machine::arity_operand` (a literal small int without materializing a term, every other operand form through
+  `read_operand`), so a register- or `Y`-held arity is **evaluated**; a non-integer arity or one outside the
+  instruction's range **fails the instruction** (C's `$FAIL`, never `badarg`).
 - `trace.rs` — the contract-A.8 `call`/`return_from`/`return_to` emission (gated on `Machine::trace_on`).
 - `tests.rs` — the unit tests migrated from the former single-file `interpreter.rs`.
 
@@ -221,8 +225,9 @@ oracle-succeeds-but-we-bail site remains there).
     (`:282`), and `run: unknown module context` (`mod.rs:673`, `drive.rs:149/222`) — internal frame/context
     bookkeeping; only a bug in this crate or a malformed image reaches them.
   - `run_export: export not found` (`run.rs:116`), `process_info: function index out of range` (`location.rs:426`),
-    the `operand: …` arms (`operand.rs:82/83/165/167/169/194/195`), `test: missing argument` (`test.rs:229`), the
-    `*: arity operand` arms (`test.rs:147/166/210`) — all "the IR/operand is not shaped as this arm requires".
+    the `operand: …` arms (`operand.rs:82/83/165/167/169/194/195`), `test: missing argument` /
+    `test: missing arity argument` (`test.rs`) — all "the IR/operand is not shaped as this arm requires"
+    (a *present* arity operand is evaluated, never refused: see the `arity_operand` note below).
 - **Class 2 — capability gaps owned OUTSIDE this node** (a typed error here is honest; the fix lives in the owner).
   - `Instr::Generic` sentinel → `Err(error::unsupported(op.name()))` (`generic.rs:44`): the loader emitted no typed
     variant. **0 corpus occurrences** (the whole-OTP census loads 1366 `.beam` / 2,888,257 instructions with zero

@@ -793,13 +793,15 @@ fn test_arity_matches_tuple_arity() {
     let mut tuple_words = [make_arityval(2), make_small(1), make_small(2)];
     let tuple = make_boxed(tuple_words.as_mut_ptr());
 
-    let build = |arity: i64| {
+    // `test_arity Fail Value Arity` — args = [Value, Arity]; a **register** arity is
+    // `Operand::X(1)` over two call arguments (`args` fills x(0..)).
+    let build = |args: &[Eterm], arity: Operand| {
         let code = vec![
             Instr::Label(Label(1)),
             Instr::Test {
                 kind: TestKind::TestArity,
                 fail: Label(2),
-                args: vec![Operand::X(0), Operand::Integer(arity)],
+                args: vec![Operand::X(0), arity],
             },
             Instr::Move {
                 src: Operand::Integer(1),
@@ -814,15 +816,42 @@ fn test_arity_matches_tuple_arity() {
             Instr::Return,
         ];
         let mut fixture = Fixture::new();
-        let entry = fixture.add_function("t", 1, code);
+        let entry = fixture.add_function("t", args.len() as u32, code);
         let module = fixture.finish();
-        run(&module, entry, &[tuple])
+        run(&module, entry, args)
     };
 
-    assert_eq!(build(2).map_err(|_| ()), Ok(make_small(1)));
-    assert_eq!(build(3).map_err(|_| ()), Ok(make_small(0)));
+    assert_eq!(
+        build(&[tuple], Operand::Integer(2)).map_err(|_| ()),
+        Ok(make_small(1))
+    );
+    assert_eq!(
+        build(&[tuple], Operand::Integer(3)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
     // A negative/out-of-range arity can never match a tuple.
-    assert_eq!(build(-1).map_err(|_| ()), Ok(make_small(0)));
+    assert_eq!(
+        build(&[tuple], Operand::Integer(-1)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A **register-held** arity is evaluated: the same tuple answers the same verdict
+    // for the same integer, and a non-integer register arity fails the instruction
+    // (C compares the tuple's header word against the operand) — never a typed error.
+    assert_eq!(
+        build(&[tuple, make_small(2)], Operand::X(1)).map_err(|_| ()),
+        Ok(make_small(1))
+    );
+    assert_eq!(
+        build(&[tuple, make_small(3)], Operand::X(1)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    for arity in [make_atom_local(9), NIL, make_small(-1)] {
+        assert_eq!(
+            build(&[tuple, arity], Operand::X(1)).map_err(|_| ()),
+            Ok(make_small(0)),
+            "a 2-tuple with the non-integer register arity {arity:?} must fail"
+        );
+    }
 }
 
 #[test]
@@ -880,8 +909,10 @@ fn is_function2_matches_a_fun_of_the_given_arity() {
     let mut ctx = MinimalContext::new();
     let fun = beam_engine::terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).unwrap();
 
-    // `is_function2 Fail Fun Arity` — args = [Fun, {integer,Arity}].
-    let build = |value: Eterm, arity: Operand| {
+    // `is_function2 Fail Fun Arity` — args = [Fun, Arity]; `args` is also what lands
+    // in x(0..), so a **register** arity operand is `Operand::X(1)` over two call
+    // arguments.
+    let build = |args: &[Eterm], arity: Operand| {
         let code = vec![
             Instr::Label(Label(1)),
             Instr::Test {
@@ -902,28 +933,58 @@ fn is_function2_matches_a_fun_of_the_given_arity() {
             Instr::Return,
         ];
         let mut fixture = Fixture::new();
-        let entry = fixture.add_function("t", 1, code);
+        let entry = fixture.add_function("t", args.len() as u32, code);
         let module = fixture.finish();
-        run(&module, entry, &[value])
+        run(&module, entry, args)
     };
 
     // A fun of the matching arity succeeds; the wrong arity fails.
     assert_eq!(
-        build(fun, Operand::Integer(2)).map_err(|_| ()),
+        build(&[fun], Operand::Integer(2)).map_err(|_| ()),
         Ok(make_small(1))
     );
     assert_eq!(
-        build(fun, Operand::Integer(3)).map_err(|_| ()),
+        build(&[fun], Operand::Integer(3)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A negative or out-of-small-range literal arity can never match.
+    assert_eq!(
+        build(&[fun], Operand::Integer(-1)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    assert_eq!(
+        build(&[fun], Operand::Integer(i64::MAX)).map_err(|_| ()),
         Ok(make_small(0))
     );
     // A non-fun value fails regardless of the arity literal.
     assert_eq!(
-        build(make_small(1), Operand::Integer(2)).map_err(|_| ()),
+        build(&[make_small(1)], Operand::Integer(2)).map_err(|_| ()),
         Ok(make_small(0))
     );
-    // A malformed (non-integer) arity operand is a typed error, never a wrong
-    // result — and only reached for a real fun (the non-fun case short-circuits).
-    assert!(build(fun, Operand::X(1)).is_err());
+    // A **register-held** arity is evaluated, exactly like the literal — this is the
+    // `test,is_function2` the OTP-30 compiler emits for `is_function(F, N)` with a
+    // variable `N` (`lib/compiler/src/beam_ssa_codegen.erl:2054`), the shape that
+    // blocked `eunit` (`lib/eunit/src/eunit_data.erl:552`).
+    assert_eq!(
+        build(&[fun, make_small(2)], Operand::X(1)).map_err(|_| ()),
+        Ok(make_small(1))
+    );
+    assert_eq!(
+        build(&[fun, make_small(3)], Operand::X(1)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A **non-integer** register arity fails the instruction — the C's `$FAIL`
+    // (`emu/instrs.tab:963` folds `erl_is_function`'s `badarg` into it) — never a
+    // typed error and never a raise. Oracle: a guard `g(F,N) when is_function(F,N)`
+    // with such an `N` takes the next clause, and a single-clause `g/2` raises
+    // `function_clause`.
+    for arity in [make_atom_local(9), NIL, make_small(-1)] {
+        assert_eq!(
+            build(&[fun, arity], Operand::X(1)).map_err(|_| ()),
+            Ok(make_small(0)),
+            "a fun with the non-integer register arity {arity:?} must fail the test"
+        );
+    }
 }
 
 #[test]
@@ -935,18 +996,15 @@ fn is_tagged_tuple_matches_the_arity_and_the_tag() {
     let mut words = [make_arityval(2), beam_term::make_atom(tag), make_small(9)];
     let tuple = make_boxed(words.as_mut_ptr());
 
-    // `is_tagged_tuple Fail Src Arity Tag` — args = [Src, {integer,Arity}, Tag].
-    let build = |value: Eterm, arity: i64, tag_operand: Atom| {
+    // `is_tagged_tuple Fail Src Arity Tag` — args = [Src, Arity, Tag]; a **register**
+    // arity is `Operand::X(1)` over two call arguments (`args` fills x(0..)).
+    let build = |args: &[Eterm], arity: Operand, tag_operand: Atom| {
         let code = vec![
             Instr::Label(Label(1)),
             Instr::Test {
                 kind: TestKind::IsTaggedTuple,
                 fail: Label(2),
-                args: vec![
-                    Operand::X(0),
-                    Operand::Integer(arity),
-                    Operand::Atom(tag_operand),
-                ],
+                args: vec![Operand::X(0), arity, Operand::Atom(tag_operand)],
             },
             Instr::Move {
                 src: Operand::Integer(1),
@@ -961,24 +1019,191 @@ fn is_tagged_tuple_matches_the_arity_and_the_tag() {
             Instr::Return,
         ];
         let mut fixture = Fixture::new();
-        let entry = fixture.add_function("t", 1, code);
+        let entry = fixture.add_function("t", args.len() as u32, code);
         let module = fixture.finish();
-        run(&module, entry, &[value])
+        run(&module, entry, args)
     };
 
     // Matching arity and tag.
-    assert_eq!(build(tuple, 2, tag).map_err(|_| ()), Ok(make_small(1)));
-    // Right tag, wrong arity.
-    assert_eq!(build(tuple, 3, tag).map_err(|_| ()), Ok(make_small(0)));
-    // Right arity, wrong tag.
-    assert_eq!(build(tuple, 2, other).map_err(|_| ()), Ok(make_small(0)));
-    // A negative or out-of-range arity can never match a tuple.
-    assert_eq!(build(tuple, -1, tag).map_err(|_| ()), Ok(make_small(0)));
-    // A non-tuple value fails.
     assert_eq!(
-        build(make_small(1), 2, tag).map_err(|_| ()),
+        build(&[tuple], Operand::Integer(2), tag).map_err(|_| ()),
+        Ok(make_small(1))
+    );
+    // Right tag, wrong arity.
+    assert_eq!(
+        build(&[tuple], Operand::Integer(3), tag).map_err(|_| ()),
         Ok(make_small(0))
     );
+    // Right arity, wrong tag.
+    assert_eq!(
+        build(&[tuple], Operand::Integer(2), other).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A negative or out-of-range arity can never match a tuple.
+    assert_eq!(
+        build(&[tuple], Operand::Integer(-1), tag).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A non-tuple value fails.
+    assert_eq!(
+        build(&[make_small(1)], Operand::Integer(2), tag).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A **register-held** arity is evaluated: the same tuple + tag answers the same
+    // verdict for the same integer, and a non-integer register arity fails the
+    // instruction (C compares the tuple's header word against the operand, so
+    // nothing but a small integer can match) instead of erroring out.
+    assert_eq!(
+        build(&[tuple, make_small(2)], Operand::X(1), tag).map_err(|_| ()),
+        Ok(make_small(1))
+    );
+    assert_eq!(
+        build(&[tuple, make_small(3)], Operand::X(1), tag).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    for arity in [make_atom_local(9), NIL, make_small(-1)] {
+        assert_eq!(
+            build(&[tuple, arity], Operand::X(1), tag).map_err(|_| ()),
+            Ok(make_small(0)),
+            "a tagged tuple with the non-integer register arity {arity:?} must fail"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arity operands held in a register (all three arity-shaped tests)
+// ---------------------------------------------------------------------------
+
+/// Run exported `function/args.len()` on `tier` over a fresh machine + context.
+fn run_one_tier(
+    module: &Module,
+    function: Atom,
+    args: &[Eterm],
+    tier: Tier,
+) -> Result<Eterm, BeamError> {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    machine.run_with_tier(module, function, args.len() as u32, args, &mut ctx, tier)
+}
+
+/// Build `f/arity` = "fail `Label(2)` when the test fails, else return 1" around one
+/// `test` instruction whose argument list is `test_args`, and export it.
+fn arity_test_module(kind: TestKind, test_args: Vec<Operand>, arity: u32) -> (Module, Atom) {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Test {
+            kind,
+            fail: Label(2),
+            args: test_args,
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", arity, code);
+    let name = fixture
+        .module
+        .atom_table
+        .lookup("f")
+        .expect("`f` was just interned");
+    fixture.module.exports.push(Export {
+        function: name,
+        arity,
+        label: entry,
+    });
+    (fixture.finish(), name)
+}
+
+/// The three arity-shaped tests with their arity operand in a **register** agree
+/// across the two tiers (and with the oracle), for a matching small integer, a
+/// non-matching one and a non-integer.
+///
+/// This is the shape the OTP-30 compiler emits for a variable arity —
+/// `lib/compiler/src/beam_ssa_codegen.erl:2054` lowers `is_function(F, N)` to
+/// `test,is_function2` with `N` still in a register, the code `eunit` died on
+/// (`lib/eunit/src/eunit_data.erl:552 check_arity/3`) — and the shape the OTP-29
+/// system `erlc` does **not** emit (it keeps `bif,is_function`), so no installed
+/// `.beam` can carry it and the module has to be hand-built.
+///
+/// The baseline tier deliberately declines this shape (`emit/test.rs`
+/// `arity_operand` refuses a non-literal operand, so the instruction deopts through
+/// `jit_step_one` to the interpreter arm) — which is precisely why the two tiers
+/// must agree: on the JIT the interpreter arm *is* the answer.
+///
+/// ```
+/// %% the oracle's verdicts (OTP 29.1.2), the same for both tiers:
+/// erl -noshell -eval 'F = fun(_,_) -> ok end,
+///   [io:format("~p~n", [f(F, N)]) || N <- [2, 3, x]], halt().'
+/// ```
+#[test]
+fn arity_shaped_tests_evaluate_a_register_operand_on_both_tiers() {
+    let mut ctx = MinimalContext::new();
+    let fun = beam_engine::terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).unwrap();
+    let mut tuple_words = [make_arityval(2), make_small(1), make_small(2)];
+    let tuple = make_boxed(tuple_words.as_mut_ptr());
+    let tag = Atom::from_raw(11);
+    let mut tagged_words = [make_arityval(2), beam_term::make_atom(tag), make_small(9)];
+    let tagged = make_boxed(tagged_words.as_mut_ptr());
+
+    // `is_function2 Fail Fun Arity` — args[1] = `Arity`, in x(1).
+    let (is_fun_module, is_fun_name) =
+        arity_test_module(TestKind::IsFunction2, vec![Operand::X(0), Operand::X(1)], 2);
+    // `test_arity Fail Value Arity`.
+    let (arity_module, arity_name) =
+        arity_test_module(TestKind::TestArity, vec![Operand::X(0), Operand::X(1)], 2);
+    // `is_tagged_tuple Fail Src Arity Tag` — the tag stays a literal atom.
+    let (tagged_module, tagged_name) = arity_test_module(
+        TestKind::IsTaggedTuple,
+        vec![Operand::X(0), Operand::X(1), Operand::Atom(tag)],
+        2,
+    );
+
+    // (label, module, exported function, call args, oracle verdict)
+    let rows: [(&str, &Module, Atom, Vec<Eterm>, i64); 9] = [
+        ("is_function2/2 arity", &is_fun_module, is_fun_name, vec![fun, make_small(2)], 1),
+        ("is_function2/3 arity", &is_fun_module, is_fun_name, vec![fun, make_small(3)], 0),
+        (
+            "is_function2 atom arity",
+            &is_fun_module,
+            is_fun_name,
+            vec![fun, make_atom_local(9)],
+            0,
+        ),
+        ("test_arity 2", &arity_module, arity_name, vec![tuple, make_small(2)], 1),
+        ("test_arity 3", &arity_module, arity_name, vec![tuple, make_small(3)], 0),
+        (
+            "test_arity atom arity",
+            &arity_module,
+            arity_name,
+            vec![tuple, make_atom_local(9)],
+            0,
+        ),
+        ("is_tagged_tuple 2", &tagged_module, tagged_name, vec![tagged, make_small(2)], 1),
+        ("is_tagged_tuple 3", &tagged_module, tagged_name, vec![tagged, make_small(3)], 0),
+        (
+            "is_tagged_tuple atom arity",
+            &tagged_module,
+            tagged_name,
+            vec![tagged, make_atom_local(9)],
+            0,
+        ),
+    ];
+    for (label, module, function, args, want) in rows {
+        let interpreter = run_one_tier(module, function, &args, Tier::Interpreter).map_err(|_| ());
+        let baseline = run_one_tier(module, function, &args, Tier::BaselineJit).map_err(|_| ());
+        assert_eq!(interpreter, Ok(make_small(want)), "{label}: interpreter");
+        assert_eq!(baseline, Ok(make_small(want)), "{label}: baseline-jit");
+        assert_eq!(baseline, interpreter, "{label}: the two tiers disagree");
+    }
 }
 
 // ---------------------------------------------------------------------------

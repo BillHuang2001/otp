@@ -23,8 +23,8 @@
 use beam_common::Result;
 use beam_loader::{Module, Operand, TestKind};
 use beam_term::{
-    cmp, cmp_arith, is_atom, is_internal_pid, is_internal_port, is_nil, is_not_nil_list,
-    make_atom, Eterm, MAX_ARITYVAL,
+    cmp, cmp_arith, is_atom, is_internal_pid, is_internal_port, is_nil, is_not_nil_list, is_small,
+    make_atom, signed_value, Eterm, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL,
 };
 
 use crate::context::ExecutionContext;
@@ -132,20 +132,35 @@ impl Machine {
 
     /// `is_function2 Fail Fun Arity` — `Fun` is a fun of the given arity.
     ///
-    /// Operand order is the file's (`emu/ops.tab:831`, verified against the oracle:
-    /// `{test,is_function2,{f,N},[Fun,{integer,Arity}]}`), i.e. `args[0]` = `Fun`,
-    /// `args[1]` = `Arity` (an integer operand).
+    /// Operand order is the file's (`emu/ops.tab:831`), i.e. `args[0]` = `Fun`,
+    /// `args[1]` = `Arity` — a literal `{integer,N}` when the compiler folded it,
+    /// otherwise an ordinary **source** operand (a register, or a type-annotated
+    /// register: `{tr,{x,1},…}`), which is evaluated like every other test operand.
+    ///
+    /// The arity operand's semantics are `erl_is_function`'s
+    /// (`../../erts/emulator/beam/erl_bif_op.c:237`), the body the C runs on its
+    /// *cold* arm for a non-small arity (`emu/instrs.tab:963` `cold_is_function2`,
+    /// `emu/ops.tab:834`; the JIT does the same through a runtime call,
+    /// `jit/x86/instr_common.cpp:1315`): a small integer is compared with the fun's
+    /// `fun_arity`, a positive bignum can never match, and every other arity
+    /// (negative small, negative bignum, atom, float, tuple, list, …) is the BIF's
+    /// `badarg`. In the **instruction** that error is not raised —
+    /// `cold_is_function2` folds `erl_is_function(…) != am_true` into `$FAIL(Fail)`
+    /// — so every non-matching case, the `badarg` ones included, is a plain
+    /// fail-label failure. Measured on the oracle: with
+    /// `g(F,N) when is_function(F,N) -> yes; g(_,_) -> no.`, `N = an_atom | true |
+    /// 1.0 | -1 | 1 bsl 100 | -(1 bsl 100) | {a} | [2] | 1 154 921 504 606 846 975`
+    /// all answer `no`, and a single-clause `g/2` raises `function_clause`, never
+    /// `badarg` (only the `erlang:is_function/2` *BIF* raises `badarg`).
     fn eval_is_function2(&self, args: &[Operand], ctx: &mut dyn ExecutionContext) -> Result<bool> {
         let value = self.test_arg(args, 0, ctx)?;
         if !crate::terms::is_fun(value) {
             return Ok(false);
         }
-        match args.get(1) {
-            Some(Operand::Integer(arity)) if *arity >= 0 && *arity <= u32::MAX as i64 => {
-                Ok(crate::terms::fun_arity(value)? == *arity as u32)
-            }
-            _ => Err(error::unsupported("is_function2: arity operand")),
-        }
+        let Some(arity) = self.arity_operand(args, 1, ctx)? else {
+            return Ok(false);
+        };
+        Ok(arity >= 0 && u64::from(crate::terms::fun_arity(value)?) == arity as u64)
     }
 
     /// `is_tagged_tuple Fail Src Arity Tag` — `Src` is a tuple of `Arity` whose first
@@ -153,17 +168,23 @@ impl Machine {
     ///
     /// Operand order is the file's (`emu/ops.tab:664`; verified against the oracle:
     /// `{test,is_tagged_tuple,{f,N},[{x,0},3,{atom,r}]}`), i.e. `args[0]` = `Src`,
-    /// `args[1]` = `Arity` (an integer), `args[2]` = `Tag` (an atom) — the same layout
+    /// `args[1]` = `Arity` (an `A`-typed operand: an integer literal in compiler
+    /// output), `args[2]` = `Tag` (an atom) — the same layout
     /// `beam_loader::TestKind::IsTaggedTuple` documents.
+    ///
+    /// C compares the tuple's *header word* with the arity operand
+    /// (`emu/instrs.tab:1023` `is_tagged_tuple`: `(tuple_val(term))[0] ==
+    /// $Arityval`), so an arity operand denoting anything but a small integer can
+    /// never match; [`Machine::arity_operand`] evaluates it and that case is a
+    /// fail-label failure, exactly like the out-of-range integer it already was.
     fn eval_is_tagged_tuple(
         &self,
         args: &[Operand],
         ctx: &mut dyn ExecutionContext,
     ) -> Result<bool> {
         let value = self.test_arg(args, 0, ctx)?;
-        let arity = match args.get(1) {
-            Some(Operand::Integer(arity)) => *arity,
-            _ => return Err(error::unsupported("is_tagged_tuple: arity operand")),
+        let Some(arity) = self.arity_operand(args, 1, ctx)? else {
+            return Ok(false);
         };
         // A tagged tuple has at least the tag element and its arity always fits
         // `MAX_ARITYVAL`; any other operand can never match, so the test fails.
@@ -197,17 +218,58 @@ impl Machine {
     /// with an immediate, because the loader rewrites that operand to a jump
     /// (`emu/ops.tab:686`), so the engine is behaviourally equivalent — only strictly
     /// safer.
+    ///
+    /// The arity operand is `A`-typed, so compiler output always carries an integer
+    /// literal; a non-literal operand is nevertheless **evaluated**
+    /// ([`Machine::arity_operand`]) and, like any term that is not the tuple's
+    /// header-word arity, fails the instruction — never a typed error.
     fn eval_test_arity(&self, args: &[Operand], ctx: &mut dyn ExecutionContext) -> Result<bool> {
         let value = self.test_arg(args, 0, ctx)?;
-        match args.get(1) {
+        let Some(arity) = self.arity_operand(args, 1, ctx)? else {
+            // No real tuple has a non-integer, negative or out-of-range arity.
+            return Ok(false);
+        };
+        if arity < 0 || arity > MAX_ARITYVAL as i64 {
+            return Ok(false);
+        }
+        Ok(predicates::is_tuple_arity(value, arity as usize))
+    }
+
+    /// Resolve a test instruction's **arity operand** (argument `i`) to the integer
+    /// it denotes, or `None` when it denotes anything else.
+    ///
+    /// `is_tagged_tuple`/`test_arity` take an `A`-typed operand (always an integer
+    /// literal in compiler output), but `is_function2`'s is an ordinary **source**
+    /// operand: the OTP-30 compiler's `bif_to_test`
+    /// (`../../lib/compiler/src/beam_ssa_codegen.erl:2054`) rewrites
+    /// `is_function(F, N)` into `test,is_function2` with `N` still in a register,
+    /// which is the shape that killed `eunit_data:check_arity/3`
+    /// (`../../lib/eunit/src/eunit_data.erl:552`). So all three **evaluate** the
+    /// operand instead of requiring a literal.
+    ///
+    /// A literal is answered without materializing a term — an integer literal
+    /// outside the small range is a bignum, and a bignum can never equal an arity —
+    /// and every other operand form goes through [`read_operand`], the same door
+    /// `args[0]` takes.
+    fn arity_operand(
+        &self,
+        args: &[Operand],
+        i: usize,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Option<i64>> {
+        match args.get(i) {
             Some(Operand::Integer(arity)) => {
-                if *arity < 0 || *arity > MAX_ARITYVAL as i64 {
-                    // No real tuple has a negative or out-of-range arity.
-                    return Ok(false);
-                }
-                Ok(predicates::is_tuple_arity(value, *arity as usize))
+                Ok((MIN_SMALL..=MAX_SMALL).contains(arity).then_some(*arity))
             }
-            _ => Err(error::unsupported("test_arity: arity operand")),
+            Some(operand) => {
+                let value = read_operand(self, ctx, operand)?;
+                Ok(if is_small(value) {
+                    Some(signed_value(value))
+                } else {
+                    None
+                })
+            }
+            None => Err(error::unsupported("test: missing arity argument")),
         }
     }
 
@@ -368,6 +430,151 @@ mod tests {
             t2,
             MAX_ARITYVAL as i64 + 1
         ));
+    }
+
+    /// Evaluate `kind` with the call arguments in `x(0..call_args.len())` and
+    /// `operands` as the instruction's argument list.
+    ///
+    /// `ctx` is threaded in so the arena holding the boxed terms outlives the call.
+    fn eval_operands(
+        ctx: &mut MinimalContext,
+        machine: &mut Machine,
+        module: &Module,
+        kind: TestKind,
+        call_args: &[Eterm],
+        operands: &[Operand],
+    ) -> Result<bool> {
+        for (slot, value) in call_args.iter().enumerate() {
+            machine.x_mut()[slot] = *value;
+        }
+        machine.eval_test(module, kind, operands, ctx)
+    }
+
+    /// The three arity-shaped tests **evaluate** an arity operand held in a register
+    /// (`{x,1}`), and a non-integer arity simply fails the instruction.
+    ///
+    /// The C ground truth: `cold_is_function2` (`emu/instrs.tab:963`) calls
+    /// `erl_is_function` (`erl_bif_op.c:237`) for a non-literal arity and folds its
+    /// every non-`true` answer — `badarg` included — into `$FAIL(Fail)`;
+    /// `test_arity`/`is_tagged_tuple` compare the tuple's header word against the
+    /// operand (`emu/instrs.tab:1055`, `:1023`), which no non-integer term can equal.
+    /// So a non-integer arity is a **fail-label** failure, never a typed error.
+    ///
+    /// Oracle (OTP 29.1.2), the same verdict every time:
+    /// `erl -noshell -eval 'F = fun(_,_) -> ok end,
+    ///   [io:format("~p~n",[g(F,N)]) || N <- [2, 3, x, true, 1.0, -1, 1 bsl 100]]'
+    /// with `g(F,N) when is_function(F,N) -> yes; g(_,_) -> no.` answers
+    /// `yes no no no no no no` (and a single-clause `g/2` raises `function_clause`).
+    #[test]
+    fn the_arity_shaped_tests_evaluate_a_register_arity() {
+        let mut module = Module::default();
+        let an_atom = module.atom_table.intern("an_atom");
+        let mut ctx = MinimalContext::new();
+        let mut machine = Machine::new();
+
+        let fun = terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).expect("build a 2-arity fun");
+        let tuple = terms::make_tuple(&mut ctx, &[make_small(1), make_small(2)]).expect("tuple");
+        let tagged =
+            terms::make_tuple(&mut ctx, &[make_atom(an_atom), make_small(9)]).expect("tagged tuple");
+        let float = terms::make_float(&mut ctx, 1.5).expect("float");
+        let big = terms::make_integer(&mut ctx, i64::MAX).expect("bignum");
+
+        // `verdict(kind, call_args, operands)`: `Some(true)` = the test succeeded,
+        // `Some(false)` = it failed the instruction, `None` = it answered an error.
+        let mut verdict =
+            |kind: TestKind, call_args: &[Eterm], operands: &[Operand]| -> Option<bool> {
+                eval_operands(&mut ctx, &mut machine, &module, kind, call_args, operands).ok()
+            };
+        // The tag operand of `is_tagged_tuple` rides in x(2) for every kind (the
+        // other two ignore a third operand), so one shape covers all three.
+        let arity_operands = [Operand::X(0), Operand::X(1), Operand::X(2)];
+        let tag = make_atom(an_atom);
+
+        // A matching small integer succeeds; a non-matching one fails.
+        for (kind, value) in [
+            (TestKind::IsFunction2, fun),
+            (TestKind::TestArity, tuple),
+            (TestKind::IsTaggedTuple, tagged),
+        ] {
+            assert_eq!(
+                verdict(kind, &[value, make_small(2), tag], &arity_operands),
+                Some(true),
+                "{kind:?} must succeed for a matching register arity"
+            );
+            assert_eq!(
+                verdict(kind, &[value, make_small(3), tag], &arity_operands),
+                Some(false),
+                "{kind:?} must fail for a non-matching register arity"
+            );
+        }
+
+        // Every non-integer arity fails the instruction — no typed error, no raise.
+        for arity in [make_atom(an_atom), NIL, float, big, make_small(-1)] {
+            for (kind, value) in [
+                (TestKind::IsFunction2, fun),
+                (TestKind::TestArity, tuple),
+                (TestKind::IsTaggedTuple, tagged),
+            ] {
+                assert_eq!(
+                    verdict(kind, &[value, arity, tag], &arity_operands),
+                    Some(false),
+                    "{kind:?} must FAIL (not error) for the non-integer arity {arity:?}"
+                );
+            }
+        }
+
+        // The `is_tagged_tuple` tag operand is still compared after the arity check.
+        assert_eq!(
+            verdict(TestKind::IsTaggedTuple, &[tagged, make_small(2), tag], &arity_operands),
+            Some(true)
+        );
+        assert_eq!(
+            verdict(
+                TestKind::IsTaggedTuple,
+                &[tagged, make_small(2), make_small(9)],
+                &arity_operands
+            ),
+            Some(false),
+            "a non-atom tag operand never matches the tuple's first element"
+        );
+    }
+
+    /// An instruction with **no** arity operand is a structural error (a malformed
+    /// module), never a silently-failing test.
+    ///
+    /// The arity operand is only reached once the *first* operand has passed its own
+    /// type test, so each kind is driven with a value that reaches it: a fun for
+    /// `is_function2` (a non-fun short-circuits to a plain failure, exactly as the C
+    /// does), a 2-tuple for `test_arity`, a tagged tuple for `is_tagged_tuple`.
+    #[test]
+    fn a_missing_arity_operand_is_a_typed_error() {
+        let mut module = Module::default();
+        let an_atom = module.atom_table.intern("an_atom");
+        let mut ctx = MinimalContext::new();
+        let mut machine = Machine::new();
+        let fun = terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).expect("build a 2-arity fun");
+        let tuple = terms::make_tuple(&mut ctx, &[make_small(1), make_small(2)]).expect("tuple");
+        let tagged =
+            terms::make_tuple(&mut ctx, &[make_atom(an_atom), make_small(9)]).expect("tagged tuple");
+        let only_value = [Operand::X(0)];
+        for (kind, value) in [
+            (TestKind::IsFunction2, fun),
+            (TestKind::TestArity, tuple),
+            (TestKind::IsTaggedTuple, tagged),
+        ] {
+            let err = eval_operands(
+                &mut ctx,
+                &mut machine,
+                &module,
+                kind,
+                &[value],
+                &only_value,
+            );
+            assert!(
+                err.is_err(),
+                "{kind:?} with no arity operand must be an error"
+            );
+        }
     }
 
     /// The oracle's answer for `{module_info,0} < {g,1}` (atom **name** order), or
