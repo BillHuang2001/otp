@@ -1338,3 +1338,113 @@ is the break-even the automatic rule already encodes, read off the copy-work axi
   in-process signal of "The allocation-heavy workload" above (Immix 95–126 µs against copying 54–57 µs on five
   forced fullsweeps), never an assertion. (c) The `churn`/`copy_out` wall windows are 10–40 ms, so their wall
   ratios are directionally reproducible in every round of both sessions but are not precise figures.
+
+## The growth request carried into the collapse (the compile route, paired A/B)
+
+The mechanism: a `grow_nursery` call — the no-relocation seam a BIF copy-out takes, because its
+caller holds no root set and therefore cannot collect — records the room it could not wait for; the
+**next minor collapse** spends it once, as `min(young_after_collection_with_need(chain, live, need),
+max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × young_minor_target_words(live)))`. A fullsweep
+carries nothing (it already installs `next_words(2·live + 64)` plus a mature space sized for
+`2·(live + young_occupancy)`), and `ensure_capacity`'s own trailing growth records nothing. The
+question this section answers is whether spending the request beats collapsing back to a live-set-only
+nursery and re-growing on the next copy-out.
+
+### Method
+
+* Workload: the real in-process `compile:file/2` of `lib/stdlib/src/ordsets.erl` with
+  `[no_spawn_compiler_process, deterministic, {outdir, …}]` — the A.9 compile route, where the
+  copy-out gate is a BIF result moving into the process heap.
+* Probe: a small module printing `SELF`, `process_info(self(), [heap_size, total_heap_size, memory,
+  garbage_collection])` before and after, and `statistics(garbage_collection)` around the compile,
+  run as `beam_rt run probe.beam probe:go/0` with `BEAM_RT_VALVE_TRACE=1`. The probe embeds its own
+  absolute source path, so its bytes must be **re-baked for the worktree in use and then frozen and
+  shared by both arms**; the compiled artifact's md5 is the gate that matters, not the probe's.
+* Arms: `pre` = the release `beam_rt` of the tree before the change, `post` = the same binary built
+  from the changed tree. Interleaved pre, post, pre, post, pre, post; `taskset -c 3`; `GNU time -v`
+  for wall and max RSS; `/proc/loadavg` recorded before and after every run.
+* Load: **69.07 / 70.00 / 135.72** at the first run → **67.86 / 69.73 / 135.28** at the last, on a
+  shared 14-core host. Every deterministic counter below is **identical in all three rounds of an
+  arm**; only wall and RSS vary, so wall is not a result here.
+
+### The compiling process (`<0.35.2>`, the probe's own pid)
+
+| metric | pre | post | post/pre |
+|---|---|---|---|
+| admissions (= collections) | 1 210 | **608** | **0.503** |
+| debt-triggered / occupancy-triggered | 1 140 / 70 | 514 / 94 | — |
+| grew the nursery / collapsed only | 603 / 607 | 292 / 316 | — |
+| words copied | 1 135 465 | **962 449** | **0.848** |
+| final `heap_size` (words) | 121 530 | **987** | **0.0081** |
+| final `total_heap_size` (words) | 196 643 | 197 637 | 1.005 |
+| final `memory` (B) | 1 573 536 | 1 581 648 | 1.005 |
+| `minor_gcs` (minors since the last fullsweep) | 41 | 317 | — |
+| `need_peak` / mean chain capacity | 70 / 4 104 | 59 / 8 156 | — |
+| wall (s, median of three) | 0.75 (0.82 / 0.72 / 0.75) | 0.73 (0.73 / 0.69 / 0.74) | inside the round range |
+| max RSS (kB, median of three) | 200 200 | 197 688 | 0.988 |
+
+Whole-VM, same runs: admissions **1 633 → 945**, words copied **1 323 824 → 1 128 549**,
+`statistics(garbage_collection)` **1 281 → 654** collections, valve descents 442 → 356.
+
+**Both acceptance criteria hold:** admissions 608 ≤ 700, and the final `heap_size` is 987 words
+(against 121 530 pre-change, i.e. −120 543 words ≈ −964 KB of nursery capacity).
+
+**Correctness gate.** The compiled artifact is byte-identical in every arm — md5
+`d020e446dda93282ed6faf9e96609909` for pre r1–r3, post r1–r3 and the oracle — and its `Code` chunk
+`4F86664F52128D47D5EED339D27C4263` equals `erlc +deterministic`'s (12 of 13 chunks identical; only
+`Dbgi` differs, which is why the whole-file md5 differs from `erlc`'s).
+
+**Oracle**, same source, traced worker, one run: **158 collections** (150 minor + 8 major),
+`heap_size` **4 185**, `total_heap_size` **10 957**, `memory` **88 640 B**. Post-change rust is
+therefore 3.85× the oracle's collection count (pre-change it was 7.66×), now **below** it on
+`heap_size`, while the mature-dominated total/memory stay ~18×.
+
+### The honest reading — a capacity redistribution, not a footprint shrink
+
+What halves is the **collection count for the same garbage** (1 281 → 654 VM-wide, 1 210 → 608 for
+the compiling pid), with identical user CPU (0.52 s both arms). The nursery's 121 530-word ratchet
+becomes 987 words, and the mature generation — now hosting the promoted garbage between the rarer
+fullsweeps — grows 75 113 → 196 650 words (`total_heap_size − heap_size`), so
+`total_heap_size`/`memory` move **+0.5 %** and max RSS is flat-to-better (0.988×). A memory figure is
+not latency evidence: the wall difference is inside this host's round-to-round range, so no
+throughput claim is made.
+
+### The same shape in-crate (`tests/gc_class_shape.rs`, deterministic counters)
+
+The fixture models the route faithfully: the lumpy copy-out is admitted through `grow_nursery` (its
+caller holds no root set), and the **next** door admission collects on the recorded
+`collection_debt()`. Columns: `collections (minor/major) / words copied / peak heap_size`.
+
+| N / strategy | pre-change code | post-change code |
+|---|---|---|
+| 2 000 copying | 175 (172/3) / 18 848 / 17 730 | **63 (61/2) / 8 768 / 27 503** |
+| 4 000 copying | 352 (348/4) / 39 344 / 17 730 | **120 (117/3) / 22 272 / 46 421** |
+| 2 000 immix | 132 (121/11) / 19 744 / 28 689 | **47 (39/8) / 12 672 / 73 925** |
+| 4 000 immix | 282 (268/14) / 39 120 / 28 689 | **92 (82/10) / 25 152 / 121 534** |
+
+Collections fall 2.8–3.1×, copy work 1.56–2.15×, and the settled nursery now covers the lump instead of
+collapsing back to the live-set-only target and re-growing — which is why the peak `heap_size` is
+*higher* while the count is lower. The fixture's assertions are structural (collections/op, spaces,
+growths/op), never a sizing figure.
+
+### At the runtime, on its own GC workloads (`bench`, paired, same session)
+
+`bench run --quick --runtime rust --workloads gc_bound,gc_class` with `BEAM_RT` pointed at each arm,
+two interleaved rounds per arm, load 162–191 (rounds overlap, so only the direction is readable):
+`gc_bound` churn **45 325.7 → 35 464.4 ns/op** (0.782×; wall 0.866×), `gc_class` send_recv 1.006×,
+ets_copy 0.906×, compile 0.995×, and peak RSS 1.000–1.005× on every row. `churn_attribution` does
+**not** move — `0.201 collections/op` (0.175 minor / 0.025 major), `271.1 words copied/op`,
+`103.40 objects/op`, peak nursery 4 185 / mature 10 958 — because that shape drives only
+`should_collect`/`collection_debt` + `ensure_capacity` and never `grow_nursery`, the one seam the
+change touches.
+
+### What the dependents' pins now read
+
+The change moves three literal pin tables in `beam_rt` (their re-derivation belongs to that node):
+`reds_door`'s plateau `2 586 → 4 185` (a *minor* collapse spending the boundary copy-out's 3 200-word
+request, `next_words(800 + 3 200 + 64)`, flat in N; the single fullsweep still installs the plain
+2 586), `boundary_cost`'s `(collections, major)` `(5 307, 331)/(10 747, 653)/(27 112, 1 624)` →
+`(1 278, 17)/(…)` with `peak_young_capacity 2 585 → 3 000`, and `slice_charging`'s collected-row
+floor `233 → 3 000`. Two of those are the intended cadence win; the third is the carriage bound
+itself (`MINOR_SHRINK_FLOOR_WORDS`, the keep-band edge of a near-empty live set), which is what a
+one-shot carry costs on a copy-out shape whose live set is empty by the time it collapses.
