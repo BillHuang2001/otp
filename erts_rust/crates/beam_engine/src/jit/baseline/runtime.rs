@@ -143,6 +143,48 @@ pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
     }
     decode_target(word & !WAIT_BIT)
 }
+
+/// The answer of an in-block transfer: the block-ABI word to hand the driver, and the
+/// resolved native entry (null = no transfer: the caller leaves for the driver with `word`).
+///
+/// # The return ABI
+///
+/// `#[repr(C)]` makes this two eightbytes of INTEGER class, so the SysV x86-64 C ABI returns
+/// it **whole in registers**: `rax` = `word`, `rdx` = `entry`. The emitted arms therefore
+/// read the resolved entry straight out of `rdx` ([`super::emit::frame`] and
+/// [`super::emit::link`]) — no runtime memory slot, no reload of `rt` for the probe, and
+/// **no sentinel**: a null `entry` is the "no transfer" answer, because the block-ABI word
+/// space overlaps user-space code addresses and a magic word could not be told apart from a
+/// real entry.
+///
+/// Pinned by the module's `transfer_abi` suite: it calls a `Transfer`-returning
+/// `extern "C"` helper from Rust *and* through emitted code, reading both registers back.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Transfer {
+    /// The block-ABI word: an [`encode_target`] continuation, or one of
+    /// [`HALT`]/[`ERROR`]/[`ENTER`]/[`SUSPEND`] (and `CALL_STORED` from the local-call
+    /// helpers).
+    pub(crate) word: i64,
+    /// The resolved native block entry to tail-jump to, or null when there is none.
+    pub(crate) entry: *const u8,
+}
+
+impl Transfer {
+    /// No transfer: `word` goes back to the driver and `entry` is null.
+    pub(crate) const fn leaving(word: i64) -> Transfer {
+        Transfer {
+            word,
+            entry: std::ptr::null(),
+        }
+    }
+
+    /// An in-block transfer to `entry`, with `word` still in `rax` for the record.
+    pub(crate) const fn entering(word: i64, entry: *const u8) -> Transfer {
+        Transfer { word, entry }
+    }
+}
+
 /// The one argument a compiled block receives.
 ///
 /// A `#[repr(C)]` bag of raw pointers at the live driver-owned objects (valid for
@@ -259,20 +301,6 @@ pub(crate) struct JitRuntime<'a> {
     /// [`Machine::literal`](crate::Machine::literal) bounds check, in the exact shape
     /// of the Y-window guard.
     pub(crate) literals_end: *const Eterm,
-    /// The block entry a [`jit_return`]/[`jit_deallocate_return`] resolved **inside the
-    /// function that is already running**, or null when the continuation must go back to
-    /// the driver (a bottom frame's [`HALT`], another module context's [`ENTER`], a
-    /// different function's mapping, an address no block covers — and every failing
-    /// helper).
-    ///
-    /// Written by the two return helpers and read by the emitted arm that calls them,
-    /// which tail-jumps to it (leaving the block's native frame first, so the target's own
-    /// prologue rebuilds one) instead of returning a word for the driver to decode. The
-    /// skipped driver iteration's work is performed by the helper *before* the transfer —
-    /// see [`commit_in_block_entry`] — so the resumed block is entered exactly as a
-    /// driver-entered one. Read by generated code at [`RUNTIME_RESUME_DISP`]; always null
-    /// for every other helper.
-    pub(crate) resume_entry: *const u8,
     /// The block-entry tables of the function the driver last entered natively
     /// ([`EntryTables`]) — what [`enter_in_block`] resolves a continuation through first, on
     /// the same-function fast path that needs no artifact lookup at all.
@@ -542,13 +570,31 @@ pub(crate) type TailHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, u32
 pub(crate) type LocalCallHelper =
     for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, i64, u32, u32) -> i64;
 
-/// The `jit_deallocate`/`jit_deallocate_return` helpers' native signature (the block ABI
-/// plus the instruction's own `(func, pc)` and the frame size the checked pop must match).
+/// The `jit_deallocate` helper's native signature (the block ABI plus the instruction's own
+/// `(func, pc)` and the frame size the checked pop must match).
+///
+/// It answers a bare word because it is the family's **non-terminating** member: the block
+/// compares the word against `encode_target(func, pc + 1)` and continues in-block, so there
+/// is no transfer to resolve ([`FrameReturnHelper`] is the terminating twin).
 pub(crate) type FrameExitHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32) -> i64;
+
+/// The `jit_return`/`jit_deallocate_return` helpers' native signature (the block ABI plus the
+/// instruction's own `(func, pc)` and, for the fused form, the frame size the checked pop must
+/// match).
+///
+/// Both answer a [`Transfer`]: whatever they resolve transfers control, so the block either
+/// tail-jumps to the entry (in `rdx`) or leaves the word for the driver (`rax`).
+pub(crate) type FrameReturnHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32) -> Transfer;
 
 /// The `jit_return` helper's native signature (the block ABI plus the instruction's own
 /// `(func, pc)`); a bare `return` pops nothing, so it carries no frame size.
-pub(crate) type ReturnHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32) -> i64;
+pub(crate) type ReturnHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32) -> Transfer;
+
+/// The `jit_call_store`/`jit_call_store_linked` helpers' native signature (the block ABI plus
+/// the call site's `(func, pc)`, the resolved callee and its `pc`, and the `arity` operand).
+pub(crate) type CallStoreHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32, u32) -> Transfer;
 
 /// The `jit_allocate`/`jit_trim` helpers' native signature (the block ABI plus the
 /// instruction's own `(func, pc)` and the single frame-size word the instruction
@@ -666,17 +712,6 @@ pub(crate) const RUNTIME_LITERALS_DISP: i32 =
 /// against, and the reason an absent area rejects every index.
 pub(crate) const RUNTIME_LITERALS_END_DISP: i32 =
     RUNTIME_LITERALS_DISP + mem::size_of::<*const Eterm>() as i32;
-
-/// The byte offset of [`JitRuntime::resume_entry`] — the same-function block entry a
-/// `return` helper resolved, which the emitted return arm tail-jumps to instead of leaving
-/// the block with a word for the driver.
-///
-/// Null means "no in-block continuation", so the arm keeps today's behaviour and returns
-/// the helper's word. It follows [`JitRuntime::literals_end`] directly (both are pointer
-/// fields at the end of the struct, which only Rust reads besides this one load); computed
-/// with [`mem::offset_of!`] so the constant cannot drift from the field's real position.
-pub(crate) const RUNTIME_RESUME_DISP: i32 =
-    mem::offset_of!(JitRuntime<'static>, resume_entry) as i32;
 
 /// The byte offset of [`JitRuntime::current_code`] — the address of
 /// `Machine::current_code`, the one word a block's prologue stores its own `(func, pc)`
@@ -2055,12 +2090,12 @@ fn report_frame_error(
 /// # The in-block continuation
 ///
 /// When the continuation names a block entry **of this module's compiled artifact** the
-/// helper resolves the entry itself and puts it in [`JitRuntime::resume_entry`]; the
-/// emitted arm then tail-jumps to it, skipping the driver iteration it would otherwise
-/// cost (decode the word, `set_current_code`, the reduction bump, `ctx.reduce(1)`, the
-/// entry lookup, the block prologue). `resume_entry` stays null on every other outcome, so
-/// the arm keeps today's return-to-driver path for a `Halt`, a cross-context continuation,
-/// an artifact that holds no code for the address and every declined bound.
+/// helper resolves the entry itself and answers it in the [`Transfer`]'s `entry` (i.e. in
+/// `rdx`); the emitted arm then tail-jumps to it, skipping the driver iteration it would
+/// otherwise cost (decode the word, `set_current_code`, the reduction bump, `ctx.reduce(1)`,
+/// the entry lookup, the block prologue). Every other outcome answers a null `entry`, so the
+/// arm keeps today's return-to-driver path for a `Halt`, a cross-context continuation, an
+/// artifact that holds no code for the address and every declined bound.
 ///
 /// There are two servable shapes, one arm each in [`enter_in_block`]:
 ///
@@ -2082,12 +2117,9 @@ fn return_word(
     continuation: Continuation,
     func: u32,
     pc: u32,
-) -> i64 {
-    // Cleared on **every** call, so the emitted arm can never observe a stale entry from an
-    // earlier return (the two arms read exactly the value their own helper wrote).
-    runtime.resume_entry = std::ptr::null();
+) -> Transfer {
     match continuation {
-        Continuation::Halt => halt_word(runtime, func, pc),
+        Continuation::Halt => Transfer::leaving(halt_word(runtime, func, pc)),
         Continuation::Address {
             func,
             pc,
@@ -2098,13 +2130,12 @@ fn return_word(
             let current = unsafe { (*runtime.machine).current_context() };
             if context != current {
                 runtime.enter = Some((context, func, pc));
-                return ENTER;
+                return Transfer::leaving(ENTER);
             }
             // The in-block transfer itself is shared with a frame-preserving `call`'s callee
             // (see [`enter_in_block`]): both are "continue the driver's loop at `(func, pc)`
-            // without going back to the driver", so they must never diverge. The clear above
-            // is this path's, so it takes the twin that does not repeat it.
-            enter_in_block_cleared(runtime, func, pc)
+            // without going back to the driver", so they must never diverge.
+            enter_in_block(runtime, func, pc)
         }
     }
 }
@@ -2135,18 +2166,20 @@ fn halt_word(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
 /// for the tier's two in-block transfers: a `return`'s continuation ([`return_word`]) and a
 /// frame-preserving `call`'s callee ([`super::call::jit_call_store_linked`]).
 ///
-/// Clears [`JitRuntime::resume_entry`] on **every** call (so no emitted arm can observe a
-/// stale entry from an earlier transfer), then:
+/// Answers a [`Transfer`]:
 ///
-/// * a **resolved** entry is stored in [`JitRuntime::resume_entry`] and the target's
-///   `(func, pc)` word is returned — the arm tail-jumps to the entry;
+/// * a **resolved** entry is answered in `entry` with the target's `(func, pc)` word in
+///   `word` — the arm tail-jumps to the entry;
 /// * a **decline** ([`cross_function_enter`]'s no-hit: no published artifact, an address no
 ///   block covers, a missing function, a failed lazy compile, an unsatisfied register-file
-///   bound) returns the same word with `resume_entry` still null — the arm leaves the word
-///   for the driver, which decodes it exactly as it did before the transfer existed;
+///   bound) answers the same word with a null `entry` — the arm leaves the word for the
+///   driver, which decodes it exactly as it did before the transfer existed;
 /// * a **refused pre-emption charge** stores the host's error in [`JitRuntime::error`] and
-///   returns [`ERROR`] — with **no** uncaught-raise funnel, exactly as the driver loop
-///   head's own `ctx.reduce(1)?` applies none on that path.
+///   answers [`ERROR`] with a null `entry` — with **no** uncaught-raise funnel, exactly as
+///   the driver loop head's own `ctx.reduce(1)?` applies none on that path.
+///
+/// Every answer is produced **here**, so an emitted arm can never observe a stale entry from
+/// an earlier transfer: there is no memory slot to be stale.
 ///
 /// # The hot/cold split
 ///
@@ -2164,32 +2197,16 @@ fn halt_word(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
 /// where a driver-side refusal parks it and the resumed slice executes each instruction
 /// exactly once.
 #[inline]
-pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
-    runtime.resume_entry = std::ptr::null();
-    enter_in_block_cleared(runtime, func, pc)
-}
-/// [`enter_in_block`] for a caller that has **already** cleared
-/// [`JitRuntime::resume_entry`] in its own first instructions — the `return` half
-/// ([`return_word`]), which must clear before its own `match` because the `HALT`/`ENTER`
-/// arms leave the field for the emitted arm to read.
-///
-/// The clear is one store and sits on the per-transfer path, so the two callers that
-/// need it (`return_word` above, a linked `call` in [`super::call`]) share this body with
-/// the clear hoisted to the one that does not already have it.
-#[inline]
-fn enter_in_block_cleared(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> Transfer {
     let word = encode_target(func, pc);
     match runtime.tables.entry(func, pc) {
         // The same-function shape: the published tables already describe this function, so
         // there is nothing to re-publish and no artifact to ask.
         Some(entry) => match commit_in_block_entry(runtime, word) {
-            Ok(()) => {
-                runtime.resume_entry = entry;
-                word
-            }
+            Ok(()) => Transfer::entering(word, entry),
             Err(err) => {
                 runtime.error = Some(err);
-                ERROR
+                Transfer::leaving(ERROR)
             }
         },
         None => cross_function_enter(runtime, func, pc, word),
@@ -2246,20 +2263,20 @@ fn commit_in_block_entry(
 /// takes: a `call`'s own continuation returns in the calling function, which the published
 /// tables already describe, and every other shape either declines here or never returns.
 ///
-/// It declines — answering the unchanged target `word` with `resume_entry` still null, no
-/// artifact publication and nothing committed — on exactly the shapes the driver's fallback
-/// must keep; see [`cross_function_entry`] for the list and for why the register-file bound
-/// is checked here but not for the same-function shape.
+/// It declines — answering the unchanged target `word` with a null `entry`, no artifact
+/// publication and nothing committed — on exactly the shapes the driver's fallback must
+/// keep; see [`cross_function_entry`] for the list and for why the register-file bound is
+/// checked here but not for the same-function shape.
 ///
 /// On a hit the target function's block-entry tables replace the published ones **after** the
 /// commit, so a nested return inside the new function resolves through them instead of
-/// falling back to the driver, and [`JitRuntime::resume_entry`] carries the entry the emitted
-/// arm tail-jumps to.
+/// falling back to the driver, and the [`Transfer`] carries the entry the emitted arm
+/// tail-jumps to.
 #[cold]
 #[inline(never)]
-fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: i64) -> i64 {
+fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: i64) -> Transfer {
     let Some((entry, tables)) = cross_function_entry(runtime, func, pc) else {
-        return word;
+        return Transfer::leaving(word);
     };
     match commit_in_block_entry(runtime, word) {
         Ok(()) => {
@@ -2268,12 +2285,11 @@ fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: 
                 // one the tables describe from here on.
                 runtime.tables = tables;
             }
-            runtime.resume_entry = entry;
-            word
+            Transfer::entering(word, entry)
         }
         Err(err) => {
             runtime.error = Some(err);
-            ERROR
+            Transfer::leaving(ERROR)
         }
     }
 }
@@ -2421,15 +2437,15 @@ pub(crate) extern "C" fn jit_deallocate(
 /// `return` **always** transfers control (the interpreter's `return_step` returns
 /// `Done`/`Goto`/`Enter`, never `Next`), so the caller leaves the block with the
 /// helper's word in `rax` instead of continuing at `pc + 1` — **unless** the continuation
-/// names a block entry of the function already running, in which case
-/// [`JitRuntime::resume_entry`] carries that entry and the emitted arm tail-jumps to it
+/// names a block entry of the function already running, in which case the [`Transfer`]'s
+/// `entry` (in `rdx`) carries that entry and the emitted arm tail-jumps to it
 /// (see [`return_word`]).
 ///
 /// The helper stores no position of its own: a taken transfer publishes its target, a
 /// decline is republished by the driver's loop-head decode, a `Halt` publishes this
 /// instruction as the finished run's position ([`halt_word`]), and the failure path
 /// publishes it in [`report_frame_error`].
-pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Transfer {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
     // holds points at an object the driver owns and keeps alive for the whole loop.
@@ -2442,7 +2458,7 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
     };
     match continuation {
         Ok(continuation) => return_word(runtime, continuation, func, pc),
-        Err(err) => report_frame_error(runtime, func, pc, err),
+        Err(err) => Transfer::leaving(report_frame_error(runtime, func, pc, err)),
     }
 }
 
@@ -2467,13 +2483,13 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
 ///
 /// Like [`jit_return`] it always transfers control, so the caller leaves the block
 /// with the helper's word in `rax` — or tail-jumps to the same-function block entry
-/// [`return_word`] resolved.
+/// [`return_word`] resolved (in the [`Transfer`]'s `entry`, i.e. `rdx`).
 pub(crate) extern "C" fn jit_deallocate_return(
     rt: *mut JitRuntime<'_>,
     func: u32,
     pc: u32,
     deallocate: u32,
-) -> i64 {
+) -> Transfer {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
     // holds points at an object the driver owns and keeps alive for the whole loop.
@@ -2486,7 +2502,7 @@ pub(crate) extern "C" fn jit_deallocate_return(
     };
     match outcome {
         Ok(continuation) => return_word(runtime, continuation, func, pc),
-        Err(err) => report_frame_error(runtime, func, pc, err),
+        Err(err) => Transfer::leaving(report_frame_error(runtime, func, pc, err)),
     }
 }
 

@@ -161,7 +161,7 @@ use beam_common::Result;
 
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
-use super::super::runtime::{encode_target, jit_tail_call, TailHelper, RUNTIME_RESUME_DISP};
+use super::super::runtime::{encode_target, jit_tail_call, TailHelper};
 use super::{native_frame_regs, frame_slot_len, spill, Allocation, SpillSite, RUNTIME_SLOT_DISP};
 
 /// Whether a block exit still owes the cached-register **spill**, or whether the code
@@ -307,19 +307,26 @@ impl<'a> Linker<'a> {
     /// skipped driver iteration's work.
     ///
     /// Entered with `rax == CALL_STORED`; the emitted sequence is
-    /// [`emit_resume_or_exit`](super::frame)'s return-side twin:
+    /// [`emit_resume_or_exit`](super::frame)'s return-side twin, reading the entry the
+    /// helper returns in **`rdx`** (SysV's second eightbyte for a two-eightbyte
+    /// `#[repr(C)]` struct) instead of through a runtime slot:
     ///
     /// ```text
-    ///   mov  rdi, [rsp + RUNTIME_SLOT_DISP] ; rt — reloaded, the helper may clobber rdi
-    ///   mov  r11, [rdi + RUNTIME_RESUME_DISP] ; the callee's entry, or null on a decline
-    ///   test r11, r11
+    ///   test rdx, rdx                     ; the callee's entry, or null on a decline
     ///   je   <declined>                   ; no entry: today's word exit
+    ///   mov  rdi, [rsp + RUNTIME_SLOT_DISP] ; `rt` for the callee's prologue
     ///   lea  rsp, [rsp + slot] ; pop …    ; leave this block's native frame
-    ///   jmp  r11                          ; the callee's prologue rebuilds its own frame
+    ///   jmp  rdx                          ; the callee's prologue rebuilds its own frame
     /// <declined>:
     ///   mov  rax, encode_target(func, pc) ; the pre-existing unlinked word
     ///   jmp  <done>
     /// ```
+    ///
+    /// Nothing reads a runtime slot for the *entry*: the helper answers it in `rdx` and no
+    /// other helper runs between the call and the `test`, so the caller-saved `rdx` still
+    /// holds it. `rt` itself must still reach the callee's prologue (which stores its first
+    /// argument into *its* `rt` slot), and `rdi` is caller-saved, so it is re-read from this
+    /// block's slot on the taken path.
     ///
     /// The cached x-registers were **already spilled** by
     /// [`emit_helper_call`](super::emit_helper_call) before the helper — that spill is the
@@ -329,16 +336,20 @@ impl<'a> Linker<'a> {
     /// The transfer is a **tail** transfer: the frame is torn down before the jump, so the
     /// native stack does not grow with Erlang non-tail recursion (each nested `call` leaves
     /// its native frame behind before entering the callee, whose own prologue builds a
-    /// fresh one) and no stale frame is left behind. `rdi`/`r11` are caller-saved and the
-    /// teardown only pops the block's saved callee-saved set, so both survive it.
+    /// fresh one) and no stale frame is left behind. `rdx`/`rax` both survive the teardown:
+    /// it only `lea`s `rsp` past the block's frame and pops the **callee-saved** registers
+    /// the prologue saved.
     ///
     /// Nothing here can produce a wrong result: the helper resolves an entry only for a
     /// block of the artifact the driver published, inside the register-file bound it
     /// checked, and every other outcome — no artifact (an interpreter-step iteration), an
     /// address no block covers, a missing function, a failed lazy compile, an unsatisfied
-    /// bound, a **refused `ctx.reduce` charge** (`ERROR` in `rax`, the host's error in
-    /// `rt.error`) — leaves `resume_entry` null and takes the declined arm, which hands the
-    /// driver exactly the word it decoded before this transfer existed.
+    /// bound, a **refused `ctx.reduce` charge** — answers a null entry, and the helper's own
+    /// word (the resolved target's `(func, pc)`, or `ERROR` with the host's error in
+    /// `rt.error`) has already left for the driver through the block's `cmp rax,
+    /// CALL_STORED` branch, so the declined arm below is unreachable defence: it keeps the
+    /// pre-existing word in `rax` rather than ever handing the driver an undecodable
+    /// `CALL_STORED`.
     ///
     /// [`jit_call_store_linked`]: super::super::call::jit_call_store_linked
     pub(super) fn emit_in_block_call(
@@ -349,18 +360,14 @@ impl<'a> Linker<'a> {
         pc: u32,
     ) -> Result<()> {
         let declined: CodeLabel = buffer.label();
-        // `rt`, reloaded from the block's own slot: `jit_call_store_linked` is an ordinary
-        // `extern "C"` call and `rdi` is caller-saved, so it may hold anything now. It is
-        // also what the callee block's prologue stores as *its* `rt` slot.
-        buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
         // The callee entry the helper resolved, or null on every decline.
-        buffer.mov_rm(Reg::R11, Reg::Rdi, RUNTIME_RESUME_DISP)?;
-        buffer.test_rr(Reg::R11, Reg::R11)?;
+        buffer.test_rr(Reg::Rdx, Reg::Rdx)?;
         buffer.jcc(Cond::E, declined)?;
         // A tail transfer: leave this block's native frame, then jump (the callee's own
         // prologue rebuilds a frame), exactly `emit_exit`'s linked path.
+        buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
         emit_frame_teardown(buffer, allocation)?;
-        buffer.jmp_r(Reg::R11)?;
+        buffer.jmp_r(Reg::Rdx)?;
         buffer.bind(declined)?;
         // The declined path is byte-for-byte today's `emit_exit` unlinked arm: the resolved
         // target's word in `rax` for the driver to decode.

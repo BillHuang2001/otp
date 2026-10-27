@@ -68,8 +68,8 @@ use super::select::try_inline_select_val;
 use super::super::call::{jit_call_store, jit_call_store_linked, CALL_STORED};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
-    encode_local_call, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
-    EXT_CALL_ONLY, LOCAL_CALL_LAST, LOCAL_CALL_ONLY, LOCAL_DECLINE,
+    encode_local_call, CallStoreHelper, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL,
+    EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_CALL_LAST, LOCAL_CALL_ONLY, LOCAL_DECLINE,
 };
 use super::super::{jit_ext_call, jit_local_call};
 use super::test::try_inline_test;
@@ -734,15 +734,17 @@ pub(crate) fn emit_block(
                     // helper (byte-identical to before); an uncompiled one asks for the
                     // linking twin.
                     let linked = linker.is_compiled(target_func, target_pc);
-                    let helper: *const () = if linked {
-                        jit_call_store as *const ()
+                    // The alias pins both helpers' `Transfer` answer at the use site, so a
+                    // signature change cannot silently disagree with `emit_in_block_call`.
+                    let helper: CallStoreHelper = if linked {
+                        jit_call_store
                     } else {
-                        jit_call_store_linked as *const ()
+                        jit_call_store_linked
                     };
                     emit_helper_call(
                         buffer,
                         allocation,
-                        helper,
+                        helper as *const (),
                         &[
                             i64::from(func),
                             i64::from(pc),
