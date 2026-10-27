@@ -23,7 +23,7 @@ The `m<session>-` prefix names the measurement session the files belong to; the 
 - `m21-load-record.md` + `m21-xrun-load.log` — the per-pass `/proc/loadavg` before/after record, the command shape, the two spike-affected rounds, the single withheld figure (`r7/rust churn`) and the memory rows.
 - `m21-budgetprobe-all.json` / `.txt` — one supplementary `--runtime all --quick` pass, run **only** so the both-sides-in-one-report budget ratio rows can be judged and so `bench compare` has a report carrying both sides; it is runtime-major and ordering-biased, so it is **not** a timing source.
 - `m21-compare-cross-runtime.txt` — `bench compare m21-budgetprobe-all.json` (the driver's own cross-runtime diff of that supplementary pass).
-- Its workload set is deliberately narrow: `slice` and the six other `Runtimes::Both` workloads are **not** in m21, so a footprint or per-call figure for them still comes from `m20`/m19.
+- Its workload set is deliberately narrow: `slice` and the six other `Runtimes::Both` workloads are **not** in m21, so a footprint or per-call figure for them comes from `m22` (start-up, `slice`, memory, the four GC-workstream per-unit rows) or from `m20`/m19 (everything else).
 
 ### `m15-` — the superseded full-suite session (2026-10-17, `/proc/loadavg` ≈2–5)
 - `m15-bench-xrun.json` — **the full cross-runtime report**: `run --full --runtime all`, the six `Runtimes::Both` workloads × both runtimes (12/12 rows `ok`). The source of every headline number in `../RESULTS.md` §2/§3.
