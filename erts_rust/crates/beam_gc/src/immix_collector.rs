@@ -402,6 +402,41 @@ impl GenImmixCollector {
         Ok(Collection { kind, stats })
     }
 
+    /// Gives the nursery's retained capacity back: collects, then installs the live set's target
+    /// **unconditionally**, and reports the collection that ran.
+    ///
+    /// The mark-region counterpart of
+    /// [`Collector::trim_retired`](crate::Collector::trim_retired), which carries the full
+    /// contract: a complete root set at a safepoint (the roots are forwarded in place, exactly as
+    /// a collection forwards them), `young_space_count() == 1` and `collection_debt() == false`
+    /// afterwards, and `heap_size_words()` == `HeapPolicy::young_minor_target_words(…)` after a
+    /// minor / `HeapPolicy::young_target_words(…)` after a fullsweep, computed from the round's
+    /// own copy volume. Collecting first is what makes the install sound: a retired space holds no
+    /// live word only once a collection has evacuated it.
+    ///
+    /// The kind is chosen by this strategy's own [`collect`](Self::collect) — the
+    /// escalation is unchanged — and the nursery it collapses is the same shared chain the
+    /// copying collector uses, so both strategies trim to the same live-set-derived capacity.
+    ///
+    /// The **mature** mark region is not resized here: only a fullsweep sizes that generation,
+    /// and [`Collection::kind`](crate::Collection) reports whether one ran.
+    ///
+    /// # Errors
+    ///
+    /// The collection's own [`BeamError`](beam_common::BeamError) — a typed heap exhaustion when
+    /// the promotion cannot fit (nothing copied in that case), or an allocation failure. A failed
+    /// collection leaves the chain as the collection left it.
+    pub fn trim_retired(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
+        let collection = self.collect(roots)?;
+        let policy = self.policy.clone();
+        let live = collection.stats.words_copied;
+        match collection.kind {
+            CollectionKind::Minor => self.nursery.trim_after_minor(&policy, live)?,
+            CollectionKind::Major => self.nursery.trim_after_fullsweep(&policy, live)?,
+        }
+        Ok(collection)
+    }
+
     /// Runs a **minor** collection: promote the nursery's live terms into the mature space.
     ///
     /// Checks up front that the mature space's free lines cover the promotion, so a
