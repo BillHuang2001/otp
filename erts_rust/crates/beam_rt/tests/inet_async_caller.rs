@@ -26,8 +26,9 @@
 //! deadline a passive read has, and ERTS addresses that completion — data or `{error, timeout}`
 //! — to the operation's issuer, `opp->caller = driver_caller(desc->port)`
 //! (`../../erts/emulator/drivers/common/inet_drv.c:2427`), which `send_async_ok`/`send_async_error`
-//! read (`:2494-2500`/`:2541-2559`). Addressing it to the port's **owner** left a spawned
-//! non-owner parked for ever, which is the defect these cases pin.
+//! read (`:2494-2500`/`:2541-2559`). That addressing rule is what the cases below pin: a
+//! completion addressed to the port's **owner** instead leaves a spawned non-owner reader parked
+//! for ever.
 //!
 //! Every probe spawns its reader (so it is a process that does **not** own the socket), waits on
 //! a bounded `receive`, and answers exactly one line; the reader is killed and every socket
@@ -181,19 +182,12 @@ fn a_spawned_readers_recv_returns_the_data_that_arrives_after_it_arms() {
     );
 }
 
-/// (b) Data buffered **before** the read, a spawned reader and a `timeout 0`: the oracle answers
-/// `{ok, <<"hi">>}` because the C attempts the receive at **control** time
-/// (`inet_drv.c:12309`), so the bytes are already the driver's when the zero deadline expires.
-///
-/// `#[ignore]`d for the **driver** half, which is not this crate's: `beam_io`'s
-/// `TcpInetDriver` has no control-time read attempt — it arms read interest and reads only from
-/// a readiness callback or from `try_complete_recv`, and a socket whose payload was fully
-/// drained into the port's input queue before the operation was enqueued has none left for it.
-/// Measured on the owner **and** on a non-owner reader, connect-side and accepted-side, so it is
-/// not an addressing difference. The expectation stays the oracle's own; the row is un-ignored
-/// the moment the control-time read lands.
+/// (b) Data buffered **before** the read, a spawned reader and a `timeout 0`: the driver attempts
+/// the receive at **control** time (`inet_drv.c:12309`), so bytes already in the socket or in the
+/// port's input queue satisfy the operation before the zero deadline expires.
+/// That holds on the owner and on a spawned non-owner reader alike, the completion being
+/// addressed to whichever process issued it.
 #[test]
-#[ignore = "beam_io has no control-time read attempt (inet_drv.c:12309): a read of already-buffered data times out for the owner too"]
 fn a_spawned_readers_recv_returns_data_that_was_buffered_before_it_armed() {
     pinned(
         "a spawned reader's recv gets the buffered data",
