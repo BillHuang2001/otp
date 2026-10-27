@@ -43,6 +43,12 @@ Per-suite routing: [`tests/CONTEXT.md`](tests/CONTEXT.md). Every measured figure
 `env_default()` reads the variable once (a `OnceLock`), so a long-running process pays one `getenv`; `mode_from_value` itself is pure (no environment read), which is how a test pins the semantics without `set_var` (edition 2024 makes it `unsafe`).
 `jit-cranelift` is accepted because it is exactly `Tier::Cranelift::name()`'s spelling, so a value copied from a tier report selects that tier back; `hot` is deliberately **not** a value — it names no tier.
 
+### When the machine exists (the first slice does not build one)
+The `Machine` is built **eagerly at engine registration**: the one engine constructor `RunnerState::spawn_with_stability` (`entry.rs:504-535`) inserts `ProcessEngine { machine: Machine::new(), .. }` (`entry.rs:511-514`), so a process owns its machine from spawn — its pid enters `RunnerState::engines` before `Runtime::spawn_process_with_policy` enqueues it — and no engine ever shares or recycles its machine.
+The first slice only selects the **tier** into that existing machine (`select_entry_tier`, `run.rs:979-983`); the slice path has no machine construction site, and the nested-run recycling pool is `../context/machine_pool.rs`, not this node.
+A process the runtime creates **without an engine** — the `Runtime::new` service stand-ins and the `-eval` action process, spawned straight into the process table — has no `ProcessEngine` and therefore no `Machine`.
+The engine is the machine's only holder after the slice re-inserts it, so `RunnerState::prune_dead` (`entry.rs:947-968`) dropping a dead pid's engine is what releases that machine.
+
 ### How and when the tier is chosen
 ```text
 tier = match engine.parked { Some(_) => engine.tier,            // a resume re-uses the remembered tier
