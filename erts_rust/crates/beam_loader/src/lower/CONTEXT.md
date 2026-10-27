@@ -51,7 +51,7 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 
 ## Routing Table
 - `instr.rs` → `lower_instr` (the opcode → `Instr` mapping, one arm per modelled opcode).
-- `group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks` + `count_fusable_pairs` (the exact per-body capacity pre-count).
-- `fuse.rs` → `fuse_in_place` (the only superinstruction pass, `Deallocate`+`Return`) and `fuse`, its owning-vector wrapper.
+- `group.rs` → `group_functions` (the `func_info` boundary rule) + `emit_fused` (the lowering emit that fuses as it goes, so the one allocation is exact) + `count_fusable_pairs` (the exact per-body capacity pre-count) + `build_blocks`.
+- `fuse.rs` → `fuses` (the one statement of the `Deallocate`+`Return` rule, shared by `emit_fused` and `fuse_in_place`), `fuse_in_place` (the superinstruction pass over an already-lowered body) and `fuse`, its owning-vector wrapper.
 - `validate.rs` → the post-lowering validation pass (label definitions, `function_count`, `func_info` arity, import refs, `LineRef`s).
 - `../../../tests/negative_ir.rs` → the code-level rejection suite that pins `validate.rs` (test node, read-only here).
