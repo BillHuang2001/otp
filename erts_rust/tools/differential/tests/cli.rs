@@ -344,7 +344,549 @@ fn a_bad_oracle_or_rust_runtime_is_a_loud_env_error() {
 /// **any** `mismatch` is unexpected and fails the test. It exists only as an escape hatch so a
 /// newly-discovered, understood divergence can be recorded explicitly rather than silently
 /// tolerated — it must never be widened to mask a genuine behavioral regression.
+///
+/// A host-oracle drift is **not** a mismatch and has its own allowlist (`known-drift.txt`) — see
+/// [`classify_suite_json`] — so a case can never sneak into this list to escape the drift rules.
 const KNOWN_RUNTIME_GAPS: &[&str] = &[];
+
+/// Load the committed **host-oracle drift** allowlist (`known-drift.txt`).
+///
+/// The corpus goldens are frozen against the tree's pinned `erts` release; the installed oracle
+/// may be a *different* release, in which case a few goldens (the three `system_info(version)`
+/// cases) legitimately miss on the oracle side while our runtime still reproduces them. That is
+/// [`Verdict::OracleDrift`], ratcheted by this committed list — exactly as `gate.sh` does with
+/// `--drift-allowlist`. A missing/unparsable file is a panic: the file is committed next to this
+/// crate and without it drift cannot be told from divergence.
+fn known_drift_allowlist() -> differential::allowlist::Allowlist {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("known-drift.txt");
+    differential::allowlist::Allowlist::load(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot load the committed drift allowlist {}: {error}",
+            path.display()
+        )
+    })
+}
+
+/// The verdict buckets of a `differential/1` suite report, plus every **per-case evidence
+/// violation** the report's own fields expose.
+///
+/// Kept separate from the (multi-hour, serial) corpus sweep it is used by, so a cheap test can
+/// pin the classification rules against hand-written report JSON — see
+/// `the_suite_classifier_requires_per_case_drift_evidence`.
+#[derive(Debug, Default)]
+struct Buckets {
+    agree: u64,
+    /// `oracle_drift` cases: the oracle missed a golden our own side reproduced.
+    drift: u64,
+    unsupported: u64,
+    skipped: u64,
+    /// The ids of `mismatch` cases (never a drift, never a gap).
+    mismatched: Vec<String>,
+    /// One entry per case whose verdict is not supported by its own evidence. Empty is the only
+    /// acceptable value.
+    violations: Vec<String>,
+}
+
+/// Classify a suite report's cases into verdict buckets **and** check each verdict against the
+/// case's own evidence.
+///
+/// The evidence rules (each violation is recorded, never tolerated):
+/// * `agree` — both sides reproduced the golden and the two sides' stdout + exit status are
+///   identical (otherwise the "agreement" is fabricated);
+/// * `oracle_drift` — `oracle.matched_golden == false`, `rust.matched_golden == true`, and the
+///   two sides' stdout/exit status really differ with at least one reported field diff (drift is
+///   **positive evidence only**: our side proves the golden is still reproducible);
+/// * `skipped` — the case never ran, so it must carry no golden check at all (a skip can never
+///   hide an oracle miss);
+/// * `mismatch`/`unsupported`/`skipped` are counted, never re-labelled;
+/// * a case that **did** run and whose oracle side missed its golden must have its id recorded in
+///   `recorded_drift`, i.e. in the committed `known-drift.txt` — an unrecorded oracle golden miss
+///   is a failure, and a deliberate allowlist entry (with a reason) is the only way to accept it.
+///
+/// A recorded entry is **not** required to drift (on an oracle whose `erts` version matches the
+/// tree's it reproduces its golden); staleness is the gate's ratchet job, not this test's.
+fn classify_suite_json(
+    json: &serde_json::Value,
+    recorded_drift: &differential::allowlist::Allowlist,
+) -> Buckets {
+    let mut buckets = Buckets::default();
+    for case in json["cases"].as_array().expect("a report carries a cases array") {
+        let id = case["case_id"].as_str().expect("a case id");
+        let verdict = case["verdict"].as_str().expect("a verdict string");
+        let oracle_matched = case["oracle"]["matched_golden"].as_bool();
+        let rust_matched = case["rust"]["matched_golden"].as_bool();
+        let observables_agree = case["rust"]["stdout"] == case["oracle"]["stdout"]
+            && case["rust"]["exit_code"] == case["oracle"]["exit_code"];
+        match verdict {
+            "agree" => {
+                buckets.agree += 1;
+                if case["rust"]["available"] != true {
+                    buckets
+                        .violations
+                        .push(format!("agree `{id}` carries no Rust observation: {case}"));
+                }
+                if rust_matched != Some(true) {
+                    buckets.violations.push(format!(
+                        "agree `{id}`: our side did not reproduce its golden \
+                         (rust.matched_golden={rust_matched:?}) — that is a mismatch, not an \
+                         agreement: {case}"
+                    ));
+                }
+                if oracle_matched != Some(true) {
+                    buckets.violations.push(format!(
+                        "agree `{id}`: the oracle did not reproduce the golden \
+                         (oracle.matched_golden={oracle_matched:?}) — an agreement needs both \
+                         sides to match: {case}"
+                    ));
+                }
+                if !observables_agree {
+                    buckets.violations.push(format!(
+                        "agree `{id}`: the two sides' stdout/exit status differ: {case}"
+                    ));
+                }
+            }
+            "oracle_drift" => {
+                buckets.drift += 1;
+                // Positive evidence only, never a heuristic: the oracle missed the golden, our
+                // side reproduced it, and the observables (and the reported diffs) really differ.
+                if oracle_matched != Some(false) {
+                    buckets.violations.push(format!(
+                        "oracle_drift `{id}` requires oracle.matched_golden == false \
+                         (got {oracle_matched:?}): {case}"
+                    ));
+                }
+                if rust_matched != Some(true) {
+                    buckets.violations.push(format!(
+                        "oracle_drift `{id}` requires rust.matched_golden == true \
+                         (got {rust_matched:?}) — a golden our side fails is a mismatch: {case}"
+                    ));
+                }
+                if observables_agree {
+                    buckets.violations.push(format!(
+                        "oracle_drift `{id}`: the two sides' stdout and exit status are \
+                         identical, so calling the case drift is a fabrication: {case}"
+                    ));
+                }
+                if case["diffs"].as_array().map(Vec::is_empty) != Some(false) {
+                    buckets.violations.push(format!(
+                        "oracle_drift `{id}`: the report carries no field diff, so nothing \
+                         observable differs: {case}"
+                    ));
+                }
+            }
+            "unsupported" => buckets.unsupported += 1,
+            "skipped" => {
+                buckets.skipped += 1;
+                if oracle_matched.is_some() {
+                    buckets.violations.push(format!(
+                        "skipped `{id}`: a skipped case never ran, so it cannot carry a golden \
+                         check (oracle.matched_golden={oracle_matched:?}): {case}"
+                    ));
+                }
+            }
+            "mismatch" => buckets.mismatched.push(id.to_string()),
+            other => panic!("unexpected verdict {other}: {case}"),
+        }
+        // A case that really ran may only miss its oracle golden when the golden is a **recorded**
+        // host-oracle drift. `oracle_drift` already required exactly that miss above; every other
+        // executed verdict must have reproduced it. (A mismatch stays a mismatch either way — this
+        // rule never converts one into drift.)
+        if verdict != "skipped" && verdict != "oracle_drift" && oracle_matched != Some(true) {
+            if recorded_drift.contains(id) {
+                eprintln!(
+                    "NOTE: `{id}` misses its oracle golden on this host and is recorded in \
+                     known-drift.txt (verdict {verdict})"
+                );
+            } else {
+                buckets.violations.push(format!(
+                    "`{id}`: the oracle missed its committed golden \
+                     (oracle.matched_golden={oracle_matched:?}) and the case is not recorded in \
+                     known-drift.txt — an unrecorded oracle golden miss is a failure, and drift \
+                     needs a deliberate `<case-id> <owning-crate> <reason…>` entry: {case}"
+                ));
+            }
+        }
+    }
+    buckets
+}
+
+/// Assert `buckets.violations` is empty, reporting every violation with the invoking child's
+/// output for context.
+fn assert_no_violations(buckets: &Buckets, output: &str) {
+    assert!(
+        buckets.violations.is_empty(),
+        "per-case verdict evidence violations ({}):\n{}\n--- report ---\n{output}",
+        buckets.violations.len(),
+        buckets.violations.join("\n")
+    );
+}
+
+/// A minimal `differential/1` **suite-shaped** report around `cases`, for the classifier test.
+///
+/// Deliberately carries a `summary` and a `schema` so the synthetic JSON has the same shape the
+/// binary writes; [`classify_suite_json`] reads only `cases`, so the summary values are inert.
+fn synthetic_suite(cases: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "differential/1",
+        "mode": "suite",
+        "summary": {
+            "total": cases.len(),
+            "agree": 0,
+            "mismatch": 0,
+            "unsupported": 0,
+            "skipped": 0,
+            "oracle_drift": 0
+        },
+        "cases": cases,
+    })
+}
+
+/// One synthetic case entry for the classifier test.
+///
+/// `matched` is `None` when the side carries no golden check at all (a side that did not run, or
+/// a case that never ran); a `sudo` side whose `stdout` is `None` did not run. Every case gets
+/// exit status `0` on any side that ran, so a `stdout` difference alone is a differing observable.
+fn synthetic_case(
+    id: &str,
+    verdict: &str,
+    oracle_matched: Option<bool>,
+    rust_matched: Option<bool>,
+    oracle_stdout: Option<&str>,
+    rust_stdout: Option<&str>,
+    diffs: usize,
+) -> serde_json::Value {
+    fn side(
+        matched: Option<bool>,
+        stdout: Option<&str>,
+    ) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "available".to_string(),
+            serde_json::Value::Bool(stdout.is_some()),
+        );
+        map.insert(
+            "stdout".to_string(),
+            stdout.map_or(serde_json::Value::Null, |text| {
+                serde_json::Value::String(text.to_string())
+            }),
+        );
+        map.insert("stdout_hex".to_string(), serde_json::Value::Null);
+        map.insert(
+            "exit_code".to_string(),
+            if stdout.is_some() {
+                serde_json::Value::from(0)
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        if let Some(matched) = matched {
+            map.insert(
+                "matched_golden".to_string(),
+                serde_json::Value::Bool(matched),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+    let diffs: Vec<serde_json::Value> = (0..diffs)
+        .map(|index| {
+            serde_json::json!({
+                "field": "stdout",
+                "oracle": format!("oracle-{index}"),
+                "rust": format!("rust-{index}"),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "case_id": id,
+        "description": "a synthetic case",
+        "contracts": ["A.8"],
+        "eval": "ok",
+        "verdict": verdict,
+        "oracle": side(oracle_matched, oracle_stdout),
+        "rust": side(rust_matched, rust_stdout),
+        "diffs": diffs,
+    })
+}
+
+/// The suite classification rules, pinned on **synthetic report JSON**.
+///
+/// The two tests that exercise the real corpus take hours (a full serial sweep), so the facts
+/// that make their verdict handling honest must be affordable on every change. This one needs no
+/// oracle, no runtime and no corpus:
+///
+/// * (a) an `oracle_drift` case is accepted only on its **positive evidence** — the oracle missed
+///   the golden, our side reproduced it, and the two sides' observables really differ;
+/// * (b) the same case with `rust.matched_golden == false` is a violation (a golden our side
+///   fails is a mismatch, never drift), and so is a "drift" whose two sides are identical or
+///   which carries no reported diff;
+/// * (c) a `mismatch` is counted as a mismatch — never as a drift, never as a gap;
+/// * (d) an `agree` case whose oracle side missed its golden is a violation (agreement needs both
+///   sides to match);
+/// * (e) a case that ran and missed its oracle golden is a violation **unless** its id is recorded
+///   in the drift allowlist (`known-drift.txt`), and a recorded entry is accepted without
+///   requiring it to drift;
+/// * (f) a `skipped` case may carry no golden check, so a skip can never hide an oracle miss.
+#[test]
+fn the_suite_classifier_requires_per_case_drift_evidence() {
+    let none = differential::allowlist::Allowlist::parse("# no recorded drift\n", None)
+        .expect("an empty drift allowlist parses");
+
+    // ---- (a) a well-formed drift is accepted -------------------------------------------
+    let drift = synthetic_case(
+        "system_info/version",
+        "oracle_drift",
+        Some(false),
+        Some(true),
+        Some("ok oracle\n"),
+        Some("ok ours\n"),
+        1,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![drift.clone()]), &none);
+    assert_no_violations(&buckets, "a well-formed drift");
+    assert_eq!(buckets.drift, 1);
+    assert_eq!(buckets.agree + buckets.unsupported + buckets.skipped, 0);
+    assert!(buckets.mismatched.is_empty());
+    // A recorded drift id is not *required*: this case is not in the allowlist at all and is
+    // still accepted, because the drift allowlist only tolerates a miss our side did not have.
+
+    // ---- (b) a fabricated / unsupported drift is a violation ----------------------------
+    // (b1) our side failed the golden: a mismatch by construction, never drift.
+    let our_side_failed = synthetic_case(
+        "system_info/version",
+        "oracle_drift",
+        Some(false),
+        Some(false),
+        Some("ok oracle\n"),
+        Some("ok ours\n"),
+        1,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![our_side_failed]), &none);
+    assert_eq!(buckets.drift, 1, "the bucket follows the verdict string");
+    assert!(
+        buckets
+            .violations
+            .iter()
+            .any(|violation| violation.contains("rust.matched_golden == true")),
+        "our side failing the golden must be a violation: {:?}",
+        buckets.violations
+    );
+    // (b2) both sides agree byte-for-byte: nothing differs, so there is nothing to drift.
+    let identical = synthetic_case(
+        "system_info/version",
+        "oracle_drift",
+        Some(false),
+        Some(true),
+        Some("ok same\n"),
+        Some("ok same\n"),
+        0,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![identical]), &none);
+    assert!(
+        buckets
+            .violations
+            .iter()
+            .any(|violation| violation.contains("identical")),
+        "an identical-observables drift is a fabrication: {:?}",
+        buckets.violations
+    );
+    // (b3) differing stdout but no reported diff: the reported evidence is incomplete.
+    let no_diff = synthetic_case(
+        "system_info/version",
+        "oracle_drift",
+        Some(false),
+        Some(true),
+        Some("ok oracle\n"),
+        Some("ok ours\n"),
+        0,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![no_diff]), &none);
+    assert!(
+        buckets
+            .violations
+            .iter()
+            .any(|violation| violation.contains("no field diff")),
+        "a drift must carry the field diff it was derived from: {:?}",
+        buckets.violations
+    );
+
+    // ---- (c) a mismatch stays a mismatch -----------------------------------------------
+    let mismatch = synthetic_case(
+        "etf/term_to_binary_tuple",
+        "mismatch",
+        Some(true),
+        Some(false),
+        Some("ok oracle\n"),
+        Some("ok ours\n"),
+        1,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![mismatch]), &none);
+    assert_eq!(buckets.mismatched, vec!["etf/term_to_binary_tuple".to_string()]);
+    assert_eq!(buckets.drift, 0, "a mismatch is never counted as drift");
+    assert_eq!(
+        buckets.unsupported + buckets.skipped,
+        0,
+        "a mismatch is never counted as a gap"
+    );
+    assert_no_violations(&buckets, "a plain mismatch");
+
+    // ---- (d) an `agree` needs both sides to match the golden ---------------------------
+    let agree_with_oracle_miss = synthetic_case(
+        "flags/custom_argument",
+        "agree",
+        Some(false),
+        Some(true),
+        Some("ok same\n"),
+        Some("ok same\n"),
+        0,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![agree_with_oracle_miss]), &none);
+    assert_eq!(buckets.agree, 1);
+    assert!(
+        buckets
+            .violations
+            .iter()
+            .any(|violation| violation.contains("an agreement needs both sides")),
+        "an agree whose oracle missed the golden is a violation: {:?}",
+        buckets.violations
+    );
+    // A well-formed agreement (both sides matched, observables identical) is clean.
+    let agree = synthetic_case(
+        "flags/custom_argument",
+        "agree",
+        Some(true),
+        Some(true),
+        Some("ok same\n"),
+        Some("ok same\n"),
+        0,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![agree]), &none);
+    assert_no_violations(&buckets, "a well-formed agreement");
+    assert_eq!(buckets.agree, 1);
+
+    // ---- (e) an oracle golden miss must be recorded ------------------------------------
+    // Our side is unobserved (a capability gap), so the verdict is `unsupported` — but the
+    // committed golden is host-version-dependent and the case is not recorded: a failure.
+    let unrecorded = synthetic_case(
+        "boot_extra/system_info_version_is_frozen_17_1",
+        "unsupported",
+        Some(false),
+        None,
+        Some("ok false\n"),
+        None,
+        0,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![unrecorded.clone()]), &none);
+    assert_eq!(buckets.unsupported, 1);
+    assert_eq!(buckets.violations.len(), 1, "{:?}", buckets.violations);
+    assert!(
+        buckets.violations[0].contains("known-drift.txt"),
+        "the violation must name the drift allowlist: {:?}",
+        buckets.violations
+    );
+    // The same case, recorded with a reason: accepted, and **not** required to drift.
+    let recorded = differential::allowlist::Allowlist::parse(
+        "boot_extra/system_info_version_is_frozen_17_1  differential  the golden pins erts-17.1; \
+         this host oracle is a different erts release\n",
+        None,
+    )
+    .expect("a one-entry drift allowlist parses");
+    let buckets = classify_suite_json(&synthetic_suite(vec![unrecorded]), &recorded);
+    assert_eq!(buckets.unsupported, 1);
+    assert_no_violations(&buckets, "a recorded oracle golden miss");
+    // A recorded id that reproduces its golden is **not** a violation here (staleness is the
+    // gate's ratchet job, not this test's).
+    let recorded_but_matching = synthetic_case(
+        "boot_extra/system_info_version_is_frozen_17_1",
+        "agree",
+        Some(true),
+        Some(true),
+        Some("ok true\n"),
+        Some("ok true\n"),
+        0,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![recorded_but_matching]), &recorded);
+    assert_no_violations(&buckets, "a recorded drift that does not drift");
+
+    // ---- (f) a skip can never hide an oracle miss --------------------------------------
+    let skipped = synthetic_case("dist/x", "skipped", None, None, None, None, 0);
+    let buckets = classify_suite_json(&synthetic_suite(vec![skipped]), &none);
+    assert_eq!(buckets.skipped, 1);
+    assert_no_violations(&buckets, "a plain skip");
+    let skipped_with_check = synthetic_case(
+        "dist/y",
+        "skipped",
+        Some(false),
+        None,
+        Some("ok false\n"),
+        None,
+        0,
+    );
+    let buckets = classify_suite_json(&synthetic_suite(vec![skipped_with_check]), &none);
+    assert_eq!(buckets.skipped, 1);
+    assert!(
+        buckets
+            .violations
+            .iter()
+            .any(|violation| violation.contains("never ran")),
+        "a skipped case carrying a golden check is a violation: {:?}",
+        buckets.violations
+    );
+
+    // ---- every case lands in exactly one bucket ----------------------------------------
+    let mixed = classify_suite_json(
+        &synthetic_suite(vec![
+            synthetic_case(
+                "a/agree",
+                "agree",
+                Some(true),
+                Some(true),
+                Some("ok\n"),
+                Some("ok\n"),
+                0,
+            ),
+            synthetic_case(
+                "a/drift",
+                "oracle_drift",
+                Some(false),
+                Some(true),
+                Some("ok oracle\n"),
+                Some("ok ours\n"),
+                1,
+            ),
+            synthetic_case(
+                "a/unsupported",
+                "unsupported",
+                Some(true),
+                None,
+                Some("ok\n"),
+                None,
+                0,
+            ),
+            synthetic_case("a/skipped", "skipped", None, None, None, None, 0),
+            synthetic_case(
+                "a/mismatch",
+                "mismatch",
+                Some(true),
+                Some(false),
+                Some("ok\n"),
+                Some("no\n"),
+                1,
+            ),
+        ]),
+        &none,
+    );
+    assert_no_violations(&mixed, "a mixed report");
+    assert_eq!(
+        mixed.agree
+            + mixed.drift
+            + mixed.unsupported
+            + mixed.skipped
+            + mixed.mismatched.len() as u64,
+        5,
+        "every case must fall into exactly one bucket"
+    );
+}
+
 
 /// The suite must report genuine module agreement (freshly compiled `.beam`s really execute
 /// under both runtimes) while surfacing the remaining capability gaps honestly — never a
@@ -414,67 +956,46 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     assert_eq!(json["mode"], "suite");
     assert_eq!(json["oracle"]["available"], true);
 
-    let mut agree = 0u64;
-    let mut unsupported = 0u64;
-    let mut skipped = 0u64;
-    let mut mismatched: Vec<String> = Vec::new();
-    for case in json["cases"].as_array().expect("cases") {
-        let id = case["case_id"].as_str().expect("a case id");
-        let verdict = case["verdict"].as_str().expect("verdict string");
-        // A `skipped` case never ran (a host tool the case needs is absent — e.g. the
-        // `dist/*` command cases without a built `dist_probe` helper), so its oracle golden was
-        // not checked: that is honest, not drift. Every case that *did* run must have
-        // reproduced its golden.
-        if verdict != "skipped" {
-            assert_eq!(
-                case["oracle"]["matched_golden"], true,
-                "the oracle drifted from a golden: {case}"
-            );
-        }
-        match verdict {
-            "agree" => {
-                agree += 1;
-                // No fabricated agreement: an `agree` case reproduced the oracle exactly.
-                assert_eq!(
-                    case["rust"]["available"], true,
-                    "an agree case must carry a Rust observation: {case}"
-                );
-                assert_eq!(case["rust"]["stdout"], case["oracle"]["stdout"], "{case}");
-                assert_eq!(case["rust"]["exit_code"], case["oracle"]["exit_code"], "{case}");
-            }
-            "unsupported" => unsupported += 1,
-            "skipped" => skipped += 1,
-            "mismatch" => {
-                assert!(
-                    KNOWN_RUNTIME_GAPS.contains(&id),
-                    "unexpected mismatch for `{id}` — not in KNOWN_RUNTIME_GAPS: {case}"
-                );
-                mismatched.push(id.to_string());
-            }
-            other => panic!("unexpected verdict {other}: {case}"),
-        }
+    // Classify every case into exactly one verdict bucket, checking each verdict against the
+    // case's own evidence (see `classify_suite_json`): an `agree` needs *both* sides to reproduce
+    // the golden and the observables to match, `oracle_drift` is positive-evidence-only, and an
+    // oracle golden miss that is not recorded in the committed `known-drift.txt` is a failure.
+    let recorded_drift = known_drift_allowlist();
+    let buckets = classify_suite_json(&json, &recorded_drift);
+    assert_no_violations(&buckets, &lenient.stdout);
+    for id in &buckets.mismatched {
+        assert!(
+            KNOWN_RUNTIME_GAPS.contains(&id.as_str()),
+            "unexpected mismatch for `{id}` — not in KNOWN_RUNTIME_GAPS: {}",
+            lenient.stdout
+        );
     }
 
-    // The summary must count exactly the cases we saw (a mismatch is never fabricated or
-    // hidden — zero mismatches is the target, and an unexpected one still fails above).
-    assert_eq!(json["summary"]["agree"], agree);
-    assert_eq!(json["summary"]["unsupported"], unsupported);
-    assert_eq!(json["summary"]["skipped"], skipped);
+    // The summary must count exactly the cases we saw (a drift or a mismatch is never fabricated
+    // or hidden — zero mismatches is the target, and an unexpected one still fails above).
+    assert_eq!(json["summary"]["agree"], buckets.agree);
+    assert_eq!(
+        json["summary"]["oracle_drift"], buckets.drift,
+        "summary.oracle_drift must count exactly the drifting cases: {}",
+        lenient.stdout
+    );
+    assert_eq!(json["summary"]["unsupported"], buckets.unsupported);
+    assert_eq!(json["summary"]["skipped"], buckets.skipped);
     assert_eq!(
         json["summary"]["mismatch"].as_u64().expect("a mismatch count"),
-        mismatched.len() as u64,
+        buckets.mismatched.len() as u64,
         "summary.mismatch must count exactly the mismatching cases: {}",
         lenient.stdout
     );
 
-    // The suite exit code is `1` iff a mismatch remains (unsupported/skipped are non-fatal
-    // without `--strict`).
-    let expected_exit = if mismatched.is_empty() { 0 } else { 1 };
+    // The suite exit code is `1` iff a mismatch remains: a host-oracle drift and a capability gap
+    // are both non-fatal without `--strict` (the binary's `suite_exit_code` documents that).
+    let expected_exit = if buckets.mismatched.is_empty() { 0 } else { 1 };
     assert_eq!(lenient.code, Some(expected_exit), "{}", lenient.describe());
 
     if agreement_possible {
         assert!(
-            agree >= 1,
+            buckets.agree >= 1,
             "the freshly-compiled module-run cases must agree: {}",
             lenient.stdout
         );
@@ -486,20 +1007,30 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
         // requires a Rust observation, which cannot exist without a resolvable runtime.
         // `tests/oracle.rs` pins the same invariant for a forced-absent runtime (it injects
         // a nonexistent `$BEAM_RT` and asserts the Rust side is `unsupported`).
-        assert_eq!(agree, 0, "nothing may agree without a usable Rust runtime");
+        assert_eq!(
+            buckets.agree, 0,
+            "nothing may agree without a usable Rust runtime"
+        );
     }
     // Every case is accounted for by exactly one verdict bucket, so this holds both today
-    // (with capability gaps) and once the gate is fully green — unlike a hard-coded
-    // `unsupported + skipped >= 1`, which would pin the current gap count.
+    // (with capability gaps and host-oracle drift) and once the gate is fully green — unlike a
+    // hard-coded `unsupported + skipped >= 1`, which would pin the current gap count.
     assert_eq!(
-        agree + unsupported + skipped + mismatched.len() as u64,
+        buckets.agree + buckets.drift + buckets.unsupported + buckets.skipped
+            + buckets.mismatched.len() as u64,
         json["summary"]["total"].as_u64().expect("a total count"),
         "every case must fall into exactly one verdict bucket: {}",
         lenient.stdout
     );
 
+    // `--strict` escalates **every** non-agreeing class to exit 1: a mismatch (always), and a
+    // capability gap or a host-oracle drift (under `--strict`). This invocation passes no
+    // `--drift-allowlist`, so the drift is unrecorded and must be exactly as fatal as a gap.
     let strict = invoke(&["suite", "--strict", "--out", &scratch.arg()], &env);
-    let strict_expected = if !mismatched.is_empty() || unsupported + skipped > 0 {
+    let strict_expected = if !buckets.mismatched.is_empty()
+        || buckets.drift > 0
+        || buckets.unsupported + buckets.skipped > 0
+    {
         1
     } else {
         0
@@ -829,6 +1360,24 @@ fn write_allowlist(path: &std::path::Path, case_ids: &[&str]) {
     std::fs::write(path, body).expect("write the allowlist");
 }
 
+/// Write a synthetic **empty** drift allowlist (a `#`-comment only, no entries) into `path`.
+///
+/// Passing an *empty* drift allowlist is what exercises the drift ratchet without pinning the
+/// corpus: any `oracle_drift` case would be `drift_unauthorized`, and any entry would be
+/// `drift_stale` — and the fake exit-3 runtime below makes every case a gap, so neither can
+/// happen and a zero count is the honest expectation.
+#[cfg(unix)]
+fn write_empty_drift_allowlist(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create the drift allowlist dir");
+    }
+    std::fs::write(
+        path,
+        "# an empty host-oracle drift allowlist: the fake runtime never produces a drift\n",
+    )
+    .expect("write the drift allowlist");
+}
+
 /// The ratchet, end to end, against the real corpus and a fake exit-3 runtime.
 ///
 /// A fake `$BEAM_RT` that signals `beam_rt: unsupported: …` (exit 3) for **every** case makes
@@ -838,6 +1387,12 @@ fn write_allowlist(path: &std::path::Path, case_ids: &[&str]) {
 ///     classified `allowed` — state-independent, the corpus size is never hard-coded;
 ///   * an allowlist that omits one id (an *unauthorized* gap) and adds a bogus id (a *stale*
 ///     entry) is `exit 1`, and the generated `GAPS.md` names both.
+///
+/// Both runs also pass `--drift-allowlist` pointing at a freshly written **empty** allowlist, so
+/// the drift ratchet is exercised end to end too. No case can be an `oracle_drift` here: our side
+/// is *unobserved* (the fake exits 3), and `Verdict::OracleDrift` requires our side to have
+/// reproduced the golden — so `drift_unauthorized` and `drift_stale` must both be 0, and a
+/// non-zero value would mean the drift classification had invented evidence.
 #[cfg(unix)]
 #[test]
 fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
@@ -858,6 +1413,11 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
     );
     let fake = fake.to_str().expect("utf-8 path");
 
+    // The drift ratchet: an empty allowlist, so every case must stay out of both drift counts.
+    let drift_list = scratch.0.join("known-drift.txt");
+    write_empty_drift_allowlist(&drift_list);
+    let drift_list = drift_list.display().to_string();
+
     let ids: Vec<&str> = differential::corpus::cases()
         .iter()
         .map(|case| case.id)
@@ -873,6 +1433,8 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
             "--strict",
             "--allowlist",
             &clean_list.display().to_string(),
+            "--drift-allowlist",
+            &drift_list,
             "--json",
             "--out",
             &scratch.arg(),
@@ -888,6 +1450,21 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
     assert_eq!(json["summary"]["mismatch"], 0, "{}", clean.stdout);
     assert_eq!(json["ratchet"]["unauthorized"], 0, "{}", clean.stdout);
     assert_eq!(json["ratchet"]["stale"], 0, "{}", clean.stdout);
+    // The drift ratchet ran (a drift allowlist was given, so the keys are present) and found
+    // nothing to tolerate — and an unobserved runtime cannot drift.
+    assert_eq!(json["summary"]["oracle_drift"], 0, "{}", clean.stdout);
+    assert_eq!(
+        json["ratchet"]["drift_unauthorized"],
+        0,
+        "an unobserved runtime can never produce a drift: {}",
+        clean.stdout
+    );
+    assert_eq!(
+        json["ratchet"]["drift_stale"],
+        0,
+        "the empty drift allowlist carries no entry that could go stale: {}",
+        clean.stdout
+    );
     // State-independent: every gap is allowlisted, so `allowed` equals the gap total — the
     // corpus size / split is never hard-coded.
     let gaps = json["summary"]["unsupported"].as_u64().expect("unsupported count")
@@ -919,6 +1496,8 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
             "--strict",
             "--allowlist",
             &dirty_list.display().to_string(),
+            "--drift-allowlist",
+            &drift_list,
             "--gaps",
             &gaps_path.display().to_string(),
             "--json",
@@ -934,6 +1513,11 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
     assert_eq!(json["summary"]["mismatch"], 0, "{}", dirty.stdout);
     assert_eq!(json["ratchet"]["unauthorized"], 1, "{}", dirty.stdout);
     assert_eq!(json["ratchet"]["stale"], 1, "{}", dirty.stdout);
+    // The drift ratchet is unaffected by the *gaps* ratchet being dirty: an unobserved runtime
+    // produces no drift, and the empty drift allowlist has nothing to go stale.
+    assert_eq!(json["summary"]["oracle_drift"], 0, "{}", dirty.stdout);
+    assert_eq!(json["ratchet"]["drift_unauthorized"], 0, "{}", dirty.stdout);
+    assert_eq!(json["ratchet"]["drift_stale"], 0, "{}", dirty.stdout);
 
     let markdown = std::fs::read_to_string(&gaps_path).expect("the gaps report was written");
     assert!(
