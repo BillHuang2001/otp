@@ -31,6 +31,7 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 
 ## Design Decisions
 - **Lowering is one peephole pass, not a full `ops.tab` transform.** An audit of the C transform surface (`beam_load.c` + the `=>` transforms in `emu/ops.tab`/`beam_transform_helpers.c`) concluded the current surface is **complete for correctness**: every load-time rewrite the C applies is performance-only (generic→specific selection, fusion, `select`-family sorting, key sorting, precomputed hashes, constant folding) or — for the data-dependent native-record/`Recs` resolution — reproduced at runtime by the engine. The sole genuine capability gap is the **foreign** native-record create form (a typed `unsupported` at the engine, never a wrong result).
+- **`init_yregs` is preserved as its own instruction, not decomposed.** `Instr::InitYregs { registers }` keeps the file's Y list verbatim (each listed slot becomes `[]`/`NIL`); the emu `ops.tab` rewrites (`allocate`/`allocate_heap` + `init_yregs` ⇒ `i_allocate_zero`/`i_allocate_heap_zero`, else one `i_init` per Y) are performance-only and are deliberately not reproduced, so the obsolete roster opcodes `allocate_zero/2`, `allocate_heap_zero/3` and `init/1` (14/15/17) lower to `Instr::Generic`.
 - **Basic blocks are label-delimited and built after fusion**, so a `Function`'s `labels` map and `blocks` indexes agree with the vector the engine dispatches on.
 
 ## Known Issues
