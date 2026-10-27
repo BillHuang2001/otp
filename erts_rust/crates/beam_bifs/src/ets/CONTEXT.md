@@ -100,7 +100,7 @@ A full audit of every table-derived `Eterm` return path in `ets.rs`/`nav.rs`/`re
 This subtree has **two** stores that outlive the BIF call and only **one** of them is safe; the walk inventory below is the complete set (re-derive with `rg -n "access::car|access::cdr|proper_list"`), so a new site can be classified by provenance instead of re-audited.
 ### List walks — all three walk a BIF ARGUMENT (caller-owned heap)
 `crate::print::proper_list` is the only walker used in production code here, and every call site receives a term from the Erlang caller:
-- `../ets.rs:973` (`selection_objects`, the object(s) of `ets:insert/2`/`insert_new/2`);
+- `../ets.rs:1006` (`selection_objects`, the object(s) of `ets:insert/2`/`insert_new/2`);
 - `../ets.rs:1359` (`parse_updates`, the `{Pos,Value}`/`[{Pos,Value}]` spec of `ets:update_element/3`);
 - `./resolve.rs:238` (`parse_options`, the `ets:new/2` option list);
 - `./adopt.rs:326` (`parse_setopts`, the `ets:setopts/2` option list).
@@ -120,7 +120,7 @@ On the **table-less** route (the `-eval`/in-process-compile shape) the copy goes
 ### Caller-side cost of an `insert`/`lookup` (the per-op inventory)
 - **Registry probes: 3 `HashMap<u64, Table>` lookups per table-taking BIF** — `get` + `take` (a `remove`) in `take_table_gated` (`../ets.rs:1617`,`:1620`), `insert` in `restore_table` (`:1626`) — plus one `lookup_name` probe when the table is passed by NAME (`./resolve.rs:98`). The `Table` itself is moved **by value** out and back (a ~200-byte struct memcpy; its `TermStore` blocks and `Box<dyn Interior>` are heap pointers, so nothing O(n) relocates).
 - **The atomic borrow is one `Rc<RefCell<TableRegistry>>::try_borrow_mut` per BIF call** (`../../../beam_rt/src/context/calls.rs:383`), not per table operation, and not a lock.
-- **One Rust `Vec` per argument/answer shape:** `selection_objects`'s `vec![selection]` (`../ets.rs:986`) and the interior's `vec![object]` (`../../../beam_ets/src/champ_interior.rs:521`); empty answers (`Vec::new()` `:522`) allocate nothing.
+- **One Rust `Vec` per argument/answer shape:** a **list** selection's `proper_list` vector (`selection_objects`, `../ets.rs:1006`) and the interior's `vec![object]` (`../../../beam_ets/src/champ_interior.rs:521`); empty answers (`Vec::new()` `:522`) allocate nothing. A single-object selection allocates nothing — it rides `Selection::Single` and reaches the table through `core::slice::from_ref` — so `ets:insert/2` of one object is allocation-free (`tests/ets_insert_alloc.rs`); `ets:insert_new/2`'s single form pays only `insert_new_into`'s key vector.
 - **`copy_out_list` allocates nothing beyond the spine under the alias witness** (`../ets.rs:1674-1677`); the graph copy happens once, in the host tail. Without a witness it allocates one `Vec` per answer plus a `copy_struct_simple` per object.
 - **Insert's own storage costs are in `beam_ets`:** one `Vec<AllocSlice>` per inserted object (`TermStore::tracked`, `store/mod.rs:274`), one `alloc_words` per term node (each a linear `free_runs` bucket scan, `:477`), and one `interior.lookup` `Vec` on the replace path (`table/mod.rs:623`).
 

@@ -43,10 +43,18 @@
 //! two-pass walk in `binconv.rs` — plus two spellings of the `binary:part` range
 //! rule. Both differences were pure cost, and a divergence between them would be a
 //! *wrong answer* for the same term depending on which BIF saw it, so they are one
-//! implementation here. The remaining crate-local walks are deliberately **not**
-//! this walk: `erlang:list_to_bitstring/1`'s (`Unit = 1`) assembles bits, `port.rs`'s
-//! `intlist_to_buf` accepts only a proper list of bytes, and `re`'s option iodata
-//! accepts an improper byte tail (`[1|2]`) that an iolist rejects.
+//! implementation here. `re`'s option iodata is a consumer too (`re/options.rs::iodata_bytes`,
+//! the capture name of `{capture, Value, Type}`), which is why an improper byte tail
+//! (`[98|99]`) is rejected there exactly as this walk rejects it. The remaining
+//! crate-local walks are deliberately **not** this walk, each because its output shape
+//! genuinely differs: `erlang:list_to_bitstring/1`'s (`Unit = 1`) assembles bits, `port.rs`'s
+//! `intlist_to_buf` accepts only a proper list of bytes (no binaries, no nesting),
+//! `io.rs`'s `iolist_to_chars`/`limit_iolist_to_chars` build a **nesting-preserving**
+//! `Chunk` tree of `char`s (the structure `io_lib_format` recurses over and elides
+//! through) rather than flat bytes, and `term_conv.rs::iolist_to_iovec_1` answers a list
+//! of **binary terms**, merging each run of copied components into one binary and passing
+//! a component past `IOL2V_COPY_THRESHOLD_BITS` through **by identity** — a decision that
+//! needs the component's own term and bit offset, neither of which a [`Leaf`] carries.
 //!
 //! # The measured cost
 //!

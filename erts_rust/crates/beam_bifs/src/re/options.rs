@@ -364,36 +364,15 @@ fn small_int(term: Eterm) -> Option<i64> {
 
 /// The byte payload of an iodata term, or `None` when it is not valid iodata
 /// (the C `erts_iolist_size`/`erts_iolist_to_buf` pair).
+///
+/// The flattening is the crate's one iolist walk ([`crate::iolist::bytes`]), so a
+/// capture name written as a string — `["foo"]`, which Erlang spells as a list of
+/// small integers — a nested list, a byte-aligned binary element and a bare binary
+/// are all accepted, and an **improper byte tail** (`[98|99]`) is `None` exactly as
+/// the oracle answer `badarg`s it (the C cons-tail rule admits only a list, `[]` or
+/// a binary).
 fn iodata_bytes(term: Eterm) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    fn walk(term: Eterm, out: &mut Vec<u8>) -> Option<()> {
-        if access::is_nil(term) {
-            return Some(());
-        }
-        if access::is_list(term) {
-            walk(access::car(term), out)?;
-            return walk(access::cdr(term), out);
-        }
-        // A list *element* is a byte (`iolist() = binary() | [byte() | binary() |
-        // iolist()]`), so a name written as a string — `["foo"]`, which Erlang
-        // spells as a list of small integers — is valid iodata.
-        if let Some(byte) = byte_value(term) {
-            out.push(byte);
-            return Some(());
-        }
-        if access::is_binary(term) {
-            out.extend_from_slice(&crate::bits::bytes(term).ok()?);
-            return Some(());
-        }
-        None
-    }
-    walk(term, &mut out)?;
-    Some(out)
-}
-
-/// A small integer in `0..=255` as a byte (the `erts_iolist_to_buf` element rule).
-fn byte_value(term: Eterm) -> Option<u8> {
-    u8::try_from(small_int(term)?).ok()
+    crate::iolist::bytes(term, crate::iolist::TopLevel::ListOrBinary).ok()
 }
 
 /// One option list element.
@@ -720,6 +699,39 @@ mod tests {
         let neg_list = f.list(&[make_small(-1)]);
         let bad = f.tup(&[cap, neg_list, index]);
         assert!(matches!(f.parse_opts(&[bad]), Err(beam_common::BeamError::BadArg)));
+    }
+
+    #[test]
+    fn a_capture_name_may_be_iodata_but_not_an_improper_byte_tail() {
+        let mut f = Fixture::new();
+        let cap = f.atom("capture");
+        let binary = f.atom("binary");
+        // A name written as a string — the list of its bytes.
+        let name_bytes = f.list(&[make_small(0x62)]);
+        let one_name = f.list(&[name_bytes]);
+        let spec = f.tup(&[cap, one_name, binary]);
+        let p = f.parse_opts(&[spec]).expect("capture/[\"b\"]/binary");
+        assert_eq!(
+            p.capture,
+            Some((CapValue::Names(vec![CapId::Name("b".to_string())]), CapType::Binary))
+        );
+        // A nested list and a binary element are iodata too.
+        let inner = f.list(&[make_small(0x62)]);
+        let nested = f.list(&[inner]);
+        let one_nested = f.list(&[nested]);
+        let spec = f.tup(&[cap, one_nested, binary]);
+        assert_eq!(f.parse_opts(&[spec]).expect("nested").capture.map(|c| c.0),
+            Some(CapValue::Names(vec![CapId::Name("b".to_string())])));
+        let binary_name = beam_codec::term::make_binary(&mut f.heap, b"b").expect("fits");
+        let one_binary = f.list(&[binary_name]);
+        let spec = f.tup(&[cap, one_binary, binary]);
+        assert_eq!(f.parse_opts(&[spec]).expect("binary element").capture.map(|c| c.0),
+            Some(CapValue::Names(vec![CapId::Name("b".to_string())])));
+        // An improper byte tail (`[98|99]`) is the oracle's `badarg`, not a name.
+        let improper = f.heap.cons(make_small(0x62), make_small(0x63)).expect("fits");
+        let one_improper = f.list(&[improper]);
+        let spec = f.tup(&[cap, one_improper, binary]);
+        assert!(matches!(f.parse_opts(&[spec]), Err(beam_common::BeamError::BadArg)));
     }
 
     #[test]
