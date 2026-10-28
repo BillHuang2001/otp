@@ -136,7 +136,18 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
 - **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3463 agree=3462 mismatch=0
-  unsupported=1 skipped=0`** → `gate.sh` exits 0. **No case disagrees.** The single recorded
+  unsupported=1 skipped=0`** against the CI oracle (OTP 29.1.1 / erts-17.1) → `gate.sh` exits 0.
+  **No case disagrees** there.
+- The same corpus against an oracle that is **not** erts-17.1 reads
+  `agree=3459 mismatch=3 unsupported=1 skipped=0 allowed=1 unauthorized=0 stale=0`: the three
+  disagreements (`system_info/version`, `boot_extra/system_info_version_is_frozen_17_1`,
+  `nif_abi/system_info_frozen_fields`) are oracle-vs-golden **drift** — an OTP 29.1.2 / erts-17.1.1
+  host answers `<<"17.1.1">>` where the goldens pin `17.1`, while the Rust side matches the frozen
+  value — so `gate.sh` exits 1 on such a host by design, not from a divergence.
+- The optional Cranelift tier reproduces that same line (`build -p beam_rt --features cranelift`
+  plus `BEAM_RT_TIER=cranelift`), so the tier changes no observable; a `cranelift` request in a
+  build without the feature is refused up front (exit 3, one `beam_rt: unsupported: …` line naming
+  the Cargo feature). The single recorded
   capability gap (`known-gaps.txt`, the ratchet allowlist) is `wire/new_fun_ext_encode` (A.5, an
   `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`). `gate.sh` is
   authoritative for the live per-contract split; it always passes `--strict` and defaults its
