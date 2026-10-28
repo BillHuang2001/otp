@@ -106,8 +106,8 @@ use beam_term::prelude::{
 use crate::error;
 use crate::exit_observer::{ProcessExit, ProcessExitObserver};
 use crate::monitor::{
-    payload_is_down_for, AliasEntry, Monitor, MonitorKind, MonitorRef, MonitoredBy, PortWatch,
-    RefAllocator, UnaliasMode,
+    payload_is_monitor_down_for, AliasEntry, Monitor, MonitorKind, MonitorRef, MonitoredBy,
+    PortWatch, RefAllocator, UnaliasMode,
 };
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
@@ -2079,12 +2079,28 @@ impl ProcessTable {
     }
 
     /// `erlang:demonitor(Ref, [flush])`: [`ProcessTable::demonitor`] **and** the removal of any
-    /// already-queued `{'DOWN', Ref, …}` from `watcher`'s mailbox.
+    /// already-queued DOWN for `reference` from `watcher`'s mailbox — **whatever its head is**.
     ///
     /// The monitor halves are dropped first (so the usual local/remote routing still happens),
     /// then the mailbox is scanned with the queue cursor API and every message recognised by
-    /// [`payload_is_down_for`] as *this* reference's DOWN is removed. A fresh cursor is derived
-    /// after each removal because a removal shifts every later message down by one.
+    /// [`payload_is_monitor_down_for`] as *this* reference's DOWN is removed. A fresh cursor is
+    /// derived after each removal because a removal shifts every later message down by one.
+    ///
+    /// # Which messages are this monitor's DOWN
+    ///
+    /// The notification an `erlang:monitor/2` monitor delivers is `{'DOWN', Ref, Kind, Target,
+    /// Reason}`, but an `erlang:monitor/3` `{tag, Tag}` monitor delivers `{Tag, Ref, Kind, Target,
+    /// Reason}` — the same DOWN with the **user's** term in the head slot (see `monitor.rs`'s "User
+    /// tags" section). Both are this monitor's DOWN and both must go, which is why the head is
+    /// never inspected here: ERTS's flush is the head-agnostic pattern `{_, Ref, _, _, _}`
+    /// (`erts_internal:flush_monitor_messages/3`, `erts/preloaded/src/erts_internal.erl:523-534`,
+    /// which `erlang:demonitor/2`'s `[flush]` traps to). A head test on the `'DOWN'` atom would
+    /// leak a tagged DOWN — exactly the shape `gen_server`'s `mc_recv/5` leaves behind, since it
+    /// flushes right after the reply.
+    ///
+    /// The reference identity is the **sole** discriminator, so a *different* monitor's DOWN (any
+    /// head), a message that is not a 5-tuple, and a 5-tuple carrying any other term at element 1
+    /// all stay in the mailbox.
     ///
     /// # Return value
     ///
@@ -2105,7 +2121,6 @@ impl ProcessTable {
             return Err(error::unknown_process());
         }
         let existed = self.demonitor(watcher, reference)?;
-        let down = self.atoms.down();
         let removed = {
             let Some(process) = self.get_mut(watcher) else {
                 return Ok(existed);
@@ -2116,7 +2131,7 @@ impl ProcessTable {
             loop {
                 let position = mailbox.position(cursor);
                 match mailbox.message_at(cursor).map(|message| message.payload()) {
-                    Some(payload) if payload_is_down_for(payload, reference, down) => {
+                    Some(payload) if payload_is_monitor_down_for(payload, reference) => {
                         mailbox.remove_at(cursor);
                         removed = true;
                         // Positions shifted down by one: re-derive a cursor at the same index.
@@ -5008,7 +5023,6 @@ mod tests {
         // `{'DOWN', Ref, process, Target, noproc}` is delivered immediately, and no half of the
         // monitor is recorded (there is nothing left to watch).
         let dead = ProcessId::new(999, 0);
-        let down_atom = table.atoms.down();
         let mailbox_before = table.get(watcher).expect("watcher").mailbox().len();
         let dead_ref = table
             .monitor(watcher, dead, MonitorKind::Process)
@@ -5031,7 +5045,7 @@ mod tests {
             .expect("the DOWN is queued")
             .payload();
         assert!(
-            payload_is_down_for(payload, dead_ref, down_atom),
+            payload_is_monitor_down_for(payload, dead_ref),
             "a 5-tuple `{{'DOWN', Ref, ..}}` for the fresh reference"
         );
         // SAFETY: the payload is the live 5-tuple the DOWN builder wrote.
@@ -5094,7 +5108,7 @@ mod tests {
             .expect("one message")
             .payload();
         assert!(
-            payload_is_down_for(remaining, first, table.atoms.down()),
+            payload_is_monitor_down_for(remaining, first),
             "the surviving DOWN is the first monitor's"
         );
 
@@ -5193,8 +5207,6 @@ mod tests {
         let name = atoms_table.intern("nobody");
         let node = atoms_table.intern("nonode@nohost");
         let watcher = table.spawn_default().expect("watcher");
-        let down_atom = table.atoms.down();
-
         assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 0);
         let reference = table
             .monitor_named(watcher, name, node, MonitorKind::Process)
@@ -5215,7 +5227,7 @@ mod tests {
             .peek()
             .expect("the DOWN is queued")
             .payload();
-        assert!(payload_is_down_for(payload, reference, down_atom));
+        assert!(payload_is_monitor_down_for(payload, reference));
         // SAFETY: the payload is the live 5-tuple the DOWN builder wrote.
         unsafe {
             assert_eq!(tuple_size(payload), 5);

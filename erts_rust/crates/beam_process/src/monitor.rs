@@ -99,8 +99,8 @@
 use beam_alloc::Heap;
 use beam_common::{next_ref_id, Result};
 use beam_term::prelude::{
-    boxed_val, header_arity, header_subtag, internal_ref_id, is_boxed_term, is_tuple, make_atom,
-    signed_value, try_make_small, tuple_element, tuple_size, write_internal_ref, Atom, Eterm,
+    boxed_val, header_arity, header_subtag, internal_ref_id, is_boxed_term, is_tuple,
+    signed_value, try_make_small, tuple_element, tuple_size, write_internal_ref, Eterm,
     TermError, INTERNAL_REF_PAYLOAD_WORDS, INTERNAL_REF_WORDS, REF_SUBTAG,
 };
 
@@ -304,10 +304,26 @@ pub struct AliasEntry {
     pub mode: UnaliasMode,
 }
 
-/// Whether `payload` is the `{'DOWN', Reference, _, _, _}` message for `reference`.
+/// Whether `payload` is **this monitor's** DOWN message for `reference` — `{_, Reference, _, _, _}`,
+/// **whatever its head is**.
 ///
-/// A `demonitor(Ref, [flush])` helper: it recognises the monitor-DOWN message a
-/// [`MonitorRef`] produced, so the caller can drop it out of a mailbox.
+/// A `demonitor(Ref, [flush])` helper: it recognises the notification a [`MonitorRef`] produced, so
+/// the caller can drop it out of a mailbox.
+///
+/// # The head is deliberately *not* inspected
+///
+/// ERTS's flush is head-agnostic: `erts_internal:flush_monitor_messages/3`
+/// (`erts/preloaded/src/erts_internal.erl:523-534`) matches the pattern `{_, Ref, _, _, _}`, i.e. a
+/// 5-tuple whose element 1 is this reference and nothing else, and `erlang:demonitor/2`'s `[flush]`
+/// traps to exactly that function. This matters because an `erlang:monitor/3` `{tag, Tag}` monitor
+/// delivers `{Tag, Ref, Kind, Target, Reason}` instead of `{'DOWN', Ref, Kind, Target, Reason}` (see
+/// this module's "User tags" section), so a head test on the `'DOWN'` atom would leave a **tagged**
+/// down in the mailbox. That is precisely the shape `gen_server`'s `mc_recv/5` produces: it calls
+/// `demonitor(Mon, [flush])` right after the reply, where a leaked tagged DOWN would corrupt the
+/// caller's next receive. A `{tag, Tag}` head is therefore *equally* this monitor's DOWN.
+///
+/// The **reference identity is the sole discriminator** — a different monitor's DOWN, a
+/// non-5-tuple, and a same-shaped message carrying any other term at element 1 all stay.
 ///
 /// # Encoding
 ///
@@ -324,26 +340,25 @@ pub struct AliasEntry {
 ///
 /// # Robustness
 ///
-/// Every read is guarded: a non-tuple payload, a payload that is not a 5-tuple, a head element
-/// that is not `down_atom`, and an element 1 that is not a boxed ref thing are all `false`
-/// without reading a word the guards have not first proven to exist. The ref block must carry
-/// **both** `REF_SUBTAG` **and** arity [`INTERNAL_REF_PAYLOAD_WORDS`], because the subtag alone
-/// is also worn by the C-layout `ErtsORefThing` (arity 2, three words — no id slot), so the
-/// arity is what proves the id word exists rather than over-reading a shorter block. It never
-/// panics.
-pub fn payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Atom) -> bool {
+/// Every read is guarded: a non-tuple payload, a payload that is not a 5-tuple, and an element 1
+/// that is not a boxed ref thing are all `false` without reading a word the guards have not first
+/// proven to exist. The head at `tuple_element(payload, 0)` is **not read at all** (it must not be:
+/// any term, atom or not, is a legal head — see above), so there is no head guard to get wrong. The
+/// ref block must carry **both** `REF_SUBTAG` **and** arity
+/// [`INTERNAL_REF_PAYLOAD_WORDS`], because the subtag alone is also worn by the C-layout
+/// `ErtsORefThing` (arity 2, three words — no id slot), so the arity is what proves the id word
+/// exists rather than over-reading a shorter block. It never panics.
+pub fn payload_is_monitor_down_for(payload: Eterm, reference: MonitorRef) -> bool {
     // SAFETY: the guards form a chain. `is_tuple` first rejects everything that is not a live
     // boxed term whose header word is a valid arity value, so `tuple_size`/`tuple_element` only
-    // ever read a live tuple; the arity test bounds every element read to `0..5`; and element 1
+    // ever read a live tuple; the arity test bounds every element read to `0..5` (element 0 — the
+    // head — is not read at all, and element 1 is read only inside that bound); and element 1
     // is only dereferenced after `is_boxed_term` proved it a dereferenceable boxed term, and
     // `header_subtag` + `header_arity` proved its header carries `REF_SUBTAG` with
     // `INTERNAL_REF_PAYLOAD_WORDS` payload words, so word `INTERNAL_REF_PAYLOAD_WORDS` (the id)
     // is in bounds. No path reads a word it has not first proven to exist.
     unsafe {
         if !is_tuple(payload) || tuple_size(payload) != 5 {
-            return false;
-        }
-        if tuple_element(payload, 0) != make_atom(down_atom) {
             return false;
         }
         let reference_term = tuple_element(payload, 1);
@@ -572,8 +587,8 @@ mod tests {
 
     use beam_common::BeamError;
     use beam_term::prelude::{
-        boxed_val, header_subtag, is_boxed, make_boxed, make_header, make_small, signed_value,
-        MAX_SMALL, MIN_SMALL, REF_SUBTAG, SMALL_BITS,
+        boxed_val, header_subtag, is_boxed, make_atom, make_boxed, make_header, make_small,
+        signed_value, MAX_SMALL, MIN_SMALL, REF_SUBTAG, SMALL_BITS,
     };
 
     use super::*;
@@ -855,23 +870,23 @@ mod tests {
     }
 
     #[test]
-    fn payload_is_down_for_matches_only_its_own_reference_and_shape() {
-        use beam_term::prelude::{make_atom, AtomTable};
+    fn payload_is_monitor_down_for_ignores_the_head_and_matches_only_its_reference() {
+        use beam_term::prelude::{make_atom, AtomTable, EXTERNAL_REF_SUBTAG};
 
         let mut table = AtomTable::new();
         let down = table.intern("DOWN");
-        let exit = table.intern("EXIT");
+        let mytag = table.intern("mytag");
         let process = table.intern("process");
 
         let mut refs = RefAllocator::new();
         let reference = refs.next();
         let other = refs.next();
 
-        let mut heap = Heap::new(64).expect("test heap");
+        let mut heap = Heap::new(128).expect("test heap");
         let mut ref_heap = Heap::new(32).expect("test heap");
         let reference_term = reference.to_eterm(&mut ref_heap).expect("the ref fits");
 
-        // The exact shape the signal builders produce.
+        // The exact shape the signal builders produce, for an ordinary `{'DOWN', …}` monitor …
         let message = heap
             .tuple(&[
                 make_atom(down),
@@ -881,13 +896,43 @@ mod tests {
                 make_small(0),
             ])
             .expect("the test arena holds the tuple");
-        assert!(payload_is_down_for(message, reference, down));
-        // A different reference is not this message's DOWN ...
-        assert!(!payload_is_down_for(message, other, down));
-        // ... and a different head atom is not a DOWN at all.
-        assert!(!payload_is_down_for(message, reference, exit));
+        assert!(payload_is_monitor_down_for(message, reference));
+        // … and for an `erlang:monitor/3` `{tag, Tag}` monitor, whose head is the *user's* term:
+        // it is the very same monitor's DOWN, so the flush must recognise it.
+        let tagged = heap
+            .tuple(&[
+                make_atom(mytag),
+                reference_term,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("fits");
+        assert!(
+            payload_is_monitor_down_for(tagged, reference),
+            "a tagged DOWN is this monitor's DOWN too"
+        );
+        // The rule is `{_, Ref, _, _, _}` (ERTS's `flush_monitor_messages/3`): the head is not
+        // inspected at all, so a non-atom head matches exactly like the `'DOWN'` atom does.
+        let non_atom_head = heap
+            .tuple(&[
+                make_small(42),
+                reference_term,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("fits");
+        assert!(
+            payload_is_monitor_down_for(non_atom_head, reference),
+            "the head element is never read"
+        );
+        // The reference identity is the sole discriminator: a different monitor's DOWN is not this
+        // one's, whatever its head is.
+        assert!(!payload_is_monitor_down_for(message, other));
+        assert!(!payload_is_monitor_down_for(tagged, other));
 
-        // A 4-tuple with the right head is not a 5-tuple DOWN.
+        // A 4-tuple and a 6-tuple carrying the right reference are not a 5-tuple DOWN.
         let short = heap
             .tuple(&[
                 make_atom(down),
@@ -896,7 +941,18 @@ mod tests {
                 pid(1).to_eterm(),
             ])
             .expect("fits");
-        assert!(!payload_is_down_for(short, reference, down));
+        assert!(!payload_is_monitor_down_for(short, reference));
+        let long = heap
+            .tuple(&[
+                make_atom(down),
+                reference_term,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+                make_small(1),
+            ])
+            .expect("fits");
+        assert!(!payload_is_monitor_down_for(long, reference));
 
         // Element 1 that is not a boxed ref thing (here: a pid immediate).
         let not_ref = heap
@@ -908,7 +964,7 @@ mod tests {
                 make_small(0),
             ])
             .expect("fits");
-        assert!(!payload_is_down_for(not_ref, reference, down));
+        assert!(!payload_is_monitor_down_for(not_ref, reference));
 
         // A **C-layout** reference block (header arity 2, three words — no id slot) wears the
         // same `REF_SUBTAG`, so it must be refused on arity rather than over-read for its id.
@@ -931,7 +987,31 @@ mod tests {
                 make_small(0),
             ])
             .expect("fits");
-        assert!(!payload_is_down_for(c_layout_down, reference, down));
+        assert!(!payload_is_monitor_down_for(c_layout_down, reference));
+
+        // A block of the right arity but a **foreign subtag** (an external reference) is not an
+        // internal ref thing at all.
+        let foreign_ref = {
+            let p = unsafe { ref_heap.alloc_words(4) }.expect("fits");
+            // SAFETY: the four words are exclusively owned and written before escaping.
+            unsafe {
+                *p = make_header(3, EXTERNAL_REF_SUBTAG);
+                *p.add(1) = make_small(0);
+                *p.add(2) = make_small(0);
+                *p.add(3) = make_small(reference.id() as i64);
+            }
+            make_boxed(p as *const Eterm)
+        };
+        let foreign_down = heap
+            .tuple(&[
+                make_atom(down),
+                foreign_ref,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("fits");
+        assert!(!payload_is_monitor_down_for(foreign_down, reference));
 
         // A ref block whose id word is *negative* is never an id: `u64::try_from` refuses it, so
         // it cannot match even a reference whose id wraps to that value in `i64`.
@@ -955,24 +1035,23 @@ mod tests {
                 make_small(0),
             ])
             .expect("fits");
-        assert!(!payload_is_down_for(negative_down, reference, down));
+        assert!(!payload_is_monitor_down_for(negative_down, reference));
         assert!(
-            !payload_is_down_for(
+            !payload_is_monitor_down_for(
                 negative_down,
                 MonitorRef {
                     id: u64::MAX // `-1i64 as u64`
-                },
-                down
+                }
             ),
             "a negative id word must not match a huge id"
         );
 
         // Non-tuple payloads must never be dereferenced.
-        assert!(!payload_is_down_for(make_small(7), reference, down));
-        assert!(!payload_is_down_for(make_atom(down), reference, down));
+        assert!(!payload_is_monitor_down_for(make_small(7), reference));
+        assert!(!payload_is_monitor_down_for(make_atom(down), reference));
         let not_a_down = heap
             .tuple(&[make_atom(process), make_small(1)])
             .expect("fits");
-        assert!(!payload_is_down_for(not_a_down, reference, down));
+        assert!(!payload_is_monitor_down_for(not_a_down, reference));
     }
 }
