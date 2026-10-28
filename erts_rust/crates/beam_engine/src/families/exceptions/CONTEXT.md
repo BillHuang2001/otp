@@ -107,10 +107,20 @@ C's discriminators are `raw_raise`'s `EXF_SAVETRACE` clear and the `c_p->ftrace`
   one-shot `pending_supplied_trace` latch, `Machine::throw_with_trace` promotes it to the live
   `raise_supplied_trace`, and `stacktrace::symbolic_stacktrace` — the one consumer — renders THOSE frames
   instead of the `raise_snapshot` heuristic (the uncaught path renders them through
-  `Machine::with_uncaught_frames`). Each frame renders as `{Module,Function,Arity,Location}` with an
-  **arity** in the `A` slot (the model carries no argument list) and the `[{file,File},{line,N}]` location
-  the `SourceLocation` describes; every name is resolved from the running module's atom table (never
-  substituted — a name it cannot intern is a typed `unsupported`).
+  `Machine::with_uncaught_frames`).
+  Each frame renders as `{Module,Function,Arity,Location}` with an **arity** in the `A` slot (the model
+  carries no argument list) and the `[{file,File},{line,N}]` location the `SourceLocation` describes.
+  Every name a frame mentions -- its `Module` and `Function` and the location's `file`/`line` keys -- is
+  resolved through the **live** atom namespace (`ExecutionContext::atoms`, via `machine::namespace_atom`)
+  with the running module's load-time snapshot as the fallback, and is never substituted.
+  A supplied trace's names routinely come from modules the re-raising module never mentioned
+  (`proc_lib`/`gen_server`/a supervisor re-raising a captured trace), so a snapshot-only lookup refused
+  traces the oracle echoes **verbatim** -- `build_stacktrace`'s `is_raised_exc` branch does no atom
+  resolution at all (`erts/emulator/beam/beam_common.c:1219-1223`) -- which is what destroyed most
+  third-party (Khepri/Cowboy) crash reports.
+  Honest residual: a name **neither** the live namespace nor the module snapshot can name is still the
+  typed `unsupported`, never a fabricated atom -- an atom index is valid only against the table it was
+  read with.
 - **The trace TERM** — `Instr::RawRaise`, the shape `sys_core_fold` folds `catch C:R:S ->
   erlang:raise(C,R,S)` into (`lib/compiler/src/sys_core_fold.erl:2441-2465`). The raise supplies its trace
   as the **cooked** `[{M,F,A,Location}]` **list**: the arm reads `x(2)` (a landed exception published the
@@ -198,8 +208,8 @@ compiled handler) and is relocated in place by every collection.
   there — it can never leak into another raise. `Machine::reset` clears both.
 
 ## The cooked trace is ONE reservation — the carve is word-exact and collection-safe
-The `[{M,F,A,Location}]` list handed to the handler is a **single** rooted reservation (`terms::reserve_slack`, `stacktrace.rs:248` for the snapshot/head path, `:323` for supplied frames), carved node-by-node by the [`Sink`] trait; nothing on that path allocates a second time, so no `Slack` cursor or carved `Eterm` is ever live across a collection-capable door.
-- **The size identity is exact, not padded.** `ItemShape::words()` (`stacktrace.rs:475-481`) = `5 + 2*args_len + (2*file_chars + 10)` matches consumption word for word: `5` for the `{M,F,A,Loc}` tuple (`Sink::tuple` charges `elems.len() + 1`, `terms/sink.rs:99`), `2*args_len` for the failed clause's argument list (`Sink::list` charges `2*len`, `:107`), `3` + `3` + `4` = `10` for `{file,F}` / `{line,N}` / the outer two-element list (`write_location`, `stacktrace.rs:623-637`), and `2*file_chars` for the file-name char list.
+The `[{M,F,A,Location}]` list handed to the handler is a **single** rooted reservation (`terms::reserve_slack`, `stacktrace.rs:249` for the snapshot/head path, `:329` for supplied frames), carved node-by-node by the [`Sink`] trait; nothing on that path allocates a second time, so no `Slack` cursor or carved `Eterm` is ever live across a collection-capable door.
+- **The size identity is exact, not padded.** `ItemShape::words()` (`stacktrace.rs:505-511`) = `5 + 2*args_len + (2*file_chars + 10)` matches consumption word for word: `5` for the `{M,F,A,Loc}` tuple (`Sink::tuple` charges `elems.len() + 1`, `terms/sink.rs:99`), `2*args_len` for the failed clause's argument list (`Sink::list` charges `2*len`, `:107`), `3` + `3` + `4` = `10` for `{file,F}` / `{line,N}` / the outer two-element list (`write_location`, `stacktrace.rs:653-667`), and `2*file_chars` for the file-name char list.
 - **The outer list and the head cons are charged separately and exactly:** `total = 2*shapes.len() + Σ words + if head {2}` (`:246`), `sink.list(&items)` carves `2*shapes.len()` (`:277`), and the head cons carves its own `2` (`Sink::cons`, `:117`). The head item is the raise's **already-built** raw-trace word, never carved here, so `+2` is the whole addition.
 - **An undersized reservation is a typed error, never an overrun:** `Slack::alloc_words` answers `Err(error::unsupported("slack: reserved region too small for the node"))` when `remaining() < n` (`terms/slack.rs:122-125`), and `Sink::tuple`'s `check_tuple_arity` (`terms/sink.rs:59`) rejects `> beam_term::MAX_ARITYVAL` (`SystemLimit`) **before** carving. A wrong `words()` therefore degrades to a typed failure, never a write past the region.
 - **Every heap-term read happens AFTER the reservation** — a collecting host relocates `x` and the stack in place, so only post-reservation words are valid: the failed-clause args latch is *length-read* before (`Machine::live_raise_function_clause_args`, `:226`, a move-invariant count) and *consumed* after (`Machine::take_raise_function_clause_args`, `:258`, re-seated by `Machine::with_roots`), and the `args` list's elements are carved inside (`write_item`, `:615`).

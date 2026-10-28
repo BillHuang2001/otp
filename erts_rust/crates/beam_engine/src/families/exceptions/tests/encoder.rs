@@ -277,13 +277,15 @@ fn the_public_encoder_cooks_what_the_system_oracle_prints() {
 
 #[test]
 fn a_name_the_module_cannot_resolve_is_a_typed_unsupported_error() {
-    // The module names `m` (its own name) but not `f`: the encoder must report the
-    // typed `unsupported` — never substitute an atom the caller did not name, which
-    // would be a WRONG term.
+    // The module names `m` (its own name) but not `f`, and the host installs no live
+    // namespace (the `ExecutionContext::atoms` default IS the module snapshot), so
+    // `f` is unnameable by **both** sources: the encoder must report the typed
+    // `unsupported` — never substitute an atom the caller did not name, which would
+    // be a WRONG term.
     let module = Fixture::new(&[]).finish();
     let mut ctx = MinimalContext::new();
     let error = crate::encode_supplied_stacktrace(&module, &mut ctx, &trace_of(frame(0)))
-        .expect_err("a frame naming an atom the module lacks must not cook");
+        .expect_err("a frame naming an atom neither namespace names must not cook");
     let BeamError::Raise(raise) = &error else {
         panic!("expected the typed `unsupported` raise, got {error:?}");
     };
