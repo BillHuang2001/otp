@@ -776,6 +776,10 @@ pub struct Runtime {
     /// — because the boot drive then finds nothing left that could wake its `{apply, …}`
     /// directive — report the misleading `unsupported: … process blocked` capability gap
     /// instead of a genuine runtime error (see [`Runtime::default_spawn_policy`]).
+    ///
+    /// It is also the runtime's **boot phase** — the window the runner's execution-tier
+    /// selection is scoped by ([`Runtime::in_boot_phase`]) — and it is written **only**
+    /// through [`Runtime::set_boot_phase`], so one field serves both readers.
     booting: bool,    /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
     pub(crate) halt: Option<i32>,
     /// The **sequential-tracing** state (contract A.8): the per-process trace tokens
@@ -4010,11 +4014,12 @@ impl Runtime {
         self.boot_script_path = Some(path.as_ref().to_path_buf());
         // While the script runs, every process it starts is a system server of this runtime,
         // not user code: it gets the unbounded system heap policy (see
-        // [`Runtime::default_spawn_policy`]). Restored on every exit path, including a
-        // directive that raises.
-        self.booting = true;
+        // [`Runtime::default_spawn_policy`]), and the runner's default execution tier is the
+        // interpreter for the same window ([`Runtime::in_boot_phase`]). Restored on every exit
+        // path, including a directive that raises.
+        self.set_boot_phase(true);
         let executed = bootscript::execute(self, &script);
-        self.booting = false;
+        self.set_boot_phase(false);
         executed?;
         Ok(script)
     }
@@ -4056,10 +4061,12 @@ impl Runtime {
         self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         self.boot_script_path = Some(path.as_ref().to_path_buf());
         // Every process the script starts is a system server of this runtime, not user code —
-        // see [`Runtime::boot_from_script`] and [`Runtime::default_spawn_policy`].
-        self.booting = true;
+        // see [`Runtime::boot_from_script`] and [`Runtime::default_spawn_policy`] — and the
+        // boot phase is what the runner's default execution tier is scoped by
+        // ([`Runtime::in_boot_phase`]). Left on every exit path, the reporting one included.
+        self.set_boot_phase(true);
         let executed = bootscript::execute_reporting(self, &script);
-        self.booting = false;
+        self.set_boot_phase(false);
         executed
     }
     /// The path of the boot script this runtime has **loaded**, if any — the source of
@@ -4395,6 +4402,36 @@ impl Runtime {
         self.spawn_process_with_policy(module, function, args, policy, None)
     }
 
+    /// Whether the runtime is in its **boot phase** — the boot-script window.
+    ///
+    /// The phase is "the runtime is running the directives of its boot script", i.e. booting
+    /// rather than in steady state. It is entered immediately before the script is driven and
+    /// left when it finishes, on every exit path including a directive that raises (see
+    /// [`Runtime::set_boot_phase`]); the same window
+    /// [`Runtime::default_spawn_policy`] uses to select the *system* heap policy for
+    /// everything the script starts.
+    ///
+    /// Its second reader is the runner's execution-tier selection: the default tier mode
+    /// (`JitMode::Auto`) runs the boot phase on the interpreter and steady state on the
+    /// native baseline tier, because compiling a module costs boot time and peak memory that
+    /// nothing during the boot benefits from (see `crate::runner::tier`). A process that
+    /// entered during the phase is upgraded at its first slice boundary after it ends, so the
+    /// phase scopes *when* code is compiled, never *which* tier a process ends up on.
+    pub(crate) fn in_boot_phase(&self) -> bool {
+        self.booting
+    }
+    /// Enters (`on == true`) or leaves (`on == false`) the **boot phase**
+    /// ([`Runtime::in_boot_phase`]) — the single writer of that state.
+    ///
+    /// Both boot drives already bracket the script execution with it
+    /// ([`Runtime::boot_from_script`], [`Runtime::boot_from_script_reporting`]): the phase is
+    /// entered immediately before the script is driven and left when it finishes, so a
+    /// directive that raises leaves it too (the flag is cleared before the failure is
+    /// propagated). Exposing the writer is what lets a test enter and leave the phase without
+    /// a second, drifting knob.
+    pub(crate) fn set_boot_phase(&mut self, on: bool) {
+        self.booting = on;
+    }
     /// The heap policy a process created **without** `spawn_opt` heap options gets: the
     /// emulator's own policy, with `+hms`/`+hmbs`/`+hmax` already applied
     /// ([`RuntimeConfig::heap_options`]).
@@ -4406,13 +4443,13 @@ impl Runtime {
     /// `min_bin_vheap_size` / `fullsweep_after` / `max_heap_size` the oracle does.
     ///
     /// The one exception is a spawn **while a boot script is running**
-    /// ([`Runtime::booting`]): everything started there is the runtime's own system server
+    /// ([`Runtime::in_boot_phase`]): everything started there is the runtime's own system server
     /// (`kernel_sup`, `code_server`, `application_controller`, `logger_server`, …), not user
     /// code, so the `+hmax` **size** is not applied to it — see [`system_spawn_policy`] for
     /// why a small `+hmax` must not be able to kill the boot. `+hms`/`+hmbs` and the
     /// `+hmax*` flag word still apply (they pick the emulator's *defaults*, not a limit).
     pub(crate) fn default_spawn_policy(&self) -> HeapPolicy {
-        if self.booting {
+        if self.in_boot_phase() {
             system_spawn_policy(&self.config)
         } else {
             self.config.heap.policy().clone()

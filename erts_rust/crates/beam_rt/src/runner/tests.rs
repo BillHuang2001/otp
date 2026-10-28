@@ -1541,7 +1541,11 @@ fn tier_fixtures() -> [&'static str; 3] {
 }
 
 /// The **default** (`JitMode::Auto`) selects the native baseline tier for a scheduled export
-/// entry, whatever the entry module's code looks like.
+/// entry **in steady state**, whatever the entry module's code looks like.
+///
+/// The `runtime()` this uses is not in its boot phase, which is the half of the mode's rule
+/// under test here; the phase-scoped half is
+/// [`the_boot_phase_selects_the_interpreter_for_the_default_mode`]'s.
 ///
 /// `stdlib_more_harness` reaches other loadable `.beam`s and `funs` uses dynamic `apply` — the
 /// two shapes a retired per-module predicate used to refuse. The engine's baseline driver
@@ -1567,8 +1571,9 @@ fn the_default_selects_the_baseline_tier_for_any_export_entry() {
 }
 
 /// `JitMode::Cranelift` selects the optional Cranelift tier for a scheduled export entry —
-/// for **every** fixture shape, since the mode alone decides and nothing about the module is
-/// inspected.
+/// for **every** fixture shape, since in steady state the mode alone decides and nothing about
+/// the module is inspected. (The boot phase scopes only the default mode, so this holds in both
+/// phases.)
 ///
 /// The answer is unconditional: `select_entry_tier` is not the feature gate (that lives once, in
 /// `beam_engine`), so this holds in a build without the backend too — and it is exactly why a
@@ -1592,9 +1597,13 @@ fn the_cranelift_mode_selects_the_cranelift_tier_for_any_export_entry() {
     }
 }
 
-/// `JitMode::Interpreter` forces the interpreter; the default (`JitMode::Auto`) and the
-/// explicit `JitMode::Baseline` alias select the native tier for the **same** entry, so the
-/// kill switch is the only thing that turns the tier off.
+/// `JitMode::Interpreter` forces the interpreter; in **steady state** the default
+/// (`JitMode::Auto`) and the explicit `JitMode::Baseline` alias select the native tier for the
+/// **same** entry, so the kill switch is the only thing that turns the tier off.
+///
+/// `runtime()` is out of its boot phase, which is what makes the `Auto` row the steady-state
+/// one; under the boot phase only `Auto` changes (see
+/// [`the_boot_phase_selects_the_interpreter_for_the_default_mode`]).
 #[test]
 fn the_mode_forces_the_tier() {
     let rt = runtime();
@@ -1613,7 +1622,7 @@ fn the_mode_forces_the_tier() {
     assert_eq!(
         select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
         Tier::BaselineJit,
-        "Auto and Baseline name the same tier"
+        "in steady state Auto and Baseline name the same tier"
     );
     assert_eq!(
         select_entry_tier(&rt, &mut state, &entry, JitMode::Interpreter),
@@ -1621,10 +1630,63 @@ fn the_mode_forces_the_tier() {
     );
 }
 
+/// The runtime's **boot phase** scopes the *default* tier mode and nothing else.
+///
+/// The phase ([`Runtime::in_boot_phase`], the boot-script window) is what keeps the JIT's
+/// compile cost off the boot: `JitMode::Auto` selects the interpreter while it is on and the
+/// native baseline tier once it is off. Every pinned mode stays authoritative and
+/// phase-independent — `Baseline` pins the baseline tier in **both** phases (which is why it is
+/// the A/B control), `Interpreter` pins the reference tier, `Cranelift` the hot tier — so the
+/// phase can never silently turn a request into a different tier.
+///
+/// Driven through [`select_entry_tier`], the one seam the runner's first entry consults, over
+/// both entry shapes it can see: a module export and an unresolved fun (whose module is only
+/// known once the context resolves the closure).
+#[test]
+fn the_boot_phase_selects_the_interpreter_for_the_default_mode() {
+    let mut rt = runtime();
+    let harness = tier_fixtures()[1];
+    let module = Arc::new(beam_loader::load_file(harness).expect("harness"));
+    let export = ProcessEntry::Export {
+        module,
+        function: Atom::from_raw(0),
+        arity: 0,
+    };
+    let fun = ProcessEntry::Fun {
+        fun: make_small(0),
+        target: None,
+    };
+    for (booting, mode, expected) in [
+        (true, JitMode::Auto, Tier::Interpreter),
+        (false, JitMode::Auto, Tier::BaselineJit),
+        (true, JitMode::Baseline, Tier::BaselineJit),
+        (false, JitMode::Baseline, Tier::BaselineJit),
+        (true, JitMode::Interpreter, Tier::Interpreter),
+        (false, JitMode::Interpreter, Tier::Interpreter),
+        (true, JitMode::Cranelift, Tier::Cranelift),
+        (false, JitMode::Cranelift, Tier::Cranelift),
+    ] {
+        rt.set_boot_phase(booting);
+        for entry in [&export, &fun] {
+            assert_eq!(
+                select_entry_tier(&rt, &mut RunnerState::default(), entry, mode),
+                expected,
+                "{mode:?} with the boot phase {booting} must select {expected:?}"
+            );
+        }
+    }
+    // Leave the phase exactly as `runtime()` hands it to a test.
+    rt.set_boot_phase(false);
+    assert!(!rt.in_boot_phase(), "the phase is a window, not a mode");
+}
+
 /// An unresolved fun entry (its module is only known once the context resolves the closure)
 /// takes the **same** tier as an export entry: with no per-module predicate left there is
 /// nothing a missing module name could make unsafe, and the engine's driver handles the
-/// in-machine entry.
+/// in-machine entry. In steady state that is the default's native tier; the boot phase scopes
+/// only the default mode (see
+/// [`the_boot_phase_selects_the_interpreter_for_the_default_mode`], which covers this entry
+/// shape too).
 #[test]
 fn an_unresolved_fun_entry_takes_the_default_tier() {
     let rt = runtime();
@@ -1718,8 +1780,9 @@ fn the_unset_default_resolves_to_auto() {
 #[test]
 fn every_roster_tier_name_resolves_to_its_own_mode() {
     let rt = runtime();
-    // A mode alone decides the tier (there is no per-module predicate), so one minimal entry
-    // serves every row — an unresolved fun entry is the shape requiring no loaded module.
+    // In steady state the mode alone decides the tier (there is no per-module predicate, and
+    // this runtime is out of its boot phase), so one minimal entry serves every row — an
+    // unresolved fun entry is the shape requiring no loaded module.
     let entry = ProcessEntry::Fun {
         fun: make_small(0),
         target: None,
@@ -2245,6 +2308,353 @@ fn an_interpreter_tier_process_is_unchanged_across_a_resume() {
         baseline_cache_len(),
         0,
         "an interpreter-tier process compiles no native code on either slice"
+    );
+}
+
+// -- the boot phase's upgrade at the slice boundary ------------------------
+/// A process that entered during the **boot phase** runs boot on the interpreter and is
+/// **upgraded** at its first slice boundary afterwards, computing exactly the value the
+/// interpreter-forced run computes.
+///
+/// The discriminating observation that the resume really ran on the native tier is the
+/// per-thread compiled-block cache: the boot-phase slice compiles nothing (the interpreter), and
+/// the post-boot resume puts the module's artifact in — which only the baseline tier's resume
+/// path does. The value is then compared against a second run of the same fixture forced onto
+/// the interpreter from a runtime that is in steady state throughout, so this is a two-tier
+/// agreement rather than two independent claims.
+#[test]
+fn an_upgraded_process_computes_the_interpreter_value_on_the_baseline_tier() {
+    const EXPECTED: i64 = 55;
+    // The cache is per thread; start from a known state so the counts below are exact.
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0, "the per-thread cache starts empty");
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    // The default mode: the phase decides, and the phase is being stepped by hand here.
+    state.jit_mode = Some(JitMode::Auto);
+    rt.set_boot_phase(true);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
+    let function = module.atom_table.lookup("fib").expect("fib is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 1,
+        },
+        vec![make_small(10)],
+    );
+    // The boot-phase slice: the interpreter's per-instruction budget pre-empts `fib` part-way.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the boot-phase slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Yield,
+        "the budget pre-empts the loop during the boot phase"
+    );
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Interpreter),
+        "the boot phase selects the interpreter at the first entry"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        0,
+        "the boot phase compiles nothing (that is the whole point of the phase)"
+    );
+    // The boot script finished: the next slice boundary is post-boot.
+    rt.set_boot_phase(false);
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000_000)
+            .expect("the post-boot slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    let upgraded = signed_value(state.result(pid).expect("the value is recorded"));
+    assert_eq!(
+        upgraded, EXPECTED,
+        "the upgraded process computes fib(10) = {EXPECTED}"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "the resume ran on the upgraded baseline tier (the interpreter compiles nothing)"
+    );
+    // The reference leg: the same fixture on the interpreter, with no phase involved at all.
+    clear_baseline_cache();
+    let mut plain_rt = runtime();
+    let mut plain_state = RunnerState::default();
+    plain_state.jit_mode = Some(JitMode::Interpreter);
+    // `self::` because the first leg's `table` binding shadows the module function here.
+    let mut plain_table = self::table();
+    let plain_pid = plain_table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
+    let function = module.atom_table.lookup("fib").expect("fib is interned");
+    plain_state.spawn(
+        plain_pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 1,
+        },
+        vec![make_small(10)],
+    );
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut plain_rt, &mut plain_state);
+        runner
+            .run(plain_pid, &mut plain_table, 1_000_000)
+            .expect("the interpreter-forced slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut plain_rt)));
+    let reference = signed_value(
+        plain_state
+            .result(plain_pid)
+            .expect("the reference value is recorded"),
+    );
+    assert_eq!(
+        upgraded, reference,
+        "the upgraded run and the interpreter-forced run agree"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        0,
+        "the interpreter-forced leg compiled no native code"
+    );
+}
+
+/// The **upgrade itself** is visible on the engine: after the boot phase ends, the parked arm
+/// raises the remembered tier to the native baseline tier and the slice really runs on it.
+///
+/// The allocating tail-loop fixture pre-empts on **either** tier, so a post-boot slice can be
+/// ended on the budget again and the engine's remembered tier read while it is parked — which a
+/// process that returns inside its first post-boot slice cannot offer. The compiled-block cache
+/// makes the second claim ("it really ran natively") independent of the field.
+#[test]
+fn an_upgraded_process_runs_its_first_post_boot_slice_on_the_baseline_tier() {
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0, "the per-thread cache starts empty");
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Auto);
+    rt.set_boot_phase(true);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(preempt_fixture()).expect("preempt.beam"));
+    let function = module
+        .atom_table
+        .lookup("alloc_loop")
+        .expect("alloc_loop is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 1,
+        },
+        vec![make_small(PREEMPT_N)],
+    );
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the boot-phase slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the budget pre-empts the loop");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Interpreter),
+        "the boot phase remembers the interpreter"
+    );
+    assert_eq!(baseline_cache_len(), 0, "nothing was compiled during boot");
+    rt.set_boot_phase(false);
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the first post-boot slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Yield,
+        "the allocating loop is pre-empted on either tier"
+    );
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::BaselineJit),
+        "the parked arm upgraded the remembered tier at the first post-boot boundary"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "and the upgraded slice really ran on the native tier"
+    );
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000_000)
+            .expect("the finishing slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    let elements = beam_engine::terms::list_elements(state.result(pid).expect("recorded"))
+        .expect("alloc_loop returns a proper list");
+    assert_eq!(
+        elements.len(),
+        PREEMPT_N as usize,
+        "the upgraded process ran the loop to completion"
+    );
+}
+
+/// A process **parked in a `receive`** during the boot phase is upgraded on its resume, and the
+/// parked mailbox scan still takes the delivered message.
+///
+/// The receive resume address (`loop_rec`) has no compiled block, so the upgraded resume advances
+/// by the driver's one-instruction interpreter step — the same deopt every un-lowered instruction
+/// takes — which is exactly why the tier can be raised under a suspended machine. The first
+/// post-boot resume re-parks on the still-empty mailbox, which is what makes the remembered tier
+/// observable there.
+#[test]
+fn a_receive_parked_boot_process_is_upgraded_on_its_resume() {
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0, "the per-thread cache starts empty");
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Auto);
+    rt.set_boot_phase(true);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the boot-phase slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Wait,
+        "the empty mailbox parks the receive"
+    );
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Interpreter),
+        "the boot phase remembers the interpreter"
+    );
+    assert_eq!(baseline_cache_len(), 0, "nothing was compiled during boot");
+    rt.set_boot_phase(false);
+    // The first post-boot boundary: the parked receive is upgraded, and re-parks (the mailbox is
+    // still empty), so the remembered tier stays readable.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the post-boot park slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the mailbox is still empty");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::BaselineJit),
+        "the resume upgraded the remembered tier"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "the resume ran on the native tier"
+    );
+    // The message wakes it: the upgraded resume still takes the parked mailbox scan.
+    clear_baseline_cache();
+    table
+        .deliver_simple(pid, pid.to_eterm(), make_small(42))
+        .expect("the message is delivered");
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert_eq!(
+        signed_value(state.result(pid).expect("the received value is recorded")),
+        42,
+        "the upgraded receive took the delivered message"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "the message resume ran on the remembered baseline tier"
+    );
+}
+
+/// A **pinned** mode is phase-independent: forcing the interpreter during the boot phase and
+/// then leaving the phase does **not** upgrade the process — the upgrade is the default mode's
+/// rule alone.
+#[test]
+fn a_pinned_interpreter_mode_does_not_upgrade_after_the_boot_phase() {
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0, "the per-thread cache starts empty");
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_preempting_loop(&mut state, pid, JitMode::Interpreter);
+    rt.set_boot_phase(true);
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the boot-phase slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the budget pre-empts the loop");
+    rt.set_boot_phase(false);
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the post-boot park slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the interpreter is pre-empted");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Interpreter),
+        "a pinned mode is never upgraded by the phase"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        0,
+        "a pinned interpreter compiles nothing, in either phase"
+    );
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000_000)
+            .expect("the finishing slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    let elements = beam_engine::terms::list_elements(state.result(pid).expect("recorded"))
+        .expect("alloc_loop returns a proper list");
+    assert_eq!(
+        elements.len(),
+        PREEMPT_N as usize,
+        "the pinned interpreter computes the same result across the phase boundary"
     );
 }
 

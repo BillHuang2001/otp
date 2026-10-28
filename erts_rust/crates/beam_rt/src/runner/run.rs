@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::{ExecutionContext, RunOutcome as EngineRunOutcome};
+use beam_engine::{ExecutionContext, RunOutcome as EngineRunOutcome, Tier};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 
 use crate::context::gc;
@@ -44,7 +44,7 @@ use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEngine, ProcessEntry, RunnerState, UnrunnableProcess};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, killed, normal};
-use super::tier::select_entry_tier;
+use super::tier::{select_entry_tier, JitMode};
 
 // The slice/park accounting for this thread's runner, for the **deterministic** counter pin on
 // a growth-shaped workload (see `super::tests`).
@@ -896,12 +896,21 @@ impl ProcessRunner for RuntimeRunner<'_> {
     ///
     /// The tier ([`Tier`](beam_engine::Tier)) is selected **once**, on the process's first
     /// entry (`super::tier`), and remembered on its engine (`ProcessEngine::tier`); every
-    /// later slice — a pre-emption or a `receive` park — resumes on that **same** tier
+    /// later slice — a pre-emption or a `receive` park — resumes on that remembered tier
     /// through [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier),
     /// so a native-tier process is never silently demoted to the interpreter mid-life. A
     /// process whose remembered tier is [`Tier::Interpreter`](beam_engine::Tier::Interpreter)
     /// behaves exactly as it always did (the dispatcher delegates to the plain
     /// [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome)).
+    ///
+    /// The default tier mode (`BEAM_RT_TIER` unset, or `auto`) is **phase-scoped**: it selects
+    /// the interpreter while the runtime is in its boot phase
+    /// ([`Runtime::in_boot_phase`](crate::runtime::Runtime::in_boot_phase) — the boot-script
+    /// window) and the native baseline tier afterwards. A process whose first entry happened
+    /// during the phase is therefore **upgraded**, one-way and only under that default mode, at
+    /// its first slice boundary after the phase ends — so it ends up on exactly the tier it
+    /// would have had if it had entered after boot. A pinned mode (`interpreter`, `baseline`,
+    /// `cranelift`) keeps its tier verbatim across every slice, in both phases.
     ///
     /// # Errors
     ///
@@ -972,14 +981,35 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // *before* the context borrows the runtime, since the context takes `Runtime` mutably
         // below) and then **remembered on the engine** (`ProcessEngine::tier`), so a resumed
         // process — one that pre-empted on the reduction budget, or parked in a `receive` —
-        // re-enters on that same tier instead of falling back to the interpreter. The mode alone
-        // decides: the baseline tier is sound for any module (the engine's driver handles the
-        // in-machine module-context switch — see `super::tier`), so the entry's module is not
-        // inspected.
+        // re-enters on that same tier instead of falling back to the interpreter. Both tiers are
+        // sound for any module (the engine's driver handles the in-machine module-context switch
+        // — see `super::tier`), so the entry's module is not inspected; the default mode is
+        // scoped by the runtime's boot phase, which is why the tier is resolved here rather than
+        // once at spawn time.
+        //
+        // A **resumed** machine keeps its remembered tier with one exception: the default mode
+        // (`JitMode::Auto`) **upgrades** a process that entered during the boot phase to the
+        // native baseline tier at its first slice boundary after that phase ends. The rule is
+        // one-way (never downgraded) and applies only to `Auto` — under a pinned mode the
+        // remembered tier is kept verbatim. Net effect: a process whose first entry happened
+        // during boot runs boot on the interpreter and then gets exactly the tier it would have
+        // had if it had entered after boot, so no new class of process is exposed to the
+        // native-tier fairness residual. `super::tier`'s module docs carry the soundness
+        // argument: the engine's native resume does not reset the machine (its registers, stack
+        // and live frames survive), and an address the lazily-built artifact has no block for
+        // executes one interpreter step.
+        let mode = self.state.jit_mode();
         let tier = match engine.parked {
-            Some(_) => engine.tier,
+            Some(_) => {
+                if mode == JitMode::Auto
+                    && engine.tier == Tier::Interpreter
+                    && !self.runtime.in_boot_phase()
+                {
+                    engine.tier = Tier::BaselineJit;
+                }
+                engine.tier
+            }
             None => {
-                let mode = self.state.jit_mode();
                 let selected = select_entry_tier(self.runtime, self.state, &engine.entry, mode);
                 engine.tier = selected;
                 selected
