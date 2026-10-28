@@ -402,7 +402,10 @@ fn raise_bifs_set_the_class_and_public_builders_agree() {
         (ExceptionClass::Throw, ExitReason::atom("a"))
     );
 
-    // `error/2` ignores its second argument in M1 (documented simplification).
+    // `error/2` raises with its **first** argument as the reason (the oracle's
+    // `TUPLE2(Reason, Args)`); the second is the stacktrace `Args` half that
+    // `ErrorMeta`/`error_meta` model but `beam_common::Raise` cannot carry yet —
+    // the reason and the class are unaffected either way.
     assert_eq!(
         raise_of(reg.call("erlang", "error", 2, &mut ctx, &[a, make_small(1)],)),
         (ExceptionClass::Error, ExitReason::atom("a"))

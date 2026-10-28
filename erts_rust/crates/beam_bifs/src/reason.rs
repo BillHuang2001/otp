@@ -25,8 +25,8 @@
 //! `throw/1` and `nif_error/1,2` in `../../erts/emulator/beam/bif.tab`
 //! (lines 65, 149, 284–285, 568) and the well-known reason atoms in
 //! `beam_common::ExitReason`. The `nif_error/2` implementation is `nif_error_2`
-//! in `../../erts/emulator/beam/bif.c:1525` (the second argument is metadata for
-//! the crash report, **not** the reason).
+//! in `../../erts/emulator/beam/bif.c:1525-1531` (exactly `error/2`: the second
+//! argument is that raise's stacktrace `Args`, **not** the reason).
 //!
 //! # Return-based raising
 //!
@@ -365,12 +365,16 @@ fn nif_error_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
-/// `erlang:nif_error/2` — as `nif_error/1`; the second argument is metadata.
+/// `erlang:nif_error/2` — exactly `error/2`, with a reason class Dialyzer treats as
+/// arbitrary.
 ///
-/// `nif_error_2` in `../../erts/emulator/beam/bif.c:1525` raises with the
-/// **first** argument as the reason and lets the second (the argument list the
-/// crash report prints) fall away: `nif_error(foo, [1,2])` is `error:foo` and
-/// `nif_error(true, [1,2])` is `error:true`.
+/// `nif_error_2` in `../../erts/emulator/beam/bif.c:1525-1531` stores
+/// `TUPLE2(BIF_ARG_1, BIF_ARG_2)` in the exception value and raises `EXC_ERROR_2` —
+/// the same shape and the same exception code as `error_2`, so the **first** argument
+/// is the reason (`nif_error(foo, [1,2])` is `error:foo`, `nif_error(true, [1,2])` is
+/// `error:true`) and the second is the `Args` half of the stacktrace payload, which
+/// [`ErrorMeta`] models and which this raise cannot carry yet. It is **not** a
+/// crash-report-only annotation, and it is not dropped by the C.
 fn nif_error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
