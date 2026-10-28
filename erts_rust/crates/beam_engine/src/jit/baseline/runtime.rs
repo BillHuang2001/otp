@@ -1860,8 +1860,6 @@ pub(crate) extern "C" fn jit_append_binary_all(
 /// emitted arm tests `rax` once and branches to `fallback`, which re-runs the instruction
 /// through [`jit_bitstr`] — so the family re-derives and re-reports the same typed error
 /// rather than this helper swallowing it.
-#[allow(dead_code)] // the fresh `bs_create_bin` route's helper: emitted code calls it once
-// that shape's arm lands; kept here so the door and the seam's build sit side by side.
 pub(crate) extern "C" fn jit_make_heap_binary(
     rt: *mut JitRuntime<'_>,
     value: i64,

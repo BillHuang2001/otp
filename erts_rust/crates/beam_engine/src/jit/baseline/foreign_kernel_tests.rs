@@ -120,8 +120,8 @@ use beam_term::{is_small, make_small, signed_value, Atom, AtomTable, Eterm, MAX_
 use super::bitstr_inline_tests::{emitted_shapes_for, static_deopts, visited_instances};
 use super::bitstr_tests::export;
 use super::emit::bitstr_inline::{
-    inlined, CreateBinShape, Route, SHAPE_BS_MATCH, SHAPE_CREATE_BIN, SHAPE_START_MATCH3,
-    SHAPE_START_MATCH4,
+    inlined, CreateBinShape, Route, SHAPE_BS_MATCH, SHAPE_CREATE_BIN, SHAPE_CREATE_FRESH,
+    SHAPE_START_MATCH3, SHAPE_START_MATCH4,
 };
 use super::tests::{assert_same_outcome, error_reason};
 use crate::context::{ExecutionContext, MinimalContext};
@@ -1127,6 +1127,11 @@ pub(super) struct AppendBuild {
     /// The widths, in bits, of the plan's run-time-value fields (`seam::Field::Bits`), in
     /// instruction order — the "6-bit" in "the 6-bit append". Empty for a refused plan.
     field_bits: Vec<u32>,
+    /// The field widths, in bits, [`seam::fresh_plan`] plans for a **bare** (accumulator-less)
+    /// build, or `None` when this instruction is not one the fresh route accepts — the
+    /// counterpart of [`Self::field_bits`] for the [`Route::Fresh`] route, which consults no
+    /// append plan at all.
+    fresh_bits: Option<Vec<u32>>,
     /// Whether every field segment's **size** operand is a compile-time integer literal
     /// (`Operand::Integer`/`Operand::Character`, the only form `seam::append_plan` can
     /// resolve to a static width). A run-time `size(Expr)` register and the atom `all` are
@@ -1181,6 +1186,19 @@ pub(super) fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild>
                         .collect()
                 })
                 .unwrap_or_default();
+            // The **bare** build's plan, from the one classifier that decides it — the two
+            // plans are mutually exclusive (`CreateBinShape::of` consults the append plan
+            // first), so at most one of `field_bits`/`fresh_bits` is ever populated.
+            let fresh_bits = seam::fresh_plan(module, segments).map(|fresh| {
+                fresh
+                    .fields
+                    .iter()
+                    .filter_map(|field| match field {
+                        Field::Bits { bits, .. } => Some(*bits),
+                        Field::ConstBytes { .. } => None,
+                    })
+                    .collect()
+            });
             Some(AppendBuild {
                 accumulator,
                 planned: plan.is_some(),
@@ -1188,6 +1206,7 @@ pub(super) fn append_builds(module: &Module, code: &[Instr]) -> Vec<AppendBuild>
                 route: shape.as_ref().map(CreateBinShape::route),
                 unit: plan.as_ref().map(|plan| plan.unit),
                 field_bits,
+                fresh_bits,
                 literal_width: has_literal_widths(segments),
                 const_bytes,
             })
@@ -1462,8 +1481,9 @@ fn the_to_lower_append_construction_lowers_its_y_slot_accumulator() {
     );
 }
 
-/// **`emqx_base62:decode/2`'s bit-granular append is emitted, and its runtime-width build is
-/// honestly not** — the non-vacuity row for the second `bs_create_bin` route, and the
+/// **`emqx_base62:decode/2`'s bit-granular append is emitted, its three bare `<<DecodeChar>>`
+/// wrappers build on the fresh route, and its runtime-width build is honestly not lowered** —
+/// the non-vacuity row for the second *and* the third `bs_create_bin` route, and the
 /// construction-side twin of [`the_base62_decode_match_arm_is_emitted_and_not_deopted`].
 ///
 /// The kernel's per-character body ends in `<< Acc/bitstring, RestBit:6 >>`, i.e. a `bits`
@@ -1477,6 +1497,11 @@ fn the_to_lower_append_construction_lowers_its_y_slot_accumulator() {
 /// `<< Acc/bitstring, RestBit:RightBitSize >>` with a **run-time** `size(Expr)`, so no
 /// lowering can plan it.
 ///
+/// The other three instances are the plain `<<DecodeChar>>` construction — no
+/// `private_append` group at all, so the append plan declines them and they are the **bare**
+/// build ([`Route::Fresh`]): one statically sized `integer 8` field over an x-register, which
+/// `create_fresh` emits as one packing sequence plus one `jit_make_heap_binary` call.
+///
 /// Without a row like this the two output rows above would also pass for an implementation that
 /// left every construction on the family helper: a per-field deopt still returns the right
 /// bytes, so tier agreement is *vacuously* satisfied. And "lowered" alone would not name the
@@ -1486,8 +1511,8 @@ fn the_to_lower_append_construction_lowers_its_y_slot_accumulator() {
 ///
 /// `static_deopts("BsCreateBin") == 0` is asserted too, but it proves little on its own: the
 /// family route is a `claimed` helper arm, not an `emit_deopt`, so it reads 0 whether or not a
-/// build lowers. The load-bearing evidence is the `SHAPE_CREATE_BIN` `inlined` delta over a
-/// cache-free compile plus the per-build `CreateBinShape::of` verdicts.
+/// build lowers. The load-bearing evidence is the `SHAPE_CREATE_BIN` + `SHAPE_CREATE_FRESH`
+/// `inlined` delta over a cache-free compile plus the per-build `CreateBinShape::of` verdicts.
 #[test]
 fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtime_width() {
     let Some(staged) = stage_or_skip("base62_decode_create_bin", &EMQX) else {
@@ -1496,10 +1521,16 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
     let index = function_index(&staged, &EMQX, "decode", 2);
     let index32 = u32::try_from(index)
         .unwrap_or_else(|_| panic!("decode/2's function index must fit a u32"));
-    let before = inlined(SHAPE_CREATE_BIN);
+    // Both construction shapes: the append route's and the fresh route's. Their sum is what
+    // "the emitter lowered this build" means, because which one a build takes *is* the
+    // append-plan verdict.
+    let before_bin = inlined(SHAPE_CREATE_BIN);
+    let before_fresh = inlined(SHAPE_CREATE_FRESH);
     let (emitted, snapshot) = emitted_shapes_for(&staged.module, index32);
-    let lowered_instances = usize::try_from(inlined(SHAPE_CREATE_BIN) - before)
-        .unwrap_or_else(|_| panic!("the lowered-instance count must fit a usize"));
+    let lowered_instances = usize::try_from(
+        (inlined(SHAPE_CREATE_BIN) - before_bin) + (inlined(SHAPE_CREATE_FRESH) - before_fresh),
+    )
+    .unwrap_or_else(|_| panic!("the lowered-instance count must fit a usize"));
     let visited = visited_instances(&snapshot, "BsCreateBin");
     let deopts = static_deopts(&snapshot, "BsCreateBin");
     let builds = append_builds(&staged.module, &staged.module.functions[index].code);
@@ -1513,6 +1544,10 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
         .iter()
         .filter(|build| build.route == Some(Route::Aligned))
         .count();
+    let fresh = builds
+        .iter()
+        .filter(|build| build.route == Some(Route::Fresh))
+        .count();
     let appends = builds
         .iter()
         .filter(|build| build.accumulator.is_some())
@@ -1521,8 +1556,8 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
     println!(
         "create_bin_arm[decode/2] = {emitted:?}, BsCreateBin visited = {visited}, lowered \
          instances = {lowered_instances}, lowered builds = {lowered}, declined = {declined}, \
-         bit-granular = {bit_granular}, aligned = {aligned}, accumulator builds = {appends}, \
-         non-append builds = {wrappers}, deopts = {deopts}"
+         bit-granular = {bit_granular}, aligned = {aligned}, fresh = {fresh}, accumulator builds \
+         = {appends}, non-append builds = {wrappers}, deopts = {deopts}"
     );
     // The census name first: a `static_deopts == 0` assertion against a variant name the
     // emitter never visits would hold trivially. The six instances are the three clauses'
@@ -1542,8 +1577,9 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
          `<<DecodeChar>>` construction, whose first segment is not `private_append`"
     );
     assert!(
-        emitted.contains(&SHAPE_CREATE_BIN),
-        "decode/2: the `bs_create_bin` private-append arm must emit (emitted: {emitted:?})"
+        emitted.contains(&SHAPE_CREATE_BIN) && emitted.contains(&SHAPE_CREATE_FRESH),
+        "decode/2: both construction arms must emit — the append arm for the two 6-bit appends \
+         and the bare arm for the three `<<DecodeChar>>` wrappers (emitted: {emitted:?})"
     );
     assert_eq!(
         deopts, 0,
@@ -1553,9 +1589,9 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
     );
     assert_eq!(
         (lowered, declined),
-        (2, 4),
-        "decode/2: the two 6-bit appends are lowered and the other four instances (the three \
-         `<<DecodeChar>>` wrappers and the runtime-width append) stay where they were"
+        (5, 1),
+        "decode/2: the two 6-bit appends and the three `<<DecodeChar>>` bare builds are lowered, \
+         and the runtime-width append stays where it was"
     );
     assert_eq!(
         lowered, lowered_instances,
@@ -1563,15 +1599,19 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
          must be the same set (accepted {lowered}, lowered {lowered_instances})"
     );
     assert_eq!(
-        lowered_instances, 2,
-        "the cache-free compile must inline both 6-bit builds' `SHAPE_CREATE_BIN` (`inlined` \
-         delta {lowered_instances})"
+        lowered_instances, 5,
+        "the cache-free compile must inline the two 6-bit builds (`SHAPE_CREATE_BIN`) and the \
+         three bare builds (`SHAPE_CREATE_FRESH`) — `inlined` delta {lowered_instances}"
     );
 
-    // The two accepted builds, per build: the bit-granular route, unit 1, one 6-bit field, and
-    // the `Y` slot the compiler holds `Acc` in. Asserting the route (not merely "lowered") is
-    // what makes this row evidence for the *second* sequence rather than for the arm at large.
-    for build in builds.iter().filter(|build| build.lowered) {
+    // The two accepted **append** builds, per build: the bit-granular route, unit 1, one 6-bit
+    // field, and the `Y` slot the compiler holds `Acc` in. Asserting the route (not merely
+    // "lowered") is what makes this row evidence for the *second* sequence rather than for the
+    // arm at large.
+    for build in builds
+        .iter()
+        .filter(|build| build.lowered && build.accumulator.is_some())
+    {
         assert_eq!(
             build.accumulator,
             Some(Reg::Y(1)),
@@ -1609,9 +1649,36 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
     assert_eq!(
         (bit_granular, aligned),
         (2, 0),
-        "decode/2's only accepted builds are the two bit-granular ones; an aligned build here \
-         would mean the routes were chosen from something other than the field widths"
+        "decode/2's only accepted *append* builds are the two bit-granular ones; an aligned \
+         build here would mean the routes were chosen from something other than the field widths"
     );
+    // The three bare builds, per build: the fresh route, one 8-bit field, no accumulator and no
+    // append unit. Asserting the width is what makes this evidence for the third sequence — a
+    // fresh build that packed the wrong width would still agree with the interpreter on a
+    // one-byte value.
+    assert_eq!(
+        fresh, 3,
+        "decode/2's three `<<DecodeChar>>` wrappers are bare builds, so all three take the fresh \
+         route"
+    );
+    for build in builds
+        .iter()
+        .filter(|build| build.route == Some(Route::Fresh))
+    {
+        assert_eq!(
+            build.accumulator, None,
+            "a fresh build has no `private_append` accumulator to advance"
+        );
+        assert!(
+            !build.planned,
+            "the append seam's compile-time half must decline a bare build (`append_plan`)"
+        );
+        assert_eq!(
+            build.fresh_bits,
+            Some(vec![8]),
+            "`<<DecodeChar>>` packs exactly one 8-bit field through `seam::fresh_plan`"
+        );
+    }
 
     // The third clause: an accumulator build whose field width is a **run-time** `size(Expr)`
     // (`{tr,{x,2},{t_integer,{1,8}}}`, block label 16), so it must be provably declined —
@@ -1653,16 +1720,18 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
         build.unit
     );
 
-    // The three `<<DecodeChar>>` wrappers: not accumulator builds at all, so neither gate ever
-    // considered them. Named explicitly so a future shape change that turned one into an
-    // append build would fail here instead of silently changing the split.
+    // The three `<<DecodeChar>>` wrappers, keyed by the *absence* of an accumulator: the append
+    // gate never considered them, and the fresh route is what lowers them. Named explicitly so a
+    // future shape change that turned one into an append build would fail here instead of
+    // silently changing the split.
     for build in builds.iter().filter(|build| build.accumulator.is_none()) {
         assert!(
-            !build.planned && !build.lowered && build.route.is_none(),
-            "a `<<DecodeChar>>` wrapper has no `private_append` segment, so no gate may accept \
-             it (planned {}, lowered {})",
+            !build.planned && build.lowered && build.route == Some(Route::Fresh),
+            "a `<<DecodeChar>>` wrapper has no `private_append` segment, so only the fresh route \
+             may accept it (planned {}, lowered {}, route {:?})",
             build.planned,
-            build.lowered
+            build.lowered,
+            build.route
         );
     }
 }

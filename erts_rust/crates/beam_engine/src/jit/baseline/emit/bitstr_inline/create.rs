@@ -62,6 +62,12 @@
 //! other changes only the field-write phase; the `binary all` tail keeps the destination
 //! and source guards and folds its commit into its one helper call.
 //!
+//! The fourth route, [`Route::Fresh`], is *not* an append build at all: a `bs_create_bin`
+//! with no `private_append` group has no accumulator to advance, so its fields are the whole
+//! result. [`CreateBinShape::of`] reports it when the append plan declines, and the emitted
+//! sequence is [`create_fresh`]'s (the fields packed into one word, then one
+//! `jit_make_heap_binary` call); `self.source` is `None` on that route.
+//!
 //! # The mutation order is the whole correctness argument
 //!
 //! The family's build performs exactly one mutation beyond the field bytes: C's
@@ -455,14 +461,18 @@ impl CreateBinShape {
     /// is also why the route ([`Self::route`]) is a function of the shape rather than a
     /// second predicate.
     ///
-    /// The one plan whose source it consults is the append plan: every emitted shape today
-    /// is an *append* build (the accumulator is the instruction's first segment group).
+    /// Two plans are consulted, in this order: the **append** plan (the accumulator is the
+    /// instruction's first segment group), and — when that declines — the **bare** build's
+    /// (see [`Self::from_fresh_plan`]). A segment list the append plan accepts never reaches
+    /// the second, so the two routes' shapes are disjoint by construction.
     pub(crate) fn of(
         module: &Module,
         dst: &Operand,
         segments: &[Operand],
     ) -> Option<CreateBinShape> {
-        let plan = seam::append_plan(module, segments)?;
+        let Some(plan) = seam::append_plan(module, segments) else {
+            return Self::from_fresh_plan(module, dst, &seam::fresh_plan(module, segments)?);
+        };
         Self::from_append_plan(module, dst, &plan)
     }
 
@@ -566,9 +576,6 @@ impl CreateBinShape {
     ///
     /// Reached only from [`CreateBinShape::of`] once the append plan declines, so a segment
     /// list that *is* an append build never takes this route.
-    // Wired into `CreateBinShape::of` by the fresh-build emitter (`create_fresh.rs`), which
-    // is the only caller; until that arm emits the packing sequence no shape takes this route.
-    #[allow(dead_code)]
     fn from_fresh_plan(
         _module: &Module,
         dst: &Operand,
@@ -616,7 +623,7 @@ impl CreateBinShape {
         self.source
     }
 
-    /// Which of the two straight-line sequences this shape is emitted with (see the module
+    /// Which of the three straight-line sequences this shape is emitted with (see the module
     /// docs).
     ///
     /// `Route::Aligned` exactly when every field is a whole number of bytes, i.e. when the

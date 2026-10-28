@@ -265,7 +265,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 16;
+pub(crate) const SHAPE_COUNT: usize = 17;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -314,6 +314,11 @@ pub(crate) const SHAPE_SKIP_UTF8: usize = 14;
 /// The `bs_get_utf8` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_UTF8: usize = 15;
+/// The **bare** (accumulator-less) `bs_create_bin` shape index in the test-build instrument
+/// — the [`Route::Fresh`] route, emitted by `create_fresh` and distinct from
+/// [`SHAPE_CREATE_BIN`]'s private-append accumulator shape.
+#[cfg(test)]
+pub(crate) const SHAPE_CREATE_FRESH: usize = 16;
 #[cfg(test)]
 thread_local! {
     /// How often each shape's native lowering was **emitted** (a compile-time count, so it
@@ -327,12 +332,12 @@ thread_local! {
 /// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
 /// entries. The two kinds of shape here need that count for different reasons.
 ///
-/// For the **fifteen helper-free** shapes — every shape in the roster except
-/// [`SHAPE_CREATE_BIN`], i.e. the eleven match-context shapes (the seven
-/// position/tail/start-match/integer extractors, the static `bs_match`, `bs_match_string` and
-/// `bs_skip_utf32`/`bs_get_utf32`) plus the variable-width `bs_skip_utf16`/`bs_get_utf16` and
-/// `bs_skip_utf8`/`bs_get_utf8` pairs — the emission is the only observable there can be:
-/// such a shape calls no helper at all, so
+/// For the **fifteen helper-free** shapes — every shape in the roster except the two
+/// construction shapes ([`SHAPE_CREATE_BIN`] and [`SHAPE_CREATE_FRESH`]), i.e. the eleven
+/// match-context shapes (the seven position/tail/start-match/integer extractors, the static
+/// `bs_match`, `bs_match_string` and `bs_skip_utf32`/`bs_get_utf32`) plus the
+/// variable-width `bs_skip_utf16`/`bs_get_utf16` and `bs_skip_utf8`/`bs_get_utf8` pairs —
+/// the emission is the only observable there can be: such a shape calls no helper at all, so
 /// [`super::super::bitstr::bitstr_calls`] never moves for it and "the inline arm ran" *is*
 /// the decision to emit.
 ///
@@ -343,6 +348,10 @@ thread_local! {
 /// arm ran for **either** route, and it is also the proof that a plan
 /// `CreateBinShape::of` **refused** emitted zero bytes (the refusal happens before the
 /// first byte, so the counter cannot move).
+///
+/// [`SHAPE_CREATE_FRESH`] is the same argument for the bare build: it calls exactly one
+/// helper (`jit_make_heap_binary`), and whether that arm emitted at all — rather than the
+/// instruction staying on the family — is the emission decision.
 ///
 /// Either way, pair it with a zero [`super::super::bitstr_inline_tests::static_deopts`]
 /// count for the same variant to prove the whole instruction stayed native.

@@ -97,7 +97,7 @@ use super::bitstr_inline_tests::{
     atom, bitstr_module, compile_cache_free, emitted_shapes, static_deopts, visited_instances,
 };
 use super::counters;
-use super::emit::bitstr_inline::{self, SHAPE_CREATE_BIN};
+use super::emit::bitstr_inline::{self, SHAPE_CREATE_BIN, SHAPE_CREATE_FRESH};
 use super::runtime::append_binary_all_calls;
 use super::tests::assert_same_outcome;
 use crate::context::MinimalContext;
@@ -4771,4 +4771,100 @@ fn a_whole_byte_build_at_a_mid_byte_window_end_refuses_the_aligned_route() {
         "the arm must emit the construction shape (emitted {emitted:?})"
     );
     assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The **bare** build (`Route::Fresh`) — the value path
+// ---------------------------------------------------------------------------
+/// **The bare build's value path, end to end at one width** — the smoke pin for
+/// [`bitstr_inline::Route::Fresh`].
+///
+/// `<<C>>` over a single byte is the bare `bs_create_bin`: no `private_append` group, so
+/// `seam::append_plan` declines it and the fields *are* the whole result. It is exactly the
+/// `<<DecodeChar>>` construction `emqx_base62:decode/2` wraps its per-character append in —
+/// one statically sized unsigned big-endian `integer 8` field — and `create_fresh` lowers it
+/// as one packing sequence plus one `jit_make_heap_binary` call.
+///
+/// The row is deliberately one width, not a sweep (the wider sweep is a separate task): what
+/// it establishes is that the arm's value path is *connected* — the built term is the 8-bit
+/// field's byte, on both tiers and against an independently computed expectation — and that
+/// the compiled run stayed **in block**: the bare route consults no append door at all, so
+/// `bitstr_calls()` must not move across the run (this fixture holds no `bs_init_writable`
+/// either). `jit_step_one` at zero is the second half of that claim: a guard that refused
+/// would show up there long before it showed up in the bytes.
+#[test]
+fn a_bare_build_packs_its_eight_bit_field_in_block_and_answers_the_family_value() {
+    // `f(Value)` — the field *is* the whole result, so the destination is the argument's own
+    // register: the compiler emits this shape whenever the built binary replaces its only
+    // source, and the emitted sequence loads every field before it stores the result.
+    let module = bin_module("bscb_fresh_int8", 1, &[], |module| {
+        vec![create_bin(
+            Operand::X(0),
+            int_seg(module, Operand::X(0), 8),
+            1,
+        )]
+    });
+    // The route the fixture is: bare, not an append build.
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("a one-field bare build is an inlinable shape");
+    assert_eq!(
+        shape.route(),
+        bitstr_inline::Route::Fresh,
+        "a build with no `private_append` group is the bare route"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_FRESH),
+        "the bare build's arm must emit (emitted {emitted:?})"
+    );
+    assert!(
+        !emitted.contains(&SHAPE_CREATE_BIN),
+        "no accumulator is involved, so the append shape must not emit (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "the bare shape must lower, not statically deopt"
+    );
+
+    let name = atom(&module, "f");
+    for value in [0i64, 0x41, 0xFF, -1] {
+        let expected = big_endian(value, 1);
+        let label = format!("bare integer 8 of {value:#x}");
+        // (1) The compiled run: one byte, the field's low eight bits, and **no** family
+        // helper call anywhere in it.
+        let report = run_counting(&module, name, &[ArgKind::Int(value)], Tier::BaselineJit);
+        assert_eq!(
+            report.bits,
+            Some(8),
+            "{label}: the built bitstring is the field's own width"
+        );
+        assert_eq!(
+            report.bytes.as_deref(),
+            Some(&expected[..]),
+            "{label}: the packed field's byte"
+        );
+        assert_eq!(
+            report.bitstr_calls, 0,
+            "{label}: the bare route consults no append door, so `jit_bitstr` must not run"
+        );
+        assert_eq!(
+            report.counters.step_one, 0,
+            "{label}: the arm must stay native (jit_step_one ran {} times)",
+            report.counters.step_one
+        );
+        // (2) Both tiers, and the family's own value: the interpreter runs the family's
+        // `bs_create_bin` body, so agreeing with it is agreeing with the reference lowering.
+        with_both_tiers_args(&module, name, &[ArgKind::Int(value)], |interpreter, baseline| {
+            assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert_eq!(
+                    returned_bytes(&label, tier, outcome),
+                    expected,
+                    "{tier}: {label}: the family's own packed byte"
+                );
+            }
+        });
+    }
 }

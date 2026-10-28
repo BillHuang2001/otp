@@ -66,9 +66,9 @@ use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
 use super::counters;
 use super::emit::bitstr_inline::{
     self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_BS_MATCH_STRING, SHAPE_COUNT, SHAPE_CREATE_BIN,
-    SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_GET_UTF16, SHAPE_GET_UTF32, SHAPE_GET_UTF8,
-    SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF16, SHAPE_SKIP_UTF32, SHAPE_SKIP_UTF8,
-    SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
+    SHAPE_CREATE_FRESH, SHAPE_GET_INTEGER2, SHAPE_GET_POSITION, SHAPE_GET_UTF16, SHAPE_GET_UTF32,
+    SHAPE_GET_UTF8, SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_SKIP_UTF16, SHAPE_SKIP_UTF32,
+    SHAPE_SKIP_UTF8, SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
 use super::tests::{assemble_function, assert_same_outcome, function_code_bytes};
@@ -504,6 +504,39 @@ fn module_create_bin() -> Module {
     )
 }
 
+/// `bs_create_bin` in its **bare** form — a single `integer 8` field and **no**
+/// `private_append` group at all, i.e. the compiler's `<<C:8>>` where the bytes *are* the
+/// whole result (`emqx_base62:decode/2`'s `<<DecodeChar>>` wrapper).
+///
+/// The one-group segment list is exactly the shape `seam::fresh_plan` accepts (one
+/// statically sized unsigned big-endian field over `x(0)`, 8 bits total), so
+/// `CreateBinShape::of` reports it as [`bitstr_inline::Route::Fresh`] — the route
+/// `create_fresh` emits as one packing sequence plus one `jit_make_heap_binary` call.
+fn module_create_fresh() -> Module {
+    bitstr_module("inline_bs_create_fresh", &["integer"], 1, |module| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsCreateBin {
+                fail: NO_FAIL,
+                alloc: 0,
+                live: 1,
+                unit: 1,
+                dst: Operand::X(0),
+                segments: vec![
+                    Operand::Atom(atom(module, "integer")),
+                    Operand::Integer(0),
+                    Operand::Integer(1),
+                    Operand::Nil,
+                    Operand::X(0),
+                    Operand::Integer(8),
+                ],
+            },
+            Instr::Return,
+        ]
+    })
+}
+
 /// `bs_match_string`: a nine-byte (72-bit) pattern compare out of the context — the shape the
 /// system compiler emits for a binary literal **longer than 64 bits** in a pattern
 /// (`tests/fixtures/bsmatch.erl`'s `strlong/1`), and well under the shape's own
@@ -846,6 +879,12 @@ pub(crate) const INLINE_SHAPE_CASES: [ShapeCase; SHAPE_COUNT] = [
     ("bs_get_utf16", SHAPE_GET_UTF16, "BsGetUtf16", module_get_utf16),
     ("bs_skip_utf8", SHAPE_SKIP_UTF8, "BsSkipUtf8", module_skip_utf8),
     ("bs_get_utf8", SHAPE_GET_UTF8, "BsGetUtf8", module_get_utf8),
+    (
+        "bs_create_bin (bare)",
+        SHAPE_CREATE_FRESH,
+        "BsCreateBin",
+        module_create_fresh,
+    ),
 ];
 
 /// The `Instr` variant the static-deopt census keys `shape` by — the **one** mapping, so a
@@ -861,7 +900,7 @@ pub(crate) fn shape_variant(shape: usize) -> &'static str {
 
 /// **Every arm emits and stays native — the mandatory instrument.**
 ///
-/// For each of the sixteen shapes ([`INLINE_SHAPE_CASES`]): a cache-free
+/// For each of the seventeen shapes ([`INLINE_SHAPE_CASES`]): a cache-free
 /// [`super::emit::compile_function`] moves that shape's `inlined(SHAPE_*)` counter, visits the
 /// variant (so the name is real), and records **zero** static deopts for it. Without this a
 /// fully-deopting "implementation" would pass every tier-agreement test in this file.

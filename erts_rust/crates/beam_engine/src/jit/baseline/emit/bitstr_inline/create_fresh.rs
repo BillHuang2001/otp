@@ -124,6 +124,9 @@ use super::super::{
 use super::create::emit_y_slot_address;
 use super::{emit_fallback_and_done, CreateBinShape, IMMED1_MASK, SMALL_TAG};
 
+#[cfg(test)]
+use super::{record_inlined, SHAPE_CREATE_FRESH};
+
 /// The register the fields are packed into (see the module docs for why it is free across the
 /// whole sequence).
 const PACK: Reg = Reg::R8;
@@ -159,6 +162,11 @@ pub(super) fn emit_fresh_build(
     if fields.is_empty() {
         return Ok(false);
     }
+    // The route is taken: recorded here, before the first emitted byte and after the last
+    // refusal, exactly like the append route's own instrument — so a shape this arm declined
+    // cannot move the counter.
+    #[cfg(test)]
+    record_inlined(SHAPE_CREATE_FRESH);
 
     let fallback: CodeLabel = buffer.label();
     let fast_done: CodeLabel = buffer.label();
