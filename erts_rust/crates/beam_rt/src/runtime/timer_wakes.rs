@@ -177,9 +177,15 @@ impl<'a> TimerSlot<'a> {
     /// Cancels the pending timer `reference` identifies — the heap's own [`Timers::cancel`],
     /// with the wake record dropped (a timer that already fired had its record dropped by
     /// [`Runtime::take_due_timers`], so forgetting it here again is a no-op).
+    ///
+    /// The wake record is keyed by the **word** the timer was scheduled with, so a cancellation
+    /// taken through a *copy* of the reference must forget the canonical word
+    /// ([`Timers::canonical_reference`], resolved **before** the removal), not the caller's copy.
     pub(crate) fn cancel(&mut self, reference: Eterm) -> Option<Duration> {
+        let canonical = self.timers.canonical_reference(reference);
         let remaining = self.timers.cancel(reference);
-        self.wakes.forget_deliver(reference);
+        self.wakes
+            .forget_deliver(canonical.unwrap_or(reference));
         remaining
     }
 }
@@ -301,6 +307,50 @@ mod tests {
         assert_eq!(assert_fast_hashed_deliver(&wakes.deliver), 1);
     }
 
+    /// A cancellation taken through a **copy** of the timer reference must forget the record
+    /// the deadline was *scheduled* with, or the run route keeps believing a cancelled deadline
+    /// could still wake the process.
+    ///
+    /// The two halves are reconciled by identity: [`TimerSlot::cancel`](super::TimerSlot)
+    /// resolves the canonical word ([`Timers::canonical_reference`](crate::timers::Timers))
+    /// before removing the timer, so the mirror drops exactly the entry the schedule inserted.
+    #[test]
+    fn a_cancellation_through_a_copy_forgets_the_canonical_wake_record() {
+        use beam_alloc::Heap;
+        use beam_process::MonitorRef;
+        let mut heap = Heap::new(64).expect("a test heap");
+        let reference = MonitorRef::from_id(31)
+            .to_eterm(&mut heap)
+            .expect("a real reference thing");
+        let copy = MonitorRef::from_eterm(reference)
+            .expect("an internal reference")
+            .to_eterm(&mut heap)
+            .expect("the same reference at another address");
+        assert_ne!(copy, reference, "a copy is a distinct word");
+        let own = ProcessId::new(6, 0);
+        let mut timers = Timers::new();
+        let mut wakes = TimerWakes::default();
+        {
+            let mut slot = super::TimerSlot::new(&mut timers, &mut wakes);
+            slot.schedule(
+                Duration::from_secs(60),
+                TimerTarget::Pid(own),
+                make_small(1),
+                make_small(1),
+                reference,
+            );
+        }
+        assert!(wakes.can_wake(own), "the pending deadline wakes its pid");
+        let mut slot = super::TimerSlot::new(&mut timers, &mut wakes);
+        assert!(slot.cancel(copy).is_some(), "the copy cancels the timer");
+        assert_eq!(
+            assert_fast_hashed_deliver(&wakes.deliver),
+            0,
+            "the canonical wake record is forgotten, not the caller's copy of it"
+        );
+        assert!(!wakes.can_wake(own), "a cancelled deadline can wake nobody");
+        assert!(timers.remaining(reference).is_none(), "and it is no longer pending");
+    }
     /// The one linear scan ([`TimerWakes::forget_action`]) removes **a** record whose target
     /// matches, never a particular one — which is what makes the hash order unobservable: two
     /// deadlines sharing a target are interchangeable, so the removed *count* (all the only

@@ -3,8 +3,10 @@
 ## Intent
 The plumbing every `beam_rt` integration suite shares: the toolchain probe, the bounded oracle
 probe, the loud-skip helpers, and the two live-node pair harnesses.
-Each suite pulls it in with `mod support;`; `nif_a3.rs` is the one module that is instead pulled
-in by `#[path = "support/nif_a3.rs"] mod nif_a3;` from the three `nif_a3_*` suites.
+Each suite pulls it in with `mod support;`; two modules are instead pulled in by a `#[path]`
+attribute from the suites that use them — `nif_a3.rs` by the three `nif_a3_*` suites, and
+`cowboy.rs` by `cowboy_serve.rs` and `cowboy_static_serve.rs` — so the rest of the crate's test
+binaries never compile them.
 Nothing here is a test — this directory carries no assertions of its own.
 
 ## API Surface
@@ -22,6 +24,19 @@ Nothing here is a test — this directory carries no assertions of its own.
   trimmed, `/dev/null` stdin, bounded and reaped.
 * `assert_badarg`, `check_gc_payload` — small shared assertions.
 * `PROBE_TIMEOUT = 30 s`.
+### `cowboy.rs` — the staged-pristine-Cowboy harness (`#[path]`-included)
+One home for the two Cowboy suites, so they cannot drift apart: `Stage::build` (the `CHECKOUT`
+checks, the toolchain probe, the `$TMPDIR` staged copy and the `erlang.mk` build — every
+environment gate is a loud skip through `Skip`, which distinguishes "nothing printed yet" from
+"the banner is already printed"), `Stage::compile` (cowboy's own unpatched
+`examples/hello_world/src/*.erl` plus one `Harness` module into `<stage>/hw_ebin`, every source's
+image required), `Stage::command` (the four `-pa` directories in their tested order, the `run`
+action on the harness, `$CW_PORT`), and `Serving` (drained stdout/stderr pipes, the bounded
+`CW_READY` wait, `exchange`/`exchange_keep_alive`, a kill-and-reap `Drop`).
+Also here: `Response`/`parse_response`, `run_bounded` (a `Command`-shaped sibling of `mod.rs`'s
+program-and-args one), `copy_tree`, `free_port`, `describe_code`, `tail`, `skip`/`skip_note`, and
+the `MAKE_TIMEOUT`/`COMPILE_TIMEOUT`/`READY_TIMEOUT`/`HTTP_TIMEOUT`/`POLL` bounds.
+It asserts nothing: which status line, header or body a route owes stays in the suite.
 ### `dist.rs` — the two-live-VM harness (contract A.5)
 `Harness` (the one home: private `epmd`, scratch dir, child spawning, `compile_fixture`,
 `child_env`, `report_registration`), `PeerKind::{Oracle, Rust}`, `ChildVm`, `PrivateEpmd`,
@@ -89,6 +104,8 @@ This directory is exercised transitively: `dist_two_vm.rs`/`dist_two_rust.rs`/
 through `mod.rs`'s `require_oracle`/`oracle_eval`/`run_bounded`.
 A change here is validated by the pair suites serially
 (`… -p beam_rt --test dist_two_vm --test dist_two_rust --test dist_two_vm_wire -- --ignored --test-threads=1`).
+A change to `cowboy.rs` is validated by both Cowboy suites, which are also `#[ignore]`d:
+`… -p beam_rt --test cowboy_serve --test cowboy_static_serve -- --ignored --nocapture`.
 
 ## Known Issues
 * `two_vm.rs`'s module docs name `dist_two_vm.rs` as a consumer; the only importer is

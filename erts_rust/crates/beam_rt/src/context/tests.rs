@@ -10320,22 +10320,25 @@ fn an_imported_fun_naming_no_lambda_raises_badfun() {
 /// **The `resolve_local_call` module-name guard is a fast path, never a narrower filter.**
 ///
 /// [`ExecutionContext::resolve_local_call`] answers `Ok(false)` for any module other than
-/// `prim_tty`/`zlib` **before** consulting the two host predicates. That is sound only because
-/// both predicates themselves begin with a module-name equality over exactly those two names
-/// (`prim_tty::serves_local_call`'s `module == LIBRARY`, `beam_bifs::serves_local_call`'s
+/// `prim_tty`/`prim_file`/`zlib` **before** consulting the three host predicates. That is sound
+/// only because each predicate itself begins with a module-name equality over exactly those
+/// three names (`prim_tty::serves_local_call`'s `module == LIBRARY`,
+/// `prim_file::serves_local_call`'s `module == "prim_file"`, `beam_bifs::serves_local_call`'s
 /// `module == "zlib"`), so the guard's answer must be **equal** to their disjunction for every
 /// shape — a served key, a served key's *name* under a foreign module, a served module's name
 /// with an unserved arity, and a look-alike module name.
 ///
 /// The test is written as that equivalence rather than as a table of expectations, so a key table
-/// that moves cannot make it wrong: it only asserts agreement, plus that both tables really do
-/// produce a `true` (so the equivalence is never vacuously satisfied by two all-`false` halves).
+/// that moves cannot make it wrong: it only asserts agreement, plus that every table really does
+/// produce a `true` (so the equivalence is never vacuously satisfied by all-`false` halves).
 #[test]
-fn the_local_call_module_guard_is_equivalent_to_the_two_predicates() {
-    // The key names both hosts serve (the `prim_tty` NIF table is reachable crate-internally;
-    // the `zlib` one is named here, and an arity that drifts only makes a row agree `false`).
+fn the_local_call_module_guard_is_equivalent_to_the_three_predicates() {
+    // The key names the three hosts serve (the `prim_tty` NIF table is reachable
+    // crate-internally; the `zlib` one is named here, and an arity that drifts only makes a row
+    // agree `false`; `prim_file` serves its one local stub).
     let mut keys: Vec<(&str, u32)> = crate::native::prim_tty::NIF_KEYS.to_vec();
     keys.extend_from_slice(&[
+        ("advise_nif", 4),
         ("open_nif", 0),
         ("close_nif", 1),
         ("set_controller_nif", 2),
@@ -10358,15 +10361,27 @@ fn the_local_call_module_guard_is_equivalent_to_the_two_predicates() {
         // A `zlib` *one-shot* (`compress/1`) is an Erlang function, not a served local key.
         ("compress", 1),    ]);
     // A module whose own `serves_local_call`/registry membership must not leak through the guard.
-    let modules = ["prim_tty", "zlib", "lists", "maps", "zlib2", "prim_tty2", ""];
+    let modules = [
+        "prim_tty",
+        "prim_file",
+        "zlib",
+        "lists",
+        "maps",
+        "zlib2",
+        "prim_tty2",
+        "prim_file2",
+        "",
+    ];
 
     let mut rt = runtime();
     let mut ctx = RuntimeContext::new(&mut rt);
     let mut prim_tty_hits = 0usize;
+    let mut prim_file_hits = 0usize;
     let mut zlib_hits = 0usize;
     for module in modules {
         for &(function, arity) in &keys {
             let expected = crate::native::prim_tty::serves_local_call(module, function, arity)
+                || crate::native::prim_file::serves_local_call(module, function, arity)
                 || beam_bifs::serves_local_call(module, function, arity as usize);
             let actual = beam_engine::ExecutionContext::resolve_local_call(
                 &mut ctx, module, function, arity,
@@ -10374,20 +10389,27 @@ fn the_local_call_module_guard_is_equivalent_to_the_two_predicates() {
             .expect("the seam answers");
             assert_eq!(
                 actual, expected,
-                "the guard must agree with the two predicates for {module}:{function}/{arity}"
+                "the guard must agree with the three predicates for {module}:{function}/{arity}"
             );
             if actual && module == "prim_tty" {
                 prim_tty_hits += 1;
+            }
+            if actual && module == "prim_file" {
+                prim_file_hits += 1;
             }
             if actual && module == "zlib" {
                 zlib_hits += 1;
             }
         }
     }
-    // Both halves of the disjunction are really reachable through the guard.
+    // Every half of the disjunction is really reachable through the guard.
     assert!(
         prim_tty_hits >= crate::native::prim_tty::NIF_KEYS.len(),
         "every prim_tty stub is served through the guard, saw {prim_tty_hits}"
+    );
+    assert_eq!(
+        prim_file_hits, 1,
+        "the one prim_file local stub is served through the guard, saw {prim_file_hits}"
     );
     assert!(
         zlib_hits > 0,

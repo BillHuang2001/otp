@@ -2214,8 +2214,8 @@ impl Runtime {
     }
 
     /// The **provenance** of `term` as a reference this runtime minted, or `None` when the
-    /// term was not minted here (a reference decoded from an external term, or one received
-    /// in a message as a *copy*).
+    /// term was not minted here (a reference decoded from an external term, or one naming a
+    /// node that is not this one).
     ///
     /// * `Some(Some(reference))` — a monitor or alias reference: [`Runtime::references`]
     ///   records the [`MonitorRef`] the term stands for, which is the only reference shape
@@ -2229,10 +2229,26 @@ impl Runtime {
     /// ([`crate::context::alias`]), the runtime's reference predicates
     /// ([`Runtime::is_known_local_reference`]) and the timer BIFs — it replaces the
     /// hand-spelled `timers.is_timer_ref(t) || references.contains_key(&t)` copies.
+    ///
+    /// # A copy is the same reference
+    ///
+    /// A reference's identity is its **id** word (the workspace's ONE reference-id space,
+    /// `beam_common::next_ref_id`), not the address of its term, so a *copy* — a reference
+    /// round-tripped through ETS, sent in a message, stored in a term — is the same reference.
+    /// **Timer** references honour that here: [`Timers::is_timer_ref`] falls back to its
+    /// id-keyed index after a word miss, so `erlang:cancel_timer/1,2` and
+    /// `erlang:read_timer/1,2` accept a copy (the oracle's `inet_gethost_native.erl` stores
+    /// its `start_timer/3` reference in an ETS row and cancels the copy it reads back).
+    /// [`Runtime::references`] is still word-keyed, so a copied **monitor**/**alias**
+    /// reference stays unknown here; widening that is a separate change (it would also need
+    /// the alias/monitor tables to be id-keyed).
     pub(crate) fn local_reference(&self, term: Eterm) -> Option<Option<MonitorRef>> {
         if let Some(entry) = self.references.get(&term) {
             return Some(*entry);
         }
+        // Word first, then identity — `Timers::is_timer_ref` is the ONE place that knows both
+        // halves, and it is written only by the timer bookkeeping, so a reference this runtime
+        // did not mint for a timer (a dead NIF resource included) stays unknown.
         if self.timers.is_timer_ref(term) {
             return Some(None);
         }
@@ -2240,8 +2256,11 @@ impl Runtime {
     }
 
     /// Whether `term` is a reference **this runtime minted** — the predicate
-    /// `erlang:cancel_timer/1,2`, `erts_internal:group_leader/3` and the send path share
-    /// (see [`Runtime::local_reference`]).
+    /// `erlang:cancel_timer/1,2`, `erlang:read_timer/1,2`, `erts_internal:group_leader/3`
+    /// and the send path share (see [`Runtime::local_reference`]).
+    ///
+    /// A copy of a **timer** reference answers `true`; a copy of a monitor/alias reference
+    /// does not yet (see [`Runtime::local_reference`]).
     pub(crate) fn is_known_local_reference(&self, term: Eterm) -> bool {
         self.local_reference(term).is_some()
     }

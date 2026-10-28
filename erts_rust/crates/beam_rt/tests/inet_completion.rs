@@ -75,9 +75,11 @@
 //!
 //! `gen_tcp:connect/2,3,4` is **not** blocked any more: `erlang:read_timer/1`, the hook its
 //! `prim_inet` polling loop needs, is implemented (`src/context/runtime_hooks.rs`), and a connect
-//! to a closed port named by IP tuple answers the oracle's own `{error,econnrefused}` (measured on
-//! both runtimes). The tests still drive their peers with std sockets, because the *string*-host
-//! form resolves through `inet_gethost`, which answers `{error,nxdomain}` here.
+//! to a closed port answers the oracle's own `{error,econnrefused}` (measured on both runtimes) —
+//! by IP tuple **and** by hostname string, whose `inet_gethost` resolver survives because the
+//! timer reference it stores in ETS is recognised by identity (`tests/timer_ref_identity.rs`).
+//! The tests still drive their peers with std sockets: their addresses are known to the peer
+//! process before the run starts, so no name has to be resolved at all.
 //!
 //! # Bounds and skips
 //!
@@ -794,11 +796,11 @@ fn an_accepted_descriptor_is_adopted_and_its_command_is_replied() {
     );
     let listen_term = port_term_text(&listen_port_line);
 
-    // The accept only completes once a peer connects, so the test connects — a std socket: this
-    // runtime's `gen_tcp:connect/3` resolves a *string* host through `inet_gethost`, which answers
-    // `{error,nxdomain}` here, while the IP-tuple form answers the oracle's own
-    // `{error,econnrefused}` (so the connect path is no longer blocked by a missing
-    // `erlang:read_timer/1` hook — it is implemented).
+    // The accept only completes once a peer connects, so the test connects — a std socket, because
+    // the peer's address is known before the run starts. This runtime's `gen_tcp:connect/3` answers
+    // the oracle's own `{error,econnrefused}` for a closed port by IP tuple **and** by hostname
+    // string now (the `erlang:read_timer/1` hook is implemented and `inet_gethost`'s ETS-stored
+    // timer reference resolves by identity — `tests/timer_ref_identity.rs`).
     let mut peer = TcpStream::connect(("127.0.0.1", listen_port as u16)).unwrap_or_else(|error| {
         panic!(
             "the test cannot connect to the fixture's listening port {listen_port}: {error}\n{}",
