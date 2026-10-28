@@ -113,7 +113,8 @@ Re-exported at the crate root and via `beam_codec::prelude::*`.
   `encode_term_local(term, atoms, hash)` and `encode_term_with_minor_version`.
   Per-format detail (flavours, floats, integer widths, internal ids, funs, records, map order):
   `src/encode/CONTEXT.md`.
-- `decode/` (`mod.rs` + `fun.rs` + `record.rs` + `local_node.rs` + `options.rs` + `export_gate.rs`) —
+- `decode/` (`mod.rs` + `container.rs` + `fun.rs` + `record.rs` + `local_node.rs` + `options.rs` +
+  `export_gate.rs`) —
   `pub struct Decoder<'a>`: `new(&'a [u8]) -> Result<Decoder>` (requires+consumes `VERSION_MAGIC`),
   `new_body`, `with_atom_cache`, `with_off_heap(host)`, `with_local_node(node, creation)` /
   `with_local_node_hash(hash)`, `with_safe()`/`set_safe(bool)`, `with_export_gate(&dyn ExportGate)`,
