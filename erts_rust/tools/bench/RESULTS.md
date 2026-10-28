@@ -1,14 +1,16 @@
 # bench — measured results (m19)
 
-This is the definitive summary of the **current** measurement session (`m19`, 2026-10-23/24) for the
-`erts_rust` benchmark driver. Every number here comes from the committed raw artifacts under
-`results/m19-*`; regenerate with the Runbook (§7) rather than quoting a stale copy.
+This is the definitive summary of the **full-suite** measurement session (`m19`, 2026-10-23/24) for the
+`erts_rust` benchmark driver — the session every §2/§3 figure and every external-target row comes from.
+Every number here comes from the committed raw artifacts under `results/m19-*`; regenerate with the
+Runbook (§7) rather than quoting a stale copy.
 Raw JSON is authoritative — this file never edits a metric value.
 
-**§9 is a later, narrower session (`m21`)**: it *adds* two workloads (`jsone`, `bbmustache`) and measures
-**only** those two, against a different oracle build (OTP 29.1.2 rather than m19's 29.1.1). It supersedes
-nothing in §0–§8 and restates no other workload's figure — read it as a new pair of rows, never as a
-re-run of the record.
+Later, **narrower** sessions also exist and are archived under `results/`; they are additional measurement pairs, never replacements for an m19 §2/§3 row.
+`m21` is the GC/allocator workstream's before-record (`results/m21-xrun-gc-*`, `results/m21-xrun-ratios.txt`) plus the two eunit rows (`jsone`, `bbmustache`), which are carried as §9.
+`m22` is that workstream's after-record and the **newest** session: six matched rounds over `baseline,gc_bound,gc_class,list_walk,slice`, each row read through `results/m22-vs-m21.txt` (its headline diff), `results/m22-xrun-ratios.txt`, `results/m22-load-record.md` and `results/m22-memory.md`.
+§2/§3 do **not** restate m21's or m22's numbers.
+`m21` and `m22` share the OTP 29.1.2 / erts-17.1.1 oracle, unlike m19's 29.1.1 / erts-17.1, so they are mutually diffable only with each other and never against a row above.
 
 ## 0. The two sides, named
 
