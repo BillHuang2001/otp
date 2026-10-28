@@ -434,6 +434,12 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // belongs to the run that raised, not to this one).
         self.pending_function_clause_args = None;
         self.raise_function_clause_args = None;
+        // The `{error_info, Map}` latches ride the same protocol: a fresh run begins
+        // with neither armed, so a cooked trace in the new run can never grow a
+        // location tail an earlier run's raise arrived carrying (the map belongs to
+        // the run that raised it).
+        self.pending_error_info = None;
+        self.raise_error_info = None;
         // The supplied-trace latches ride the same two-latch protocol: a fresh run
         // begins with neither armed, so a raise in the new run can never render the
         // trace an earlier run's raise arrived carrying (the term belongs to the run

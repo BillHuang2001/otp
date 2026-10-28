@@ -347,3 +347,13 @@ Pins: `bif_frame/tests.rs` (16 tests — the three table arms + the negative, th
   half of this protocol).
 - `../../CONTEXT.md` → crate contracts, the frozen seams, the execution model.
 - `../../INSTRUCTION_SURFACE.md` → per-opcode semantics and the complete gap list.
+
+## `erlang:error/2,3` argument list and `{error_info, Map}` extension (SLICE B1)
+C's `save_stacktrace` sends `erlang:error/1,2,3`, `exit/1` and `throw/1` to its `non_bif_stacktrace:` arm, so the innermost item is the **caller's** function at the call site (`beam_common.c:1005-1023`).
+There `args` is the exception's own argument list (`is_list(args) || is_nil(args)` selects it in the `A` slot, else the arity: `utils.c:3449-3457`) and `error_info = c_p->fvalue` for `EXC_ERROR_3` (`:1024-1026`), packed as `{error_info, Map}` into one cons **after** the `{file,_}`/`{line,_}` pairs, so the extended location reads `[{file,F},{line,N},{error_info,Map}]`.
+Both belong to the innermost item only: every outer frame is built with `erts_build_mfa_item(..., am_true, NIL)` (`:1283-1291`).
+The engine carries the list in the existing `raise_function_clause_args` latch and the map in a new `raise_error_info`/`pending_error_info` pair (`LOOSE_HEAP_TERMS = 7`), armed by `interpreter/bif.rs`'s `throw_with_trace_headed` from `Raise::saved_args`/`Raise::error_info` **only when the raise synthesizes no head item** (`!has_head`) — a head item carries its own location.
+The carve charges the extension exactly **5** words (the `{error_info,Map}` 2-tuple's `3` plus the outer list growing from two to three cells, `+2`); the map word is **shared, not copied**, so the map's own nodes are never charged.
+Residual: `EXF_HAS_EXT_INFO`'s `#{cause => Fvalue, module => FormatModule}` variant IS reachable in the oracle (`ets:lookup(nonexistent,k)` ⇒ `#{cause => id, module => erl_stdlib_errors}`, `erlang:register(a,1)` ⇒ `never`, `erlang:process_flag(1,1)` ⇒ `badopt`, `erlang:start_timer(bad,self(),x)` ⇒ `time`, a bit-syntax failure ⇒ `{Segment,Op,type,Value}`), but `cause` is the raising BIF's own ext-info value which only the BIF layer can publish: a BIF that attaches it through `Raise::error_info` is rendered **verbatim** by this carve, and today no in-tree BIF does.
+Residual: the **uncaught** path (`Machine::with_uncaught_frames`) renders the symbolic `beam_common::StackTrace`, whose `Location` is two-element, so an uncaught `error/3` raise carries no extension there; the path consumes (`take_`) both latches rather than leaving one armed.
+The `erlang:error/3` option-scanning rules (last `{error_info,_}` wins, a non-map payload dropped, an improper/non-matching options list invalidating the scan) are `beam_bifs`'s.
