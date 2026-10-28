@@ -37,6 +37,13 @@
 //! and an absent (or empty) chunk contributes nothing — the C hashes a
 //! zero-initialized entry as zero bytes, which is exactly "skip it".
 //!
+//! The payloads are **streamed** into one incremental MD5 context, so the digest is
+//! that conceptual concatenation while no copy of it is ever materialized: the chunk
+//! directory is walked exactly once to resolve each digested id to its payload (in
+//! file order, first occurrence wins — see [`module_md5`]), and each payload slice is
+//! fed in place. The `FunT'` entry filter below feeds its 20-byte prefix and a 4-byte
+//! zero word per entry directly, allocating nothing per entry.
+//!
 //! `FunT'` is the one special case: the 4-byte entry count is digested as-is, then
 //! each 24-byte entry contributes its first 20 bytes (`Function`/`Arity`/`Index`/
 //! `NumFree`) followed by 4 zero bytes — the trailing `OldUniq` field is a
@@ -47,35 +54,45 @@
 //!
 //! ## The MD5 implementation
 //!
-//! The digest is [`beam_common::md5::digest`] — the workspace's **single** RFC 1321
-//! implementation, shared by every contract that needs one (A.2 here, A.5 in
+//! The digest is [`beam_common::md5::Md5`], the streaming form of the workspace's
+//! **single** RFC 1321 implementation ([`beam_common::md5::digest`] is merely its
+//! one-shot wrapper), shared by every contract that needs one (A.2 here, A.5 in
 //! `beam_dist`, A.7's `erlang:md5/1` family). This module therefore owns only the
-//! chunk walk and the `FunT'` filtering described above, never the algorithm. The
-//! digest is pinned by the RFC 1321 test vectors below and by the live
-//! `beam_lib:md5/1` oracle cross-check in `tests/checksum.rs`.
+//! chunk walk and the `FunT'` filtering described above, never the algorithm, and it
+//! keeps no buffer of its own: `Md5::update` folds whole blocks straight out of the
+//! caller's slice and copies only the ≤ 64-byte tail block into its own context. That
+//! per-block tail copy lives in `beam_common` and is out of scope here.
+//!
+//! The digest is pinned by the RFC 1321 test vectors below, by the streamed-vs-
+//! concatenated equivalence tests, and by the live `beam_lib:md5/1` oracle cross-check
+//! in `tests/checksum.rs`.
 //!
 //! [`beam_lib:md5/1`]: https://www.erlang.org/doc/apps/stdlib/beam_lib.html#md5-1
 
+use beam_common::md5::Md5;
 use beam_common::{BeamError, Result};
 
 use crate::container::{ChunkId, RawChunk};
 
-/// The chunk ids digested in the fixed order described in the module docs, *excluding*
-/// the specially-handled `FunT` (which is filtered through [`digest_funtab`]). The
-/// obsolete Latin-1 `Atom` chunk leads the list — it is normally absent, so it normally
-/// contributes nothing, but `beam_lib:md5/1` lists it first.
-const DIGEST_CHUNKS_BEFORE_FUNT: [ChunkId; 6] = [
+/// Every chunk id the digest covers, in the fixed digest order described in the module
+/// docs: the ids before `FunT`, then `FunT` itself (whose payload is filtered through
+/// [`digest_funtab`] rather than fed verbatim), then the ids after it.
+///
+/// The obsolete Latin-1 `Atom` chunk leads the list — it is normally absent, so it
+/// normally contributes nothing, but `beam_lib:md5/1` lists it first.
+const DIGEST_CHUNKS: [ChunkId; 11] = [
     ChunkId::OBSOLETE_ATOM,
     ChunkId::ATOM,
     ChunkId::CODE,
     ChunkId::STRT,
     ChunkId::IMPT,
     ChunkId::EXPT,
+    ChunkId::FUNT,
+    ChunkId::LITT,
+    ChunkId::META,
+    ChunkId::RECS,
+    ChunkId::DBGB,
 ];
-
-/// The chunk ids digested after `FunT`, in order.
-const DIGEST_CHUNKS_AFTER_FUNT: [ChunkId; 4] =
-    [ChunkId::LITT, ChunkId::META, ChunkId::RECS, ChunkId::DBGB];
 
 /// Computes the module checksum — the 16-byte MD5 [`beam_lib:md5/1`] reports — over the
 /// raw, unpadded chunk payloads of `raw`.
@@ -84,8 +101,10 @@ const DIGEST_CHUNKS_AFTER_FUNT: [ChunkId; 4] =
 /// keep the first occurrence, matching [`crate::container::Container::find`]. Pass
 /// [`crate::chunk::Chunks::raw`], which `chunk::parse` retains for exactly this purpose.
 ///
-/// The MD5 arithmetic is [`beam_common::md5::digest`] — the workspace's one RFC 1321
-/// implementation; this function owns only the chunk walk and the `FunT'` filtering.
+/// The directory is walked **once**: each digested id ([`DIGEST_CHUNKS`]) is resolved to
+/// its payload slice, which is then fed to a single incremental
+/// [`beam_common::md5::Md5`] context in the fixed order documented above. Nothing is
+/// copied — neither the concatenation nor a `FunT` entry table.
 ///
 /// # Errors
 ///
@@ -94,32 +113,37 @@ const DIGEST_CHUNKS_AFTER_FUNT: [ChunkId; 4] =
 ///
 /// [`beam_lib:md5/1`]: https://www.erlang.org/doc/apps/stdlib/beam_lib.html#md5-1
 pub fn module_md5(raw: &[RawChunk<'_>]) -> Result<[u8; 16]> {
-    // An absent chunk is the empty slice — the same "hashes nothing" the C's
-    // zero-initialized directory entry produces. Duplicate ids keep the first.
-    let chunk = |id: ChunkId| -> &[u8] {
-        raw.iter()
-            .find(|chunk| chunk.id == id)
-            .map(|chunk| chunk.data)
-            .unwrap_or_default()
-    };
+    // An absent chunk stays `None` — the same "hashes nothing" the C's zero-initialized
+    // directory entry produces. Duplicate ids keep the first (`get_or_insert` never
+    // overwrites), matching `Container::find`.
+    let mut payloads: [Option<&[u8]>; DIGEST_CHUNKS.len()] = [None; DIGEST_CHUNKS.len()];
+    for chunk in raw {
+        if let Some(slot) = DIGEST_CHUNKS.iter().position(|id| *id == chunk.id) {
+            payloads[slot].get_or_insert(chunk.data);
+        }
+    }
 
-    let mut input = Vec::new();
-    for id in DIGEST_CHUNKS_BEFORE_FUNT {
-        input.extend_from_slice(chunk(id));
+    let mut md5 = Md5::new();
+    for (id, payload) in DIGEST_CHUNKS.iter().zip(payloads) {
+        let payload = payload.unwrap_or_default();
+        if *id == ChunkId::FUNT {
+            digest_funtab(payload, &mut md5)?;
+        } else {
+            md5.update(payload);
+        }
     }
-    digest_funtab(chunk(ChunkId::FUNT), &mut input)?;
-    for id in DIGEST_CHUNKS_AFTER_FUNT {
-        input.extend_from_slice(chunk(id));
-    }
-    Ok(beam_common::md5::digest(&input))
+    Ok(md5.finish())
 }
 
-/// Appends a `FunT` chunk's digest input — the 4-byte entry count followed by each
-/// 24-byte entry with its trailing `OldUniq` forced to zero — to `input`.
+/// Feeds a `FunT` chunk's digest input — the 4-byte entry count followed by each
+/// 24-byte entry with its trailing `OldUniq` forced to zero — into `md5`.
 ///
 /// An empty `funtab` contributes nothing. A non-empty table whose length is not
 /// `4 + 24n` is the C's corrupt-lambda-table error.
-fn digest_funtab(funtab: &[u8], input: &mut Vec<u8>) -> Result<()> {
+///
+/// Each entry is fed as two borrowed slices (its 20-byte prefix and a shared 4-byte zero
+/// word), so the filter allocates nothing per entry.
+fn digest_funtab(funtab: &[u8], md5: &mut Md5) -> Result<()> {
     if funtab.is_empty() {
         return Ok(());
     }
@@ -129,14 +153,16 @@ fn digest_funtab(funtab: &[u8], input: &mut Vec<u8>) -> Result<()> {
     if funtab.len() < 4 {
         return Err(BeamError::BadArg);
     }
-    input.extend_from_slice(&funtab[..4]);
+    md5.update(&funtab[..4]);
 
+    // The entry's trailing `OldUniq` is forced to zero from this one shared word.
+    let zero_uniq = [0u8; 4];
     let mut rest = &funtab[4..];
     while let Some(entry) = rest.get(..24) {
         // `[function:u32][arity:u32][index:u32][num_free:u32]` are digested verbatim…
-        input.extend_from_slice(&entry[..20]);
-        // …and the entry's trailing `OldUniq` is forced to zero.
-        input.extend_from_slice(&[0u8; 4]);
+        md5.update(&entry[..20]);
+        // …and its `OldUniq` is digested as zero.
+        md5.update(&zero_uniq);
         rest = &rest[24..];
     }
     if !rest.is_empty() {
@@ -399,6 +425,61 @@ mod tests {
         let second = [0x22u8; 4];
         let dup = chunks(&[(ChunkId::ATOM, &first), (ChunkId::ATOM, &second)]);
         assert_eq!(module_md5(&dup).unwrap(), digest(&first));
+    }
+
+    #[test]
+    fn streamed_digest_equals_an_independently_built_concatenation() {
+        // The digest is streamed straight out of the container — no whole-module buffer
+        // is assembled — so pin the stream against a concatenation built here by hand in
+        // the fixed order. The directory mixes present, absent, present-but-empty,
+        // duplicated and excluded ids, and carries a non-empty `FunT` whose `OldUniq`
+        // words must be digested as zero.
+        const EMPTY: &[u8] = &[];
+        let obsolete = [0x01u8, 0x02, 0x03];
+        let atu8_first = [0xA1u8; 6];
+        let atu8_second = [0xA2u8; 6]; // duplicate `AtU8`: never digested
+        let code = [0xC0u8; 33];
+        let expt = [0xE1u8; 2];
+        let table = funtab(3);
+        let litt = [0x7Au8; 9];
+        let recs = [0x5Eu8; 4];
+        let line = [0xFFu8; 8]; // excluded from the digest
+        let raw = chunks(&[
+            (ChunkId::DBGB, EMPTY),
+            (ChunkId::OBSOLETE_ATOM, &obsolete),
+            (ChunkId::ATOM, &atu8_first),
+            (ChunkId::ATOM, &atu8_second),
+            (ChunkId::LINE, &line),
+            (ChunkId::CODE, &code),
+            (ChunkId::EXPT, &expt),
+            (ChunkId::FUNT, &table),
+            (ChunkId::LITT, &litt),
+            (ChunkId::RECS, &recs),
+        ]);
+
+        // `Atom`(obsolete) · `AtU8` · `Code` · `StrT`(absent) · `ImpT`(absent) · `ExpT`
+        // · `FunT'` · `LitT` · `Meta`(absent) · `Recs` · `DbgB`(empty).
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&obsolete);
+        expected.extend_from_slice(&atu8_first);
+        expected.extend_from_slice(&code);
+        expected.extend_from_slice(&expt);
+        expected.extend_from_slice(&table[..4]);
+        for entry in table[4..].chunks_exact(24) {
+            expected.extend_from_slice(&entry[..20]);
+            expected.extend_from_slice(&[0u8; 4]);
+        }
+        expected.extend_from_slice(&litt);
+        expected.extend_from_slice(&recs);
+
+        assert_eq!(module_md5(&raw).unwrap(), digest(&expected));
+        // The ignored duplicate, the excluded `Line` payload and the entries' real
+        // `OldUniq` words must all stay out of the digest.
+        let mut with_extras = expected.clone();
+        with_extras.extend_from_slice(&atu8_second);
+        with_extras.extend_from_slice(&line);
+        with_extras.extend_from_slice(&table[4..]);
+        assert_ne!(module_md5(&raw).unwrap(), digest(&with_extras));
     }
 
     #[test]
