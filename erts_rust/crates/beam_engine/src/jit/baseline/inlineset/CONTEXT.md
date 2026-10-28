@@ -21,7 +21,8 @@ Inlined groups, by arm:
 - **The 8 comparison BIFs** and the named-BIF accessors `erlang:hd/1`, `element/2` (compile-time index `>= 1`), `tuple_size/1`, `erlang:byte_size/1`, `length/1` (`emit/bif.rs`).
 - **`Jump`**; `CallLast` (`emit_tail_exit` for a compiled successor, `emit_tail_exit_to_driver` for a resolved-but-uncompiled one); `CallOnly` (`emit_exit`); the frame-preserving local `Call` (`jit_call_store` + the `CALL_STORED` compare, then `emit_exit` or `emit_in_block_call` for the lazy cross-function shape).
 - **`CallExt`**/**`CallExtOnly`**/**`CallExtLast`** via `emit_ext_call` — natively executed, with the module transfer a driver round-trip by design.
-- **The receive family** `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage` (`receive.rs::jit_receive`), and **the whole family-owned surface** — `put_list`/`put_tuple2`, the native-record set, `make_fun3`/`call_fun`/`call_fun2`/`apply`/`apply_last`, the try/catch/raise set, floats, maps, `recv_marker_*` — via `family.rs::jit_family`.
+- **The receive family** `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage` (`receive.rs::jit_receive`), and **the rest of the family-owned surface** — `put_tuple2`, the native-record set, `make_fun3`/`call_fun`/`call_fun2`/`apply`/`apply_last`, the try/catch/raise set, floats, maps, `recv_marker_*` — via `family.rs::jit_family`.
+- **The cons writer `put_list`** via `cons.rs::jit_put_list`, the one family-owned instruction with a native arm of its own: `emit/cons.rs::emit_put_list` is one positioned helper call, taken only when every operand is a `Loc` or an immediate word (see `## The cons writer arm`).
 - **The bitstring family** (`crate::families::bitstrings::claimed`) via `bitstr.rs::jit_bitstr`; **sixteen** of its arms — seventeen shapes — are lowered in-block instead (below).
 - **The frame-discipline trio** `Deallocate`/`Return`/`DeallocateReturn` and **the heap / frame-admission four** `allocate`/`allocate_heap`/`test_heap`/`trim` — each one positioned helper call, `allocate` included: a frame-changing instruction emits no frame push, because the `Y` window must stay re-derivable from `Machine` state at every enterable address (below).
 - **Everything else is the `_` arm.** `FuncInfo` is deliberately there: it is the failed-head-clause `error:function_clause` raise, not a metadata no-op, so it must deopt.
@@ -169,6 +170,27 @@ The bit-granular route has no byte cursor at all: with every field `<= MAX_INLIN
 `BitGranular` + `ConstBytes` is refused by the predicate: there is no constant-bytes store on the bit-granular sequence, and mixing one would commit a window end from the aligned half before the bit fields' room check.
 There is **no fail arm**: `bs_create_bin`'s `fail`-vs-`NO_FAIL` discrimination stays in the family, whose own value, fail transfer or raise is what the process observes; the fallback is one interpreter step for the **whole** instruction.
 The refusal vocabulary is **closed**: a refused plan emits zero bytes, records no static deopt and is the family's own path; no new typed error exists on this arm.
+
+## The cons writer arm — `put_list`, one predicate, one helper call (authoritative)
+`put_list` is the one family-owned instruction outside the bitstring family with a native arm of its own: `emit/cons.rs::emit_put_list` lowers it to **one positioned helper call**, `../cons.rs::jit_put_list`, and `emit/block.rs`'s `Instr::PutList` arm precedes the family arm so `emit_put_list` answering `Ok(false)` is what falls through to `emit/family.rs::emit_family` (the `try_inline_*` convention's `Option` is expressed as this `bool` here, because the fall-through must be the *family* arm, not `emit_block`'s `_` deopt arm).
+Its predicate `emit/cons.rs::put_list_shape(head, tail, dst) -> Option<PutListShape>` is **label-free** (no `LabelMap`, no fail label) and purely syntactic over the three operand kinds: each of `head`/`tail`/`dst` must be `Loc::of`-addressable (an in-bound `X(n)`, or a `Y(n)` the `lea ... disp32` can address) or a `constant_word` immediate (`Nil`, an atom, a small int, a character). It refuses `FloatReg`, `Literal`, an out-of-bound `X`, an un-addressable `Y`, and any non-small `Operand::Integer` — the last because materialising a bignum needs `big_size_words(1)` of slack, i.e. an allocation, which the arm may not perform.
+
+### The route
+`emit_positioned_helper_call` to `jit_put_list` (the prologue's `emit_position_store`, 24 B / three instructions, then the helper-call sequence), `jmp fast_done`, `bind(fallback)` → `emit_step_and_continue` (exactly one `jit_step_one` = one `Machine::step_instruction_with_entry`), `bind(fast_done)` → `emit_continue_check`.
+The position is published **inline before** the call, so a pre-emption or a suspension parks on the `put_list` instruction itself; the helper stores no position of its own (the `bitstr.rs` pattern).
+The success word is `encode_target(func, pc + 1)`, passed in **pre-encoded** as a block-ABI argument so the helper needs at most five; a raise answers the block-ABI `ERROR` word with the `BeamError` in `JitRuntime::error` (`report_frame_error`/`jit_test_heap`'s convention).
+
+### The guard order
+All guards run **before** the call, hence before any mutation, and share **one** refusal exit to the `fallback`: `dst.guard_store(Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2, fallback)` when `dst` is a `Y` slot (a rejected destination writes nothing), then `Loc::guard_load` for each `Y` `head`/`tail` operand. An all-`X`/immediate shape emits a **0 B** guard phase. Nothing else is refutable at run time.
+
+### The mutation order is the whole correctness argument
+The helper mutates nothing before the reserve: both operands are read **inside** `terms::make_cons_rooted`'s closure, i.e. *after* the reservation, so a collection the reservation triggers relocates them and the post-collection reads see the moved terms (the frozen **reserve → read → write** discipline, `RootSet::ALL_LIVE`, `extra = 0`). After the cons exists nothing can fail except the destination store, so a re-execution of the instruction after a deopt or a suspension is safe: the arm either takes the family path (nothing written) or completes.
+`uses_y()` is `shape.uses_y()` — `head`/`tail`/`dst` any `Y` — and `registers()` is empty: a `Y` slot is never charged to the register cache or `highest_native_register`, and the arm reports `is_inlined == false` (reset group) with empty `cacheable_touches`/`cacheable_reads`/`cacheable_writes`, which is sound because the mandatory pre-call spill syncs the cache and the continue arm refills from `(live ∪ written) ∩ slots`.
+
+### Refusals of the cons shape
+Compile time: the predicate's list above, plus — by construction — a `head`/`tail`/`dst` that is not addressable at all. A refused shape emits **zero bytes**, records `declined` and is the family's own path.
+Run time: exactly one refusal — a `Y` operand outside the published frame window — which takes the `fallback` (one interpreter step for the whole instruction, producing the family's own value or error). A host whose `alloc_words_rooted` refuses raises the interpreter's exact reason with no partial state.
+The refusal vocabulary is **closed**: no new typed error exists on this arm.
 
 ## Deliberately left on `jit_bitstr`
 Each is the tier's normal discipline, not a gap: a refused shape emits zero bytes, records **zero** static deopts (a claimed shape falls through to the family route, not to the `_` deopt arm) and yields the interpreter's own result.
