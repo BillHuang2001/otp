@@ -280,11 +280,13 @@ by construction).
   into it, so a return chain does not grow the native stack; otherwise the word leaves for the driver),
   plus its unit tests (the frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
-  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
+  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers, `allocate`
+  included: one `jit_allocate` call plus the continue arm, no emitted frame push) and the private
   `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
   `encode_target(func, pc+1)`, no register refill and no emitted refresh — the helper re-published the
   Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
-  split, and `a_frame_changing_helper_emits_no_separate_refresh_call`).
+  split, `a_frame_changing_helper_emits_no_separate_refresh_call` and the structural
+  `the_allocate_arm_pushes_the_frame_with_a_helper_call_only`).
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
   `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`) and `emit_bitstr` (the same
   arm for the `Bs*` family through `../bitstr.rs::jit_bitstr`, plus the inline position store its
