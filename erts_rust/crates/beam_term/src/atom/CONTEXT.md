@@ -106,5 +106,5 @@ allocation pins can derive their budget instead of hard-coding a slack.
 
 ## Routing Table
 - `store.rs` → `NAMES_PER_CHUNK`, `INDEX_SHARDS`, `NameChunk`, `NameChunks`, `IndexShard`,
-  `IndexShards`, `shard_of`; consumed only by `../atom.rs` (`AtomTable`) and, for the two
-  constants, by `../../../tests/intern_alloc.rs`.
+  `IndexShards`, `hash_of`/`shard_of`/`shard_of_hash`/`probe_index`; consumed only by `../atom.rs`
+  (`AtomTable`) and, for the two constants, by `../../../tests/intern_alloc.rs`.
