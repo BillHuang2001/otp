@@ -8,9 +8,10 @@ Raw JSON is authoritative — this file never edits a metric value.
 
 Later, **narrower** sessions also exist and are archived under `results/`; they are additional measurement pairs, never replacements for an m19 §2/§3 row.
 `m21` is the GC/allocator workstream's before-record (`results/m21-xrun-gc-*`, `results/m21-xrun-ratios.txt`) plus the two eunit rows (`jsone`, `bbmustache`), which are carried as §9.
-`m22` is that workstream's after-record and the **newest** session: six matched rounds over `baseline,gc_bound,gc_class,list_walk,slice`, each row read through `results/m22-vs-m21.txt` (its headline diff), `results/m22-xrun-ratios.txt`, `results/m22-load-record.md` and `results/m22-memory.md`.
+`m22` is that workstream's after-record: six matched rounds over `baseline,gc_bound,gc_class,list_walk,slice`, each row read through `results/m22-vs-m21.txt` (its headline diff), `results/m22-xrun-ratios.txt`, `results/m22-load-record.md` and `results/m22-memory.md`.
 §2/§3 do **not** restate m21's or m22's numbers.
 `m21` and `m22` share the OTP 29.1.2 / erts-17.1.1 oracle, unlike m19's 29.1.1 / erts-17.1, so they are mutually diffable only with each other and never against a row above.
+`m23` is the **newest** session and a different kind of record: the startup round's *binary A/B on four sides* (`old` / HEAD / HEAD-with-`BEAM_RT_TIER=baseline` / the oracle), read through `results/m23-boot-wall.json`, `results/m23-slice-wall.json`, `results/m23-bench-{old,new}-r{1,2,3}.json` and the differential sweep `results/m23-sweep-merged.json`; its own section is at the end of this file. Same oracle as m21/m22 (29.1.2 / erts-17.1.1).
 
 ## 0. The two sides, named
 
@@ -549,3 +550,144 @@ cross-runtime row in the suite), p99 1.1265–1.2656; `bbmustache` p50 **1.0325 
   `skipped(erlc-absent)`, a checkout that will not compile ⇒ `failed(module-compile-failed)` with the
   compiler's stderr quoted — never a skip; a count that disagrees with the intended one or with the other
   side ⇒ `failed(...)` with **no metric published**.
+
+## m23 — startup round: phase-scoped tier + shared per-image label maps + loader cost pass (2026-10-29)
+
+A **narrow, single-topic** session: it restates no §2/§3 row and supersedes none.
+It measures **what a boot costs**, on four sides, and the load-bearing figures are the **paired per-round
+medians** — never an absolute.
+
+**Provenance.** Host as §1 (14 logical cores, shared); every sample is one process at a time, pinned
+`taskset -c 3`. Four sides: `old` = the **pre-round `beam_rt` build**, `new` = **HEAD** (the phase-scoped
+tier rule), `newpin` = the **same HEAD binary run with `BEAM_RT_TIER=baseline`**, `sys` = the system oracle
+`erl` (**OTP 29.1.2 / erts-17.1.1** — m21/m22's oracle, not m19's 29.1.1). 1-min `/proc/loadavg`: the boot
+A/B is **21 rounds at 66.0–74.1**, the `slice` run **15 rounds at 66.0–67.7**, recorded before and after
+every round, with the side order reshuffled per round.
+Two instruments: (1) the four-side spawn A/B — wall from `perf_counter` around `fork`/`wait4`, **CPU =
+`ru_utime + ru_stime`** (the load-robust column), peak RSS from `ru_maxrss`; (2) the driver's own
+non-regression rounds, `bench run --quick --runtime rust --workloads slice,list_walk,copy_bound,baseline`,
+three alternating rounds per side — plus `perf stat` for instructions/cycles/task-clock and the two-point
+steady-state slope.
+
+**What is NOT a valid figure here** (the caveats travel with the numbers):
+
+- **wall at 1-min load > 20.** Three archived pairs are the round's *contended* counterparts, kept only as
+  evidence and never as a timing source: `m23-boot-ab.json` and `m23-slice-ab.json` (load 454–490) and the
+  first A/B, `m23-tier-{old,new}-r{1..5}.json` (`m23-tier-loads.txt`, load 73–161). Every boot/`slice` cell
+  below comes from the load-66–74 window.
+- **the `ns_per_*` / per-call rows.** `case_*_ns_per_*` is `N`-dependent on the rust side and the host is
+  shared (§3.3 applies unchanged); the `peak_memory_bytes` rows below are boot-dominated except `slice`
+  (N=1). Read the paired ratios and the deterministic `case_*` counters.
+- **any absolute wall time as a constant.**
+
+### Boot — 21 interleaved rounds, 1-min load 66–74 (`m23-boot-wall.json`)
+
+| side | wall p50 (ms) | wall p95 (ms) | CPU p50 `utime+stime` (ms) | peak RSS p50 (MiB) |
+|---|---|---|---|---|
+| `old` — pre-round build | 201.5 | 322.8 | 156.6 | 58.93 |
+| **HEAD — phase rule** | **166.5** | **292.1** | **127.3** | **49.62** |
+| HEAD + `BEAM_RT_TIER=baseline` | 194.9 | 317.3 | 142.1 | 57.01 |
+| system oracle (`erl` 29.1.2 / erts-17.1.1) | 175.3 | 425.4 | 136.4 | 59.40 |
+
+Paired per-round medians (the reading of record — one ratio per round, median over the 21):
+
+| pair | wall | CPU | RSS |
+|---|---|---|---|
+| `old` / HEAD | **1.267** | **1.242** | **1.188** |
+| HEAD / `BEAM_RT_TIER=baseline` | **0.848** | **0.904** | **0.870** |
+| HEAD / oracle | **0.923** | **0.930** | **0.836** |
+
+### `slice` module run — 15 rounds, 1-min load 66–68 (`m23-slice-wall.json`)
+
+| side | wall p50 (ms) | CPU p50 (ms) | peak RSS p50 (MiB) |
+|---|---|---|---|
+| `old` — pre-round build | 196.0 | 158.7 | 58.91 |
+| **HEAD — phase rule** | **152.3** | **126.8** | **49.70** |
+| HEAD + `BEAM_RT_TIER=baseline` | 196.9 | 143.2 | 56.98 |
+| system oracle | 196.3 | 151.1 | 64.55 |
+
+Paired per-round medians, HEAD / `BEAM_RT_TIER=baseline`: wall **0.864**, CPU **0.894**, RSS **0.872**.
+
+### Instructions vs cycles vs task-clock, one boot (`perf stat`, 3 reps, ranges)
+
+| side | instructions | cycles | task-clock (ms) |
+|---|---|---|---|
+| `old` — pre-round build | 1.089–1.091 G | 501–505 M | 160–162 |
+| HEAD — phase rule | 1.193–1.199 G | 387–391 M | **123.5–125.2** |
+| HEAD + `BEAM_RT_TIER=baseline` | 0.953–0.961 G | 423–444 M | 140.8–144.1 |
+| HEAD + `BEAM_RT_TIER=interpreter` | 1.187–1.195 G | 360–376 M | 125.4–128.0 |
+| system oracle | 0.791 G | 366–469 M | 137–185 |
+
+**The conclusion this table supports — instructions are not time.** The interpreter boot retires *more*
+instructions than the pre-round build (1.187–1.195 G vs 1.089–1.091 G) yet spends *fewer* cycles
+(360–376 M vs 501–505 M) and *less* CPU (125.4–128.0 ms vs 160–162 ms), because the baseline JIT's compile
+work is fault/mmap/i-cache bound rather than instruction bound: the JIT-retired instructions are cheap, the
+compile path's cycles are not. An instructions-only reading of this round would rank the two boots the
+wrong way round, so every claim here is stated in cycles/CPU/wall.
+
+### Steady state — instructions per walked element (two-point slope, 1 M vs 5 M walked elements, `list_walk` shape)
+
+| side | instructions / element |
+|---|---|
+| `old` — pre-round build | 350.2 |
+| **HEAD — phase rule** | **352.2** |
+| HEAD + `BEAM_RT_TIER=baseline` | 352.4 |
+| HEAD + `BEAM_RT_TIER=interpreter` | 2 543 |
+
+Parity within **0.6 %** across the three JIT sides: the tier rule costs nothing per element in steady
+state, and the tier column is what proves the **one-way post-boot upgrade lands** — a process that starts
+on the interpreter and is upgraded to the baseline tier walks elements at the baseline tier's cost, not at
+the interpreter's (2 543).
+
+### Peak RSS + deterministic counters — `bench run --runtime rust`, median of 3 alternating rounds
+
+| workload | `old` peak RSS (MiB) | HEAD peak RSS (MiB) | HEAD/`old` |
+|---|---|---|---|
+| `slice` | 59.28 | 50.10 | **0.845×** |
+| `list_walk` | 59.02 | 49.81 | **0.844×** |
+| `copy_bound` | 60.16 | 51.23 | **0.851×** |
+| `baseline` (compute) | 89.64 | 80.21 | **0.895×** |
+
+The counters are **identical on both sides in all six passes** — `case_list_walk_elements` 50 000 000,
+`case_etf_roundtrip_ops` 500 000, `case_ets_copy_ops` 250 000, `case_send_recv_ops` 90 000,
+`case_send_recv_plain_ops` 300 000 — so the RSS difference is not a difference in work done.
+
+### Retired instructions per boot across the round (the deterministic, load-robust headline)
+
+| state | instructions / boot |
+|---|---|
+| pre-round | 1.088 G |
+| after the phase-scoped tier (interpreting the boot instead of compiling it) | 1.300 G |
+| after loader pass 1 | 1.186 G (−8.7 % on its own predecessor) |
+| after loader pass 2 | 1.1196 G (−6.15 % on its own predecessor) |
+| — with the tier held constant across the same boots | **1.088 G → 0.957 G** |
+
+Read the row **with** the cycles table above: the phase-scoped tier raises retired instructions (it
+interprets the boot instead of compiling it) while lowering cycles, CPU and wall, and the two loader passes
+then take the count back down below the pre-round figure.
+
+### Differential gate at this state (`m23-sweep-merged.json`, folded by `merge`, full corpus)
+
+`summary: total=3469 agree=3465 mismatch=0 unsupported=1 skipped=0 oracle_drift=3`;
+ratchet `allowed=1 unauthorized=0 stale=0`; drift `allowed=3 unauthorized=0 stale=0` ⇒ **gate PASS**.
+The single `unsupported` is the recorded `wire/new_fun_ext_encode` gap; the three `oracle_drift` cases are
+the version goldens the host oracle answers with its `erts-17.1.1` patch string against this tree's frozen
+`17.1`.
+
+### Artifacts
+
+`results/m23-boot-{ab,wall}.json`, `results/m23-slice-{ab,wall}.json`, the six non-regression rounds
+`results/m23-bench-{old,new}-r{1,2,3}.json`, the first (contended) A/B
+`results/m23-tier-{old,new}-r{1..5}.json` + `results/m23-tier-loads.txt`, the retained `perf stat` output
+of the steady-state point `results/m23-lw-perf-{old,new,newpin}.txt`, and the differential sweep
+`results/m23-sweep-merged.json` + `results/m23-sweep-merge.log`.
+The six `m23-bench-*` and ten `m23-tier-*` reports carry the directory's documented path normalization
+(`runtimes[].program` → `erts_rust/target/release/beam_rt`, scratch prefixes → `$TMPDIR/…`); no metric value
+was touched. The sweep report is **not** normalized, so its `rust.program` still names the volatile path of
+this round's HEAD binary (`/tmp/genesis/ab_final_head_beam_rt` — the same build as every `new` cell above,
+which no longer exists).
+Two rows above are transcribed from the round's established results rather than from an archived raw file,
+and are flagged here as such: the per-boot instructions/cycles/task-clock table and the 1 M-element point of
+the steady-state slope. The retained `perf stat` output is the slope's **5 M-element** point only
+(`m23-lw-perf-{old,new,newpin}.txt`, one `perf stat -x,` record per side at 5 000 walks × `LEN` 1 000, its
+`out` checksum 2 502 500 000).
