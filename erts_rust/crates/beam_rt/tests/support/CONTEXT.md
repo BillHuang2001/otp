@@ -104,6 +104,8 @@ This directory is exercised transitively: `dist_two_vm.rs`/`dist_two_rust.rs`/
 through `mod.rs`'s `require_oracle`/`oracle_eval`/`run_bounded`.
 A change here is validated by the pair suites serially
 (`… -p beam_rt --test dist_two_vm --test dist_two_rust --test dist_two_vm_wire -- --ignored --test-threads=1`).
+A change to `cowboy.rs` is validated by both Cowboy suites, which are also `#[ignore]`d:
+`… -p beam_rt --test cowboy_serve --test cowboy_static_serve -- --ignored --nocapture`.
 
 ## Known Issues
 * `two_vm.rs`'s module docs name `dist_two_vm.rs` as a consumer; the only importer is
