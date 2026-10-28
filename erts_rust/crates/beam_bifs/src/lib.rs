@@ -129,19 +129,19 @@ pub use crate::hook_sets::{
     PERSISTENT_TERM_BIFS, PORT_HOOK_BIFS, PROCESS_HOOK_BIFS, RECORD_SOURCE_BIFS,
     RUNTIME_HOOKS_BIFS, SEND_HOOK_BIFS,
 };
-pub use crate::reason::{exit_reason_from_term, reason_term_from_exit_reason};
+pub use crate::reason::{error_meta, exit_reason_from_term, reason_term_from_exit_reason, ErrorMeta};
 pub use crate::registry::{default_registry, BifFn, BifRegistry};
 pub use crate::zlib::serves_local_call;
 
 /// The conventional glob-import surface for downstream crates.
 ///
 /// `use beam_bifs::prelude::*;` brings the [`BifRegistry`] seam, the
-/// [`BifContext`] and its sinks, the raise builders, the reason-term mapping and
-/// [`TableRegistry`] into scope.
+/// [`BifContext`] and its sinks, the raise builders, the reason-term mapping, the
+/// [`ErrorMeta`] payload of `erlang:error/2,3` and [`TableRegistry`] into scope.
 pub mod prelude {
     pub use crate::{
-        default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
-        reason_term_from_exit_reason, serves_local_call, AtomInterner, BifContext, BifFn,
+        default_registry, error_meta, exit_reason_from_term, raise_error, raise_exit, raise_throw,
+        reason_term_from_exit_reason, serves_local_call, AtomInterner, BifContext, BifFn, ErrorMeta,
         BifRegistry, BytesSink,
         DictHook, FunCaller, LocalFunIdentity, LocalNode, MemoryHook, ModuleInfo, NifLoadError,
         NifLoader, NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
