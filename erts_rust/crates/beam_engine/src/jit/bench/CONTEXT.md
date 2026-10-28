@@ -197,10 +197,12 @@ operand (the head survives in `Y(0)` across the non-tail recursive call) and wri
 (`{y,1}`), and the tier inlines both behind its per-block published frame window, as it does the
 `Move` guarding the recursion. `sum/1` is therefore **not** a deopt-dominated twin of `walk/2`: min of
 3 timed runs is interpreter **4718.7 ns/op** vs baseline-jit **2675.8 ns/op**, i.e. baseline ≈
-**1.76×** the interpreter. The per-level deopts that remain are the `Allocate{2}` frame push and the
-**non-tail** local `Call`; the call's continuation `pc + 1` — which `beam_loader` does not cut a block
-at — has its own native **continuation sub-block**, so the driver re-enters natively at the post-call
-continuation instead of stepping the block tail one interpreter instruction at a time. Both tiers pin
+**1.76×** the interpreter. Both remaining shape costs are in-block: the frame push is one `jit_allocate`
+helper call and the **non-tail** local `Call` is the in-block `jit_call_store` path (a declined callee
+exits to the driver, never to a `jit_step_one` step); the call's continuation `pc + 1` — which
+`beam_loader` does not cut a block at — has its own native **continuation sub-block**, so the driver
+re-enters natively at the post-call continuation instead of stepping the block tail one interpreter
+instruction at a time. Both tiers pin
 the exact triangular sum (`SUM_LENGTH * (SUM_LENGTH + 1) / 2` = 2080).
 
 Full min-of-3 table (min per column), `ns/op` (interpreter → baseline-jit), from
