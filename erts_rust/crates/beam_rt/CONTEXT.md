@@ -147,6 +147,7 @@ The design rationale and binding invariants of the runtime glue — the mature-G
 * An allocate-and-abandon loop is collector-bound, never arena-bound — G *Scheduler / runner*.
 * A registered-BIF tail loop leaves the reported heap capacity flat — GC *Memory and statistics*.
 * A nested fun application's nursery chain is bounded by the debt gate — GC *GC / heap model*.
+* A `-eval` fun application is **compiled** past 512 walked applications (`src/eval/nesting.rs`), so a deep recursion answers its value on the BEAM stack; an application that can neither walk further nor compile (16 compiled applications already nested, or a context inside a scheduler slice) is the typed `unsupported: eval fun application: …` gap — [`src/eval/CONTEXT.md`](src/eval/CONTEXT.md), `tests/eval_deep_recursion.rs`.
 * The two long-lived term regions are reclaimed only where nothing executes; one statement pays the peak — GC *GC / heap model*.
 * The `-eval` store's written volume, not the region pass, sets one statement's RSS — GC *GC / heap model*.
 * The store's written prefix in one statement is bounded by its copy-out volume — GC *GC / heap model*.
