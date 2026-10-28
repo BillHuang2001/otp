@@ -28,7 +28,9 @@
 //!   the raw data chunks.
 //! * the sibling [`group`] module (re-exported here) splits the module-wide
 //!   instruction stream into functions ([`group_functions`]) and decomposes a body
-//!   into label-delimited basic blocks ([`build_blocks`]).
+//!   into label-delimited basic blocks ([`build_blocks`]). Its checked variant
+//!   (`group_functions_checked`) applies the [`validate`] rules while it emits each
+//!   body, so grouping, block construction and validation are one traversal.
 //! * the private `instr` module maps one decoded instruction to one IR [`Instr`].
 //!
 //! Every fallible step reports `BeamError::BadArg` through [`crate::error::bad_file`]
@@ -55,7 +57,10 @@ mod instr;
 mod validate;
 pub mod fuse;
 
-pub use group::{build_blocks, group_functions};/// Assembles the IR [`Module`] from the parsed chunks and the decoded instructions.
+pub use group::{build_blocks, group_functions};
+use group::group_functions_checked;
+
+/// Assembles the IR [`Module`] from the parsed chunks and the decoded instructions.
 ///
 /// `atom_table` is the interning context the module's atoms are resolved through
 /// (seeding it with `atom.names` for preloaded/positional atoms is `beam_rt`'s
@@ -116,13 +121,16 @@ pub fn build_module(
         });
     }
 
-    // Every `z,4` static-literal operand must name a literal the file's own `LitT` table
-    // defines: the C asserts `index.word_value < literals->count` and adds "it must not
-    // have been created at runtime" (`beam_file.c:2400-2417`). The check runs *before*
+    // One operand walk answers both questions this step asks. Every `z,4` static-literal
+    // operand must name a literal the file's own `LitT` table defines: the C asserts
+    // `index.word_value < literals->count` and adds "it must not have been created at
+    // runtime" (`beam_file.c:2400-2417`). That bound runs *before*
     // `rewrite_wide_integers` appends the synthesized bignum literals — those are numbered
     // *after* the file's own entries, so a synthesized index is legitimately at or above
-    // the file's count and must not be bounded by it.
-    check_static_literals(raw_instrs, chunks.literals.len())?;
+    // the file's count and must not be bounded by it. The same walk counts the wide
+    // integers the rewrite must materialize, so the operands are visited once instead of
+    // twice (`validate::scan_operands`).
+    let scan = validate::scan_operands(raw_instrs, chunks.literals.len())?;
 
     // The C loader turns a wide `i` operand into a bignum **static literal**
     // (`marshal_integer` → `beamfile_add_literal`, `beam_file.c:2210-2220`) that the
@@ -130,7 +138,12 @@ pub fn build_module(
     // pointed at a literal appended after the file's own `LitT` entries. Nothing is
     // copied and nothing is appended when the module has no wide operand.
     let mut synthesized: Vec<Vec<u8>> = Vec::new();
-    let rewritten = rewrite_wide_integers(raw_instrs, chunks.literals.len(), &mut synthesized)?;
+    let rewritten = rewrite_wide_integers(
+        raw_instrs,
+        chunks.literals.len(),
+        scan.big_integers,
+        &mut synthesized,
+    )?;
     let raw_instrs: &[RawInstr] = rewritten.as_deref().unwrap_or(raw_instrs);
 
     // The `Recs` native-record definitions: wire atom indices become interned atoms,
@@ -139,16 +152,24 @@ pub fn build_module(
     let pending_records =
         build_records(&chunks.records, &atoms, chunks.literals.len(), &mut synthesized)?;
 
-    let functions = group_functions(raw_instrs)?;
-
     // The `Code` header's declared label/function counts and the `Line`/`ImpT` tables
-    // bound what the assembled code may reference (`jit/asm_load.c`): a defined label
-    // must lie in the declared label space and be defined once, there must be exactly
-    // `function_count` functions, a `func_info` arity must fit `MAX_ARG`, and every
-    // import index and line-item reference must resolve. Accept/reject-only, exactly as
-    // the C validates while it emits code — see `lower/validate.rs`.
+    // bound what the assembled code may reference (`jit/asm_load.c`): a defined label must
+    // lie in the declared label space and be defined once, a `func_info` arity must fit
+    // `MAX_ARG`, and every import index and line-item reference must resolve.
+    // Accept/reject-only, exactly as the C validates while it emits code — and applied
+    // *while* each body is emitted now, so grouping, block construction and validation
+    // share one traversal of the lowered stream instead of the three that `group_functions`
+    // + `build_blocks` + `validate_code` cost. See `lower/validate.rs`.
     let line = chunks.line.clone().unwrap_or_default();
-    validate::validate_code(&functions, chunks.code_version, &line, imports.len())?;
+    let validate_ctx = validate::ValidateContext {
+        code_version: chunks.code_version,
+        line: &line,
+        import_count: imports.len(),
+    };
+    let functions = group_functions_checked(raw_instrs, &validate_ctx)?;
+    // The one check that needs the grouped module rather than one body: the declared
+    // `function_count` (and, per function, the `func_info` arity bound).
+    validate::validate_module(&functions, chunks.code_version)?;
 
     // `FunT` carries wire atom indices; the fun-table index (`make_fun3`'s operand)
     // is the entry's *position*, so file order is preserved.
@@ -263,45 +284,6 @@ fn atom_at(atoms: &[Atom], index: u32) -> Result<Atom> {
         .ok_or_else(|| bad_file("atom index out of range"))
 }
 
-/// Rejects an instruction operand that names a static literal the file's `LitT` table
-/// does not define.
-///
-/// The C asserts `index.word_value < literals->count` for every `z,4` operand against the
-/// file's *static* literal table (`beam_file.c:2400-2417`) — a reference the file does not
-/// define is malformed, because such a literal could only have been created at runtime.
-/// The literal count is not known to [`crate::decode`] (the decoder never sees the `LitT`
-/// chunk), so the bound is enforced here, where the module's literal table is in hand.
-fn check_static_literals(instrs: &[RawInstr], literal_count: usize) -> Result<()> {
-    for instr in instrs {
-        for operand in instr.operands.iter() {
-            check_static_literal(operand, literal_count)?;
-        }
-    }
-    Ok(())
-}
-
-/// Rejects `operand` — recursively, through a `z,1` argument list — if it names a static
-/// literal at or past `literal_count`.
-///
-/// [`Operand::List`] is the only nesting: every other variant carries leaf indices.
-fn check_static_literal(operand: &Operand, literal_count: usize) -> Result<()> {
-    match operand {
-        Operand::Literal(index) => {
-            if *index as usize >= literal_count {
-                return Err(bad_file("static literal index out of range"));
-            }
-            Ok(())
-        }
-        Operand::List(items) => {
-            for item in items.iter() {
-                check_static_literal(item, literal_count)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
 /// Points every wide-integer operand of `instrs` at a synthesized static literal.
 ///
 /// `base` is the number of the module's own `LitT` literals, so the synthesized ones
@@ -310,22 +292,22 @@ fn check_static_literal(operand: &Operand, literal_count: usize) -> Result<()> {
 /// `chunks.literals` followed by `synthesized` therefore resolves every rewritten
 /// [`Operand::Literal`] index.
 ///
-/// Returns `None` — copying nothing — when the module has no wide-integer operand;
-/// a literal index that would not fit `u32` is [`BeamError::SystemLimit`].
+/// `wide_count` is the number of wide-integer operands, already counted by
+/// [`validate::scan_operands`] in the walk that enforces the static-literal bound — so
+/// this step never re-reads an operand it does not have to rewrite. `None` — copying
+/// nothing — is returned when that count is zero; a literal index that would not fit
+/// `u32` is [`BeamError::SystemLimit`].
 fn rewrite_wide_integers(
     instrs: &[RawInstr],
     base: usize,
+    wide_count: usize,
     synthesized: &mut Vec<Vec<u8>>,
 ) -> Result<Option<Vec<RawInstr>>> {
-    let count: usize = instrs
-        .iter()
-        .map(|instr| instr.operands.iter().map(count_wide_integers).sum::<usize>())
-        .sum();
-    if count == 0 {
+    if wide_count == 0 {
         return Ok(None);
     }
     // `Operand::Literal` carries a `u32` index, so the extended literal count must fit.
-    if base.saturating_add(count) > u32::MAX as usize {
+    if base.saturating_add(wide_count) > u32::MAX as usize {
         return Err(BeamError::SystemLimit);
     }
 
@@ -339,15 +321,6 @@ fn rewrite_wide_integers(
         rewritten.push(instr);
     }
     Ok(Some(rewritten))
-}
-
-/// The number of wide-integer operands in `operand`, including an argument list's.
-fn count_wide_integers(operand: &Operand) -> usize {
-    match operand {
-        Operand::BigInteger(_) => 1,
-        Operand::List(items) => items.iter().map(count_wide_integers).sum(),
-        _ => 0,
-    }
 }
 
 /// Replaces every wide-integer operand (recursively) with a synthesized
@@ -514,11 +487,25 @@ mod tests {
     /// One decoded instruction with the given opcode and operands (the operand
     /// vector is adopted as [`RawOperands`], exactly as the decoder builds it).
     fn raw(opcode: Opcode, operands: Vec<Operand>) -> RawInstr {
+        // `.into()` keeps this helper agnostic to the operand container's type.
         RawInstr {
             opcode,
             operands: operands.into(),
             offset: 0,
         }
+    }
+
+    /// The rewrite route [`build_module`] takes: the one fused operand scan (which also
+    /// enforces the file's static-literal bound), then the rewrite itself.
+    fn rewrite_wide(
+        instrs: &[RawInstr],
+        base: usize,
+        synthesized: &mut Vec<Vec<u8>>,
+    ) -> Result<Option<Vec<RawInstr>>> {
+        // `base` is the file's own literal count; these test streams carry no
+        // `Operand::Literal`, so the bound never fires.
+        let scan = validate::scan_operands(instrs, base)?;
+        rewrite_wide_integers(instrs, base, scan.big_integers, synthesized)
     }
 
     /// The `label L` instruction as the compiler writes it: a `u` operand.
@@ -1962,7 +1949,7 @@ mod tests {
             vec![Operand::big_integer(false, vec![0xFF; 8])],
         )];
         let mut synthesized = Vec::new();
-        let rewritten = rewrite_wide_integers(&instrs, 4, &mut synthesized)
+        let rewritten = rewrite_wide(&instrs, 4, &mut synthesized)
             .unwrap()
             .expect("a wide operand forces a rewrite");
         assert_eq!(rewritten[0].operands.to_vec(), vec![Operand::Literal(4)]);
@@ -2025,7 +2012,7 @@ mod tests {
         let instrs = vec![raw(Opcode::r#move, vec![Operand::X(0), Operand::X(1)])];
         let mut synthesized = Vec::new();
         assert!(
-            rewrite_wide_integers(&instrs, 0, &mut synthesized)
+            rewrite_wide(&instrs, 0, &mut synthesized)
                 .unwrap()
                 .is_none(),
             "no wide operand must copy nothing"
@@ -2043,7 +2030,7 @@ mod tests {
             ])],
         )];
         let mut synthesized = Vec::new();
-        let rewritten = rewrite_wide_integers(&instrs, 0, &mut synthesized)
+        let rewritten = rewrite_wide(&instrs, 0, &mut synthesized)
             .unwrap()
             .expect("rewrite");
         assert_eq!(
