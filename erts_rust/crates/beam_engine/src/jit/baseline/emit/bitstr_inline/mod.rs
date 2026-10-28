@@ -656,7 +656,8 @@ pub(crate) fn emit_bit_extract(
 /// extra byte can never contribute a bit of the result. The narrow bound was a real
 /// performance bug: a `<<_:2, Field:6>>` match over a **1-byte** subject (a `base62`-style
 /// per-character binary) needs no second byte at all, yet `ceil(8 / 8) = 1` refused the
-/// two-byte window and forced a deopt on every character.///
+/// two-byte window and forced a deopt on every character.
+///
 /// **The refc arm's `num_bytes` is the strict `ceil((rem + end - start) / 8)`** — never
 /// word-rounded — because an off-heap payload's reserved extent is not word-asserted, so
 /// `base + num_bytes` must never be allowed to exceed the bytes the window really covers.
@@ -680,7 +681,8 @@ fn emit_subject_view(
     fallback: CodeLabel,
 ) -> Result<(Reg, Reg, Reg)> {
     let refc_arm: CodeLabel = buffer.label();
-    let tail: CodeLabel = buffer.label();    buffer.mov_rm(Reg::Rdx, ctx, SUB_BITS_ORIG_DISP)?;
+    let tail: CodeLabel = buffer.label();
+    buffer.mov_rm(Reg::Rdx, ctx, SUB_BITS_ORIG_DISP)?;
     buffer.mov_ri(Reg::Rax, NOT_BOXED_MASK)?;
     buffer.test_rr(Reg::Rdx, Reg::Rax)?;
     buffer.jcc(Cond::Ne, fallback)?;
@@ -701,7 +703,8 @@ fn emit_subject_view(
     buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
     buffer.jcc(Cond::E, refc_arm)?;
     // The on-heap arm: an `ErlHeapBits` is the only other readable form (a bare `BinRef`, a
-    // tuple, an atom, … is the family's typed error).    buffer.mov_ri(Reg::Rax, BITSTRING_TAG_MASK_WORD)?;
+    // tuple, an atom, … is the family's typed error).
+    buffer.mov_ri(Reg::Rax, BITSTRING_TAG_MASK_WORD)?;
     buffer.and_rr(Reg::Rdi, Reg::Rax)?;
     buffer.mov_ri(Reg::Rax, HEAP_BITS_SUBTAG_WORD)?;
     buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
@@ -754,5 +757,6 @@ fn emit_subject_view(
     buffer.mov_rr(Reg::Rax, Reg::Rdi)?;
     buffer.mov_rr(Reg::Rdx, pos)?;
     buffer.add_rr(Reg::Rdx, Reg::Rcx)?;
-    buffer.bind(tail)?;    Ok((MOVE_SCRATCH_2, Reg::Rdx, Reg::Rax))
+    buffer.bind(tail)?;
+    Ok((MOVE_SCRATCH_2, Reg::Rdx, Reg::Rax))
 }
