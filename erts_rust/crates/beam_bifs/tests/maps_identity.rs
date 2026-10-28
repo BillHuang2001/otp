@@ -19,8 +19,11 @@
 // %CopyrightEnd%
 
 //! The **no-op identity** of `maps:put/3`, `maps:update/3`, `maps:remove/2` and
-//! `maps:merge/2`: a call that provably changes nothing returns the *argument map
-//! term*, not a rebuilt copy.
+//! `maps:merge/2`: a call whose result is already one of the argument terms returns
+//! *that argument map term*, not a rebuilt copy. For `put`/`update`/`remove` the
+//! deciding test is the value word; for `merge/2` it is ERTS's own rule — the empty
+//! arms, plus "every key of `Map1` is in `Map2`" which hands back **`Map2`** — see the
+//! matrix below.
 //!
 //! # The predicate: raw word equality
 //!
@@ -35,12 +38,13 @@
 //! `src/erts_internal.rs::same_2`).
 //!
 //! `=:=` never sees any of this, so the matrix below is the only pin: for every row
-//! the test asserts the returned term is **word-identical to the argument** (a `true`
-//! row) or a **different word** (a `false` row), and the content assertions keep the
-//! answers honest.
+//! the test asserts the returned term is **word-identical to the named argument** or a
+//! **different word**, and the content assertions keep the answers honest.
 //!
-//! # Oracle matrix (measured on the system OTP 29 / erts-17.1, compiled module,
-//! `V = 42`, `M = #{a => V}`)
+//! # Oracle matrix (measured on the system OTP 29.1.2 / erts-17.1.1, compiled module,
+//! `V = 42`, `M = #{a => V}`; every map built with `maps:from_list/1` over a
+//! differently-ordered pair list so the compiler cannot CSE two expressions into one
+//! term)
 //!
 //! ```text
 //! erts_debug:same(maps:put(a,V,M), M)                        => true  (same value word)
@@ -48,23 +52,33 @@
 //! erts_debug:same(maps:put(b,1,#{a=>1,b=>2}), #{a=>1,b=>2})   => false
 //! erts_debug:same(maps:put(a,43,M), M)                       => false
 //! erts_debug:same(maps:update(a,V,M), M)                     => true
-//! erts_debug:same(maps:merge(M,#{}), M)                      => true  (empty Map2)
-//! erts_debug:same(maps:merge(#{},M), M)                      => true  (empty Map1)
-//! erts_debug:same(maps:merge(M,#{a=>V}), M)                  => true  (Map2 adds nothing)
-//! erts_debug:same(maps:merge(M,#{b=>1}), M)                  => false
 //! erts_debug:same(maps:remove(zz,M), M)                      => true  (absent key)
 //! erts_debug:same(maps:with([a],M), M)                       => false (negative pin)
 //! ```
 //!
-//! # One documented divergence, `erts_debug:same/2`-only
+//! # `maps:merge/2`'s identity arms are ERTS's (`erl_map.c:1256-1372`)
 //!
-//! `flatmap_merge` prefers **`Map2`** when the two maps have the *same key set* with
-//! identical value words (`if (n == n2) { … return map2; }`, `erl_map.c`), so for two
-//! *distinct* maps with equal content the oracle answers `same(maps:merge(M1, M2), M2)`
-//! ⇒ `true` and `same(maps:merge(M1, M2), M1)` ⇒ `false`. This runtime returns `Map1`
-//! there (`args[0]`, the "changed nothing" answer); the two agree at `=:=` and differ
-//! only under `erts_debug:same/2`. The live-oracle cross-check at the bottom of this
-//! file pins both readings so the divergence cannot drift silently.
+//! They are a **key-set** rule, not a value rule, and they are measured:
+//!
+//! ```text
+//! merge(M1, M1)                                       => Map1  (any size, flat or HAMT)
+//! merge(M, #{})                                       => M1    (empty Map2)
+//! merge(#{}, M)                                       => M2    (empty Map1)
+//! merge(#{a=>1}, #{a=>99})                            => Map2  (shared key, Map2 wins)
+//! merge(#{a=>1,b=>2}, #{b=>2,a=>1})                   => Map2  (same key set)
+//! merge(#{a=>1}, #{a=>1,b=>2})                        => Map2  (Map1 ⊆ Map2)
+//! merge(#{a=>1,b=>2}, #{a=>1})                        => fresh (Map2 ⊂ Map1: n > n2)
+//! merge(#{a=>1,b=>2}, #{a=>99})                       => fresh (a key of Map1 missing)
+//! merge(40-key, 41-key superset)                      => Map2  (HAMT)
+//! merge(20-key, 40-key superset)                      => Map2  (HAMT)
+//! merge(40-key, 40-key with different values)         => Map2  (HAMT, values ignored)
+//! merge(3-key flat, 40-key HAMT superset)             => Map2  (mixed representations)
+//! ```
+//!
+//! `flatmap_merge` reaches the shared-key-set arm as `if (n == n2) return map2;`
+//! (`erl_map.c:1368-1372`), the HAMT merge as "only unique B stuff" at the root — so
+//! the values never matter (`same(merge(#{a=>1},#{a=>99}), Map2)` ⇒ `true`) and the
+//! answer for an identical key set is **`Map2`**, never `Map1`.
 
 use std::collections::HashMap;
 
@@ -322,44 +336,52 @@ fn remove_hands_back_the_map_when_the_key_is_absent() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn merge_hands_back_an_argument_when_it_adds_nothing() {
+fn merge_hands_back_an_argument_on_the_empty_arms() {
     run(|reg, ctx| {
         let (a, b) = (atom(ctx, "a"), atom(ctx, "b"));
         let v = int(42);
         let m = map_of(reg, ctx, &[(a, v)]);
 
-        // An empty Map2 contributes nothing ⇒ Map1.
+        // An empty Map2 contributes nothing ⇒ Map1 (`if (n2 == 0) return map1`).
         let blank = empty(reg, ctx);
         let got = call(reg, ctx, "maps", "merge", &[m, blank]);
         assert!(same_word(got, m), "maps:merge/2 with an empty Map2");
 
-        // An empty Map1 means the union *is* Map2.
+        // An empty Map1 means the union *is* Map2 (`if (n1 == 0) return map2`).
         let blank = empty(reg, ctx);
         let got = call(reg, ctx, "maps", "merge", &[blank, m]);
         assert!(same_word(got, m), "maps:merge/2 with an empty Map1");
 
-        // Map2 whose only pair is already present with the same value word ⇒ Map1.
-        let echo = map_of(reg, ctx, &[(a, v)]);
-        assert!(!same_word(echo, m), "the echo map is a distinct heap term");
-        let got = call(reg, ctx, "maps", "merge", &[m, echo]);
-        assert!(same_word(got, m), "maps:merge/2 with a redundant Map2");
+        // Both empty: Map2 is the answer, and here that is the *second* argument word.
+        let blank1 = empty(reg, ctx);
+        let blank2 = empty(reg, ctx);
+        assert!(!same_word(blank1, blank2), "two distinct empty map terms");
+        let got = call(reg, ctx, "maps", "merge", &[blank1, blank2]);
+        assert!(same_word(got, blank2), "merge of two empty maps is Map2");
 
         // A new key in Map2 is a real merge.
         let extra = map_of(reg, ctx, &[(b, int(1))]);
         let got = call(reg, ctx, "maps", "merge", &[m, extra]);
         assert!(!same_word(got, m), "maps:merge/2 that adds a key");
+        assert!(!same_word(got, extra), "…and is not Map2 either");
         assert_eq!(size_of(reg, ctx, got), 2);
 
-        // So is a changed value on a shared key.
+        // A changed value on a shared key: the key sets are equal, so Map2 is the
+        // answer (`if (n == n2) return map2`) — never Map1.
         let changed = map_of(reg, ctx, &[(a, int(43))]);
         let got = call(reg, ctx, "maps", "merge", &[m, changed]);
         assert!(!same_word(got, m), "maps:merge/2 that changes a value");
+        assert!(same_word(got, changed), "Map2 itself, values and all");
         assert!(same_word(get(reg, ctx, a, got), int(43)), "Map2 wins");
     });
 }
 
+/// `maps:merge/2`'s identity arm is a **key-set** test, never a value test
+/// (`erl_map.c:1368-1372`): `Map2`'s value wins on a shared key, so whenever `Map2`
+/// already holds every key of `Map1` the answer is `Map2` itself whatever the values
+/// are — word-identical or not.
 #[test]
-fn merge_compares_value_words_not_structure() {
+fn merge_ignores_value_words_entirely() {
     run(|reg, ctx| {
         let a = atom(ctx, "a");
         let elems = [int(1), int(2)];
@@ -367,42 +389,69 @@ fn merge_compares_value_words_not_structure() {
         let second = ctx.list(&elems).expect("fits");
         let m = map_of(reg, ctx, &[(a, first)]);
 
-        // `Map2`'s value is `=:=` but a different word ⇒ real union (rebuild).
+        // `Map2`'s value is `=:=` but a different word: still `Map2` (rule 5).
         let twin = map_of(reg, ctx, &[(a, second)]);
         let got = call(reg, ctx, "maps", "merge", &[m, twin]);
-        assert!(!same_word(got, m), "distinct value words are a real merge");
+        assert!(!same_word(got, m), "the answer is not Map1");
+        assert!(same_word(got, twin), "the answer is Map2 itself");
         assert!(
             compare::eq(get(reg, ctx, a, got), second, ctx.atoms()),
             "Map2's value wins"
         );
 
-        // The same word is the redundant case.
+        // The same value word: the same answer, `Map2`.
         let echo = map_of(reg, ctx, &[(a, first)]);
         let got = call(reg, ctx, "maps", "merge", &[m, echo]);
-        assert!(same_word(got, m), "the same value word adds nothing");
+        assert!(same_word(got, echo), "the same value word still answers Map2");
+        assert!(!same_word(got, m), "…and not Map1");
     });
 }
 
-/// The one place this runtime is deliberately *more* eager than the oracle: with two
-/// **distinct** maps that share their whole key set and every value word,
-/// `maps:merge/2` returns `Map1` where `flatmap_merge`'s `n == n2` arm returns `Map2`.
-/// `=:=` cannot see the difference; only `erts_debug:same/2` can (see the module docs,
-/// and the live-oracle cross-check below, which pins both readings).
+/// `flatmap_merge`'s `n == n2` arm (`erl_map.c:1368-1372`) — and its HAMT twin — hand
+/// back **`Map2`** for two *distinct* maps with the same key set, whether the values
+/// agree or not. The reverse relation is *not* an identity: with `Map2 ⊂ Map1` the
+/// union is larger than `Map2`, so neither argument is the answer.
 #[test]
-fn merge_with_an_identical_key_set_returns_map1() {
+fn merge_with_an_identical_key_set_returns_map2() {
     run(|reg, ctx| {
-        let a = atom(ctx, "a");
+        let (a, b) = (atom(ctx, "a"), atom(ctx, "b"));
         let v = int(42);
+
+        // Same key set, identical values, distinct terms.
         let m1 = map_of(reg, ctx, &[(a, v)]);
         let m2 = map_of(reg, ctx, &[(a, v)]);
         assert!(!same_word(m1, m2), "distinct heap maps");
-
         let got = call(reg, ctx, "maps", "merge", &[m1, m2]);
-        assert!(same_word(got, m1), "ours: Map1 (`args[0]`)");
-        assert!(!same_word(got, m2), "the oracle would answer Map2 here");
+        assert!(same_word(got, m2), "Map2 (`if (n == n2) return map2`)");
+        assert!(!same_word(got, m1), "not Map1");
         assert!(
             compare::eq(got, m2, ctx.atoms()),
             "the content is Map2's either way"
+        );
+
+        // Same key set, distinct values, distinct terms (order of construction
+        // reversed so the two terms cannot coincide).
+        let one = map_of(reg, ctx, &[(a, int(1)), (b, int(2))]);
+        let swapped = map_of(reg, ctx, &[(b, int(2)), (a, int(1))]);
+        assert!(!same_word(one, swapped), "distinct heap maps");
+        let got = call(reg, ctx, "maps", "merge", &[one, swapped]);
+        assert!(same_word(got, swapped), "same key set ⇒ Map2");
+        assert!(!same_word(got, one), "…not Map1");
+
+        // `Map1 ⊆ Map2` (a proper subset this time): still Map2.
+        let small = map_of(reg, ctx, &[(a, v)]);
+        let big = map_of(reg, ctx, &[(a, v), (b, int(7))]);
+        let got = call(reg, ctx, "maps", "merge", &[small, big]);
+        assert!(same_word(got, big), "Map1 ⊆ Map2 ⇒ Map2");
+
+        // `Map2 ⊂ Map1`: the union is neither argument — a fresh map.
+        let got = call(reg, ctx, "maps", "merge", &[big, small]);
+        assert!(!same_word(got, big), "Map2 ⊂ Map1 ⇒ not Map1");
+        assert!(!same_word(got, small), "Map2 ⊂ Map1 ⇒ not Map2");
+        assert_eq!(size_of(reg, ctx, got), 2, "the union still has both keys");
+        assert!(
+            compare::eq(got, big, ctx.atoms()),
+            "content equals the superset"
         );
     });
 }
@@ -445,15 +494,62 @@ fn the_no_op_identity_holds_for_a_hamt_too() {
         let blank = empty(reg, ctx);
         let got = call(reg, ctx, "maps", "merge", &[blank, hamt]);
         assert!(same_word(got, hamt), "merge({{}}, HAMT)");
-        // …a redundant Map2…
-        let echo = map_of_ints(reg, ctx, &[(7, 7)]);
-        let got = call(reg, ctx, "maps", "merge", &[hamt, echo]);
-        assert!(same_word(got, hamt), "merge(HAMT, a redundant pair)");
+        // …a self-merge (rule 1)…
+        let got = call(reg, ctx, "maps", "merge", &[hamt, hamt]);
+        assert!(same_word(got, hamt), "merge(HAMT, HAMT)");
+        // …a `Map1 ⊆ Map2` pair, which answers Map2 even though Map2 is the *larger*
+        // term (`if (n == n2) return map2` / the HAMT merge's "only unique B")…
+        let superset_pairs: Vec<(i64, i64)> = (1..=41).map(|n| (n, n)).collect();
+        let superset = map_of_ints(reg, ctx, &superset_pairs);
+        let got = call(reg, ctx, "maps", "merge", &[hamt, superset]);
+        assert!(same_word(got, superset), "merge(HAMT40, a 41-key superset)");
         // …and a real one.
         let extra = map_of_ints(reg, ctx, &[(99, 99)]);
         let got = call(reg, ctx, "maps", "merge", &[hamt, extra]);
         assert!(!same_word(got, hamt), "merge(HAMT, a new key)");
+        assert!(!same_word(got, extra), "…and not Map2 either");
         assert_eq!(size_of(reg, ctx, got), 41);
+    });
+}
+
+/// The `n == n2` arm on the HAMT tier and across representations: a `Map2` that already
+/// holds every key of `Map1` is the answer — 20 keys into a 40-key superset, a 40-key
+/// map with **different values** (the values are irrelevant), and a 3-key *flat* map
+/// into a 40-key HAMT (the C's `map_merge_mixed` path).
+#[test]
+fn merge_answers_map2_for_a_subset_on_the_hamt_tier_too() {
+    run(|reg, ctx| {
+        let keys = |from: i64, to: i64| -> Vec<(i64, i64)> {
+            (from..=to).map(|n| (n, n)).collect()
+        };
+
+        // 20-key ⊂ 40-key, both distinct HAMT terms.
+        let twenty = map_of_ints(reg, ctx, &keys(1, 20));
+        let forty = map_of_ints(reg, ctx, &keys(1, 40));
+        assert!(!same_word(twenty, forty), "distinct heap maps");
+        let got = call(reg, ctx, "maps", "merge", &[twenty, forty]);
+        assert!(same_word(got, forty), "merge(20-key, 40-key superset) ⇒ Map2");
+        assert!(!same_word(got, twenty), "…not Map1");
+
+        // Same 40 keys, every value different: still Map2 (a key-set test).
+        let values: Vec<(i64, i64)> = (1..=40).map(|n| (n, n * 1000)).collect();
+        let other = map_of_ints(reg, ctx, &values);
+        let got = call(reg, ctx, "maps", "merge", &[forty, other]);
+        assert!(same_word(got, other), "merge(40-key, 40-key new values) ⇒ Map2");
+        assert!(!same_word(got, forty), "…not Map1");
+
+        // A flat map whose keys all live in a HAMT (mixed representations).
+        let flat = map_of_ints(reg, ctx, &keys(1, 3));
+        assert_eq!(size_of(reg, ctx, flat), 3, "still a flat map");
+        let got = call(reg, ctx, "maps", "merge", &[flat, forty]);
+        assert!(same_word(got, forty), "merge(3-key flat, 40-key HAMT) ⇒ Map2");
+        assert!(!same_word(got, flat), "…not Map1");
+
+        // The reverse relation on the mixed pair is a fresh map again.
+        let got = call(reg, ctx, "maps", "merge", &[forty, flat]);
+        assert!(!same_word(got, forty), "merge(40-key HAMT, 3-key flat) ⇒ fresh");
+        assert!(!same_word(got, flat), "…not Map2");
+        assert_eq!(size_of(reg, ctx, got), 40);
     });
 }
 
@@ -483,6 +579,10 @@ fn the_error_paths_are_unchanged_by_the_early_returns() {
         let bad = invoke(reg, ctx, "maps", "merge", &[one_map, two]);
         assert_reason(bad, ctx, "badmap", two);
         let bad = invoke(reg, ctx, "maps", "merge", &[nine, two]);
+        assert_reason(bad, ctx, "badmap", nine);
+        // …including the *same* non-map word twice, which rule 1 must not mistake for
+        // a map merge (measured: `merge(notamap, notamap)` ⇒ `error:{badmap,notamap}`).
+        let bad = invoke(reg, ctx, "maps", "merge", &[nine, nine]);
         assert_reason(bad, ctx, "badmap", nine);
         // …and an empty-map argument does not skip the classification of the other.
         let bad = invoke(reg, ctx, "maps", "merge", &[nine, blank]);
@@ -517,7 +617,11 @@ fn with_does_not_hand_back_the_map() {
 // ---------------------------------------------------------------------------
 
 /// The compiled probe module. It is **compiled** on purpose: an `-eval` expression is
-/// run by `erl_eval`, whose literal handling is not a compiled module's.
+/// run by `erl_eval`, whose literal handling is not a compiled module's, and every map
+/// here is built at runtime with `maps:from_list/1` over a pair list in a *different*
+/// order from its twin — so no two expressions can be CSE'd into one term. The
+/// `guard_*` rows prove the pairs the `merge_*` rows compare really are distinct terms,
+/// which is what makes `erts_debug:same/2` able to tell `Map1` from `Map2` at all.
 const ORACLE_MODULE: &str = r#"
 -module(map_identity_oracle).
 -export([go/0]).
@@ -530,19 +634,59 @@ go() ->
     M = maps:put(A, Value, maps:new()),
     %% `#{a => 1, b => 2}` — putting `1` under `b` is a real change (2 -> 1).
     Two = maps:put(B, 2, maps:put(A, 1, maps:new())),
-    %% A distinct map with the very same content as M (no literal sharing).
+    %% Distinct maps with the very same content (no literal sharing).
     Echo = maps:from_list([{A, Value}]),
+    TwoR = maps:from_list([{B, 2}, {A, 1}]),
+    One  = maps:from_list([{A, 1}]),
+    High = maps:from_list([{A, 99}]),
+    Pair = maps:from_list([{A, 1}, {B, 2}]),
+    %% The HAMT tier (above MAP_SMALL_MAP_LIMIT = 32), built key-descending.
+    K  = fun(N) -> list_to_atom("k" ++ integer_to_list(N)) end,
+    Hn = fun(N, F) -> maps:from_list([{K(I), F(I)} || I <- lists:seq(N, 1, -1)]) end,
+    H20  = Hn(20, fun(I) -> I end),
+    H40  = Hn(40, fun(I) -> I end),
+    H41  = maps:from_list([{K(41), 41} | [{K(I), I} || I <- lists:seq(40, 1, -1)]]),
+    H40v = Hn(40, fun(I) -> I * 1000 end),
+    Flat3 = maps:from_list([{K(3), 3}, {K(2), 2}, {K(1), 1}]),
+    NotAMap = list_to_atom("notamap"),
     Rows = [
         {"put_same_value",         is(maps:put(A, Value, M), M)},
         {"put_new_key",            is(maps:put(B, 1, M), M)},
         {"put_into_two",           is(maps:put(B, 1, Two), Two)},
         {"put_new_value",          is(maps:put(A, 43, M), M)},
         {"update_same_value",      is(maps:update(A, Value, M), M)},
-        {"merge_empty_second",     is(maps:merge(M, maps:new()), M)},
-        {"merge_empty_first",      is(maps:merge(maps:new(), M), M)},
-        {"merge_adds_key",         is(maps:merge(M, maps:put(B, 1, maps:new())), M)},
-        {"merge_same_set_is_map1", is(maps:merge(M, Echo), M)},
-        {"merge_same_set_is_map2", is(maps:merge(M, Echo), Echo)},
+        {"guard_m_echo_distinct",       distinct(M, Echo)},
+        {"guard_pair_twor_distinct",    distinct(Pair, TwoR)},
+        {"guard_one_high_distinct",     distinct(One, High)},
+        {"guard_h20_h40_distinct",      distinct(H20, H40)},
+        {"guard_h40_h40v_distinct",     distinct(H40, H40v)},
+        {"guard_flat3_h40_distinct",    distinct(Flat3, H40)},
+        {"merge_self_is_map1",                   is(maps:merge(M, M), M)},
+        {"merge_self_hamt_is_map1",              is(maps:merge(H40, H40), H40)},
+        {"merge_empty_second",                   is(maps:merge(M, maps:new()), M)},
+        {"merge_empty_first",                    is(maps:merge(maps:new(), M), M)},
+        {"merge_shared_key_is_map2",             is(maps:merge(One, High), High)},
+        {"merge_shared_key_is_map1",             is(maps:merge(One, High), One)},
+        {"merge_same_set_is_map2",               is(maps:merge(M, Echo), Echo)},
+        {"merge_same_set_is_map1",               is(maps:merge(M, Echo), M)},
+        {"merge_two_same_set_is_map2",           is(maps:merge(Pair, TwoR), TwoR)},
+        {"merge_two_same_set_is_map1",           is(maps:merge(Pair, TwoR), Pair)},
+        {"merge_subset_is_map2",                 is(maps:merge(One, Pair), Pair)},
+        {"merge_subset_is_map1",                 is(maps:merge(One, Pair), One)},
+        {"merge_superset_is_map1",               is(maps:merge(Pair, One), Pair)},
+        {"merge_superset_is_map2",               is(maps:merge(Pair, One), One)},
+        {"merge_adds_key",                       is(maps:merge(M, maps:put(B, 1, maps:new())), M)},
+        {"merge_hamt_superset41_is_map2",        is(maps:merge(H40, H41), H41)},
+        {"merge_hamt_superset41_is_map1",        is(maps:merge(H40, H41), H40)},
+        {"merge_hamt_20of40_is_map2",            is(maps:merge(H20, H40), H40)},
+        {"merge_hamt_20of40_is_map1",            is(maps:merge(H20, H40), H20)},
+        {"merge_hamt_sameset_newvalues_is_map2", is(maps:merge(H40, H40v), H40v)},
+        {"merge_hamt_sameset_newvalues_is_map1", is(maps:merge(H40, H40v), H40)},
+        {"merge_mixed_flat_hamt_is_map2",        is(maps:merge(Flat3, H40), H40)},
+        {"merge_mixed_flat_hamt_is_map1",        is(maps:merge(Flat3, H40), Flat3)},
+        {"err_same_non_map",       err(fun() -> maps:merge(NotAMap, NotAMap) end, NotAMap)},
+        {"err_first_non_map",      err(fun() -> maps:merge(NotAMap, maps:new()) end, NotAMap)},
+        {"err_second_non_map",     err(fun() -> maps:merge(M, NotAMap) end, NotAMap)},
         {"remove_absent",          is(maps:remove(Z, M), M)},
         {"with_one_key",           is(maps:with([A], M), M)}
     ],
@@ -550,6 +694,13 @@ go() ->
     ok.
 
 is(X, Y) -> erts_debug:same(X, Y).
+distinct(X, Y) -> not is(X, Y).
+err(F, Expected) ->
+    try F() of
+        _ -> false
+    catch
+        error:R -> R =:= {badmap, Expected}
+    end.
 "#;
 
 /// Compiles [`ORACLE_MODULE`] with the system `erlc`, runs it with the system `erl`
@@ -601,12 +752,12 @@ fn compiled_module_oracle() -> Option<HashMap<String, bool>> {
 }
 
 /// Re-derives the whole matrix from the live system `erl` and compares it with this
-/// runtime's own answers, which the sections above pin. Skips LOUDLY when `erlc`/`erl`
-/// is unavailable (CI's `cargo test` job has no oracle).
+/// runtime's own answers, row for row. Skips LOUDLY when `erlc`/`erl` is unavailable
+/// (CI's `cargo test` job has no oracle).
 ///
-/// The two `merge_same_set_*` rows are the documented divergence: the oracle returns
-/// **`Map2`** for two distinct maps with an identical key set, this runtime returns
-/// `Map1`. Both sides are asserted, so neither reading can drift unnoticed.
+/// The `merge_*` rows are ERTS's key-set rule (`erl_map.c:1256-1372`), so **every** row
+/// must agree: the identical-key-set family answers `Map2`, the `Map2 ⊂ Map1` family a
+/// fresh map, and no row is a documented divergence.
 #[test]
 fn the_identity_matrix_agrees_with_the_live_oracle() {
     let Some(oracle) = compiled_module_oracle() else {
@@ -617,21 +768,48 @@ fn the_identity_matrix_agrees_with_the_live_oracle() {
         return;
     };
 
-    // The oracle's own answers (the matrix in the module docs).
+    // The oracle's own answers — the transcript this suite was built from (OTP 29.1.2 /
+    // erts-17.1.1). Asserted against the live run *and* against this runtime below.
     let expected: &[(&str, bool)] = &[
         ("put_same_value", true),
         ("put_new_key", false),
         ("put_into_two", false),
         ("put_new_value", false),
         ("update_same_value", true),
+        ("guard_m_echo_distinct", true),
+        ("guard_pair_twor_distinct", true),
+        ("guard_one_high_distinct", true),
+        ("guard_h20_h40_distinct", true),
+        ("guard_h40_h40v_distinct", true),
+        ("guard_flat3_h40_distinct", true),
+        ("merge_self_is_map1", true),
+        ("merge_self_hamt_is_map1", true),
         ("merge_empty_second", true),
         ("merge_empty_first", true),
+        ("merge_shared_key_is_map2", true),
+        ("merge_shared_key_is_map1", false),
+        ("merge_same_set_is_map2", true),
+        ("merge_same_set_is_map1", false),
+        ("merge_two_same_set_is_map2", true),
+        ("merge_two_same_set_is_map1", false),
+        ("merge_subset_is_map2", true),
+        ("merge_subset_is_map1", false),
+        ("merge_superset_is_map1", false),
+        ("merge_superset_is_map2", false),
         ("merge_adds_key", false),
+        ("merge_hamt_superset41_is_map2", true),
+        ("merge_hamt_superset41_is_map1", false),
+        ("merge_hamt_20of40_is_map2", true),
+        ("merge_hamt_20of40_is_map1", false),
+        ("merge_hamt_sameset_newvalues_is_map2", true),
+        ("merge_hamt_sameset_newvalues_is_map1", false),
+        ("merge_mixed_flat_hamt_is_map2", true),
+        ("merge_mixed_flat_hamt_is_map1", false),
+        ("err_same_non_map", true),
+        ("err_first_non_map", true),
+        ("err_second_non_map", true),
         ("remove_absent", true),
         ("with_one_key", false),
-        // The documented `n == n2` arm: the oracle prefers Map2.
-        ("merge_same_set_is_map1", false),
-        ("merge_same_set_is_map2", true),
     ];
     for (name, answer) in expected {
         assert_eq!(
@@ -641,93 +819,115 @@ fn the_identity_matrix_agrees_with_the_live_oracle() {
         );
     }
 
+    let keys = |from: i64, to: i64| -> Vec<(i64, i64)> {
+        (from..=to).map(|n| (n, n)).collect()
+    };
+
     // This runtime's answers, observed as word identity through the real registry —
     // the same rows, so the two columns are comparable.
     run(|reg, ctx| {
         let (a, b, zz) = (atom(ctx, "a"), atom(ctx, "b"), atom(ctx, "zz"));
+        let nine = int(9);
         let v = int(42);
         let m = map_of(reg, ctx, &[(a, v)]);
         let two = map_of(reg, ctx, &[(a, int(1)), (b, int(2))]);
         let echo = map_of(reg, ctx, &[(a, v)]);
+        let two_r = map_of(reg, ctx, &[(b, int(2)), (a, int(1))]);
+        let one = map_of(reg, ctx, &[(a, int(1))]);
+        let high = map_of(reg, ctx, &[(a, int(99))]);
+        let pair = map_of(reg, ctx, &[(a, int(1)), (b, int(2))]);
         let blank = empty(reg, ctx);
         let blank2 = empty(reg, ctx);
         let extra = map_of(reg, ctx, &[(b, int(1))]);
+        let h20 = map_of_ints(reg, ctx, &keys(1, 20));
+        let h40 = map_of_ints(reg, ctx, &keys(1, 40));
+        let h41 = map_of_ints(reg, ctx, &keys(1, 41));
+        let h40v: Vec<(i64, i64)> = (1..=40).map(|n| (n, n * 1000)).collect();
+        let h40v = map_of_ints(reg, ctx, &h40v);
+        let flat3 = map_of_ints(reg, ctx, &keys(1, 3));
+        let key_list = ctx.list(&[a]).expect("fits");
+        let blank_empty = empty(reg, ctx);
 
-        let rows: Vec<(&str, bool, bool)> = vec![
-            (
-                "put_same_value",
-                same_word(call(reg, ctx, "maps", "put", &[a, v, m]), m),
-                true,
-            ),
-            (
-                "put_new_key",
-                same_word(call(reg, ctx, "maps", "put", &[b, int(1), m]), m),
-                false,
-            ),
-            (
-                "put_into_two",
-                same_word(call(reg, ctx, "maps", "put", &[b, int(1), two]), two),
-                false,
-            ),
-            (
-                "put_new_value",
-                same_word(call(reg, ctx, "maps", "put", &[a, int(43), m]), m),
-                false,
-            ),
+        let merge = |ctx: &mut BifContext<'_>, x: Eterm, y: Eterm| -> Eterm {
+            call(reg, ctx, "maps", "merge", &[x, y])
+        };
+        let rows: Vec<(&str, bool)> = vec![
+            ("put_same_value", same_word(call(reg, ctx, "maps", "put", &[a, v, m]), m)),
+            ("put_new_key", same_word(call(reg, ctx, "maps", "put", &[b, int(1), m]), m)),
+            ("put_into_two", same_word(call(reg, ctx, "maps", "put", &[b, int(1), two]), two)),
+            ("put_new_value", same_word(call(reg, ctx, "maps", "put", &[a, int(43), m]), m)),
             (
                 "update_same_value",
                 same_word(call(reg, ctx, "maps", "update", &[a, v, m]), m),
-                true,
+            ),
+            ("guard_m_echo_distinct", !same_word(m, echo)),
+            ("guard_pair_twor_distinct", !same_word(pair, two_r)),
+            ("guard_one_high_distinct", !same_word(one, high)),
+            ("guard_h20_h40_distinct", !same_word(h20, h40)),
+            ("guard_h40_h40v_distinct", !same_word(h40, h40v)),
+            ("guard_flat3_h40_distinct", !same_word(flat3, h40)),
+            ("merge_self_is_map1", same_word(merge(ctx, m, m), m)),
+            ("merge_self_hamt_is_map1", same_word(merge(ctx, h40, h40), h40)),
+            ("merge_empty_second", same_word(merge(ctx, m, blank), m)),
+            ("merge_empty_first", same_word(merge(ctx, blank2, m), m)),
+            ("merge_shared_key_is_map2", same_word(merge(ctx, one, high), high)),
+            ("merge_shared_key_is_map1", same_word(merge(ctx, one, high), one)),
+            ("merge_same_set_is_map2", same_word(merge(ctx, m, echo), echo)),
+            ("merge_same_set_is_map1", same_word(merge(ctx, m, echo), m)),
+            ("merge_two_same_set_is_map2", same_word(merge(ctx, pair, two_r), two_r)),
+            ("merge_two_same_set_is_map1", same_word(merge(ctx, pair, two_r), pair)),
+            ("merge_subset_is_map2", same_word(merge(ctx, one, pair), pair)),
+            ("merge_subset_is_map1", same_word(merge(ctx, one, pair), one)),
+            ("merge_superset_is_map1", same_word(merge(ctx, pair, one), pair)),
+            ("merge_superset_is_map2", same_word(merge(ctx, pair, one), one)),
+            ("merge_adds_key", same_word(merge(ctx, m, extra), m)),
+            ("merge_hamt_superset41_is_map2", same_word(merge(ctx, h40, h41), h41)),
+            ("merge_hamt_superset41_is_map1", same_word(merge(ctx, h40, h41), h40)),
+            ("merge_hamt_20of40_is_map2", same_word(merge(ctx, h20, h40), h40)),
+            ("merge_hamt_20of40_is_map1", same_word(merge(ctx, h20, h40), h20)),
+            (
+                "merge_hamt_sameset_newvalues_is_map2",
+                same_word(merge(ctx, h40, h40v), h40v),
             ),
             (
-                "merge_empty_second",
-                same_word(call(reg, ctx, "maps", "merge", &[m, blank]), m),
-                true,
+                "merge_hamt_sameset_newvalues_is_map1",
+                same_word(merge(ctx, h40, h40v), h40),
+            ),
+            ("merge_mixed_flat_hamt_is_map2", same_word(merge(ctx, flat3, h40), h40)),
+            ("merge_mixed_flat_hamt_is_map1", same_word(merge(ctx, flat3, h40), flat3)),
+            // The `{badmap, Map}` arms: the classification runs in argument order and a
+            // word-identical non-map pair is not a merge (rules 1-2).
+            (
+                "err_same_non_map",
+                invoke(reg, ctx, "maps", "merge", &[nine, nine]).is_err(),
             ),
             (
-                "merge_empty_first",
-                same_word(call(reg, ctx, "maps", "merge", &[blank2, m]), m),
-                true,
+                "err_first_non_map",
+                invoke(reg, ctx, "maps", "merge", &[nine, blank_empty]).is_err(),
             ),
             (
-                "merge_adds_key",
-                same_word(call(reg, ctx, "maps", "merge", &[m, extra]), m),
-                false,
+                "err_second_non_map",
+                invoke(reg, ctx, "maps", "merge", &[m, nine]).is_err(),
             ),
+            ("remove_absent", same_word(call(reg, ctx, "maps", "remove", &[zz, m]), m)),
+            // `with/2` is the negative pin: no identity on either side.
             (
-                "merge_same_set_is_map1",
-                same_word(call(reg, ctx, "maps", "merge", &[m, echo]), m),
-                true,
-            ),
-            (
-                "merge_same_set_is_map2",
-                same_word(call(reg, ctx, "maps", "merge", &[m, echo]), echo),
-                false,
-            ),
-            (
-                "remove_absent",
-                same_word(call(reg, ctx, "maps", "remove", &[zz, m]), m),
-                true,
+                "with_one_key",
+                same_word(call(reg, ctx, "maps", "with", &[key_list, m]), m),
             ),
         ];
-        for (name, got, want) in rows {
+        for (name, got) in rows {
+            let want = expected
+                .iter()
+                .find(|(row, _)| *row == name)
+                .map(|(_, answer)| *answer)
+                .unwrap_or_else(|| panic!("`{name}` is not in the expected matrix"));
             assert_eq!(got, want, "this runtime's `{name}` row");
-            if name.starts_with("merge_same_set_") {
-                // The documented divergence: the oracle answers from Map2, we from
-                // Map1. `=:=` agrees either way.
-                continue;
-            }
             assert_eq!(
                 oracle.get(name).copied(),
                 Some(got),
                 "`{name}`: the oracle and this runtime must agree"
             );
         }
-
-        // `with/2` is the negative pin: no identity on either side.
-        let keys = ctx.list(&[a]).expect("fits");
-        let got = same_word(call(reg, ctx, "maps", "with", &[keys, m]), m);
-        assert!(!got, "maps:with/2 builds a fresh map");
-        assert_eq!(oracle.get("with_one_key").copied(), Some(false), "oracle with");
     });
 }

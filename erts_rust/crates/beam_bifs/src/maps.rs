@@ -610,21 +610,42 @@ fn is_key_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `maps:merge/2` — the union of two maps; `Map2`'s value wins on a shared key.
 ///
-/// Three no-op shapes hand an **argument** back instead of building a union: an empty
-/// `Map1` ⇒ `Map2` (the union *is* `Map2`; `flatmap_merge`'s `if (n1 == 0) return
-/// map2`), an empty `Map2` ⇒ `Map1` (`if (n2 == 0) return map1`), and a `Map2` that
-/// adds no entry — every pair of it is already in `Map1` with a **word-identical** value
-/// — ⇒ `Map1` (`erts_debug:same(maps:merge(M, #{a => V}), M)` ⇒ `true` for
-/// `M = #{a => V}`). Both **map-ness** checks still run first and in argument order, so
-/// the `{badmap, Map}` raise names the same argument as before.
+/// The identity arms are ERTS's (`erl_map.c:1256-1372`, `maps_merge_2` +
+/// `flatmap_merge`/`hashmap_merge`/`map_merge_mixed`), in this order:
+///
+/// 1. two **word-identical** arguments: a map merges onto itself and is returned
+///    as-is (`if (BIF_ARG_1 == BIF_ARG_2) { if (is_map(...)) return ...; }`,
+///    `:1257-1263`); a non-map argument is classified below and raises
+///    `{badmap, Map1}` as it always did;
+/// 2. `Map1` not a map ⇒ `{badmap, Map1}`; `Map2` not a map ⇒ `{badmap, Map2}`
+///    (argument order, both before any early return);
+/// 3. empty `Map1` ⇒ `Map2` (the union *is* `Map2`; `if (n1 == 0) return map2`);
+/// 4. empty `Map2` ⇒ `Map1` (`if (n2 == 0) return map1`);
+/// 5. **every key of `Map1` present in `Map2`** ⇒ `Map2` (`if (n == n2) return
+///    map2;`, `erl_map.c:1368-1372`) — a **key-set** test, never a value test:
+///    `Map2`'s value wins on a shared key, so the merged map's values are `Map2`'s
+///    whatever `Map1`'s were (`erts_debug:same(maps:merge(#{a => 1}, #{a => 99}),
+///    Map2)` ⇒ `true`), and the same holds for a flat/hash pair;
+/// 6. otherwise a **fresh** map — including `Map2 ⊂ Map1`, where the union is
+///    larger than `Map2` (`n > n2`), so neither argument is the answer.
+///
+/// Both tiers are covered by the same key-set rule: `flatmap_merge` reaches it as
+/// `n == n2` after counting the shared keys, the HAMT merge as "only unique B
+/// stuff" at the root. Key identity is the exact (`=:=`) one `map_lookup` uses.
 ///
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Map}` naming whichever argument is not a map
 /// (the live reason term of the raise).
 fn merge_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    // Both arguments are classified before any early return, `Map1` first — the
-    // `{badmap, Map}` raise names the same argument it always did.
+    // Rule 1: the same word twice. `Map1` is returned as-is, which also lets a
+    // self-merge of a HAMT skip the key-set walk; a non-map falls through to the
+    // classification below, whose `{badmap, Map1}` names the very same term.
+    if args[0] == args[1] && access::is_map(args[0]) {
+        return Ok(args[0]);
+    }
+    // Rules 2-4: both arguments are classified before any early return, `Map1`
+    // first — the `{badmap, Map}` raise names the same argument it always did.
     let mut pairs = map_pairs(ctx, args[0])?;
     let second = map_pairs(ctx, args[1])?;
     if pairs.is_empty() {
@@ -635,20 +656,24 @@ fn merge_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // `Map2` contributes nothing (`n2 == 0`).
         return Ok(args[0]);
     }
-    let mut adds_nothing = true;
-    for &(k2, v2) in &second {
-        match map_lookup(ctx, args[0], k2)? {
-            Some(v1) if v1 == v2 => {}
-            _ => {
-                adds_nothing = false;
+    // Rule 5: every key of `Map1` also in `Map2`, so the union has `Map2`'s size
+    // and `Map2` itself is the answer. The values are irrelevant by construction
+    // (`Map2` wins on a shared key), so this never looks at them. Two key sets can
+    // only be in that relation when `Map1` has no more keys than `Map2`.
+    if pairs.len() <= second.len() {
+        let mut every_key_present = true;
+        for &(key, _) in &pairs {
+            if map_lookup(ctx, args[1], key)?.is_none() {
+                every_key_present = false;
                 break;
             }
         }
+        if every_key_present {
+            return Ok(args[1]);
+        }
     }
-    if adds_nothing {
-        return Ok(args[0]);
-    }
-    // Appending `Map2`'s pairs makes its value win on a shared key (last wins).
+    // Rule 6: appending `Map2`'s pairs makes its value win on a shared key (last
+    // wins) and gives a fresh map `=:=` the oracle's union.
     pairs.extend(second);
     build(ctx, &pairs)
 }
