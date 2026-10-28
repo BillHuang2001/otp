@@ -108,6 +108,8 @@ No new atom names were needed for `dist`/`dist_ctrl`/`Binary` (a binary carries 
 
 ## Constraints
 - Read-only with respect to the rest of the crate: this node owns `src/info.rs`, `src/info/`, and `tests/system_info_oracle.rs` only.
+- **No byte figures live here.** `system_info(memory)` is the oracle's `badarg` (in the rejected-key list above); the nine-key `erlang:memory/0,1` accounting is the sibling `src/context/memory_hook.rs` (`MemoryHook` seam), and per-process memory is `process_info(P, memory)` (`src/native/memory/`).
+- The four counts in `info/limits.rs` (`atom_count`, `process_count`, `port_count`, `ets_count`) are live table lengths, never recorded constants: a fresh `Runtime::new` answers `process_count` = 4 (the runtime-owned `init` stand-in, root, `erl_prim_loader` and `file_server_2`, `src/runtime.rs`), a boot-script-driven action adds the boot's own tree, and no figure for the booted set is recorded here.
 - No `unsafe`: `InfoValue::Map` is written through `beam_codec::term::make_flatmap`, `InfoValue::Binary` through `beam_codec::term::make_binary`, and an out-of-small-range `InfoValue::Int` through `beam_codec::term::make_big`.
 - No invented values: a facility this runtime does not have ⇒ the `unsupported` gap.
 - Every key's value is derived from this runtime's own configuration/tables or from a genuine build/host constant. `Runtime` accessors used: `config()` (emulator features / schedulers / dirty schedulers / `max_processes` / `max_ports`), `heap.policy()`/`heap.max_heap_flags()`, `code_server.atoms()`, `processes()`, `loaded_modules()`, `ports`, `tables`, `dist_node()`. **No new `Runtime` getter was needed.**

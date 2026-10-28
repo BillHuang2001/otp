@@ -150,8 +150,8 @@ use crate::runtime::Runtime;
 use crate::RuntimeContext;
 
 /// Whether **any** machine root handed to a collection site, or any container in the process's
-/// own root set, **reaches** a container in an unscanned region (the building block is
-/// [`root_is_unscanned`]).
+/// own root set, **reaches** a container that forwards a scanned word out of an unscanned region
+/// (the building block is [`root_is_unscanned`]).
 ///
 /// This is the **valve** every collection site consults: it is the conservative reachability
 /// check of [`crate::context::gc_walk`]. The single-level test it replaces could only see a
@@ -1440,19 +1440,21 @@ pub(crate) fn ensure_heap(
         forced,
         x_regs.len() + stack.len(),
     );
-    // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root in a region the
-    // collector does not scan would be left pointing at young words this move relocates, so the
-    // move is **declined** — the heap keeps its terms, the unscanned root stays valid and the
-    // program stays correct. The test runs *after* the occupancy short-circuit (an ordinary
-    // admission point that is not about to collect pays nothing) and *before* the request is
-    // consumed, so a forced collection it refuses stays armed for the runner's park arm.
+    // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root that forwards a young
+    // word out of a region the collector does not scan would be left pointing at a word this move
+    // relocates, so the move is **declined** — the heap keeps its terms, the foreign container
+    // keeps its words and the program stays correct. The test runs *after* the occupancy
+    // short-circuit (an ordinary admission point that is not about to collect pays nothing) and
+    // *before* the request is consumed, so a forced collection it refuses stays armed for the
+    // runner's park arm.
     //
     // `descend` is the pid's **foreign-reachability gate**
     // ([`Runtime::foreign_reachable`](crate::runtime)): the per-word root phase always runs, so
-    // a root that is *itself* a foreign container is still declined here without any descent,
-    // and the descent — the `O(live objects)` half — is only paid for a process that has ever
-    // held one (see the valve's module docs). A **hit** opens the gate permanently: a foreign
-    // container really did reach a live root, which is the event the gate records.
+    // a root that is *itself* a foreign container forwarding a scanned word is still declined
+    // here without any descent, and the descent — the `O(live objects)` half — is only paid for a
+    // process that has ever held one (see the valve's module docs). A **hit** opens the gate
+    // permanently: a foreign container really did reach a live root, which is the event the gate
+    // records.
     let descend = runtime.foreign_reachable(pid);
     let declined = any_root_is_unscanned_at(
         super::gc_valve_trace::ValveDoor::EnsureHeap,
@@ -1752,12 +1754,12 @@ fn ensure_heap_full_commit(
         x_count + roots.stack.len() + fr_count,
         roots.stack.len(),
     );
-    // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root in
-    // a region the collector does not scan declines the move (see [`root_is_unscanned`]), so the
-    // heap keeps its terms and the unscanned root stays valid. Tested after the occupancy
-    // short-circuit and before the request is consumed, so a refused forced collection stays
-    // armed for the runner's park arm. The descent is gated on `pid`'s foreign-reachability bit
-    // and a hit opens it permanently, exactly as in [`ensure_heap`].
+    // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root
+    // that forwards a scanned word out of such a region declines the move (see
+    // [`root_is_unscanned`]), so the heap keeps its terms and the container's words stay valid.
+    // Tested after the occupancy short-circuit and before the request is consumed, so a refused
+    // forced collection stays armed for the runner's park arm. The descent is gated on `pid`'s
+    // foreign-reachability bit and a hit opens it permanently, exactly as in [`ensure_heap`].
     //
     // The iterator is the bounded one, which is the *same* decision the full file would give:
     // [`root_is_unscanned`] answers `false` for every word past the last pointer (they are
@@ -1801,10 +1803,11 @@ fn ensure_heap_full_commit(
     }
     // The **latch's closing half** (see [`root_is_unscanned`] and
     // [`Runtime::close_foreign_reachable`]): this door handed the valve the machine's whole root
-    // set, and the descent it ran reached no container from a region the collector does not scan
-    // — so the process's graph holds none, and the descent can be skipped again until an event
-    // puts one back. No other door may do this: [`ensure_heap`] cannot see the FR file, and the
-    // park arm and the signal gate run for a process whose roots are not published.
+    // set, and the descent it ran reached no container that could forward a scanned word into a
+    // region the collector does not scan (an inert foreign term does not count) — so the
+    // process's graph holds no hazard, and the descent can be skipped again until an event puts
+    // one back. No other door may do this: [`ensure_heap`] cannot see the FR file, and the park
+    // arm and the signal gate run for a process whose roots are not published.
     if verdict.foreign_free {
         runtime.close_foreign_reachable(pid);
     }
@@ -2256,9 +2259,10 @@ fn alloc_words_rooted_commit(
         return runtime.alloc_words(n);
     };
     // The unscanned-root valve (see [`root_is_unscanned`]): collecting over a root set that
-    // contains a container in a region the collector does not scan would relocate the young
-    // words it reaches without updating it, so this collection is declined and the block comes
-    // from the pointer-stable arena — the same honest fallback every other refusal path takes.
+    // contains a container forwarding a young word out of a region the collector does not scan
+    // would relocate that word without updating the container, so this collection is declined and
+    // the block comes from the pointer-stable arena — the same honest fallback every other refusal
+    // path takes.
     // The descent is gated on `pid`'s foreign-reachability bit and a hit opens it permanently,
     // exactly as in [`ensure_heap`]. A declined collection leaves a forced request **armed**,
     // exactly as at [`ensure_heap_full`], so the runner's park arm may still serve it.
@@ -2322,8 +2326,8 @@ fn alloc_words_rooted_commit(
         return runtime.alloc_words(n);
     }
     // The latch's closing half, exactly as at [`ensure_heap_full`]: this door also handed the
-    // valve the machine's whole root set, so a descent that reached no foreign container says the
-    // process's graph holds none and the bit can be retired.
+    // valve the machine's whole root set, so a descent that reached no hazardous foreign
+    // container says the process's graph holds none and the bit can be retired.
     if verdict.foreign_free {
         runtime.close_foreign_reachable(pid);
     }
@@ -3899,6 +3903,90 @@ mod tests {
         assert!(
             rt.foreign_reachable(pid),
             "the BIF-result seam only opens the latch; a clean result cannot close it"
+        );
+    }
+    /// **An inert foreign container does not keep the descent latch open across a full-root door.**
+    ///
+    /// That door-driven retirement is what bounds the `O(live)` root descent to the events that can
+    /// introduce a *hazard*: [`ensure_heap_full`] hands the valve the machine's **whole** root set,
+    /// so a descent that reached no container a relocation could leave dangling retires `pid`'s bit
+    /// ([`Runtime::close_foreign_reachable`]) and the next admission pays the per-word phase alone.
+    /// Before the verdict was refined to the hazard ([`forwards_scanned_word`]) rather than "any
+    /// foreign container at all", a process keeping one inert foreign term alive — a `make_ref/0`
+    /// block, an arena tuple of small integers, exactly what the boot-setup process `<0.10.0>`
+    /// holds — re-proved the same fact at **every** admission
+    /// (`descents_per_collection` 1.000), and that whole-graph descent was ≈8 % of the boot
+    /// profile's samples.
+    ///
+    /// Both halves are driven through the real door, never a re-derivation of its valve call:
+    ///
+    /// 1. **hazard** — the machine root holds a foreign cons over a nursery word: the valve
+    ///    declines (collecting would relocate that word without updating the block), the latch
+    ///    stays open, and the arena fallback is the honest answer;
+    /// 2. **inert** — same process, same door, the nursery term no longer reachable: the descent
+    ///    reaches only the all-immediate foreign tuple, so the verdict is `foreign_free`, the door
+    ///    retires the latch and the collection proceeds.
+    ///
+    /// The retirement is sound by the case list of
+    /// [`a_foreign_leaf_is_not_unscanned_but_a_container_forwarding_a_young_word_is`]: an inert
+    /// container forwards no scanned word, so no relocation can leave it stale.
+    #[test]
+    fn an_inert_foreign_container_does_not_keep_the_descent_latch_open() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+        let region = ForeignRegion::new(table.get_mut(pid).expect("the spawned process"));
+        let mut x = [NIL; 4];
+        let mut stack = [NIL; 2];
+        let mut fr = [NIL; 4];
+        let door = |rt: &mut Runtime,
+                    table: &mut ProcessTable,
+                    x: &mut [Eterm],
+                    stack: &mut [Eterm],
+                    fr: &mut [Eterm]| {
+            rt.request_gc(pid);
+            let mut ctx = RuntimeContext::for_process(rt, table, pid);
+            ctx.current_module = Some("gc_foreign_latch".to_string());
+            ensure_heap_full(
+                &mut ctx,
+                0,
+                RootSet::new(x, stack, fr, 1),
+                true,
+            )
+            .expect("the heap-admission point never fails the program");
+        };
+        assert!(!rt.foreign_reachable(pid), "a fresh pid's latch is closed");
+        // (1) A foreign container forwarding a nursery word: the door declines, so the latch it
+        //     opened stays open and no collection touches the nursery word the block holds.
+        x[0] = region.cons_over_young;
+        valve_counters::reset();
+        door(&mut rt, &mut table, &mut x, &mut stack, &mut fr);
+        let hazardous = valve_counters::snapshot().ensure_heap_full;
+        assert_eq!(
+            hazardous.collections, 0,
+            "a hazardous root must decline the collection; {hazardous:?}"
+        );
+        assert!(
+            rt.foreign_reachable(pid),
+            "the declined door must leave the descent latch open"
+        );
+        // (2) The same process and door with only the **inert** foreign tuple reachable: the
+        //     descent reached no hazardous container, so the door retires the latch and collects.
+        x[0] = region.tuple;
+        valve_counters::reset();
+        door(&mut rt, &mut table, &mut x, &mut stack, &mut fr);
+        let inert = valve_counters::snapshot().ensure_heap_full;
+        assert_eq!(
+            inert.collections, 1,
+            "an inert foreign root must not decline the collection; {inert:?}"
+        );
+        assert!(
+            !rt.foreign_reachable(pid),
+            "a full-root descent that reached only an inert foreign container must retire the \
+             latch — otherwise the process re-proves the same fact at every admission for the \
+             rest of its life"
         );
     }
 }

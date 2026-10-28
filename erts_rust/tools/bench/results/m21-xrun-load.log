@@ -1,0 +1,37 @@
+# m21 — /proc/loadavg at every pass boundary (1/5/15-min; the 1-min figure is the one quoted)
+# GC/allocator 'before' record: four workloads (baseline, gc_bound, gc_class, list_walk),
+# `--quick`, one process at a time, every matched pass pinned with `taskset -c 3`.
+# The load figures are verbatim from the session's raw log; that log's run labels were stored
+# without their separator and are restored here (r<N>/<side>), and its `running/total` process-count
+# field plus the free-form driver output are not reproduced (the driver's notes are inside each JSON).
+# wall_s is the pass's own wall time, derived from its before/after timestamps.
+2026-10-27T12:58:36Z PASS=m21-xrun-gc-rust-r1 side=rust round=1 event=before loadavg=19.57 13.84 8.16
+2026-10-27T12:58:54Z PASS=m21-xrun-gc-rust-r1 side=rust round=1 event=after loadavg=16.30 13.49 8.16 rc=0 wall_s=18
+2026-10-27T12:58:54Z PASS=m21-xrun-gc-sys-r1 side=sys round=1 event=before loadavg=16.30 13.49 8.16
+2026-10-27T12:59:08Z PASS=m21-xrun-gc-sys-r1 side=sys round=1 event=after loadavg=13.86 13.09 8.12 rc=0 wall_s=14
+2026-10-27T12:59:08Z PASS=m21-xrun-gc-sys-r2 side=sys round=2 event=before loadavg=13.86 13.09 8.12
+2026-10-27T12:59:23Z PASS=m21-xrun-gc-sys-r2 side=sys round=2 event=after loadavg=13.00 12.94 8.15 rc=0 wall_s=15
+2026-10-27T12:59:23Z PASS=m21-xrun-gc-rust-r2 side=rust round=2 event=before loadavg=13.00 12.94 8.15
+2026-10-27T12:59:39Z PASS=m21-xrun-gc-rust-r2 side=rust round=2 event=after loadavg=10.91 12.48 8.08 rc=0 wall_s=16
+2026-10-27T12:59:39Z PASS=m21-xrun-gc-rust-r3 side=rust round=3 event=before loadavg=10.91 12.48 8.08
+2026-10-27T12:59:55Z PASS=m21-xrun-gc-rust-r3 side=rust round=3 event=after loadavg=9.09 12.00 7.99 rc=0 wall_s=16
+2026-10-27T12:59:55Z PASS=m21-xrun-gc-sys-r3 side=sys round=3 event=before loadavg=9.09 12.00 7.99
+2026-10-27T13:00:09Z PASS=m21-xrun-gc-sys-r3 side=sys round=3 event=after loadavg=8.27 11.68 7.95 rc=0 wall_s=14
+2026-10-27T13:00:09Z PASS=m21-xrun-gc-sys-r4 side=sys round=4 event=before loadavg=8.27 11.68 7.95
+2026-10-27T13:00:23Z PASS=m21-xrun-gc-sys-r4 side=sys round=4 event=after loadavg=7.76 11.38 7.91 rc=0 wall_s=14
+2026-10-27T13:00:23Z PASS=m21-xrun-gc-rust-r4 side=rust round=4 event=before loadavg=7.76 11.38 7.91
+2026-10-27T13:00:39Z PASS=m21-xrun-gc-rust-r4 side=rust round=4 event=after loadavg=6.76 10.99 7.83 rc=0 wall_s=16
+2026-10-27T13:00:39Z PASS=m21-xrun-gc-rust-r5 side=rust round=5 event=before loadavg=6.76 10.99 7.83
+2026-10-27T13:00:56Z PASS=m21-xrun-gc-rust-r5 side=rust round=5 event=after loadavg=7.19 10.86 7.84 rc=0 wall_s=17
+2026-10-27T13:00:56Z PASS=m21-xrun-gc-sys-r5 side=sys round=5 event=before loadavg=7.19 10.86 7.84
+2026-10-27T13:01:11Z PASS=m21-xrun-gc-sys-r5 side=sys round=5 event=after loadavg=7.34 10.72 7.85 rc=0 wall_s=15
+2026-10-27T13:02:22Z PASS=m21-xrun-gc-sys-r6 side=sys round=6 event=before loadavg=5.65 9.56 7.67
+2026-10-27T13:02:37Z PASS=m21-xrun-gc-sys-r6 side=sys round=6 event=after loadavg=7.00 9.68 7.74 rc=0 wall_s=15
+2026-10-27T13:02:37Z PASS=m21-xrun-gc-rust-r6 side=rust round=6 event=before loadavg=7.00 9.68 7.74
+2026-10-27T13:02:57Z PASS=m21-xrun-gc-rust-r6 side=rust round=6 event=after loadavg=6.35 9.40 7.68 rc=0 wall_s=20
+2026-10-27T13:02:57Z PASS=m21-xrun-gc-rust-r7 side=rust round=7 event=before loadavg=6.35 9.40 7.68
+2026-10-27T13:03:31Z PASS=m21-xrun-gc-rust-r7 side=rust round=7 event=after loadavg=12.44 10.49 8.10 rc=0 wall_s=34
+2026-10-27T13:03:31Z PASS=m21-xrun-gc-sys-r7 side=sys round=7 event=before loadavg=12.44 10.49 8.10
+2026-10-27T13:03:47Z PASS=m21-xrun-gc-sys-r7 side=sys round=7 event=after loadavg=13.90 10.90 8.29 rc=0 wall_s=16
+2026-10-27T13:04:09Z PASS=m21-budgetprobe-all event=before loadavg=13.84 11.06 8.39
+2026-10-27T13:04:41Z PASS=m21-budgetprobe-all event=after loadavg=9.58 10.30 8.22 rc=0 wall_s=32

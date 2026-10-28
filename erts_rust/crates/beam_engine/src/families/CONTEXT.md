@@ -264,7 +264,7 @@ between sessions and up to 5× on a loaded one).
 ## Rooting / lifetime audit of the families (verified against the code)
 Every in-crate construction arm routes through a `*_rooted` twin and obeys reserve -> read -> write; the
 findings below are the residuals that survived that pass. Mechanism that makes a stale word possible at all:
-`beam_rt`'s `call_registered` **rewinds** the pooled 16 MiB `bif_heaps` region to its call `mark`
+`beam_rt`'s `call_registered` **rewinds** the pooled outermost `bif_heaps` region (default 128 MiB of lazily-faulted capacity — `DEFAULT_HEAP_WORDS = 1<<24` words, `beam_rt/src/config.rs:68`; pool at `beam_rt/src/runtime.rs:363,1564`) to its call `mark`
 (`beam_rt/src/context/calls.rs`), and `Runtime::grow_eval_heap` **retires** an exhausted region; a term built
 in either and read afterwards is the "dangling boxed argument" class of `../../../../beam_rt/M1_GAPS_GC.md`
 (fixed once for a raise reason by commit `2f1bdc1909`'s copy-at-the-escape-boundary).

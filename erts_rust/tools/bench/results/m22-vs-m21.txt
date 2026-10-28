@@ -1,0 +1,140 @@
+m22 vs m21 — per-row diff of the rust/sys ratio (both records named)
+m22 = results/m22-xrun-r{1..6}-{rust,sys}.json  (this session, six matched rounds, 2026-10-27 18:31-18:36 UTC)
+m21 = results/m21-xrun-gc-r{1..7}-{rust,sys}.json (the workstream's before record, seven matched rounds,
+      2026-10-27 12:58-13:05 UTC; see m21-load-record.md / m21-xrun-ratios.txt)
+Both records use the SAME oracle: `sys` = the system `erl` on PATH, Erlang/OTP 29.1.2 / erts-17.1.1,
+from the same store path (/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1),
+and the same `rust` = erts_rust/target/release/beam_rt at its default baseline-JIT tier (version=30).
+So the two records ARE diffable row for row — except the slice rows, which m21 never measured.
+Note for anyone quoting older tables: m20/m19 and earlier named OTP 29.1.1 / erts-17.1; m21 already
+named 29.1.2 / erts-17.1.1 (verified in its own JSON `runtimes[].program`), so the oracle moved BEFORE
+m21, not between m21 and m22.
+
+PER-ROW RULE (stated once, applied to every row):
+  ratio      = median of the per-round rust/sys ratios of that record (never a ratio of two medians)
+  band       = the record's own robust round-to-round spread: median +/- 1.4826*MAD of its per-round ratios
+               (the same 1.4826*MAD scale estimator the driver uses to decide whether a marginal clears
+               the timer noise; on 6-7 rounds it is a spread estimate, NOT a confidence interval)
+  noise band used for the verdict = max(scale(m22), scale(m21)) in ratio units
+  OUTSIDE  <=> |ratio(m22) - ratio(m21)| > that band   => the change is larger than the round-to-round
+               spread of BOTH records; a real change, not host drift
+  inside   <=> the difference fits inside that band    => NOT resolved by these records (this is not
+               evidence of "no change"; it means the pair of records cannot separate change from drift)
+  The raw per-round min-max range of each record is printed as well, so a reader can overrule the
+  summary with their own eye. A single spiked round inflates a record's MAD, and is named per row.
+
+row                                             m21 rust(med)  m21 sys(med) m21 ratio            band |   m22 rust(med)  m22 sys(med) m22 ratio            band |   d ratio      d%  rust d%  sys d%  verdict
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+baseline/startup_ms[p50]                               163.81        108.31     1.540          ±0.311 |          130.88        107.68     1.210          ±0.053 |    -0.330   -21.4    -20.1    -0.6  OUTSIDE
+baseline/startup_ms[p99]                               164.73        118.69     1.522          ±0.693 |          136.38        110.77     1.178          ±0.045 |    -0.344   -22.6    -17.2    -6.7  inside
+baseline/compute_loop_ms[p50]                          183.70        165.86     1.110          ±0.072 |          150.02        167.42     0.875          ±0.048 |    -0.235   -21.2    -18.3    +0.9  OUTSIDE
+baseline/compute_ops_per_sec                        5,345,676     6,022,809     0.888          ±0.120 |       6,657,011     5,989,102     1.140          ±0.053 |    +0.252   +28.4    +24.5    -0.6  OUTSIDE
+baseline/vm_memory_total_bytes                      9,320,543    36,199,472     0.257          ±0.000 |       7,253,583    36,193,568     0.200          ±0.000 |    -0.057   -22.2    -22.2    -0.0  OUTSIDE
+list_walk/case_list_walk_ns_per_element                 16.01          2.27     6.846          ±0.328 |           15.20          2.26     6.753          ±0.038 |    -0.093    -1.4     -5.0    -0.5  inside
+gc_bound/case_churn_ns_per_op                       25,685.39      4,211.66     6.080          ±0.127 |       23,879.90      4,235.61     5.600          ±0.108 |    -0.481    -7.9     -7.0    +0.6  OUTSIDE
+gc_class/case_send_recv_ns_per_op                   19,859.64      3,344.34     5.842          ±0.143 |       18,659.16      3,299.96     5.442          ±0.279 |    -0.400    -6.8     -6.0    -1.3  OUTSIDE
+gc_class/case_ets_copy_ns_per_op                    12,436.12      1,833.34     6.519          ±0.173 |       10,980.98      1,805.36     6.104          ±0.408 |    -0.415    -6.4    -11.7    -1.5  OUTSIDE
+gc_class/case_compile_ns_per_op                252,273,029.50 16,992,662.88    14.871          ±0.919 |  239,840,909.50 16,643,446.00    14.453          ±0.260 |    -0.418    -2.8     -4.9    -2.1  inside
+slice/case_add_wall_ms[p50]                                                                           |          126.04        121.77     1.037          ±0.025 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_fib_wall_ms[p50]                                                                           |          126.71        120.91     1.046          ±0.042 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_pick_wall_ms[p50]                                                                          |          126.70        122.25     1.032          ±0.033 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_calendar_last_day_wall_ms[p50]                                                             |          126.79        122.35     1.030          ±0.036 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_queue_from_size_wall_ms[p50]                                                               |          126.79        125.96     0.995          ±0.100 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_gb_trees_size_wall_ms[p50]                                                                 |          126.59        127.70     0.993          ±0.079 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_base64_encode_size_wall_ms[p50]                                                            |          127.08        128.82     0.984          ±0.093 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_ordsets_from_size_wall_ms[p50]                                                             |          126.19        124.62     1.013          ±0.043 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_string_str_length_wall_ms[p50]                                                             |          126.24        123.46     1.024          ±0.052 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+baseline/peak_memory_bytes                        128,106,496   135,168,000     0.947          ±0.001 |     100,311,040   135,231,488     0.742          ±0.001 |    -0.206   -21.7    -21.7    +0.0  OUTSIDE
+gc_bound/case_churn_peak_rss_bytes                 96,722,944    67,661,824     1.429          ±0.002 |      68,440,064    67,647,488     1.012          ±0.002 |    -0.418   -29.2    -29.2    -0.0  OUTSIDE
+list_walk/case_list_walk_peak_rss_bytes            96,694,272    67,600,384     1.430          ±0.002 |      68,153,344    67,381,248     1.012          ±0.003 |    -0.419   -29.3    -29.5    -0.3  OUTSIDE
+gc_class/case_send_recv_peak_rss_bytes            193,597,440    67,624,960     2.862          ±0.002 |      68,657,152    67,698,688     1.014          ±0.002 |    -1.848   -64.6    -64.5    +0.1  OUTSIDE
+gc_class/case_ets_copy_peak_rss_bytes              97,177,600    67,620,864     1.437          ±0.002 |      68,431,872    67,633,152     1.011          ±0.002 |    -0.426   -29.6    -29.6    +0.0  OUTSIDE
+gc_class/case_compile_peak_rss_bytes              207,814,656    78,745,600     2.638          ±0.069 |     149,678,080    81,092,608     1.846          ±0.007 |    -0.793   -30.0    -28.0    +3.0  OUTSIDE
+slice/case_add_peak_rss_bytes                                                                         |      68,065,280    67,512,320     1.008          ±0.003 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+slice/case_string_str_length_peak_rss_bytes                                                           |      68,243,456    67,602,432     1.009          ±0.002 |       n/a     n/a      n/a     n/a  m21: NOT MEASURED (no slice row)
+
+SUMMARY (rule above; a row is OUTSIDE only if it clears the LARGER of the two records' robust scales)
+  diffable rows: 16  OUTSIDE: 13  inside: 3  (m21 never measured: the 9 slice wall rows + 2 slice RSS rows)
+  OUTSIDE the band:
+    baseline/startup_ms[p50]                     ratio   1.540 ->   1.210  (-21.4%)
+    baseline/compute_loop_ms[p50]                ratio   1.110 ->   0.875  (-21.2%)
+    baseline/compute_ops_per_sec                 ratio   0.888 ->   1.140  (+28.4%)
+    baseline/vm_memory_total_bytes               ratio   0.257 ->   0.200  (-22.2%)
+    gc_bound/case_churn_ns_per_op                ratio   6.080 ->   5.600  (-7.9%)
+    gc_class/case_send_recv_ns_per_op            ratio   5.842 ->   5.442  (-6.8%)
+    gc_class/case_ets_copy_ns_per_op             ratio   6.519 ->   6.104  (-6.4%)
+    baseline/peak_memory_bytes                   ratio   0.947 ->   0.742  (-21.7%)
+    gc_bound/case_churn_peak_rss_bytes           ratio   1.429 ->   1.012  (-29.2%)
+    list_walk/case_list_walk_peak_rss_bytes      ratio   1.430 ->   1.012  (-29.3%)
+    gc_class/case_send_recv_peak_rss_bytes       ratio   2.862 ->   1.014  (-64.6%)
+    gc_class/case_ets_copy_peak_rss_bytes        ratio   1.437 ->   1.011  (-29.6%)
+    gc_class/case_compile_peak_rss_bytes         ratio   2.638 ->   1.846  (-30.0%)
+  inside the band (NOT resolved by these two records — not evidence of no change):
+    baseline/startup_ms[p99]                     ratio   1.522 ->   1.178  (-22.6%)
+    list_walk/case_list_walk_ns_per_element      ratio   6.846 ->   6.753  (-1.4%)
+    gc_class/case_compile_ns_per_op              ratio  14.871 ->  14.453  (-2.8%)
+
+WHICH SIDE MOVED (the rust side is the one the four code changes touch):
+  Every OUTSIDE row above moves because the RUST median moved; the sys median is flat within a few
+  percent on all of them (see the two right-hand d% columns). That is the shape a real code change
+  makes on this host, and it is stated per row rather than assumed.
+
+PER-ROW RAW RANGE (min..max of the per-round ratios — the eye-check on the summary above)
+  baseline/startup_ms[p50]                     m21   1.237..  3.142   m22   1.163..  1.285   OUTSIDE
+  baseline/startup_ms[p99]                     m21   0.785..  3.891   m22   1.023..  1.291   inside
+  baseline/compute_loop_ms[p50]                m21   0.961..  2.342   m22   0.814..  0.938   OUTSIDE
+  baseline/compute_ops_per_sec                 m21   0.431..  1.019   m22   1.062..  1.221   OUTSIDE
+  baseline/vm_memory_total_bytes               m21   0.257..  0.258   m22   0.200..  0.201   OUTSIDE
+  list_walk/case_list_walk_ns_per_element      m21   6.524.. 14.271   m22   6.617..  9.306   inside
+  gc_bound/case_churn_ns_per_op                m21   5.962..  6.787   m22   5.150..  5.711   OUTSIDE
+  gc_class/case_send_recv_ns_per_op            m21   5.512..  7.902   m22   4.839..  6.113   OUTSIDE
+  gc_class/case_ets_copy_ns_per_op             m21   6.403..  7.761   m22   5.064..  6.643   OUTSIDE
+  gc_class/case_compile_ns_per_op              m21  13.036.. 19.462   m22  12.542.. 14.728   inside
+  baseline/peak_memory_bytes                   m21   0.947..  0.948   m22   0.741..  0.743   OUTSIDE
+  gc_bound/case_churn_peak_rss_bytes           m21   1.426..  1.431   m22   1.009..  1.014   OUTSIDE
+  list_walk/case_list_walk_peak_rss_bytes      m21   1.426..  1.435   m22   1.005..  1.015   OUTSIDE
+  gc_class/case_send_recv_peak_rss_bytes       m21   2.853..  2.865   m22   1.010..  1.016   OUTSIDE
+  gc_class/case_ets_copy_peak_rss_bytes        m21   1.432..  1.442   m22   1.007..  1.014   OUTSIDE
+  gc_class/case_compile_peak_rss_bytes         m21   2.588..  2.686   m22   1.838..  1.911   OUTSIDE
+
+THE THREE "inside" ROWS, spelled out (none of them is a claim that nothing changed)
+  * baseline/startup_ms[p99] — medians 1.522 -> 1.178 (-22.6%), i.e. the same direction and roughly the
+    same size as the p50 row that clears the band. It is called "inside" only because m21's p99 ratios
+    span 0.785..3.891 on seven rounds (r1 3.891, r7 3.049 - the two documented spike rounds), giving a
+    MAD half-width of 0.693; the shift (-0.344) is just under it. m22's own p99 half-width is 0.045, so
+    the LIMIT here is m21's spike, not the measurement. Per side: rust p99 -17.2%, sys p99 -6.7%.
+  * list_walk/case_list_walk_ns_per_element — medians 6.846 -> 6.753 (-1.4%). m21's scale (0.328) is
+    inflated by its r6 round (14.271 against 6.5-7.4 elsewhere); m22's own scale is 0.038 and the shift
+    (-0.093) would clear it. Under the max() rule the row is "inside", so no improvement is claimed:
+    what the pair of records supports is "unchanged within a couple of percent".
+  * gc_class/case_compile_ns_per_op — medians 14.871 -> 14.453 (-2.8%); m21 scale 0.919 (its r5 round
+    read 19.462), m22 scale 0.260. Same reading: a small improvement at most, not resolvable here.
+
+TWO FOOTNOTES ON THE ARITHMETIC
+  * gc_bound: m21 withheld its r7/rust churn marginal, so that row is paired over the 6 rounds that
+    produced a ratio; m21-xrun-ratios.txt quotes the sys *value* median over all 7 rounds (4 220.30),
+    while this table pairs it with the ratio set (4 211.66). The ratios themselves are identical.
+  * vm_memory_total_bytes is the VM's own `erlang:memory(total)` accounting, not a footprint; its row is
+    here only because it moves with the runtime's accounted capacity. The footprint rows are the
+    peak_memory_bytes / case_*_peak_rss_bytes rows below and are discussed in m22-memory.md.
+
+WHAT THIS PAIR OF RECORDS SUPPORTS — AND WHAT IT DOES NOT
+  * It supports, row by row: start-up (both p50 and the p99 direction), the boot-dominated peak-RSS rows,
+    the four GC-workstream per-unit rows, and (new) a whole-process `slice` at parity in both wall time
+    and footprint. Those are measured against one oracle, on one host, with the side order alternating.
+  * It does NOT attribute any row to a specific one of the four changes: there is no binary A/B in this
+    session (no second `beam_rt` build was measured), and the engineering rule is that a ratio is never
+    chained with an A/B. What the shape does say is that every movement is on the RUST side while the
+    oracle is flat, and that the two memory/boot figures match the workstream's own boot claims
+    (boot `VmHWM` 91.45 -> 66.68 MiB claimed; 66.03 MiB measured independently here).
+  * The one row that moved for a reason no change in this set targets is baseline/compute_loop
+    (rust 183.70 -> 150.02 ms, -18.3%, sys +0.9%). That loop builds a 1 000 000-element cons list, so it
+    is heap-growth/GC-sensitive — consistent with the `beam_gc` carried-growth change — but it is reported
+    as a movement, not as an attribution.
+  * A row called "inside" is not evidence of no change; it is evidence that this pair of 6- and 7-round
+    records cannot separate change from host drift at that magnitude.
+
+Legend: rust(med)/sys(med) are the medians of the per-round per-side values in that record's unit;
+"band" is the robust scale above (a half-width, not a range); d = ratio(m22) - ratio(m21).
+The per-round ratio lists behind every row are in m22-xrun-ratios.txt (m22) and m21-xrun-ratios.txt (m21).
+

@@ -247,8 +247,9 @@ pub(crate) struct DoorCounts {
     pub(crate) declined_phase1: u64,
     /// Declines only the descent found — the nested shape the walk exists for.
     pub(crate) declined_descent: u64,
-    /// Answers of `foreign_free`: the descent ran and reached no container from a region the
-    /// collector does not scan. These are the answers that may **close** `pid`'s descent latch.
+    /// Answers of `foreign_free`: the descent ran and reached no container that *forwards* a
+    /// scanned word (an inert foreign term — one whose children are immediates — does not count).
+    /// These are the answers that may **close** `pid`'s descent latch.
     pub(crate) foreign_free: u64,
     /// The visited-set size summed over this door's walks.
     pub(crate) visited_sum: u64,

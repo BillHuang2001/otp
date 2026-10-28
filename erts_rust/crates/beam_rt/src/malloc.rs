@@ -55,19 +55,18 @@
 //! (≈157 M instructions, ≈25 ms) of *every* invocation, and ERTS never frees the world at
 //! `halt` either. So this call now finds a largely **live** arena and returns little:
 //!
-//! | phase | peak RSS | exit RSS (after the trim) |
-//! |---|---|---|
-//! | bare boot (`-eval 'halt().'`) | 118.7–119.1 MB | 113.1–114.6 MB |
-//! | in-process compile of `orddict.erl` | 310 044 kB | 303 376 kB |
+//! | phase | peak RSS |
+//! |---|---|
+//! | bare boot (`-eval 'halt().'`) | 59.45 MiB |
 //!
-//! Before the trade the same probes read 17.6–21.2 MB and 26 416 kB at exit, against an
-//! unchanged peak — the trim existed to give back a *dead* high-water, and there is no longer a
-//! dead high-water to give back. **Peak `VmHWM` is unchanged by the trade** (it is the run's
-//! high-water mark, reached while everything was live), which is the figure a workload pays;
-//! only the process's last-instant RSS changes. The one earlier, "obvious" placement was also
-//! measured and rejected: at the boot→action boundary the arena is 97 681 kB **in use** of
-//! 97 948 kB — 266 kB free, so there is nothing to release. `src/cli.rs` records the same
-//! finding next to that point.//!
+//! The trim existed to give back a *dead* high-water; with the boot's retained state kept
+//! alive there is none to give back, so the call's exit RSS stays within a few MB of the peak.
+//! **Peak `VmHWM` is what a workload pays** and is reached while everything is live, so no
+//! placement of this call can lower it. The one earlier, "obvious" placement was also measured
+//! and rejected: at the boot→action boundary the arena is almost entirely **in use** (the
+//! retained module graph and atom store are live), so there is nothing to release.
+//! `src/cli.rs` records the same finding next to that point, and per-workload peaks are
+//! `../tools/bench/RESULTS.md`'s; the boot decomposition is `CONTEXT.md`'s *Startup footprint*.//!
 //! It is **not** on the scheduler pass, the runner's park arm, a BIF, a receive or any other
 //! per-call/per-slice path: nothing in the runtime's execution semantics may pay for it.
 //!

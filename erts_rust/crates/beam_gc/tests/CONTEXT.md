@@ -77,6 +77,46 @@ Two conventions are load-bearing:
   (`header`/`tuple_elements`/`list_cells`/`copied_run`), and `build_grid` with the **pinned live geometry**
   (`LIVE_WORDS = 21`, `OBJECTS = 7`, `DEAD_WORDS = 6`) plus the dead-object sentinels. The pinned counts
   are what make a `move_size`/layout change surface as a count instead of a silent shift.
+- `nursery_trim.rs` → **the explicit capacity give-back seam** (`AnyCollector::trim_retired`, and the
+  `Collector`/`GenImmixCollector` forms behind it): a trim runs a collection — what makes the retired
+  chain's words provably dead — and then installs the live set's target **unconditionally**, bypassing
+  the keep band. Asserted: one trim on a grown chain (`young_space_count() > 1`, `collection_debt()`)
+  leaves `young_space_count() == 1` and no debt, at exactly `young_minor_target_words` of the round's
+  `words_copied` after a minor / `young_target_words` after a fullsweep, never a banded third value; a
+  capacity the band would have kept as it stands is handed back; the rooted terms survive and a
+  following collection copies exactly what an untrimmed twin copies (`words_copied`/`objects_copied`);
+  a second trim with nothing young installs the policy floor, so the seam converges instead of
+  ratcheting. Each trim's collection is a **minor** here (the mature generation has room), so the
+  give-back is a nursery-side install, and both mature strategies agree (the chain is shared).
+- `growth_need_carried.rs` → **the carried growth request**: a no-relocation growth (`grow_nursery`)
+  that really retires a space records the room it could not wait for, and the collection that follows
+  spends it **once**. Asserted: a **minor** collapse installs
+  `young_after_collection_with_need(chain, live, need)` bounded by the minor keep band's own upper edge
+  (`max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × young_minor_target_words(live))`) and covering
+  the request; the next collection, with no growth before it, installs the plain rule's answer
+  (`young_after_collection`), so the capacity is never a function of the call count; a copy-out loop's
+  growths, debt admissions and collections per round are **O(1) in the round count** (the grow →
+  collect → shrink → grow cycle is broken); a **fullsweep** over the identical geometry installs
+  exactly `young_target_words(live)` — the request is *consumed*, never folded in; the heap-admission
+  door's own growth (`ensure_capacity`) carries nothing; a request that scales with the capacity stays
+  inside the keep band instead of becoming a ladder; a fullsweep sizes the fresh mature space against
+  the nursery it actually installs (`mature_after_fullsweep(…, used.min(installed))`, pinned ≠ the
+  unclamped figure); and `trim_retired` installs the **plain** target, discarding the request. Both
+  mature strategies.
+- `gc_class_shape.rs` → **the compile-shaped collection census** (the C4 workload class, modelled
+  against the collector so it is contention-immune): a retained set that grows in steps, a ring of
+  per-op transients that outlive a collection (so the promotion and the mature garbage are the real
+  shape), and a periodic one-off copy-out far above the settled nursery. The ordinary allocations take
+  the runtime's own admission door (`should_collect(need) || collection_debt()` → `ensure_capacity`
+  over a live `&mut [Eterm]` root slice), while the copy-out takes the **no-relocation** seam
+  (`grow_nursery`: its caller holds no published root set) and the **next** door admission collects on
+  the `collection_debt()` it recorded. One `#[test]` prints a deterministic per-`(N, strategy)` row —
+  collections split minor/major, words copied and reclaimed (totals and per-op), objects copied, final
+  and peak `heap_size` / `total_heap_size` / `young_space_count` / mature capacity, and how many
+  copy-outs exceeded the room they found — over both strategies and two run lengths, and asserts only
+  structural invariants (every collection counted once as minor or major, a non-empty census, the
+  retained root in a region the collector scans): never a sizing figure, so a later change re-runs this
+  same file and diffs the counters.
 - The other files in this directory (copy/generation/chain/bounds/Immix/off-heap/accounting gates) are
   catalogued — with the contract each pins — in `../CONTEXT.md`'s "Test Strategy" and routing table.
 
@@ -116,20 +156,23 @@ What a `beam_rt` driver must know about the relocation seam (each pinned by a ca
   `offheap_steady_state.rs`, `retained_vs_live.rs` (the one that also samples RSS, `read_rss_bytes`),
   `post_fullsweep_nursery.rs`, `production_dispatch.rs` and `mature_strategy_sweep.rs` (the
   collector-level C1/C2/C3-shaped sweep, with per-class paired medians and a noise floor).
-  `immix_parity.rs`, `gen_immix_collector.rs` and `immix_stress.rs` also drive both strategies but
-  compare *observable results*, not cost.
+  `immix_parity.rs`, `gen_immix_collector.rs`, `immix_stress.rs`, `nursery_trim.rs` and
+  `growth_need_carried.rs` also drive both strategies but compare *observable results*, not cost;
+  `gc_class_shape.rs` drives both only to print the same census for each.
 - **No messaging/copy-bound and no real `compile:file/2` workload is measured under both strategies
   here** — that remains true: this crate's dev-deps are `beam_codec` only, so a `beam_message`/`beam_rt`
   shape cannot be driven from this suite. `mature_strategy_sweep.rs` is the **in-crate counterpart**
-  (the collector-level C1/C2 sweep plus a C3-*shaped* copy-out with no ETS); the real C3
-  (messaging/copy-bound) and C4 (a real in-process compile) measurements live in
-  `../../beam_rt/GC_STRATEGY_MEASURED.md` and their harness in `../../beam_rt/tests/gc_strategy_classes.rs`.
+  (the collector-level C1/C2 sweep plus a C3-*shaped* copy-out with no ETS) and `gc_class_shape.rs` is
+  the C4-*shaped* census (a model, not a real compile); the real C3 (messaging/copy-bound) and C4
+  (a real in-process compile) measurements live in `../../beam_rt/GC_STRATEGY_MEASURED.md` and their
+  harness in `../../beam_rt/tests/gc_strategy_classes.rs`.
 - **No per-file wall time is recorded anywhere**; the only in-crate figure is
-  `nursery_growth_retention.rs`'s whole-5-test file at 0.01 s (`../MEASURED.md:497`). Nothing under
-  `tests/` is `#[ignore]`d (the crate's only two ignores are doctest fences, `src/offheap.rs:102,153`).
+  `nursery_growth_retention.rs`'s whole-5-test file at 0.01 s (`../MEASURED.md:503`). The only
+  `#[ignore]`d item under `tests/` is `mature_strategy_sweep.rs`'s re-exec'd worker (the crate's two
+  other ignores are doctest fences, `src/offheap.rs:102,153`).
 - `AnyCollector`'s variants are **public** (`Copying(Collector)` / `Immix(GenImmixCollector)`,
   `../src/any_collector.rs:52`), so a test reaches `ImmixStats`
-  (`GenImmixCollector::last_immix_stats`, `../src/immix_collector.rs:280`) and `mature().used_lines()`
+  (`GenImmixCollector::last_immix_stats`, `../src/immix_collector.rs:287`) and `mature().used_lines()`
   with a two-arm match; `AnyCollector` itself exposes only `GcStats`, `HeapObservable` and
   `HeapFootprint`.
 

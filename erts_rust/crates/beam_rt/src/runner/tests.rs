@@ -4128,7 +4128,8 @@ fn heap_growth_expected_collections(n: i64, iterations_per_nursery: u64) -> u64 
 /// if that were a real per-call work increase rather than a measurement artefact, then at least
 /// one of these deterministic counters — collections per call, or slices per call — would grow
 /// with N too. This test pins the truth for the churn shape: neither grows — both are flat,
-/// because the nursery settles on a live-set-derived capacity (2 585 words on this shape) and every call
+/// because the nursery settles on a live-set-derived capacity (3 000 words on this shape — the
+/// minor collapse's carriage bound at the shape's live figure) and every call
 /// therefore performs the same allocation and collection work — so on this shape the excess wall
 /// clock is **not** extra per-call GC/runner work.
 #[test]

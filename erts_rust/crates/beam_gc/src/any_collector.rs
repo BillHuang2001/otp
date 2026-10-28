@@ -304,6 +304,28 @@ impl AnyCollector {
         }
     }
 
+    /// Gives the nursery's retained capacity back: collects, then installs the live set's target
+    /// **unconditionally**, and reports the collection that ran.
+    ///
+    /// Forwarded to [`Collector::trim_retired`] /
+    /// [`GenImmixCollector::trim_retired`](crate::GenImmixCollector::trim_retired) — see the
+    /// former for the full contract: a complete root set at a safepoint, the roots forwarded in
+    /// place, `young_space_count() == 1` / `collection_debt() == false` afterwards, and
+    /// `heap_size_words()` equal to the live set's target for the kind the returned
+    /// [`Collection`] reports. The strategy does not change the guarantee (the nursery chain is
+    /// shared), and the mature generation is resized only by a fullsweep.
+    ///
+    /// # Errors
+    ///
+    /// The collection's own `BeamError` — a typed heap exhaustion when the live set does not fit
+    /// (nothing copied in that case), or an allocation failure.
+    pub fn trim_retired(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
+        match self {
+            AnyCollector::Copying(c) => c.trim_retired(roots),
+            AnyCollector::Immix(c) => c.trim_retired(roots),
+        }
+    }
+
     /// Forces a **minor** collection on the selected strategy (escalation is bypassed).
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         match self {

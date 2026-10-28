@@ -85,9 +85,16 @@ fn retained_words(c: &AnyCollector) -> usize {
     c.heap_size_words() - c.young().capacity_words()
 }
 
-/// The upper edge of the heap-size policy's **minor** hysteresis band for a live set of
-/// `live_words`: the largest nursery capacity a *minor* may settle on without giving the memory
-/// back — `max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × HeapPolicy::young_minor_target_words)`.
+/// The upper edge of the heap-size policy's hysteresis band for a live set of `live_words`, given
+/// the room request (`need_words`) the growth seam recorded since the last collection: the largest
+/// nursery capacity a **minor** may settle on without giving the memory back —
+/// `max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × HeapPolicy::young_minor_target_words)`.
+///
+/// `need_words` is the legacy C's `need` term: a collapse sizes the nursery to leave room for the
+/// request a growth had to retire a space for
+/// ([`HeapPolicy::young_after_collection_with_need`]). It is **one-shot** — it belongs to the one
+/// collection that follows the growth — so a caller that knows the request its loop made passes it
+/// here and `0` for a round with no intervening growth.
 ///
 /// The band is `[target, max(MINOR_SHRINK_FLOOR_WORDS, 8 × target)]`, so the legacy C's
 /// minor-shrink floor (`MINOR_SHRINK_FLOOR_WORDS` = 3 000 words, `HEAP_SIZE(p) > 3000` before a
@@ -101,8 +108,13 @@ fn retained_words(c: &AnyCollector) -> usize {
 /// A **fullsweep**'s band is the whole-heap one (`YOUNG_SHRINK_FACTOR ×
 /// HeapPolicy::young_target_words`, no floor): a fullsweep is the one collection that measures the
 /// whole live set exactly, and it installs that target whenever it is outside the band.
-fn band_edge(policy: &HeapPolicy, live_words: usize) -> usize {
-    MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * policy.young_minor_target_words(live_words))
+///
+/// The fullsweep's whole-heap rule is folded in as well
+/// ([`HeapPolicy::young_target_words_with_need`], whose target is the larger of the two), so one
+/// helper bounds both collapse seams a `collect` may run.
+fn band_edge(policy: &HeapPolicy, live_words: usize, need_words: usize) -> usize {
+    let whole = policy.young_target_words_with_need(live_words, need_words);
+    MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * whole)
 }
 
 // ---------------------------------------------------------------------------
@@ -352,11 +364,14 @@ fn drive_loop(c: &mut AnyCollector, elems: &[Eterm], kind: MatureKind) -> Observ
             // memory back past the band's upper edge: settle inside the band or not at all.
             let live = c.mature_used_words();
             let settled = c.young().capacity_words();
-            let band = band_edge(c.heap_policy(), live);
+            // The growth this loop makes is an `OP_WORDS`-word room request, and it rides into
+            // the collection as the one-shot `need` term (or the round before it did), so the
+            // band is derived from the need-augmented target.
+            let band = band_edge(c.heap_policy(), live, OP_WORDS);
             assert!(
                 settled <= band,
                 "{kind:?} round {round}: a collection must settle inside the live set's band \
-                 (8 × young_target_words({live}) = {band}), got {settled}"
+                 (8 × young_target_words_with_need({live}, {OP_WORDS}) = {band}), got {settled}"
             );
             max_live = max_live.max(live);
         }
@@ -470,7 +485,7 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             max_live > 0,
             "{kind:?}: the run must have measured a live set"
         );
-        let band_max = band_edge(c.heap_policy(), max_live);
+        let band_max = band_edge(c.heap_policy(), max_live, OP_WORDS);
         let peak_bound = c.heap_policy().next_words(2 * band_max, 0);
         assert!(
             peak_young <= peak_bound,
@@ -498,7 +513,7 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             tail_spaces <= 2,
             "{kind:?}: the plateau holds at most one retired space, got {tail_spaces}"
         );
-        let tail_band = band_edge(c.heap_policy(), tail_live);
+        let tail_band = band_edge(c.heap_policy(), tail_live, OP_WORDS);
         assert!(
             tail_young <= tail_band,
             "{kind:?}: the plateau's nursery sits inside the live set's band (8 × \
@@ -611,11 +626,13 @@ fn a_repeated_grow_and_collect_cycle_never_accumulates_spaces() {
             );
             // And the capacity it settles on is the live set's, inside the documented band.
             let live_after = c.mature_used_words();
-            let band = band_edge(c.heap_policy(), live_after);
+            // This round's growth is a 4096-word room request, so it rides into the collection
+            // as the one-shot `need` term.
+            let band = band_edge(c.heap_policy(), live_after, 4096);
             assert!(
                 c.young().capacity_words() <= band,
                 "{kind:?} round {round}: a collection settles inside the live set's band \
-                 (8 × young_target_words({live_after}) = {band}), got {}",
+                 (8 × young_target_words_with_need({live_after}, 4096) = {band}), got {}",
                 c.young().capacity_words()
             );
         }

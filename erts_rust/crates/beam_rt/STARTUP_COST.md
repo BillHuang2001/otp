@@ -129,8 +129,10 @@ again — which is the `239` of `384` the census classifies as debt-driven.
 `../../erts/emulator/beam/erl_gc.c:1517-1529`) widens the shrink band to
 `max(3 000, 8 × target)`, so a collection no longer hands a capacity at or below **3 000 words**
 back.
-The observed ladder on one boot is `2 586 → 376 → 986 → 376 → 986`, and the 384 are a **capacity
-oscillation**, not the live set asking to be collected.
+The ladder recorded on the boot that census measured is `2 586 → 376 → 986 → 376 → 986`, and the
+384 are a **capacity oscillation**, not the live set asking to be collected; on this tree the same
+swing carries up to the collapse's **carriage bound** (`max(3 000, 8 × the live set's minor target)`,
+`BEAM_RT_GC_TRACE` showing `3 008` as its upper step for a ~238-word live set).
 
 ### The `+hms` sweep — a surrogate for a heap floor (5 paired rounds per row)
 
@@ -192,18 +194,18 @@ Nothing at or below 1 864 moves: the 233-word nursery floor and `heap_growth`'s 
 capacities — 843 on the rows that never take a fullsweep, 987 after one — all stand, as do
 `bif_extra/process_info_spawned_exact_item_values`'
 `{heap_size,233}`/`{total_heap_size,233}`.
-`reds_boundary`'s 2 586-word plateau is above the 1 864-word edge, so it is not one of these: it
-holds on `young_after_collection`'s keeping branch (`young_minor_target_words(1 201) = 1 598` up to
-`8 × 1 598 = 12 784`).
-The two re-derivations the ask named are settled: `src/runner/tests/boundary_cost.rs`'s
-`MEASURED_YOUNG_CAPACITY = 2_585` is still the capacity this tree runs (its row dump reports
-`peak_young_capacity` 2 585, and the row's collection totals beside it are the same measured
-figure), and `src/context/tests.rs::the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve`
+`reds_boundary`'s 4 185-word plateau is above the 1 864-word edge, so it is not one of these: it is
+the collapse's carried minor target, a fixed point inside the keep band `young_minor_target_words(1 201)
+= 1 598` up to `8 × 1 598 = 12 784`.
+`src/runner/tests/boundary_cost.rs`'s `MEASURED_YOUNG_CAPACITY = 3_000` is the capacity this tree runs
+(its row dump reports `peak_young_capacity` 3 000 at every row, and the row's collection totals
+beside it are the same measured figure), and
+`src/context/tests.rs::the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve`
 is green.
-The floor is measurement-neutral for that row because it does not move the edge of the row's own
-keep band: at the shape's 376-word minor target the edge is `YOUNG_SHRINK_FACTOR × 376 = 3 008`
-either way, so 2 585 stays inside it and neither the capacity nor the collection cadence is the
-floor's to change.
+That row is the floor's own figure: at the shape's 233-word minor target the keep band's edge is
+`max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × 233) = max(3 000, 1 864) = 3 000`, so the
+carried collapse installs the floor itself and neither the capacity nor the collection cadence sits
+below it.
 
 ## Measurement discipline
 

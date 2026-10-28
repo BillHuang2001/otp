@@ -1,0 +1,36 @@
+cross-runtime compare m21-budgetprobe-all.json — 4 workload(s), 33 numeric row(s)
+workload           metric                   unit               sys           rust          delta      delta%  speedup
+--------------------------------------------------------------------------------------------------------------------
+baseline           compute_loop_ms          ms            178.0834       183.6203        +5.5369      +3.11%   0.9698
+baseline           compute_ops_per_sec      ops/s     5615346.7634   5446020.9643   -169325.7991      -3.02%   1.0311
+baseline           startup_ms               ms            136.9576       171.0535       +34.0959     +24.90%   0.8007
+baseline           vm_memory_total_bytes    bytes    36227656.0000   9320543.0000 -26907113.0000     -74.27%   3.8869
+baseline           peak_memory_bytes        bytes   135094272.0000 128163840.0000  -6930432.0000      -5.13%   1.0541
+gc_bound           case_churn_ns_per_op     ns           4189.0710     26286.5707    +22097.4997    +527.50%   0.1594
+gc_bound           case_churn_ops           ops        200000.0000     10000.0000   -190000.0000     -95.00%  20.0000
+gc_bound           case_churn_peak_rss_bytes bytes    67541674.6667  96750250.6667 +29208576.0000     +43.25%   0.6981
+gc_bound           case_churn_startup_ms    ms            168.3985       164.3372        -4.0613      -2.41%   1.0247
+gc_bound           case_churn_wall_ms       ms            998.5758       434.2347      -564.3411     -56.51%   2.2996
+gc_bound           peak_memory_bytes        bytes    67661824.0000  96858112.0000 +29196288.0000     +43.15%   0.6986
+gc_class           case_compile_ns_per_op   ns       16565384.6250 251930226.0000 +235364841.3750   +1420.82%   0.0658
+gc_class           case_compile_ops         ops             8.0000         2.0000        -6.0000     -75.00%   4.0000
+gc_class           case_compile_peak_rss_bytes bytes    80700757.3333 208242005.3333 +127541248.0000    +158.04%   0.3875
+gc_class           case_compile_startup_ms  ms            119.6398       162.9961       +43.3563     +36.24%   0.7340
+gc_class           case_compile_wall_ms     ms            252.1674       704.8135      +452.6461    +179.50%   0.3578
+gc_class           case_ets_copy_ns_per_op  ns           1773.9618     11364.4454     +9590.4836    +540.63%   0.1561
+gc_class           case_ets_copy_ops        ops        400000.0000     40000.0000   -360000.0000     -90.00%  10.0000
+gc_class           case_ets_copy_peak_rss_bytes bytes    67719168.0000  97198080.0000 +29478912.0000     +43.53%   0.6967
+gc_class           case_ets_copy_startup_ms ms            118.8602       162.6732       +43.8129     +36.86%   0.7307
+gc_class           case_ets_copy_wall_ms    ms            875.4323       616.9441      -258.4882     -29.53%   1.4190
+gc_class           case_send_recv_ns_per_op ns           3454.2754     19042.1356    +15587.8602    +451.26%   0.1814
+gc_class           case_send_recv_ops       ops        200000.0000     25000.0000   -175000.0000     -87.50%   8.0000
+gc_class           case_send_recv_peak_rss_bytes bytes    67760128.0000 193538730.6667 +125778602.6667    +185.62%   0.3501
+gc_class           case_send_recv_startup_ms ms            130.1381       169.0431       +38.9050     +29.90%   0.7699
+gc_class           case_send_recv_wall_ms   ms            822.4902       693.2667      -129.2235     -15.71%   1.1864
+gc_class           peak_memory_bytes        bytes    80732160.0000 208289792.0000 +127557632.0000    +158.00%   0.3876
+list_walk          case_list_walk_elements  elements 100000000.0000  50000000.0000 -50000000.0000     -50.00%   2.0000
+list_walk          case_list_walk_ns_per_element ns              2.4082        14.6921       +12.2840    +510.10%   0.1639
+list_walk          case_list_walk_peak_rss_bytes bytes    67802453.3333  96609621.3333 +28807168.0000     +42.49%   0.7018
+list_walk          case_list_walk_startup_ms ms            115.5935       160.5153       +44.9218     +38.86%   0.7201
+list_walk          case_list_walk_wall_ms   ms            352.1802       904.5696      +552.3893    +156.85%   0.3893
+list_walk          peak_memory_bytes        bytes    67899392.0000  96743424.0000 +28844032.0000     +42.48%   0.7019

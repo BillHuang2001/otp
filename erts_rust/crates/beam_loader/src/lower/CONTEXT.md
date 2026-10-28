@@ -7,11 +7,18 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 
 ## Pipeline (inside `build_module`)
 1. `decode::decode_stream` → `Vec<RawInstr>` (`../decode.rs`).
-2. `group::group_functions` — split into `Function`s at the `func_info` boundary; each function gets `func_label`/`entry_label`.
+2. `group::group_functions` — split into `Function`s at the `func_info` boundary; each function gets `func_label`/`entry_label`. The boundaries are found on the *raw* stream (only the `label`/`func_info` instructions at a boundary are lowered to do so), and each body is then lowered straight into its one `code` vector, so no instruction is lowered twice and no body is held twice.
 3. `lower::instr::lower_instr` — one decoded opcode → exactly one `Instr` variant (or the lossless `Instr::Generic`).
-4. `fuse` — coalesce an **adjacent** `Deallocate(N); Return` pair into `Instr::DeallocateReturn(N)`. Runs *before* `build_blocks`, so a block's `start..end` indexes the same fused vector the engine dispatches on. `Label` is the only branch target, so the pair can never cross a block; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules.
+4. `fuse::fuse_in_place` — coalesce an **adjacent** `Deallocate(N); Return` pair into `Instr::DeallocateReturn(N)`, compacted in place. Runs *before* `build_blocks`, so a block's `start..end` indexes the same fused vector the engine dispatches on. `Label` is the only branch target, so the pair can never cross a block; everything else is carried through untouched, so `Deallocate`/`Return` stay live for hand-built modules. `group::emit_fused` applies the same rule (`fuse::fuses`, its one statement) while it lowers, so the body is emitted already fused.
 5. `group::build_blocks` — label-delimited blocks (`blocks[k]` = `code[start..end]` beginning at `blocks[k].label`); CFG construction is the engine's concern.
 6. `validate` — the post-lowering accept/reject pass below.
+
+## The per-body allocation rule (one exact allocation, never a realloc)
+- **`Function::code` is allocated once, at its final length** — `group.rs:146`'s `Vec::with_capacity(body.len() - count_fusable_pairs(body))` — and `group::emit_fused` fills it to `len == capacity`: it pushes the fused sequence, never the pre-fusion one.
+- **A body must never be sized for the post-fusion length and then filled with the pre-fusion sequence.** That was the previous rule and it was self-defeating: `count_fusable_pairs` is *exact* (measured over a boot: 3 073/3 073 bodies with a pair had `fused == body.len() - counted`, zero inexact), but the push loop emitted `body.len()` instructions into a capacity of `body.len() - counted`, so every one of those 3 073 bodies grew to **exactly 2×** its final length and then had `shrink_to_fit` restore it — two extra reallocations per function (166 092 lowered instructions against 159 959 fused, 319 918 instructions of peak capacity).
+- **There is no `shrink_to_fit` on this path.** The exactness invariant is a `debug_assert_eq!(code.len(), code.capacity())` (`group.rs:157`) plus `tests/real_modules.rs::slack_tables`, which asserts `code.len() == code.capacity()` for every function of all 1 366 installed modules — a drift is caught by the suite in any profile, and its only release-mode consequence would be slack (a memory regression), never a wrong instruction.
+- **Why it is an accounting win and not an RSS win (measured).** Removing the growth + shrink removes the two reallocations but not any resident page: glibc services a >128 KiB `realloc` on an mmap'd block with `mremap` (no data copy) and a shrink frees the tail, so boot `VmHWM` is unchanged (`64.51 → 64.53 MiB`, median of 15 interleaved pairs) and boot CPU is neutral (`0.140 → 0.142 s`, `ru_utime+ru_stime`, same runs). Massif's own *useful* heap is also unchanged (`40.60 → 40.56 MiB`); what collapses is `mem_heap_extra_B` (`11.23 → 1.46 MiB`) — valgrind's bookkeeping, which billed the shrink's `realloc` as a second live allocation and made the two sites at `group.rs` read as "9.76 MiB @ `shrink_to_fit` + 8.80 MiB @ `with_capacity`". After the change the peak snapshot carries **one** `Vec<Instr>` entry: 18.57 MiB = 304 212 instructions × 64 B, the *retained* typed IR of the 99 modules a `-eval` boot loads.
+- **The retention, not the transient, is the boot peak.** The resident set plateaus at its peak (`64.68 MiB` from t≈181 ms to exit on `-eval 'timer:sleep(300), halt().'`), i.e. the peak is the end state, so no load-time transient can move it; `Vec<Instr>` is 43.7 % of the heap and its 64 B/instruction is the frozen `Instr` layout.
 
 ## Rules
 - **`instr.rs` is the whole semantic mapping.** Every opcode the compiler emits maps to one named `Instr`; every other opcode is preserved losslessly as `Instr::Generic { op, operands, offset }` (`offset` = the byte offset in the `Code` stream, for line/backtrace mapping). `Generic` is reached only from the single catch-all arm: every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch.
@@ -36,6 +43,7 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 ## Known Issues
 - **Looser than the C, deliberately:** an obsolete/transform-only roster opcode (`-allocate_zero/2`, `-is_constant/2`, `-make_fun2/1`; none has an `ops.tab` line) lowers to `Instr::Generic` instead of `PLEASE_RECOMPILE` (`beam_load.c:600-605`); an `f` target no `label` defines is accepted (a release-build C accepts it too) and surfaces as a typed execution error; the `bs_match` sub-instruction vocabulary is only the engine's typed `unsupported` (`beam_load.c:625-638`).
 - **Stricter than the C:** a defined label 0 is refused (the C tests only `< 0 || >= label_count`, `asm_load.c:512-518`).
+- **Which error a doubly-malformed stream reports:** the boundaries are located (and the boundary rules applied) before the bodies are lowered, so a stream that carries both a malformed `func_info` boundary and an unlowerable instruction names the boundary; a stream with one defect reports that defect, and every one of these is `BadArg` either way — the accept/reject verdict is unchanged.
 
 ## Notes for Agents
 - Read `src/lower/instr.rs` for the per-opcode table; read `src/instr.rs` (`../instr.rs`) for the variant shapes and `../CONTEXT.md` for the vocabulary summary.
@@ -43,7 +51,7 @@ Ground truth: the `=>` transforms and opcode definitions in `../../../../erts/em
 
 ## Routing Table
 - `instr.rs` → `lower_instr` (the opcode → `Instr` mapping, one arm per modelled opcode).
-- `group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks`.
-- `fuse.rs` → `fuse` (the only superinstruction pass, `Deallocate`+`Return`).
+- `group.rs` → `group_functions` (the `func_info` boundary rule) + `emit_fused` (the lowering emit that fuses as it goes, so the one allocation is exact) + `count_fusable_pairs` (the exact per-body capacity pre-count) + `build_blocks`.
+- `fuse.rs` → `fuses` (the one statement of the `Deallocate`+`Return` rule, shared by `emit_fused` and `fuse_in_place`), `fuse_in_place` (the superinstruction pass over an already-lowered body) and `fuse`, its owning-vector wrapper.
 - `validate.rs` → the post-lowering validation pass (label definitions, `function_count`, `func_info` arity, import refs, `LineRef`s).
 - `../../../tests/negative_ir.rs` → the code-level rejection suite that pins `validate.rs` (test node, read-only here).

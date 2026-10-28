@@ -40,17 +40,24 @@
 //!    `beam_rt/tests/atom_table_commit_alloc.rs` relies on: it uses `rt.atoms().clone()` as its
 //!    positive control and requires the control to scale with the table. A shared-`Arc` clone
 //!    would allocate O(1) and silently make that sibling pin vacuous.
-//! 5. **(e) `AtomTable::fork()` allocates two containers and nothing else**, at any table size —
-//!    the same copy made from shared name handles, which is what the per-module load of a
-//!    `beam_rt` boot uses. Its allocation count is *flat* in the table size while `clone`'s is
-//!    linear, and (d) and (e) are the two halves of that contrast: one pinning that `clone`
-//!    still scales, the other that `fork` does not.
+//! 5. **(e) `AtomTable::fork()` allocates nothing at any table size** — it shares the whole prefix
+//!    (both storage directions) by `Arc`, so it copies no name handle and no bucket. This is the
+//!    copy the per-module load of a `beam_rt` boot uses on every module, and its allocation count
+//!    is *flat* in the table size while `clone`'s is linear: (d) and (e) are the two halves of
+//!    that contrast — one pinning that `clone` still scales, the other that `fork` does not.
+//! 6. **(f) the copy-on-write step a fork pays on its first append is bounded and flat** — one
+//!    name chunk (≤ `NAMES_PER_CHUNK` handles), the shard array (its `8 · INDEX_SHARDS` bytes move
+//!    bytes, not allocation *count*), one index shard (about `len / INDEX_SHARDS` entries) and the
+//!    new string, at 300 atoms exactly as at 3 000. Without this the fork would only move the
+//!    whole-table copy from fork time to the first append.
+
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use beam_term::atom::store::{INDEX_SHARDS, NAMES_PER_CHUNK};
 use beam_term::AtomTable;
 
 // ---------------------------------------------------------------------------
@@ -150,9 +157,39 @@ fn allocations_in<T>(body: impl FnOnce() -> T) -> (Measured, T) {
 const NAMES: usize = 3_000;
 /// A tenth of it, for the clone-scaling half of invariant (d).
 const SMALL: usize = 300;
-/// How far a bulk seed may exceed "one allocation per distinct name": the `Vec` reservation and
-/// the `HashMap` reservation, plus slack for one extra growth event.
-const SEED_SLACK: usize = 8;
+
+/// How far a bulk seed may exceed "one allocation per distinct name".
+///
+/// The store behind [`AtomTable`] keeps the name list in [`NAMES_PER_CHUNK`]-sized chunks and the
+/// name→index map in [`INDEX_SHARDS`] shards, so a seed pays, on top of one string per name:
+///
+/// * the chunk containers — one `Arc<NameChunk>` plus one `Vec<Arc<str>>` buffer per chunk
+///   (`NAMES.div_ceil(NAMES_PER_CHUNK)` of them), plus the chunk list's `Arc` and its one
+///   reserved buffer;
+/// * the shard containers — the shard array (`Arc` + buffer), one `Arc<IndexShard>` per shard a
+///   name lands in, and up to six map-growth events per such shard.
+///
+/// This is a deliberate **upper bound**, counted in containers rather than names so it stays put
+/// when the name count grows. It is an *over*-allowance by construction, not a derivation to be
+/// re-fitted: it charges every shard the six growth events of a densely loaded map, while at
+/// `INDEX_SHARDS = 1024` a `NAMES`-name seed leaves only ~3 names in each (one or two events), and
+/// at any shard count a map that holds `n` names grows `O(log n)` times, never `O(n)`. The property
+/// the budget states is the shape — one string per name plus a bounded number of *containers*.
+fn seed_slack() -> usize {
+    let chunks = NAMES.div_ceil(NAMES_PER_CHUNK);
+    let chunk_containers = chunks * 2 + 2;
+    let shard_containers = INDEX_SHARDS + INDEX_SHARDS * 6 + 2;
+    chunk_containers + shard_containers
+}
+
+/// How many allocations the first append after a fork may cost.
+///
+/// Every mutating path detaches its shared container with `Arc::make_mut`, and one such step is
+/// **two** allocations (the cloned payload and the `Arc` block that owns it): one for the chunk
+/// list, one for the chunk the append lands in, one for the shard array, one for the shard. On top
+/// of that: the interned string itself, a fresh chunk when the index falls on a
+/// `NAMES_PER_CHUNK` boundary (its `Arc` and its buffer), and one shard-map growth event.
+const FORK_APPEND_BUDGET: usize = 4 * 2 + 1 + 2 + 1;
 
 /// `n` distinct, realistically-shaped names.
 fn synthetic_names(n: usize) -> Vec<String> {
@@ -199,11 +236,12 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
     let source = atom_names_source(&names);
 
     // (a) `seed` of NAMES distinct names.
-    let (seed, seeded) = allocations_in(|| {
+    let (seed, mut seeded) = allocations_in(|| {
         let mut t = AtomTable::new();
         t.seed(names.iter().map(String::as_str));
         t
     });
+    assert_eq!(seeded.len(), NAMES, "the seed really interned every name");
 
     // (b) `seed_from_atom_names` over the ~NAMES-name source.
     let (from_source, parsed) = allocations_in(|| {
@@ -238,10 +276,33 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
     small_table.seed(small_names.iter().map(String::as_str));
     let (clone_small, _c1) = allocations_in(|| small_table.clone());
     let (clone_large, _c2) = allocations_in(|| seeded.clone());
-    // (e) `fork()` at the same two sizes, plus the empty table: two container allocations, flat.
+    // (e) `fork()` at the same two sizes, plus the empty table: nothing at all, at any size. The
+    // empty table is built *outside* the window, so the measurement is the fork and only the fork.
+    let empty = AtomTable::new();
     let (fork_small, _f1) = allocations_in(|| small_table.fork());
     let (fork_large, _f2) = allocations_in(|| seeded.fork());
-    let (fork_empty, _f3) = allocations_in(|| AtomTable::new().fork());
+    let (fork_empty, _f3) = allocations_in(|| empty.fork());
+    // (f) the copy-on-write step a fork pays on its first append — the property the whole design
+    // exists for. `seeded`/`small_table` still hold their containers, so the fork's append must
+    // detach (a chunk + a shard), and the parent's own next append (with the fork alive) must too.
+    let (fork_intern_large, _g1) = allocations_in(|| {
+        let mut f = seeded.fork();
+        f.intern("only_in_a_literal");
+        f
+    });
+    let (fork_intern_small, _g2) = allocations_in(|| {
+        let mut f = small_table.fork();
+        f.intern("only_in_a_literal");
+        f
+    });
+    let held_fork = seeded.fork();
+    let seeded_len = seeded.len();
+    let (parent_intern, _g3) = allocations_in(|| seeded.intern("after_the_fork"));
+    assert_eq!(
+        held_fork.len(),
+        seeded_len,
+        "the fork held across the parent's append did not move"
+    );
 
     // Print everything *before* asserting, so a pre-fix run still reports every figure.
     for line in [
@@ -255,12 +316,14 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
         fork_small.line(&format!("(e) fork({SMALL})")),
         fork_large.line(&format!("(e) fork({NAMES})")),
         fork_empty.line("(e) fork(empty)"),
+        fork_intern_small.line(&format!("(f) fork({SMALL}) + 1 intern")),
+        fork_intern_large.line(&format!("(f) fork({NAMES}) + 1 intern")),
+        parent_intern.line(&format!("(f) parent intern() with a live fork ({NAMES})")),
     ] {
         println!("{line}");
     }
 
     // The measured calls really did the work, so the figures are not vacuous.
-    assert_eq!(seeded.len(), NAMES);
     assert_eq!(parsed.len(), NAMES);
     assert_eq!(
         parsed.lookup(&names[NAMES / 2]),
@@ -283,20 +346,23 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
         "re-interning a known name must not allocate"
     );
 
-    // (a)+(b) one heap string per name, plus bounded container reservations.
+    // (a)+(b) one heap string per name, plus a bounded number of *container* allocations that
+    // grows with the container count (chunks, shards), never with the name count.
+    let budget = NAMES + seed_slack();
     assert!(
-        seed.allocations <= NAMES + SEED_SLACK,
-        "seeding {NAMES} names cost {} allocations (budget {}): the name must be stored once, \
-         not once per container",
+        seed.allocations <= budget,
+        "seeding {NAMES} names cost {} allocations (budget {}): one heap string per distinct name, \
+         plus a bounded number of container allocations that grows with the container count, never \
+         with the name count",
         seed.allocations,
-        NAMES + SEED_SLACK
+        budget
     );
     assert!(
-        from_source.allocations <= NAMES + SEED_SLACK,
+        from_source.allocations <= budget,
         "seed_from_atom_names over {NAMES} names cost {} allocations (budget {}): the parser must \
          intern each printname directly, with no throw-away buffer",
         from_source.allocations,
-        NAMES + SEED_SLACK
+        budget
     );
 
     // (d) the clone is a deep copy: it allocates a fresh name string per entry, and so scales.
@@ -312,30 +378,75 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
         clone_large.allocations,
         clone_small.allocations
     );
-    // (e) `fork` shares the name handles: two containers (the `names` `Vec` and the `index`
-    // buckets), no string per entry — so the count is flat in the table size, and it is the
-    // *contrast* with (d) that makes each half meaningful: `clone` still scales, `fork` does not.
+    // (e) `fork` shares both storage directions by `Arc`: no string, no name handle, no bucket —
+    // so it allocates *nothing* at any table size, and it is the contrast with (d) that makes
+    // each half meaningful: `clone` still scales, `fork` does not.
     assert_eq!(
-        fork_large.allocations, 2,
-        "a fork of a {NAMES}-atom table must allocate exactly two containers (a `Vec` of handles \
-         and a hash-table bucket array), got {}",
+        fork_large.allocations, 0,
+        "a fork of a {NAMES}-atom table must allocate nothing (it shares the chunk list and the \
+         shard array by `Arc`), got {}",
         fork_large.allocations
     );
     assert_eq!(
-        fork_small.allocations, fork_large.allocations,
-        "a fork must not scale with the table: {SMALL} atoms cost {} allocations, {NAMES} atoms {}",
-        fork_small.allocations,
-        fork_large.allocations
+        fork_small.allocations, 0,
+        "a fork of a {SMALL}-atom table must allocate nothing, got {}",
+        fork_small.allocations
     );
     assert_eq!(
         fork_empty.allocations, 0,
         "a fork of an empty table allocates nothing"
     );
+    assert_eq!(
+        fork_small.allocations, fork_large.allocations,
+        "a fork must not scale with the table: {SMALL} atoms cost {} allocations, {NAMES} atoms {}",
+        fork_small.allocations, fork_large.allocations
+    );
     assert!(
         fork_large.bytes < clone_large.bytes,
-        "a fork must move fewer bytes than a deep clone (it copies handles and bucket slots, \
-         never the name bytes): {} vs {} bytes for {NAMES} atoms",
+        "a fork must move fewer bytes than a deep clone (it copies nothing at all): {} vs {} \
+         bytes for {NAMES} atoms",
         fork_large.bytes,
         clone_large.bytes
+    );
+
+    // (f) the first append after a fork pays ONE chunk, ONE shard and the new string — a bounded,
+    // size-independent number of allocations, not a table copy.
+    for (label, measured) in [
+        (format!("fork({SMALL}) + 1 intern"), fork_intern_small),
+        (format!("fork({NAMES}) + 1 intern"), fork_intern_large),
+        (
+            format!("parent intern() with a live fork ({NAMES})"),
+            parent_intern,
+        ),
+    ] {
+        assert!(
+            measured.allocations <= FORK_APPEND_BUDGET,
+            "{label} cost {} allocations (budget {FORK_APPEND_BUDGET}): an append after a fork may \
+             pay one name chunk and one index shard (two allocations each, payload + `Arc` block) \
+             plus the string, but never the table",
+            measured.allocations
+        );
+    }
+    assert!(
+        fork_intern_large.allocations <= fork_intern_small.allocations + 2,
+        "the fork-then-append cost must be flat, not proportional: {SMALL} atoms cost {} \
+         allocations, {NAMES} atoms {} (one extra shard-map growth event is all the slack there is)",
+        fork_intern_small.allocations,
+        fork_intern_large.allocations
+    );
+    assert!(
+        fork_intern_large.bytes * 10 < clone_large.bytes,
+        "fork-then-append must be under a tenth of a deep clone: {} vs {} bytes for {NAMES} atoms",
+        fork_intern_large.bytes,
+        clone_large.bytes
+    );
+    // the append really landed, and the parent's did too (on its own side)
+    assert_eq!(seeded_len, NAMES);
+    assert_eq!(seeded.len(), NAMES + 1);
+    assert_eq!(
+        seeded
+            .lookup("after_the_fork")
+            .map(|atom| atom.raw() as usize),
+        Some(NAMES)
     );
 }

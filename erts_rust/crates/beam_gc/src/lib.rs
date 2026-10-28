@@ -84,6 +84,7 @@ pub use crate::reachable::{for_each_reachable_in, ReachableObject}; // the walk 
 pub mod selection;
 pub mod space;
 pub mod stats;
+mod trim; // the explicit capacity-give-back entry point (`Collector::trim_retired`) — inherent impl, no items to re-export
 
 pub use crate::any_collector::*;
 pub use crate::bin_vheap::BinVheap;

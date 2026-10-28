@@ -157,8 +157,9 @@ pub(crate) struct GcState {
     /// that entry in place** (keeping its position), mirroring the one-bit-per-process latch of
     /// [`Runtime::request_gc`].
     async_completions: Vec<AsyncGcCompletion>,
-    /// The **descent gate**: the pids that have ever had a container from a region their
-    /// collector does not scan enter their reachable term graph.
+    /// The **descent gate**: the pids whose reachable term graph has held a **hazard** — a
+    /// container from a region their collector does not scan that can forward a scanned word into
+    /// one it does.
     ///
     /// This is a **shared** per-pid latch cell (`Rc<RefCell<…>>`): the installed
     /// [`RuntimeCollectionGate`](crate::context::gc_walk::RuntimeCollectionGate) holds a clone
@@ -175,13 +176,14 @@ pub(crate) struct GcState {
     /// result outside the process heap, a heap-fragment delivery, a spawn argument that is not
     /// the new process's own).
     ///
-    /// The bit is **scoped to the foreign containers actually in the graph, not to the process's
+    /// The bit is **scoped to the foreign hazards actually in the graph, not to the process's
     /// life**: it is set by the events above and — the other half — **closed** again by a
-    /// full-root descent that reached no container from an unscanned region at all
+    /// full-root descent that reached no container that can forward a scanned word out of such a
+    /// region (an inert foreign term does not count)
     /// ([`Runtime::close_foreign_reachable`]), which is what a loop that drops its foreign term
     /// (or never nested one) relies on to stop paying the `O(live)` descent. Only the two
     /// *full* admission doors may close it: they hand the valve the whole `RootSet`, so "no
-    /// foreign container reachable" is a statement about the process's entire term graph, while
+    /// foreign hazard reachable" is a statement about the process's entire term graph, while
     /// the narrow door, the park arm and the signal gate see less. A clear is conservative in
     /// exactly one direction: an under-approximated root set would skip a descent, so the two
     /// doors that cannot see everything never clear.
@@ -549,8 +551,9 @@ impl Runtime {
     ///
     /// Returns whether a collection ran. The answer is `false` — with the counters
     /// untouched, never a fabricated collection — for a request the valves refuse (a pinned
-    /// or halted pid, the global escape-store valve, or a live root that reaches a container in
-    /// a region the collector does not scan), for a pid the table no longer holds,
+    /// or halted pid, the global escape-store valve, or a live root that reaches a **hazard** —
+    /// a container in a region the collector does not scan that can forward a scanned word into
+    /// one it does), for a pid the table no longer holds,
     /// and for a **relocation-exempt** process (the host holds live words outside this
     /// crate's root set: nothing is moved and, because nothing failed, the process's
     /// collection is *not* halted). A genuine collection failure halts that process's
@@ -572,8 +575,9 @@ impl Runtime {
         // admission point and the collecting allocation seam consult, here over the process's
         // own root set (the pid is not relocation-exempt here, so this is a park that did publish
         // the parked machine's roots into it, and a delivery
-        // may have filled its mailbox since). A container in a region the collector does not
-        // scan, reachable from a live root, makes the move unsound, so it is declined: the
+        // may have filled its mailbox since). A **hazard** — a container in a region the
+        // collector does not scan that can forward a scanned word into one it does, reachable
+        // from a live root — makes the move unsound, so it is declined: the
         // request is dropped exactly as the other valves drop it, and nothing is moved.
         //
         // The descent is gated on the pid's **foreign-reachability** bit (see
@@ -766,15 +770,15 @@ impl Runtime {
     }
 
     /// Closes `pid`'s **descent gate** ([`GcState::foreign`]) after a descent that ran over the
-    /// process's **whole** root set and reached no container from a region the collector does not
-    /// scan.
+    /// process's **whole** root set and reached no container that can forward a scanned word out
+    /// of a region the collector does not scan (an inert foreign term does not count).
     ///
     /// This is the *only* place the bit is cleared, and it is deliberately narrow: the caller must
     /// have handed the valve the executing machine's complete `RootSet` (the two full admission
     /// doors, [`crate::context::gc`]) and received a
     /// [`ValveVerdict::foreign_free`](crate::context::gc_walk::ValveVerdict) — the walk itself
     /// only reports that property for a walk that descended over the roots it was handed. "No
-    /// foreign container is reachable" is what makes the clear sound: a hazard needs a foreign
+    /// foreign hazard is reachable" is what makes the clear sound: a hazard needs a foreign
     /// container to *hold* a scanned word, so with none reachable there is none to leave dangling,
     /// and the graph can only acquire one through an event that re-opens the bit.
     ///
