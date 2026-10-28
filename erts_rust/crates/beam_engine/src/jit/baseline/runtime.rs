@@ -1844,6 +1844,50 @@ pub(crate) extern "C" fn jit_append_binary_all(
     append_binary_all(machine, acc_slot, src_slot, flags)
 }
 
+/// Build a binary from a **packed** bit field — the fresh (`accumulator`-less)
+/// `bs_create_bin` shape's one allocating door.
+///
+/// `value` carries every statically sized big-endian unsigned `integer` segment of the
+/// instruction already folded into one `nbits`-wide field, **field 0 in the most
+/// significant position and each field pre-masked to its own width** (the emitter packs
+/// it, so no allocation, no root and no `ExecutionContext` call happens in-block); the
+/// seam's [`make_fresh_binary`](crate::families::bitstrings::create::seam::make_fresh_binary)
+/// left-aligns those bits into a freshly allocated payload on the process heap and is
+/// byte-exact versus the family's own `exec`.
+///
+/// Answers the built term's raw word, or **`0`** ([`THE_NON_VALUE`], never a valid build
+/// result) for a refusal or an `Err`. `0` is the block ABI's one decline point: the
+/// emitted arm tests `rax` once and branches to `fallback`, which re-runs the instruction
+/// through [`jit_bitstr`] — so the family re-derives and re-reports the same typed error
+/// rather than this helper swallowing it.
+#[allow(dead_code)] // the fresh `bs_create_bin` route's helper: emitted code calls it once
+// that shape's arm lands; kept here so the door and the seam's build sit side by side.
+pub(crate) extern "C" fn jit_make_heap_binary(
+    rt: *mut JitRuntime<'_>,
+    value: i64,
+    nbits: usize,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is blocked
+    // in the block call that reached us), and it holds no `&mut` to either half while the
+    // helper runs.
+    let runtime = unsafe { &mut *rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`. This
+    // helper **does** write through it (the build reserves and fills process-heap words),
+    // which is why it takes the unique borrow the two appending doors above deliberately do
+    // not need; the driver is blocked in the block call, so no other `&mut Machine` exists.
+    let machine = unsafe { &mut *runtime.machine };
+    // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as a raw
+    // pointer, and the driver holds no `&mut` to it while the helper runs.
+    let ctx = unsafe { &mut *runtime.ctx };
+    match crate::families::bitstrings::create::seam::make_fresh_binary(machine, ctx, value as u64, nbits)
+    {
+        Ok(term) => term.raw() as i64,
+        // A refusal (`Err`) is the family's own path and the emitted `je` sends the
+        // instruction there; `0` is `THE_NON_VALUE`, which no build can produce.
+        Err(_) => 0,
+    }
+}
 /// How many times [`append_binary_all`] has executed on this thread and how many of those
 /// executions were **served** (answered the accumulator, i.e. really appended) rather than
 /// refused, as `(calls, served)`.
