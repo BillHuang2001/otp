@@ -386,12 +386,10 @@ driver-side publication before any emitted code can use the store again:
 - Never touch the stores: `enter_in_block`/`commit_in_block_entry`/`cross_function_enter` (`:2234`/`:2247`/`:2283`/`:2328`), which only switch the entry tables.
 - Driver-side: `drive` (`mod.rs:1091`) publishes before the loop, the loop head (`:1257-1262`) re-publishes each iteration, `code.enter_cached` (`:1285`) and the deopt arm (`:1409-1418`) run inside an iteration that re-publishes at its head; `enter_machine` (`mod.rs:809`) resets and pushes frame 0 **before** the loop publishes. A `traced` run never builds a `JitRuntime` (`mod.rs:1100-1102`).
 
-### The two rules an emitted store access must keep
+### What an emitted store access would have to keep
 
-- **Every capacity guard precedes every write.** A `grow` moves `ptr`, and the emitted
-  arm re-reads `ptr` from the header after the guards, so the fast path can never name
-  freed memory; the miss goes to `jit_allocate`, which lets the `Vec` grow and publishes
-  the fresh pointer itself.
+- **Every capacity guard precedes every write.** A `grow` moves `ptr`, so an emitted arm would have to re-read `ptr` from the header after its guards and could never name freed memory; today the whole push is the `jit_allocate` helper call, which lets the `Vec` grow and publishes the fresh window itself.
 - **The commit order is `fill`, then `len`.** The Y words are written into spare
   capacity before `stack.len` is bumped, so a collection (or the census walk) never sees
   a length covering a word the push has not written.
+- **The Y-window publication must be re-derivable at every enterable address.** The window follows from `Machine` state alone (`push_frame_window`'s `(y_base, y_count)` on a push, `refresh_y_base` on a `trim`/pop), so a block entry or a resumed slice can always re-derive it and an emitted push that published only mid-block could not stand in for the prologue's publish; `../frame_push_tests.rs` pins the behavioural half (each frame pushed exactly once across a sliced and resumed run) and `heap.rs`'s `the_allocate_arm_pushes_the_frame_with_a_helper_call_only` the structural half.
