@@ -383,10 +383,8 @@ pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<Appen
 }
 
 /// One compile-time field of a bare (`accumulator-less`) `bs_create_bin` build.
-// The consumer outside the tests is the baseline tier's bare-build arm (`src/jit`), which is
-// wired beside this seam; the `not(test)` gate keeps the crate's `#[cfg(test)]` census of the
-// seam honest in the meantime.
-#[cfg_attr(not(test), allow(dead_code))]
+// The consumer is the baseline tier's bare-build arm (`src/jit`), which reaches it through
+// `Machine` + the seam, so this type is on the production path.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FreshPlan {
     /// The fields in instruction order, each a run-time value written MSB-first. Always
@@ -411,7 +409,6 @@ pub(crate) struct FreshPlan {
 /// Pure over the module image and the instruction's operands: it reads, allocates nothing and
 /// mutates nothing, and `None` is never an error — it means "this instruction is not that
 /// shape", so the tier keeps the family's own route.
-#[cfg_attr(not(test), allow(dead_code))] // see `FreshPlan`
 pub(crate) fn fresh_plan(module: &Module, segments: &[Operand]) -> Option<FreshPlan> {
     // `prepare` declines a truncated (or stray) operand list too; an empty list is declined
     // here because a build with no fields has nothing to pack.
@@ -495,7 +492,6 @@ pub(crate) fn fresh_plan(module: &Module, segments: &[Operand]) -> Option<FreshP
 /// * It is **re-execution idempotent** for the same `(packed, nbits)`: it writes no machine
 ///   state, so a parked instruction may be re-executed from the top and produces an equal
 ///   term (a fresh block, the same bits).
-#[cfg_attr(not(test), allow(dead_code))] // see `FreshPlan`
 pub(crate) fn make_fresh_binary(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
