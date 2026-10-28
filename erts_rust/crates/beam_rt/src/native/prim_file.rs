@@ -162,6 +162,8 @@ use crate::runtime::Runtime;
 mod advise;
 mod sendfile;
 
+pub(crate) use advise::serves_local_call;
+
 /// The `Data` key holding this runtime's private open-file registry id.
 ///
 /// The oracle's map has no such entry: it decodes `handle` (a NIF resource reference)

@@ -111,7 +111,7 @@ pub(crate) mod net_kernel;
 mod node;
 pub(crate) mod port;
 mod prim;
-mod prim_file;
+pub(crate) mod prim_file;
 pub(crate) mod prim_tty;
 mod process;
 #[cfg(test)]
