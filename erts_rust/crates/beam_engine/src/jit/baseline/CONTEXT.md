@@ -149,8 +149,9 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `arith.rs`, `compare.rs`, `aggregate.rs` (+ `aggregate/list.rs`), `frame.rs`, `heap.rs`, `family.rs`,
   `link.rs`, `operands.rs`, `liveness.rs`, `regalloc.rs`, `regs.rs`). `Allocation::y_last`/
   `refresh_y_after` and the Y-window publish/refresh emission live in `prologue.rs`/`regalloc.rs`; the
-  publish gate itself is `regs.rs::Allocation::prologue_publishes_y`, fed by `regalloc.rs`'s
-  `y_first`/`frame_republish_first` derivation.
+  publish gate itself is `regs.rs::Allocation::prologue_publishes_y` = "the block touches a `Y` slot"
+  (`y_last.is_some()`), and `regalloc.rs`'s `y_first`/`frame_republish_first` derivation survives as the
+  analysis record the counters and tests read, not as a suppression of the publish.
   See `emit/CONTEXT.md`.
 
 
