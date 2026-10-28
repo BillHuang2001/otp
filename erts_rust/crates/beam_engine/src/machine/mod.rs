@@ -495,6 +495,31 @@ pub struct Machine {
     /// writes back (see [`Machine::loose_heap_terms`]). No argument about an
     /// allocation-free window is needed — and none is made.
     pub(crate) pending_supplied_term: Option<Eterm>,
+    /// A **one-shot latch** marking [`Machine::pending_supplied_term`] as a
+    /// **verbatim echo** rather than a preserved cooked chain.
+    ///
+    /// `true` means the term the raise about to land supplies is the
+    /// `erlang:raise/3` **third argument itself**
+    /// ([`beam_common::Raise::supplied_trace`]), so the cooked stacktrace is that
+    /// term returned unchanged — C's `build_stacktrace` `is_raised_exc` arm, which
+    /// echoes a supplied trace with no resolution and no re-encoding
+    /// (`../../erts/emulator/beam/beam_common.c:1219-1223`). `false` (the default)
+    /// means the term is the preserved cooked chain
+    /// [`Instr::RawRaise`](beam_loader::Instr) supplies, which the uncaught funnel
+    /// renders from [`Machine::raise_snapshot`].
+    ///
+    /// The distinction is what makes an **explicitly empty** supplied trace
+    /// observable: `raise(_, _, [])` arrives as the term [`NIL`], which is
+    /// word-identical to "no trace supplied", so the term alone cannot select the
+    /// echo.
+    ///
+    /// Armed by [`Machine::raise_error`] **immediately before** the
+    /// `throw_with_trace` that lands the raise, and consumed by that call (see
+    /// [`Machine::raise_supplied_term_verbatim`]) — the same two-latch protocol as
+    /// [`Machine::pending_callee_head`]. It is metadata (`bool`) only: the term it
+    /// describes rides the latches above, which [`Machine::with_roots`] already
+    /// parks and re-seats.
+    pub(crate) pending_supplied_term_verbatim: bool,
     /// The **live raise** state behind [`Machine::pending_supplied_trace`]: the
     /// explicit frames the raise currently in flight arrived carrying.
     ///
@@ -533,6 +558,28 @@ pub struct Machine {
     /// back (see [`Machine::loose_heap_terms`]). A collection between the raise and
     /// its consumption therefore **relocates** the cooked list instead of stranding it.
     pub(crate) raise_supplied_term: Option<Eterm>,
+    /// The **live raise** state behind [`Machine::pending_supplied_term_verbatim`]:
+    /// `true` while the raise currently in flight supplies its trace as a
+    /// **verbatim echo** (C's `is_raised_exc` arm — the `erlang:raise/3` third
+    /// argument returned unchanged, `[]` included).
+    ///
+    /// [`Machine::throw_with_trace`] sets it from the one-shot latch on **every**
+    /// fresh raise (so a raise that supplies none clears it), and the two consumers
+    /// take it **exactly once**:
+    ///
+    /// * the caught path
+    ///   ([`crate::families::exceptions::stacktrace::symbolic_stacktrace`]) returns
+    ///   the raise's raw-trace register word — where the landing published the term
+    ///   ([`Machine::land_exception`]) — **unchanged**, with no decode, no atom
+    ///   resolution, no re-encode and no frame counting;
+    /// * the uncaught path ([`Machine::with_uncaught_frames`]) consumes it and
+    ///   renders **no** frames: the supplied term is the whole answer, and the
+    ///   engine's frame model cannot express it (an argument list in the `A` slot),
+    ///   so deriving one from [`Machine::raise_snapshot`] — which a supplied raise
+    ///   deliberately does not rebuild — would be an invented trace.
+    ///
+    /// Metadata (`bool`) only, so it needs no rooting.
+    pub(crate) raise_supplied_term_verbatim: bool,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -941,8 +988,10 @@ impl Machine {
             raise_error_info: None,
             pending_supplied_trace: None,
             pending_supplied_term: None,
+            pending_supplied_term_verbatim: false,
             raise_supplied_trace: None,
             raise_supplied_term: None,
+            raise_supplied_term_verbatim: false,
             refc_binaries: Vec::new(),
             writable_payloads: Vec::new(),
             args_scratch: Vec::new(),

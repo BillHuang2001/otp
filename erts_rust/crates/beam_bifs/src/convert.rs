@@ -93,7 +93,9 @@
 use core::cmp::Ordering;
 
 use beam_codec::term as codec_term;
-use beam_common::{AtomName, BeamError, ExceptionClass, Result, SourceLocation, StackFrame, StackTrace};
+use beam_common::{
+    AtomName, BeamError, ExceptionClass, LiveReason, Result, SourceLocation, StackFrame, StackTrace,
+};
 use beam_term::{atom_val, is_byte, make_atom, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access;
@@ -722,10 +724,12 @@ fn decode_location(atoms: &AtomTable, location: Eterm) -> Result<Option<SourceLo
 /// # Errors
 ///
 /// [`unsupported_bif`] for every frame the oracle accepts but a [`StackFrame`]
-/// cannot express — an `erl_eval`-style `{Fun, Args[, Location]}` **call frame**
-/// (it names no module/function), a 3rd element that is an argument list or any
+/// cannot express — an `erl_eval`-style `{Fun, Args[, Location]}` **call frame** (it
+/// names no module/function), a 3rd element that is an argument list or any
 /// other non-`0..=255` value (`-1`, `256`, a float), an unnameable module/function,
 /// or a location [`decode_location`] rejects. Never a truncated or invented frame.
+/// The refusal is **not** observable on the raise path: [`raise_3`] keeps the third
+/// argument as a term, which is what the oracle echoes (see [`decode_stacktrace`]).
 fn decode_stacktrace_frame(atoms: &AtomTable, frame: Eterm) -> Result<StackFrame> {
     // Restates `decode_stacktrace`'s precondition: every frame was accepted by
     // `is_stacktrace_frame` before this runs, so this is the frame shape guard that
@@ -772,18 +776,46 @@ fn decode_stacktrace_frame(atoms: &AtomTable, frame: Eterm) -> Result<StackFrame
     })
 }
 
-/// Decodes a **validated** `raise/3` stacktrace argument into the frames the engine
-/// renders verbatim.
+/// Decodes a **validated** `raise/3` stacktrace argument into the frames a
+/// [`StackTrace`] can express.
 ///
-/// The empty list decodes to the **empty** [`StackTrace`], which leaves the engine's
-/// supplied-trace latch unarmed (so `raise(_, _, [])` keeps its derived stacktrace);
-/// every other element must decode, and one that cannot is the typed gap (see
-/// [`decode_stacktrace_frame`]).
+/// # The oracle echoes this argument verbatim
+///
+/// Measured on `erl` 29 / erts-17.1 with a compiled module, `raise/3`'s third
+/// argument comes back **unchanged** in a handler's cooked trace — C's
+/// `build_stacktrace` returns a supplied trace with no resolution, no re-encoding and
+/// no shape validation (`is_raised_exc` ⇒ `get_args_from_exc`,
+/// `../../erts/emulator/beam/beam_common.c:1219-1223`), after `raise_3` itself has
+/// only *validated* the frames (`../../erts/emulator/beam/bif.c:1580-1624`):
+///
+/// ```text
+/// raise(error, boom, [])                                    ⇒ []
+/// raise(error, boom, [{m,f,[1,2],[]}])                      ⇒ [{m,f,[1,2],[]}]
+/// raise(error, boom, [{unknown_mod,f,1,[{file,"z.erl"},{line,3}]}])
+///                                                           ⇒ echoed as-is
+/// raise(error, boom, [{m,f,1}])                             ⇒ [{m,f,1,[]}]  (normalized)
+/// ```
+///
+/// So the `A` slot **may be an argument list**, a frame may name a module that is not
+/// loaded, and the empty list is a supplied trace like any other. [`StackFrame`] can
+/// express none of the first two (its arity is a `u8`) and cannot distinguish `[]`
+/// from "nothing supplied", which is why [`raise_3`] attaches the third argument to
+/// the raise **as a term** ([`beam_common::Raise::supplied_trace`]) and the re-raise
+/// path no longer goes through this decoder: the engine echoes the term.
+///
+/// This decoder is therefore a **best-effort enrichment**: it answers the frames the
+/// engine cooks for a trace whose elements are representable (which reproduces the
+/// oracle, `{M,F,A}` included, because the frames route renders the normalized
+/// `{M,F,A,[]}`), and the caller keeps the term for everything else. Its refusal is
+/// **not** a raised error any more.
 ///
 /// # Errors
 ///
-/// [`unsupported_bif`] for an unrepresentable frame; the trace itself has already
-/// passed [`is_stacktrace`], so a non-list never reaches the `proper_list` failure.
+/// [`unsupported_bif`] for a frame a [`StackFrame`] cannot express (see
+/// [`decode_stacktrace_frame`]). This is the documented **residual** shape gap — the
+/// armed term makes it unobservable on the raise path, and the model is not
+/// widened by inventing an arity. The trace itself has already passed
+/// [`is_stacktrace`], so a non-list never reaches the `proper_list` failure.
 fn decode_stacktrace(atoms: &AtomTable, stacktrace: Eterm) -> Result<StackTrace> {
     let frames = proper_list(stacktrace).ok_or_else(unsupported_bif)?;
     let mut decoded = StackTrace::new();
@@ -828,24 +860,31 @@ fn attach_stacktrace(err: BeamError, stacktrace: StackTrace) -> BeamError {
 /// try erlang:raise(error, foo, x)    catch C:R -> {C,R} end  ⇒ badarg  (*returned*)
 /// ```
 ///
-/// A **valid** trace is decoded into the returned raise's
-/// [`StackTrace`](beam_common::StackTrace) ([`decode_stacktrace`]), which the engine
-/// renders verbatim instead of deriving the frames its raise snapshot would
-/// (`build_stacktrace` returns a supplied trace unchanged). The empty list decodes
-/// to the empty trace, so `raise(_, _, [])` is unchanged. Pinned live (erts-17.1):
+/// A **valid** trace is attached to the returned raise **as a term** — the third
+/// argument verbatim, in the
+/// [`supplied_trace`](beam_common::Raise::supplied_trace) slot — because that is
+/// exactly what the oracle does with it: `build_stacktrace` echoes a supplied trace
+/// with no resolution, no re-encoding and no shape validation
+/// (`../../erts/emulator/beam/beam_common.c:1219-1223`), i.e. whatever
+/// [`decode_stacktrace`] can or cannot express. Pinned live (erts-17.1, compiled
+/// module):
 ///
 /// ```text
+/// raise(error, foo, [])                     ⇒ []          (the empty trace is kept)
 /// raise(error, foo, [{lists,map,2,[{file,"lists.erl"},{line,1234}]}])
 ///   ⇒ the trace is echoed verbatim
-/// raise(error, foo, [{m,f,1}])  /  [{m,f,1,[]}]  ⇒  [{m,f,1,[]}]
+/// raise(error, foo, [{m,f,[1,2],[]}])       ⇒ [{m,f,[1,2],[]}]   (an argument list in A)
+/// raise(error, foo, [{unknown_mod,f,1,[{file,"z.erl"},{line,3}]}])
+///   ⇒ echoed as-is (the module need not be loaded)
+/// raise(error, foo, [{m,f,1}])              ⇒ [{m,f,1,[]}]  (normalized by the oracle's copy)
 /// ```
 ///
-/// A trace element the oracle echoes but a
-/// [`StackFrame`](beam_common::StackFrame) cannot express (an `erl_eval`-style
-/// `{Fun,Args}` **call** frame, an argument list or an out-of-`0..=255` value in the
-/// arity slot, a location that is not exactly `[{file,CharList},{line,Integer}]`) is
-/// raised as [`unsupported_bif`], never as the returned `badarg`: the argument *is*
-/// valid, so it is a capability gap, and an invented frame would be a wrong result.
+/// The decoded [`StackTrace`](beam_common::StackTrace) ([`decode_stacktrace`]) is
+/// kept **as well** whenever the trace's elements are representable, because that is
+/// the model the engine cooks for such a trace (and it reproduces the oracle's
+/// `{M,F,A}` ⇒ `{M,F,A,[]}` normalization). A trace element the model cannot express
+/// is no longer a capability gap: the raise carries the term, and the engine echoes
+/// **that** — never a fabricated arity.
 fn raise_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // The class is resolved first (`bif.c:1563-1572`), then the stacktrace shape
     // (`bif.c:1580-1624`); either failure is the returned `badarg` atom. The class
@@ -857,9 +896,14 @@ fn raise_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !is_stacktrace(args[2]) {
         return ctx.intern_atom("badarg");
     }
-    // The 3rd argument is a *valid* stacktrace: decode it into the frames the engine
-    // renders verbatim. Encoding stops here for an element no frame can express.
-    let stacktrace = decode_stacktrace(ctx.atoms(), args[2])?;
+    // The 3rd argument is a *valid* stacktrace, and it is the raise's **trace term**:
+    // read once, and nothing below may allocate on the BEAM heap before the raise is
+    // returned, because the engine publishes this word into its frozen root set as
+    // soon as it receives the raise. The decode is a best-effort enrichment (it only
+    // builds Rust-side values): a `None` means "the frames model cannot express this
+    // trace", which the term already covers.
+    let supplied_trace = args[2];
+    let stacktrace = decode_stacktrace(ctx.atoms(), supplied_trace).ok();
     let err = if !access::is_atom(args[1]) {
         // `c_p->fvalue = value` (`bif.c:1564-1571`): a non-atom reason is the
         // argument term itself, whatever the class.
@@ -876,7 +920,24 @@ fn raise_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             _ => raise_error(reason),
         }
     };
-    Err(attach_stacktrace(err, stacktrace))
+    let err = match stacktrace {
+        Some(stacktrace) => attach_stacktrace(err, stacktrace),
+        None => err,
+    };
+    Err(attach_supplied_trace(err, supplied_trace))
+}
+
+/// Attaches the caller-supplied trace **term** to the raise `err` carries.
+///
+/// Every path of [`raise_3`] builds a [`BeamError::Raise`] (`raise_term` and the
+/// three `raise_*` builders always do), so that arm is the one taken; any other error
+/// is returned unchanged rather than wrapped in a fabricated raise — the same
+/// discipline [`attach_stacktrace`] follows.
+fn attach_supplied_trace(err: BeamError, trace: Eterm) -> BeamError {
+    match err {
+        BeamError::Raise(raise) => BeamError::Raise(raise.with_supplied_trace(LiveReason::new(trace))),
+        other => other,
+    }
 }
 
 /// The atom naming the **local** node — the node every internal pid/port/ref
@@ -2064,26 +2125,30 @@ mod tests {
         }
     }
 
-    /// Asserts `result` is the typed `unsupported_bif` capability gap for a trace
-    /// element the oracle accepts but a frame cannot express — an `error`-class raise
-    /// whose reason is that atom, **never** the returned `badarg` atom (the argument
-    /// is valid, so it is a gap, not an argument error).
-    fn assert_unsupported_bif(result: Result<Eterm>, what: &str) {
+    /// Asserts `result` carries the raise with **no decoded frames** but the trace
+    /// **term** verbatim — the shapes a [`StackFrame`] cannot express. The oracle
+    /// echoes the supplied trace unchanged, so the raise must carry the term for the
+    /// engine to echo (`Raise::supplied_trace`), and the argument is valid, so it is
+    /// **never** the returned `badarg` atom.
+    fn assert_supplied_trace_verbatim(result: Result<Eterm>, trace: Eterm, what: &str) {
         assert!(
             !matches!(&result, Err(BeamError::BadArg)),
             "{what}: a *valid* trace element was reported as the returned badarg"
         );
-        match result {
-            Err(BeamError::Raise(raise)) => {
-                assert_eq!(raise.class, ExceptionClass::Error, "{what}: the class");
-                assert_eq!(
-                    raise.reason,
-                    beam_common::ExitReason::atom("unsupported_bif"),
-                    "{what}: the typed gap"
-                );
-            }
-            other => panic!("{what}: expected the typed unsupported_bif, got {other:?}"),
-        }
+        let raise = trace_raise(result);
+        assert_eq!(raise.class, ExceptionClass::Error, "{what}: the class");
+        assert!(
+            raise.stacktrace.is_empty(),
+            "{what}: a frame the `StackTrace` model cannot express must not decode"
+        );
+        assert_eq!(
+            raise
+                .supplied_trace()
+                .and_then(|slot| slot.downcast_ref::<Eterm>())
+                .copied(),
+            Some(trace),
+            "{what}: the third argument must ride the raise verbatim"
+        );
     }
 
     /// A `[{file, FileName}, {line, N}]` location with an ASCII `file` char list.
@@ -2177,10 +2242,12 @@ mod tests {
         });
     }
 
-    /// The empty trace decodes to the empty [`StackTrace`], which leaves the
-    /// engine's supplied-trace latch unarmed — today's behaviour, byte for byte.
+    /// The empty trace decodes to the empty [`StackTrace`] **and** rides the raise as
+    /// a term: `[]` is a *supplied* trace like any other (the oracle echoes it —
+    /// `try erlang:raise(error,boom,[]) catch _:_:S -> S end` ⇒ `[]`), which is the
+    /// discriminator neither the decoded frames nor [`StackTrace`] can carry.
     #[test]
-    fn raise_decodes_an_empty_stacktrace_as_empty() {
+    fn raise_carries_an_empty_stacktrace_as_its_term() {
         with_trace_ctx(|ctx| {
             let error = ctx.atom("error").expect("seeded");
             let foo = ctx.atom("foo").expect("seeded");
@@ -2189,6 +2256,14 @@ mod tests {
             assert!(raise.stacktrace.is_empty());
             assert_eq!(raise.stacktrace.len(), 0);
             assert_eq!(raise.stacktrace, StackTrace::new());
+            assert_eq!(
+                raise
+                    .supplied_trace()
+                    .and_then(|slot| slot.downcast_ref::<Eterm>().copied()),
+                Some(empty),
+                "an explicitly empty supplied trace must ride the raise as a term"
+            );
+            assert!(access::is_nil(empty), "the fixture's `[]` is NIL");
         });
     }
 
@@ -2208,6 +2283,15 @@ mod tests {
             assert_eq!(
                 raise.stacktrace.frames,
                 vec![StackFrame::new(AtomName::new("m"), AtomName::new("f"), 3)]
+            );
+            // A decodable trace rides **both** models: the frames (which reproduce the
+            // oracle's `{m,f,3}` ⇒ `{m,f,3,[]}` normalization) and the term.
+            assert_eq!(
+                raise
+                    .supplied_trace()
+                    .and_then(|slot| slot.downcast_ref::<Eterm>().copied()),
+                Some(trace),
+                "the third argument also rides the raise verbatim"
             );
         });
     }
@@ -2248,9 +2332,10 @@ mod tests {
     }
 
     /// Every trace element the oracle echoes verbatim but a [`StackFrame`] cannot
-    /// express is the typed `unsupported_bif` raise — never the returned `badarg`
-    /// (the argument *is* valid) and never a truncated or invented frame. Ground
-    /// truth (erts-17.1, each shape echoed back unchanged by the oracle):
+    /// express rides the raise **as the third argument, verbatim** — never the
+    /// returned `badarg` (the argument *is* valid), never a truncated or invented
+    /// frame, and no longer a raised `unsupported_bif` capability gap. Ground truth
+    /// (erts-17.1, each shape echoed back unchanged by the oracle):
     ///
     /// ```text
     /// [{m,f,[a,b],[]}]                    ⇒ [{m,f,[a,b],[]}]
@@ -2263,8 +2348,12 @@ mod tests {
     /// [{m,f,1,[{file,"x"},{line,-1}]}]    ⇒ accepted verbatim
     /// [{m,f,1,[{file,[1114112]},{line,1}]}] ⇒ accepted verbatim
     /// ```
+    ///
+    /// The decoder's own refusal is still pinned — it is the documented residual
+    /// shape gap of the [`StackTrace`] **model**, which the armed term makes
+    /// unobservable on the raise path.
     #[test]
-    fn raise_reports_unrepresentable_trace_elements_as_unsupported_bif() {
+    fn raise_carries_unrepresentable_trace_elements_verbatim() {
         with_trace_ctx(|ctx| {
             let error = ctx.atom("error").expect("seeded");
             let foo = ctx.atom("foo").expect("seeded");
@@ -2339,7 +2428,13 @@ mod tests {
             ];
 
             for (what, trace) in traces {
-                assert_unsupported_bif(raise_3(ctx, &[error, foo, trace]), what);
+                assert_supplied_trace_verbatim(raise_3(ctx, &[error, foo, trace]), trace, what);
+                // The enforced residual: the frames model still refuses the shape, so
+                // the engine can only echo the term (never fabricate an arity).
+                assert!(
+                    decode_stacktrace(ctx.atoms(), trace).is_err(),
+                    "{what}: the frames model must not pretend to express it"
+                );
             }
         });
     }
