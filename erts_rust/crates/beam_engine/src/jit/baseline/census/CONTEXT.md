@@ -234,6 +234,7 @@ push fails in the emitter instead of at run time; its behavioural twin is
 rows), so every visited `Allocate` instance takes the in-block arm; and the corpus-wide emitted
 bytes and every block/instance/deopt counter are **identical** at `e6ba57dff9` and at `6be815d640`,
 each side censusing its own corpus:
+
 | figure | `e6ba57dff9` | `6be815d640` |
 |---|---|---|
 | corpus | 38 fixtures (422 functions) + 1321 OTP (102 646 functions) = **1359** modules / **103 068** functions | identical |
