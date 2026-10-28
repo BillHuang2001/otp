@@ -219,9 +219,11 @@ Every other form falls through to one interpreter step: a non-boxed word, a lite
 the family reads them the same way), a bare `BinRef`, a non-refc `ErlSubBits`, and every non-bitstring.
 The arm mutates nothing, so it is deopt-idempotent by construction; `jit_step_one` re-executes the instruction and
 re-reads the same words.
-Pinned by `../../bs_match_deopt_tests.rs`'s three refc rows (16 KiB whole window, a 4-bit-offset window, and a non-refc
-`ErlSubBits` that must still decline, each with a **zero run-time `BsMatch` deopt** count on the accepted forms — the
-value alone also passes for an arm that deopts every time).
+Two suites pin it, and they are not interchangeable.
+`../../bs_match_deopt_tests.rs` section 9 (`a_bs_match_over_an_off_heap_refc_window_takes_no_interpreter_step`) is the **whole-program** row: the real `erlc`-built `long_append` bench program over a 16 KiB subject the engine's own append path built, asserting the 64 KiB result byte for byte, a **zero** `BsMatch` deopt count, and that `bitstr::bitstr_calls` is not the per-element route.
+Section 10 is the synthetic `refc_window` trio — the accepted path (also pinning the **cache-free** static emission: `emitted_shapes` contains `SHAPE_BS_MATCH` and `static_deopts == 0`), a 4-bit-offset window (the `start % 8` byte-base/bit-position arithmetic, which section 9's byte-aligned subject cannot see), and a non-refc `ErlSubBits` that must still decline and agree with the interpreter.
+On the value-and-deopt axis section 10's first row is a **weaker duplicate** of section 9 — it is kept for its static-emission pin and because it needs no `erlc`; deleting either the offset row or the decline row would unpin real behaviour, not a duplicate.
+The value alone proves nothing on any row: a deopted instruction runs on the interpreter on both tiers, so an arm silently degraded back to one step per element still agrees.
 
 ### The on-heap subject guard's mask invariant
 `emit_subject_view` proves the on-heap form by masking the header word with `BITSTRING_TAG_MASK` (`0x3B`) — the tag field only — and comparing the result against `HEAP_BITS_SUBTAG` (`0x20`).
