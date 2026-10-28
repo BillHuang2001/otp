@@ -221,7 +221,7 @@ maximum-width construction arm nor a longest literal pattern or character sequen
 under-allocate the `CodeBuffer`.
 
 ### The `allocate` arm — one helper call, and its zero-delta two-tree check
-Table 4 has **no `allocate` row**: the per-kind instrument prices sixteen shapes plus the unlinked
+Table 4 has **no `allocate` row**: the per-kind instrument prices seventeen shapes from sixteen arms plus the unlinked
 `call_last` exit, and the frame push is not among them.
 The arm's emission is therefore checked in two other ways, both recorded here.
 **Shape (emitter pin).** `../emit/heap.rs::the_allocate_arm_pushes_the_frame_with_a_helper_call_only`

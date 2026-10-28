@@ -179,7 +179,7 @@ This node has **no child directories** — `CONTEXT.md` is its only file — so 
 - `../emit/prologue/CONTEXT.md` → the Y-window publish/refresh mechanism and the `prologue_publishes_y` soundness argument whose measurements are above.
 - `../emit/regalloc/CONTEXT.md` → the register picker and the `y_first`/`frame_republish_first` derivation; `../emit/regs/CONTEXT.md` → the register cache, the dirty-set spill and the partial fill (the refill lever measured here).
 - `../emit/link/CONTEXT.md` → `ExitSpill` (the single-spill exit), the frame teardown and the in-block transfer arm.
-- `../emit/bitstr_inline/CONTEXT.md` → the sixteen native `Bs*` shapes and the `bs_create_bin` construction routes whose helper cut the `foreign` deltas price.
+- `../emit/bitstr_inline/CONTEXT.md` → the seventeen native `Bs*` shapes from sixteen arms, and the `bs_create_bin` construction arm's routes, whose helper cut the `foreign` deltas price.
 - `../inlineset/CONTEXT.md` → the authoritative inline set: which groups lower in-block, every run-time guard, and the do-not-re-open levers.
 - `../census/CONTEXT.md` → the deopt/execution/code-size censuses, the live corpus totals and the three instruction-counting bases — the source for every counter named here.
 - `../testing/CONTEXT.md` → the in-node test enumeration (incl. the `bs_match` deopt-idempotency and `foreign` kernel parity suites).
