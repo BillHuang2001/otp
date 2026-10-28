@@ -317,10 +317,11 @@ fn emit_list_read(
     // The guard: `is_not_list(source)` — a non-cons source (`[]`, a small int, an
     // atom, a tuple) branches to the helper, which raises `{badmatch, Source}`.
     //
-    // Five instructions: `test` sets ZF from `word & NOT_LIST_MASK` without writing
-    // its operand (the same bits the `and`/`cmp` pair compared), and the untag then
-    // reuses the loaded word via `and_ri` — so neither the reload of the source nor
-    // either ten-byte `movabs` constant is needed.
+    // Four instructions after the source load (five in all: 23 B for a cached-register
+    // source, against 41 B and eight instructions before). `test` sets ZF from
+    // `word & NOT_LIST_MASK` without writing its operand (the same bits the `and`/`cmp`
+    // pair compared), so the untag reuses the loaded word via `and_ri` — neither the
+    // reload of the source nor either ten-byte `movabs` constant is needed.
     shape
         .source
         .load(buffer, allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, fallback, highest_touched)?;
