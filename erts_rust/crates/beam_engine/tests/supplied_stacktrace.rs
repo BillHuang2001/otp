@@ -167,25 +167,42 @@ fn a_name_only_the_live_namespace_knows_is_cooked() {
         "the module's snapshot must not name the frame's atoms"
     );
 
+    let mut located = StackFrame::new("ranch_acceptors_sup", "init", 1);
+    located.location = Some(SourceLocation {
+        file: AtomName::new("x.erl"),
+        line: 1,
+    });
     let frames = StackTrace {
-        frames: vec![StackFrame::new("ranch_acceptors_sup", "init", 1)],
+        frames: vec![located],
     };
     let mut ctx = MinimalContext::with_shared_atoms(live.clone());
     let cooked = beam_engine::encode_supplied_stacktrace(&module, &mut ctx, &frames)
         .expect("the live namespace names every atom the frame uses");
 
+    // The oracle echoes the supplied item verbatim:
+    // `[{ranch_acceptors_sup,init,1,[{file,"x.erl"},{line,1}]}]`.
     let mut expected_ctx = MinimalContext::new();
     let atom = |name: &str| make_atom(live.lookup(name).expect("the live namespace names it"));
+    let chars: Vec<Eterm> = "x.erl".chars().map(|ch| make_small(ch as i64)).collect();
+    let name =
+        beam_engine::terms::make_list(&mut expected_ctx, &chars).expect("the char list fits");
+    let file_pair = beam_engine::terms::make_tuple(&mut expected_ctx, &[atom("file"), name])
+        .expect("the {file,Name} pair fits");
+    let line_pair = beam_engine::terms::make_tuple(&mut expected_ctx, &[atom("line"), make_small(1)])
+        .expect("the {line,N} pair fits");
+    let location =
+        beam_engine::terms::make_list(&mut expected_ctx, &[file_pair, line_pair]).expect("location");
     let item = beam_engine::terms::make_tuple(
         &mut expected_ctx,
-        &[atom("ranch_acceptors_sup"), atom("init"), make_small(1), NIL],
+        &[atom("ranch_acceptors_sup"), atom("init"), make_small(1), location],
     )
     .expect("the item tuple fits the context heap");
     let expected = beam_engine::terms::make_list(&mut expected_ctx, &[item])
         .expect("the expected list fits the context heap");
     assert!(
         cmp(cooked, expected, &live).is_eq(),
-        "the encoder must cook [{{ranch_acceptors_sup,init,1,[]}}] from the live namespace"
+        "the encoder must cook [{{ranch_acceptors_sup,init,1,[{{file,\"x.erl\"}},{{line,1}}]}}] \
+         from the live namespace (all four names: module, function, file, line)"
     );
 }
 
