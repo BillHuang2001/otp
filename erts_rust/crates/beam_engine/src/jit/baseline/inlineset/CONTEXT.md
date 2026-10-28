@@ -189,6 +189,7 @@ Which refusals occur in the corpus is **measured**, not asserted here: `emit/tes
 - **A predicate must not pre-empt a family typed error**: an out-of-range string-table offset or a missing pattern stays the family's own `unsupported`, so the shape declines rather than reporting it.
 - **Compile-time pattern bytes and constant stores are copies, never pointers**, because a cached block can outlive the `Arc<Module>` whose string/literal area it was compiled against.
 - **`CACHE_REGISTERS` is 5**; `rbx` is the `machine.x` base, `rsp`+`RUNTIME_SLOT_DISP` the `rt` slot, `r10`/`r11` within-instruction scratch only.
+- **A frame-changing instruction stays a helper call.** `allocate` is one `jit_allocate` call plus the continue arm; an inline push would have to keep the `Y` window re-derivable at **every** enterable address (never a mid-block-only publication), prove no emitted code runs between a store move and the next publication, and pin its emission counter — the store inventory and its two rules are `../emit/CONTEXT.md`'s.
 - **This node adds no `unsafe`**; the emitter modules keep their `// SAFETY:` rationales. Files ~1000 lines, and a legitimately long one documents why at its top.
 
 ## Test Strategy
