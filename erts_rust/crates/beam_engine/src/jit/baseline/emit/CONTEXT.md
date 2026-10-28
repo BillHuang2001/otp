@@ -346,8 +346,8 @@ by construction).
 
 ## Store-mutation inventory (the published `machine.stack`/`machine.frames` slots)
 
-No emitted code reads `JitRuntime::stack_store`/`frames_store`/`frame_template` today: the frame push is a `jit_allocate` helper call, so every store mutation happens in Rust.
-The inventory below is the precondition any future inline push would have to satisfy.
+No emitted code reads `JitRuntime::stack_store`/`frames_store`/`frame_template`, and no emitted code writes either `PubVec` header: a frame-changing instruction is exactly one helper call (`jit_allocate`/`jit_allocate_heap`/`jit_trim`/`jit_deallocate`), so every store mutation happens in Rust and the published Y window stays re-derivable from `Machine` state at every enterable address.
+The inventory below is therefore the **precondition any future inline frame push would have to meet**, not a description of emitted traffic: such a push would have to name every site that can move `machine.stack`/`machine.frames`, prove that no emitted code runs between a move and the publication that follows it, and keep its Y-window publication re-derivable at every enterable address rather than mid-block only.
 `JitRuntime::stack_store`/`frames_store` are `*mut PubVec<…>` and the store header's
 `ptr`/`len`/`cap` **are** the truth — an emitted push and every Rust accessor would read and
 write the same words, so there is no mirror to commit and no staleness window.
