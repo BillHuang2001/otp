@@ -406,7 +406,13 @@ where
     // payload around it on a scratch arena, then copy the whole graph in one go.
     let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
     let payload = build(&mut scratch, reason)?;
-    let start = held_words.map(|words| words.saturating_add(FRAGMENT_SLACK_WORDS));
+    // The apply-time route holds **no** price (see the fn docs), so it starts at
+    // `SIGNAL_FRAGMENT_FLOOR_WORDS`; a held price is a lower bound the caller already paid for and
+    // gets this route's slack. `copy_into_fragment` adds its own tag slack on top and re-reserves
+    // monotonically from the copy's refusal, so neither figure is a correctness requirement.
+    let start = Some(held_words.map_or(SIGNAL_FRAGMENT_FLOOR_WORDS, |words| {
+        words.saturating_add(FRAGMENT_SLACK_WORDS)
+    }));
     // `copy_struct` walks the graph by pointer, so the heap-resident `reason` subtree is copied
     // in too; the source process's persistent off-heap table resolves its refc binaries/MSO, and
     // the copy's own refusal re-reserves the fragment monotonically.

@@ -55,7 +55,7 @@
 //! one source table per call.
 
 use beam_alloc::Heap;
-use beam_common::{AllocFailure, AllocKind, BeamError, Result};
+use beam_common::{AllocKind, BeamError, Result};
 use beam_message::{copy_struct, CopyContext, HeapFragment, OffHeapTable};
 use beam_term::prelude::{is_boxed_term, is_immediate, is_list, is_literal, Eterm};
 use beam_term::size_object;
@@ -156,13 +156,6 @@ impl TagSlot {
         self.root
     }
 
-    /// The off-heap table the tag word's references resolve against: the slot's own fragment table
-    /// for an owned copy, `None` for a heap-independent word (which references nothing off-heap by
-    /// construction).
-    pub(crate) fn off_heap(&self) -> Option<&OffHeapTable> {
-        self.fragment.as_ref().map(HeapFragment::off_heap)
-    }
-
     /// Whether this slot owns a fragment — i.e. whether the tag must be copied before it can be
     /// embedded in a term on some other heap.
     pub(crate) fn is_fragment_backed(&self) -> bool {
@@ -170,6 +163,11 @@ impl TagSlot {
     }
 
     /// The heap words the slot's own copy occupies (`0` for a heap-independent tag).
+    ///
+    /// It is the source-occupancy figure the staging arena is sized from, so
+    /// [`stage_sources`] needs no [`size_object`] walk over the fragment's graph: the fragment
+    /// already holds exactly that graph, and a copy into the arena cannot need fewer words than it
+    /// occupies (an under-estimate is re-reserved monotonically from the copy's own refusal).
     pub(crate) fn fragment_words(&self) -> usize {
         self.fragment.as_ref().map_or(0, HeapFragment::used)
     }
@@ -287,9 +285,9 @@ pub(crate) fn stage_sources(
 ) -> Result<StagedSources> {
     let mut capacity = STAGE_FLOOR_WORDS.saturating_add(extra_words);
     if let Some(slot) = tag {
-        if slot.is_fragment_backed() {
-            capacity = capacity.saturating_add(size_object(slot.root()));
-        }
+        // The fragment already holds the tag's graph, so its used words are the destination figure
+        // — O(1), no walk of the tag's shape.
+        capacity = capacity.saturating_add(slot.fragment_words());
     }
     if !is_immediate(reason) {
         capacity = capacity.saturating_add(size_object(reason));
@@ -354,19 +352,6 @@ fn stage_into(
     Ok((staged_tag, staged_reason))
 }
 
-/// The destination price, in words, of the payload a refusal refused — or `None` when the refusal
-/// carries no such price.
-///
-/// Only an [`AllocKind::Message`] refusal is the copier's preflight figure. A [`AllocKind::Heap`]
-/// one is some *other* allocation (an off-heap slot table growing, say) whose byte count says
-/// nothing about the payload, and is never used as a reservation.
-pub(crate) fn refused_payload_words(failure: AllocFailure) -> Option<usize> {
-    match failure.kind {
-        AllocKind::Message => refused_words(failure.requested),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Unit tests for the tag's ownership model: the immediate/literal no-allocation rule, the
@@ -426,7 +411,6 @@ mod tests {
         assert!(!slot.is_fragment_backed());
         assert_eq!(slot.root(), tag, "the caller's own word is stored");
         assert_eq!(slot.fragment_words(), 0, "no fragment was reserved");
-        assert!(slot.off_heap().is_none(), "an immediate references nothing off-heap");
         // The transfer is the identity — no copy, so a receiver keeps the same word.
         let mut process = process(1);
         assert_eq!(
@@ -512,13 +496,25 @@ mod tests {
         // SAFETY: the heap has the pair's words and `binary` keeps the payload alive.
         let tag = unsafe { bin_ref_pair(&mut source, &binary) };
         let slot = TagSlot::new(tag, &table).expect("the binary-carrying tag is copied");
+        // The slot's **own** table is what its copy is resolved against: staging the tag through
+        // the public transfer re-registers the payload in the staging table, which is the same
+        // resolution `copy_into_heap` performs for a destination process.
+        let mut staged_heap = Heap::new(ERL_REFC_BITS_SIZE + 4).expect("a staging heap");
+        let mut staged_table = OffHeapTable::new();
+        let staged = slot
+            .stage_into(&mut staged_heap, &mut staged_table)
+            .expect("the tag stages");
         assert!(
-            slot.off_heap()
-                .expect("the slot owns a table")
+            staged_table
                 .binary_by_data_ptr(binary.data_ptr())
                 .is_some(),
-            "the slot's own table holds the payload"
+            "the slot's own table resolved the payload into the staging table"
         );
+        assert!(compare::eq(
+            staged,
+            tag,
+            &beam_term::prelude::AtomTable::new()
+        ));
 
         let mut process = process(2);
         let copied = slot.copy_into_heap(&mut process).expect("the copy fits");
