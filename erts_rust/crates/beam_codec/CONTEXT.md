@@ -299,16 +299,20 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
 
 ## Routing Table
 - `src/` → the implementation node (crate wiring, `tag.rs`, `reader.rs`/`writer.rs`, `atom_cache.rs`,
-  `off_heap.rs`, `compress.rs`, `error.rs`, `ref_wire.rs`, `prelude.rs`); per-file scope and the
+  `off_heap.rs`, `compress.rs`, `error.rs`, `ref_wire.rs`, `prelude.rs`, `scratch.rs` — the reusable
+  encode buffer); per-file scope and the
   source-side constraints in [`src/CONTEXT.md`](./src/CONTEXT.md)
 - `src/decode/` → the `Decoder` state machine: tag arms, input bounds, `[used]` count, the
   local-node identity rules D1–D7, `[safe]` + `ExportGate`, off-heap binaries, map canonicalization,
-  depth bound — [`src/decode/CONTEXT.md`](./src/decode/CONTEXT.md)
-- `src/encode/` → the `Encoder` state machine: minor-version flavours, floats, integer widths,
-  internal ids, funs + `FunIdentity`, records, map key order, the `COMPRESSED` wrapper —
-  [`src/encode/CONTEXT.md`](./src/encode/CONTEXT.md)
+  depth bound, and `container.rs` (the stack-staged tuple/map/list arms) —
+  [`src/decode/CONTEXT.md`](./src/decode/CONTEXT.md)
+- `src/encode/` → the `Encoder` state machine: tag-first dispatch, minor-version flavours, floats,
+  integer widths, internal ids, funs + `FunIdentity`, records, map key order, the `COMPRESSED`
+  wrapper — [`src/encode/CONTEXT.md`](./src/encode/CONTEXT.md)
 - `src/term/` → the only `unsafe` subtree: heap-agnostic writers/readers over `beam_term`, the
-  record definition hash, the oversized-flatmap writer — [`src/term/CONTEXT.md`](./src/term/CONTEXT.md)
+  record definition hash, the oversized-flatmap writer, `classify.rs` (the one boxed-tag read the
+  encoder dispatches on) and `list.rs` (the bulk cons-spine writer) —
+  [`src/term/CONTEXT.md`](./src/term/CONTEXT.md)
 - `tests/` → the 34 integration binaries, their roles and the shared support modules —
   [`tests/CONTEXT.md`](./tests/CONTEXT.md)
 - `examples/` → `etf_attrib.rs` (the codec-alone attribution binary; §Test Strategy)
