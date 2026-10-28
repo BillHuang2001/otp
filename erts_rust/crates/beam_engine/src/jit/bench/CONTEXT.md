@@ -18,10 +18,11 @@ Thirteen workloads, split by how the baseline tier lowers them:
   caller's frame — and therefore the Y slot holding the head — stays live across the recursive call,
   so its `gc_bif '+'/2` names a `Y` operand and a `Y` destination; the tier inlines both behind its
   per-block published frame window, as it does the `Move` guarding the recursion, so the body is
-  mostly native). The only per-level deopts are the `Allocate{2}` frame push and the **non-tail**
-  local `Call`, whose return address `pc + 1` — which `beam_loader` does not cut a block at — has its
-  own native **continuation sub-block**, so the driver re-enters natively at the post-call
-  continuation instead of stepping the block tail one interpreter instruction at a time.
+  mostly native). The frame push is one in-block `jit_allocate` helper call, never a `jit_step_one`
+  step, and so is the **non-tail** local `Call`, whose return address `pc + 1` — which `beam_loader`
+  does not cut a block at — has its own native **continuation sub-block**, so the driver re-enters
+  natively at the post-call continuation instead of stepping the block tail one interpreter
+  instruction at a time.
 * **Inlined** (the tier handles the body natively) — in `inlined.rs`: **`slice:fib/1`** (a real
   `.beam` fixture), **`kernel/2`**, **`wide/2`**, **`aggr/2`** and **`cmp/2`**.
 * **Cross-module** — in `workloads.rs`: **`cross/2`**, a two-module
@@ -59,9 +60,10 @@ Thirteen workloads, split by how the baseline tier lowers them:
   `send_recv(0, Acc) -> Acc; send_recv(N, Acc) -> Self ! {Self, N}, receive {Self, T} ->
   send_recv(N - 1, Acc + T) end` — the same instruction sequence the installed `erlc` emits, with
   `self/0` replaced by a small-int constant in `Y(0)` (one `MinimalContext` process has no `self/0`
-  BIF). Per round, **eight** instructions deopt to `jit_step_one` (the `allocate_heap` frame push,
-  the `put_tuple2` message build, `send`, `loop_rec`, `remove_message`, the two `Y`-operand
-  `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`), while the rest of the body is
+  BIF). The round's frame admission is one in-block `jit_allocate_heap` helper call, not a
+  `jit_step_one` step; the interpreter-step sites are the `put_tuple2` message build, `send`,
+  `loop_rec`, `remove_message`, the two `Y`-operand `gc_bif`s and the `Y`-operand bound-variable
+  `is_eq_exact`, while the rest of the body is
   inlined (the entry clause `is_eq_exact`, the four `move`s, the `is_tuple`/`test_arity` header
   tests, the two `get_tuple_element`s, `swap`, `call_last`). The mailbox is `LoopbackMailbox`, a
   one-process FIFO whose `send_message` enqueues the message the very next `receive` scans, so the
@@ -195,10 +197,12 @@ operand (the head survives in `Y(0)` across the non-tail recursive call) and wri
 (`{y,1}`), and the tier inlines both behind its per-block published frame window, as it does the
 `Move` guarding the recursion. `sum/1` is therefore **not** a deopt-dominated twin of `walk/2`: min of
 3 timed runs is interpreter **4718.7 ns/op** vs baseline-jit **2675.8 ns/op**, i.e. baseline ≈
-**1.76×** the interpreter. The per-level deopts that remain are the `Allocate{2}` frame push and the
-**non-tail** local `Call`; the call's continuation `pc + 1` — which `beam_loader` does not cut a block
-at — has its own native **continuation sub-block**, so the driver re-enters natively at the post-call
-continuation instead of stepping the block tail one interpreter instruction at a time. Both tiers pin
+**1.76×** the interpreter. Both remaining shape costs are in-block: the frame push is one `jit_allocate`
+helper call and the **non-tail** local `Call` is the in-block `jit_call_store` path (a declined callee
+exits to the driver, never to a `jit_step_one` step); the call's continuation `pc + 1` — which
+`beam_loader` does not cut a block at — has its own native **continuation sub-block**, so the driver
+re-enters natively at the post-call continuation instead of stepping the block tail one interpreter
+instruction at a time. Both tiers pin
 the exact triangular sum (`SUM_LENGTH * (SUM_LENGTH + 1) / 2` = 2080).
 
 Full min-of-3 table (min per column), `ns/op` (interpreter → baseline-jit), from
@@ -243,8 +247,9 @@ shared and heavily loaded.
 runtime-level regression: in this in-process, non-blocking loopback the baseline tier is **faster**,
 min-of-3 interpreter **13337.7 ns/op** vs baseline-jit **9268.9 ns/op** (≈ **1.44×**, i.e. ≈ **208.4
 ns** vs ≈ **144.8 ns** per `send` + `receive` round-trip over 64 rounds). The per-round instruction mix
-is **eight** deopts (`allocate_heap`, `put_tuple2`, `send`, `loop_rec`, `remove_message`, the two
-`Y`-operand `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`) against an inlined remainder
+is a fixed list of interpreter-step sites (`put_tuple2`, `send`, `loop_rec`, `remove_message`, the two
+`Y`-operand `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`) — the round's `allocate_heap`
+frame admission is an in-block helper call, not one of them — against an inlined remainder
 (the entry clause `is_eq_exact`, four `move`s, `is_tuple`/`test_arity`, two `get_tuple_element`s,
 `swap`, `call_last`), and here the inlined work outweighs the deopt overhead — so the shape does
 **not** reproduce the runtime-level 2.15×–3.31× default-tier deficit on the two-process `send_recv`

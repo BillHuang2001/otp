@@ -46,9 +46,9 @@
 //!   x-register: `push_frame` grows `machine.stack` and pushes a `Frame`, and `trim`
 //!   shifts the stack and renumbers the frame's Y slots. Like
 //!   [`super::emit_deallocate`] they therefore emit **no** register refill — the block's
-//!   cached registers still hold exactly what `machine.x` does — but they *are* frame
-//!   changes, so they re-publish the Y window on the continue arm when a later
-//!   instruction of the block still accesses a Y slot.
+//!   cached registers still hold exactly what `machine.x` does — and, both helpers
+//!   re-publishing the Y window on their own success path, no emitted refresh call
+//!   either.
 //! * **`allocate_heap`** ([`emit_allocate_heap`]) and **`test_heap`**
 //!   ([`emit_test_heap`]) reach the host's heap-admission door, and a **collecting** host
 //!   relocates the young heap and rewrites every root **in place** — including
@@ -78,21 +78,24 @@ use super::super::runtime::{
     encode_target, jit_allocate, jit_allocate_heap, jit_test_heap, jit_trim, AllocateHeapHelper,
     FrameSizeHelper, HeapNeedHelper,
 };
-use super::{
-    emit_continue_check, emit_continue_check_helper_refresh, emit_helper_call, Allocation,
-};
+use super::{emit_continue_check, emit_continue_check_helper_refresh, emit_helper_call, Allocation};
 
 /// Lower `allocate StackNeed Live` — push a stack frame, then continue in-block at
 /// `pc + 1`.
 ///
-/// The helper ([`jit_allocate`]) makes the interpreter's own `Machine::push_frame` call
-/// (no heap admission: `allocate` deliberately skips C's `$AH` check) and answers either
-/// `encode_target(func, pc + 1)` (the interpreter's `Step::Next`) or `ERROR`. The pop's
-/// analogue [`super::emit_deallocate`]: no register refill (the push touches no
-/// x-register), but the frame changed, so the Y window is re-published when a later
-/// instruction of this block still accesses a Y slot.
+/// The frame push is a helper call ([`jit_allocate`], which makes the interpreter's own
+/// `Machine::push_frame_window` call — no heap admission: `allocate` deliberately skips
+/// C's `$AH` check). A frame change must leave the machine's Y window re-derivable from
+/// Rust state, and only the push itself knows the new `(y_base, y_count)` it hands back,
+/// so the helper re-publishes the window on its success path and emitted code never
+/// performs the push.
 ///
-/// [`Machine::push_frame`]: crate::Machine
+/// The helper answers either `encode_target(func, pc + 1)` (the interpreter's
+/// `Step::Next`) or `ERROR`, and [`emit_frame_change_continue`] folds both. Like
+/// [`super::emit_deallocate`] there is no register refill (the push touches no
+/// x-register) and, the window being already the live frame's, no emitted refresh call.
+///
+/// [`Machine::push_frame_window`]: crate::Machine
 pub(super) fn emit_allocate(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
@@ -110,7 +113,6 @@ pub(super) fn emit_allocate(
     pc)?;
     emit_frame_change_continue(buffer, done, func, pc)
 }
-
 /// Lower `allocate_heap StackNeed HeapNeed Live` — admit the heap need, then push the
 /// frame, then continue in-block at `pc + 1`.
 ///
@@ -299,9 +301,7 @@ mod tests {
             (
                 "allocate",
                 jit_allocate as *const (),
-                lowered(|buffer, done| {
-                    emit_allocate(buffer, &allocation, done, 4, 7, 2)
-                }),
+                lowered(|buffer, done| emit_allocate(buffer, &allocation, done, 4, 7, 2)),
             ),
             (
                 "allocate_heap",
@@ -440,5 +440,75 @@ mod tests {
         });
         assert!(contains(&heap_refreshed, &refresh_immediate()));
         assert!(!contains(&heap_plain, &refresh_immediate()));
+    }
+    /// Every distinct 8-byte **store** into a `JitRuntime` field at `disp`, over all base
+    /// and source register pairs.
+    ///
+    /// The probe is exhaustive on purpose: an emitted Y-window write would pick one fixed
+    /// register pair, and a push that picked a different pair must still be caught.
+    ///
+    /// `rsp` is excluded as a base because the block's own `rt` slot lives at
+    /// `[rsp + RUNTIME_SLOT_DISP]` (`RUNTIME_SLOT_DISP == 0`), which every helper call
+    /// legitimately loads — no frame push can reach `JitRuntime` through `rsp`.
+    fn stores_into_runtime_field(disp: i32) -> Vec<Vec<u8>> {
+        let mut encodings: Vec<Vec<u8>> = Vec::new();
+        for base in Reg::ALL {
+            if base == Reg::Rsp {
+                continue;
+            }
+            for src in Reg::ALL {
+                let bytes = encoded(|buffer| buffer.mov_mr(base, disp, src).unwrap());
+                if !encodings.contains(&bytes) {
+                    encodings.push(bytes);
+                }
+            }
+        }
+        encodings
+    }
+    /// **The frame push is a helper call and nothing else.**
+    ///
+    /// The shape is forced by the Y-window rule: an emitted push would have to carry
+    /// capacity/reallocation guards against `machine.stack` and `machine.frames`, a `NIL`
+    /// fill of the new Y slots, and `rt.y_base`/`rt.y_end` written mid-block -- all of it
+    /// state a **resumed** slice does not re-derive, since a resume re-enters the block with
+    /// nothing republished, leaving the window and the frame geometry a later instruction
+    /// reads different from what the machine's own state implies (the failure signature is a
+    /// `badfun`-class structured error inside `gen_server:try_handle_call/4`, whose fun lives
+    /// in a frame's Y slot). Hence `allocate` is one `jit_allocate` helper call,
+    /// re-publishing the window from `Machine::push_frame_window`.
+    ///
+    /// The pin states that shape as an invariant: the helper's
+    /// `movabs` immediate is present, and the emitted arm contains **no** store into the
+    /// published Y window. An emitted push fails here, in the emitter, before it can fail at
+    /// run time — the behavioural half of the same property is
+    /// `frame_push_tests.rs::a_sliced_and_resumed_baseline_run_pushes_each_frame_exactly_once`.
+    ///
+    /// The probe allocation caches nothing, so the emitted arm is exactly the helper call
+    /// plus the frame-change continue check and holds no memory operand but the `rt` slot.
+    #[test]
+    fn the_allocate_arm_pushes_the_frame_with_a_helper_call_only() {
+        use super::super::super::runtime::{RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP};
+        let code = lowered(|buffer, done| {
+            emit_allocate(buffer, &Allocation::default(), done, 4, 7, 2)
+        });
+        // The push itself: exactly the `jit_allocate` helper call.
+        assert!(
+            contains(&code, &helper_immediate(jit_allocate as *const ())),
+            "`allocate` must call the `jit_allocate` helper"
+        );
+        // No Y-window publication: the helper's `Machine::push_frame_window` re-derives the
+        // window from machine state, which a resumed slice can do and emitted writes cannot.
+        for (field, disp) in [
+            ("rt.y_base", RUNTIME_YBASE_DISP),
+            ("rt.y_end", RUNTIME_YEND_DISP),
+        ] {
+            for store in stores_into_runtime_field(disp) {
+                assert!(
+                    !contains(&code, &store),
+                    "`allocate` must not store into the published {field}: the Y window is \
+                     re-derived from `Machine::push_frame_window`, never written by emitted code"
+                );
+            }
+        }
     }
 }

@@ -23,6 +23,7 @@ The driver, the two artifact layouts and the tier seam live one level up in `../
   A slot is `std::ptr::null()` when that address compiled no block — a **sentinel** rather than an `Option`, because `size_of::<Option<*const u8>>() == 16` on this toolchain (a raw pointer carries no null niche), so an `Option` table was twice the width and every probe paid a tag load and a scaling-by-16.
   `EntryTables::entry(func, pc)` reads one word per table, tests it for null and keeps the **entries-first precedence**, so a real block start always wins over a continuation sub-block.
 - `enter` carries a cross-module target, `resume_entry` an in-block transfer target, and `suspend` the address of an un-applied suspended BIF instruction (the driver-only side channel a `SUSPEND` word's address rides).
+- No field publishes a frame store: `machine.stack`/`machine.frames` are private `Vec`s behind `Machine`, `allocate` is one `jit_allocate` helper call, and every store mutation is Rust's. Detail: `../emit/CONTEXT.md` (`## Store-mutation inventory`).
 
 ## The helpers (crate-visible; `crate::jit::baseline::runtime::…`)
 - `jit_step_one` — the per-instruction deopt: it records the position and calls `Machine::step_instruction_with_entry`; a `Step::Enter` becomes the `ENTER` word with the target in `JitRuntime::enter`.

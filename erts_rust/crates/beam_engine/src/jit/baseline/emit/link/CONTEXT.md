@@ -109,22 +109,10 @@ the −7-byte single-store saving the exit's `ExitSpill::Done` mode gives back (
 
 ## Measured
 
-### The dead prologue Y-window publish (measured)
-`emit/prologue.rs` emits `jit_publish_y` only when `Allocation::prologue_publishes_y` holds, so a block whose
-**every** `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s
-`y_first` vs `frame_republish_first`) emits the plain inline position store (`emit_position_store`) instead — the frame helper's own
-`JitRuntime::refresh_y_base` on its in-block continue arm makes the prologue's publish dead work (soundness:
-`## Spill/fill discipline` above; the full rule and its linear-control-flow argument in `../CONTEXT.md`).
-Two retired-user-instruction slopes, per-rep, two legs from the same tree with only this gate differing,
-sides interleaved and the order alternated, `taskset -c 3`, one process at a time: `list_walk`
-(`BENCH_TIER=baseline BENCH_K=20`, `i(4000) − i(500)`) **−2.33 %** (paired min / median **0.976676 /
-0.976684**, 5 rounds, zero overlap) and `foreign_cowboy_bstr`
-(`to_lower/1` 438 + `capitalize_token/1` 660 IR instructions, `i(101 000) − i(1 000)`) **−0.40 % / −0.36 %**
-(**0.996005 / 0.996398**) — small because the entry-side saving is diluted by the 1 098-instruction call
-body. About half of a **test** build's saving is the `#[cfg(test)]` counter probe in `jit_publish_y`, so the
-counter-borne figure overstates a production build; the sign and the mechanism do not depend on it. The
-per-workload rows, the round-by-round ratios and the corpus-wide `y_blocks` / `y_prologue_publishes` split are
-in `../CONTEXT.md`'s `## Measured`.
+### The prologue Y-window publish is suppressed behind an in-block frame helper
+`emit/prologue.rs` emits `jit_publish_y` for a block that accesses a `Y` slot **unless** its first `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s `y_first` vs `frame_republish_first`, read by `Allocation::prologue_publishes_y`) — such a helper re-publishes the window itself on the arm that continues the block in-block, and a block is entered only at its own start, so a resume re-enters at the block entry and re-executes the prefix. The suppressed blocks emit the plain position store instead.
+The suppression measured **−2.33 %** on `list_walk` and **−0.40 %** on `foreign_cowboy_bstr` retired instructions.
+The figures, the round-by-round ratios and the corpus-wide `y_blocks` / `y_prologue_publishes` split are `../measure/CONTEXT.md`'s; the rule itself is `../prologue/CONTEXT.md`'s.
 
 ## Continuation sub-blocks (both layouts)
 

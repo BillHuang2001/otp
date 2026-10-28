@@ -280,11 +280,13 @@ by construction).
   into it, so a return chain does not grow the native stack; otherwise the word leaves for the driver),
   plus its unit tests (the frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
-  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
+  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers, `allocate`
+  included: one `jit_allocate` call plus the continue arm, no emitted frame push) and the private
   `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
   `encode_target(func, pc+1)`, no register refill and no emitted refresh — the helper re-published the
   Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
-  split, and `a_frame_changing_helper_emits_no_separate_refresh_call`).
+  split, `a_frame_changing_helper_emits_no_separate_refresh_call` and the structural
+  `the_allocate_arm_pushes_the_frame_with_a_helper_call_only`).
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
   `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`) and `emit_bitstr` (the same
   arm for the `Bs*` family through `../bitstr.rs::jit_bitstr`, plus the inline position store its
@@ -344,3 +346,42 @@ by construction).
   Each of the newer match-context shapes charges a path budget of its own on top of `BS_PATH_BYTES`, because its sequence is wider than the shared match-context guards it reuses: `BS_MATCH_STRING_PATH_BYTES = 2_304` per `bs_match_string` (one emitted triple per pattern byte, bounded by `match_string::MAX_MATCH_BYTES = 64`), `UTF32_PATH_BYTES`/`UTF16_PATH_BYTES` = 1 024 each and `UTF8_PATH_BYTES = 2_048`. Like the other path budgets they are charged whether or not a predicate claims the instruction, because the estimate runs before the predicate and an under-estimate is a `SystemLimit` compile error.
 - **The register-cache gate** (`regalloc.rs::{cacheable_touches, cacheable_reads, cacheable_writes, is_inlined}`) and the `Y` gate (`arith.rs::uses_y`) consult the same `*_shape` functions and the label-free `<Shape>::of(...)` constructors, so the emitted register set, the block's dirty-spill set and the `Y` refresh decision are derived from one decision. A shape's destination must be charged as **written** — the value lands in that cache register, so an uncharged write lets a stale register survive a block exit.
 
+## Store-mutation inventory (`machine.stack` / `machine.frames`)
+
+`Machine::stack` and `Machine::frames` are private `Vec`s: no emitted code names either store, and no `JitRuntime` field publishes a header or a frame image.
+A frame-changing instruction is exactly one helper call (`jit_allocate`/`jit_allocate_heap`/`jit_trim`/`jit_deallocate`), so every store mutation happens in Rust and the published Y window stays re-derivable from `Machine` state at every enterable address.
+The inventory below is therefore the **precondition any future inline frame push would have to meet**, not a description of emitted traffic: such a push would have to name every site that can move `machine.stack`/`machine.frames`, prove that no emitted code reads a stale pointer after a reallocation, and keep its Y-window publication re-derivable at every enterable address rather than mid-block only.
+The reason it is decidable at all is that a `Vec` write either leaves the store valid as written (any `Vec` method, the only way Rust touches the storage) or **moves the allocation** (a growth/`resize`), which invalidates any pointer taken before it.
+
+### Erlang stack (`machine.stack`)
+
+- `machine/frames.rs` `push_frame_window`'s `resize` — grows the store (may reallocate) and writes the Y words; re-derives the window.
+- `machine/frames.rs` `pop_frame`/`pop_frame_checked`/`pop_frame_take_continuation`'s `truncate` — length only, no move.
+- `machine/frames.rs` `trim`'s `copy_within` + `truncate` — in-place, no move.
+- `machine/mod.rs` `with_parked_loose_terms`'s `push`/`truncate` — the dominant hidden mutator: reachable from **every** rooted hand-off, and the `push` can reallocate.
+- `machine/registers.rs` `Machine::reset`'s `clear`, `machine/catch.rs` the unwind `truncate` — length only.
+- In-place Y-slot word writes in `machine/frames.rs` — no reallocation.
+- Root hand-offs borrow the words, never a cached pointer: `machine/mod.rs` (`RootSet::new`, `for_each_root_mut`, the census walk, `stack_mut`), `families/bitstrings/raw.rs`.
+
+### Call frames (`machine.frames`)
+
+- `machine/frames.rs` `push_frame_window`'s `push` — may reallocate.
+- `machine/frames.rs` `pop_frame`/`pop_frame_checked`/`pop_frame_take_continuation`'s `pop` and their cold re-push.
+- `machine/frames.rs` `last_mut`/`trim` field writes — in place.
+- `machine/catch.rs` `truncate`, `machine/registers.rs` `clear` — length only.
+
+### Helpers reachable from emitted code
+
+Each of these either re-derives the Y window before the block continues, or is followed by a
+driver-side (re)publication before any emitted code can use a store:
+
+- Re-derive the window in place (they never hand out a store pointer): `jit_allocate`, `jit_allocate_heap`, `jit_test_heap`, `jit_trim`, `jit_deallocate`, `jit_deallocate_return`, `jit_tail_call`, `jit_return`, `jit_call_store`/`jit_call_store_linked`/`call_store_impl` (`call.rs`), `jit_publish_y`, `jit_refresh_y`, `refresh_y_base`, `publish_y_window`.
+- Run interpreted instructions (which may push/pop/trim/`with_parked_loose_terms`) and return a block-ABI word the driver folds: `jit_step_one`, `jit_step_ext`, `jit_ext_call`, `jit_local_call`/`probe_local_call`, `jit_bif_value`, `jit_family`, `jit_receive`, `jit_bitstr`.
+- Never touch the stores: `enter_in_block`/`commit_in_block_entry`/`cross_function_enter`, which only switch the entry tables.
+- Driver-side: `drive` (`mod.rs`) publishes the runtime before the loop and `JitRuntime::refresh_literals` runs at every module rebind; `code.enter_cached` and the deopt arm run inside an iteration. A `traced` run never builds a `JitRuntime`.
+
+### What an emitted store access would have to keep
+
+- **Every capacity guard precedes every write.** A growth moves the allocation, so an emitted arm would have to re-read the store after its guards and could never name freed memory; today the whole push is the `jit_allocate` helper call, which lets the `Vec` grow and re-derives the window itself.
+- **The commit order is `fill`, then `len`.** The Y words are written into spare capacity before the stack length is bumped, so a collection (or the census walk) never sees a length covering a word the push has not written.
+- **The Y-window publication must be re-derivable at every enterable address.** The window follows from `Machine` state alone (`push_frame_window`'s `(y_base, y_count)` on a push, `refresh_y_base` on a `trim`/pop), so a block entry or a resumed slice can always re-derive it: the in-block `allocate`/`allocate_heap`/`trim` helper re-publishes it on the arm that continues the block, a block entry re-executes the block prefix, and the prologue publishes whenever the block's first Y access is not preceded by such a helper. `../frame_push_tests.rs` pins the behavioural half (each frame pushed exactly once across a sliced and resumed run) and `heap.rs`'s `the_allocate_arm_pushes_the_frame_with_a_helper_call_only` the structural half.

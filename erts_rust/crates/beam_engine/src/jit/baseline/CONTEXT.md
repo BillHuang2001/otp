@@ -149,8 +149,10 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `arith.rs`, `compare.rs`, `aggregate.rs` (+ `aggregate/list.rs`), `frame.rs`, `heap.rs`, `family.rs`,
   `link.rs`, `operands.rs`, `liveness.rs`, `regalloc.rs`, `regs.rs`). `Allocation::y_last`/
   `refresh_y_after` and the Y-window publish/refresh emission live in `prologue.rs`/`regalloc.rs`; the
-  publish gate itself is `regs.rs::Allocation::prologue_publishes_y`, fed by `regalloc.rs`'s
-  `y_first`/`frame_republish_first` derivation.
+  publish gate itself is `regs.rs::Allocation::prologue_publishes_y` — the block touches a `Y` slot
+  **and** its first `Y` access does not follow an in-block `allocate`/`allocate_heap`/`trim`, which
+  re-publish the window themselves (`regalloc.rs` derives `y_first`/`frame_republish_first` for it,
+  beside the `y_last` the post-helper refresh gate reads).
   See `emit/CONTEXT.md`.
 
 
@@ -160,6 +162,7 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 - **`CallExt*` executes natively but the cross-module transfer is a driver round-trip by design**; the frame-preserving local `Call`'s same-module callee is linked **in-block** through the shared `enter_in_block` resolver, as a tail transfer.
 - **The register cache is partial in both directions** (dirty-set `spill`, liveness `fill`, live-in prologue `entry_fill`); `emit/regs/CONTEXT.md` is its only owner.
 - **A `Y` slot is guarded at run time** by the published frame window; every Y operands' guard can only ever *reject* (branch to `jit_step_one`), never fabricate a result.
+- **The Y window is re-derivable from Rust state at every enterable address, and a frame-changing instruction is one helper call.** The `machine.stack`/`machine.frames` mutation is `Machine`'s (`push_frame_window`/`trim`/`pop_frame*`), never emitted code: an `allocate`/`allocate_heap`/`trim` helper re-publishes the window from the `(y_base, y_count)` the push just computed (or by re-deriving it) on the arm that continues the block in-block, and a block is entered only at its own start — a fresh block entry, or a resume, which parks on a **block entry** and re-executes the prefix. The prologue therefore publishes exactly when the block's first `Y` access is not preceded by such a helper. Detail: `emit/prologue/CONTEXT.md`, `emit/CONTEXT.md` (`## Store-mutation inventory`).
 - The full inline-set table, every restricted shape, the three deopt levels and the do-not-re-open rationale for each measured lever: `inlineset/CONTEXT.md`.
 - Every measured figure (levers, slopes, corpus counters, the honest throughput negative): `measure/CONTEXT.md`.
 - The deopt / execution / code-size censuses and their gate commands: `census/CONTEXT.md`.
