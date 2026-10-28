@@ -4719,3 +4719,67 @@ fn stop_and_cancel_report_what_was_really_armed() {
             .is_none()
     );
 }
+
+/// `erlang:link/1` and `erlang:unlink/1` on a **port** move the port's link set and never its
+/// `connected` process.
+///
+/// The two halves are the C's own split: the link set is what the close-time snapshot walks to
+/// owe each link its `{'EXIT', Port, Reason}` (`erts_port_unlink`, `bif.c:1280`), while
+/// `desc->connected` — this runtime's [`PortMeta::owner`] — is what every delivery site reads, so
+/// unlinking a port must leave the owner where it is. The set is also the C's
+/// `port_info(Port, links)`: **absent** means "only the owner" (`open_port/2`'s own link), which is
+/// why the first write materializes it as `[owner]` rather than starting empty.
+///
+/// Oracle-measured (OTP 29.1.2): `link/1` and `unlink/1` answer `true` on a **live** port term and
+/// on the term of one already `port_close`d — so a port this registry no longer holds is a
+/// successful no-op here too, never a `badarg`.
+#[test]
+fn link_and_unlink_on_a_port_move_its_link_set_and_never_its_owner() {
+    let mut fx = fixture();
+    let spawn = fx.spawn("cat");
+    let port = fx.hook.open_port(spawn, NIL).expect("a valid port");
+    let owner = OWNER.to_eterm();
+    let other = ProcessId::new(11, 0);
+    // `open_port/2`'s own link is the port's only one, and the registry reports it by absence.
+    assert!(fx.registry.borrow().extra_links(port.number()).is_none());
+    assert_eq!(
+        terms::list_elements(fx.item(port, "links")).expect("links is a list"),
+        vec![owner]
+    );
+
+    // `link/1` adds the caller **after** the owner, and a repeated link changes nothing (the C's
+    // `erts_link_internal_tree_lookup_create` reuses the existing link).
+    fx.registry.borrow_mut().link_port(port.number(), other);
+    fx.registry.borrow_mut().link_port(port.number(), other);
+    assert_eq!(
+        terms::list_elements(fx.item(port, "links")).expect("links is a list"),
+        vec![owner, other.to_eterm()]
+    );
+
+    // `unlink/1` removes the caller and leaves the owner — `desc->connected` — alone.
+    fx.registry.borrow_mut().unlink_port(port.number(), other);
+    assert_eq!(
+        terms::list_elements(fx.item(port, "links")).expect("links is a list"),
+        vec![owner]
+    );
+    assert_eq!(
+        fx.item(port, "connected"),
+        owner,
+        "unlinking never moves the port's connected process"
+    );
+
+    // The owner's own link is removable too: the port then reports no links at all and still
+    // delivers to the same process.
+    fx.registry.borrow_mut().unlink_port(port.number(), OWNER);
+    assert_eq!(
+        terms::list_elements(fx.item(port, "links")).expect("links is a list"),
+        Vec::new()
+    );
+    assert_eq!(fx.item(port, "connected"), owner);
+
+    // A port the registry no longer holds is the oracle's discarded-link case: nothing recorded,
+    // nothing refused.
+    fx.registry.borrow_mut().link_port(9999, other);
+    fx.registry.borrow_mut().unlink_port(9999, other);
+    assert!(fx.registry.borrow().extra_links(9999).is_none());
+}
