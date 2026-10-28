@@ -39,8 +39,9 @@
 //! `raise_snapshot` heuristic.
 //!
 //! A raise whose supplied trace is **empty** is currently indistinguishable from a
-//! raise that supplied none, so both cook the same `raise_snapshot`-derived output —
-//! pinned by [`an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace`].
+//! raise that supplied none, so both cook the same output (the failing import's
+//! synthesized head item in front of the `raise_snapshot`-derived frame) — pinned by
+//! [`an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace`].
 //! That equivalence is a **`beam_common::Raise` limitation, not intended semantics**:
 //! `Raise` carries no supplied-trace flag, so "supplied `[]`" and "no trace supplied"
 //! reach the engine as the same value. C's discriminator is `is_raised_exc`
@@ -282,6 +283,26 @@ fn expected_snapshot(ctx: &mut MinimalContext, module: &Module) -> Eterm {
     terms::make_list(ctx, &[item]).expect("a list")
 }
 
+/// `[{host,target,[],[]},{raise_with_trace,run,0,[]}]` — what a raise out of the
+/// fixture's `call_ext` **actually** cooks, head item first.
+///
+/// The failing import is dispatched as a BIF, so the raise carries the synthesized
+/// innermost item naming that callee with its own argument list
+/// (`{host,target,[],[]}`; `host` is outside the closed format-module table, so its
+/// `Location` is the empty list), and the `raise_snapshot`-derived `run/0` frame
+/// follows it. That is also what the oracle produces for an unresolvable
+/// `host:target()` call — the `undef` head item, `[{host,target,[],[]}]` — modulo the
+/// trailing `erl_eval`/`init` frames this run does not have.
+fn expected_cooked(ctx: &mut MinimalContext, module: &Module) -> Eterm {
+    let host = make_atom(module.atom_table.lookup("host").expect("seeded"));
+    let target = make_atom(module.atom_table.lookup("target").expect("seeded"));
+    let head = terms::make_tuple(ctx, &[host, target, NIL, NIL]).expect("a tuple");
+    let run_atom = make_atom(module.atom_table.lookup("run").expect("seeded"));
+    let frame = terms::make_tuple(ctx, &[make_atom(module.name), run_atom, make_small(0), NIL])
+        .expect("a tuple");
+    terms::make_list(ctx, &[head, frame]).expect("a list")
+}
+
 // ===========================================================================
 // 1. The supplied frames are rendered verbatim
 // ===========================================================================
@@ -373,17 +394,19 @@ fn an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace() {
         "the two fixtures agree under either module's atom table"
     );
 
-    // ... and both are the `raise_snapshot`-derived single raising frame (`run/0`),
-    // proving the empty case takes the derivation path. For a supplied empty trace the
-    // oracle keeps `[]` instead; that value is out of this engine's reach until
-    // `beam_common::Raise` carries the discriminator (see the doc comment above and
-    // the crate `CONTEXT.md` §Known Issues entry).
+    // ... and both cook the SAME two-item trace: the failing import's synthesized
+    // head item (`{host,target,[],[]}`) in front of the `raise_snapshot`-derived
+    // raising frame (`run/0`) — proving the empty case takes the derivation path.
+    // For a supplied empty trace the oracle keeps `[]` instead; that value is out of
+    // this engine's reach until `beam_common::Raise` carries the discriminator (see
+    // the doc comment above and the crate `CONTEXT.md` §Known Issues entry).
     let mut build = MinimalContext::new();
-    let snapshot = expected_snapshot(&mut build, &module);
+    let cooked_expected = expected_cooked(&mut build, &module);
     for (label, cooked) in [("no trace", without), ("empty trace", empty)] {
         assert!(
-            cmp(cooked, snapshot, &module.atom_table).is_eq(),
-            "{label}: the cooked S must stay the snapshot-derived trace: got {cooked:?}"
+            cmp(cooked, cooked_expected, &module.atom_table).is_eq(),
+            "{label}: the cooked S must be the import's head item in front of the \
+             snapshot-derived frame: got {cooked:?}"
         );
     }
 }

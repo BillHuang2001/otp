@@ -142,6 +142,7 @@ mod callee;
 mod cross_module;
 mod encoder;
 mod end_to_end;
+mod error_info;
 mod function_clause;
 mod handlers;
 mod oracle;

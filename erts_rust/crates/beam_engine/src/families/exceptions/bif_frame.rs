@@ -276,7 +276,19 @@ fn carve(
 ) -> Result<Option<Eterm>> {
     let argc = args.len();
     let total = 2 * argc + ITEM_WORDS + extension.map_or(0, |_| EXTENSION_WORDS);
-    let mut sink = terms::reserve_slack(machine, ctx, total)?;
+    // A host that cannot serve the reservation — a minimal embedding host with no
+    // `alloc_words` at all, or a genuinely exhausted heap — must **not** have the
+    // BIF's own raise replaced by this marshalling failure (the one outcome the
+    // `Err(_) => None` decline below already guards for an unreadable operand). The
+    // head item is a best-effort *extension* of the cooked trace, so failing to
+    // build one DECLINES: the raise then lands with the pre-mechanism
+    // (`raise_snapshot`-derived) trace, exactly the shape a raise naming no
+    // nameable BIF produces. Propagating here would substitute
+    // `unsupported_opcode: alloc_words` for the real reason, turning a correct
+    // raise into a wrong one.
+    let Ok(mut sink) = terms::reserve_slack(machine, ctx, total) else {
+        return Ok(None);
+    };
     // Children before parents, in the order `total` counts.
     let location = match extension {
         Some((error_info, key, value)) => {
@@ -330,7 +342,9 @@ fn carve(
 ///   which this module deliberately does not touch);
 /// * the BIF's `(module, function)` atom cannot be named ([`namespace_atom`]);
 /// * an argument operand is unreadable (a malformed instruction, not a runtime
-///   value) — nothing is fabricated in its place.
+///   value) — nothing is fabricated in its place;
+/// * the host cannot serve the item's reservation (no `alloc_words`, or an
+///   exhausted heap) — a marshalling failure never replaces the BIF's own error.
 pub(crate) fn bif_head_item(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
