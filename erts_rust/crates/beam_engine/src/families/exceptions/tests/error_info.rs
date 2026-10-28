@@ -61,7 +61,7 @@ use beam_common::{LiveReason, Raise};
 use beam_loader::{Atom, Export, Import, ImportRef};
 use beam_term::{is_nil, Eterm, NIL};
 
-use crate::context::Mailbox;
+use crate::context::{BifKind, Mailbox};
 use crate::families::exceptions::bif_frame::tests::{atom_of, expected_item};
 use crate::jit::Tier;
 use crate::terms::{list_elements, tuple_element};
@@ -77,6 +77,9 @@ const ROW_ATOMS: &[&str] = &[
     "erlang",
     "hd",
     "send",
+    "lists",
+    "max",
+    "function_clause",
     "binary",
     "at",
     "binary_to_atom",
@@ -123,6 +126,9 @@ const ROW_ATOMS: &[&str] = &[
 enum Reg {
     Int(i64),
     Atom(&'static str),
+    /// The empty list — `Operand::Nil`, the one compound term a `move` can spell
+    /// without a heap cell (`lists:max([])`'s argument).
+    Nil,
 }
 
 impl Reg {
@@ -136,6 +142,7 @@ impl Reg {
                     .lookup(name)
                     .unwrap_or_else(|| panic!("the fixture interns {name}")),
             ),
+            Reg::Nil => Operand::Nil,
         }
     }
 
@@ -144,6 +151,7 @@ impl Reg {
         match self {
             Reg::Int(value) => make_small(value),
             Reg::Atom(name) => atom_of(module, name),
+            Reg::Nil => NIL,
         }
     }
 }
@@ -686,6 +694,74 @@ fn records_get_gets_no_extension() {
     assert!(
         is_nil(tuple_element(list_elements(cooked).unwrap()[0], 3).unwrap()),
         "the location of a row outside the table is the empty list"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The measured table: declared BIF vs stdlib fast path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lists_max_cooks_the_fast_path_item_without_an_extension() {
+    // Measured on the oracle with a compiled module:
+    //   `lmax() -> lists:max([]).` caught ->
+    //   `{error, function_clause, {lists,max,[[]],[{file,"lists.erl"},{line,638}]}}`.
+    //
+    // `lists:max/1` is NOT a `bif.tab` BIF: it is one of `beam_bifs`'s stdlib **fast
+    // paths**, standing in for the `lists.erl` body. The oracle's innermost item is
+    // therefore the ERLANG SOURCE function with a source location, never a BIF frame,
+    // and so never the `[{error_info, #{module => FormatModule}}]` extension — an
+    // extension here would make `erl_error:format_exception/4` look up
+    // `erl_stdlib_errors:format_error/1` for a call that was not a BIF.
+    //
+    // No engine-side door can name a source location, so the honest shape is the real
+    // argument list with an EMPTY location. Both halves of the shape rule agree on it
+    // here (the host classifies the name as a fast path, and the reason is the bare
+    // `function_clause`); the unit suite pins each half on its own.
+    let (module, run_atom) = call_ext_traced("lists", "max", 1, &[Reg::Nil]);
+    let mut ctx = raising_ctx(
+        ("lists", "max", 1),
+        "function_clause",
+        ExceptionClass::Error,
+    );
+    ctx.set_bif_kind_resolver(Box::new(|module, function, arity| {
+        if (module, function, arity) == ("lists", "max", 1) {
+            BifKind::StdlibFastPath
+        } else {
+            BifKind::Unknown
+        }
+    }));
+    let cooked = cooked_on_both_tiers(&module, run_atom, &mut ctx);
+    assert_head_item(
+        &module,
+        &mut ctx,
+        cooked,
+        "lists",
+        "max",
+        &terms_of(&module, &[Reg::Nil]),
+        None,
+    );
+}
+
+#[test]
+fn a_declared_bif_keeps_its_extension_when_the_host_says_declared() {
+    // The negative of the row above: the same `call_ext` route and the same `badarg`
+    // reason, but a host that classifies `erlang:hd/1` as a **declared** `bif.tab`
+    // BIF. The item keeps the closed table's
+    // `[{error_info, #{module => erl_erts_errors}}]` extension — on both tiers, with
+    // tier agreement asserted first (`cooked_on_both_tiers`).
+    let (module, run_atom) = call_ext_traced("erlang", "hd", 1, &[Reg::Int(1)]);
+    let mut ctx = badarg_ctx();
+    ctx.set_bif_kind_resolver(Box::new(|_, _, _| BifKind::Declared));
+    let cooked = cooked_on_both_tiers(&module, run_atom, &mut ctx);
+    assert_head_item(
+        &module,
+        &mut ctx,
+        cooked,
+        "erlang",
+        "hd",
+        &terms_of(&module, &[Reg::Int(1)]),
+        Some("erl_erts_errors"),
     );
 }
 

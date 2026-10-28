@@ -37,6 +37,38 @@
 //! FormatModule}`. A module outside that table gets **no `error_info` at all**, so
 //! its item's `Location` is the empty list.
 //!
+//! # The shape rule: only a *declared* BIF gets the extension
+//!
+//! Rule 1 above is C's `bif_mfa` path: it applies to a BIF the `bif.tab` surface
+//! **declares**. The engine's BIF door is wider than that — a host serves every
+//! `beam_bifs` registry key through
+//! [`call_bif`](crate::context::ExecutionContext::call_bif), including the
+//! **stdlib fast paths** that stand in for pure-Erlang source functions
+//! (`lists:max/1`, `lists:nth/2`, …). The oracle's innermost frame for such a call
+//! is the **source function**
+//! (`{lists, max, [[]], [{file,"lists.erl"},{line,638}]}`), never a BIF frame, so an
+//! `error_info` extension there would be a fabricated classification — and a
+//! harmful one, because `erl_error:format_exception/4` would then look up
+//! `erl_stdlib_errors:format_error/1` for a call that never was a BIF.
+//!
+//! The rule is therefore closed-form, and both halves land on the same shape (the
+//! real argument list with an **empty** `Location`):
+//!
+//! * [`BifKind::StdlibFastPath`] — the host classifies the name as a fast path
+//!   ([`ExecutionContext::bif_kind`](crate::context::ExecutionContext::bif_kind));
+//!   the extension is dropped whatever the reason.
+//! * the reason is the bare atom **`function_clause`** — C's only producer is
+//!   `func_info` (`emu/instrs.tab`'s `i_func_info_IaaI`), which names **its own**
+//!   frame with a source location, and **no declared BIF raises it**; so an
+//!   extension on such a raise is always a misclassification. This arm applies
+//!   **today**, before any host overrides [`BifKind`], which is what makes
+//!   `lists:max([])` cook `{lists,max,[[]],[]}` on a pre-seam host.
+//!
+//! The oracle's true `{file,_}`/`{line,_}` location for a fast path is an honest
+//! residual (see the module-level "Residuals" below): the engine has no
+//! "source location of a loaded function" door, so the C-producible, non-fabricated
+//! shape is the empty location.
+//!
 //! `build_stacktrace` (`:1197-1297`) then renders that innermost frame with
 //! `erts_build_mfa_item` (`../../erts/emulator/beam/utils.c:3430-3457`), whose
 //! `Location` argument is *appended to* the `[{error_info, Map}]` list it was
@@ -48,7 +80,14 @@
 //! catch hd(1)                     -> {erlang,hd,[1],[{error_info,#{module => erl_erts_errors}}]}
 //! catch maps:get(k,#{})           -> {erlang,map_get,[k,#{}],[{error_info,#{module => erl_stdlib_errors}}]}
 //! catch records:get(1,2)          -> {records,get,[1,2],[]}
+//! catch lists:max([])             -> {lists,max,[[]],[{file,"lists.erl"},{line,638}]}
 //! ```
+//!
+//! The last row is the shape rule below: `lists:max/1` is a **stdlib fast path**
+//! standing in for the `lists.erl` body, so the oracle's item is the **source**
+//! function with a source location and **no** extension. This runtime reproduces
+//! `{lists,max,[[]],[]}` for it (same module, function and real argument list; the
+//! location is the honest "no extension" form — see the residuals).
 //!
 //! The engine's raise snapshot is `(context, func, pc)` metadata, so its cooked
 //! items can only ever carry an **arity** in the `A` slot (see [`super::stacktrace`])
@@ -108,12 +147,20 @@
 //!   excludes from this path entirely; the *caller-frame* path renders a
 //!   `Raise::error_info` payload verbatim instead (`stacktrace.rs`'s
 //!   `raise_error_info` latch).
+//! * A **stdlib fast path** carries an **empty** `Location` where the oracle names
+//!   the Erlang source function's `{file,_}`/`{line,_}` (e.g. `lists:max/1` at
+//!   `lists.erl:638`). Nothing engine-side can supply it: a source location is a
+//!   property of a loaded Erlang function (a `beam_loader` line-table entry keyed by
+//!   `(func, pc)`), and a fast path has no code — the host that recognized the name
+//!   is the only party that could. Module, function and the real argument list are
+//!   right; the absent extension is deliberate (see the shape rule above), never a
+//!   fabricated classification.
 
 use beam_loader::{Atom, Module, Operand};
 use beam_term::{make_atom, Eterm, NIL};
 
-use beam_common::Result;
-use crate::context::ExecutionContext;
+use beam_common::{BeamError, Result};
+use crate::context::{BifKind, ExecutionContext};
 use crate::machine::{namespace_atom, Machine};
 use crate::operand::read_operand;
 use crate::terms::{self, Sink};
@@ -148,8 +195,10 @@ const EXTENSION_WORDS: usize = beam_term::map::map_words_capacity(1) + 3 + 2;
 /// Note that `lists`/`maps` appear here because a *BIF* may be named by them
 /// (`erlang:map_get/2` is reached as `maps:get/2` from source), not because their
 /// Erlang **functions** are BIFs: a raise out of `lists:max/1`'s or
-/// `maps:update_with/3`'s own Erlang body is a **source** frame, not a BIF frame,
-/// and never comes through this module.
+/// `maps:update_with/3`'s own Erlang body is a **source** frame, not a BIF frame.
+/// Such a call still reaches this module when a host serves it as a **stdlib fast
+/// path** — but then [`extension_allowed`] drops the extension, so the item this
+/// table would select for `lists`/`maps` is never attached to a fast-path raise.
 pub(crate) fn format_module(bif_module: &str) -> Option<&'static str> {
     match bif_module {
         "atomics" | "counters" | "erlang" | "erts_internal" | "persistent_term" => {
@@ -182,6 +231,49 @@ pub(crate) fn is_non_bif_raise(bif_module: &str, bif_function: &str, arity: u32)
             "exit" | "throw" => arity == 1,
             _ => false,
         }
+}
+
+/// Whether this failure may attach the `[{error_info, #{module => FormatModule}}]`
+/// location extension at all — the closed-form **shape rule** at the top of this
+/// module.
+///
+/// `kind` is the host's answer for the failing name
+/// ([`ExecutionContext::bif_kind`](crate::context::ExecutionContext::bif_kind)) and
+/// `reason_is_function_clause` says whether the raise's reason is BARE
+/// `function_clause`, read at the arming site from the `BeamError` the BIF door just
+/// produced.
+///
+/// * A **stdlib fast path** gets no extension, whatever the reason: it stands in for
+///   an Erlang source function, whose oracle frame is
+///   `{M, F, Args, [{file, F}, {line, N}]}` — source location, no extension.
+/// * A bare **`function_clause`** reason gets no extension even for a **declared**
+///   BIF: C's only producer of that reason is `func_info`
+///   (`emu/instrs.tab:1236`'s `i_func_info_IaaI`), which names its own frame with a
+///   source location, and no declared BIF raises it — an extension there is always a
+///   misclassification (typically a fast path on a host that has not overridden
+///   [`ExecutionContext::bif_kind`](crate::context::ExecutionContext::bif_kind) yet).
+/// * [`BifKind::Unknown`] is treated exactly as [`BifKind::Declared`], so a pre-seam
+///   host differs from the old behaviour **only** on the `function_clause` arm.
+fn extension_allowed(kind: BifKind, reason_is_function_clause: bool) -> bool {
+    match kind {
+        BifKind::StdlibFastPath => false,
+        BifKind::Declared | BifKind::Unknown => !reason_is_function_clause,
+    }
+}
+
+/// Whether `error`'s reason is the bare atom `function_clause` — C's
+/// `func_info`-only reason (see [`extension_allowed`]).
+///
+/// Only the reason's **name** is read; a [`beam_common::Raise`]'s term payloads are
+/// never touched (the caller classifies **before** the item's reservation, so no
+/// `Eterm` is read across an allocating door). Both the `&'static str` form and the
+/// owned-name form are covered, exactly as [`super::callee::is_unresolved_undef`]
+/// does for `undef`.
+fn is_function_clause_reason(error: &BeamError) -> bool {
+    if error.as_atom() == Some("function_clause") {
+        return true;
+    }
+    matches!(error, BeamError::Raise(raise) if raise.reason.as_atom() == Some("function_clause"))
 }
 
 /// The three atoms the `[{error_info, #{module => FormatModule}}]` extension needs,
@@ -326,13 +418,19 @@ fn carve(
 /// ```
 ///
 /// with the empty-list `Location` when [`format_module`] does not name a format
-/// module for `bif_module`.
+/// module for `bif_module` **or** the shape rule ([`extension_allowed`]) drops the
+/// extension — a stdlib fast path, or a bare `function_clause` reason.
 ///
 /// This is the **`bif`/`gc_bif` instruction** shape: `args` are the instruction's own
 /// argument operands (the very list the dispatch marshalled for the BIF), so the
 /// item names the callee with its real arguments exactly as C's
 /// `make_arglist(c_p, reg, bif_mfa->arity)` does. For the `call_ext`-shaped sites see
 /// [`bif_head_item_regs`].
+///
+/// `error` is the failure the BIF door produced. Only its **reason name** is read
+/// ([`is_function_clause_reason`]), and only to decide the extension; the raise
+/// itself is landed by the caller. It is passed in rather than derived here because
+/// the reason exists only at the arming site.
 ///
 /// Returns `None` — today's behaviour, an unmodified raise — when any of:
 ///
@@ -352,6 +450,7 @@ pub(crate) fn bif_head_item(
     bif_module: &str,
     bif_function: &str,
     args: &[Operand],
+    error: &BeamError,
 ) -> Result<Option<Eterm>> {
     build(
         machine,
@@ -360,6 +459,7 @@ pub(crate) fn bif_head_item(
         bif_module,
         bif_function,
         Args::Operands(args),
+        error,
     )
 }
 
@@ -380,6 +480,7 @@ pub(crate) fn bif_head_item_regs(
     bif_module: &str,
     bif_function: &str,
     arity: u32,
+    error: &BeamError,
 ) -> Result<Option<Eterm>> {
     build(
         machine,
@@ -388,6 +489,7 @@ pub(crate) fn bif_head_item_regs(
         bif_module,
         bif_function,
         Args::Registers(arity),
+        error,
     )
 }
 
@@ -400,12 +502,18 @@ fn build(
     bif_module: &str,
     bif_function: &str,
     args: Args<'_>,
+    error: &BeamError,
 ) -> Result<Option<Eterm>> {
-    if is_non_bif_raise(bif_module, bif_function, args.len() as u32)
+    let arity = args.len() as u32;
+    if is_non_bif_raise(bif_module, bif_function, arity)
         || machine.catch_frame_depth() == 0
     {
         return Ok(None);
     }
+    // The shape rule, decided **before** the reservation: it reads the host's
+    // classification and the raise's reason *name* only, so no `Eterm` is held
+    // across the allocating door.
+    let attach = extension_allowed(ctx.bif_kind(bif_module, bif_function, arity), is_function_clause_reason(error));
     let (Some(module_atom), Some(function_atom)) = (
         namespace_atom(ctx, module, bif_module),
         namespace_atom(ctx, module, bif_function),
@@ -413,8 +521,13 @@ fn build(
         return Ok(None);
     };
     // Resolved before the reservation: the three atom words are `Copy` indices and
-    // can never be relocated. An extension the module cannot name is simply absent.
-    let extension = extension_atoms(ctx, module, bif_module);
+    // can never be relocated. An extension the module cannot name — or one the shape
+    // rule dropped — is simply absent, and then costs no words at all.
+    let extension = if attach {
+        extension_atoms(ctx, module, bif_module)
+    } else {
+        None
+    };
     carve(
         machine,
         ctx,

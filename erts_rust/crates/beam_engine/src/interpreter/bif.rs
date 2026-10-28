@@ -158,8 +158,15 @@ impl Machine {
             // raising BIFs, for a raise that cannot land, and for anything it cannot
             // name. A guard failure (`fail != NO_FAIL`, the arm below) arms nothing.
             Err(e) if fail == NO_FAIL => {
-                let head =
-                    bif_frame::bif_head_item(self, ctx, module, module_name, function_name, args)?;
+                let head = bif_frame::bif_head_item(
+                    self,
+                    ctx,
+                    module,
+                    module_name,
+                    function_name,
+                    args,
+                    &e,
+                )?;
                 self.raise_bif_error_with_head(module, e, head, ctx)
             }
             // Guard failure: jump to the fail label.

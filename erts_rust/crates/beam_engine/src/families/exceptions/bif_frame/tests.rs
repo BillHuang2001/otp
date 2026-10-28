@@ -27,7 +27,7 @@ use super::*;
 
 use std::collections::BTreeMap;
 
-use beam_common::BeamError;
+use beam_common::{BeamError, ExitReason, Raise};
 use beam_loader::{Atom, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, NO_FAIL};
 use beam_term::{cmp, make_small};
 
@@ -43,6 +43,8 @@ use crate::terms::{list_elements, tuple_element};
 const TABLE_ATOMS: &[&str] = &[
     "erlang",
     "hd",
+    "lists",
+    "max",
     "binary",
     "at",
     "os",
@@ -133,7 +135,9 @@ pub(crate) fn expected_item(
 }
 
 /// Run [`bif_head_item`] for `bif_module:bif_function` over `Operand::X(0..n)` with
-/// the registers set to `values`.
+/// the registers set to `values`, for a `badarg` failure (the shape a host returns
+/// for a wrongly-typed argument — and one whose reason is not `function_clause`, so
+/// the extension's own rules are what a row observes).
 fn head_item(
     machine: &mut Machine,
     ctx: &mut MinimalContext,
@@ -142,11 +146,24 @@ fn head_item(
     bif_function: &str,
     values: &[i64],
 ) -> Option<Eterm> {
+    head_item_for(machine, ctx, module, bif_module, bif_function, values, &BeamError::BadArg)
+}
+
+/// [`head_item`] with an explicit failure — the knob the shape-rule rows turn.
+fn head_item_for(
+    machine: &mut Machine,
+    ctx: &mut MinimalContext,
+    module: &Module,
+    bif_module: &str,
+    bif_function: &str,
+    values: &[i64],
+    error: &BeamError,
+) -> Option<Eterm> {
     for (i, value) in values.iter().enumerate() {
         machine.set_x(i as u32, make_small(*value)).unwrap();
     }
     let args: Vec<Operand> = (0..values.len()).map(|i| Operand::X(i as u32)).collect();
-    bif_head_item(machine, ctx, module, bif_module, bif_function, &args)
+    bif_head_item(machine, ctx, module, bif_module, bif_function, &args, error)
         .expect("the arena never refuses a reservation")
 }
 
@@ -296,6 +313,122 @@ fn a_zero_arity_bif_cooks_an_empty_argument_list() {
 }
 
 // ---------------------------------------------------------------------------
+// the shape rule: only a DECLARED BIF gets the `error_info` extension
+// ---------------------------------------------------------------------------
+
+/// `function_clause` — C's `func_info`-only reason (no declared BIF raises it).
+fn function_clause_error() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("function_clause")))
+}
+
+#[test]
+fn a_fast_path_item_carries_no_extension() {
+    // Oracle: `catch lists:max([])` -> `{lists,max,[[]],[{file,"lists.erl"},{line,638}]}`.
+    // `lists:max/1` is NOT a `bif.tab` BIF: it is a `beam_bifs` stdlib fast path
+    // standing in for the `lists.erl` body, so the oracle's innermost item is that
+    // **source** function with a source location and no `error_info`. No engine-side
+    // door can name a source location, so the honest shape is the real argument list
+    // with an EMPTY location — never a fabricated `erl_stdlib_errors` classification.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MinimalContext::new();
+    ctx.set_bif_kind_resolver(Box::new(|module, function, arity| {
+        if (module, function, arity) == ("lists", "max", 1) {
+            BifKind::StdlibFastPath
+        } else {
+            BifKind::Unknown
+        }
+    }));
+    let item = head_item(&mut machine, &mut ctx, &module, "lists", "max", &[1])
+        .expect("a live catch frame and a nameable fast path synthesize the item");
+    let expected = expected_item(
+        &mut ctx,
+        &module,
+        "lists",
+        "max",
+        &[make_small(1)],
+        None,
+    );
+    assert!(cmp(item, expected, &module.atom_table).is_eq());
+    assert_eq!(
+        tuple_element(item, 3).unwrap(),
+        NIL,
+        "a stdlib fast path's item has no `error_info` extension"
+    );
+}
+
+#[test]
+fn a_function_clause_raise_carries_no_extension_even_for_a_declared_bif() {
+    // No host override at all (the `Unknown` default, treated as `Declared`): the
+    // bare `function_clause` reason alone drops the extension, because C's only
+    // producer of that reason is `func_info`, which names its OWN frame with a source
+    // location and never goes through `save_stacktrace`'s BIF arm. This is the arm
+    // that makes `lists:max([])` cook `{lists,max,[[]],[]}` on a **pre-seam** host.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MinimalContext::new();
+    let item = head_item_for(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "lists",
+        "max",
+        &[1],
+        &function_clause_error(),
+    )
+    .expect("a live catch frame and a nameable module synthesize the item");
+    let expected = expected_item(
+        &mut ctx,
+        &module,
+        "lists",
+        "max",
+        &[make_small(1)],
+        None,
+    );
+    assert!(cmp(item, expected, &module.atom_table).is_eq());
+    assert_eq!(
+        tuple_element(item, 3).unwrap(),
+        NIL,
+        "a `function_clause` item carries no `error_info` extension"
+    );
+}
+
+#[test]
+fn the_hosts_classification_decides_the_extension() {
+    // `Declared` and the `Unknown` default keep the extension — a host that does not
+    // override `bif_kind` is byte-identical to the pre-seam engine — while
+    // `StdlibFastPath` drops it. Same failure (`badarg`), same names, three hosts.
+    let module = fixture();
+    let make = |kind: BifKind, ctx: &mut MinimalContext| {
+        ctx.set_bif_kind_resolver(Box::new(move |_, _, _| kind));
+    };
+    for (kind, extension) in [
+        (BifKind::Declared, Some("erl_erts_errors")),
+        (BifKind::Unknown, Some("erl_erts_errors")),
+        (BifKind::StdlibFastPath, None),
+    ] {
+        let mut machine = machine_with_a_catch_frame();
+        let mut ctx = MinimalContext::new();
+        make(kind, &mut ctx);
+        let item = head_item(&mut machine, &mut ctx, &module, "erlang", "hd", &[1]).unwrap();
+        let expected =
+            expected_item(&mut ctx, &module, "erlang", "hd", &[make_small(1)], extension);
+        assert!(
+            cmp(item, expected, &module.atom_table).is_eq(),
+            "{kind:?} must cook the extension {extension:?}"
+        );
+    }
+}
+
+#[test]
+fn the_default_classification_is_unknown() {
+    // The pre-seam default: no host override, so the seam answers `Unknown`, which
+    // the shape rule treats exactly as `Declared`.
+    let ctx = MinimalContext::new();
+    assert_eq!(ctx.bif_kind("erlang", "hd", 1), BifKind::Unknown);
+}
+
+// ---------------------------------------------------------------------------
 // the declines
 // ---------------------------------------------------------------------------
 
@@ -309,7 +442,16 @@ fn the_item_is_declined_without_a_live_catch_frame() {
     machine.set_x(0, make_small(1)).unwrap();
     let mut ctx = MinimalContext::new();
     assert_eq!(
-        bif_head_item(&mut machine, &mut ctx, &module, "erlang", "hd", &[Operand::X(0)]).unwrap(),
+        bif_head_item(
+            &mut machine,
+            &mut ctx,
+            &module,
+            "erlang",
+            "hd",
+            &[Operand::X(0)],
+            &BeamError::BadArg,
+        )
+        .unwrap(),
         None
     );
 }
@@ -348,7 +490,16 @@ fn the_item_is_declined_when_a_name_cannot_be_resolved() {
     machine.set_x(0, make_small(1)).unwrap();
     let mut ctx = MinimalContext::new();
     assert_eq!(
-        bif_head_item(&mut machine, &mut ctx, &module, "erlang", "hd", &[Operand::X(0)]).unwrap(),
+        bif_head_item(
+            &mut machine,
+            &mut ctx,
+            &module,
+            "erlang",
+            "hd",
+            &[Operand::X(0)],
+            &BeamError::BadArg,
+        )
+        .unwrap(),
         None
     );
 }
@@ -369,6 +520,7 @@ fn the_item_is_declined_when_an_argument_operand_is_unreadable() {
             "erlang",
             "hd",
             &[Operand::X(crate::machine::MAX_REGISTER as u32)],
+            &BeamError::BadArg,
         )
         .unwrap(),
         None

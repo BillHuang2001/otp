@@ -897,6 +897,7 @@ pub(crate) fn apply_target(
                     &module_name,
                     &function_name,
                     arity,
+                    &e,
                 )?,
             };
             Ok(ApplyTarget::Raised(

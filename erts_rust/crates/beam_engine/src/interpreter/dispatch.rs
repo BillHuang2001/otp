@@ -1015,7 +1015,7 @@ impl Machine {
             // `{erlang,send,[1,hi],…}`), with the destination and message in `x(0)`/`x(1)`.
             Err(e) => {
                 let head =
-                    bif_frame::bif_head_item_regs(self, ctx, module, "erlang", "send", 2)?;
+                    bif_frame::bif_head_item_regs(self, ctx, module, "erlang", "send", 2, &e)?;
                 Ok(Some(ApplyTarget::Raised(
                     self.raise_bif_error_with_head(module, e, head, ctx)?,
                 )))
@@ -1129,6 +1129,7 @@ impl Machine {
                                             bif_module,
                                             bif_function,
                                             bif_arity,
+                                            &e,
                                         )?
                                     }
                                     // The import reference is unreadable: there is no
@@ -1498,9 +1499,10 @@ impl Machine {
                 // differential case reaches a failing `zlib`/`prim_tty` stub, and the
                 // engine's seam has no NIF epilogue to consult, so the item follows
                 // the BIF route — a documented shape difference, never a wrong term.
-                let head =
-                    bif_frame::bif_head_item_regs(self, ctx, module, module_name, function_name, arity)
-                        .map_err(Box::new)?;
+                let head = bif_frame::bif_head_item_regs(
+                    self, ctx, module, module_name, function_name, arity, &e,
+                )
+                .map_err(Box::new)?;
                 return self
                     .raise_bif_error_with_head(module, e, head, ctx)
                     .map_err(Box::new)
