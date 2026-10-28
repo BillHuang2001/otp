@@ -74,7 +74,9 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   The **frame-changing** helpers (`jit_allocate`, `jit_allocate_heap`, `jit_trim`, `jit_deallocate`) do not
   use this arm: they are the parties that invalidate the window (`push_frame`/`trim`/`pop_frame*` move
   `frames.last()` and truncate `machine.stack`) and they re-publish it **inside** the helper on their success
-  path, via `JitRuntime::refresh_y_base` — a pure re-derivation from machine state. `emit/heap.rs::
+  path — `JitRuntime::publish_y_window` for the two `allocate` helpers (from the `(y_base, y_count)`
+  `Machine::push_frame_window` just computed) and `JitRuntime::refresh_y_base` for `jit_trim`/`jit_deallocate`
+  — both pure Rust-state derivations, never an emitted store. `emit/heap.rs::
   emit_frame_change_continue` (frame-only: `allocate`/`trim`, no register refill) takes no `Allocation` for
   that reason, and `emit/mod.rs::emit_continue_check_helper_refresh` is `emit_continue_check` **minus** the
   refresh call but **keeping** the partial refill, used by `allocate_heap` because a collecting host's
