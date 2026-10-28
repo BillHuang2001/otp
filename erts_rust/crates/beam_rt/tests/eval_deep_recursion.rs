@@ -55,6 +55,9 @@
 //! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt \
 //!     --test eval_deep_recursion
 //! ```
+// The shared helper module is compiled into every integration-test binary, so this binary
+// would otherwise warn on the entry points it does not call.
+#[allow(dead_code)]
 mod support;
 
 /// The suite's banner in a loud skip.
