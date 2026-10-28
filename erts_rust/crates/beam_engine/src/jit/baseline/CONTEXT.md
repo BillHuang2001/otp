@@ -161,6 +161,7 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 - **`CallExt*` executes natively but the cross-module transfer is a driver round-trip by design**; the frame-preserving local `Call`'s same-module callee is linked **in-block** through the shared `enter_in_block` resolver, as a tail transfer.
 - **The register cache is partial in both directions** (dirty-set `spill`, liveness `fill`, live-in prologue `entry_fill`); `emit/regs/CONTEXT.md` is its only owner.
 - **A `Y` slot is guarded at run time** by the published frame window; every Y operands' guard can only ever *reject* (branch to `jit_step_one`), never fabricate a result.
+- **A Y-touching block publishes the window in its prologue, and a frame-changing instruction is one helper call.** The `machine.stack`/`machine.frames` mutation is `Machine`'s (`push_frame_window`/`trim`/`pop_frame*`), never emitted code, so the published window stays re-derivable from Rust state at every enterable address -- which is what a block entry and a resume, neither of which re-executes a prefix, both need. Detail: `emit/prologue/CONTEXT.md`, `emit/CONTEXT.md` (`## Store-mutation inventory`).
 - The full inline-set table, every restricted shape, the three deopt levels and the do-not-re-open rationale for each measured lever: `inlineset/CONTEXT.md`.
 - Every measured figure (levers, slopes, corpus counters, the honest throughput negative): `measure/CONTEXT.md`.
 - The deopt / execution / code-size censuses and their gate commands: `census/CONTEXT.md`.
