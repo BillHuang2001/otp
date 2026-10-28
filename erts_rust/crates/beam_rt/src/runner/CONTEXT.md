@@ -5,7 +5,7 @@ The concrete [`ProcessRunner`](beam_process::ProcessRunner) that `beam_process`'
 It builds a [`RuntimeContext`](crate::context::RuntimeContext) that runs **as that pid** in the caller-supplied process table, takes the pid's engine out of [`RunnerState`], executes it and records the observable outcome.
 A first entry runs `run_export_outcome_with_tier`; a re-entry — a reduction pre-emption, a `receive` park, a BIF suspend — runs `resume_outcome_with_tier` on the process's **remembered** tier.
 The return value is stabilized (`Runtime::stabilize_term_with`) onto the runtime's `-eval` store (`Runtime::eval_heap` + its off-heap payload table) and recorded in `RunnerState::results`; a raise's live reason is stabilized (`Runtime::stabilize_error_live_reason`) into `RunnerState::exits`, with the original `BeamError` in `RunnerState::errors`.
-A run to `return` exits `normal` — `x(0)` is the function's return value, not the exit reason — and a failure exits with the raise's own reason term, so nothing is swallowed and nothing is invented.
+A run to `return` exits `normal` — `x(0)` is the function's return value, not the exit reason — and a failure exits with the raise's own **exit value** (see *The death-path reason*), so nothing is swallowed and nothing is invented.
 This node also owns the **execution-tier decision** (taken once per process, carried for its life), the **park root hand-off**, the **slice-boundary collection door**, the **slice-boundary off-heap refc-binary prune**, and the process's own pre-sleep signal work.
 Per-suite routing: [`tests/CONTEXT.md`](tests/CONTEXT.md). Every measured figure and its caveats: [`MEASURED.md`](MEASURED.md).
 
