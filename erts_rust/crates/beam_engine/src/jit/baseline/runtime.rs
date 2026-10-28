@@ -2244,8 +2244,9 @@ fn halt_word(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
 /// for the tier's two in-block transfers: a `return`'s continuation ([`return_word`]) and a
 /// frame-preserving `call`'s callee ([`super::call::jit_call_store_linked`]).
 ///
-/// Clears [`JitRuntime::resume_entry`] on **every** call (so no emitted arm can observe a
-/// stale entry from an earlier transfer), then:
+/// [`JitRuntime::resume_entry`] is left **null** on every arm that publishes no entry (see
+/// [`enter_in_block_cleared`]), so no emitted arm can observe a stale entry from an earlier
+/// transfer. The arms are:
 ///
 /// * a **resolved** entry is stored in [`JitRuntime::resume_entry`] and the target's
 ///   `(func, pc)` word is returned — the arm tail-jumps to the entry;
@@ -2272,19 +2273,25 @@ fn halt_word(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
 /// iteration would have published — so a `ctx.reduce` refusal parks the machine exactly
 /// where a driver-side refusal parks it and the resumed slice executes each instruction
 /// exactly once.
+///
+/// [`enter_in_block_cleared`] carries the body; this entry point exists because the
+/// `return` half ([`return_word`]) must clear before its own `match` (the `HALT`/`ENTER`
+/// arms leave the field for the emitted arm to read) and so calls the body directly.
 #[inline]
 pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
-    runtime.resume_entry = std::ptr::null();
     enter_in_block_cleared(runtime, func, pc)
 }
-/// [`enter_in_block`] for a caller that has **already** cleared
-/// [`JitRuntime::resume_entry`] in its own first instructions — the `return` half
-/// ([`return_word`]), which must clear before its own `match` because the `HALT`/`ENTER`
-/// arms leave the field for the emitted arm to read.
+/// The body of [`enter_in_block`], shared with the `return` half's already-cleared call.
 ///
-/// The clear is one store and sits on the per-transfer path, so the two callers that
-/// need it (`return_word` above, a linked `call` in [`super::call`]) share this body with
-/// the clear hoisted to the one that does not already have it.
+/// # `resume_entry` is cleared on exactly the arms that do not publish an entry
+///
+/// The emitted arm reads [`JitRuntime::resume_entry`] and treats null as "the transfer was
+/// declined", so a stale entry from an earlier transfer must never survive a call. The
+/// clear therefore sits on the two arms that publish nothing —
+/// [`cross_function_enter`] (whose own head clears, because its decline answers before any
+/// store) and the refused-charge arm below — while the accepted arm overwrites the field
+/// outright. No emitted code runs between the clear and either arm: both are reached from
+/// inside this body.
 #[inline]
 fn enter_in_block_cleared(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     let word = encode_target(func, pc);
@@ -2297,6 +2304,7 @@ fn enter_in_block_cleared(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i
                 word
             }
             Err(err) => {
+                runtime.resume_entry = std::ptr::null();
                 runtime.error = Some(err);
                 ERROR
             }
@@ -2368,6 +2376,10 @@ fn commit_in_block_entry(
 #[cold]
 #[inline(never)]
 fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: i64) -> i64 {
+    // Cleared here, at the head, because this body is the transfer's **decline** home: the
+    // early return below answers before any store, and a caller arrives with the field
+    // whatever the previous transfer left there. The accepted arms overwrite it.
+    runtime.resume_entry = std::ptr::null();
     let Some((entry, tables)) = cross_function_entry(runtime, func, pc) else {
         return word;
     };
