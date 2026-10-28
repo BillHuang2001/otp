@@ -90,7 +90,8 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
   now **agrees** (the default CLI route loads this runtime's own release's script).
 - **CI wiring:** `.github/workflows/erts_rust.yml` (path-triggered on `erts_rust/**`) builds and tests the
   workspace and runs `differential/gate.sh`, honouring its exit-code policy (`1` mismatch, `2` env error
-  and `3` a ratchet update that was not made all **fail** the job). Two further jobs close the
+  and `3` a ratchet update that was not made all **fail** the job; `0` tolerates only a *recorded* gap or drift).
+  The workflow pins `otp-version: '29.1.1'`, whose erts matches the tree's pin — on such an oracle the three committed `known-drift.txt` entries are **stale**, so the drift allowlist must be passed empty there (`--drift-allowlist <empty file>`) or the pin moved to `29.1.2`. Two further jobs close the
   debug-only blind spot: `rust-erts-release` (`beam_abi`/`beam_io`/`beam_rt` in `--release`) and
   `rust-erts-cranelift` (`-p beam_engine --features jit-cranelift`). `bench` remains a manual/opt-in
   command.
