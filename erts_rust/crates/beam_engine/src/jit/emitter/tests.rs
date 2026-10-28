@@ -1091,3 +1091,254 @@
         );
         assert_eq!(dword_ext.len(), 8);
     }
+
+    /// `extern "C" fn(i64) -> i64` (System V: `rdi` → `rax`).
+    type UnOp = extern "C" fn(i64) -> i64;
+
+    /// One of the four immediate-operand encoders, taken as a function pointer so the
+    /// byte pin can drive all four from one table.
+    type ImmEncoder = fn(&mut CodeBuffer, Reg, i32) -> beam_common::Result<()>;
+
+    #[test]
+    fn emits_the_immediate_operand_encodings() {
+        // `REX.W F7 /0 id` for `test`, `REX.W 81 /7|/4|/0 id` for `cmp`/`and`/`add`:
+        // one opcode byte, one register-form `ModRM` (the opcode extension in the
+        // `reg` field), and the `imm32` little-endian — 7 bytes for every register,
+        // with `REX.B` (0x49 instead of 0x48) for an `r8`-`r15` operand.
+        for (imm, imm_le) in [
+            (1_i32, [0x01, 0x00, 0x00, 0x00]),
+            (7, [0x07, 0x00, 0x00, 0x00]),
+            (-8, [0xF8, 0xFF, 0xFF, 0xFF]),
+            (-4, [0xFC, 0xFF, 0xFF, 0xFF]),
+        ] {
+            for (reg, rex, rm) in [
+                (Reg::Rax, 0x48_u8, 0x0_u8),
+                (Reg::Rcx, 0x48, 0x1),
+                (Reg::R8, 0x49, 0x0),
+                (Reg::R11, 0x49, 0x3),
+            ] {
+                let ops: [(&str, [u8; 3], ImmEncoder); 4] = [
+                    ("test", [rex, 0xF7, 0xC0 | rm], CodeBuffer::test_ri),
+                    ("cmp", [rex, 0x81, 0xF8 | rm], CodeBuffer::cmp_ri),
+                    ("and", [rex, 0x81, 0xE0 | rm], CodeBuffer::and_ri),
+                    ("add", [rex, 0x81, 0xC0 | rm], CodeBuffer::add_ri),
+                ];
+                for (name, prefix, emit) in ops {
+                    let mut buf = CodeBuffer::new().unwrap();
+                    emit(&mut buf, reg, imm).unwrap();
+                    let mut expected = prefix.to_vec();
+                    expected.extend_from_slice(&imm_le);
+                    assert_eq!(
+                        emitted(&buf),
+                        expected,
+                        "{name} {reg:?}, {imm} must be REX.W + opcode + ModRM + imm32 LE"
+                    );
+                    assert_eq!(buf.len(), 7, "one instruction, 7 bytes — {name} {reg:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emits_the_immediate_operand_whole_32_bit_field() {
+        // The extremes prove the complete `imm32` field is written little-endian in
+        // both directions, rather than a truncated `imm8` or a byte-swapped field.
+        for (imm, imm_le) in [
+            (i32::MIN, [0x00_u8, 0x00, 0x00, 0x80]),
+            (i32::MAX, [0xFF, 0xFF, 0xFF, 0x7F]),
+        ] {
+            let mut test = CodeBuffer::new().unwrap();
+            test.test_ri(Reg::Rax, imm).unwrap();
+            assert_eq!(
+                emitted(&test),
+                [vec![0x48, 0xF7, 0xC0], imm_le.to_vec()].concat()
+            );
+            assert_eq!(test.len(), 7);
+
+            let mut cmp = CodeBuffer::new().unwrap();
+            cmp.cmp_ri(Reg::Rcx, imm).unwrap();
+            assert_eq!(
+                emitted(&cmp),
+                [vec![0x48, 0x81, 0xF9], imm_le.to_vec()].concat()
+            );
+            assert_eq!(cmp.len(), 7);
+
+            let mut and = CodeBuffer::new().unwrap();
+            and.and_ri(Reg::R8, imm).unwrap();
+            assert_eq!(
+                emitted(&and),
+                [vec![0x49, 0x81, 0xE0], imm_le.to_vec()].concat(),
+                "REX.B for r8"
+            );
+            assert_eq!(and.len(), 7);
+
+            let mut add = CodeBuffer::new().unwrap();
+            add.add_ri(Reg::R11, imm).unwrap();
+            assert_eq!(
+                emitted(&add),
+                [vec![0x49, 0x81, 0xC3], imm_le.to_vec()].concat(),
+                "REX.B for r11"
+            );
+            assert_eq!(add.len(), 7);
+        }
+
+        // The `mov_ri` + `_rr` pair the encoders replace, priced for contrast: the
+        // `movabs` is 10 bytes on its own, so the pair is 13 bytes where this form is 7.
+        let mut pair = CodeBuffer::new().unwrap();
+        pair.mov_ri(Reg::R11, -8).unwrap();
+        pair.test_rr(Reg::Rax, Reg::R11).unwrap();
+        assert_eq!(pair.len(), 13);
+    }
+
+    #[test]
+    fn executes_test_ri_with_a_sign_extended_immediate() {
+        // `test a, -8` observed through `ZF`: the block returns 1 when `a & -8` is
+        // non-zero and 0 when it is zero.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.test_ri(Reg::Rdi, -8).unwrap();
+        let is_zero = buf.label();
+        let done = buf.label();
+        buf.jcc(Cond::E, is_zero).unwrap();
+        buf.mov_ri(Reg::Rax, 1).unwrap();
+        buf.jmp(done).unwrap();
+        buf.bind(is_zero).unwrap();
+        buf.mov_ri(Reg::Rax, 0).unwrap();
+        buf.bind(done).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let nonzero_after_mask: UnOp = buf.as_fn_ptr();
+
+        // The low three bits are the only ones the mask clears.
+        assert_eq!(nonzero_after_mask(0), 0);
+        assert_eq!(nonzero_after_mask(7), 0);
+        assert_eq!(nonzero_after_mask(8), 1);
+        assert_eq!(nonzero_after_mask(0xFF), 1);
+        assert_eq!(nonzero_after_mask(-1), 1);
+        // The sign-extension witness: bit 32 survives `& -8` only if the immediate is
+        // sign-extended to `0xFFFF_FFFF_FFFF_FFF8`. Were the field zero-extended to
+        // `0x0000_0000_FFFF_FFF8`, the mask would be zero and `ZF` would be set.
+        assert_eq!(nonzero_after_mask(1 << 32), 1);
+        assert_eq!(nonzero_after_mask(i64::MIN), 1);
+
+        // A zero immediate always clears both operands' conjunction: `ZF` is set.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.test_ri(Reg::Rdi, 0).unwrap();
+        let is_zero = buf.label();
+        let done = buf.label();
+        buf.jcc(Cond::E, is_zero).unwrap();
+        buf.mov_ri(Reg::Rax, 1).unwrap();
+        buf.jmp(done).unwrap();
+        buf.bind(is_zero).unwrap();
+        buf.mov_ri(Reg::Rax, 0).unwrap();
+        buf.bind(done).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let always_zero: UnOp = buf.as_fn_ptr();
+        for a in [0, 1, -1, i64::MIN, i64::MAX] {
+            assert_eq!(always_zero(a), 0, "test {a}, 0 sets ZF");
+        }
+    }
+
+    #[test]
+    fn executes_cmp_ri_with_a_sign_extended_immediate() {
+        // `cmp a, -8` observed through a **signed** `L`: 1 when `a < -8`, else 0.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.cmp_ri(Reg::Rdi, -8).unwrap();
+        let less = buf.label();
+        let done = buf.label();
+        buf.jcc(Cond::L, less).unwrap();
+        buf.mov_ri(Reg::Rax, 0).unwrap();
+        buf.jmp(done).unwrap();
+        buf.bind(less).unwrap();
+        buf.mov_ri(Reg::Rax, 1).unwrap();
+        buf.bind(done).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let below_minus_eight: UnOp = buf.as_fn_ptr();
+
+        assert_eq!(below_minus_eight(-9), 1);
+        assert_eq!(below_minus_eight(i64::MIN), 1);
+        assert_eq!(below_minus_eight(-8), 0);
+        // The sign-extension witness: a **zero**-extended `0x0000_0000_FFFF_FFF8` is
+        // 4294967288, so the signed comparison `0 < 4294967288` would hold and answer 1.
+        assert_eq!(below_minus_eight(0), 0);
+        assert_eq!(below_minus_eight(1), 0);
+        assert_eq!(below_minus_eight(i64::MAX), 0);
+    }
+
+    #[test]
+    fn executes_and_ri_and_add_ri_with_sign_extended_immediates() {
+        // `f(a) = (a & -8) + -4` — the untag-then-re-tag shape the call sites build.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.and_ri(Reg::Rax, -8).unwrap();
+        buf.add_ri(Reg::Rax, -4).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let untag_and_offset: UnOp = buf.as_fn_ptr();
+
+        assert_eq!(untag_and_offset(0), -4);
+        assert_eq!(untag_and_offset(5), -4); // 5 & !7 == 0
+        assert_eq!(untag_and_offset(8), 4);
+        assert_eq!(untag_and_offset(-1), -12); // -1 & !7 == -8
+        // `1<<32` is already 8-aligned, so only the offset moves it.
+        assert_eq!(untag_and_offset(1 << 32), (1_i64 << 32) - 4);
+        // Already 8-aligned, and the `add` wraps like the hardware does.
+        assert_eq!(untag_and_offset(i64::MIN), i64::MIN.wrapping_sub(4));
+
+        // The `and` encoder's sign-extension witness, alone (a composite value cannot
+        // show it: a zero-extended `-4` offset and a wrapped one coincide). Bit 32
+        // survives `& -8` only under a sign-extended `0xFFFF_FFFF_FFFF_FFF8`; a
+        // zero-extended `0x0000_0000_FFFF_FFF8` would clear both bits and answer 0.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.and_ri(Reg::Rax, -8).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let untag: UnOp = buf.as_fn_ptr();
+        assert_eq!(untag((1 << 32) | 1), 1 << 32);
+        assert_eq!(untag(-1), -8);
+
+        // The `add` encoder's sign-extension witness, alone: a zero-extended `-4`
+        // would answer `4294967292` for an operand of 0.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.add_ri(Reg::Rax, -4).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let offset: UnOp = buf.as_fn_ptr();
+        assert_eq!(offset(0), -4);
+        assert_eq!(offset(8), 4);
+
+        // The whole 32-bit field, both extremes, through both encoders.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.and_ri(Reg::Rax, i32::MIN).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let mask_min: UnOp = buf.as_fn_ptr();
+        // `i32::MIN` sign-extends to `0xFFFF_FFFF_8000_0000`, i.e. `-2^31` — not to
+        // `0x0000_0000_8000_0000`, which would also leave bit 31 alone.
+        assert_eq!(mask_min(-1), i64::from(i32::MIN));
+        // Every bit at or above 31 is kept, every bit below it cleared.
+        assert_eq!(mask_min(0x7FFF_FFFF), 0);
+        assert_eq!(mask_min(0x0000_0001_8000_0000), 0x0000_0001_8000_0000);
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.add_ri(Reg::Rax, i32::MIN).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let add_min: UnOp = buf.as_fn_ptr();
+        assert_eq!(add_min(0), i64::from(i32::MIN));
+        assert_eq!(add_min(i64::from(i32::MIN)), -4_294_967_296);
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.add_ri(Reg::Rax, i32::MAX).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let add_max: UnOp = buf.as_fn_ptr();
+        assert_eq!(add_max(0), i64::from(i32::MAX));
+        assert_eq!(add_max(1), 2_147_483_648);
+    }

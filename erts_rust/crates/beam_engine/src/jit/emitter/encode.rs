@@ -240,6 +240,68 @@ impl CodeBuffer {
         self.emit_rr(0x31, dst, src)
     }
 
+    // -- 64-bit immediate-operand arithmetic and logic -----------------------
+
+    /// Emits the register-immediate form `REX.W 81 /n id`: the 64-bit destination in
+    /// the `ModRM` `r/m` field, the opcode extension `op` in its `reg` field, and the
+    /// **sign-extended** `imm32` written little-endian.
+    ///
+    /// The uniform `81 /n` shape is used for every register, including `rax` (which
+    /// additionally has the one-byte-shorter `3D`/`25`/`05` accumulator forms), so one
+    /// encoding covers all 16 registers.
+    fn emit_ri(&mut self, op: u8, dst: Reg, imm: i32) -> Result<()> {
+        self.emit_rex(true, 0, 0, ext(dst))?;
+        self.emit_u8(0x81)?;
+        self.emit_u8(0xC0 | ((op & 0x7) << 3) | (dst.code() & 0x7))?;
+        self.emit_i32(imm)
+    }
+
+    /// `test a, imm` — sets the flags for `a & imm` (no operand is written).
+    ///
+    /// The 64-bit form with a **sign-extended `imm32`** (`REX.W F7 /0 id`), which is
+    /// what makes a constant guard cost one instruction: the alternative is a
+    /// [`Self::mov_ri`] of the constant into a scratch register followed by
+    /// [`Self::test_rr`], and `mov_ri` is the 10-byte `movabs` — so the pair costs two
+    /// instructions and ten bytes more than this one, for any constant that fits a
+    /// sign-extended 32-bit immediate.
+    ///
+    /// Every register is encoded through the `/0`-extended `F7` opcode, `rax`
+    /// included, so the accumulator's one-byte-shorter `A9` form is never emitted.
+    pub fn test_ri(&mut self, a: Reg, imm: i32) -> Result<()> {
+        self.emit_rex(true, 0, 0, ext(a))?;
+        self.emit_u8(0xF7)?;
+        self.emit_u8(0xC0 | (a.code() & 0x7))?;
+        self.emit_i32(imm)
+    }
+
+    /// `cmp a, imm` — sets the flags for `a - imm` (no operand is written).
+    ///
+    /// The 64-bit form with a **sign-extended `imm32`** (`REX.W 81 /7 id`), the one-
+    /// instruction replacement for a [`Self::mov_ri`] + [`Self::cmp_rr`] pair (two
+    /// instructions and ten bytes more, because `mov_ri` is the 10-byte `movabs`).
+    pub fn cmp_ri(&mut self, a: Reg, imm: i32) -> Result<()> {
+        self.emit_ri(7, a, imm)
+    }
+
+    /// `and dst, imm` — the 64-bit bitwise and with a sign-extended `imm32`
+    /// (`REX.W 81 /4 id`).
+    ///
+    /// Replaces a [`Self::mov_ri`] + [`Self::and_rr`] pair: one instruction and ten
+    /// bytes fewer for any constant that fits a sign-extended 32-bit immediate — the
+    /// untag mask of a tagged term is the canonical caller.
+    pub fn and_ri(&mut self, dst: Reg, imm: i32) -> Result<()> {
+        self.emit_ri(4, dst, imm)
+    }
+
+    /// `add dst, imm` — the 64-bit addition of a sign-extended `imm32`
+    /// (`REX.W 81 /0 id`).
+    ///
+    /// Replaces a [`Self::mov_ri`] + [`Self::add_rr`] pair: one instruction and ten
+    /// bytes fewer for any constant that fits a sign-extended 32-bit immediate.
+    pub fn add_ri(&mut self, dst: Reg, imm: i32) -> Result<()> {
+        self.emit_ri(0, dst, imm)
+    }
+
     /// `imul dst, src` — the two-operand signed multiply (`dst = dst * src`).
     ///
     /// Sets `OF`/`CF` exactly when the low 64 bits are not the sign-extended exact
