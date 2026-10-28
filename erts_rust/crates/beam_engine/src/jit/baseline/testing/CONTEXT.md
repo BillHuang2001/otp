@@ -81,8 +81,8 @@ A write-then-helper stores the dirty register once, an inlined write-nothing ins
 ## `../emit/compile.rs` (the continuation sub-blocks)
 `the_continuation_sub_blocks_scale_linearly_not_quadratically` (both layouts) and `the_disjoint_sub_blocks_still_run_every_call_ext`.
 
-## `../emit/heap.rs` (the frame-changing republish)
-`a_frame_changing_helper_emits_no_separate_refresh_call`.
+## `../emit/heap.rs` (the frame-changing helpers, one call each)
+`a_frame_changing_helper_emits_no_separate_refresh_call`, plus the structural `the_allocate_arm_pushes_the_frame_with_a_helper_call_only`: the emitted `allocate` block holds the `jit_allocate` immediate, stores **nothing** into the published `y_base`/`y_end` and neither loads nor stores a `PubVec` header word (`ptr`/`len`/`cap`), because the push is `Machine::push_frame_window`'s and the window is re-derived from machine state at every entry.
 
 ## `../bs_match_deopt_tests.rs` (the `bs_match` arm's re-execution idempotency)
 `the_decoder_character_shape_agrees_with_the_interpreter_and_stays_native` — the exact `<<_:2, F:6>>`-over-a-**1-byte**-subject shape on both tiers with the value asserted, then a cache-free compile proving `inlined(SHAPE_BS_MATCH) > 0` with **zero** `BsMatch` static deopts, so the arm cannot regress into a silent deopt.
