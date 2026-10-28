@@ -557,15 +557,21 @@ A.9's differential coverage is boot/version **observability** plus the in-proces
   `erl_term.h`, `external.c`, `dist.c`, `copy.c`, `erl_message.c`, `erl_gc.c`, `erl_db_*.c`,
   `beam_load.c`, `beam_file.c`, `emu/ops.tab`, `jit/asm_load.c`, `erl_nif.c`, `erl_driver.h`,
   `erl_bif_*.c`, `bif.tab`, `atom.names`). **Read it; never modify it.**
-- The system Erlang toolchain (OTP 29 / erts-17.1) is on `PATH` — `erlc`/`erl`/`escript` are usable
-  for producing `.beam` fixtures and as the differential oracle.
+- The host oracle on `PATH` is Erlang/OTP **29.1.2 / erts-17.1.1**, while the tree pins 30.0-rc0 /
+  erts-17.1 — its `erlc`/`erl`/`escript` are usable for producing `.beam` fixtures and as the
+  differential oracle, and a golden that pins the erts version drifts on such a host.
 - **Differential-corpus coverage:** the gate pins the native-record opcode family (`records` group), the
   `func_info` clause-failure path and bare-atom `undef` (`errors` group), the structured raise reasons
-  (`{case_clause,_}`/`{badmap,_}`/`{badkey,_}`/`{bad_generator,_}`/`{try_clause,_}`/`{badrecord,_}`) and
-  the port paths (`driver/open_port_*`, `port_info`, `port_command`). The two remaining shallow contracts
-  are A.5 (the `wire` group covers the ETF codec only — a live handshake / `DOP_*` loopback needs two
-  connected nodes and is not expressible through a single CLI process) and A.9 (boot/version
-  observability only — see the A.9 status above).
+  (`{case_clause,_}`/`{badmap,_}`/`{badkey,_}`/`{bad_generator,_}`/`{try_clause,_}`/`{badrecord,_}`), the
+  port paths (`driver/open_port_*`, `port_info`, `port_command`) and the live distribution surface:
+  the `dist/` group (five cases — four `dist_probe`-shaped live two-node loopbacks plus the self-pair
+  `dist/live_self_pair_handshake_and_message`) and `dist_extra/` (twenty-one peer-carrying cases that
+  widen the same loopback over the `DOP_SEND`/`DOP_REG_SEND` message families, pid externalization,
+  payload round trips, the inbound `DOP_LINK`/`DOP_EXIT`/`DOP_EXIT2`/`DOP_MONITOR_P`/`DOP_UNLINK_ID`
+  signals and the handshake-refusal paths), so A.5 is exercised live rather than through the ETF codec
+  alone, and a peer-carrying case pairs a side with a peer of **its own** program, never a cross-runtime
+  pair. The one remaining shallow contract is A.9 (boot/version observability only — see the A.9 status
+  above).
 
 ## See Also
 - `../CONTEXT.md` → workspace root: the binding cross-crate contracts and routing table.
