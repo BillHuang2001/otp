@@ -439,7 +439,7 @@ pub struct CompiledFunctions {
     ///
     /// Read through [`CompiledFunctions::labels`] (in-crate) or [`NativeCode::labels`]
     /// (the driver's seam).
-    labels: crate::interpreter::LabelMap,
+    labels: std::sync::Arc<crate::interpreter::LabelMap>,
     /// The highest x-register index any inlined instruction addresses directly in
     /// `machine.x`.
     ///
