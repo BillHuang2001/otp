@@ -972,27 +972,41 @@ fn emit_aligned_fields(
                 // [`MAX_TAIL_BYTES`], so the displacement is a small `disp32`.
                 let offset = (*offset_bits / 8) as i32;
                 let nbytes = (*bits / 8) as usize;
+                // One load per field, into `Rdx`, and the bytes are then peeled off it in
+                // place — never one load per byte (a wider field used to pay `nbytes` loads of
+                // the same word and `nbytes` full-width shifts).
                 match *value {
-                    Loc::X(_) => {}
-                    Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rcx, k)?,
-                }
-                for i in 0..nbytes {
-                    match *value {
-                        Loc::X(x) => {
-                            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-                            touch(highest_touched, x);
-                        }
-                        Loc::Y(_) => buffer.mov_rr(Reg::Rdx, Reg::Rcx)?,
+                    Loc::X(x) => {
+                        buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
+                        touch(highest_touched, x);
                     }
-                    // Byte `i` (MSB first) of the big-endian field is word bits
-                    // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift
-                    // is ARITHMETIC precisely because the caller wants
-                    // `(value as i64 as u64).to_be_bytes()`: the raw word's bit 63 is the
-                    // small value's sign bit, so `sar` sign-extends the 60-bit value to the
-                    // 64 bits `push_byte_field` receives, where a logical shift's zero fill
-                    // would corrupt a negative 8-byte field's top byte (`-1` as `0F FF …`).
-                    buffer.sar_ri(Reg::Rdx, (4 + 8 * (nbytes - 1 - i)) as u32)?;
+                    Loc::Y(k) => {
+                        emit_y_slot_value(buffer, Reg::Rcx, k)?;
+                        buffer.mov_rr(Reg::Rdx, Reg::Rcx)?;
+                    }
+                }
+                // Byte `i` (MSB first) of the big-endian field is word bits
+                // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift is
+                // ARITHMETIC precisely because the caller wants
+                // `(value as i64 as u64).to_be_bytes()`: the raw word's bit 63 is the small
+                // value's sign bit, so `sar` sign-extends the 60-bit value to the 64 bits
+                // `push_byte_field` receives, where a logical shift's zero fill would corrupt
+                // a negative 8-byte field's top byte (`-1` as `0F FF …`).
+                //
+                // The field is emitted **descending**, shifting the one loaded word in place:
+                // arithmetic right shifts compose, so `sar 4` then one `sar 8` between bytes
+                // leaves exactly the value `sar (4 + 8 * (nbytes - 1 - i))` would have at
+                // step `i`, i.e. every store writes the byte the ascending form wrote, at its
+                // own offset. The offsets are visited in the other order, which nothing can
+                // observe: they are disjoint bytes of one field, all written before the
+                // build's single window-end commit, and a re-execution rewrites the same
+                // bytes at the same offsets in the same order.
+                buffer.sar_ri(Reg::Rdx, 4)?;
+                for i in (0..nbytes).rev() {
                     buffer.mov_mr8(Reg::Rax, offset + i as i32, Reg::Rdx)?;
+                    if i > 0 {
+                        buffer.sar_ri(Reg::Rdx, 8)?;
+                    }
                 }
             }
             PreparedField::Const { bytes, offset_bits } => {
