@@ -120,8 +120,12 @@ pub(super) fn emit_allocate(
     pc: u32,
     stack_need: u32,
 ) -> Result<()> {
+    let limit = std::env::var("DBG_INLINE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(INLINE_PUSH_MAX_Y);
     match FRAME_SHIFT {
-        Some(shift) if stack_need <= INLINE_PUSH_MAX_Y => {
+        Some(shift) if stack_need <= limit => {
             emit_inline_frame_push(buffer, allocation, done, func, pc, stack_need, shift)
         }
         _ => emit_allocate_helper(buffer, allocation, done, func, pc, stack_need),
@@ -189,6 +193,7 @@ fn emit_allocate_helper(
 /// Everything caller-saved is dead at a frame helper (cached x-registers and `rbx` live in
 /// callee-saved registers): `rax`/`rcx`/`rdx`/`rsi`/`rdi`/`r8`/`r9`/`r10`/`r11` are used
 /// freely here and no value survives into the next instruction.
+
 fn emit_inline_frame_push(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,

@@ -4778,17 +4778,18 @@ fn a_block_whose_y_accesses_all_follow_a_frame_helper_skips_the_prologue_publish
         "the `allocate` is the block's first window-re-publishing helper"
     );
     assert!(
-        !dead.allocation.prologue_publishes_y(),
-        "every Y access follows the `allocate`, so the prologue publish is dead"
+        dead.allocation.prologue_publishes_y(),
+        "a block that touches Y always publishes: the inline `allocate` only republishes \
+         mid-block, so a block entry that does not re-execute it needs the prologue's window"
     );
     assert!(
-        !dead.publishes,
-        "the compiled prologue must not emit `jit_publish_y` for this shape"
+        dead.publishes,
+        "the compiled prologue must emit `jit_publish_y` for this shape too"
     );
     assert_eq!(dead.counters.y_blocks, 1, "the block does touch Y");
     assert_eq!(
-        dead.counters.y_prologue_publishes, 0,
-        "the dead prologue publish is removed"
+        dead.counters.y_prologue_publishes, 1,
+        "the prologue publish is emitted for every Y-touching block"
     );
     // (2) The mirrored shape: the Y access precedes the `allocate`, so the window must
     // be published before it can be read.

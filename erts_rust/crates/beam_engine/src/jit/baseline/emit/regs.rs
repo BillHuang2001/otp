@@ -307,28 +307,28 @@ impl Allocation {
     /// ([`super::super::runtime::jit_publish_y`]) instead of only recording the position
     /// ([`super::super::emit::prologue`]'s inline store).
     ///
-    /// A block that accesses no Y slot publishes nothing. A block that does publishes
-    /// **unless** every one of its Y accesses lies at or after an in-block helper that has
-    /// already re-published the window itself ([`Allocation::frame_republish_first`]: an
-    /// `allocate`/`allocate_heap`/`trim`, whose helper calls
-    /// `JitRuntime::refresh_y_base` on its success arm). A block's control flow is linear
-    /// — it is entered only at its own start and the only ways out of the middle are a
-    /// branch/exit into another range (each with **its own** prologue) — so reaching the
-    /// first Y access necessarily executed that helper first and the prologue's window is
-    /// overwritten before anything reads it: the publish would be dead work.
+    /// A block that accesses no Y slot publishes nothing; a block that does always
+    /// publishes. The publish is **idempotent** (`jit_publish_y` re-derives the window
+    /// from `machine.frames.last()` and a fresh `machine.stack.as_ptr()`, so a repeat
+    /// costs one helper call and changes no state), and it is the only thing that makes a
+    /// Y access safe at a block **entry** that does not re-execute a mid-block window
+    /// publisher.
     ///
-    /// **Conservative by construction**: an `Allocation` whose tables the analysis did not
-    /// fill (a synthetic one a unit test built directly — `y_last` set but `y_first`
-    /// absent) still publishes. The only failure direction is therefore a redundant
-    /// publish, never a Y access against a window nothing published.
+    /// A suppression rule was tried and is **unsound**, which is why it is not here: a
+    /// block whose every Y access follows a frame-changing instruction was allowed to skip
+    /// the publish on the theory that instruction re-published the window first. That holds
+    /// only if the entry point really executes the block prefix, and the inline
+    /// `allocate`/`allocate_heap` frame push (`emit/heap.rs`, `INLINE_PUSH_MAX_Y`) publishes
+    /// only **mid-block** — so a block entered with a window left over from a shallower
+    /// frame depth (the resume path, which republishes nothing, and any native entry whose
+    /// prologue chose not to publish) read its Y slots through a stale base. The failure
+    /// surfaced as a `{badmatch, _}` out of `get_list` under the default (baseline) tier on
+    /// `bench_list_walk:walk/1`, with the interpreter — which derives the window per
+    /// instruction — correct. [`Allocation::y_first`]/`frame_republish_first` survive as the
+    /// analysis's record and are read by the counters/tests; they no longer gate the
+    /// publish.
     pub(crate) fn prologue_publishes_y(&self) -> bool {
-        if self.y_last.is_none() {
-            return false;
-        }
-        match (self.y_first, self.frame_republish_first) {
-            (Some(first), Some(republish)) => first <= republish,
-            _ => true,
-        }
+        self.y_last.is_some()
     }
 }
 
