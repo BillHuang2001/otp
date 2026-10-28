@@ -252,6 +252,8 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
   BIF-level suite here (`beam_bifs` covers them — sibling node).
 
 ## Known Issues / Remaining gaps
+- **The encoder cannot write into a caller-owned buffer.** `Encoder::new_body` always allocates `Writer::with_capacity(DEFAULT_IMAGE_CAPACITY)` (`src/encode/mod.rs:309`) and `finish` moves the `Vec` out (`src/encode/mod.rs:1066`), so every `term_to_binary` pays one `malloc`/`free` of 128 B.
+  `Writer` is already public with `clear`/`into_vec` (`src/writer.rs:103`/`:98`), so the missing pieces are only a `Writer` constructor over an existing `Vec` plus `Encoder::with_writer`/`Encoder::take_writer` — additive here; a host still needs a slot to keep the buffer between calls (a new defaulted `beam_bifs` seam).
 - **A `FunKind::Local` (`make_fun3`) fun encodes only with a caller-supplied `FunIdentity`** —
   without one the encoder returns the typed `error::unsupported_local_fun`, never a mis-encoded
   term. This is a **host** property, not a missing wire rule: a genuine module closure whose module
