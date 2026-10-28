@@ -1,14 +1,16 @@
 # bench — measured results (m19)
 
-This is the definitive summary of the **current** measurement session (`m19`, 2026-10-23/24) for the
-`erts_rust` benchmark driver. Every number here comes from the committed raw artifacts under
-`results/m19-*`; regenerate with the Runbook (§7) rather than quoting a stale copy.
+This is the definitive summary of the **full-suite** measurement session (`m19`, 2026-10-23/24) for the
+`erts_rust` benchmark driver — the session every §2/§3 figure and every external-target row comes from.
+Every number here comes from the committed raw artifacts under `results/m19-*`; regenerate with the
+Runbook (§7) rather than quoting a stale copy.
 Raw JSON is authoritative — this file never edits a metric value.
 
-**§9 is a later, narrower session (`m21`)**: it *adds* two workloads (`jsone`, `bbmustache`) and measures
-**only** those two, against a different oracle build (OTP 29.1.2 rather than m19's 29.1.1). It supersedes
-nothing in §0–§8 and restates no other workload's figure — read it as a new pair of rows, never as a
-re-run of the record.
+Later, **narrower** sessions also exist and are archived under `results/`; they are additional measurement pairs, never replacements for an m19 §2/§3 row.
+`m21` is the GC/allocator workstream's before-record (`results/m21-xrun-gc-*`, `results/m21-xrun-ratios.txt`) plus the two eunit rows (`jsone`, `bbmustache`), which are carried as §9.
+`m22` is that workstream's after-record and the **newest** session: six matched rounds over `baseline,gc_bound,gc_class,list_walk,slice`, each row read through `results/m22-vs-m21.txt` (its headline diff), `results/m22-xrun-ratios.txt`, `results/m22-load-record.md` and `results/m22-memory.md`.
+§2/§3 do **not** restate m21's or m22's numbers.
+`m21` and `m22` share the OTP 29.1.2 / erts-17.1.1 oracle, unlike m19's 29.1.1 / erts-17.1, so they are mutually diffable only with each other and never against a row above.
 
 ## 0. The two sides, named
 
@@ -144,7 +146,7 @@ pass.** The per-round audit table is `m19-xab-ratios.txt`.
 | `binary_append` | per `expand/1` call | 81 749.74 ns | 1 327 024.36 ns | **16.250×** | 16.391 16.157 16.341 16.309 16.191 16.136 |
 | `file_io` | `write_read` | 134 510.44 ns | 98 643.46 ns | **0.733× — RUST FASTER** | 0.732 0.770 0.739 0.733 0.728 0.727 |
 | `file_io` | `handle_rw` | 140 944.46 ns | 1 529 350.61 ns | **10.848×** | 10.905 10.884 10.812 10.773 10.906 10.793 |
-| `file_io` | `ram_file` | 14 885.26 ns | **absent — no metric** | — | — (sys-only row) |
+| `file_io` | `ram_file` | 14 885.26 ns | **absent in m19 — no metric** | — | — (m19 sys-only row) |
 | `gc_class` | `send_recv` | 3 256.62 ns | 51 282.00 ns | **15.766×** | 15.925 15.712 15.680 15.781 16.032 15.751 |
 | `gc_class` | `ets_copy` | 1 688.33 ns | 14 026.24 ns | **8.329×** | 8.263 8.355 8.177 8.365 8.302 8.363 |
 | `gc_class` | `compile` | 16 179 064.25 ns | 333 405 219.75 ns | **20.612×** | 20.488 20.680 20.619 20.606 20.711 20.401 |
@@ -170,8 +172,9 @@ the `vm_memory_total_bytes` **0.213× accounting** figure, which is explicitly *
 **4.08×** · startup **2.52× p50 / 2.51× p99** · `slice` **2.28×** · `copy_bound/etf_roundtrip` **2.18×** ·
 compute loop **1.71×**.
 
-The one case with **no** rust figure at all is `file_io/ram_file` (§8): the rust side produced no metric,
-so its 14 885.26 ns/op is a **sys-only** number and no ratio exists.
+The one case with **no** rust figure at all is `file_io/ram_file` **in m19** (§8): the rust side produced no
+metric, so its 14 885.26 ns/op is a **sys-only** number and no ratio exists. The runtime now serves the case
+(`beam_rt`'s native ram file; see `CONTEXT.md`), so a fresh run does carry a rust figure for it.
 
 ### 3.2 Memory (like-for-like, `slice`)
 
@@ -213,8 +216,10 @@ names it (**sys / rust**): `etf_roundtrip_ops` 1 500 000 / 500 000, `ets_copy_op
 10 000, `list_walk_elements` 100 000 000 / 50 000 000, `foreign` `calls` 1 500 000 / 50 000
 (`bstr_to_lower`), 1 500 000 / 40 000 (`bstr_capitalize_token`), 3 000 000 / 60 000
 (`emqx_base62_encode`), 3 000 000 / 60 000 (`emqx_base62_decode`), `binary_append_calls` 50 000 / 2 000
-(`binary_append_bytes` 3 276 800 000 / 131 072 000), `file_io` `write_read` 200 000 / 20 000 ops,
-`handle_rw` 200 000 / 1 000 ops, `ram_file` 200 000 / — (sys-only), `gc_class` `send_recv` 200 000 /
+(`binary_append_bytes` 3 276 800 000 / 131 072 000 — an **m19** count: the workload is now calibrated at
+`n_rust` = 4 000, so a new run reports `binary_append_calls` 4 000 and 262 144 000 bytes, and an m19
+`binary_append` figure is comparable only at its own `N`), `file_io` `write_read` 200 000 / 20 000 ops,
+`handle_rw` 200 000 / 1 000 ops, `ram_file` 200 000 / — (m19: sys-only), `gc_class` `send_recv` 200 000 /
 25 000 ops, `ets_copy` 400 000 / 40 000 ops, `compile` 8 / 2 ops. **Never compare raw `wall_ms` across
 two sides with different `N`** — only the per-unit normalization is comparable, and a `gc_class/compile`
 figure must always be quoted with its `compile_ops` (§8).
@@ -410,10 +415,13 @@ Archive `out/` copies into `results/` with **only** the mechanical normalisation
   faster, all six rounds) is the *only* per-unit case rust wins; the `vm_memory_total_bytes` **0.213×** is
   an accounting figure, not a footprint; **every other measured case is dearer**, from
   `gc_class/compile` 20.61× down to the compute loop 1.71× (full ranking in §3.1.1).
-- **`file_io/ram_file` is absent on the rust side — no metric was recorded.** The row's own note is the
-  honest reason, quoted verbatim: `case ram_file: absent on rust (case ram_file (rust): exited 1: …
+- **`file_io/ram_file` carried no rust metric in m19.** The rust side recorded none then because the runtime
+  exec'd a `ram_file_drv` that was not present; the row's own note is that honest reason, quoted verbatim:
+  `case ram_file: absent on rust (case ram_file (rust): exited 1: …
   exec: ram_file_drv: not found … did not terminate within 60000 ms) — no metric recorded`. So its
-  14 885.26 ns/op is a **sys-only** figure and no rust/sys ratio exists for it.
+  14 885.26 ns/op is a **sys-only** figure and no rust/sys ratio exists for it **in m19**. `beam_rt` now
+  serves the case natively (`crates/beam_io/src/drivers/ram_file.rs`), so this caveat is m19-specific and a
+  fresh run reports all three cases.
 - **`gc_class/compile` is a runtime-execution comparison, not a compiler measurement.** Both sides resolve
   `code:which(compile)` to the **system OTP 29.1.1** compiler
   (`…/erlang-29.1.1/lib/erlang/lib/compiler-10.0.6/ebin/compile.beam`), so the 20.61× measures how fast
@@ -439,11 +447,13 @@ Archive `out/` copies into `results/` with **only** the mechanical normalisation
   `vm_memory_total_bytes` (0.213×) is an **accounting** figure, never a footprint.
 - **`foreign`'s and `binary_append`'s `case_<name>_ns_per_call` remain `N`-dependent on rust** (a
   common-mode per-op heap retention), so those per-call figures are comparable **only across runs at the
-  same `N`**; the counts are the ones in §3.3. `binary_append`'s `n_rust` = 2 000 is additionally **capped
-  by the runtime, not by the loop-count rule**: `beam_rt`'s `RUN_DEADLINE = 60 s`
-  (`crates/beam_rt/src/runtime/scheduler.rs:90`) is **non-overridable**, and any future increase in
-  per-call cost silently turns that row into `failed(no-binary-append-run)` — re-derive `n_rust` from the
-  measured cost before changing anything there.
+  same `N`**; the counts are the ones in §3.3. `binary_append`'s `n_rust` is now **4 000**, re-derived from
+  the merged runtime's measured ≈204 µs/call (deliberately the conservative figure: the driver's own
+  quiet-window paired marginal reads ≈157.5 µs/call, i.e. ≈630 ms of loop work, 1.26× the floor) so the
+  loop does ≈0.82 s of work and clears the ≥0.5 s rule —
+  the row no longer sits at the runtime's deadline cap, though `beam_rt`'s `RUN_DEADLINE = 60 s`
+  (`crates/beam_rt/src/runtime/scheduler.rs:90`) remains **non-overridable** and the maintenance rule still
+  applies: re-derive `n_rust` from the measured cost before changing anything there.
 - **No self-hosted build (contract A.9).** `erlc_compiler` and `elixir_compiler` are `Runtimes::SysOnly`
   and shell out to the system `erlc`/`elixirc`; nothing in the driver runs a compiler **under** `beam_rt`.
 - **Honesty caveats that travel with every figure here:** the host is shared, so absolute wall times are

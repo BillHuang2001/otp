@@ -6,7 +6,8 @@ Both records use the SAME oracle: `sys` = the system `erl` on PATH, Erlang/OTP 2
 from the same store path (/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1),
 and the same `rust` = erts_rust/target/release/beam_rt at its default baseline-JIT tier (version=30).
 So the two records ARE diffable row for row — except the slice rows, which m21 never measured.
-Note for anyone quoting older tables: m20/m19 and earlier named OTP 29.1.1 / erts-17.1; m21 already
+Note for anyone quoting older tables: m19 and earlier named OTP 29.1.1 / erts-17.1, and no m20 record
+or artifact exists; m21 already
 named 29.1.2 / erts-17.1.1 (verified in its own JSON `runtimes[].program`), so the oracle moved BEFORE
 m21, not between m21 and m22.
 

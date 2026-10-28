@@ -756,12 +756,12 @@ const MAX_INTERNAL_ATOM_CACHE_ENTRIES: usize = 255;
 /// committed `gen_instructions.escript` from this tree's own generator (see that
 /// file's header for the why and the how).
 ///
-/// Oracle-verified (OTP 29.1.1 / erts-17.1): **245** entries, the first four
-/// `["aligned_label_Lt", "allocate_tt", "allocate_heap_tIt", "append_cons_Is"]`
-/// and the last `"wait_unlocked_f"`. This tree is OTP 30 and its `ops.tab` reworked
-/// the native-record family, so its table holds **248**; the difference is a
-/// release skew, not a divergence, and is pinned as an explicit exception set by
-/// `the_generated_roster_matches_a_live_oracle_modulo_the_release_skew` below.
+/// Oracle-verified: the OTP 29.1.x oracles answer **245** entries with the same first
+/// four `["aligned_label_Lt", "allocate_tt", "allocate_heap_tIt", "append_cons_Is"]` and
+/// the same last `"wait_unlocked_f"`. This tree is OTP 30 and its `ops.tab` carries the
+/// native-record matching feature, so its table holds **248**; the difference is a
+/// feature/fix backport split, not a divergence, and is calibrated per oracle release by
+/// the `COHORTS` table in `the_generated_roster_matches_a_live_oracle_modulo_the_release_skew`.
 ///
 /// # Errors
 ///
@@ -1814,36 +1814,130 @@ mod tests {
     // instructions/0
     //
     // `erts_debug:instructions()` is the `beam_makeops`-generated `opc[]` name table,
-    // in dispatch order, each name a charlist of its bytes. This tree (OTP 30) holds
-    // **248** rows; the live OTP 29.1.1 oracle holds **245**, because OTP 30's
-    // `erts/emulator/beam/jit/x86/ops.tab:1328-1371` reworked the native-record family.
-    // The skew is pinned as an explicit exception set below, never smoothed over.
-
-    /// The instruction names this tree emits that the OTP 29.1.1 oracle does **not**: the
-    /// three opcodes OTP 30's native-record rework added.
-    ///
-    /// This set must shrink to **empty** once the differential oracle is an OTP 30
-    /// runtime — a leftover entry then fails loudly (see
-    /// [`the_version_skew_exception_set_is_exactly_the_documented_one`]).
-    const RELEASE_SKEW_ADDED: [&str; 3] = [
-        "i_get_local_record_elements_qxI",
-        "i_get_local_record_elements_qyI",
-        "i_update_local_native_record_aqsdtI",
-    ];
-
-    /// The four names whose spelling differs, as `(this tree, the OTP 29.1.1 oracle)`.
-    /// Both spellings are real instructions; only the operand letters the native-record
-    /// rework touched moved (`j` → `f` for a *failed*-typed source operand, `j…` → `…` for
-    /// the no-longer-distinct argument registers).
-    const RELEASE_SKEW_RENAMED: [(&str, &str); 4] = [
-        ("i_create_native_record_jcdtI", "i_create_native_record_cdtI"),
-        ("i_get_record_elements_jxI", "i_get_record_elements_fxI"),
-        ("i_get_record_elements_jyI", "i_get_record_elements_fyI"),
-        ("i_update_native_record_jsdtI", "i_update_native_record_sdtI"),
-    ];
+    // in dispatch order, each name a charlist of its bytes.
+    // This tree holds **248** rows, generated from the pinned release's own
+    // `erts/emulator/beam/jit/x86/ops.tab`: re-running the committed
+    // `gen_instructions.escript` against that tree reproduces the committed table
+    // byte for byte, so the roster is right for OTP 30.0-rc0 / erts-17.1.
+    // An oracle of an *older* release holds a different roster, and the difference is a
+    // feature/fix backport split, never a divergence — so it is calibrated per oracle
+    // release in the [`COHORTS`] table below rather than smoothed over.
+    // Only the native-record family has ever moved
+    // (`erts/emulator/beam/jit/x86/ops.tab:1327-1371`):
+    // `6fbf8a305e` ("Add instructions for matching/updating of native records") added
+    // `i_get_local_record_elements q xy I *` and `i_update_local_native_record a q s d t I *`,
+    // and moved `i_get_record_elements`' failed-typed source operand `f` → `j`;
+    // `e5a280abff` (issue #11691, "Handle native record operations with non-zero fail
+    // label") prefixed the fail label `j` to `i_create_native_record`/`i_update_native_record`,
+    // i.e. `c` → `j c` and `s` → `j s`.
+    // This tree has both commits; the OTP 29 maint patch that hosts this sandbox's oracle
+    // backported the fix only, and OTP 29.1.1 has neither.
 
     /// `use` of the generated table, so the assertions below read as prose.
     use crate::runtime::instructions::INSTRUCTIONS;
+
+    /// One live-oracle cohort: an identifiable OTP/erts release pair, plus exactly how
+    /// this tree's generated roster differs from that release's `opc[]`.
+    ///
+    /// A cohort is selected by the **exact** pair
+    /// `(erlang:system_info(otp_release), erlang:system_info(version))`.
+    /// "No skew" is a claim about one specific release, never a default: an oracle that
+    /// matches no cohort fails the roster test loudly.
+    struct OracleCohort {
+        /// `erlang:system_info(otp_release)`, e.g. `"29"`.
+        otp_release: &'static str,
+        /// `erlang:system_info(version)`, e.g. `"17.1.1"` — the `erts-` prefix is not part
+        /// of the value.
+        erts_version: &'static str,
+        /// This tree's rows that the cohort's oracle does **not** have: opcodes the newer
+        /// release added and no maint branch backported.
+        dropped: &'static [&'static str],
+        /// `(this tree's spelling, the cohort oracle's spelling)` for a row present on
+        /// both, where the older release spells the same opcode differently.
+        renamed: &'static [(&'static str, &'static str)],
+    }
+
+    impl OracleCohort {
+        /// The cohort's identity, for a failure message.
+        fn id(&self) -> String {
+            format!("OTP {}/erts-{}", self.otp_release, self.erts_version)
+        }
+    }
+
+    /// Every oracle release this roster is calibrated against, one entry per
+    /// `(otp_release, erts version)` pair that has actually served as an oracle.
+    ///
+    /// Adding a cohort means reading that release's own
+    /// `erts/emulator/beam/jit/x86/ops.tab` and diffing its `beam_makeops` output against
+    /// [`INSTRUCTIONS`]; nothing here may be inferred from a version string.
+    static COHORTS: &[OracleCohort] = &[
+        OracleCohort {
+            // OTP 29.1.1 — the original calibration oracle: it has neither the
+            // native-record matching/updating feature `6fbf8a305e` nor its fail-label fix
+            // `e5a280abff`.
+            otp_release: "29",
+            erts_version: "17.1",
+            dropped: &[
+                "i_get_local_record_elements_qxI",
+                "i_get_local_record_elements_qyI",
+                "i_update_local_native_record_aqsdtI",
+            ],
+            renamed: &[
+                ("i_create_native_record_jcdtI", "i_create_native_record_cdtI"),
+                ("i_get_record_elements_jxI", "i_get_record_elements_fxI"),
+                ("i_get_record_elements_jyI", "i_get_record_elements_fyI"),
+                ("i_update_native_record_jsdtI", "i_update_native_record_sdtI"),
+            ],
+        },
+        OracleCohort {
+            // OTP 29.1.2 — the 29 maint patch: it backported the fix `e5a280abff`, not the
+            // feature `6fbf8a305e`, so both `i_*_native_record` spellings already agree
+            // and only the two `i_get_record_elements` rows still hunt for their source
+            // operand with `f`.
+            otp_release: "29",
+            erts_version: "17.1.1",
+            dropped: &[
+                "i_get_local_record_elements_qxI",
+                "i_get_local_record_elements_qyI",
+                "i_update_local_native_record_aqsdtI",
+            ],
+            renamed: &[
+                ("i_get_record_elements_jxI", "i_get_record_elements_fxI"),
+                ("i_get_record_elements_jyI", "i_get_record_elements_fyI"),
+            ],
+        },
+        OracleCohort {
+            // OTP 30.0-rc0 / erts-17.1 — the pinned release itself: the comparison is
+            // exact, so any entry appearing here would be a divergence rather than a skew.
+            otp_release: "30",
+            erts_version: "17.1",
+            dropped: &[],
+            renamed: &[],
+        },
+    ];
+
+    /// The [`COHORTS`] entry for the oracle that printed `otp_release`/`erts_version`.
+    ///
+    /// An uncalibrated oracle **fails loudly**, naming both observed values: comparing an
+    /// unknown release with "no skew" would turn every difference into a claim we never
+    /// checked.
+    fn cohort_for_oracle(otp_release: &str, erts_version: &str) -> &'static OracleCohort {
+        COHORTS
+            .iter()
+            .find(|cohort| {
+                cohort.otp_release == otp_release && cohort.erts_version == erts_version
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "unrecognised oracle cohort: erlang:system_info(otp_release) = \
+                     {otp_release:?}, erlang:system_info(version) = {erts_version:?}.\n\
+                     Add an `OracleCohort` to COHORTS calibrated from that release's own \
+                     erts/emulator/beam/jit/x86/ops.tab (the native-record family is at \
+                     lines 1327-1371 here) and diffed against INSTRUCTIONS — never widen \
+                     the comparison instead."
+                )
+            })
+    }
 
     /// [`INSTRUCTIONS`] is this tree's dispatch roster: 248 unique, non-empty ASCII names,
     /// the same first and last rows the oracle reports (the ends are release-stable).
@@ -1919,39 +2013,111 @@ mod tests {
         );
     }
 
-    /// The release-skew exception set of the two tables above is exactly the documented one
-    /// and nothing else: every dropped name and every in-tree spelling is really in
-    /// [`INSTRUCTIONS`], and no oracle spelling is.
+    /// Every [`COHORTS`] entry is a real, non-overlapping claim about [`INSTRUCTIONS`]:
+    /// each dropped row and each in-tree spelling is really in the generated roster, no
+    /// oracle spelling is, no row is claimed twice inside one cohort, and the pinned
+    /// release's own cohort carries zero skew.
     ///
-    /// **Why this exists:** this tree is OTP 30 and the differential oracle is OTP 29.1.1,
-    /// so the two `opc[]` tables differ by the native-record rework in
-    /// `erts/emulator/beam/jit/x86/ops.tab:1328-1371` (it gained the `j` operand plus the
-    /// `i_get_local_record_elements`/`i_update_local_native_record` opcodes). The set is a
-    /// *skew*, not a divergence: it must shrink to **empty** when the oracle becomes OTP
-    /// 30, and failing loudly here is the intent — a stale entry would let a real
-    /// divergence hide behind a "known exception".
+    /// **Why this exists:** the roster test below trusts the cohort table, so the table
+    /// must be checkable with no `erl` in sight.
+    /// The entries are a *backport split* — the opcodes and operand letters the
+    /// `6fbf8a305e` feature and the `e5a280abff` fix moved (`ops.tab:1327-1371`), present
+    /// here because this tree is OTP 30 and absent from the OTP 29 oracles — so a stale or
+    /// invented entry has to fail here instead of letting a divergence hide behind it.
     #[test]
     fn the_version_skew_exception_set_is_exactly_the_documented_one() {
-        assert_eq!(RELEASE_SKEW_ADDED.len(), 3, "the documented dropped names");
-        assert_eq!(RELEASE_SKEW_RENAMED.len(), 4, "the documented renames");
         let roster: std::collections::BTreeSet<&str> = INSTRUCTIONS.iter().copied().collect();
-        for name in RELEASE_SKEW_ADDED {
-            assert!(roster.contains(name), "{name} is not in the generated roster");
-        }
-        for (ours, oracle) in RELEASE_SKEW_RENAMED {
-            assert!(roster.contains(ours), "{ours} is not in the generated roster");
+        let mut identities = std::collections::BTreeSet::new();
+        for cohort in COHORTS {
+            // Within one cohort a row is claimed at most once: a dropped row cannot also be
+            // renamed, and no rename source may appear twice.
+            let mut claimed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            let identity = (cohort.otp_release, cohort.erts_version);
             assert!(
-                !roster.contains(oracle),
-                "{oracle} is the oracle's spelling and must not be in this tree's roster"
+                identities.insert(identity),
+                "{} is listed twice",
+                cohort.id()
+            );
+            for name in cohort.dropped {
+                assert!(
+                    roster.contains(name),
+                    "{}: dropped row {name} is not in the generated roster",
+                    cohort.id()
+                );
+                assert!(
+                    claimed.insert(name),
+                    "{}: {name} is claimed twice by the cohort's tables",
+                    cohort.id()
+                );
+            }
+            for (ours, oracle) in cohort.renamed {
+                assert!(
+                    roster.contains(ours),
+                    "{}: in-tree spelling {ours} is not in the generated roster",
+                    cohort.id()
+                );
+                assert!(
+                    !roster.contains(oracle),
+                    "{}: {oracle} is an oracle spelling and must not be in this tree's roster",
+                    cohort.id()
+                );
+                assert_ne!(ours, oracle, "{}: {ours} is renamed to itself", cohort.id());
+                assert!(
+                    claimed.insert(ours),
+                    "{}: {ours} is claimed twice by the cohort's tables",
+                    cohort.id()
+                );
+            }
+            // The mapped roster keeps every row it does not drop, and no rename collides
+            // with another row (a collision would silently shrink the comparison).
+            let mapped = our_roster_for_the_oracle(cohort);
+            assert_eq!(
+                mapped.len(),
+                INSTRUCTIONS.len() - cohort.dropped.len(),
+                "{}: the mapped roster keeps every row it does not drop",
+                cohort.id()
+            );
+            let unique: std::collections::BTreeSet<&str> =
+                mapped.iter().map(|(_, oracle)| oracle.as_str()).collect();
+            assert_eq!(
+                unique.len(),
+                mapped.len(),
+                "{}: a rename collides with another row",
+                cohort.id()
             );
         }
+        // The documented sizes: a fourth dropped row or a fifth rename is a new claim about
+        // a release, not a tweak, so it has to be written down here too.
+        let otp_29_1_1 = cohort_for_oracle("29", "17.1");
+        assert_eq!(otp_29_1_1.dropped.len(), 3, "OTP 29.1.1: the three feature rows");
+        assert_eq!(otp_29_1_1.renamed.len(), 4, "OTP 29.1.1: the four renames");
+        let otp_29_1_2 = cohort_for_oracle("29", "17.1.1");
+        assert_eq!(otp_29_1_2.dropped.len(), 3, "OTP 29.1.2: the same three feature rows");
+        assert_eq!(otp_29_1_2.renamed.len(), 2, "OTP 29.1.2: the two get_record_elements renames");
+        assert_eq!(COHORTS.len(), 3, "the calibrated oracle cohort count");
+        // The pinned release is compared exactly: a skew entry for it would be a divergence
+        // in disguise.
+        let pinned = cohort_for_oracle("30", "17.1");
+        assert!(
+            pinned.dropped.is_empty(),
+            "OTP 30.0-rc0/erts-17.1 is this tree's own release: no dropped rows"
+        );
+        assert!(
+            pinned.renamed.is_empty(),
+            "OTP 30.0-rc0/erts-17.1 is this tree's own release: no renames"
+        );
     }
 
-    /// The generated roster equals a **live** OTP 29.1.1 oracle's roster element for
-    /// element, in order, once the documented release skew is applied.
+    /// The generated roster equals a **live** oracle's roster element for element, in
+    /// order, once that oracle's own [`COHORTS`] entry is applied.
     ///
-    /// Skips **loudly** when no `erl` is on `PATH`. A differing row reports its index and
-    /// both spellings, so a real divergence cannot hide behind the skew set.
+    /// The oracle identifies itself by the exact `(otp_release, erts version)` pair it
+    /// prints, so the same test is meaningful against any calibrated release and an
+    /// uncalibrated one fails with both observed values named.
+    /// **Every** diverging row lands in one report — index, this tree's spelling, the
+    /// oracle's, and a stale-rename hint — so a real divergence cannot hide behind the
+    /// skew set.
+    /// Skips **loudly** when no `erl` is on `PATH`.
     #[test]
     fn the_generated_roster_matches_a_live_oracle_modulo_the_release_skew() {
         if crate::runtime::ddll::test_support::which_erl().is_none() {
@@ -1965,7 +2131,9 @@ mod tests {
         erl.args([
             "-noshell",
             "-eval",
-            "L = erts_debug:instructions(), io:format(\"~p~n\", [length(L)]), \
+            "L = erts_debug:instructions(), \
+             io:format(\"otp ~s~nerts ~s~n~p~n\", [erlang:system_info(otp_release), \
+                       erlang:system_info(version), length(L)]), \
              lists:foreach(fun(S) -> io:format(\"~s~n\", [S]) end, L), halt(0).",
         ]);
         let stdout = match erl.output() {
@@ -1984,49 +2152,84 @@ mod tests {
             }
         };
         let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+        let otp_release = lines
+            .next()
+            .and_then(|line| line.trim().strip_prefix("otp "))
+            .expect("the oracle printed `otp <otp_release>` first")
+            .to_string();
+        let erts_version = lines
+            .next()
+            .and_then(|line| line.trim().strip_prefix("erts "))
+            .expect("the oracle printed `erts <version>` second")
+            .to_string();
         let count: usize = lines
             .next()
             .expect("the oracle printed the roster length")
             .trim()
             .parse()
             .expect("the oracle's length line is a number");
-        let oracle: Vec<&str> = lines.collect();
+        let oracle: Vec<&str> = lines.map(str::trim).collect();
         assert_eq!(oracle.len(), count, "the oracle's own count line");
-        assert_eq!(count, 245, "the OTP 29.1.1 opc[] row count");
 
-        let ours = our_roster_for_the_oracle();
-        assert_eq!(
-            ours.len(),
-            oracle.len(),
-            "{} rows here against {} on the oracle (245 = 248 − {} added, {} renamed)",
-            ours.len(),
-            oracle.len(),
-            RELEASE_SKEW_ADDED.len(),
-            RELEASE_SKEW_RENAMED.len()
-        );
-        for (index, (ours, theirs)) in ours.iter().zip(&oracle).enumerate() {
-            assert_eq!(
-                ours, theirs,
-                "row {index}: this tree says {ours:?}, the oracle says {theirs:?}"
-            );
+        let cohort = cohort_for_oracle(&otp_release, &erts_version);
+        let ours = our_roster_for_the_oracle(cohort);
+
+        let mut report: Vec<String> = Vec::new();
+        if ours.len() != oracle.len() {
+            report.push(format!(
+                "length: this tree yields {} rows for {}, the oracle prints {}",
+                ours.len(),
+                cohort.id(),
+                oracle.len()
+            ));
         }
+        for (index, ((tree_name, ours), theirs)) in ours.iter().zip(&oracle).enumerate() {
+            if ours == theirs {
+                continue;
+            }
+            let mut row = format!(
+                "row {index}: this tree says {ours:?} (unmapped {tree_name:?}), \
+                 the oracle says {theirs:?}"
+            );
+            // The oracle agreeing with the *unmapped* spelling is exactly what a rename
+            // entry that no longer applies looks like on this release.
+            if theirs == tree_name && cohort.renamed.iter().any(|(ours, _)| ours == tree_name) {
+                row.push_str(&format!(
+                    " — the {} rename entry for {tree_name:?} is stale for this oracle",
+                    cohort.id()
+                ));
+            }
+            report.push(row);
+        }
+        assert!(
+            report.is_empty(),
+            "the instructions/0 roster disagrees with the {} oracle in {} row(s):\n{}",
+            cohort.id(),
+            report.len(),
+            report.join("\n")
+        );
     }
 
-    /// [`INSTRUCTIONS`] with the documented release skew applied — the roster a live OTP
-    /// 29.1.1 oracle must agree with.
-    fn our_roster_for_the_oracle() -> Vec<String> {
+    /// [`INSTRUCTIONS`] with `cohort`'s skew applied: `(this tree's spelling, the spelling
+    /// that cohort's oracle prints)`, in dispatch order — the roster that oracle must agree
+    /// with.
+    fn our_roster_for_the_oracle(cohort: &OracleCohort) -> Vec<(&'static str, String)> {
         INSTRUCTIONS
             .iter()
-            .filter(|name| !RELEASE_SKEW_ADDED.contains(name))
+            .copied()
+            .filter(|name| !cohort.dropped.contains(name))
             .map(|name| {
-                let renamed = RELEASE_SKEW_RENAMED
+                let renamed = cohort
+                    .renamed
                     .iter()
-                    .find(|(ours, _)| ours == name)
+                    .find(|(ours, _)| *ours == name)
                     .map(|(_, oracle)| *oracle);
-                renamed.unwrap_or(name).to_string()
+                (name, renamed.unwrap_or(name).to_string())
             })
             .collect()
-    }    // -----------------------------------------------------------------------
+    }
+
+    // -----------------------------------------------------------------------
     // map_info/1
     //
     // The whole oracle probe these expectations were taken from (OTP 29.1.1 /

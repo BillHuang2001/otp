@@ -14,9 +14,9 @@ A/B (`../BOTTLENECKS.md` §1.1).
 Sides: `sys` = the system ERTS on `PATH` — **Erlang/OTP 29.1.2 / erts-17.1.1**
 (`/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl`,
 `version=29`); `rust` = `erts_rust/target/release/beam_rt` at its default baseline-JIT tier
-(`version=30`). **Note the oracle moved:** earlier records (m17–m20) named OTP **29.1.1 / erts-17.1**;
+(`version=30`). **Note the oracle moved:** earlier records (m17–m19) named OTP **29.1.1 / erts-17.1**;
 this host's `erl` is **29.1.2 / erts-17.1.1**. Both sides, every pass, are recorded in
-`m21-xrun-ratios.txt` §G; ratios are therefore vs *this* oracle, not the one m20 quoted.
+`m21-xrun-ratios.txt` §G; ratios are therefore vs *this* oracle, not the one m19 quoted.
 
 ## Command shape (one matched round = two single-side passes, alternating order)
 

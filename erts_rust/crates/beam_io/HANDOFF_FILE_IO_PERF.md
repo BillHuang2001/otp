@@ -139,16 +139,16 @@ marginal at `N`=1 000 down to ~42 ms — one round read `-1.9 ms … 51.4 ms` an
 withheld as below timer resolution. `n_rust` for `handle_rw` should rise to ~20 000 once this
 lands (a `tools/bench` change, not made here).
 
-## 4. `file_io/ram_file` — why there was no rust row, and the patch that fixes it
+## 4. `file_io/ram_file` — the `{spawn, Cmd}` first-token resolution that makes the row run
 
-The absent row is **not** a `beam_io` gap: `ram_file_drv`, its 13 opcodes and its 77/77 reply
-encodings are shipped and pinned here. The runtime instead `execve`d a program called
-`ram_file_drv` (`/bin/sh: line 1: exec: ram_file_drv: not found`) and then hung for 60 s, because
-`ram_file.erl:383` opens the driver through the **`{spawn, Cmd}`** name form —
-`erlang:open_port({spawn,"ram_file_drv"}, Opts)` — and `beam_rt`'s `name_spec` classified every
-`("spawn",2)` as an OS child. The C resolves a command's **first token** against its driver list
-before it forks (`erts/emulator/beam/io.c:599-628`); this tree already had that rule for the
-`[exit_status]` refusal (`opens_a_driver_port`) and simply did not apply it when choosing the arm.
+The row is **not** a `beam_io` gap: `ram_file_drv`, its 13 opcodes and its 77/77 reply
+encodings are shipped and pinned here. It runs because `ram_file.erl:383` opens the driver through
+the **`{spawn, Cmd}`** name form — `erlang:open_port({spawn,"ram_file_drv"}, Opts)` — and
+`beam_rt`'s `name_spec` resolves a command's **first token** against its driver list before it forks,
+as the C does (`erts/emulator/beam/io.c:599-628`): that is the same rule the `[exit_status]`
+refusal (`opens_a_driver_port`) reads. Taking the OS-child arm instead forks
+`/bin/sh -c "exec ram_file_drv"` and hangs the owner in `ram_file:get_response/1`'s `receive`
+(`/bin/sh: line 1: exec: ram_file_drv: not found`).
 
 ```diff
 --- a/erts_rust/crates/beam_rt/src/port.rs
@@ -202,22 +202,23 @@ own `file:read_file_info(Name)` ⇒ `{error,enoent}` self-check passes (`rambenc
   (`task-clock:u` 182 ms at `N`=0 vs 392 ms at `N`=1 000), i.e. ~13× the oracle's 15.7 µs — the
   port-command round trip costs far more than the driver's work. Not a `beam_io` figure: the
   driver's replies are staged inside its own `output` callback.
-* `tools/bench`'s `ram_file` calibration (`(RAM_FILE, 52_000.0, 20_000)`) therefore cannot stay
-  at `N`=20 000 — at ~12.9 ms/op that is 258 s and trips the 60 s run deadline. It needs
-  `n_rust` ≈ 1 000 until the round trip is fixed.
+* `tools/bench`'s `ram_file` calibration is `(RAM_FILE, 52_000.0, 20_000)`: `n_rust` 20 000 against
+  the driver's committed per-op cost basis for the case, i.e. ≈1.04 s of loop work. The row reports
+  `ok` under the Rust runtime, so no reduced count is needed.
 
 ## 5. Test evidence for the patches (applied, then reverted)
 
-* `cargo test -p beam_rt --no-fail-fast`: the only red targets are the eight inventoried
-  known-red tests in `crates/beam_rt/TEST_STRATEGY.md` — the four `src/runner/` lib tests plus
-  `foreign_root_loop`, `gc_immix_payload`, `gc_strategy`, `off_heap_reclaim`. **No new red**
-  (lib: 1986 passed / 4 failed, exactly the inventoried four).
+* `cargo test -p beam_rt --no-fail-fast`: green — with these patches applied the lib suite reports
+  no red, and `crates/beam_rt/TEST_STRATEGY.md` *Test status* carries no known-red list ("nothing
+  in this crate is red on an unmodified tree").
 * `cargo test -p beam_io --no-fail-fast`: **fully green** — whole crate 1328 passed / 0 failed /
   2 ignored over 28 binaries (lib 1074 passed / 0 failed). No red target.
-* Differential, 404 `driver*`/`port*`/`file*`/`inet*`/`spawn*` cases run individually at 16-way and
-  merged with `--allowlist tools/differential/known-gaps.txt`: `total 3439 / agree 3438 /
-  mismatch 0 / unsupported 1 / skipped 0`, ratchet `allowed 1 / unauthorized 0 / stale 0` — the
-  baseline, unchanged.
+* Differential: the corpus is **3469** cases; a **12-way** `differential run <id> --out-file` sweep
+  over the `driver*`/`port*`/`file*`/`inet*`/`spawn*` cases included, folded with `differential
+  merge` and both committed allowlists, reports `total=3469 / agree=3465 / mismatch=0 /
+  unsupported=1 / skipped=0 / oracle_drift=3` with ratchet `allowed=1 / unauthorized=0 / stale=0`
+  and drift `allowed=3 / unauthorized=0 / stale=0` — the three non-agreeing cases are the recorded
+  host-oracle drift (an erts-17.1.1 oracle vs the tree's frozen `17.1`), no divergence.
 
 ## 6. Reproduction
 

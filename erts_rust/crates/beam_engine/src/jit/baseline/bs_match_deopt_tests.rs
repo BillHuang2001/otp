@@ -1089,6 +1089,7 @@ fn a_bs_match_over_an_off_heap_refc_window_takes_no_interpreter_step() {
     );
 }
 
+// ---------------------------------------------------------------------------
 // 10. A refc-window subject — the binary-comprehension inner loop
 // ---------------------------------------------------------------------------
 /// Build an off-heap (**refc**) bitstring term over `payload_bytes` with the window
@@ -1367,4 +1368,72 @@ fn a_non_refc_sub_bits_subject_still_declines_to_the_family() {
         &baseline,
         &module.atom_table,
     );
+}
+
+// ---------------------------------------------------------------------------
+// 11. The on-heap subject guard accepts every `ErlHeapBits` block arity
+// ---------------------------------------------------------------------------
+/// **An on-heap subject of every `ErlHeapBits` block arity stays native.**
+///
+/// `emit_subject_view` classifies the on-heap form by masking the block's header word with
+/// `BITSTRING_TAG_MASK` (`0x3B`) and comparing the remaining subtag field against
+/// `HEAP_BITS_SUBTAG` (`0x20`) — the two-step test `beam_term::boxed::is_bitstring_header`
+/// performs. The header word also carries the block's **arity**
+/// (`make_header(num_words - 1, HEAP_BITS_SUBTAG)`) in bits `6..`, so a mask that reaches above
+/// bit 5 compares against the arity as well and refuses a well-formed heap binary whose arity
+/// has that bit set. That is exactly what a merge glued away once: the `mov_ri` loading the mask
+/// was absorbed into a trailing comment, so the header was masked with the *previous* register
+/// value (`SUB_BITS_HEADER`) and every subject whose block arity had bit 2 set (`17..=48`
+/// payload bytes) silently deopted once per element — a value-identical regression that tier
+/// agreement cannot see.
+///
+/// Every length below is ≤ [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`], so the subject really
+/// is an `ErlHeapBits`; the block arities (`heap_bits_size_words(bits) - 1`) cover every residue
+/// mod 8, and the run-time `BsMatch` deopt count must be zero for each of them.
+#[test]
+fn an_on_heap_subject_of_every_block_arity_takes_no_interpreter_step() {
+    let module = match_module_with(
+        "bsm_on_heap_arities",
+        &["ensure_at_least", "integer"],
+        |module| {
+            let mut commands = ensure_at_least_command(module, 8, 1);
+            commands.extend(integer_command(module, 8, 1, Operand::X(2)));
+            commands
+        },
+        vec![Instr::Move {
+            src: Operand::X(2),
+            dst: Operand::X(0),
+        }],
+    );
+    assert_inlinable("on-heap arities", &module);
+    let name = atom(&module, "f");
+    // 1 -> arity 2, 9 -> 3, 17 -> 4, 25 -> 5, 33 -> 6, 41 -> 7, 49 -> 8, 64 -> 9: arities 4..=7
+    // are the ones a mask that includes header bit 8 refuses.
+    for len in [1usize, 9, 17, 25, 33, 41, 49, 64] {
+        let arity = beam_term::bitstring::heap_bits_size_words(len * 8) - 1;
+        let mut subject = vec![0u8; len];
+        subject[0] = 0x5a; // distinguishable from every following byte (0x00)
+        let label = format!("on-heap {len} B (block arity {arity})");
+        let (interpreted, _) = run_counting_bytes(&module, name, &subject, Tier::Interpreter);
+        let (baseline, snapshot) = run_counting_bytes(&module, name, &subject, Tier::BaselineJit);
+        assert_same_outcome(&label, &interpreted, &baseline, &module.atom_table);
+        let returned = baseline
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        let RunOutcome::Returned(value) = returned else {
+            panic!("{label}: unexpected outcome {returned:?}");
+        };
+        assert_eq!(
+            beam_term::signed_value(*value),
+            0x5a,
+            "{label}: the first 8 bits of the subject must be its first payload byte"
+        );
+        assert_eq!(
+            snapshot.deopts_by_variant.get("BsMatch").copied().unwrap_or(0),
+            0,
+            "{label}: the header mask names the tag field only, so the block arity cannot make \
+             the guard refuse a well-formed `ErlHeapBits` (run-time deopts {:?})",
+            snapshot.deopts_by_variant
+        );
+    }
 }

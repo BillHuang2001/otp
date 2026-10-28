@@ -579,6 +579,17 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - `+Q N` / `ERL_MAX_PORTS` -> `system_info(port_limit)` **is** pinned (the `next_power_of_two` sizing
   matrix); `+Q legacy` / no `+Q` -> 65536.
 
+- `binary:referenced_byte_size/1` of a **sub-binary** differs above the 64-byte heap-binary limit:
+  for a `binary:part/3` window, or for a `<<H:S/binary, _/binary>>` match, out of a 512-byte refc
+  binary the oracle answers the **parent** payload's size (`{65,512}` … `{511,512}`) while the Rust
+  runtime answers the sub-binary's own size (`{65,65}` … `{511,511}`) — the extracted window is
+  materialized as its own payload rather than referencing the parent. The two sides agree at and
+  below the limit (`{20,20}`, `{64,64}`) and on a whole refc binary (`512`). The **bytes** of every
+  such window do agree and are pinned (`bitbin/refc_subject_bit_offset_binary_fields`, which takes
+  a `4/binary` at bit 11 and a `180/binary` at bit 24 out of the unaligned refc window), so only
+  this size figure is unpinned — no case may read it (guarded by
+  `bitbin::tests::no_case_pins_referenced_byte_size`). Owner: `beam_term` / `beam_bifs` (the
+  sub-binary representation).
 ## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
 - `erl_ddll`'s refusal shapes all agree and are pinned: the missing-object / missing-directory /
   non-string-name `{error,{open_error,-10}}`, the not-loaded `{error,not_loaded}`, the

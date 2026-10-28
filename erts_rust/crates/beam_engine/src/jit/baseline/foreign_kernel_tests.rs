@@ -1512,7 +1512,8 @@ fn the_to_lower_append_construction_lowers_its_y_slot_accumulator() {
 /// `static_deopts("BsCreateBin") == 0` is asserted too, but it proves little on its own: the
 /// family route is a `claimed` helper arm, not an `emit_deopt`, so it reads 0 whether or not a
 /// build lowers. The load-bearing evidence is the `SHAPE_CREATE_BIN` + `SHAPE_CREATE_FRESH`
-/// `inlined` delta over a cache-free compile plus the per-build `CreateBinShape::of` verdicts.#[test]
+/// `inlined` delta over a cache-free compile plus the per-build `CreateBinShape::of` verdicts.
+#[test]
 fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtime_width() {
     let Some(staged) = stage_or_skip("base62_decode_create_bin", &EMQX) else {
         return;
@@ -1590,7 +1591,8 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
         (lowered, declined),
         (5, 1),
         "decode/2: the two 6-bit appends and the three `<<DecodeChar>>` bare builds are lowered, \
-         and the runtime-width append stays where it was"    );
+         and the runtime-width append stays where it was"
+    );
     assert_eq!(
         lowered, lowered_instances,
         "the builds `CreateBinShape::of` accepts and the instances the emitter actually lowered \

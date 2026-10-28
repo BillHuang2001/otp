@@ -53,7 +53,9 @@
 %%
 %% **The emitted file is generated data — never hand-edit it.** The output is
 %% pinned by the tests in `erts_debug.rs', which compare it against a live
-%% oracle modulo a documented OTP-version-skew exception set.
+%% oracle through the per-oracle-version `COHORTS' table there: for each
+%% `(otp_release, erts version)' pair it records the rows this roster has and
+%% that oracle lacks, plus the rows respelled between the two releases.
 
 main(Args) ->
     Top = opt(Args, "--top", default_top()),
@@ -290,9 +292,13 @@ render(Names) ->
         "//! ## OTP-version skew\n"
         "//!\n"
         "//! The table describes *this* source tree (OTP 30). A live oracle of a\n"
-        "//! different OTP release differs, because `ops.tab` itself differs; the test\n"
-        "//! module of `super::erts_debug` therefore carries an explicit, documented\n"
-        "//! exception set for the release skew and pins this roster's own length.\n"
+        "//! different OTP release differs, because `ops.tab` itself differs, so the test\n"
+        "//! module of `super::erts_debug` calibrates the comparison against a\n"
+        "//! per-oracle-version `COHORTS` table: for each `(otp_release, erts version)`\n"
+        "//! pair it records the rows this roster has and that oracle lacks, plus the\n"
+        "//! rows respelled between the two releases. An oracle matching no cohort fails\n"
+        "//! loudly instead of being compared with \"no skew\", and this roster's own\n"
+        "//! length is pinned.\n"
         "\n",
     Body = "/// The `opc[]` roster in dispatch order: `INSTRUCTIONS[N]` is the name of\n"
         "/// instruction `N`.\n"

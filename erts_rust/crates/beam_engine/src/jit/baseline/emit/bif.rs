@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's **BIF** fast paths: five `erlang:` accessors lowered in block
+//! The baseline JIT's **BIF** fast paths: six `erlang:` accessors lowered in block
 //! instead of deopting to one interpreter step, through **two routes**.
 //!
 //! **(a) The pure aggregate accessors, reused in block.** `hd/1`, `element/2` (with a
@@ -187,8 +187,8 @@ impl Inlined {
     }
 }
 
-/// Whether `source`/`dst` are a shape [`jit_bif_value`] can serve for `byte_size/1` or
-/// `length/1`.
+/// Whether `source`/`dst` are a shape [`jit_bif_value`] can serve for `byte_size/1`,
+/// `bit_size/1` or `length/1`.
 ///
 /// Purely syntactic: the source must be a **pure machine read** the helper can address
 /// (an in-bound `X` register or an addressable `Y` slot) or a **constant** operand
@@ -216,7 +216,7 @@ fn value_registers(dst: &Operand) -> (Vec<u32>, Vec<u32>) {
 }
 
 /// Classify `instr` as one of the six lowered BIFs — the three pure accessors reused from
-/// the aggregate read guards, or the two helper-evaluated value accessors — with the
+/// the aggregate read guards, or the three helper-evaluated value accessors — with the
 /// destination operand every one of them writes.
 ///
 /// The test is exactly the interpreter's own dispatch key: the import's **module** name is

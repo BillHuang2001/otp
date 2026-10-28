@@ -45,8 +45,9 @@
 //!   `file:read(Fd, byte_size(Payload))` + `file:close/1`. The same full-equality check,
 //!   so a short read is a failure.
 //! * `ram_file` (**optional**) — `file:open(Name, [ram, read, write, binary])` + write +
-//!   reposition + read + close, the `ram_file_drv` path. It is optional because a runtime
-//!   may legitimately not serve it; see *the optional case* below.
+//!   reposition + read + close, the `ram_file_drv` path (`beam_rt` serves it natively). It
+//!   is optional because a runtime may legitimately not serve it; see *the optional case*
+//!   below.
 //!
 //! The payload ([`PAYLOAD_BYTES`] bytes, built by interpreted recursion from this crate's
 //! constants — the Erlang source is generated from them, so the sides cannot drift) is
@@ -68,9 +69,12 @@
 //! it back, closes, and then asserts that the name is **gone** (`{error, enoent}`). A
 //! runtime that silently ignores the `ram` option would instead materialise a host file,
 //! and its time would be an ordinary disk figure mislabelled as a RAM one — that
-//! verification turns exactly that into a loud `{ram_not_ram, Name}` exit. A case that
-//! refuses on a runtime is reported **absent on that runtime with its own reason** and
-//! contributes **no** metric (see [`Case::optional`]); it never fabricates a number.
+//! verification turns exactly that into a loud `{ram_not_ram, Name}` exit. Both runtimes
+//! serve the case today (`beam_rt` implements the driver natively in
+//! `crates/beam_io/src/drivers/ram_file.rs`), so each reports a figure for it while the
+//! self-check still proves no host file appeared. A case that refuses on a runtime is
+//! reported **absent on that runtime with its own reason** and contributes **no** metric
+//! (see [`Case::optional`]); it never fabricates a number.
 //!
 //! # The measurement (paired, drift-cancelling, per op)
 //!
@@ -192,8 +196,10 @@ impl Case {
 /// own run-to-run boot/startup jitter** (measured at ≈±0.1 s on the rust boot). The rust
 /// floor is therefore **≥0.5 s of loop work**. The measured rust per-op cost on that host
 /// (2026-10-23, `/proc/loadavg` ≈5, `--quick`, default baseline-JIT tier) is
-/// **≈98 µs** (`write_read`), **≈1.51 ms** (`handle_rw`); `ram_file` is refused by `beam_rt`
-/// (absent), so its cost is the earlier estimate. The counts below are ≈1.95 s, ≈1.51 s and
+/// **≈98 µs** (`write_read`), **≈1.51 ms** (`handle_rw`); `ram_file` is served by both
+/// runtimes today (`beam_rt` implements the driver natively in
+/// `crates/beam_io/src/drivers/ram_file.rs`), so its count rests on a real per-op cost rather
+/// than on a case that could not run. The counts below are ≈1.95 s, ≈1.51 s and
 /// ≈1.04 s of loop work — ≳20× the paired estimator's
 /// measured residual noise band. The oracle's much smaller startup jitter needs a
 /// correspondingly smaller marginal, so its counts are an order of magnitude larger.
