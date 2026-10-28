@@ -595,7 +595,14 @@ fn count_send_warm(term: Eterm, src: &Src, words: usize) -> Counters {
 
 /// `REPEATS` counter windows of the same phase must agree **exactly** — the determinism claim.
 /// Returns the agreed counters and panics naming the phase on any disagreement.
+///
+/// One **discarded warm-up** window runs first. The copy's fix-up worklist is a per-thread `Vec`
+/// (`copy::WARM_WORKLIST`) that every copy clears rather than drops, so a phase's *first* window is
+/// the cold one and pays that `Vec`'s growth steps — one more or fewer depending on which shape ran
+/// before it. The figure this instrument reports is the steady-state one; discarding the first
+/// window does not weaken the claim, because every *measured* window must still be identical.
 fn repeat<F: FnMut() -> Counters>(label: &str, mut phase: F) -> Counters {
+    let _warm_up = phase();
     let first = phase();
     for i in 1..REPEATS {
         let again = phase();

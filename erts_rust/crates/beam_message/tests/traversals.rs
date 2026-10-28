@@ -121,7 +121,8 @@ use beam_alloc::Heap;
 use beam_gc::policy::DEFAULT_MIN_HEAP_WORDS;
 use beam_message::off_heap::OffHeapTable;
 use beam_message::{
-    is_message_heap_exhaustion, send, send_fragmented, shrink_warm_scratch, CopyContext, Queue,
+    copy_struct, is_message_heap_exhaustion, send, send_fragmented, shrink_warm_scratch,
+    shrink_warm_worklist, CopyContext, Queue,
 };
 use beam_term::prelude::*;
 use beam_term::{compare, size_object};
@@ -1020,9 +1021,11 @@ fn row(name: &'static str, term: Eterm, source: &Census, phase: Phase) -> Row {
 /// per-thread `SizingScratch` `beam_message::preflight` keeps, which every walk **clears** rather than
 /// drops. This test pins that mechanism at the boundary the crate exposes:
 ///
-/// * with the scratch **cold** (`beam_message::shrink_warm_scratch()`), a refused send's window holds
-///   the walk's own allocations on top of the copy's fix-up worklist;
-/// * **warm**, the same window holds the copy's worklist only — strictly fewer blocks;
+/// * with the scratch **cold** (`beam_message::shrink_warm_scratch()`, plus
+///   `shrink_warm_worklist()` for the copy's own retained worklist — both buffers are per-thread
+///   state that a refusal would otherwise leave warm from an earlier test), a refused send's window
+///   holds the walk's own allocations on top of the copy's fix-up worklist growth;
+/// * **warm**, the same window holds **no allocation at all** — neither walk nor copy grows a buffer;
 /// * shrinking again returns the window to the *identical* cold figure, so the difference is the
 ///   retained buffers and nothing else (no growth step, no one-time initialisation).
 ///
@@ -1050,12 +1053,17 @@ fn report_a_warm_preflight_allocates_nothing() {
     // One word short of the price: the send is refused, which is the shape that runs the gate.
     let capacity = price.words - 1;
 
-    // Cold, warm, cold again. The first `shrink_warm_scratch` also initialises this thread's scratch,
-    // so the one-time thread-local setup cannot be mistaken for the walk's own allocations.
-    shrink_warm_scratch();
+    // Cold, warm, cold again. Both retained per-thread buffers are put back to their cold state —
+    // the pricing scratch and the copy's fix-up worklist — so the one-time thread-local setup cannot
+    // be mistaken for either one's own allocations.
+    let cold = || {
+        shrink_warm_scratch();
+        shrink_warm_worklist();
+    };
+    cold();
     let cold_a = one_phase(Mode::Refused, term, &src, capacity, 0, 0);
     let warm = one_phase(Mode::Refused, term, &src, capacity, 0, 0);
-    shrink_warm_scratch();
+    cold();
     let cold_b = one_phase(Mode::Refused, term, &src, capacity, 0, 0);
 
     println!();
@@ -1104,8 +1112,8 @@ fn report_a_warm_preflight_allocates_nothing() {
         "the warm histogram must account for every allocation event"
     );
     println!(
-        "  => the pricing walk's own {} block(s) / {} B are gone once warm; the {} warm block(s) \
-         are the copy's fix-up worklist",
+        "  => the walk's and the worklist's {} block(s) / {} B are gone once warm; the warm window \
+         holds {} block(s)",
         cold_a.counters.blocks - warm.counters.blocks,
         cold_a.counters.bytes - warm.counters.bytes,
         warm.counters.blocks
@@ -1115,4 +1123,106 @@ fn report_a_warm_preflight_allocates_nothing() {
         "warm preflight: /proc/loadavg at end = {}",
         loadavg()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 7. The copy's own allocation window (the retained fix-up worklist)
+// ---------------------------------------------------------------------------
+
+/// One `copy_struct` into a destination sized to the copier's own price, returning the allocation
+/// window of the copy itself (the heap and the off-heap table are staged **outside** it).
+fn one_copy(term: Eterm, src: &Src) -> Counters {
+    let price = write_census(term).words;
+    let mut dst = Heap::new(price).expect("destination heap");
+    let mut dst_off = OffHeapTable::new();
+    let (result, counters) = counted(|| {
+        let mut ctx = CopyContext::new(&src.off, &mut dst_off);
+        copy_struct(term, &mut dst, &mut ctx)
+    });
+    let copied = result.expect("a destination of exactly the price fits the payload");
+    assert_eq!(dst.used(), price, "a fitted copy writes the copier's price");
+    assert!(compare::eq(term, copied, &src.atoms), "the copy is the source graph");
+    counters
+}
+
+/// **A warm copy allocates nothing** — the claim the per-message copy now rests on.
+///
+/// `copy_struct`'s fix-up worklist is a per-thread `Vec<Fixup>` (`copy::WARM_WORKLIST`) that every
+/// copy **clears** rather than drops, the same discipline `beam_message::preflight`'s
+/// `SizingScratch` follows. This test pins that mechanism at the boundary the crate exposes:
+///
+/// * with the worklist **cold** (`beam_message::shrink_warm_worklist()`), a copy's window holds the
+///   worklist's growth steps (1, 2, 4, … entries, one heap event each);
+/// * **warm**, the same copy holds **no allocation at all**;
+/// * shrinking again returns the window to the *identical* cold figure, so the difference is the
+///   retained worklist and nothing else (no growth step, no one-time initialisation).
+///
+/// The payload is the `copy_bound` one, so the window covers both shapes the engine copies: the flat
+/// map, and the two cons chains (the chain fast path reserves its cells through the same target).
+#[test]
+fn report_a_warm_copy_allocates_nothing() {
+    let _guard = MEASUREMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    println!("warm copy: /proc/loadavg at start = {}", loadavg());
+
+    let mut src = Src::new();
+    let payload = copy_bound_payload(&mut src);
+    let term = src
+        .heap
+        .tuple(&[make_small(FROM), payload])
+        .expect("the request fits");
+
+    // Cold, warm, cold again. The first `shrink_warm_worklist` also initialises this thread's
+    // worklist, so the one-time thread-local setup cannot be mistaken for the copy's allocations.
+    shrink_warm_worklist();
+    let cold_a = one_copy(term, &src);
+    let warm = one_copy(term, &src);
+    shrink_warm_worklist();
+    let cold_b = one_copy(term, &src);
+
+    println!();
+    println!("== copy_struct: allocation window, cold vs retained fix-up worklist ==");
+    for (label, window) in [
+        ("cold (fresh worklist)", &cold_a),
+        ("warm (retained)", &warm),
+        ("cold again (shrunk)", &cold_b),
+    ] {
+        println!(
+            "  {:<22} {:>3} blocks {:>7} B ({:>5.1} B/block)  {}",
+            label,
+            window.blocks,
+            window.bytes,
+            window.bytes_per_block(),
+            histogram_summary(window, 6)
+        );
+    }
+
+    // Shrinking restores the cold state *exactly* — same blocks, bytes and histogram — so the
+    // cold-to-warm delta is the retained worklist and nothing else.
+    assert_eq!(
+        cold_a, cold_b,
+        "a shrunk worklist must copy exactly like a never-warmed one"
+    );
+    assert!(
+        cold_a.blocks > 0,
+        "a cold worklist must grow, or this window is not measuring it"
+    );
+    assert_eq!(
+        warm.blocks, 0,
+        "a warm copy must perform no heap allocation at all (it made {} block(s) / {} B)",
+        warm.blocks, warm.bytes
+    );
+    assert_eq!(
+        warm.hist.iter().sum::<usize>(),
+        0,
+        "the warm histogram must be empty too"
+    );
+    println!(
+        "  => the worklist's {} block(s) / {} B are gone once warm",
+        cold_a.blocks - warm.blocks,
+        cold_a.bytes - warm.bytes
+    );
+    println!();
+    println!("warm copy: /proc/loadavg at end = {}", loadavg());
 }
