@@ -891,6 +891,11 @@ impl TcpInetDriver {
         }
         let _written = self.write_pending(ctx)?;
         self.settle_command(ctx)?;
+        // A command whose bytes the socket could not take in full is the C's `busy_on_send`
+        // condition: arm (or, on a drained queue, cancel) the `{send_timeout, …}` one-shot
+        // (`tcp_inet_send_timeout`, `inet_drv.c:12458`). After `settle_command` so an already
+        // answered command never leaves a timer behind.
+        self.note_send_stall(ctx);
         // Report the queue's **net** shrinkage — the length the port measured before this callback
         // (`stripped + payload_len`) minus what is left now — which is exactly what
         // [`crate::Port`]'s write accounting compares against. The strip took `stripped` bytes off
@@ -950,6 +955,9 @@ impl TcpInetDriver {
             return Some(0);
         }
         self.caller_stripped = true;
+        // A new command: the one-shot of a stall that already fired was the previous command's,
+        // so this one may arm its own (the C re-arms `busy_on_send` per stalled command).
+        self.send_timeout.begin_command();
         let (prefix, tag) = {
             let front = ctx.output().front();
             match split_command_prefix(front) {
