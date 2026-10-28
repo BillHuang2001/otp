@@ -27,10 +27,12 @@
 //! The unit suite (`src/families/exceptions/tests/encoder.rs`) pins the cooked
 //! layout against the oracle and against the engine's private carve. This suite pins
 //! what only an out-of-crate caller can check: that both public entry points are
-//! reachable and useful with **only** the public API (a `beam_loader::Module` whose
-//! atom table is a clone of the host's shared table, and a `MinimalContext` for the
-//! heap), and that a frame naming an atom the passed table lacks is the typed
-//! `unsupported` error rather than a substituted atom.
+//! reachable and useful with **only** the public API (a `beam_loader::Module` and a
+//! `MinimalContext` for the heap), that a frame's names are resolved through the
+//! host's **live** atom namespace with the module's snapshot as the fallback (a name
+//! only the live namespace knows must cook), and that a frame naming an atom
+//! **neither** namespace can name is the typed `unsupported` error rather than a
+//! substituted atom.
 use beam_common::{AtomName, ExceptionClass, SourceLocation, StackFrame, StackTrace};
 use beam_engine::prelude::*;
 use beam_loader::Module;
@@ -148,20 +150,59 @@ fn the_prelude_and_the_machine_method_reach_the_same_encoder() {
 }
 
 #[test]
-fn a_name_the_passed_table_lacks_is_the_typed_unsupported_error() {
-    // The host passed a table that names `m` but not `f`: the encoder reports the
-    // typed `unsupported`, naming the atom it could not resolve, and the caller
-    // gets no cooked term at all — an atom the caller did not name is never
-    // fabricated.
+fn a_name_only_the_live_namespace_knows_is_cooked() {
+    // The Khepri/ranch shape at the public-encoder level: `proc_lib`/`gen_server`
+    // re-raise a captured trace whose frames name modules the re-raising module never
+    // mentions. Here the passed `Module` interns **nothing** (`Module::default()`), so
+    // its load-time snapshot names none of the frame's atoms, while the host's live
+    // namespace ([`ExecutionContext::atoms`]) names all four — the frame's module and
+    // function plus the location's `file`/`line` keys.
+    let mut live = AtomTable::new();
+    for name in ["ranch_acceptors_sup", "init", "file", "line"] {
+        live.intern(name);
+    }
+    let module = Module::default();
+    assert!(
+        module.atom_table.lookup("ranch_acceptors_sup").is_none(),
+        "the module's snapshot must not name the frame's atoms"
+    );
+
+    let frames = StackTrace {
+        frames: vec![StackFrame::new("ranch_acceptors_sup", "init", 1)],
+    };
+    let mut ctx = MinimalContext::with_shared_atoms(live.clone());
+    let cooked = beam_engine::encode_supplied_stacktrace(&module, &mut ctx, &frames)
+        .expect("the live namespace names every atom the frame uses");
+
+    let mut expected_ctx = MinimalContext::new();
+    let atom = |name: &str| make_atom(live.lookup(name).expect("the live namespace names it"));
+    let item = beam_engine::terms::make_tuple(
+        &mut expected_ctx,
+        &[atom("ranch_acceptors_sup"), atom("init"), make_small(1), NIL],
+    )
+    .expect("the item tuple fits the context heap");
+    let expected = beam_engine::terms::make_list(&mut expected_ctx, &[item])
+        .expect("the expected list fits the context heap");
+    assert!(
+        cmp(cooked, expected, &live).is_eq(),
+        "the encoder must cook [{{ranch_acceptors_sup,init,1,[]}}] from the live namespace"
+    );
+}
+
+#[test]
+fn a_name_neither_namespace_can_name_is_the_typed_unsupported_error() {
+    // Both namespaces name `m` and neither names `f`: the encoder reports the typed
+    // `unsupported`, naming the atom it could not resolve, and the caller gets no
+    // cooked term at all — an atom the caller did not name is never fabricated.
     let mut shared = AtomTable::new();
     shared.intern("m");
     let module = module_over(&shared);
     let frames = StackTrace {
         frames: vec![frame(0, None)],
     };
-    let mut ctx = MinimalContext::new();
+    let mut ctx = MinimalContext::with_shared_atoms(shared);
     let error = beam_engine::encode_supplied_stacktrace(&module, &mut ctx, &frames)
-        .expect_err("a frame naming an atom the table lacks must not cook");
+        .expect_err("a frame naming an atom neither namespace names must not cook");
     let raise = error.into_raise().expect("the failure is a BEAM raise");
     assert_eq!(raise.class, ExceptionClass::Error, "the class of the failure");
     assert_eq!(

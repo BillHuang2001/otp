@@ -50,9 +50,14 @@
 //! `Raise` has to carry the flag.
 //!
 //! Every name a supplied frame needs (`my`, `fake`, the `file`/`line` location keys)
-//! is resolved from the running module's atom table and is **never substituted**: a
-//! name it cannot intern is a typed `unsupported` — pinned by
-//! [`a_supplied_frame_naming_an_unknown_atom_is_a_typed_error`].
+//! is resolved through the engine's **live atom namespace**
+//! ([`ExecutionContext::atoms`](beam_engine::ExecutionContext::atoms)) with the
+//! running module's load-time snapshot as the fallback, and is **never substituted**:
+//! a name **neither** source can name is a typed `unsupported` — pinned by
+//! [`a_supplied_frame_naming_an_unknown_atom_is_a_typed_error`]. A name only the LIVE
+//! namespace knows must still cook, because a re-raised trace (`proc_lib`,
+//! `gen_server`, a supervisor) names modules the re-raising module never mentioned —
+//! pinned by [`a_supplied_frame_naming_an_atom_the_live_namespace_knows_is_cooked`].
 //!
 //! The oracle-backed case **skips loudly** when no runnable `erl` is on `PATH`
 //! (the discipline of `tests/trace.rs::oracle_eval`).
@@ -417,6 +422,65 @@ fn a_supplied_frame_naming_an_unknown_atom_is_a_typed_error() {
         }
         other => panic!("expected a typed unsupported for the unknown atom, got {other:?}"),
     }
+}
+
+// ===========================================================================
+// 3b. A supplied frame naming an atom only the LIVE namespace knows still cooks
+// ===========================================================================
+
+/// A `Module` whose **load-time snapshot** cannot name a frame's atoms still cooks
+/// the supplied frames when the host's live namespace can — the Khepri/ranch shape.
+///
+/// `proc_lib`/`gen_server`/supervisors re-raise a captured trace with
+/// `erlang:raise(C,R,S)`; the re-raising module (a supervisor) never mentions the
+/// frames' modules, so its snapshot cannot name them, while the runtime's ONE live
+/// atom namespace (interned when those modules were loaded) can. The oracle echoes
+/// such a trace verbatim — `build_stacktrace`'s `is_raised_exc` branch returns the
+/// supplied list with no atom resolution at all
+/// (`../../erts/emulator/beam/beam_common.c:1219-1223`) — so declining here
+/// destroyed the crash report instead of reporting it.
+#[test]
+fn a_supplied_frame_naming_an_atom_the_live_namespace_knows_is_cooked() {
+    let mut frame = StackFrame::new("ranch_acceptors_sup", "init", 1);
+    frame.location = None;
+    let mut trace = StackTrace::new();
+    trace.push(frame);
+
+    let (module, run_atom) = Fixture::build();
+    // The runtime's live namespace: the module's snapshot plus the names interned
+    // when the frame's own modules were loaded.
+    let mut live = module.atom_table.clone();
+    let module_atom = live.intern("ranch_acceptors_sup");
+    let function_atom = live.intern("init");
+    assert!(
+        module.atom_table.lookup("ranch_acceptors_sup").is_none(),
+        "the running module's snapshot must NOT name the frame's module, or this \
+         test would not pin the live-namespace route"
+    );
+
+    let mut ctx = MinimalContext::with_shared_atoms(live.clone());
+    ctx.set_bif_hook(Box::new(move |_, _, _, _| Err(raise_with(Some(trace.clone())))));
+    let mut machine = Machine::new();
+    let cooked = machine
+        .run_export(&module, run_atom, 0, &[], &mut ctx)
+        .expect("the live namespace names every atom the supplied frame uses");
+
+    let mut build = MinimalContext::new();
+    let item = terms::make_tuple(
+        &mut build,
+        &[
+            make_atom(module_atom),
+            make_atom(function_atom),
+            make_small(1),
+            NIL,
+        ],
+    )
+    .expect("a tuple");
+    let expected = terms::make_list(&mut build, &[item]).expect("a list");
+    assert!(
+        cmp(cooked, expected, &live).is_eq(),
+        "the cooked S must be [{{ranch_acceptors_sup,init,1,[]}}]: got {cooked:?}"
+    );
 }
 
 // ===========================================================================
