@@ -129,10 +129,12 @@ use crate::context::RuntimeContext;
 /// Every `{function, arity}` of `prim_file`'s **non-exported** NIF stubs this floor serves —
 /// the ONE source of truth behind [`serves_local_call`].
 ///
-/// One key only: `advise_nif/4`, the stub `prim_file.erl`'s own `advise/4` body chains into
-/// (`prim_file.erl:274-280`) and therefore the one `file:sendfile/8` needs (`:433`). The
-/// module's other stubs are reached through the floor's exported-key arms, so serving them
-/// locally would add a dispatch path nothing takes — see the module docs.
+/// One key only: `advise_nif/4`, the **non-exported** stub that `prim_file.erl`'s own `advise/4`
+/// wrapper calls (`:277`, inside the wrapper at `:274-280`) — and therefore the one the chain
+/// site `file:sendfile/8` needs, `advise(Fd, Offset, Bytes, sequential)` at
+/// `erts/preloaded/src/prim_file.erl:433`. The module's other stubs are reached through the
+/// floor's exported-key arms, so serving them locally would add a dispatch path nothing takes —
+/// see the module docs.
 pub(crate) const LOCAL_KEYS: [(&str, u32); 1] = [("advise_nif", 4)];
 
 /// Whether `(module, function, arity)` is a `prim_file` NIF stub this floor serves — the

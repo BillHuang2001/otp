@@ -67,6 +67,9 @@
 //! | `datasync/1` | `prim_file.erl:299-304` + `sync_nif` with `data = 1` (`fdatasync(2)`) | as `sync/1` with the data-only host call |
 //! | `write_file/2` | `prim_file.erl:574-584` (composes `open(Name,[write,binary])` → `write` → `close`) | `write_file(P,<<"hello">>)`⇒`ok` (contents `<<"hello">>`); overwriting a 10-byte file with `<<"AB">>`⇒`ok`, size 2; a directory⇒`{error,eisdir}`; a missing parent⇒`{error,enoent}`; `<<>>`/`[]`⇒`{error,enoent}`; an atom path / a NUL path / a bad payload (`foo`, `[1\|2]`)⇒`{error,badarg}`; `write_file/3` is **not exported** (`error:undef`) |
 //! | `set_cwd/1` | `prim_file.erl:794-802` + `efile_set_cwd` = `chdir(2)`; `is_path_translatable/1` (`:899-902`) over the `is_translatable/1` BIF (`erl_unicode.c:2855-2895`) | an existing dir⇒`ok`; `<<dir>>`⇒`ok`; `"."`⇒`ok`; a file⇒`{error,enotdir}`; a missing dir⇒`{error,enoent}`; `[]`/`<<>>`⇒`{error,enoent}`; an atom/int⇒`{error,badarg}`; `<<255,255>>`⇒`{error,no_translation}`; a NUL (in a list or a binary)⇒`{error,badarg}` |
+//! | `list_dir/1`, `list_dir_all/1` | `prim_file.erl:608-611` (`list_dir_1/2`) → `list_dir_nif` (`:850`) → `efile_list_dir` (`unix_prim_file.c:907-943`), folded by `list_dir_convert/3` (`:619-645`) | `{ok,[Names]}` in the reverse of the native listing (the wrapper's fold prepends; the native `readdir(3)` order is the one documented divergence); an undecodable name is *skipped* by `list_dir/1` and kept as its raw binary by `list_dir_all/1`; a missing dir⇒`{error,enoent}`; a file⇒`{error,enotdir}`; a bad path⇒`{error,badarg}` |
+//! | `read_file_info/1,2`, `read_link_info/1,2` | `prim_file.erl:647-665` (`read_info_1/3` at `:657`, `FollowLinks` 1/0) + `adjust_times/2` (`:683-691`) → `read_info_nif` → `efile_read_info` (`unix_prim_file.c:739-769`: `stat(2)`/`lstat(2)` + two `access(2)` probes) + `build_file_info/2` (`:712-737`); `access` from `beam_io::path_access`'s real probes | `{ok,#file_info{}}` (a 14-tuple); a missing path⇒`{error,enoent}`; a bad path⇒`{error,badarg}`; `[{time,posix}]`⇒raw POSIX seconds; `[{time,universal}]`/`[{time,local}]`⇒`{{Y,M,D},{H,M,S}}`; `[{time,bogus}]`⇒`{error,badarg}` |
+//! | `read_handle_info/1,2` | `prim_file.erl:667-681` (`read_handle_info_1/2` at `:672`) → `read_handle_info_nif` → `efile_read_handle_info` (`unix_prim_file.c:803-819`: `fstat(2)`) with `access` from `check_access/1` (`:771-801`, the file's own uid/gid against the **effective** credentials), served by the sibling [`prim_file`](super::prim_file) | `{ok,#file_info{}}` (a `0444` file answers `read`, a `0644` one `read_write`); a closed descriptor⇒`{error,einval}`; a non-descriptor⇒`{error,badarg}`; a non-list `Opts`⇒an uncaught `function_clause` |
 //!
 //! The whole-file-descriptor entries (`open/2`, `read/2`, `write/2`, `close/1`,
 //! `position/2`, `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`,
@@ -102,6 +105,19 @@
 //! typed capability gap decided before a byte is read or written, never a partial send
 //! (`prim_file/sendfile.rs`).
 //!
+//! That write **is** a port command, so it must carry the `inet` driver's **caller prefix** —
+//! `[n:be16]` tag length + tag (`erts/preloaded/src/prim_inet.erl:582-589`), stripped once per
+//! command by `init_caller` (`erts/emulator/drivers/common/inet_drv.c:1820-1890`). `sendfile/8`
+//! has no monitor reference to answer into, so it sends the C's **zero-length** tag `[0,0]`: the
+//! two bytes come off the queue with **no** `{inet_reply, …}` staged, the payload is written
+//! unchanged, and `port_info(Port, output)`/`statistics(io)` charge payload+2 as the C's
+//! `prt->bytes_out += size` does (`erts/emulator/beam/io.c:1520`). A command without that prefix
+//! is the driver's `EINVAL` (`tcp_inet_command`, `inet_drv.c:12634-12638`) — the port is
+//! **killed** and the payload silently lost while `port_command` still answers `Done`, and the
+//! oracle behaves the same way, which is why the prefix must come from the caller and can never
+//! be injected by the seam. Mechanism and measured matrix: `prim_file/sendfile.rs` (*The payload
+//! is a port command*).
+//!
 //! A **closed** descriptor is `{error,einval}` for the exported `advise/4`, because the C's
 //! `file_handle_wrapper` state test precedes the operation (`prim_file_nif.c:343-347`) — the
 //! whole descriptor family's answer, and the one divergence from the `advise_nif` stub's own
@@ -135,20 +151,10 @@
 //! capability gap instead of the silently wrong `{error,badarg}` the preloaded wrapper's
 //! `catch error:_` would otherwise produce:
 //!
-//! * `read_file_info/1,2`, `read_link_info/1,2`, `read_handle_info/1,2` — every `#file_info{}`
-//!   field is safe-`std`-derivable **except** `access`: the path forms call `access(2)`
-//!   (`efile_read_info`, `unix_prim_file.c:757-762`) and the handle form
-//!   `check_access/1`'s `geteuid`/`getegid` + mode bits (`:771-801`), neither of which safe
-//!   `std` exposes. The **default `local`** (and `[{time,universal}]`) forms need **no**
-//!   time-zone facility here — the Erlang wrapper `adjust_times/2` produces them through the
-//!   served `erlang:posixtime_to_universaltime/1`/`universaltime_to_localtime/1`, so the NIF
-//!   only ever returns the clamped POSIX seconds.
 //! * `write_file_info/2,3` — `chmod(2)`/`chown(2)`/`utimes(2)`.
 //! * `allocate/3` — `posix_fallocate(2)`, the sibling facility of the now-served `advise/4`
 //!   hint: a real reservation of blocks is not something this runtime's `std`-only host can
 //!   make, so it stays a gap.
-//! * `list_dir/1`/`list_dir_all/1` — the answer is raw `readdir(3)` order, a property of the
-//!   on-disk directory state that the oracle does not sort and this runtime cannot pin.
 //! * `read_line/1` — its Erlang body drives the `prim_buffer:*` resource NIFs, which this
 //!   runtime does not model.
 //! * `file_desc_to_ref/2` — adopting a raw `int` fd.
