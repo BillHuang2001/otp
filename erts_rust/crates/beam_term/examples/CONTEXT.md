@@ -29,6 +29,7 @@ read the **retired-instruction count** or a ratio between two measured quantitie
 
 ## Routing Table
 - `atom_fork_bench.rs` → `clone` vs `fork` in retired instructions
+- `atom_intern_bench.rs` → the atom table's name→index probe and index→name reader, ns/call
 - `atom_witness.rs` → the O(1) witness vs the O(table) clone
 - `map_build_bench.rs` → `write_map` builder A/B
 - `cmp_lookup_bench.rs` → comparison/map-lookup/hash micro-buckets for `perf` attribution
