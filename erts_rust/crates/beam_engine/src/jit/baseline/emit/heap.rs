@@ -444,9 +444,8 @@ mod tests {
     /// Every distinct 8-byte **store** into a `JitRuntime` field at `disp`, over all base
     /// and source register pairs.
     ///
-    /// The probe is exhaustive on purpose: the retired inline frame push wrote the Y window
-    /// with one fixed register pair, and a reintroduction that picked different registers
-    /// must still be caught.
+    /// The probe is exhaustive on purpose: an emitted Y-window write would pick one fixed
+    /// register pair, and a push that picked a different pair must still be caught.
     ///
     /// `rsp` is excluded as a base because the block's own `rt` slot lives at
     /// `[rsp + RUNTIME_SLOT_DISP]` (`RUNTIME_SLOT_DISP == STORE_PTR_OFF == 0`), which every
@@ -485,23 +484,23 @@ mod tests {
     }
     /// **The frame push is a helper call and nothing else.**
     ///
-    /// `7475317f64` lowered `allocate` by emitting the push itself: capacity guards against
-    /// the two published `PubVec` headers, a `NIL` fill of the new Y slots, the frame slot
-    /// copied out of `JitRuntime::frame_template`, `rt.y_base`/`rt.y_end` written mid-block
-    /// and both store lengths committed (`mov [stack.len], …` / `mov [frames.len], …`).
-    /// That was **unsound**: a frame change must leave the machine's Y window re-derivable
-    /// from Rust state (`Machine::push_frame_window`), and a *resumed* slice re-enters the
-    /// block with nothing republished, so the window and the frame geometry a later
-    /// instruction reads are not the ones the machine's own state implies. With it enabled
-    /// the default tier (`Tier::BaselineJit`) raised a `badfun`-class structured error inside
-    /// `gen_server:try_handle_call/4` on essentially every run; `5efe7d8737` retired it in
-    /// favour of the `jit_allocate` helper.
+    /// The shape is forced by the Y-window rule: an emitted push would have to carry capacity
+    /// guards against the two published `PubVec` headers, a `NIL` fill of the new Y slots, the
+    /// frame slot copied out of `JitRuntime::frame_template`, `rt.y_base`/`rt.y_end` written
+    /// mid-block and both store lengths committed (`mov [stack.len], …` /
+    /// `mov [frames.len], …`) -- all of it state a **resumed** slice does not re-derive, since
+    /// a resume re-enters the block with nothing republished, leaving the window and the frame
+    /// geometry a later instruction reads different from what the machine's own state implies
+    /// (the failure signature is a `badfun`-class structured error inside
+    /// `gen_server:try_handle_call/4`, whose fun lives in a frame's Y slot). Hence `allocate`
+    /// is one `jit_allocate` helper call, re-publishing the window from
+    /// `Machine::push_frame_window`.
     ///
-    /// This pin is the shape that retirement produced, stated as an invariant: the helper's
+    /// The pin states that shape as an invariant: the helper's
     /// `movabs` immediate is present, and the emitted arm contains **no** store into the
-    /// published Y window and **no** read of a `PubVec` header word. A reintroduced inline
-    /// push fails here, in the emitter, before it can fail at run time — the behavioural half
-    /// of the same bug is `tests.rs::a_sliced_and_resumed_baseline_run_pushes_each_frame_exactly_once`.
+    /// published Y window and **no** read of a `PubVec` header word. An emitted push fails
+    /// here, in the emitter, before it can fail at run time — the behavioural half of the same
+    /// property is `frame_push_tests.rs::a_sliced_and_resumed_baseline_run_pushes_each_frame_exactly_once`.
     ///
     /// The probe allocation caches nothing, so the emitted arm is exactly the helper call
     /// plus the frame-change continue check and holds no memory operand but the `rt` slot.

@@ -17,18 +17,17 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Regression pin for the retired inline `allocate` frame push (`7475317f64`,
-//! retired by `5efe7d8737`).
+//! Frame geometry pin for a sliced and resumed run of the DEFAULT tier.
 //!
-//! The bug: the baseline tier emitted `allocate`'s frame push **inline** into
-//! generated code (capacity guards, then direct writes of `machine.stack` /
-//! `machine.frames` through published store headers and a mid-block
-//! `JitRuntime` Y-window publish). A frame-changing instruction must instead
-//! leave the Y window re-derivable from Rust state
-//! ([`Machine::push_frame_window`]), which emitted code cannot reproduce on a
-//! later entry -- so a **sliced and resumed** run of the DEFAULT tier
-//! ([`Tier::BaselineJit`]) raised a `badfun`-class structured error inside
-//! `gen_server:try_handle_call/4` on essentially every run.
+//! A frame-changing instruction must leave the Y window and the frame geometry
+//! **re-derivable from Rust state** ([`Machine::push_frame_window`]), because
+//! emitted code cannot reproduce them at a later entry: a resume re-enters a
+//! block at its entry and re-executes no prefix. So `allocate` lowers to exactly
+//! one `jit_allocate` helper call, and a block that touches a Y slot publishes
+//! the window in its prologue -- the property below fails the moment a push
+//! commits state that a parked-then-resumed slice does not re-derive (measured
+//! as a `badfun`-class structured error inside `gen_server:try_handle_call/4`,
+//! whose fun lives in a frame's Y slot).
 //!
 //! The shape below is that function's, reduced to its frame-relevant core:
 //! `get_tuple_element x0, 6 -> x0` (the fun), `allocate 2, 4`,
