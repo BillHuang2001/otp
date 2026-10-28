@@ -101,7 +101,6 @@ use crate::families::bitstrings::programs::{BitstrPrograms, ProgramWitness};
 
 use self::catch::UNRESOLVED_CLASS_ATOMS;
 pub(crate) use self::location::{pack_current_code, CURRENT_CODE_NONE};
-pub(crate) use self::pubvec::PubVec;
 
 mod catch;
 mod context;
@@ -115,7 +114,6 @@ mod label_cache_tests;
 mod local_callee;
 mod location;
 mod offheap;
-mod pubvec;
 mod registers;
 mod run;
 #[cfg(test)]
@@ -194,17 +192,9 @@ pub struct Machine {
     /// A deterministic diagnostic/test counter (see [`Machine::refilled_words`]): it is
     /// written once per reset and read by nothing on an execution path.
     pub(crate) refilled_words: u32,    /// The Erlang stack: the Y-slot words of every live frame, oldest first.
-    ///
-    /// A [`PubVec`], not a `Vec`, because the baseline tier's emitted `allocate` grows it
-    /// **inline**: the `#[repr(C)]` header's `ptr`/`len`/`cap` are published to compiled
-    /// code (see [`PubVec`]'s module docs and `jit::baseline::runtime`'s `STORE_*_OFF`
-    /// constants), so a frame push needs no Rust round trip on the hot path.
-    pub(crate) stack: PubVec<Eterm>,
+    pub(crate) stack: Vec<Eterm>,
     /// The call-frame stack (innermost last).
-    ///
-    /// A [`PubVec`] for the same reason as [`Machine::stack`]: the emitted `allocate`
-    /// pushes the `Frame` itself, through the published header.
-    pub(crate) frames: PubVec<Frame>,
+    pub(crate) frames: Vec<Frame>,
     /// The exception catch-frame stack (innermost last).
     ///
     /// Pushed by `try`/`catch`, popped by the handler opcodes
@@ -873,8 +863,8 @@ impl Machine {
             fr_mark: 0,
             x_dirty: 0,
             fr_dirty: 0,
-            refilled_words: 0,            stack: PubVec::with_capacity(STACK_RESERVE_WORDS),
-            frames: PubVec::with_capacity(FRAMES_RESERVE),
+            refilled_words: 0,            stack: Vec::with_capacity(STACK_RESERVE_WORDS),
+            frames: Vec::with_capacity(FRAMES_RESERVE),
             catch_frames: Vec::with_capacity(CATCH_FRAMES_RESERVE),
             pending_exception: None,
             class_atoms: UNRESOLVED_CLASS_ATOMS,

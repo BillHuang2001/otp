@@ -42,7 +42,7 @@ use beam_term::Eterm;
 
 use crate::context::{ExecutionContext, ReduceHook};
 use crate::error;
-use crate::machine::{Continuation, Frame, Machine, PubVec};
+use crate::machine::{Continuation, Machine};
 use crate::Step;
 
 use super::code::CompiledModule;
@@ -326,30 +326,6 @@ pub(crate) struct JitRuntime<'a> {
     /// code, so its position is immaterial to the emitted stream and it is **appended** so
     /// every pre-existing `#[repr(C)]` offset — and therefore every emitted byte — stays put.
     pub(crate) reduce_hook: Option<ReduceHook>,
-    /// `&mut machine.stack` — the Erlang stack's [`PubVec`] **header**, whose
-    /// `ptr`/`len`/`cap` words are at [`STORE_PTR_OFF`]/[`STORE_LEN_OFF`]/[`STORE_CAP_OFF`].
-    ///
-    /// Published so an emitted frame push *could* grow the stack in place, but **no
-    /// emitted code reads it today**: `allocate` goes through [`jit_allocate`], and the
-    /// helper's `Machine::push_frame_window` is what moves the `Vec` and re-publishes the
-    /// Y window. The pointer is taken once per driver loop, exactly like
-    /// [`Self::current_code`]: `Machine` is not `repr(C)` and the driver's `&mut Machine`
-    /// is the only one for the whole loop, so the field's address is stable until the loop
-    /// returns.
-    pub(crate) stack_store: *mut PubVec<Eterm>,
-    /// `&mut machine.frames` — the call-frame stack's [`PubVec`] header, the frame-push
-    /// half of the same publication, and equally unread by emitted code today.
-    pub(crate) frames_store: *mut PubVec<Frame>,
-    /// The words of a `Frame { continuation: Continuation::Halt, y_base: 0, y_count: 0 }`
-    /// — what an emitted frame push would copy into the frame store's spare capacity
-    /// before writing the two values that vary (the frame's `y_base` and `y_count`, at
-    /// [`FRAME_Y_BASE_OFF`]/[`FRAME_Y_COUNT_OFF`]).
-    ///
-    /// The template is materialised in Rust (see [`frame_template`]) because `Frame` is a
-    /// `repr(Rust)` struct: generated code must never encode its layout, so it copies whole
-    /// words from here and patches exactly the two fields the constants name. Like the two
-    /// store handles it is published for a push no emitted arm performs today.
-    pub(crate) frame_template: [usize; FRAME_WORDS],
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -783,90 +759,6 @@ pub(crate) const RUNTIME_RESUME_DISP: i32 =
 /// `RUNTIME_*_DISP` offset moves).
 pub(crate) const RUNTIME_CURRENT_CODE_DISP: i32 =
     mem::offset_of!(JitRuntime<'static>, current_code) as i32;
-
-/// The number of words an emitted frame push copies out of
-/// [`JitRuntime::frame_template`]: `size_of::<Frame>()` rounded to whole words.
-///
-/// A compile-time constant so both sides agree by construction: the emitter unrolls
-/// exactly this many word copies, and the template array is exactly this long.
-pub(crate) const FRAME_WORDS: usize = mem::size_of::<Frame>() / mem::size_of::<usize>();
-
-const _: () = assert!(
-    mem::size_of::<Frame>() == FRAME_WORDS * mem::size_of::<usize>(),
-    "a Frame must be a whole number of machine words for the emitted push to copy it"
-);
-const _: () = assert!(mem::align_of::<Frame>() <= mem::align_of::<usize>());
-
-/// The byte offset of [`Machine::stack`]'s header words inside [`PubVec<Eterm>`]:
-/// `ptr`/`len`/`cap`, in that order (the store is `#[repr(C)]`, see [`PubVec`]).
-///
-/// The one definition of the header layout, used by the crate's tests and by every
-/// emitted store/load that grows the Erlang stack in place.
-pub(crate) const STORE_PTR_OFF: i32 = mem::offset_of!(PubVec<Eterm>, ptr) as i32;
-/// The byte offset of the header's `len` word (see [`STORE_PTR_OFF`]).
-pub(crate) const STORE_LEN_OFF: i32 = mem::offset_of!(PubVec<Eterm>, len) as i32;
-/// The byte offset of the header's `cap` word (see [`STORE_PTR_OFF`]).
-pub(crate) const STORE_CAP_OFF: i32 = mem::offset_of!(PubVec<Eterm>, cap) as i32;
-
-const _: () = assert!(
-    STORE_LEN_OFF == STORE_PTR_OFF + mem::size_of::<*mut u8>() as i32
-        && STORE_CAP_OFF == STORE_LEN_OFF + mem::size_of::<usize>() as i32
-);
-const _: () = assert!(
-    mem::offset_of!(PubVec<Frame>, ptr) as i32 == STORE_PTR_OFF
-        && mem::offset_of!(PubVec<Frame>, len) as i32 == STORE_LEN_OFF
-        && mem::offset_of!(PubVec<Frame>, cap) as i32 == STORE_CAP_OFF,
-    "every PubVec<T> lays its header out identically, so one set of offsets serves both stores"
-);
-
-/// The byte offset of a [`Frame`]'s `y_base` field — patched by the emitted frame push
-/// after it copies [`JitRuntime::frame_template`].
-pub(crate) const FRAME_Y_BASE_OFF: i32 = mem::offset_of!(Frame, y_base) as i32;
-/// The byte offset of a [`Frame`]'s `y_count` field (see [`FRAME_Y_BASE_OFF`]).
-pub(crate) const FRAME_Y_COUNT_OFF: i32 = mem::offset_of!(Frame, y_count) as i32;
-
-const _: () = assert!(
-    FRAME_Y_BASE_OFF + mem::size_of::<usize>() as i32 <= mem::size_of::<Frame>() as i32
-        && FRAME_Y_COUNT_OFF + mem::size_of::<u32>() as i32 <= mem::size_of::<Frame>() as i32,
-    "both patched fields must lie inside the frame slot the push writes"
-);
-
-/// The template an emitted frame push writes: a `Frame` whose continuation is
-/// [`Continuation::Halt`] and whose two Y fields are zero (the push patches them).
-///
-/// # Why a template and not a layout the generated code knows
-///
-/// `Frame`/`Continuation` are `repr(Rust)` types owned by [`crate::machine`] — generated
-/// code must never encode their layout, and a *code-shape* that depends on it would tie
-/// emitted bytes to a compiler decision. So the words are produced here, where the layout
-/// is the compiler's own (`offset_of!` + a real value), and the push copies whole words
-/// and patches the two fields at [`FRAME_Y_BASE_OFF`]/[`FRAME_Y_COUNT_OFF`]. A change to
-/// `Frame` therefore changes the template's *contents* and the two offsets, never the
-/// emitted instruction shape.
-pub(crate) fn frame_template() -> [usize; FRAME_WORDS] {
-    let frame = Frame {
-        continuation: Continuation::Halt,
-        y_base: 0,
-        y_count: 0,
-    };
-    let mut words = [0usize; FRAME_WORDS];
-    // SAFETY: `words` is `FRAME_WORDS` machine words = exactly `size_of::<Frame>()` bytes
-    // (the `const` assertion above) and is `usize`-aligned, hence aligned for `Frame`.
-    // `frame` is a live, fully initialized `Copy` value with no `Drop`, so copying its
-    // bytes into the zeroed array initializes every word the emitted push reads; the
-    // struct's padding bytes are the only range whose value is unspecified, and they are
-    // only ever copied back into another `Frame` (never read as a field, never a term,
-    // never a pointer).
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            std::ptr::addr_of!(frame).cast::<u8>(),
-            words.as_mut_ptr().cast::<u8>(),
-            mem::size_of::<Frame>(),
-        );
-    }
-    words
-}
-
 // ---------------------------------------------------------------------------
 // The helper
 // ---------------------------------------------------------------------------

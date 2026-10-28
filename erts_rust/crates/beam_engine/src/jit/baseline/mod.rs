@@ -1155,14 +1155,6 @@ fn drive(
     // `Machine` itself never moves for the whole loop (the driver holds the only `&mut`),
     // so the pointer stays valid until the loop returns.
     let current_code: *mut u64 = std::ptr::addr_of_mut!(machine.current_code);
-    // The two frame stores' **addressable headers** (`repr(C)` `{ptr, len, cap}`), taken
-    // the same way and for the same reason: generated code grows the Erlang stack and
-    // pushes the call frame *inline* for an `allocate`, so it needs the header of each
-    // store rather than a helper call. The contents are the live ones — a `push` here or
-    // in any helper is immediately what the next emitted push sees — and the addresses are
-    // stable for the whole loop for the same reason `current_code`'s is.
-    let stack_store = std::ptr::addr_of_mut!(machine.stack);
-    let frames_store = std::ptr::addr_of_mut!(machine.frames);
     let machine_ptr: *mut Machine = &mut *machine;
     let ctx_ptr = &mut *ctx as *mut dyn ExecutionContext;
     // The starting context: `0` for a fresh run; the context a suspended process
@@ -1213,9 +1205,6 @@ fn drive(
         compiled: std::ptr::null(),
         current_code,
         reduce_hook,
-        stack_store,
-        frames_store,
-        frame_template: runtime::frame_template(),
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run
@@ -1227,6 +1216,7 @@ fn drive(
     // (`Machine::switch_context` is called from `Machine::drive` and `switch_into`
     // only), so every rebind of `rt.module` is a driver site.
     rt.refresh_literals();
+
     loop {
         // ── The block-entry reduction charge: the native tier's pre-emption point ──
         //

@@ -448,8 +448,8 @@ mod tests {
     /// register pair, and a push that picked a different pair must still be caught.
     ///
     /// `rsp` is excluded as a base because the block's own `rt` slot lives at
-    /// `[rsp + RUNTIME_SLOT_DISP]` (`RUNTIME_SLOT_DISP == STORE_PTR_OFF == 0`), which every
-    /// helper call legitimately loads — no frame push can reach a store header through `rsp`.
+    /// `[rsp + RUNTIME_SLOT_DISP]` (`RUNTIME_SLOT_DISP == 0`), which every helper call
+    /// legitimately loads — no frame push can reach `JitRuntime` through `rsp`.
     fn stores_into_runtime_field(disp: i32) -> Vec<Vec<u8>> {
         let mut encodings: Vec<Vec<u8>> = Vec::new();
         for base in Reg::ALL {
@@ -465,50 +465,29 @@ mod tests {
         }
         encodings
     }
-    /// Every distinct 8-byte **load** out of a `PubVec` header word at `off`, over all base
-    /// and destination register pairs (same `rsp` exclusion as [`stores_into_runtime_field`]).
-    fn loads_of_store_header_word(off: i32) -> Vec<Vec<u8>> {
-        let mut encodings: Vec<Vec<u8>> = Vec::new();
-        for base in Reg::ALL {
-            if base == Reg::Rsp {
-                continue;
-            }
-            for dst in Reg::ALL {
-                let bytes = encoded(|buffer| buffer.mov_rm(dst, base, off).unwrap());
-                if !encodings.contains(&bytes) {
-                    encodings.push(bytes);
-                }
-            }
-        }
-        encodings
-    }
     /// **The frame push is a helper call and nothing else.**
     ///
-    /// The shape is forced by the Y-window rule: an emitted push would have to carry capacity
-    /// guards against the two published `PubVec` headers, a `NIL` fill of the new Y slots, the
-    /// frame slot copied out of `JitRuntime::frame_template`, `rt.y_base`/`rt.y_end` written
-    /// mid-block and both store lengths committed (`mov [stack.len], …` /
-    /// `mov [frames.len], …`) -- all of it state a **resumed** slice does not re-derive, since
-    /// a resume re-enters the block with nothing republished, leaving the window and the frame
-    /// geometry a later instruction reads different from what the machine's own state implies
-    /// (the failure signature is a `badfun`-class structured error inside
-    /// `gen_server:try_handle_call/4`, whose fun lives in a frame's Y slot). Hence `allocate`
-    /// is one `jit_allocate` helper call, re-publishing the window from
-    /// `Machine::push_frame_window`.
+    /// The shape is forced by the Y-window rule: an emitted push would have to carry
+    /// capacity/reallocation guards against `machine.stack` and `machine.frames`, a `NIL`
+    /// fill of the new Y slots, and `rt.y_base`/`rt.y_end` written mid-block -- all of it
+    /// state a **resumed** slice does not re-derive, since a resume re-enters the block with
+    /// nothing republished, leaving the window and the frame geometry a later instruction
+    /// reads different from what the machine's own state implies (the failure signature is a
+    /// `badfun`-class structured error inside `gen_server:try_handle_call/4`, whose fun lives
+    /// in a frame's Y slot). Hence `allocate` is one `jit_allocate` helper call,
+    /// re-publishing the window from `Machine::push_frame_window`.
     ///
     /// The pin states that shape as an invariant: the helper's
     /// `movabs` immediate is present, and the emitted arm contains **no** store into the
-    /// published Y window and **no** read of a `PubVec` header word. An emitted push fails
-    /// here, in the emitter, before it can fail at run time — the behavioural half of the same
-    /// property is `frame_push_tests.rs::a_sliced_and_resumed_baseline_run_pushes_each_frame_exactly_once`.
+    /// published Y window. An emitted push fails here, in the emitter, before it can fail at
+    /// run time — the behavioural half of the same property is
+    /// `frame_push_tests.rs::a_sliced_and_resumed_baseline_run_pushes_each_frame_exactly_once`.
     ///
     /// The probe allocation caches nothing, so the emitted arm is exactly the helper call
     /// plus the frame-change continue check and holds no memory operand but the `rt` slot.
     #[test]
     fn the_allocate_arm_pushes_the_frame_with_a_helper_call_only() {
-        use super::super::super::runtime::{
-            RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP, STORE_CAP_OFF, STORE_LEN_OFF, STORE_PTR_OFF,
-        };
+        use super::super::super::runtime::{RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP};
         let code = lowered(|buffer, done| {
             emit_allocate(buffer, &Allocation::default(), done, 4, 7, 2)
         });
@@ -528,29 +507,6 @@ mod tests {
                     !contains(&code, &store),
                     "`allocate` must not store into the published {field}: the Y window is \
                      re-derived from `Machine::push_frame_window`, never written by emitted code"
-                );
-            }
-        }
-        // No `PubVec` header traffic in either direction: the frame push is the helper's, so
-        // emitted code neither reads a header word (to test capacity) nor commits one (to
-        // publish the push). The push lives in `Machine`, so the store is `Machine`'s `Vec`.
-        for (word, off) in [
-            ("ptr", STORE_PTR_OFF),
-            ("len", STORE_LEN_OFF),
-            ("cap", STORE_CAP_OFF),
-        ] {
-            for load in loads_of_store_header_word(off) {
-                assert!(
-                    !contains(&code, &load),
-                    "`allocate` must not read a `PubVec` {word} word: the capacity a frame \
-                     push needs is `Machine::push_frame_window`'s, behind the helper"
-                );
-            }
-            for store in stores_into_runtime_field(off) {
-                assert!(
-                    !contains(&code, &store),
-                    "`allocate` must not write a `PubVec` {word} word: the push is \
-                     `Machine::push_frame_window`'s, behind the helper"
                 );
             }
         }
