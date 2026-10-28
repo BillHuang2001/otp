@@ -29,9 +29,12 @@
 //!   the wrong shape for a copy-on-write table: one append would have to clone the entire slot
 //!   array. [`IndexShards`] splits it into [`INDEX_SHARDS`] independent shards, so an append copies
 //!   one shard (about `len / INDEX_SHARDS` entries) instead of the whole index. Each shard is an
-//!   open-addressed table keyed by the name's 64-bit hash (see [`hash_of`]), because the shard
+//!   open-addressed table keyed by the name's hash (see [`hash_of`]), because the shard
 //!   choice is *itself* derived from that hash and re-deriving it a second time (as a `HashMap`
-//!   `RandomState` would) is pure waste on the hottest lookup in the ETF decode path.
+//!   `RandomState` would) is pure waste on the hottest lookup in the ETF decode path. The shard
+//!   stores only the hash's high 32 bits ([`tag_of`]) next to each name, which keeps an entry at
+//!   24 B — the footprint that lets a shard's slot array stay at or below the `HashMap` buckets it
+//!   replaced.
 //!
 //! Both directions sit behind one `Arc` each, which is what makes [`super::AtomTable::fork`] an
 //! O(1) operation that allocates **nothing**: it clones two `Arc`s. Every mutating path goes
@@ -208,27 +211,39 @@ impl NameChunks {
 // name → index: hash-sharded
 // ---------------------------------------------------------------------------
 
-/// One entry of a shard's probe table.
+/// One entry of a shard's probe table — **24 B**, so a shard's slot array stays at or below the
+/// `HashMap` bucket array this table replaced (32 B per entry made the boot's atom index cost
+/// ~+0.8 MiB peak RSS; see the cost model in `src/atom/CONTEXT.md`).
 ///
-/// The `hash` is stored so a probe can reject a slot that holds a *different* name with one `u64`
-/// compare instead of reaching into the string — the common case in a small table is landing next
-/// to an unrelated entry, and a byte compare there costs a deref plus a `memcmp`.
+/// `tag` is [`tag_of`]`(hash_of(name))` — the **high 32 bits** of the name's hash, stored so a
+/// probe can reject a slot that holds a *different* name with one `u32` compare instead of reaching
+/// into the string: the common case in a small table is landing next to an unrelated entry, and a
+/// byte compare there costs a deref plus a `memcmp`.
+///
+/// The tag is only a **filter**, never the identity of a name: the authoritative comparison is
+/// always the full byte compare of `name`, so two distinct names whose tags collide cost one extra
+/// compare and are never confused for one another
+/// (`a_tag_collision_between_two_names_is_slow_but_never_wrong`).
 #[derive(Debug, Clone)]
 struct Entry {
-    /// [`hash_of`] of `name` — the value the shard choice and the probe slot are both derived from.
-    hash: u64,
-    name: Arc<str>,
+    tag: u32,
     atom: Atom,
+    name: Arc<str>,
 }
 
+/// The 24 B shape is what the footprint fix depends on: a field added here (or a `u64` hash put
+/// back) makes `Option<Entry>` 32 B again and silently undoes it.
+const _: () = assert!(std::mem::size_of::<Entry>() == 24);
+const _: () = assert!(std::mem::size_of::<Option<Entry>>() == 24);
+
 /// One hash shard of the name→index direction: an open-addressed, linear-probing table keyed by
-/// the name's 64-bit hash.
+/// the name's probe tag ([`tag_of`], the high 32 bits of its hash).
 ///
 /// A `HashMap` was the wrong container here, because the shard already knows the name's hash — the
 /// shard is *derived* from it. A `HashMap` throws that away and re-derives it with SipHash (a
 /// per-process `RandomState` key, so it cannot even be memoized across calls), then compares keys
 /// through an `Arc<str>` deref. Here a single [`hash_of`] per lookup serves the shard mask **and**
-/// the in-shard probe slot, and a mis-probed slot is rejected by one integer compare.
+/// the in-shard probe slot, and a mis-probed slot is rejected by one `u32` compare.
 ///
 /// `Clone` is required (not incidental): [`IndexShards::insert`] detaches a shared shard with
 /// `Arc::make_mut`, which clones the table instead of mutating one a fork can still see. It is a
@@ -251,7 +266,7 @@ impl IndexShard {
     /// atom table — so 8 slots (which hold 6 at the 3/4 grow point) is one allocation for a
     /// typical shard and at most one grow event for a shard at the boot's load, instead of the
     /// 4 → 8 → 16 regrow ladder a minimal first capacity would walk. The cost is 8 ×
-    /// `size_of::<Option<Entry>>()` ≈ 256 B per *non-empty* shard of the shared table.
+    /// `size_of::<Option<Entry>>()` = 8 × 24 B = 192 B per *non-empty* shard of the shared table.
     const MIN_CAPACITY: usize = 8;
 
     /// The number of interned names in this shard.
@@ -259,23 +274,24 @@ impl IndexShard {
         self.len
     }
 
-    /// The index interned for `name`, whose [`hash_of`] is `hash`.
+    /// The index interned for `name`, whose probe tag is `tag`.
     ///
-    /// Probe slot 0 comes from the **high** half of the hash; equal hashes and a full scan both
-    /// fall through to the next slot. The loop always terminates: [`IndexShard::insert`] keeps the
-    /// table at or below a 3/4 load factor, so at least one slot is `None`.
+    /// Probe slot 0 comes from the **tag** (the hash's high half); an equal tag and a full scan
+    /// both fall through to the next slot, and the tag only pre-filters — the byte compare is what
+    /// decides. The loop always terminates: [`IndexShard::insert`] keeps the table at or below a
+    /// 3/4 load factor, so at least one slot is `None`.
     #[inline]
-    fn get(&self, hash: u64, name: &str) -> Option<Atom> {
+    fn get(&self, tag: u32, name: &str) -> Option<Atom> {
         if self.slots.is_empty() {
             return None;
         }
         let mask = self.slots.len() - 1;
-        let mut slot = probe_index(hash, mask);
+        let mut slot = probe_index(tag, mask);
         loop {
             match &self.slots[slot] {
                 None => return None,
                 Some(entry) => {
-                    if entry.hash == hash && entry.name.as_bytes() == name.as_bytes() {
+                    if entry.tag == tag && entry.name.as_bytes() == name.as_bytes() {
                         return Some(entry.atom);
                     }
                 }
@@ -284,19 +300,19 @@ impl IndexShard {
         }
     }
 
-    /// Record `name → atom`, whose [`hash_of`] is `hash`.
+    /// Record `name → atom`, whose probe tag is `tag`.
     ///
     /// Re-inserting a name that is already here is a no-op: the index is append-only, so the first
     /// mapping of a name wins and nothing may renumber it.
-    fn insert(&mut self, hash: u64, name: Arc<str>, atom: Atom) {
+    fn insert(&mut self, tag: u32, name: Arc<str>, atom: Atom) {
         if self.slots.is_empty() {
             self.slots = vec![None; Self::MIN_CAPACITY];
         }
         let mask = self.slots.len() - 1;
-        let mut slot = probe_index(hash, mask);
+        let mut slot = probe_index(tag, mask);
         loop {
             match &self.slots[slot] {
-                Some(entry) if entry.hash == hash && entry.name.as_bytes() == name.as_bytes() => {
+                Some(entry) if entry.tag == tag && entry.name.as_bytes() == name.as_bytes() => {
                     return;
                 }
                 Some(_) => slot = (slot + 1) & mask,
@@ -304,7 +320,7 @@ impl IndexShard {
                 None => break,
             }
         }
-        self.slots[slot] = Some(Entry { hash, name, atom });
+        self.slots[slot] = Some(Entry { tag, atom, name });
         self.len += 1;
         // Grow the moment the table would pass a 3/4 load factor. The test is written as a
         // multiplication rather than a division so it stays exact and branch-predictable.
@@ -313,7 +329,7 @@ impl IndexShard {
         }
     }
 
-    /// Double the table and re-place every entry from its **stored** hash — never by re-hashing a
+    /// Double the table and re-place every entry from its **stored** tag — never by re-hashing a
     /// name, so a grow moves each `Arc` handle without touching a byte of any string.
     ///
     /// Keeping the slot count a power of two is what makes the mask work; keeping the load factor
@@ -324,7 +340,7 @@ impl IndexShard {
         let mask = new_cap - 1;
         let mut slots: Vec<Option<Entry>> = vec![None; new_cap];
         for entry in std::mem::take(&mut self.slots).into_iter().flatten() {
-            let mut slot = probe_index(entry.hash, mask);
+            let mut slot = probe_index(entry.tag, mask);
             while slots[slot].is_some() {
                 slot = (slot + 1) & mask;
             }
@@ -362,9 +378,10 @@ impl IndexShards {
 
     /// The index interned for `name`, if any.
     ///
-    /// [`hash_of`] runs **once** and serves both halves of the probe — the shard mask and the
-    /// slot inside the shard. That single hash is the whole point of the open-addressed shard: a
-    /// `HashMap` had to hash the same bytes a second time, with a different (seeded) algorithm.
+    /// [`hash_of`] runs **once** and serves both halves of the probe — the shard mask (low bits)
+    /// and the slot inside the shard (the high-bit [`tag_of`]). That single hash is the whole point
+    /// of the open-addressed shard: a `HashMap` had to hash the same bytes a second time, with a
+    /// different (seeded) algorithm.
     ///
     /// The empty-table `?` comes before the hash, so a lookup in a table that has never interned
     /// anything costs a load and a branch.
@@ -372,7 +389,7 @@ impl IndexShards {
     pub(crate) fn get(&self, name: &str) -> Option<Atom> {
         let shards = self.shards.as_ref()?;
         let hash = hash_of(name);
-        shards[shard_of_hash(hash)].as_ref()?.get(hash, name)
+        shards[shard_of_hash(hash)].as_ref()?.get(tag_of(hash), name)
     }
 
     /// Record `name → atom` in its shard — the **only** mutating path.
@@ -385,7 +402,7 @@ impl IndexShards {
         );
         let shard =
             Arc::make_mut(shards[slot].get_or_insert_with(|| Arc::new(IndexShard::default())));
-        shard.insert(hash, name, atom);
+        shard.insert(tag_of(hash), name, atom);
     }
 
     /// The total number of name→index entries (Σ over the shards).
@@ -416,8 +433,8 @@ impl IndexShards {
 /// shard without coordinating. A seeded hasher (`RandomState`'s SipHash) could not: it is
 /// per-process state, so it would have to be re-derived on every call.
 ///
-/// One call serves **both** halves of a lookup: [`shard_of_hash`] picks the shard and
-/// [`probe_index`] picks the slot inside it.
+/// One call serves **both** halves of a lookup: [`shard_of_hash`] picks the shard from the low bits
+/// and [`tag_of`] — the high 32 bits — picks (and pre-filters) the slot inside it.
 #[inline]
 fn hash_of(name: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -435,10 +452,23 @@ fn hash_of(name: &str) -> u64 {
 
 /// The shard a [`hash_of`] value names: its low bits, masked to the shard count.
 ///
-/// The low bits are the shard's, which is exactly why [`probe_index`] takes the high ones.
+/// The low bits are the shard's, which is exactly why [`tag_of`] takes the high ones.
 #[inline]
 fn shard_of_hash(hash: u64) -> usize {
     (hash as usize) & (INDEX_SHARDS - 1)
+}
+
+/// The probe **tag** of a [`hash_of`] value: its high 32 bits — both the slot [`probe_index`]
+/// starts at and the value [`Entry`] stores.
+///
+/// Storing 32 of the hash's 64 bits is a pure footprint decision (a 24 B entry instead of 32, which
+/// keeps a shard's slot array at or below the `HashMap` buckets it replaced); the tag is only a
+/// *filter*, so a collision costs one extra byte compare and is never a wrong answer. The shard
+/// choice keeps using the **full** hash's low bits, so shard assignment — and therefore the memory
+/// balance across shards — is untouched.
+#[inline]
+fn tag_of(hash: u64) -> u32 {
+    (hash >> 32) as u32
 }
 
 /// The shard a `name` lives in — [`hash_of`] composed with [`shard_of_hash`].
@@ -453,16 +483,19 @@ fn shard_of(name: &str) -> usize {
     shard_of_hash(hash_of(name))
 }
 
-/// The first slot a `hash` probes in a table of `cap_mask + 1` slots.
+/// The first slot a `tag` probes in a table of `cap_mask + 1` slots.
 ///
-/// The **high** half of the hash, deliberately: the low bits are already spent on the shard mask
-/// ([`shard_of_hash`]), so every entry of one shard shares them — deriving the slot from them would
-/// collapse a shard's names into a single probe cluster and turn the table into a linear scan.
-/// The splitmix64 finalizer mixes the high half into the low bits but leaves the two statistically
-/// independent, so the high half spreads uniformly within a shard.
+/// The tag is the **high** half of the hash, deliberately: the low bits are already spent on the
+/// shard mask ([`shard_of_hash`]), so every entry of one shard shares them — deriving the slot from
+/// them would collapse a shard's names into a single probe cluster and turn the table into a linear
+/// scan. The splitmix64 finalizer mixes the high half into the low bits but leaves the two
+/// statistically independent, so the high half spreads uniformly within a shard.
+///
+/// The mask is always far below `2^32` (a shard holds ~9 entries at the boot's table size), so the
+/// tag's own low bits are what select the slot.
 #[inline]
-fn probe_index(hash: u64, cap_mask: usize) -> usize {
-    ((hash >> 32) as usize) & cap_mask
+fn probe_index(tag: u32, cap_mask: usize) -> usize {
+    (tag as usize) & cap_mask
 }
 
 #[cfg(test)]
@@ -718,13 +751,117 @@ mod tests {
         for mask in [7usize, 15, 31] {
             let spread: HashSet<usize> = names
                 .iter()
-                .map(|name| probe_index(hash_of(name), mask))
+                .map(|name| probe_index(tag_of(hash_of(name)), mask))
                 .collect();
             assert!(
                 spread.len() >= 4,
                 "mask {mask} spread {} of {} names: {spread:?}",
                 spread.len(),
                 names.len()
+            );
+        }
+    }
+
+    /// Two distinct names whose probe **tags** are equal, plus that shared tag.
+    ///
+    /// A tag collision is a birthday event over 2^32 buckets, so a pair turns up after about
+    /// `sqrt(π/2 · 2^32) ≈ 82 000` candidates. The candidate stream is deterministic, so the pair
+    /// the test works with is reproducible rather than luck-of-the-run.
+    fn a_tag_collision_pair() -> (String, String, u32) {
+        const SCAN: u32 = 4_000_000;
+        const NONE: u32 = u32::MAX;
+        let name_at = |i: u32| format!("tag_collision_candidate_{i}");
+        // (first candidate index, second candidate index or NONE) per tag — no per-candidate
+        // allocation, so the scan stays cheap at the ~10^5 candidates a pair needs.
+        let mut seen: HashMap<u32, (u32, u32)> = HashMap::new();
+        for i in 0..SCAN {
+            let name = name_at(i);
+            let tag = tag_of(hash_of(&name));
+            let slot = seen.entry(tag).or_insert((i, NONE));
+            if slot.0 == i {
+                continue;
+            }
+            return (name_at(slot.0), name, tag);
+        }
+        panic!("no tag collision in {SCAN} candidates — the tag is not 32 bits of the hash");
+    }
+
+    /// The stored tag is only a **filter**: two distinct names whose high-32-bit tags are equal must
+    /// both resolve, and neither may shadow the other. A tag-only probe would answer the wrong
+    /// `Atom` here (or, on `insert`, silently refuse the second name).
+    #[test]
+    fn a_tag_collision_between_two_names_is_slow_but_never_wrong() {
+        let (first, second, tag) = a_tag_collision_pair();
+        let (first, second) = (&first, &second);
+        assert_ne!(first, second);
+        assert_eq!(tag_of(hash_of(first)), tag);
+        assert_eq!(tag_of(hash_of(second)), tag);
+
+        let (atom_first, atom_second) = (Atom(7), Atom(9));
+        let mut shard = IndexShard::default();
+        shard.insert(tag, arc(first), atom_first);
+        // The tag matches, so it is the *byte compare* that rejects this slot — twice over: this
+        // lookup and the second insert below.
+        assert_eq!(shard.get(tag, second), None, "the tag must not answer for a name");
+
+        shard.insert(tag, arc(second), atom_second);
+        assert_eq!(shard.len(), 2);
+        assert_eq!(shard.get(tag, first), Some(atom_first));
+        assert_eq!(shard.get(tag, second), Some(atom_second));
+
+        // Re-inserting either name is a no-op (the index is append-only: first mapping wins), so a
+        // collision cannot renumber the other one either.
+        shard.insert(tag, arc(second), Atom(u32::MAX));
+        assert_eq!(shard.len(), 2);
+        assert_eq!(shard.get(tag, first), Some(atom_first));
+        assert_eq!(shard.get(tag, second), Some(atom_second));
+
+        // The same pair through the whole index, where the low bits put them in their own shards.
+        let mut index = IndexShards::new();
+        index.insert(arc(first), atom_first);
+        index.insert(arc(second), atom_second);
+        assert_eq!(index.entries(), 2);
+        assert_eq!(index.get(first), Some(atom_first));
+        assert_eq!(index.get(second), Some(atom_second));
+    }
+
+    /// `n` distinct names that start probing at the **same slot** of an `mask + 1`-slot shard, plus
+    /// that slot: a genuine probe cluster, which every lookup here has to walk past.
+    fn names_sharing_a_probe_slot(n: usize, mask: usize) -> (Vec<String>, usize) {
+        let mut buckets: HashMap<usize, Vec<u32>> = HashMap::new();
+        for i in 0.. {
+            let slot = probe_index(tag_of(hash_of(&format!("cluster_candidate_{i}"))), mask);
+            let bucket = buckets.entry(slot).or_default();
+            bucket.push(i);
+            if bucket.len() == n {
+                let names = bucket
+                    .iter()
+                    .map(|&i| format!("cluster_candidate_{i}"))
+                    .collect();
+                return (names, slot);
+            }
+            assert!(i < 1_000_000, "no {n}-way probe-slot collision in {i} candidates");
+        }
+        unreachable!("the slot scan returns or panics")
+    }
+
+    /// A probe cluster in one shard must stay unambiguous: every name finds its own `Atom`, and a
+    /// name that only shares the starting slot stays absent.
+    #[test]
+    fn a_probe_cluster_inside_one_shard_stays_unambiguous() {
+        let (names, slot) = names_sharing_a_probe_slot(3, 7);
+        let mut shard = IndexShard::default();
+        for (i, name) in names.iter().enumerate() {
+            shard.insert(tag_of(hash_of(name)), arc(name), Atom(i as u32));
+        }
+        assert_eq!(shard.len(), 3);
+        assert_eq!(shard.slots.len(), IndexShard::MIN_CAPACITY);
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(probe_index(tag_of(hash_of(name)), 7), slot);
+            assert_eq!(
+                shard.get(tag_of(hash_of(name)), name),
+                Some(Atom(i as u32)),
+                "{name}"
             );
         }
     }

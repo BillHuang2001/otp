@@ -11,7 +11,8 @@ own copy-on-write container:
 - **name → index** (which index does `"ok"` have?) — `IndexShards`, the index hash-sharded into
   `INDEX_SHARDS` independent shards, so an append copies one shard (about `len / INDEX_SHARDS`
   entries) instead of the whole slot array. Each shard is an open-addressed probe table keyed by
-  the name's 64-bit hash, so one `hash_of` per lookup serves the shard choice *and* the probe. The
+  the name's probe **tag** (the high 32 bits of its hash), so one `hash_of` per lookup serves the
+  shard choice *and* the probe. The
   shard array itself is the other half of that trade — `8 · INDEX_SHARDS` B per non-empty table —
   so the shard count has an interior optimum; the cost model below states it.
 
@@ -38,21 +39,27 @@ allocation pins can derive their budget instead of hard-coding a slack.
   `get(index) -> Option<&str>`, `push(Arc<str>) -> u32` (**the only mutating path**, returns the
   index it took), `reserve_names(total)`; test-only `container_ptr()`/`name_arc(index)`.
 - `IndexShard` — one shard's **open-addressed, linear-probing** table: `slots: Vec<Option<Entry>>`
-  (`len()` a power of two, or `0`) + `len: usize`, where `Entry { hash: u64, name: Arc<str>,
-  atom: Atom }`. Empty state is `Vec::new()`, so a shard allocates nothing until its first insert
-  (which allocates the one slot buffer, `MIN_CAPACITY = 8`); plain probing to the first `None` is
-  correct because there is no delete path. `Clone` is required
+  (`len()` a power of two, or `0`) + `len: usize`, where
+  `Entry { tag: u32, atom: Atom, name: Arc<str> }` is **24 B** (`Option<Entry>` too, via the `Arc`
+  pointer's niche). Empty state is `Vec::new()`, so a shard allocates nothing until its first insert
+  (which allocates the one slot buffer, `MIN_CAPACITY = 8`, i.e. 192 B); plain probing to the first
+  `None` is correct because there is no delete path. `Clone` is required
   (`IndexShards::insert` detaches a shared shard with `Arc::make_mut`) and is a **deep** copy — one
   fresh name string per entry plus one slot buffer, i.e. the same shape the `HashMap` had, which is
   what the siblings' Θ(N) clone controls measure.
+  The `tag` is only a **filter** for the probe: the authoritative comparison is always the full byte
+  compare of `name`, so two names whose tags collide cost one extra compare and are never
+  confused (`a_tag_collision_between_two_names_is_slow_but_never_wrong`). The 24 B shape is pinned
+  by `const` assertions in `store.rs`.
 - `IndexShards` (`shards: Option<Arc<[Option<Arc<IndexShard>>; INDEX_SHARDS]>>`) — `new()`,
   `fork()`, `get(&str) -> Option<Atom>`, `insert(Arc<str>, Atom)` (**the only mutating path**),
   `entries()` (Σ shard `len`, O(`INDEX_SHARDS`), debug-only use); test-only `container_ptr()`.
 - `hash_of(&str) -> u64` — FNV-1a 64 over the name bytes, then the splitmix64 finalizer.
   `shard_of_hash(u64) -> usize` — the low bits masked to the shard count; `shard_of(&str)` is the
   composition (test-only: the live paths reach it through `shard_of_hash` so they keep the hash).
-  `probe_index(u64, mask) -> usize` — the **high** half of the hash masked to the shard's slot
-  count (the low bits are the shard's, so every entry of one shard shares them).
+  `tag_of(u64) -> u32` — the hash's **high** 32 bits: the stored `Entry.tag` and the probe slot's
+  input. `probe_index(u32, mask) -> usize` — the tag masked to the shard's slot count (the low hash
+  bits are the shard's, so every entry of one shard shares them).
 
 ## Constraints
 - **Indices are the observable identity.** `chunks[i][j]` names `Atom(i * NAMES_PER_CHUNK + j)`,
@@ -64,8 +71,8 @@ allocation pins can derive their budget instead of hard-coding a slack.
   container the other side of a fork can see — that is the whole isolation guarantee.
 - **`shard_of` is a pure function of the name bytes** (no seed, no table state, no allocation), so
   a fork and its parent — and any number of fork generations — agree on where a name lives without
-  coordinating. The same holds for `hash_of`/`shard_of_hash`/`probe_index`, which is what lets the
-  probe slot be a pure function too (a seeded hasher could not be).
+  coordinating. The same holds for `hash_of`/`shard_of_hash`/`tag_of`/`probe_index`, which is what
+  lets the probe slot be a pure function too (a seeded hasher could not be).
 - `NAMES_PER_CHUNK` and `INDEX_SHARDS` are **tuning constants, not contracts**: `NAMES_PER_CHUNK`
   moves the copy granularity, `INDEX_SHARDS` the shard granularity, and no caller may depend on
   either value (the two `pub` constants exist only for the allocation-budget arithmetic).
@@ -79,13 +86,22 @@ allocation pins can derive their budget instead of hard-coding a slack.
   block), so the array's `8 · INDEX_SHARDS` bytes move bytes rather than allocation *count*;
   measured at **9 allocations** for a fork-then-intern at 300 atoms and **10** at 3 000
   (`../../../tests/intern_alloc.rs`, case (f), which pins the bound as flat — budget 11).
-- `get`/`len`/`insert` — **one** `hash_of` per call, serving both the shard mask and the in-shard
-  probe slot, plus one probe. (A `HashMap<Arc<str>, Atom>` could not reuse it: `RandomState`'s
+- `get`/`len`/`insert` — **one** `hash_of` per call, serving both the shard mask (low bits via
+  `shard_of_hash`) and the in-shard probe tag/slot (high bits via `tag_of`), plus one probe. (A
+  `HashMap<Arc<str>, Atom>` could not reuse it: `RandomState`'s
   SipHash is per-process seeded state, re-derived for every lookup, and it compares keys through an
   `Arc<str>` deref. This was the single hottest symbol on `copy_bound/etf_roundtrip`.) `len` is
   O(1) (`split_last` of the chunk list). The probe table grows at a 3/4 load factor (exact test
   `4·len >= 3·cap`), doubling the power-of-two slot count and re-placing entries from their
-  **stored** hashes — never by re-hashing a string.
+  **stored** tags — never by re-hashing a string.
+- **An entry is 24 B, not 32.** The stored hash is only ever a probe filter, so the entry keeps its
+  **high 32 bits** (`tag`) instead of all 64: `Entry { tag: u32, atom: Atom, name: Arc<str> }`, and
+  `Option<Entry>` inherits the same 24 B through the `Arc` niche. That makes `MIN_CAPACITY = 8` a
+  192 B slot buffer and a 16-slot boot shard 384 B — at or below the `HashMap` bucket array it
+  replaced (the 32 B entry measured 131 072 B of shard slots against 60 472 B of buckets at the boot
+  peak, worth ~+0.8 MiB peak RSS; the 24 B entry removes it). A tag collision is **slow, never
+  wrong**: the byte compare is authoritative, and the `const` size assertions in `store.rs` plus
+  `a_tag_collision_between_two_names_is_slow_but_never_wrong` pin both halves.
 - **The shard array is the second term of the trade.** A non-empty table's `shards` block is
   `8 · INDEX_SHARDS` B (8 KB at 1024), and it is *retained* by every table whose array has diverged
   from its parent — i.e. by every loaded module's `fork` on its first intern — as well as
@@ -106,5 +122,5 @@ allocation pins can derive their budget instead of hard-coding a slack.
 
 ## Routing Table
 - `store.rs` → `NAMES_PER_CHUNK`, `INDEX_SHARDS`, `NameChunk`, `NameChunks`, `IndexShard`,
-  `IndexShards`, `hash_of`/`shard_of`/`shard_of_hash`/`probe_index`; consumed only by `../atom.rs`
-  (`AtomTable`) and, for the two constants, by `../../../tests/intern_alloc.rs`.
+  `IndexShards`, `hash_of`/`shard_of`/`shard_of_hash`/`tag_of`/`probe_index`; consumed only by
+  `../atom.rs` (`AtomTable`) and, for the two constants, by `../../../tests/intern_alloc.rs`.
