@@ -36,13 +36,22 @@ allocation pins can derive their budget instead of hard-coding a slack.
 - `NameChunks { chunks: Option<Arc<Vec<Arc<NameChunk>>>> }` — `new()`, `fork()`, `len()`,
   `get(index) -> Option<&str>`, `push(Arc<str>) -> u32` (**the only mutating path**, returns the
   index it took), `reserve_names(total)`; test-only `container_ptr()`/`name_arc(index)`.
-- `IndexShard { map: HashMap<Arc<str>, Atom> }` — one shard's map (`Clone` is required:
-  `IndexShards::insert` detaches a shared shard with `Arc::make_mut`).
+- `IndexShard` — one shard's **open-addressed, linear-probing** table: `slots: Vec<Option<Entry>>`
+  (`len()` a power of two, or `0`) + `len: usize`, where `Entry { hash: u64, name: Arc<str>,
+  atom: Atom }`. Empty state is `Vec::new()`, so a shard allocates nothing until its first insert
+  (which allocates the one slot buffer, `MIN_CAPACITY = 8`); plain probing to the first `None` is
+  correct because there is no delete path. `Clone` is required
+  (`IndexShards::insert` detaches a shared shard with `Arc::make_mut`) and is a **deep** copy — one
+  fresh name string per entry plus one slot buffer, i.e. the same shape the `HashMap` had, which is
+  what the siblings' Θ(N) clone controls measure.
 - `IndexShards` (`shards: Option<Arc<[Option<Arc<IndexShard>>; INDEX_SHARDS]>>`) — `new()`,
   `fork()`, `get(&str) -> Option<Atom>`, `insert(Arc<str>, Atom)` (**the only mutating path**),
-  `entries()` (Σ shard `map.len()`, O(`INDEX_SHARDS`), debug-only use); test-only `container_ptr()`.
-- `shard_of(&str) -> usize` — FNV-1a 64 over the name bytes, then the splitmix64 finalizer, masked
-  to the shard count.
+  `entries()` (Σ shard `len`, O(`INDEX_SHARDS`), debug-only use); test-only `container_ptr()`.
+- `hash_of(&str) -> u64` — FNV-1a 64 over the name bytes, then the splitmix64 finalizer.
+  `shard_of_hash(u64) -> usize` — the low bits masked to the shard count; `shard_of(&str)` is the
+  composition (test-only: the live paths reach it through `shard_of_hash` so they keep the hash).
+  `probe_index(u64, mask) -> usize` — the **high** half of the hash masked to the shard's slot
+  count (the low bits are the shard's, so every entry of one shard shares them).
 
 ## Constraints
 - **Indices are the observable identity.** `chunks[i][j]` names `Atom(i * NAMES_PER_CHUNK + j)`,
