@@ -1163,3 +1163,68 @@ fn filelib_existence_probes_on_an_existing_path_agree_with_the_oracle() {
         assert_eq!(agrees_with_the_oracle(&call), expected, "`{call}`");
     }
 }
+/// The **audit** of the twelve remaining floor namespaces: `src/native/CONTEXT.md`'s
+/// *Namespace audit* section says every one of them stays floored, and the two reasons a key can
+/// stay are (a) its OTP body needs a facility this runtime does not run, or (b) it answers a
+/// question whose true source is a live server this runtime keeps its own copy of. This pins the
+/// part that *is* falsifiable without withdrawing anything: for the keys a body **could** plausibly
+/// serve, the floor's answer is the oracle's answer, argument by argument — so "kept because it
+/// agrees" is measured rather than asserted.
+///
+/// The withdrawn `application` namespace is the counter-example this pins against: it agreed on
+/// the plain reads too and still had to go, because it disagreed on the *state* (`set_env/4`).
+/// A key that merely agrees on a read is therefore kept here only where no body can disagree
+/// later — every probe below is a pure query.
+#[test]
+fn the_kept_floor_namespaces_agree_with_the_oracle() {
+    // Environment-independent answers: pinned outright (so the probe is meaningful without an
+    // oracle), then required to be the oracle's rendering too.
+    for (call, expected) in [
+        // `code:is_loaded/1` — the `CodeServer`'s own loaded set.
+        // `is_loaded/1` answers `{file, Path}` for a loaded module, `false` for one it never saw.
+        ("is_tuple(code:is_loaded(lists))", "true"),
+        ("code:is_loaded(no_such_xyz)", "false"),
+        // `code:is_sticky/1` — the release's sticky directory rule.
+        ("code:is_sticky(lists)", "true"),
+        ("code:is_sticky(mnesia)", "false"),
+        // `code:get_mode/0` — the floor's `-mode` init argument.
+        ("code:get_mode()", "interactive"),
+        // `code:load_file/1`, `ensure_loaded/1` and `get_object_code/1` — a miss is the same
+        // `{error,nofile}`/`error` the oracle's own loader answers.
+        ("code:load_file(no_such_xyz)", "{error,nofile}"),
+        ("code:ensure_loaded(no_such_xyz)", "{error,nofile}"),
+        ("code:get_object_code(no_such_xyz)", "error"),
+        // The node's own link table: `net_adm:ping/1` on a name nothing is listening for is
+        // `pang` (the oracle's timeout answer) and `net_kernel:connect_node/1` is `ignored`.
+        ("net_adm:ping(nonode@nohost)", "pang"),
+        ("net_kernel:connect_node(nonode@nohost)", "ignored"),
+        // `code:lib_dir/1` and `code:priv_dir/1` — the release layout, whose version suffix the
+        // installation owns, so the two are pinned by their relationship and by `is_list/1`.
+        ("is_list(code:lib_dir(stdlib))", "true"),
+        ("is_list(code:priv_dir(stdlib))", "true"),
+        ("code:priv_dir(stdlib) =:= code:lib_dir(stdlib) ++ \"/priv\"", "true"),
+        // `os:cmd/1` runs a real shell; the comparison form keeps the rendering independent of
+        // the shell's own output buffering.
+        ("os:cmd(\"echo hi\") =:= \"hi\\n\"", "true"),
+        ("os:cmd(\"printf hi\") =:= \"hi\"", "true"),
+    ] {
+        assert_eq!(agrees_on_the_booted_route(call), expected, "`{call}`");
+    }
+    // Path-valued answers name the installation, so only the oracle can pin them — each is
+    // compared outright, and independently required to be a non-empty quoted path naming what
+    // was asked for, so a probe that stops answering cannot pass vacuously.
+    for (call, suffix) in [
+        ("code:which(lists)", "lists.beam\""),
+        ("code:which(erlang)", "preloaded"),
+        ("code:where_is_file(\"lists.beam\")", "lists.beam\""),
+        ("code:root_dir()", "erlang\""),
+        ("code:priv_dir(stdlib)", "priv\""),
+        ("filename:basename(code:which(lists))", "\"lists.beam\""),
+    ] {
+        let rendered = agrees_on_the_booted_route(call);
+        assert!(
+            rendered.ends_with(suffix),
+            "`{call}` renders {rendered:?}, not an answer ending {suffix:?}"
+        );
+    }
+}
