@@ -111,7 +111,7 @@ What the pair publishes and reads back is the **shared** root-hand-off mechanism
 ### The raise arm is the escape boundary for a raised error
 The runner stabilizes the `BeamError` itself, because its structured reason term is a raw `Eterm` in the raise's live-reason slot, built on the dying process's heap or on the recyclable pooled BIF region.
 The copy's `SourcePayloads` come from `Runtime::source_payloads` — the executing **machine's** handles unioned with the whole off-heap family the pid's scan retained from the messages it received (`MailboxState::retained_binaries`/`retained_off_heap`/`retained_nodes`), since a payload the process *received* carries its handles on the message envelope, not on this machine.
-So a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared rather than tripping the valve, whether the process built it or received it; the recorded exit reason is derived from the stabilized error (`reason::exit_reason`: atom → the stabilized live term → interned `Display` text), so one copy serves both exit propagation and every later rendering.
+So a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared rather than tripping the valve, whether the process built it or received it; the **bare** reason is derived from the stabilized error (`reason::exit_reason`: atom → the stabilized live term → interned `Display` text), so one copy serves the crash report, the signalled exit value's base and every later rendering.
 A reason that cannot be copied is the honest `error:system_limit`, never a stored dangling word; `Runtime::as_action_process` is the same boundary for the `-eval`/`-s`/`-run`/boot-directive routes.
 
 ## The death-path reason — bare vs signalled (one death, two terms)
