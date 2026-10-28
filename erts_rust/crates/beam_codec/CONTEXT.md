@@ -241,6 +241,7 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
   state-machine suites are `src/encode/tests.rs`/`src/decode/tests.rs`, exposing the `pub(crate)`
   helpers (`new_heap`, `decode`, `assert_bad_arg`, `assert_system_limit`) the `fun`/`record`
   submodules reuse.
+- **Gate results at the current HEAD:** `cargo test -p beam_codec -p beam_bifs --no-fail-fast` = **142 test binaries, 2469 passed, 0 failed, 0 ignored**; the codec-family differential sweep (`etf, wire, wire_extra, wire_ids, binary, bin2term, bits, bitbin, maps, terms` = 733 case ids at 12-way parallelism, merged with `--allowlist known-gaps.txt --drift-allowlist <empty>`) = **`total=733 agree=732 mismatch=0 unsupported=1`**, the single `unsupported` being the allowlisted `wire/new_fun_ext_encode`.
 - **Integration:** 34 binaries in six roles — public-API/re-export (`ref_wire_public`),
   property/fuzz (`property_roundtrip`/`property_oracle` + `property_support/`, splitmix64 seed
   `0x5EED_F00D_1234_5678`), hardening (`decode_hostile`, `decode_depth`), identity/`[safe]` seams
