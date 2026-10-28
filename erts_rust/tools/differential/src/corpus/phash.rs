@@ -66,6 +66,16 @@
 //! Each claims contract A.2 alongside A.7 (the corpus registry only lets a module-run case claim
 //! the contracts it evidences directly). The closure is applied as well as hashed, so a fun whose
 //! hash were answered from a substitute while the fun itself did not work cannot pass.
+//!
+//! # The other two local-fun identity keys
+//!
+//! A fourth module run, `phash/local_fun_to_list_and_external_size_agree`, reaches the two
+//! `LOCAL_FUN_IDENTITY_BIFS` keys the hash cases do not: `erlang:fun_to_list/1` and
+//! `erlang:external_size/2`. The text is the **same** `#Fun<Module.OldIndex.OldUniq>` triple, so
+//! it carries the same volatile `uniq` — the case rebuilds the expected text from the run's own
+//! `fun_info/2` identity items and compares it as a relation (pinning every character while
+//! pinning no moving number), and the two `external_size` answers are compared against the
+//! `term_to_binary` byte counts they are defined to be.
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
@@ -154,6 +164,52 @@ bor bit(P =:= erlang:phash(I, 1 bsl 27), 32)\n\
 bor bit(P =/= erlang:phash(G, 1 bsl 27), 64)\n\
 bor bit(erlang:phash(mk_cap(3), 1 bsl 27) =/= P, 128),\n\
 byte_size(term_to_binary(F)) * 1000 + Flags.\n";
+
+/// The module behind `phash/local_fun_to_list_and_external_size_agree`: one capturing closure
+/// factory `mk_cap(A)` and a function that both **renders** and **sizes** a compiled module's
+/// `make_fun3` fun — the two `LocalFunIdentity` hook-set keys (`erlang:fun_to_list/1` and
+/// `erlang:external_size/2`) no other case reaches with a *local* fun.
+///
+/// `fun_to_list/1`'s text is `"#Fun<Module.OldIndex.OldUniq>"`, whose `Uniq` rides the module CRC
+/// and therefore moves with the compile-time source path (a module-run case compiles into its own
+/// temp dir). So the text is never pinned verbatim: the case rebuilds the **expected** text from
+/// this same run's `fun_info/2` identity items (`module`, `index`, `uniq`) and compares it as a
+/// relation, which pins the whole rendering — the `#Fun<` head, both `.` separators, the trailing
+/// `>` and every digit of both numbers — without pinning a number that moves between
+/// compilations. The fun is applied as well as rendered (`_ = F(1) + G(1)`), so a text answered
+/// for a fun that does not actually work cannot pass.
+///
+/// The answer is **one integer**, as a module run requires: the fun image's byte size (a
+/// compile-time constant — the same *classification* the sibling cases use) in the high digits
+/// plus a 10-bit relation mask that is `1023` when all ten relations hold.
+const LOCAL_FUN_IDENT_SOURCE: &str = "-module(fun_ident).\n\
+-export([to_list_and_external_size/0]).\n\
+bit(true, B) -> B;\n\
+bit(false, _) -> 0.\n\
+mk_cap(A) -> fun(X) -> X + A end.\n\
+to_list_and_external_size() ->\n\
+F = mk_cap(7),\n\
+G = mk_cap(8),\n\
+L = erlang:fun_to_list(F),\n\
+{module, M} = erlang:fun_info(F, module),\n\
+{index, Index} = erlang:fun_info(F, index),\n\
+{uniq, Uniq} = erlang:fun_info(F, uniq),\n\
+Expected = \"#Fun<\" ++ atom_to_list(M) ++ \".\" ++ integer_to_list(Index)\n\
+++ \".\" ++ integer_to_list(Uniq) ++ \">\",\n\
+_ = F(1) + G(1),\n\
+S1 = erlang:external_size(F),\n\
+S2 = erlang:external_size(F, [deterministic]),\n\
+Flags = bit(is_list(L), 1)\n\
+bor bit(lists:prefix(\"#Fun<fun_ident.\", L), 2)\n\
+bor bit(lists:suffix(\">\", L), 4)\n\
+bor bit(L =:= Expected, 8)\n\
+bor bit(L =:= erlang:fun_to_list(binary_to_term(term_to_binary(F))), 16)\n\
+bor bit(S1 =:= byte_size(term_to_binary(F)), 32)\n\
+bor bit(S2 =:= byte_size(term_to_binary(F, [deterministic])), 64)\n\
+bor bit(S1 =:= S2, 128)\n\
+bor bit(erlang:external_size(G) =:= S1, 256)\n\
+bor bit(erlang:external_size(G, [deterministic]) =:= S2, 512),\n\
+S1 * 10000 + Flags.\n";
 /// The A.7 `phash`/`phash2` cases.
 pub(crate) fn group() -> Vec<Case> {
     vec![
@@ -395,6 +451,31 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the other two local-fun identity keys -------------------------------------------
+        //
+        // `erlang:fun_to_list/1` renders the very `#Fun<Module.OldIndex.OldUniq>` triple whose
+        // `uniq` moves with the compile-time source path, and `erlang:external_size/2` sizes the
+        // same fun's external image. Both are `LOCAL_FUN_IDENTITY_BIFS` keys no other case reaches
+        // with a *local* fun (`bifs/external_size_of_a_term` only sizes an int and an atom), so
+        // this module run is their coverage: the text is folded into relations against the run's
+        // own `fun_info/2` items and the two sizes into the high digits. See the module docs.
+        Case {
+            id: "phash/local_fun_to_list_and_external_size_agree",
+            description: "erlang:fun_to_list/1 and erlang:external_size/2 of a compiled module's make_fun3 local fun: the #Fun<Module.OldIndex.OldUniq> text rebuilt from the run's own fun_info/2 identity items (and its imported image), the two external sizes against the term_to_binary byte counts they are defined to be, classified into one integer",
+            contracts: &[Contract::BeamAsm, Contract::OtpApps],
+            kind: CaseKind::Module(ModuleRun {
+                source: LOCAL_FUN_IDENT_SOURCE,
+                module: "fun_ident",
+                function: "to_list_and_external_size",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("791023"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -500,5 +581,52 @@ mod tests {
             assert_eq!(case.golden.stdout, Some(golden), "{id}");
             assert_eq!(case.golden.exit_code, 0, "{id}");
         }
+    }
+
+    /// The `fun_to_list/1` + `external_size/2` module run: it reaches the other two
+    /// `LOCAL_FUN_IDENTITY_BIFS` keys with a **compiled** local fun (an `-eval` lambda is an
+    /// `erl_eval` closure and carries no module/index identity, so it cannot pin this seam), and
+    /// it pins the text as a relation against the run's own `fun_info/2` items rather than as the
+    /// volatile `#Fun<…uniq>` text or its byte size.
+    #[test]
+    fn the_fun_text_and_external_size_case_reaches_both_remaining_keys() {
+        let cases = group();
+        let case = cases
+            .iter()
+            .find(|c| c.id == "phash/local_fun_to_list_and_external_size_agree")
+            .expect("registered");
+        assert_eq!(
+            case.contracts,
+            &[Contract::BeamAsm, Contract::OtpApps],
+            "a module-run case must evidence the .beam contract"
+        );
+        assert_eq!(case.kind_label(), "module-run");
+        let CaseKind::Module(run) = &case.kind else {
+            panic!("the fun-identity case runs a compiled module");
+        };
+        assert_eq!(run.module, "fun_ident");
+        assert_eq!(run.function, "to_list_and_external_size");
+        assert_eq!(run.arity, 0);
+        assert!(run.args.is_empty());
+        assert!(run.nif.is_none());
+        // Both hook-set keys are really read: the renderer and the /2 sizer.
+        assert!(
+            run.source.contains("erlang:fun_to_list(F)"),
+            "the case must reach erlang:fun_to_list/1"
+        );
+        assert!(
+            run.source.contains("erlang:external_size(F, [deterministic])"),
+            "the case must reach erlang:external_size/2 with an option list"
+        );
+        // The one volatile field of the text (`uniq`) is rebuilt from the run's own `fun_info/2`
+        // items instead of being pinned — the corpus never asserts a value that rides the CRC.
+        assert!(
+            run.source.contains("{uniq, Uniq} = erlang:fun_info(F, uniq)"),
+            "the text is compared against the run's own identity, not a pinned uniq"
+        );
+        // The oracle's integer line: `79 * 10000 + 1023` — the fun image's byte size and the
+        // ten relations, all of which hold.
+        assert_eq!(case.golden.stdout, Some("791023"));
+        assert_eq!(case.golden.exit_code, 0);
     }
 }
