@@ -344,3 +344,52 @@ by construction).
   Each of the newer match-context shapes charges a path budget of its own on top of `BS_PATH_BYTES`, because its sequence is wider than the shared match-context guards it reuses: `BS_MATCH_STRING_PATH_BYTES = 2_304` per `bs_match_string` (one emitted triple per pattern byte, bounded by `match_string::MAX_MATCH_BYTES = 64`), `UTF32_PATH_BYTES`/`UTF16_PATH_BYTES` = 1 024 each and `UTF8_PATH_BYTES = 2_048`. Like the other path budgets they are charged whether or not a predicate claims the instruction, because the estimate runs before the predicate and an under-estimate is a `SystemLimit` compile error.
 - **The register-cache gate** (`regalloc.rs::{cacheable_touches, cacheable_reads, cacheable_writes, is_inlined}`) and the `Y` gate (`arith.rs::uses_y`) consult the same `*_shape` functions and the label-free `<Shape>::of(...)` constructors, so the emitted register set, the block's dirty-spill set and the `Y` refresh decision are derived from one decision. A shape's destination must be charged as **written** — the value lands in that cache register, so an uncharged write lets a stale register survive a block exit.
 
+## Emitted-store invalidation inventory (the inline `allocate` push)
+
+`JitRuntime::stack_store`/`frames_store` are `*mut PubVec<…>` and the store header's
+`ptr`/`len`/`cap` **are** the truth — the emitted push and every Rust accessor read and
+write the same words, so there is no mirror to commit and no staleness window.
+That is what makes this inventory decidable: a site either (a) leaves the header
+correct as it writes it (any `PubVec` method, which is the only way Rust may touch the
+storage), or (b) moves `ptr` (a `grow`, i.e. a `Vec` reallocation), which invalidates
+the pointer the emitted code re-reads — so it must be followed by **no emitted code
+until the next publication**. The driver publishes both handles once per loop iteration
+(`jit/baseline/mod.rs:1193`, `stack_store`/`frames_store`/`frame_template`), from the
+same `&mut Machine` the loop holds exclusively, so no pointer outlives one `drive()`.
+
+### Erlang stack (`machine.stack`)
+
+- `machine/frames.rs:240` `push_frame_window`'s `resize` — grows the store (may move `ptr`) and writes the Y words; publishes.
+- `machine/frames.rs:266`, `:293`, `:321` `pop_frame`/`pop_frame_checked`/`pop_frame_take_continuation`'s `truncate` — length only, no move.
+- `machine/frames.rs:359-361`, `:363` `trim`'s `copy_within` + `truncate` — in-place, no move.
+- `machine/mod.rs:1121`/`:1135` `with_parked_loose_terms`'s `push`/`truncate` — the dominant hidden mutator: reachable from **every** rooted hand-off, and the `push` can move `ptr`.
+- `machine/registers.rs:362` `Machine::reset`'s `clear`, `machine/catch.rs:364` the unwind `truncate` — length only.
+- In-place word writes: `machine/frames.rs:99`, `:116`, `:137`, `:155` (Y-slot setters) — no header change.
+- Root hand-offs read the words, never the pointer: `machine/mod.rs:1030`/`:1124` (`RootSet::new`), `:1325` (`for_each_root_mut`), `:1226` (census walk), `:937` (`stack_mut`), `families/bitstrings/raw.rs:677`.
+
+### Call frames (`machine.frames`)
+
+- `machine/frames.rs:245-249` `push_frame_window`'s `push` — may move `ptr`.
+- `machine/frames.rs:264`, `:284`, `:312` `pop_frame`/`pop_frame_checked`/`pop_frame_take_continuation`'s `pop`; `:290`/`:318` their cold re-push.
+- `machine/frames.rs:195-196`, `:204`, `:322-325`, `:364-366` `last_mut`/`trim` field writes — in place.
+- `machine/catch.rs:357` `truncate`, `machine/registers.rs:363` `clear` — length only.
+
+### Helpers reachable from emitted code
+
+Each of these either re-publishes before the block continues, or is followed by a
+driver-side publication before any emitted code can use the store again:
+
+- Publishes the store's contents in place (never moves `ptr`), so the emitted handle stays valid: `jit_allocate` (`runtime.rs:2580`), `jit_allocate_heap` (`:2626`), `jit_test_heap` (`:2672`), `jit_trim` (`:2709`), `jit_deallocate` (`:2451`), `jit_deallocate_return` (`:2539`), `jit_tail_call` (`:2002`), `jit_return` (`:2500`), `jit_call_store`/`jit_call_store_linked`/`call_store_impl` (`call.rs:237`/`:266`/`:285`), `jit_publish_y` (`:1475`), `jit_refresh_y` (`:1503`), `refresh_y_base` (`:437`), `publish_y_window` (`:478`).
+- Run interpreted instructions (which may push/pop/trim/`with_parked_loose_terms`) and return a block-ABI word the driver folds, so no emitted code runs between the helper and the driver's next publication: `jit_step_one` (`:866`), `jit_step_ext` (`:925`), `jit_ext_call` (`:1244`/`:1251`), `jit_local_call`/`probe_local_call` (`:1291`/`:1356`), `jit_bif_value` (`bif_helper.rs:99`), `jit_family` (`family.rs:57`), `jit_receive` (`receive.rs:68`), `jit_bitstr` (`bitstr.rs:91`).
+- Never touch the stores: `enter_in_block`/`commit_in_block_entry`/`cross_function_enter` (`:2234`/`:2247`/`:2283`/`:2328`), which only switch the entry tables.
+- Driver-side: `drive` (`mod.rs:1091`) publishes before the loop, the loop head (`:1257-1262`) re-publishes each iteration, `code.enter_cached` (`:1285`) and the deopt arm (`:1409-1418`) run inside an iteration that re-publishes at its head; `enter_machine` (`mod.rs:809`) resets and pushes frame 0 **before** the loop publishes. A `traced` run never builds a `JitRuntime` (`mod.rs:1100-1102`).
+
+### The two rules the emitter must keep
+
+- **Every capacity guard precedes every write.** A `grow` moves `ptr`, and the emitted
+  arm re-reads `ptr` from the header after the guards, so the fast path can never name
+  freed memory; the miss goes to `jit_allocate`, which lets the `Vec` grow and publishes
+  the fresh pointer itself.
+- **The commit order is `fill`, then `len`.** The Y words are written into spare
+  capacity before `stack.len` is bumped, so a collection (or the census walk) never sees
+  a length covering a word the push has not written.

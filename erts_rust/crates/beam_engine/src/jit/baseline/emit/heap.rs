@@ -600,7 +600,7 @@ mod tests {
             !guarded.starts_with(&spill),
             "the inline push is not a call, so it spills nothing on its success path"
         );
-        let needle = helper_immediate(jit_allocate);
+        let needle = helper_immediate(jit_allocate as *const ());
         let call = guarded
             .windows(needle.len())
             .position(|window| window == needle)
