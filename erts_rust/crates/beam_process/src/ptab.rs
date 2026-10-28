@@ -321,12 +321,6 @@ where
     }
 }
 
-/// Term-word slack added on top of a caller-held refusal price when reserving a signal fragment,
-/// so the common case costs one copy attempt. It is an **optimisation**, never a correctness
-/// requirement: an under-sized reservation is re-reserved from the copy's own refusal (see
-/// [`enqueue_fragment_payload`]).
-const FRAGMENT_SLACK_WORDS: usize = 8;
-
 /// The reservation a signal fragment starts from when the caller holds **no** price for it — the
 /// apply-time route, where the payload build failed on a single bumped allocation of the receiver's
 /// own heap and therefore priced that allocation, not the payload.
@@ -383,7 +377,9 @@ fn refused_payload_words(failure: AllocFailure) -> Option<usize> {
 /// enqueue-time call sites hold either the payload's exact price (the reason copy that produced the
 /// refusal *is* a copy of this payload) or the reason sub-graph's (the builders wrap it, hence
 /// [`EXIT_ENVELOPE_WORDS`]/[`DOWN_ENVELOPE_WORDS`]); only the apply-time route holds none and
-/// starts at [`SIGNAL_FRAGMENT_FLOOR_WORDS`].
+/// starts at [`SIGNAL_FRAGMENT_FLOOR_WORDS`]. Either figure is passed through to
+/// [`copy_into_fragment`] **unchanged**, because that call owns the one term-word slack it adds on
+/// top of its caller's number (applying it here as well would reserve it twice).
 ///
 /// A reservation can still be too small — a lower bound, a floor, and a copy price that exceeds
 /// `beam_term::size_object`'s source occupancy for a refc binary the copier has to flatten — so the
@@ -407,12 +403,12 @@ where
     let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
     let payload = build(&mut scratch, reason)?;
     // The apply-time route holds **no** price (see the fn docs), so it starts at
-    // `SIGNAL_FRAGMENT_FLOOR_WORDS`; a held price is a lower bound the caller already paid for and
-    // gets this route's slack. `copy_into_fragment` adds its own tag slack on top and re-reserves
-    // monotonically from the copy's refusal, so neither figure is a correctness requirement.
-    let start = Some(held_words.map_or(SIGNAL_FRAGMENT_FLOOR_WORDS, |words| {
-        words.saturating_add(FRAGMENT_SLACK_WORDS)
-    }));
+    // `SIGNAL_FRAGMENT_FLOOR_WORDS`; a held price is handed to `copy_into_fragment` **unchanged**,
+    // because that is the one place the term-word slack is applied (`TAG_SLACK_WORDS`, on top of
+    // whatever figure it is given) and it re-reserves monotonically from the copy's own refusal —
+    // so neither figure is a correctness requirement, and applying the slack here as well would
+    // only inflate the reservation.
+    let start = Some(held_words.unwrap_or(SIGNAL_FRAGMENT_FLOOR_WORDS));
     // `copy_struct` walks the graph by pointer, so the heap-resident `reason` subtree is copied
     // in too; the source process's persistent off-heap table resolves its refc binaries/MSO, and
     // the copy's own refusal re-reserves the fragment monotonically.
@@ -4748,6 +4744,8 @@ mod tests {
         is_tuple, make_atom, make_small, tuple_element, tuple_size, AtomTable,
     };
 
+    use crate::tag::TAG_SLACK_WORDS;
+
     use super::*;
 
     /// A table with a fresh atom table behind it.
@@ -6307,8 +6305,8 @@ mod tests {
 
     /// A fragment reserved from a **held** refusal price is sized from that figure — not from a
     /// fresh ``size_object`` walk of the payload. The held figure here is deliberately far above the
-    /// payload's 3-word copy price, so the reservation (`held + FRAGMENT_SLACK_WORDS`) cannot be
-    /// mistaken for any walk-derived number.
+    /// payload's 3-word copy price, so the reservation (`held + TAG_SLACK_WORDS`, the one slack
+    /// [`copy_into_fragment`] applies) cannot be mistaken for any walk-derived number.
     #[test]
     fn a_held_refusal_price_reserves_the_fragment_without_a_sizing_walk() {
         let mut table = table();
@@ -6334,9 +6332,9 @@ mod tests {
             .expect("one fragment");
         assert_eq!(
             fragment.capacity(),
-            20 + FRAGMENT_SLACK_WORDS,
-            "the reservation is the caller's held price plus the slack (`size_object` of the \
-             payload is 3, so a sizing walk would have reserved 11)"
+            20 + TAG_SLACK_WORDS,
+            "the reservation is the caller's held price plus the one slack `copy_into_fragment` \
+             applies (`size_object` of the payload is 3, so a sizing walk would have reserved 11)"
         );
         assert_eq!(fragment.used(), 3, "one copy filled exactly the payload's words");
     }

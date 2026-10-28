@@ -64,7 +64,11 @@ use crate::process::Process;
 /// The words added on top of a [`size_object`] figure when reserving a tag's fragment, so the
 /// common small tag costs one copy attempt. An optimisation only: an under-sized reservation is
 /// re-reserved from the copy's own refusal (see [`copy_into_fragment`]).
-const TAG_SLACK_WORDS: usize = 8;
+///
+/// This is the **one** term-word slack of a fragment reservation: [`copy_into_fragment`] applies it
+/// to whatever starting figure its caller passes, so no caller may add a slack of its own (crate
+/// visible so the fragment-reservation pins are derived from it rather than from a copied number).
+pub(crate) const TAG_SLACK_WORDS: usize = 8;
 
 /// The floor for a tag fragment's reservation — a boxed tuple header plus a few elements.
 const TAG_FRAGMENT_FLOOR_WORDS: usize = 16;
