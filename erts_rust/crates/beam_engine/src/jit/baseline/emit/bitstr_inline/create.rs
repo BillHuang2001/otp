@@ -260,7 +260,7 @@ use super::super::operands::{x_offset, y_offset, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCR
 use super::super::{
     emit_positioned_helper_call, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, RUNTIME_SLOT_DISP,
 };
-use super::{emit_fallback_and_done, IMMED1_MASK, POINTER_MASK, SMALL_TAG, SUB_BITS_END_DISP};
+use super::{emit_fallback_and_done, POINTER_MASK, SMALL_TAG, SUB_BITS_END_DISP};
 
 #[cfg(test)]
 use super::{record_inlined, SHAPE_CREATE_BIN};
@@ -806,6 +806,18 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     //
     // The `binary all` route has no static field at all, so its guard phase is the (1c)
     // source guard and nothing else.
+    //
+    // `IMMED1_MASK == SMALL_TAG` (the small-integer tag *is* the all-ones immediate tag;
+    // the assertion beside those constants pins it), so `(v & mask) == tag` is
+    // `(v & SMALL_TAG) == SMALL_TAG` and one `movabs` serves every field of the append.
+    // `rax` is free across the loop: [`Loc::load`] writes only `dst` (plus its `end`
+    // scratch on a `Y` read) and nothing between the hoist and the last guard calls out.
+    if prepared
+        .iter()
+        .any(|field| matches!(field, PreparedField::Bits { .. }))
+    {
+        buffer.mov_ri(Reg::Rax, SMALL_TAG)?;
+    }
     for field in &prepared {
         let PreparedField::Bits { value, .. } = field else {
             continue;
@@ -818,9 +830,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
             fallback,
             highest_touched,
         )?;
-        buffer.mov_ri(Reg::Rax, IMMED1_MASK)?;
         buffer.and_rr(Reg::Rdx, Reg::Rax)?;
-        buffer.mov_ri(Reg::Rax, SMALL_TAG)?;
         buffer.cmp_rr(Reg::Rdx, Reg::Rax)?;
         buffer.jcc(Cond::Ne, fallback)?;
     }

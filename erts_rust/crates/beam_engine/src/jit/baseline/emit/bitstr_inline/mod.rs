@@ -269,6 +269,9 @@ const IMMED1_MASK: i64 = TAG_IMMED1_MASK as i64;
 
 /// `_TAG_IMMED1_SMALL` — the small-integer level-1 immediate tag.
 const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
+/// `is_small` is `(v & mask) == tag`, and the small-integer tag is the all-ones immediate
+/// tag, so one immediate can carry both halves of the predicate.
+const _: () = assert!(IMMED1_MASK == SMALL_TAG);
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
