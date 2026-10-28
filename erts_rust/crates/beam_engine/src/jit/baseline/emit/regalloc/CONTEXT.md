@@ -1,7 +1,7 @@
 # `emit/regalloc` — the register picker and the block's gate derivation
 
 ## Intent
-`regalloc.rs::allocate_registers_with_labels`: the live-interval x-register selection (≤5 cache slots) and the three gates derived from the same scans — the Y publish/refresh triple (`y_last`/`y_first`/`frame_republish_first` → `prologue_publishes_y`) and the per-`pc` dirty set (`spill_sets`).
+`regalloc.rs::allocate_registers_with_labels`: the live-interval x-register selection (≤5 cache slots) and the gates derived from the same scans — the Y triple (`y_last` → the prologue publish and the post-helper refresh; `y_first`/`frame_republish_first` the recorded window-helper geometry) and the per-`pc` dirty set (`spill_sets`).
 The selector is a greedy linear scan by descending interval length, tie-broken by ascending register index; physical assignment is by first-appearance order, so it is deterministic.
 Membership is **fixed for the whole block** — the correctness contract that keeps the two representations from disagreeing.
 
