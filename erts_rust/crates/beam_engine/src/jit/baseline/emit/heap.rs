@@ -441,4 +441,119 @@ mod tests {
         assert!(contains(&heap_refreshed, &refresh_immediate()));
         assert!(!contains(&heap_plain, &refresh_immediate()));
     }
+    /// Every distinct 8-byte **store** into a `JitRuntime` field at `disp`, over all base
+    /// and source register pairs.
+    ///
+    /// The probe is exhaustive on purpose: the retired inline frame push wrote the Y window
+    /// with one fixed register pair, and a reintroduction that picked different registers
+    /// must still be caught.
+    ///
+    /// `rsp` is excluded as a base because the block's own `rt` slot lives at
+    /// `[rsp + RUNTIME_SLOT_DISP]` (`RUNTIME_SLOT_DISP == STORE_PTR_OFF == 0`), which every
+    /// helper call legitimately loads — no frame push can reach a store header through `rsp`.
+    fn stores_into_runtime_field(disp: i32) -> Vec<Vec<u8>> {
+        let mut encodings: Vec<Vec<u8>> = Vec::new();
+        for base in Reg::ALL {
+            if base == Reg::Rsp {
+                continue;
+            }
+            for src in Reg::ALL {
+                let bytes = encoded(|buffer| buffer.mov_mr(base, disp, src).unwrap());
+                if !encodings.contains(&bytes) {
+                    encodings.push(bytes);
+                }
+            }
+        }
+        encodings
+    }
+    /// Every distinct 8-byte **load** out of a `PubVec` header word at `off`, over all base
+    /// and destination register pairs (same `rsp` exclusion as [`stores_into_runtime_field`]).
+    fn loads_of_store_header_word(off: i32) -> Vec<Vec<u8>> {
+        let mut encodings: Vec<Vec<u8>> = Vec::new();
+        for base in Reg::ALL {
+            if base == Reg::Rsp {
+                continue;
+            }
+            for dst in Reg::ALL {
+                let bytes = encoded(|buffer| buffer.mov_rm(dst, base, off).unwrap());
+                if !encodings.contains(&bytes) {
+                    encodings.push(bytes);
+                }
+            }
+        }
+        encodings
+    }
+    /// **The frame push is a helper call and nothing else.**
+    ///
+    /// `7475317f64` lowered `allocate` by emitting the push itself: capacity guards against
+    /// the two published `PubVec` headers, a `NIL` fill of the new Y slots, the frame slot
+    /// copied out of `JitRuntime::frame_template`, `rt.y_base`/`rt.y_end` written mid-block
+    /// and both store lengths committed (`mov [stack.len], …` / `mov [frames.len], …`).
+    /// That was **unsound**: a frame change must leave the machine's Y window re-derivable
+    /// from Rust state (`Machine::push_frame_window`), and a *resumed* slice re-enters the
+    /// block with nothing republished, so the window and the frame geometry a later
+    /// instruction reads are not the ones the machine's own state implies. With it enabled
+    /// the default tier (`Tier::BaselineJit`) raised a `badfun`-class structured error inside
+    /// `gen_server:try_handle_call/4` on essentially every run; `5efe7d8737` retired it in
+    /// favour of the `jit_allocate` helper.
+    ///
+    /// This pin is the shape that retirement produced, stated as an invariant: the helper's
+    /// `movabs` immediate is present, and the emitted arm contains **no** store into the
+    /// published Y window and **no** read of a `PubVec` header word. A reintroduced inline
+    /// push fails here, in the emitter, before it can fail at run time — the behavioural half
+    /// of the same bug is `tests.rs::a_sliced_and_resumed_baseline_run_pushes_each_frame_exactly_once`.
+    ///
+    /// The probe allocation caches nothing, so the emitted arm is exactly the helper call
+    /// plus the frame-change continue check and holds no memory operand but the `rt` slot.
+    #[test]
+    fn the_allocate_arm_pushes_the_frame_with_a_helper_call_only() {
+        use super::super::super::runtime::{
+            RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP, STORE_CAP_OFF, STORE_LEN_OFF, STORE_PTR_OFF,
+        };
+        let code = lowered(|buffer, done| {
+            emit_allocate(buffer, &Allocation::default(), done, 4, 7, 2)
+        });
+        // The push itself: exactly the `jit_allocate` helper call.
+        assert!(
+            contains(&code, &helper_immediate(jit_allocate as *const ())),
+            "`allocate` must call the `jit_allocate` helper"
+        );
+        // No Y-window publication: the helper's `Machine::push_frame_window` re-derives the
+        // window from machine state, which a resumed slice can do and emitted writes cannot.
+        for (field, disp) in [
+            ("rt.y_base", RUNTIME_YBASE_DISP),
+            ("rt.y_end", RUNTIME_YEND_DISP),
+        ] {
+            for store in stores_into_runtime_field(disp) {
+                assert!(
+                    !contains(&code, &store),
+                    "`allocate` must not store into the published {field}: the Y window is \
+                     re-derived from `Machine::push_frame_window`, never written by emitted code"
+                );
+            }
+        }
+        // No `PubVec` header traffic in either direction: the frame push is the helper's, so
+        // emitted code neither reads a header word (to test capacity) nor commits one (to
+        // publish the push). The push lives in `Machine`, so the store is `Machine`'s `Vec`.
+        for (word, off) in [
+            ("ptr", STORE_PTR_OFF),
+            ("len", STORE_LEN_OFF),
+            ("cap", STORE_CAP_OFF),
+        ] {
+            for load in loads_of_store_header_word(off) {
+                assert!(
+                    !contains(&code, &load),
+                    "`allocate` must not read a `PubVec` {word} word: the capacity a frame \
+                     push needs is `Machine::push_frame_window`'s, behind the helper"
+                );
+            }
+            for store in stores_into_runtime_field(off) {
+                assert!(
+                    !contains(&code, &store),
+                    "`allocate` must not write a `PubVec` {word} word: the push is \
+                     `Machine::push_frame_window`'s, behind the helper"
+                );
+            }
+        }
+    }
 }

@@ -7013,3 +7013,6 @@ mod bif_tests;
 #[cfg(test)]
 #[path = "raise_tier_tests.rs"]
 mod raise_tier_tests;
+#[cfg(test)]
+#[path = "frame_push_tests.rs"]
+mod frame_push_tests;
