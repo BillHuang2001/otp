@@ -120,6 +120,17 @@ allocation pins can derive their budget instead of hard-coding a slack.
   pointer identity are unchanged, and `system_info(atom_count)`, `maps:to_list`, `phash2`,
   `term_to_binary` and `code:all_loaded` are byte-identical to the oracle's.
 
+## Measured effect (the probe table, on `copy_bound/etf_roundtrip`)
+The decode side interns/looks up **6 names per op** (`beam_codec`'s `atom_term` → `AtomTable::lookup`), which is why this module was the second-largest block of that row.
+Pairs are `rt-before` vs `rt-after` (the same tree plus this module's probe table), release build, interleaved rounds, `taskset -c 5`; the host was shared and heavily loaded (loadavg 190–510), so the **retired-instruction** column is the evidence and the wall column is directional only.
+- Retired user instructions per op (`perf stat -e instructions:u`, median of 5 rounds, each `(N=20 000 − N=0)`): `etf_roundtrip` **20 466 → 18 998 (−7.2 %)**; `ets_copy` 19 201 → 18 990 (−1.1 %); `send_recv` **65 916 → 64 342 (−2.4 %)**; `send_recv_plain` 31 783 → 31 667 (−0.4 %).
+- Cross-check by callgrind `totals:` (deterministic, independent of `perf`'s counter group): `etf_roundtrip` 20 507 → 19 080 Ir/op (−7.0 %); `send_recv` 66 570 → 64 560 (−3.0 %). The two methods agree to 0.2–0.6 %.
+- Wall clock, same pairing (median `ns/op`): `etf_roundtrip` **−10.7 %** on a quiet host (loadavg 25→42) and −22.5 % under loadavg 194→292 (rounds spanning 1 453–4 408 ns/op — directional); `send_recv` −10.7 % / −9.9 %; `ets_copy` and `send_recv_plain` within the round-to-round swing.
+- The wall delta exceeds the instruction delta because the probe also touches less memory: one hash per lookup instead of two, no per-lookup seeded-state derivation, and a 24 B slot instead of a 400 B bucket array — a cycles win that retired instructions cannot show.
+- The 24 B entry left a **+496 KiB** boot peak-RSS residual (`beam_rt -noshell -eval 'halt().'`: 60 328 → 60 824 KiB, min of 9 interleaved runs) against the `HashMap` bucket array it replaced, down from +996 KiB at a 32 B entry. It is the one honest cost of the change; `MIN_CAPACITY` is the knob.
+- **Nothing renumbers.** A name's index is still `names.len()` at intern time and no path here touches it; `shard_of_hash`/`hash_of` are unchanged, so a name lives in the same shard as before, the shard-count memory balance and the fork/COW isolation are unchanged, and the tag is a filter over the same bytes. `system_info(atom_count)`, `atom_to_list` numbering, `maps:to_list` order, `phash2` and `term_to_binary` bytes are therefore identical — which is what the compatibility gate's `terms`/`atoms`/`codec`/`wire`/`system_info` families re-check.
+- Next lever (not taken): `hash_of` is byte-at-a-time FNV-1a. Its values are not observable (only shard/probe placement is), so a word-at-a-time mix would cut the remaining per-lookup cost — but it moves every name's shard, so it needs its own footprint measurement, not a drive-by change.
+
 ## Routing Table
 - `store.rs` → `NAMES_PER_CHUNK`, `INDEX_SHARDS`, `NameChunk`, `NameChunks`, `IndexShard`,
   `IndexShards`, `hash_of`/`shard_of`/`shard_of_hash`/`tag_of`/`probe_index`; consumed only by
