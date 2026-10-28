@@ -222,3 +222,8 @@ re-reads the same words.
 Pinned by `../../bs_match_deopt_tests.rs`'s three refc rows (16 KiB whole window, a 4-bit-offset window, and a non-refc
 `ErlSubBits` that must still decline, each with a **zero run-time `BsMatch` deopt** count on the accepted forms — the
 value alone also passes for an arm that deopts every time).
+
+### The on-heap subject guard's mask invariant
+`emit_subject_view` proves the on-heap form by masking the header word with `BITSTRING_TAG_MASK` (`0x3B`) — the tag field only — and comparing the result against `HEAP_BITS_SUBTAG` (`0x20`).
+The mask must never reach header bit 8: the block's **arity** lives in bits `6..` of that same word (`make_header(num_words - 1, HEAP_BITS_SUBTAG)`), so a wider mask compares the arity too, refuses a well-formed heap binary, and silently turns the arm into one interpreter step per element — a value-identical failure, which is why tier agreement cannot see it.
+Pinned by `../../bs_match_deopt_tests.rs`'s section 11 (`an_on_heap_subject_of_every_block_arity_takes_no_interpreter_step`), which drives 1/9/17/25/33/41/49/64-byte payloads (block arities 2..9, every residue mod 8 — arities 4..7 being exactly the ones such a mask refuses) and asserts a **zero** run-time `BsMatch` deopt count for each.
