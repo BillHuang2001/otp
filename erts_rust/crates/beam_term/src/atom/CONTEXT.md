@@ -8,11 +8,12 @@ own copy-on-write container:
 
 - **index → name** (which name does `Atom(i)` denote?) — `NameChunks`, a list of fixed-capacity
   `NameChunk`s. O(1) random access, and an append never renumbers an existing index.
-- **name → index** (which index does `"ok"` have?) — `IndexShards`, the map hash-sharded into
+- **name → index** (which index does `"ok"` have?) — `IndexShards`, the index hash-sharded into
   `INDEX_SHARDS` independent shards, so an append copies one shard (about `len / INDEX_SHARDS`
-  entries) instead of the whole bucket array. The shard array itself is the other half of that
-  trade — `8 · INDEX_SHARDS` B per non-empty table — so the shard count has an interior optimum;
-  the cost model below states it.
+  entries) instead of the whole slot array. Each shard is an open-addressed probe table keyed by
+  the name's 64-bit hash, so one `hash_of` per lookup serves the shard choice *and* the probe. The
+  shard array itself is the other half of that trade — `8 · INDEX_SHARDS` B per non-empty table —
+  so the shard count has an interior optimum; the cost model below states it.
 
 Each direction sits behind exactly one `Arc`, which is what makes `AtomTable::fork` two `Arc`
 clones (zero allocations) instead of a `Vec::clone` plus a `HashMap::clone` (the boot's largest
