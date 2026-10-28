@@ -61,7 +61,9 @@ pub mod off_heap;
 pub mod preflight;
 mod share;
 
-pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
+pub use crate::copy::{
+    copy_struct, copy_struct_simple, shrink_warm_worklist, size_of_copy, CopyContext,
+};
 pub use crate::error::is_message_heap_exhaustion;
 pub use crate::fragment::{Fragments, HeapFragment};
 pub use crate::mailbox::{
@@ -75,7 +77,9 @@ pub use crate::share::copy_struct_shared;
 
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
-    pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
+    pub use crate::copy::{
+        copy_struct, copy_struct_simple, shrink_warm_worklist, size_of_copy, CopyContext,
+    };
     pub use crate::error::is_message_heap_exhaustion;
     pub use crate::fragment::{Fragments, HeapFragment};
     pub use crate::mailbox::{

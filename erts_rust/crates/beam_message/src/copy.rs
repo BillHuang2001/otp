@@ -83,6 +83,30 @@
 //! keeps one per thread, so a graph priced twice (every refused send, and every retried one) pays for
 //! the buffers once. `tests/traversals.rs` measures that: a warm preflight allocates nothing.
 //!
+//! # The worklist is retained per thread, and a cons chain is copied in one pass
+//!
+//! The writing traversal drives an explicit worklist of pending fix-ups ([`drain`]), which both copy
+//! routes share: the optimistic [`try_copy_fast`] and the sized tail of [`copy_struct`] are the same
+//! loop over a different [`CopyTarget`], so it exists once. The `Vec` behind it is a **retained
+//! per-thread buffer** ([`WARM_WORKLIST`], mirrored on
+//! [`preflight::WARM`](crate::preflight)) that every copy **clears** rather than drops, so a thread
+//! that has copied one graph of a given depth copies the next one allocation-free instead of growing
+//! `1, 2, 4, … 2ⁿ` entries on every send. Retaining it cannot keep a term alive: a [`Fixup`] records
+//! a destination word (inside a heap that never reallocates) and a source word, its lifetime is one
+//! copy, and the list is empty whenever the copy returns — it is not a GC root holder.
+//! [`shrink_warm_worklist`] is the host's RSS lever after an outlier payload, exactly as
+//! [`shrink_warm_scratch`](crate::preflight::shrink_warm_scratch) is for the pricing scratch.
+//!
+//! Inside the driver a **cons chain** is copied by [`copy_cons_chain`] rather than one worklist
+//! round-trip per cell: a list is the dominant object count in a real payload, and the whole `cdr`
+//! chain is written by one tight loop that records a fix-up only for a child that is not shared (the
+//! same [`push_fixup`] test, in the same order), so the destination layout and word count are
+//! unchanged. The chain walk's **cycle bound** is the target's remaining capacity
+//! ([`CopyTarget::remaining_words`]): it extends the chain only while another 2-word cell can be
+//! served, so a forged `cdr` back-edge cannot spin — the pending cell goes back through the ordinary
+//! per-object path, whose `reserve` fails, and the typed `BadArg` is re-derived exactly as before
+//! (on the sized path the preflight has already proven acyclicity, so the bound never fires there).
+//!
 //! # One sizing walk, the cycle guard on it, and one price per refusal
 //!
 //! A term the engine builds is always acyclic, but a *forged* term (a raw write into the heap) can
@@ -106,6 +130,8 @@
 //! only the destination's finite free words, so a forged cycle exhausts them (in at most
 //! `available / 2` objects), the attempt is abandoned and the preflight path re-derives the typed
 //! `BadArg`.
+
+use std::cell::RefCell;
 
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -131,6 +157,14 @@ pub(crate) trait CopyTarget {
 
     /// Writes the M1 off-heap reference container `[HEADER_BIN_REF, slot, 0]` and returns it.
     fn off_heap_container(&mut self, slot: usize) -> Result<Eterm>;
+
+    /// The words this target can still hand out.
+    ///
+    /// The chain walk ([`copy_cons_chain`]) reads it as its **cycle bound**: it keeps extending a
+    /// `cdr` chain only while the target can still serve another 2-word cell, so a forged
+    /// back-edge terminates instead of spinning. It is an upper bound on `reserve`'s own patience,
+    /// not a substitute for it — every reservation is still checked by [`CopyTarget::reserve`].
+    fn remaining_words(&self) -> usize;
 }
 
 impl CopyTarget for Heap {
@@ -142,6 +176,10 @@ impl CopyTarget for Heap {
 
     fn off_heap_container(&mut self, slot: usize) -> Result<Eterm> {
         layout::make_off_heap_container(self, slot)
+    }
+
+    fn remaining_words(&self) -> usize {
+        self.available()
     }
 }
 
@@ -204,6 +242,10 @@ impl CopyTarget for TrialTarget {
             *p.add(2) = Eterm::from_raw(0);
         }
         Ok(make_boxed(p as *const Eterm))
+    }
+
+    fn remaining_words(&self) -> usize {
+        self.free
     }
 }
 
@@ -287,6 +329,79 @@ pub(crate) fn identity(term: Eterm) -> Option<usize> {
 fn push_fixup(work: &mut Vec<Fixup>, slot: *mut Eterm, child: Eterm) {
     if !is_shared(child) {
         work.push((slot, child));
+    }
+}
+
+/// Whether `term` is a **non-shared cons cell** — the shape the chain walk
+/// ([`copy_cons_chain`]) continues into.
+///
+/// `NIL` is an immediate, so [`is_list`] already excludes it; [`is_shared`] is reused rather than
+/// re-deriving the literal-area test, which keeps the one shared/not-shared decision in one place.
+fn is_cons_unshared(term: Eterm) -> bool {
+    is_list(term) && !is_shared(term)
+}
+
+/// Copies the `cdr` chain starting at the non-shared cons cell `head` in one tight loop.
+///
+/// A list is the dominant object count in a real message payload (`[1..10]`, a char list, …), and
+/// re-entering [`shallow_unshared`] once per cell pays a worklist push/pop, a dispatch and a
+/// separate `reserve` for each one. This loop writes the whole chain directly — two words per cell —
+/// and records a fix-up only for a child that is not shared ([`push_fixup`], the one shared-term
+/// test), in exactly the order the per-cell path records it: each cell's `CAR` fix-up is queued
+/// while the chain is walked and popped after it, so the destination layout and word count are
+/// unchanged.
+///
+/// **The cycle bound is the target's remaining capacity.** A forged `cdr` back-edge
+/// (`[1 | <self>]`, the shape `tests/guards.rs` forges) would otherwise spin forever, so the loop
+/// extends the chain only while the target can still serve another 2-word cell. That is sound on
+/// both copy routes:
+///
+/// * the trial path hands out exactly the destination heap's free words, so the chain stops after
+///   `free / 2` cells and the pending cell goes back through the ordinary per-object path, whose
+///   `reserve` fails — the attempt is abandoned and the sized path re-derives the typed `BadArg`
+///   from the preflight's cycle verdict;
+/// * the sized path has already had its graph proven acyclic by that preflight, so a genuine chain
+///   always fits and the bound never fires (and if it somehow did, the ordinary path would answer
+///   the same typed `AllocKind::Message` refusal rather than truncating the list).
+fn copy_cons_chain<A: CopyTarget>(to: &mut A, work: &mut Vec<Fixup>, head: Eterm) -> Result<Eterm> {
+    // The caller guarantees a non-shared cons cell, so the first cell is always materialised and
+    // the root is well defined.
+    let root = to.reserve(2)?;
+    let mut dst = root;
+    let mut src = head;
+    loop {
+        // SAFETY: `src` is a live, non-`NIL` cons cell — the caller's guard for the first iteration,
+        // and for every later one `is_cons_unshared` re-tested the `cdr` just read.
+        let (car, cdr) = unsafe {
+            let cell = list_val(src);
+            (*cell, *cell.add(1))
+        };
+        // SAFETY: `dst` heads the two destination words reserved for this cell (the reservation
+        // above, or the one at the end of the previous iteration). Neither target ever reallocates,
+        // so the pointer is still live.
+        unsafe { *dst = car };
+        push_fixup(work, dst, car);
+
+        if is_cons_unshared(cdr) && to.remaining_words() >= 2 {
+            // The chain continues, so the cell's `CDR` is the **next destination cell** — exactly
+            // the word the per-cell path's tail fix-up would have written, `make_list(dst_next)`.
+            // (Writing the source `cdr` verbatim here would leave the destination list pointing
+            // into the source heap.)
+            let next = to.reserve(2)?;
+            // SAFETY: `dst` owns two words and `next` is the destination cell just reserved for
+            // this cell's tail.
+            unsafe { *dst.add(1) = make_list(next as *const Eterm) };
+            dst = next;
+            src = cdr;
+            continue;
+        }
+        // The chain ends here: the tail is written verbatim and queued for the ordinary per-object
+        // path, which copies it when it is a compound (`push_fixup` skips an immediate/literal) and
+        // answers its typed refusal when this target cannot serve a cell the bound above refused.
+        // SAFETY: `dst` owns two words, so `dst.add(1)` is in bounds.
+        unsafe { *dst.add(1) = cdr };
+        push_fixup(work, unsafe { dst.add(1) }, cdr);
+        return Ok(make_list(root as *const Eterm));
     }
 }
 
@@ -409,23 +524,7 @@ pub(crate) fn shallow_unshared<A: CopyTarget>(
 ) -> Result<Eterm> {
 
     match primary_tag(src) {
-        PrimaryTag::List => {
-            // SAFETY: `src` is a live, non-`NIL` cons cell, so its two words are readable.
-            let (head, tail) = unsafe {
-                let cell = list_val(src);
-                (*cell, *cell.add(1))
-            };
-            let dst = to.reserve(2)?;
-            // SAFETY: `dst` is the base of those two words.
-            unsafe {
-                *dst = head;
-                *dst.add(1) = tail;
-            }
-            push_fixup(work, dst, head);
-            // SAFETY: `dst` owns two words, so `dst.add(1)` is in bounds.
-            push_fixup(work, unsafe { dst.add(1) }, tail);
-            Ok(make_list(dst as *const Eterm))
-        }
+        PrimaryTag::List => copy_cons_chain(to, work, src),
         PrimaryTag::Boxed => {
             // An off-heap MSO reference is refcounted, never deep-copied: clone the source handle
             // (bumping the MSO refcount) into the destination table and write the new slot.
@@ -521,6 +620,91 @@ fn is_fast_path_eligible(ctx: &CopyContext<'_>) -> bool {
     ctx.dst_off_heap().is_fully_empty()
 }
 
+thread_local! {
+    /// The copier's **fix-up worklist**, one per thread: cleared (never re-`malloc`ed) by every
+    /// copy, so a thread that has copied one graph of a given depth copies the next one
+    /// **allocation-free**.
+    ///
+    /// Retaining the buffer is sound because a [`Fixup`] has a one-copy lifetime: the recorded
+    /// address points into the destination heap (or the trial overlay of it), which never
+    /// reallocates and is kept alive by the caller's own root, and the source term is a word of a
+    /// graph the caller still owns. The list is cleared before every use and is empty when the copy
+    /// returns, so the retained buffer **holds no live term** — it is not a GC root and can never
+    /// keep a term alive.
+    ///
+    /// A `RefCell` because the loop needs `&mut` and the borrow must be checked, not assumed: a
+    /// nested copy (see [`drain_with_warm_worklist`]) must not alias it.
+    static WARM_WORKLIST: RefCell<Vec<Fixup>> = RefCell::new(Vec::new());
+}
+
+/// The one **worklist driver** both copy routes share: materialise `term`, then every pending
+/// fix-up, until the worklist is empty.
+///
+/// [`try_copy_fast`] and the sized tail of [`copy_struct`] are the same loop over a different
+/// [`CopyTarget`], so it lives here once instead of once per route. A popped item is always a term
+/// [`push_fixup`] proved **not** shared, which is why the pop side calls [`shallow_unshared`] (no
+/// second `is_shared` per object) and why the root call is [`shallow`] (which does test it).
+fn drain<A: CopyTarget>(
+    target: &mut A,
+    ctx: &mut CopyContext<'_>,
+    term: Eterm,
+    work: &mut Vec<Fixup>,
+) -> Result<Eterm> {
+    let root = shallow(target, ctx, term, work)?;
+    while let Some((slot, src)) = work.pop() {
+        let copied = shallow_unshared(target, ctx, src, work)?;
+        // SAFETY: `slot` was recorded by `shallow`/`shallow_unshared` as a reference word inside an
+        // object it just materialised on the destination (a heap region, or the trial overlay of
+        // one, neither of which ever reallocates), so the word is still live, exclusively owned by
+        // this copy and writable.
+        unsafe { *slot = copied };
+    }
+    Ok(root)
+}
+
+/// [`drain`] over this thread's retained worklist ([`WARM_WORKLIST`]).
+///
+/// A copy does not re-enter itself — the worklist is only touched from here, and no step of a copy
+/// starts another one — so the borrow succeeds in practice. It is still a `try_borrow_mut` with a
+/// **locally built** `Vec` fallback, exactly the structure
+/// [`preflight_words`](crate::preflight::preflight_words) uses for its scratch: a re-entrant call,
+/// or a call from a thread whose worklist is already destroyed at thread teardown, runs the
+/// identical loop on its own buffer instead of panicking. The answer never depends on which buffer
+/// ran — only the allocation does.
+fn drain_with_warm_worklist<A: CopyTarget>(
+    target: &mut A,
+    ctx: &mut CopyContext<'_>,
+    term: Eterm,
+) -> Result<Eterm> {
+    let warmed = WARM_WORKLIST.try_with(|cell| match cell.try_borrow_mut() {
+        Ok(mut warm) => {
+            warm.clear();
+            Some(drain(target, ctx, term, &mut warm))
+        }
+        Err(_) => None,
+    });
+    match warmed {
+        Ok(Some(result)) => result,
+        _ => drain(target, ctx, term, &mut Vec::new()),
+    }
+}
+
+/// Releases this thread's retained copy worklist — the buffer [`drain_with_warm_worklist`] keeps —
+/// back to the allocator.
+///
+/// Retaining it is the point (a warm worklist makes a copy allocation-free), so an outlier payload
+/// leaves a high-water-mark `Vec` behind for the life of the thread. This is the same RSS lever
+/// [`shrink_warm_scratch`](crate::preflight::shrink_warm_scratch) is for the pricing scratch:
+/// **no result changes**, the next copy simply re-grows the buffer. A call that cannot take the
+/// borrow (a copy in progress on this thread, or a worklist already destroyed) is a no-op.
+pub fn shrink_warm_worklist() {
+    let _ = WARM_WORKLIST.try_with(|cell| {
+        if let Ok(mut warm) = cell.try_borrow_mut() {
+            warm.shrink_to_fit();
+        }
+    });
+}
+
 /// The optimistic **single-pass** copy: [`shallow`] + the worklist loop with no preflight
 /// traversal, writing into a [`TrialTarget`] over the destination heap's own unwritten words and
 /// committing the heap with one `alloc_words` when the whole graph has been materialised.
@@ -531,15 +715,7 @@ fn is_fast_path_eligible(ctx: &CopyContext<'_>) -> bool {
 /// the caller re-runs the sized path, which re-derives the crate's typed outcome.
 fn try_copy_fast(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
     let mut trial = TrialTarget::over(to);
-    let mut work: Vec<Fixup> = Vec::new();
-    let root = shallow(&mut trial, ctx, term, &mut work)?;
-    while let Some((slot, src)) = work.pop() {
-        let copied = shallow_unshared(&mut trial, ctx, src, &mut work)?;
-        // SAFETY: `slot` was recorded by `shallow` as a reference word inside an object it just
-        // materialised in the trial region (words of the destination heap, which never
-        // reallocates), so the word is still live, exclusively owned by this copy and writable.
-        unsafe { *slot = copied };
-    }
+    let root = drain_with_warm_worklist(&mut trial, ctx, term)?;
 
     // Commit: every word the trial handed out has already been written, so the destination's bump
     // pointer now advances over exactly those words — the one allocation the heap sees, in place
@@ -613,16 +789,7 @@ pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Res
         return Err(crate::error::heap_exhausted(needed));
     }
 
-    let mut work: Vec<Fixup> = Vec::new();
-    let root = shallow(to, ctx, term, &mut work)?;
-    while let Some((slot, src)) = work.pop() {
-        let copied = shallow_unshared(to, ctx, src, &mut work)?;
-        // SAFETY: `slot` was recorded by `shallow` as a reference word inside an object it just
-        // materialised on the destination heap. That heap never reallocates, so the word is still
-        // live, exclusively owned by this copy and writable.
-        unsafe { *slot = copied };
-    }
-    Ok(root)
+    drain_with_warm_worklist(to, ctx, term)
 }
 
 /// The common case of [`copy_struct`] with empty off-heap tables (no off-heap references).
@@ -649,51 +816,4 @@ pub fn size_of_copy(term: Eterm) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use beam_alloc::Heap;
-    use beam_term::prelude::*;
-
-    use super::{copy_struct_simple, is_shared};
-
-    #[test]
-    fn immediates_and_literals_are_shared() {
-        let mut heap = Heap::new(8).expect("test heap");
-
-        assert!(is_shared(make_small(1)));
-        assert!(is_shared(NIL));
-
-        let tuple = heap.tuple(&[make_small(1)]).expect("the tuple fits");
-        assert!(!is_shared(tuple), "a heap tuple is copied");
-        assert!(is_shared(make_literal(tuple)), "a literal-tagged tuple is shared");
-
-        let list = heap.cons(make_small(1), NIL).expect("the cons fits");
-        assert!(!is_shared(list), "a heap cons is copied");
-        assert!(is_shared(make_literal(list)), "a literal-tagged cons is shared");
-    }
-
-    #[test]
-    fn zero_arity_tuple_normalises_to_the_shared_literal() {
-        let mut heap = Heap::new(8).expect("test heap");
-        // SAFETY: the heap owns this one word.
-        let p = unsafe { heap.alloc_words(1).expect("the header fits") };
-        // SAFETY: `p` is that word; a zero-arity tuple header is a single word.
-        unsafe { *p = make_arityval_zero() };
-        let t0 = make_boxed(p as *const Eterm);
-
-        let mut dst = Heap::new(8).expect("destination heap");
-        let copy = copy_struct_simple(t0, &mut dst).expect("the copy succeeds");
-        assert_eq!(copy.raw(), tuple0().raw());
-        assert_eq!(dst.used(), 0, "the shared literal uses no destination word");
-    }
-
-    #[test]
-    fn over_capacity_simple_copy_is_rejected_before_allocating() {
-        let mut src = Heap::new(16).expect("source heap");
-        let tuple = src
-            .tuple(&[make_small(1), make_small(2), make_small(3)])
-            .expect("the tuple fits");
-        let mut dst = Heap::new(1).expect("too-small heap");
-        assert!(copy_struct_simple(tuple, &mut dst).is_err());
-        assert_eq!(dst.used(), 0);
-    }
-}
+mod tests;

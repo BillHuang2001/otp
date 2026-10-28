@@ -192,6 +192,60 @@ fn a_cycle_reached_through_a_valid_prefix_is_refused() {
     assert_cycle_is_refused(acc, 4096);
 }
 
+/// The same forged `cdr` cycle on **both** copy routes, at capacities spanning the two ways the
+/// chain walk's capacity bound can bite: too small for even one more cell (`4`) and large enough
+/// (`4096` = 2048 cells) that only the cycle — never capacity — can be the failure.
+///
+/// The shape is the chain walk's worst case: a long, perfectly ordinary prefix whose last `cdr`
+/// is forged closed, so the walk hands out cell after cell before the cycle is reached. Route 1 is
+/// the empty-off-heap-table single pass (the trial over the destination's unwritten tail); route 2
+/// is the sized path (a non-empty destination table, so no trial), where the preflight has already
+/// proven acyclicity and refuses before a word is written.
+#[test]
+fn a_forged_cdr_cycle_is_refused_on_both_copy_routes() {
+    /// A 100-cell list whose outermost `cdr` is forged to point back at the innermost cell.
+    fn forged_chain(heap: &mut Heap) -> Eterm {
+        let mut acc = NIL;
+        let mut cells = Vec::new();
+        for i in 0..100 {
+            acc = heap.cons(make_small(i), acc).expect("the cons fits");
+            cells.push(acc);
+        }
+        let innermost = *cells.last().expect("at least one cell");
+        // SAFETY: `acc` is the most recently reserved (outermost) cell, exclusively owned by the
+        // heap, so `list_val(acc).add(1)` is its `cdr` word; the write closes a 100-cell cycle.
+        unsafe { *list_val(acc).add(1) = innermost };
+        acc
+    }
+
+    for capacity in [4usize, 64, 4096] {
+        // Route 1: empty destination off-heap table ⇒ the optimistic single pass.
+        let mut src = Heap::new(256).expect("source heap");
+        let cyclic = forged_chain(&mut src);
+        let mut dst = Heap::new(capacity).expect("destination heap");
+        match copy_struct_simple(cyclic, &mut dst) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("single pass, capacity {capacity}: expected BadArg, got {other:?}"),
+        }
+        assert_eq!(dst.used(), 0, "single pass, capacity {capacity}: no word is written");
+
+        // Route 2: a non-empty destination off-heap table ⇒ priced first, refused up front.
+        let mut src = Heap::new(256).expect("source heap");
+        let cyclic = forged_chain(&mut src);
+        let src_off = OffHeapTable::new();
+        let mut dst_off = OffHeapTable::new();
+        dst_off.push(Mso::new(0x5A5A_u32, 4));
+        let mut dst = Heap::new(capacity).expect("destination heap");
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        match copy_struct(cyclic, &mut dst, &mut ctx) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("sized, capacity {capacity}: expected BadArg, got {other:?}"),
+        }
+        assert_eq!(dst.used(), 0, "sized, capacity {capacity}: no word is written");
+        assert_eq!(dst_off.len(), 1, "sized, capacity {capacity}: the table's entry survives");
+    }
+}
+
 #[test]
 fn the_sharing_preserving_copier_also_refuses_a_forged_cycle() {
     // `copy_struct_shared` shares the same preflight, so it must terminate identically.

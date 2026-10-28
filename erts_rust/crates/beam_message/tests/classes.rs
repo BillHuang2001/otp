@@ -154,6 +154,81 @@ fn a_proper_list_of_boxed_elements_copies_recursively() {
     assert_eq!(dst.used(), size_object(list));
 }
 
+/// Every **cons-chain shape** the chain walk takes in one pass copies cell for cell: an integer
+/// list, a char list, an improper list (`[1,2|3]`, whose walk ends on a non-cons), a one-cell list
+/// whose tail is `NIL`, a nested list (each `car` a cons) and a list whose head is a **shared
+/// literal**.
+///
+/// The claim is `classes.rs`'s: each copy is `compare::eq` its original **and** consumed exactly
+/// `size_of_copy` destination words — except the literal-headed list, whose head is shared by
+/// identity and therefore costs no destination word beyond the cell that names it (the `litopt`
+/// skip `tests/destination_pricing.rs` pins as a price delta).
+#[test]
+fn every_cons_chain_shape_copies_identically() {
+    let mut src = src_heap();
+    let ints = build_list(&mut src, &(1..=10).map(make_small).collect::<Vec<_>>());
+    let chars = build_list(
+        &mut src,
+        &"a char list"
+            .bytes()
+            .map(|b| make_small(i64::from(b)))
+            .collect::<Vec<_>>(),
+    );
+    let improper_tail = src.cons(make_small(2), make_small(3)).expect("the pair fits");
+    let improper = src.cons(make_small(1), improper_tail).expect("the pair fits");
+    let single = src.cons(make_small(7), NIL).expect("the cell fits");
+    let inner_a = build_list(&mut src, &[make_small(1), make_small(2)]);
+    let inner_b = build_list(&mut src, &[make_small(3), make_small(4)]);
+    let nested = {
+        let tail = src.cons(inner_b, NIL).expect("the cell fits");
+        src.cons(inner_a, tail).expect("the cell fits")
+    };
+
+    for (name, term) in [
+        ("integer list", ints),
+        ("char list", chars),
+        ("improper list", improper),
+        ("one-cell list", single),
+        ("nested list", nested),
+    ] {
+        let mut dst = dest_for(term);
+        let copy = copy_into(term, &mut dst);
+        assert!(
+            compare::eq(term, copy, &AtomTable::new()),
+            "{name}: the copy must be =:= the original"
+        );
+        assert_ne!(object_addr(term), object_addr(copy), "{name}: a real copy");
+        assert_eq!(
+            dst.used(),
+            size_of_copy(term),
+            "{name}: the chain writes exactly the source graph's words"
+        );
+    }
+
+    // A literal-tagged head is shared by identity: the cell is written, its interior is not.
+    let literal_interior = src.tuple(&[make_small(1), make_small(2)]).expect("fits");
+    let literal = make_literal(literal_interior);
+    let with_literal = src.cons(literal, NIL).expect("the cell fits");
+    let mut dst = dest_for(with_literal);
+    let copy = copy_into(with_literal, &mut dst);
+    assert!(
+        compare::eq(with_literal, copy, &AtomTable::new()),
+        "a shared literal child is a sharing decision, not a shape change"
+    );
+    assert_eq!(dst.used(), 2, "the one cons cell only");
+    assert_eq!(
+        dst.used(),
+        size_of_copy(with_literal) - size_of_copy(literal),
+        "the literal's interior is the whole of the difference"
+    );
+    // SAFETY: `with_literal` and its copy are both live non-NIL cons cells.
+    assert_eq!(
+        unsafe { car(with_literal) }.raw(),
+        unsafe { car(copy) }.raw(),
+        "the copied cell names the very same literal object"
+    );
+}
+
 #[test]
 fn an_improper_dotted_pair_copies_its_non_nil_tail() {
     let mut src = src_heap();
