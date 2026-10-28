@@ -28,7 +28,6 @@
 //!   is_boxed        off fallback                                 ; guard
 //!   not a bare header word  off fallback                         ; guard
 //!   header == HEADER_SUB_BITS       off fallback                 ; guard
-//!   is_bin_ref([p + ORIG])          off fallback                 ; 3 guards
 //!   start == 0                      off fallback                 ; guard
 //!   base = [p + BASE] & !FLAGS      off fallback / zero          ; 2 guards
 //!   end = [p + END], end % 8 == 0   off fallback                 ; guard
@@ -57,6 +56,10 @@
 //! and the helper's `unit == 8` append-position gate is the `end % 8 == 0` guard. Every
 //! guard is therefore a **refusal only**: what it cannot prove takes one interpreter step
 //! (the family's own answer), never a wrong result.
+//!
+//! [`is_refc_binary`](beam_term::refc::is_refc_binary)'s **`is_bin_ref(orig)`** clause is the
+//! one condition with no guard of its own here, because the helper's registry gate subsumes
+//! it for every accumulator this runtime can produce; section (3) below carries the argument.
 //!
 //! # Every guard is a refusal and nothing here writes
 //!
@@ -93,8 +96,8 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::emit_y_slot_value;
 use super::super::{
-    BIN_REF_HEADER, HEADER_DISP, NOT_BOXED_MASK, POINTER_MASK, SUB_BITS_END_DISP, SUB_BITS_HEADER,
-    SUB_BITS_ORIG_DISP, SUB_BITS_START_DISP,
+    HEADER_DISP, NOT_BOXED_MASK, POINTER_MASK, SUB_BITS_END_DISP, SUB_BITS_HEADER,
+    SUB_BITS_START_DISP,
 };
 use super::super::super::operands::{x_offset, Loc};
 use super::super::super::prologue;
@@ -183,22 +186,30 @@ pub(super) fn emit_append_cursor(
     buffer.cmp_rr(Reg::Rcx, Reg::Rdx)?;
     buffer.jcc(Cond::Ne, fallback)?;
 
-    // (3) `orig` (word 4) must be a `BinRef` — `is_bin_ref(orig)`, i.e. `is_boxed_term(orig)`
-    // and `*boxed_val(orig) == HEADER_BIN_REF`. An `ErlSubBits` whose `orig` is anything else
-    // is a **match context** (or an on-heap-bitstring window), which has no writable payload.
-    buffer.mov_rm(Reg::Rcx, Reg::R8, SUB_BITS_ORIG_DISP)?;
-    buffer.mov_ri(Reg::Rdx, NOT_BOXED_MASK)?;
-    buffer.test_rr(Reg::Rcx, Reg::Rdx)?;
-    buffer.jcc(Cond::Ne, fallback)?;
-    buffer.mov_ri(Reg::Rdx, PRIMARY_MASK)?;
-    buffer.test_rr(Reg::Rcx, Reg::Rdx)?;
-    buffer.jcc(Cond::E, fallback)?;
-    buffer.mov_ri(Reg::Rdx, POINTER_MASK)?;
-    buffer.and_rr(Reg::Rcx, Reg::Rdx)?;
-    buffer.mov_rm(Reg::Rcx, Reg::Rcx, HEADER_DISP)?;
-    buffer.mov_ri(Reg::Rdx, BIN_REF_HEADER)?;
-    buffer.cmp_rr(Reg::Rcx, Reg::Rdx)?;
-    buffer.jcc(Cond::Ne, fallback)?;
+    // (3) `orig` (word 4) is deliberately **not** tested, and the sequence is therefore one
+    // guard group shorter than `raw::writable_append_target`'s clause list. The omitted
+    // clause is `is_refc_binary`'s `is_bin_ref(orig)`, and step (7)'s registry gate subsumes
+    // it for every accumulator this runtime can produce:
+    //
+    // * the registry's only writer is `raw::build_writable_bitstring` (the `bs_init_writable`
+    //   family, `Machine::mark_writable`), which builds a **0-bit refc binary** — an
+    //   `ErlSubBits` over a `BinRef` — and registers *that* payload's first data byte; so an
+    //   accepted `base` implies `orig` is a `BinRef`, and no term this test would reject can
+    //   reach the registry gate and be accepted;
+    // * an `ErlSubBits` that is really a **match context** carries `base_flags == 0`
+    //   (`raw::make_ctx` writes the zero word; `set_ctx_start`/`set_ctx_end` only touch words
+    //   2 and 3), so step (5) refuses it on the null base;
+    // * an `ErlSubBits` windowing an **on-heap** binary carries a process-heap pointer in
+    //   `base_flags`, and no heap block's first word is a registry key: the keys are the
+    //   `RefcBinary::data_ptr()` of payloads this machine allocated, pruned in lockstep with
+    //   `retain_refc_binaries` — so a live key can only name a live payload, whose first byte
+    //   is a different address from any live heap block's;
+    // * nothing else reads `orig`, so dropping the test removes no dereference-safety guard.
+    //
+    // A term the registry refuses takes the same one interpreter step the `orig` test took, so
+    // the observable surface is unchanged; `bs_create_bin_tests` pins both refused forms (a
+    // match context used as the accumulator, and an `ErlSubBits` window over an on-heap
+    // binary) at exactly one interpreter step per tier.
 
     // (4) `start` (word 2) must be `0`: C asserts it for both append forms
     // (`erl_bits.c:1943-1948`), because an in-place append writes at absolute payload offsets.
