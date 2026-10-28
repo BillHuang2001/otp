@@ -142,7 +142,10 @@ const _: () = assert!(NOT_BOXED_MASK == NOT_BOXED_MASK_I32 as i64);
 const PRIMARY_MASK_I32: i32 = PRIMARY_MASK as i32;
 const _: () = assert!(PRIMARY_MASK == PRIMARY_MASK_I32 as i64);
 /// [`POINTER_MASK`] as the `imm32` of [`CodeBuffer::and_ri`].
-const POINTER_MASK_I32: i32 = POINTER_MASK as i32;
+///
+/// Shared with [`super::create`]'s commit/destination phase, which masks a *second* loaded
+/// accumulator in place: one constant, one narrowing assertion, two sites.
+pub(super) const POINTER_MASK_I32: i32 = POINTER_MASK as i32;
 const _: () = assert!(POINTER_MASK == POINTER_MASK_I32 as i64);
 /// [`SUB_BITS_POINTER_MASK`] as the `imm32` of [`CodeBuffer::and_ri`].
 const SUB_BITS_POINTER_MASK_I32: i32 = SUB_BITS_POINTER_MASK as i32;

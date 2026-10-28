@@ -277,7 +277,7 @@ use create_binary::emit_binary_all;
 use create_field::{
     emit_bit_field_store, FieldScratch, MAX_INLINE_FIELD_BITS, PRODUCTION_FIELD_SCRATCH,
 };
-use create_door::emit_append_cursor;
+use create_door::{emit_append_cursor, POINTER_MASK_I32};
 
 // The gold-standard oracle for `emit_bit_field_store`: the sequence is executed for every
 // width, window offset and window end over a byte-pre-filled payload and compared with the
@@ -323,6 +323,11 @@ const MAX_TAIL_BYTES: usize = 256;
 
 /// [`MAX_TAIL_BYTES`] in bits, the form the plan's `tail_bits` is compared against.
 const MAX_TAIL_BITS: u32 = MAX_TAIL_BYTES as u32 * 8;
+
+/// The commit's advance is a register-immediate `add` ([`CodeBuffer::add_ri`], a
+/// sign-extended `imm32`), so the compile-time tail must fit one. A cap that grew past
+/// `i32::MAX` would fail the build here rather than silently truncate the window advance.
+const _: () = assert!(MAX_TAIL_BITS <= i32::MAX as u32);
 
 /// The scratch the `Y` accumulator's up-front guard computes its slot address in, and the
 /// scratch its window bound goes to.
@@ -912,30 +917,45 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         // build's result, and **the only mutation** the sequence performs beyond the payload
         // bytes. (The `binary all` route's commit is inside its helper: its advance is the
         // source's run-time width, not a compile-time constant.)
+        //
+        // One load of the accumulator serves this phase **and** phase (6)'s destination
+        // store: the term goes to `rdx` (kept for the store), the untagged boxed pointer is
+        // masked **in place** out of `rax` (`and rax, -8`, an imm32 form rather than a
+        // `movabs`+`and` pair), and the commit is the one write through it. The old shape
+        // reloaded the accumulator for the destination store and materialised the mask in a
+        // register, i.e. one load and two instructions of pure overhead per append.
         match source {
-            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
-            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
+            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rax, highest_touched)?,
+            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rax, k)?,
         }
-        buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
-        buffer.and_rr(Reg::Rdx, Reg::Rax)?;
-        buffer.mov_rm(Reg::Rcx, Reg::Rdx, SUB_BITS_END_DISP)?;
-        buffer.mov_ri(Reg::Rax, i64::from(shape.tail_bits))?;
-        buffer.add_rr(Reg::Rcx, Reg::Rax)?;
-        buffer.mov_mr(Reg::Rdx, SUB_BITS_END_DISP, Reg::Rcx)?;
+        buffer.mov_rr(Reg::Rdx, Reg::Rax)?;
+        buffer.and_ri(Reg::Rax, POINTER_MASK_I32)?;
+        buffer.mov_rm(Reg::Rcx, Reg::Rax, SUB_BITS_END_DISP)?;
+        // `tail_bits` is bounded by [`MAX_TAIL_BITS`] (the assertion beside it keeps the
+        // `u32 as i32` narrowing provable), so the advance is a register-immediate `add`.
+        buffer.add_ri(Reg::Rcx, shape.tail_bits as i32)?;
+        buffer.mov_mr(Reg::Rax, SUB_BITS_END_DISP, Reg::Rcx)?;
     }
 
     // (6) The accumulator term into the destination — the very word the instruction was
     // given, because the seam proved the build takes the in-place route (`grow`, republish
     // and promotion to the copy-rebuild form all decline). Nothing after this may fail.
+    //
+    // The term is `rdx` on the append routes (phase (5) kept it across the commit) and on
+    // the `binary all` route it is read here, because that helper owns its own commit.
     if let Loc::Y(k) = shape.dst {
         // The window guard already ran and nothing between it and here moved the frame (the
         // helper only reads machine state), so the slot address is re-derived without a
-        // second guard.
+        // second guard. It is derived into `Y_ADDR_SCRATCH`, which the three-instruction
+        // re-derivation writes alone, so `rdx` (the term) and `rax` (the door's answer /
+        // the boxed pointer) survive it.
         emit_y_slot_address(buffer, Y_ADDR_SCRATCH, k)?;
     }
-    match source {
-        Loc::X(_) => source.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
-        Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
+    if shape.binary_all.is_some() {
+        match source {
+            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
+            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
+        }
     }
     shape
         .dst
