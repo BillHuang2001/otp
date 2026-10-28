@@ -28,7 +28,7 @@ allocation pins can derive their budget instead of hard-coding a slack.
 - `pub const NAMES_PER_CHUNK: usize = 128` — names per `NameChunk`; also the `names%` modulus that
   turns an index into `(chunk, slot)`.
 - `pub const INDEX_SHARDS: usize = 1024` — the shard count; **must** be a power of two (a
-  `const` assertion pins it, because `shard_of` masks with `INDEX_SHARDS - 1`). Chosen by the
+  `const` assertion pins it, because `shard_of_hash` masks with `INDEX_SHARDS - 1`). Chosen by the
   boot measurement in the cost model, not by the copy granularity alone: the array it sizes grows
   with `INDEX_SHARDS`, the shard clone it avoids shrinks with it.
 - `NameChunk { names: Vec<Arc<str>> }` — `with_capacity()`, `push(Arc<str>)` (keeps a full chunk's
