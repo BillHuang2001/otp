@@ -77,7 +77,10 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   `line_delim`, the membership pair) and `opt_sys.rs` (everything that reaches
   `setsockopt(2)`/`getsockopt(2)`, incl. `linger`'s `struct linger` shapes, `bind_to_device`, `raw`,
   `pktoptions`, `multicast_if`) — so `prim_inet:accept_opts/3`, the `getopts`+`setopts` pair a
-  `gen_tcp:accept/1` ends in, completes. Every code is byte-compared against the oracle per port
+  `gen_tcp:accept/1` ends in, completes. `send_timeout*` is not a stored-only code:
+  `inet/send_timeout.rs` arms the one-shot per stalled write and its expiry answers the stalled
+  command's issuing caller (`inet/CONTEXT.md` › *The send-timeout path*). Every code is
+  byte-compared against the oracle per port
   state — no socket, open stream, open datagram, post-`close`, bound-and-listening — plus the
   datagram `post-close` twin (`opt_state_tests.rs`/`opt_sys_tests.rs`; `opt_oracle.rs` is the one
   shared harness).
@@ -296,7 +299,7 @@ children for `spawn`, loopback TCP/UDP + `erl`-oracle cross-checks for `inet`. B
 against the C `read_linebuf` cases in `line_buffer.rs`'s in-module suite. The `spawn` suite's
 child-exit and end-of-file waits are **condition-based under a 60 s hang guard**, never a wall-clock
 budget tuned for an idle host (see *Notes for Agents*).
-**Per-module in-module counts (`-p beam_io --lib`): `drivers` 736** — `inet` 612 (per-suite breakdown in `src/drivers/inet/CONTEXT.md`), `ram_file` 34 (23 + the 6 in `ram_file_split_tests.rs` + the 5 in `ram_file_close_tests.rs`), `spawn` 27 (23 + the 4 in `spawn_teardown_tests.rs`), `line_buffer` 24, `fd` 17 (14 + the 3 in `fd_close_tests.rs`), `efile` 13, `binary_io` 9; the crate-wide gate is **1337 passed / 0 failed / 2 ignored over 28 binaries**.
+**Per-module in-module counts (`-p beam_io --lib`): `drivers` 747** — `inet` 623 (per-suite breakdown in `src/drivers/inet/CONTEXT.md`), `ram_file` 34 (23 + the 6 in `ram_file_split_tests.rs` + the 5 in `ram_file_close_tests.rs`), `spawn` 27 (23 + the 4 in `spawn_teardown_tests.rs`), `line_buffer` 24, `fd` 17 (14 + the 3 in `fd_close_tests.rs`), `efile` 13, `binary_io` 9; the crate-wide gate is **1358 passed / 0 failed / 2 ignored over 29 binaries**.
 Each driver's **close-path half is a sibling test module of its own source half** (`super` is the driver module) so the source file stays near its size target:
 - `spawn_teardown_tests.rs` (4) pins the **teardown ordering** over real children and a payload larger than a pipe buffer (512 KiB): `stop` gives the child end of file before anything is killed, a closed port's whole queued command really reaches the child, a child that never reads stdin does not hang the close (the bound, the documented divergence), and the same row cross-checked against the system `erl` (`erl` absent ⇒ skips **loudly**); every wait polls a condition under the 60 s hang guard.
 - `fd_close_tests.rs` (3) pins an `FdDriver` close over a real `UnixStream::pair`: a short write parks the close **before** `stop` (the parked port still owns its write fd), the parked remainder is delivered in full by the rounds, and `a_command_queued_before_a_close_is_written_by_the_close` pins the writing that the inherited default `flush` leaves alone. Hermetic (no `cc`, no `erl`, no child).
