@@ -135,19 +135,3 @@ pub(crate) fn named_port_monitor() -> BeamError {
 pub(crate) fn unsupported_port_monitor_alias() -> BeamError {
     unsupported("monitor/3: {alias, Mode} on a port monitor (the DOWN and reply paths hold no port table)")
 }
-
-/// The typed diagnostic for an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is **not**
-/// heap-independent.
-///
-/// A monitor record is a **plain value** the collector never scans (see `monitor.rs`), so a tag
-/// term resident in a per-process heap could not be relocated and would dangle after a
-/// collection. Two shapes are accepted: an **immediate** (an atom, small integer, local pid/port,
-/// `nil`) and a **literal-area** term (shared, frozen and never relocated). Only a *heap-resident*
-/// boxed/list term is refused here, rather than silently stored as a word that a later collection
-/// invalidates.
-pub(crate) fn unsupported_tag() -> BeamError {
-    unsupported(concat!(
-        "monitor/3: tag must be an immediate (atom/integer/pid/port) or a literal-area term",
-        " (a heap-resident term cannot be stored)"
-    ))
-}

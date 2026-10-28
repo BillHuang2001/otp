@@ -98,10 +98,8 @@ use std::collections::{HashMap, VecDeque};
 use beam_alloc::Heap;
 use beam_common::{AllocFailure, AllocKind, BeamError, Result};
 use beam_gc::HeapPolicy;
-use beam_message::{Fragments, HeapFragment, Message, OffHeapTable};
-use beam_term::prelude::{
-    atom_val, is_atom, is_boxed_term, is_immediate, is_list, is_literal, make_atom, Atom, Eterm,
-};
+use beam_message::{Fragments, Message, OffHeapTable};
+use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
 
 use crate::error;
 use crate::exit_observer::{ProcessExit, ProcessExitObserver};
@@ -124,6 +122,7 @@ use crate::signal::{
     ExitPolicy, ExitSignal, ReceiveApplicability, SignalAtoms,
 };
 use crate::signal_queue::PendingSignal;
+use crate::tag::{copy_into_fragment, refused_words, stage_sources, StagedSources, TagSlot};
 
 /// The outcome of applying an exit signal to a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -309,7 +308,9 @@ where
             if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
         {
             if recipient.has_unpublished_roots() || decline {
-                return enqueue_fragment_signal(recipient, from, reason, &mut build);
+                // No user tag reaches this route (`enqueue_down_message` handles a tagged DOWN
+                // itself), so the payload's only graph root is the reason.
+                return enqueue_fragment_payload(recipient, from, reason, None, None, &mut build);
             }
             grow_receiver_for_signal(recipient, failure, decline)?;
             let term = build(recipient.heap_mut(), reason)?;
@@ -343,19 +344,6 @@ const EXIT_ENVELOPE_WORDS: usize = 4;
 /// 4-word boxed [`MonitorRef`] ([`MonitorRef::to_eterm`]) plus, for a named monitor, a `{Name, Node}`
 /// pair (4 words) in place of the target.
 const DOWN_ENVELOPE_WORDS: usize = 16;
-
-/// The word count a message-heap refusal reports, when its byte figure is a whole (nonzero) number
-/// of term words — `None` for any other figure.
-///
-/// The `AllocKind::Message` figure is the copier's **exact destination price** in bytes: the copy
-/// preflights the whole graph in one walk and refuses with that count
-/// (`beam_message::error::heap_exhausted`). The conversion is the same one `beam_message`'s private
-/// `refused_words` makes for its own fragmenting send path.
-fn refused_words(requested_bytes: usize) -> Option<usize> {
-    let word = core::mem::size_of::<Eterm>();
-    let words = requested_bytes / word;
-    (words > 0 && requested_bytes % word == 0).then_some(words)
-}
 
 /// The destination price, in words, of the payload a refusal refused — or `None` when the refusal
 /// carries no such price.
@@ -418,27 +406,12 @@ where
     // payload around it on a scratch arena, then copy the whole graph in one go.
     let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
     let payload = build(&mut scratch, reason)?;
-    let mut capacity = held_words.map_or(SIGNAL_FRAGMENT_FLOOR_WORDS, |words| {
-        words.saturating_add(FRAGMENT_SLACK_WORDS)
-    });
+    let start = held_words.map(|words| words.saturating_add(FRAGMENT_SLACK_WORDS));
     // `copy_struct` walks the graph by pointer, so the heap-resident `reason` subtree is copied
-    // in too; the source process's persistent off-heap table resolves its refc binaries/MSO.
+    // in too; the source process's persistent off-heap table resolves its refc binaries/MSO, and
+    // the copy's own refusal re-reserves the fragment monotonically.
     let src = src_off_heap.unwrap_or_else(|| recipient.off_heap());
-    let (fragment, root) = loop {
-        let mut candidate = HeapFragment::new(capacity)?;
-        match candidate.copy_root(payload, src) {
-            Ok(root) => break (candidate, root),
-            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
-                match refused_words(failure.requested) {
-                    // The copy priced the payload exactly: reserve that and retry (strictly larger,
-                    // so the loop terminates at the true price).
-                    Some(words) if words > capacity => capacity = words,
-                    _ => return Err(BeamError::Alloc(failure)),
-                }
-            }
-            Err(other) => return Err(other),
-        }
-    };
+    let (fragment, root) = copy_into_fragment(payload, src, start)?;
     let mut fragments = Fragments::new();
     fragments.push(fragment);
     recipient
@@ -454,15 +427,20 @@ fn enqueue_fragment_signal<F>(
     recipient: &mut Process,
     from: Eterm,
     reason: Eterm,
+    tag: Option<Eterm>,
     build: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
+    F: FnMut(&mut Heap, Eterm, Option<Eterm>) -> Result<Eterm>,
 {
     // No held price here: the build refused on one bumped allocation of the receiver's own heap
     // rather than on a copy of the payload, so the reservation starts at the floor and the copy's
-    // own refusal re-reserves it exactly.
-    enqueue_fragment_payload(recipient, from, reason, None, None, build)
+    // own refusal re-reserves it exactly. `tag` is the queued signal's tag — already a word on the
+    // receiver's own heap (the apply-time form; see `materialise_tag_onto`), so it travels with the
+    // reason through the same pointer-walking copy.
+    enqueue_fragment_payload(recipient, from, reason, None, None, &mut |heap, reason| {
+        build(heap, reason, tag)
+    })
 }
 
 /// Copies `reason` — whose heap is described by `src_off_heap` — into `process`'s own heap,
@@ -513,39 +491,147 @@ fn copy_reason_onto(
     }
 }
 
-/// Whether `term` may be stored in a `{tag, Tag}` side table: it must be **heap-independent**.
+/// The [`TagSlot`] for an `erlang:monitor/3` `{tag, Tag}` option — the **ownership transfer** at
+/// the table boundary, where the raw [`MonitorOptions::tag`] word (a `Copy` option set the host
+/// builds by field assignment) becomes a record the monitor owns.
 ///
-/// Two shapes qualify (see `monitor.rs`'s user-tag contract):
+/// A `None` option allocates nothing, an immediate/literal-area tag is stored verbatim, and any
+/// other shape is copied into the slot's own heap fragment (`src` is the **watcher's** off-heap
+/// table: the tag lives in the watcher's young heap, whose refc binaries the copy resolves and
+/// re-registers in the slot's table — see [`crate::tag`]).
 ///
-/// * an **immediate** — an atom, a small integer, a local pid/port, `nil` — which carries no
-///   pointer at all;
-/// * a term resident in a **literal area** — shared, frozen and never relocated, so the word
-///   stays valid for the life of the runtime.
+/// Built **before** any table mutation, so a failed allocation leaves no partial monitor behind.
 ///
-/// Everything else (a boxed/list word on some process heap) is refused: the side table holds
-/// plain values the collector never scans, so such a word could not be relocated and would
-/// dangle after a collection.
+/// # Errors
 ///
-/// [`is_literal`] is a plain `TAG_LITERAL_PTR` bit test, which its own doc restricts to
-/// BOXED/LIST words (an immediate's payload bits are unrelated to it), so it is guarded by the
-/// pointer-tag test — exactly the `is_boxed(x) || is_list(x)` guard the C's
-/// `erts_set_literal_tag` trailing rule uses.
-fn is_heap_independent(term: Eterm) -> bool {
-    is_immediate(term) || ((is_boxed_term(term) || is_list(term)) && is_literal(term))
+/// Returns `BeamError::TermNotFound` when the watcher is unknown; propagates the fragment's own
+/// `BeamError::Alloc` when the tag cannot be copied.
+fn monitor_tag_slot(
+    table: &ProcessTable,
+    watcher: ProcessId,
+    tag: Option<Eterm>,
+) -> Result<Option<TagSlot>> {
+    let Some(term) = tag else {
+        return Ok(None);
+    };
+    let watcher = table.get(watcher).ok_or_else(error::unknown_process)?;
+    Ok(Some(TagSlot::new(term, watcher.off_heap())?))
 }
 
-/// Validates an `erlang:monitor/3` `{tag, Tag}` user tag.
+/// Copies a monitor's fragment-backed user tag `tag` onto `recipient`'s **own** young heap, which
+/// is the only form the queued [`PendingSignal::Down`] may carry: that slot is an **in-heap
+/// sub-rootset** the collector gathers and scatters, so a fragment-resident word would be
+/// relocated against the wrong off-heap table (see `crate::tag`).
 ///
-/// `None` (no option) and a **heap-independent** tag — an immediate, or a term resident in a
-/// literal area ([`is_heap_independent`]) — pass through unchanged. A term resident in a
-/// per-process heap is refused with the typed [`error::unsupported_tag`]: a monitor record is a
-/// plain value the collector never scans, so it could not keep such a word valid across a
-/// collection, and a later `{'DOWN', …}` would carry a dangling tag.
-fn check_tag(tag: Option<Eterm>) -> Result<Option<Eterm>> {
-    match tag {
-        None => Ok(None),
-        Some(term) if is_heap_independent(term) => Ok(Some(term)),
-        Some(_) => Err(error::unsupported_tag()),
+/// A receiver whose heap must not move — relocation-exempt/`Running`
+/// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)), or one the
+/// host's [`CollectionGate`] declines (`decline`) — is refused unchanged, with **no** collection
+/// and **no** growth; the caller then builds the whole DOWN into a message heap fragment.
+///
+/// Otherwise a full nursery is **grown in place** ([`Process::grow_nursery`], which never
+/// relocates): the caller has already materialised the DOWN's `reason` on that heap by the time
+/// this runs, so a collect-and-retry here would dangle it.
+fn materialise_tag_onto(
+    recipient: &mut Process,
+    tag: &TagSlot,
+    decline: bool,
+) -> Result<Eterm> {
+    match tag.copy_into_heap(recipient) {
+        Ok(word) => Ok(word),
+        Err(BeamError::Alloc(failure))
+            if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+        {
+            if recipient.has_unpublished_roots() || decline {
+                return Err(BeamError::Alloc(failure));
+            }
+            let need_words = failure.requested / core::mem::size_of::<Eterm>();
+            // The growth's own error is deliberately ignored, exactly as `Process::deliver`
+            // documents: a policy ceiling makes the request unreachable, `grow_nursery` fails
+            // fail-fast without touching the collector, and the retry below reproduces the refusal
+            // (which is authoritative).
+            let _growth = recipient.grow_nursery(need_words);
+            tag.copy_into_heap(recipient)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Enqueues a `{'DOWN', …}`/`{Tag, …}` payload built by `build` into `recipient`'s mailbox —
+/// the **mailbox** half of the DOWN routes ([`ProcessTable::deliver_noproc_down`],
+/// [`ProcessTable::deliver_named_noproc_down`],
+/// [`ProcessTable::enqueue_port_down_message`]), which materialise straight into the mailbox
+/// rather than through the signal queue.
+///
+/// `build` receives the head word — the monitor's user tag when it has one, else `None` (the
+/// caller's builder then uses the `'DOWN'` atom) — and the reason.
+///
+/// # Two routes, chosen by the tag's ownership
+///
+/// * **No tag, an immediate or a literal-area tag** — nothing to transfer: the word is embedded
+///   verbatim through [`build_signal_message`] (the long-standing route, allocation-free for the
+///   tag itself).
+/// * **A heap-resident tag** — the tag lives in its [`TagSlot`]'s own heap fragment, so it is not
+///   a word any other heap may embed. The tag and the reason are first **staged** together on one
+///   scratch arena with **one merged** off-heap table ([`stage_sources`]; a copy resolves off-heap
+///   references against exactly one table, so the merge is what lets a tag carrying a refc binary
+///   travel with a reason from another heap), then the whole payload is moved onto the recipient's
+///   heap through [`copy_reason_onto`] — the same collect-grow-retry policy every other signal
+///   build uses. When that transfer is refused (a relocation-exempt/`Running` recipient, or the
+///   host's [`CollectionGate`]) the **whole** DOWN is copied into the message's own
+///   [`HeapFragment`](beam_message::HeapFragment) instead, from that same merged table: no
+///   collection, no growth, no heap relocation.
+fn enqueue_down_message<F>(
+    recipient: &mut Process,
+    from: Eterm,
+    reason: Eterm,
+    src: Option<&OffHeapTable>,
+    tag: Option<TagSlot>,
+    decline: bool,
+    mut build: F,
+) -> Result<()>
+where
+    F: FnMut(&mut Heap, Option<Eterm>, Eterm) -> Result<Eterm>,
+{
+    let tag = match tag {
+        Some(slot) if slot.is_fragment_backed() => slot,
+        _ => {
+            let word = tag.as_ref().map(TagSlot::root);
+            return build_signal_message(recipient, from, reason, src, decline, |heap, reason| {
+                build(heap, word, reason)
+            });
+        }
+    };
+    let reason_src = src.unwrap_or_else(|| recipient.off_heap());
+    let StagedSources {
+        mut scratch,
+        table,
+        tag: tag_word,
+        reason: reason_word,
+    } = stage_sources(Some(&tag), reason, reason_src, DOWN_ENVELOPE_WORDS)?;
+    let payload = build(&mut scratch, tag_word, reason_word)?;
+    match copy_reason_onto(recipient, payload, Some(&table), decline) {
+        // Nothing runs between the copy and the enqueue, so the copied word is live when the
+        // message takes it.
+        Ok(owned) => {
+            recipient.mailbox_mut().enqueue(Message::new(owned, from));
+            Ok(())
+        }
+        Err(BeamError::Alloc(failure))
+            if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+        {
+            // The refusal's own figure is this payload's destination price (the copy that refused
+            // *was* a copy of it), so the fragment is reserved straight from it — and re-reserved
+            // monotonically by the copy itself if it is only a lower bound.
+            let (fragment, root) =
+                copy_into_fragment(payload, &table, refused_payload_words(failure))?;
+            let mut fragments = Fragments::new();
+            fragments.push(fragment);
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(root, from).with_fragments(fragments));
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -562,8 +648,11 @@ fn check_tag(tag: Option<Eterm>) -> Result<Option<Eterm>> {
 /// caller's job, exactly as the atom-to-[`MonitorKind`] parse is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MonitorOptions {
-    /// The `{tag, Tag}` user tag that replaces the `'DOWN'` head atom (see `monitor.rs`'s
-    /// user-tag contract: it must be heap-independent — an immediate or a literal-area term).
+    /// The `{tag, Tag}` user tag that replaces the `'DOWN'` head atom. **Any** term shape is
+    /// accepted: the option is a plain `Copy` word the host hands down, and the table takes
+    /// ownership of it at the monitor boundary — an immediate or a literal-area term is stored
+    /// verbatim (no allocation), every other shape is copied into the monitor's own heap fragment
+    /// and released with the monitor (see `crate::tag`).
     pub tag: Option<Eterm>,
     /// The `{alias, Mode}` option: when `Some`, the monitor's own reference **doubles as an
     /// alias** for the watcher, so a message sent to it is delivered to the watcher and it
@@ -610,17 +699,24 @@ fn forget_alias(aliases: &mut HashMap<MonitorRef, AliasEntry>, reference: Monito
 /// Remembers `reference`'s `erlang:monitor/3` user tag, if it has one.
 ///
 /// Only a supplied tag is stored — an untagged monitor leaves no entry, so a lookup answering
-/// `None` means the default `'DOWN'` head atom (see `monitor.rs`'s user-tag contract). The
-/// stored term has passed [`check_tag`], so it is heap-independent (an immediate or a
-/// literal-area term).
-fn remember_tag(tags: &mut HashMap<MonitorRef, Eterm>, reference: MonitorRef, tag: Option<Eterm>) {
+/// `None` means the default `'DOWN'` head atom (see `monitor.rs`'s user-tag contract and
+/// [`crate::tag`]). The stored [`TagSlot`] **owns** the tag (an immediate/literal-area word
+/// verbatim, any other shape as an independent copy in the slot's own heap fragment), so the tag
+/// is on no process heap — the collector neither scans nor relocates it — and forgetting the entry
+/// releases it.
+fn remember_tag(
+    tags: &mut HashMap<MonitorRef, TagSlot>,
+    reference: MonitorRef,
+    tag: Option<TagSlot>,
+) {
     if let Some(tag) = tag {
         tags.insert(reference, tag);
     }
 }
 
-/// Forgets `reference`'s user tag — its monitor is gone, so the entry must not linger.
-fn forget_tag(tags: &mut HashMap<MonitorRef, Eterm>, reference: MonitorRef) {
+/// Forgets `reference`'s user tag — its monitor is gone, so the entry must not linger (dropping
+/// the slot releases the tag's fragment and refcounts its off-heap references down).
+fn forget_tag(tags: &mut HashMap<MonitorRef, TagSlot>, reference: MonitorRef) {
     tags.remove(&reference);
 }
 
@@ -684,17 +780,22 @@ pub struct ProcessTable {
     /// dying holder's outgoing-monitor sweep and a delivered DOWN all remove it.
     named_monitors: HashMap<MonitorRef, NamedTarget>,
     /// The `erlang:monitor/3` `{tag, Tag}` **user tag** of every tagged monitor, keyed by its
-    /// reference.
+    /// reference, as a [`TagSlot`] — the monitor's **ownership** of the tag.
     ///
     /// A tag cannot be a field of [`Monitor`]/[`MonitoredBy`]/[`PortWatch`] — those are built by
     /// struct literal from other crates, so their shape is fixed — and it is kept here instead,
     /// exactly like [`NamedTarget`] (see `monitor.rs`'s user-tag contract). An entry is created
-    /// only when a tag is supplied, holds a **heap-independent** term — an immediate or a
-    /// literal-area term (so it is not a GC root and never needs relocating) — and is removed the
-    /// moment its monitor dies —
+    /// only when a tag is supplied and is removed the moment its monitor dies —
     /// `demonitor`/`demonitor_flush`, the terminated target's watcher sweep, `demonitor_port` and
     /// `port_closed` — so it cannot leak.
-    tags: HashMap<MonitorRef, Eterm>,
+    ///
+    /// The slot is what makes **every** term shape an accepted tag (the C's
+    /// `mk_heap_frag_eterm`/`save_heap_frag_eterm`, `erl_monitor_link.c:833-900,1130-1160`): an
+    /// immediate or literal-area term is stored verbatim (no allocation, and it is not a GC root),
+    /// while any other shape is copied into the slot's own [`HeapFragment`] — an independent copy
+    /// on **no** process heap, so the collector neither scans nor relocates it, and it is released
+    /// with the monitor. `crate::tag` owns that model; nothing here interprets the word.
+    tags: HashMap<MonitorRef, TagSlot>,
     /// The live **reference aliases** (`erlang:alias/1` and the `erlang:monitor/3`
     /// `{alias, Mode}` option), keyed by the alias reference, holding which process a message sent
     /// to the reference is delivered to and the mode that expires it.
@@ -1516,14 +1617,15 @@ impl ProcessTable {
     /// [`ProcessTable::monitor`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
     /// eventual `{'DOWN', Ref, Kind, Target, Reason}` becomes `{Tag, Ref, Kind, Target, Reason}`.
     ///
-    /// `tag = None` reproduces [`ProcessTable::monitor`] byte-for-byte. A tag that is not
-    /// heap-independent (an immediate or a literal-area term — see `monitor.rs`'s user-tag
-    /// contract) is refused with the typed [`error::unsupported_tag`] rather than stored as a
-    /// word a collection could invalidate.
+    /// `tag = None` reproduces [`ProcessTable::monitor`] byte-for-byte. The tag may be **any**
+    /// term: it is copied into the monitor's own heap fragment at creation (`crate::tag`), so it
+    /// is an independent copy on no process heap, is released with the monitor, and the DOWN
+    /// carries it as its head element.
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a heap-resident tag.
+    /// As [`ProcessTable::monitor`], plus the fragment's `BeamError::Alloc` when a heap-resident
+    /// tag cannot be copied.
     pub fn monitor_with_tag(
         &mut self,
         watcher: ProcessId,
@@ -1550,7 +1652,8 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a heap-resident tag.
+    /// As [`ProcessTable::monitor`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied.
     pub fn monitor_with_options(
         &mut self,
         watcher: ProcessId,
@@ -1558,10 +1661,12 @@ impl ProcessTable {
         kind: MonitorKind,
         options: MonitorOptions,
     ) -> Result<MonitorRef> {
+        // The tag's ownership transfer comes first: a failed allocation must leave no partial
+        // monitor (no alias, no reference, no record) behind.
+        let tag = monitor_tag_slot(self, watcher, options.tag)?;
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
-        let tag = check_tag(options.tag)?;
         let reference = self.refs.next();
         remember_alias(&mut self.aliases, reference, watcher, options.alias);
         if !self.contains(target) {
@@ -1595,10 +1700,10 @@ impl ProcessTable {
     /// Enqueues the immediate `{'DOWN', Ref, process, Target, noproc}` of a monitor on a
     /// non-live target into `watcher`'s mailbox and wakes a blocked watcher.
     ///
-    /// When `tag` is `Some`, the head atom is the caller's user tag instead of `'DOWN'`
-    /// (the `erlang:monitor/3` form). Mirrors
+    /// When `tag` is `Some`, the head word is the monitor's `erlang:monitor/3` **user tag** instead
+    /// of the `'DOWN'` atom (the `erlang:monitor/3` form). Mirrors
     /// [`ProcessTable::enqueue_port_down_message`]: the build goes through
-    /// [`build_signal_message`] (so a full heap is a collection and a retry — or, for a
+    /// [`enqueue_down_message`] (so a full heap is a collection and a retry — or, for a
     /// **relocation-exempt**/`Running` watcher or one the host's [`CollectionGate`] declines, a
     /// heap fragment — never fatal) and the wake is recorded on
     /// the wake list. `target` must be an immediate (a pid term; the named form materialises its
@@ -1610,7 +1715,7 @@ impl ProcessTable {
         watcher: ProcessId,
         reference: MonitorRef,
         target: Eterm,
-        tag: Option<Eterm>,
+        tag: Option<TagSlot>,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let reason = atoms.noproc_term();
@@ -1618,7 +1723,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, target, reason, None, decline, |heap, reason| {
+        enqueue_down_message(recipient, target, reason, None, tag, decline, |heap, tag, reason| {
             let reference_term = reference.to_eterm(heap)?;
             build_down_message_term(
                 heap,
@@ -1645,9 +1750,9 @@ impl ProcessTable {
     /// Enqueues the immediate `{'DOWN', Ref, process, {Name, Node}, noproc}` of a **named**
     /// monitor on an unregistered name into `watcher`'s mailbox, and wakes a blocked watcher.
     ///
-    /// When `tag` is `Some`, the head atom is the caller's user tag instead of `'DOWN'`.
-    /// The `{Name, Node}` target is materialised *inside* the [`build_signal_message`] closure, on
-    /// whichever heap (the watcher's, or a fragment's scratch arena) the closure is handed, so a
+    /// When `tag` is `Some`, the head word is the monitor's **user tag** instead of `'DOWN'`.
+    /// The `{Name, Node}` target is materialised *inside* the [`enqueue_down_message`] closure, on
+    /// whichever heap (the watcher's, a scratch arena, or a fragment's) the closure is handed, so a
     /// collect-and-retry never leaves a stale word behind.
     ///
     /// The message's **`from`** is the `system` atom — an immediate — exactly as the C stores
@@ -1659,7 +1764,7 @@ impl ProcessTable {
         reference: MonitorRef,
         name: Atom,
         node: Atom,
-        tag: Option<Eterm>,
+        tag: Option<TagSlot>,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let reason = atoms.noproc_term();
@@ -1668,7 +1773,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, None, decline, |heap, reason| {
+        enqueue_down_message(recipient, from, reason, None, tag, decline, |heap, tag, reason| {
             let reference_term = reference.to_eterm(heap)?;
             let target = heap.tuple(&[make_atom(name), make_atom(node)])?;
             build_down_message_term(
@@ -1736,13 +1841,13 @@ impl ProcessTable {
 
     /// [`ProcessTable::monitor_named`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**.
     ///
-    /// `tag = None` reproduces [`ProcessTable::monitor_named`] byte-for-byte; a heap-resident
-    /// tag is the typed [`error::unsupported_tag`] (see `monitor.rs`'s user-tag contract).
+    /// `tag = None` reproduces [`ProcessTable::monitor_named`] byte-for-byte; the tag may be any
+    /// term (see [`ProcessTable::monitor_with_tag`]).
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a heap-resident
-    /// tag.
+    /// As [`ProcessTable::monitor_named`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied.
     pub fn monitor_named_with_tag(
         &mut self,
         watcher: ProcessId,
@@ -1762,8 +1867,8 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a heap-resident
-    /// tag.
+    /// As [`ProcessTable::monitor_named`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied.
     pub fn monitor_named_with_options(
         &mut self,
         watcher: ProcessId,
@@ -1772,6 +1877,8 @@ impl ProcessTable {
         kind: MonitorKind,
         options: MonitorOptions,
     ) -> Result<MonitorRef> {
+        // The tag's ownership transfer comes first (see `monitor_with_options`).
+        let tag = monitor_tag_slot(self, watcher, options.tag)?;
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
@@ -1782,7 +1889,6 @@ impl ProcessTable {
             // honest answer.
             return Err(error::named_port_monitor());
         }
-        let tag = check_tag(options.tag)?;
         let reference = self.refs.next();
         remember_alias(&mut self.aliases, reference, watcher, options.alias);
         // `whereis` already resolves "registered but its process is gone" to `None`.
@@ -1846,13 +1952,13 @@ impl ProcessTable {
     /// [`ProcessTable::monitor_port`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
     /// eventual `{'DOWN', Ref, port, Port, Reason}` becomes `{Tag, Ref, port, Port, Reason}`.
     ///
-    /// `tag = None` reproduces [`ProcessTable::monitor_port`] byte-for-byte; a heap-resident tag
-    /// is the typed [`error::unsupported_tag`] (see `monitor.rs`'s user-tag contract).
+    /// `tag = None` reproduces [`ProcessTable::monitor_port`] byte-for-byte; the tag may be any
+    /// term (see [`ProcessTable::monitor_with_tag`]).
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a heap-resident
-    /// tag.
+    /// As [`ProcessTable::monitor_port`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied.
     pub fn monitor_port_with_tag(
         &mut self,
         watcher: ProcessId,
@@ -1879,8 +1985,9 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a heap-resident tag
-    /// and [`error::unsupported_port_monitor_alias`] for an `{alias, Mode}` option.
+    /// As [`ProcessTable::monitor_port`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied, and [`error::unsupported_port_monitor_alias`] for an
+    /// `{alias, Mode}` option.
     pub fn monitor_port_with_options(
         &mut self,
         watcher: ProcessId,
@@ -1888,6 +1995,8 @@ impl ProcessTable {
         ports: &mut PortTable,
         options: MonitorOptions,
     ) -> Result<MonitorRef> {
+        // The tag's ownership transfer comes first (see `monitor_with_options`).
+        let tag = monitor_tag_slot(self, watcher, options.tag)?;
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
@@ -1896,7 +2005,6 @@ impl ProcessTable {
             // resolved faithfully (a later `port_closed` would deliver a spurious DOWN).
             return Err(error::unsupported_port_monitor_alias());
         }
-        let tag = check_tag(options.tag)?;
         let reference = self.refs.next();
         if !ports.contains(port) {
             // Nothing to watch: the port is already gone. Tell the watcher right away and
@@ -1941,8 +2049,8 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_port_term`], plus [`error::unsupported_tag`] for a
-    /// heap-resident tag.
+    /// As [`ProcessTable::monitor_port_term`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied.
     pub fn monitor_port_term_with_tag(
         &mut self,
         watcher: ProcessId,
@@ -1960,8 +2068,8 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_port_term`], plus [`error::unsupported_tag`] and
-    /// [`error::unsupported_port_monitor_alias`].
+    /// As [`ProcessTable::monitor_port_term`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied, and [`error::unsupported_port_monitor_alias`].
     pub fn monitor_port_term_with_options(
         &mut self,
         watcher: ProcessId,
@@ -2565,9 +2673,9 @@ impl ProcessTable {
         }
 
         // 2. Monitors: every watcher is told the target is down, carrying the monitor's
-        //    `erlang:monitor/3` user tag when it has one. The records hold no tag field, so it is
-        //    read from the side table; the DOWN that consumes it is its last use, so the entry is
-        //    dropped as soon as the signal is queued.
+        //    `erlang:monitor/3` user tag when it has one. The records hold no tag field, so its
+        //    [`TagSlot`] is **taken out** of the side table (the DOWN that consumes it is its last
+        //    use, so this is the slot's final holder and dropping it releases the tag's fragment).
         //
         //    The watcher's **outgoing** record goes too: the oracle resolves both halves when the
         //    target's death is signalled, so `erlang:process_info(W, monitors)` stops listing the
@@ -2582,7 +2690,7 @@ impl ProcessTable {
                 // The watcher died earlier in this same propagation.
                 continue;
             }
-            let tag = self.tags.get(&watcher.reference).copied();
+            let tag = self.tags.remove(&watcher.reference);
             let queued = match self.enqueue_down_signal(
                 watcher.watcher,
                 watcher.reference,
@@ -2610,7 +2718,6 @@ impl ProcessTable {
                     false
                 }
             };
-            forget_tag(&mut self.tags, watcher.reference);
             // The monitor is resolved, so its `{alias, Mode}` alias follows the DOWN-site rule:
             // `demonitor`/`reply_demonitor` expire with their monitor, while an
             // `explicit_unalias` alias survives as a standalone alias (the C replaces the monitor
@@ -2977,10 +3084,9 @@ impl ProcessTable {
                 reference,
                 target,
                 kind,
-                tag,
                 ..
             } => {
-                self.deliver_down_message(pid, reference, target, kind, tag)?;
+                self.deliver_down_message(pid, reference, target, kind)?;
                 Ok(true)
             }
         }
@@ -2997,6 +3103,14 @@ impl ProcessTable {
             .signals()
             .peek()
             .map(PendingSignal::reason)
+    }
+
+    /// The `erlang:monitor/3` user tag of the signal at the head of `pid`'s queue, if any — a word
+    /// on `pid`'s **own** heap (the enqueue-time materialisation; see `materialise_tag_onto`), so a
+    /// collection relocates it alongside the head signal's reason and it must be re-read per
+    /// delivery attempt, never cached across one.
+    fn head_signal_tag(&self, pid: ProcessId) -> Option<Eterm> {
+        lookup(&self.slots, pid)?.signals().peek()?.tag()
     }
 
     /// Removes the signal at the head of `pid`'s queue.
@@ -3043,7 +3157,7 @@ impl ProcessTable {
     /// signal is removed and a blocked `pid` is woken (and recorded on the wake list).
     fn deliver_head_signal<F>(&mut self, pid: ProcessId, from: Eterm, mut build: F) -> Result<()>
     where
-        F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
+        F: FnMut(&mut Heap, Eterm, Option<Eterm>) -> Result<Eterm>,
     {
         // Read once, before the delivery loop: the gate is consulted before the recipient borrow
         // is taken (it needs `&mut self`), and the decline is stable for this one delivery.
@@ -3054,10 +3168,13 @@ impl ProcessTable {
                 // The queue emptied (or the process is gone): nothing to deliver.
                 return Ok(());
             };
+            // The queued signal's tag is an in-heap sub-rootset too, so a collection relocates it
+            // alongside the reason: both are re-read on every attempt.
+            let tag = self.head_signal_tag(pid);
             let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
                 return Ok(());
             };
-            match build(recipient.heap_mut(), reason) {
+            match build(recipient.heap_mut(), reason, tag) {
                 Ok(term) => {
                     recipient.mailbox_mut().enqueue(Message::new(term, from));
                     break;
@@ -3069,7 +3186,7 @@ impl ProcessTable {
                     if recipient.has_unpublished_roots() || decline {
                         // The heap must not move under the live terms the root set does not carry,
                         // nor under a receiver whose collection the host declined.
-                        enqueue_fragment_signal(recipient, from, reason, &mut build)?;
+                        enqueue_fragment_signal(recipient, from, reason, tag, &mut build)?;
                         break;
                     }                    // A collection relocates the queued reason word: re-read it next iteration.
                     grow_receiver_for_signal(recipient, failure, decline)?;
@@ -3096,7 +3213,7 @@ impl ProcessTable {
     fn deliver_trapped_exit(&mut self, pid: ProcessId, from: ProcessId) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let from_term = from.to_eterm();
-        self.deliver_head_signal(pid, from_term, move |heap, reason| {
+        self.deliver_head_signal(pid, from_term, move |heap, reason, _tag| {
             build_exit_message(heap, &atoms, from, reason)
         })
     }
@@ -3112,13 +3229,17 @@ impl ProcessTable {
     /// ([`ProcessId::to_eterm`]): the C requires `is_immed(ERL_MESSAGE_FROM(mp))`
     /// (`erl_proc_sig_queue.c:8441`), and a `{Name, node}`/external-pid target belongs in the
     /// message **body**, never in `from` — which is not a GC root.
+    ///
+    /// The `erlang:monitor/3` user tag comes from the queued signal itself
+    /// ([`ProcessTable::head_signal_tag`]), re-read inside the build closure on every attempt: the
+    /// tag word lives on `pid`'s own heap, so a collection relocates it (see
+    /// [`ProcessTable::deliver_head_signal`]).
     fn deliver_down_message(
         &mut self,
         pid: ProcessId,
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
-        tag: Option<Eterm>,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let named = self.named_monitors.get(&reference).copied();
@@ -3127,7 +3248,7 @@ impl ProcessTable {
             MonitorKind::Port => atoms.port(),
         };
         let from_term = target.to_eterm();
-        self.deliver_head_signal(pid, from_term, move |heap, reason| {
+        self.deliver_head_signal(pid, from_term, move |heap, reason, tag| {
             let reference_term = reference.to_eterm(heap)?;
             let target_term = match named {
                 Some(nt) => heap.tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
@@ -3220,13 +3341,21 @@ impl ProcessTable {
 
     /// Enqueues a monitor-DOWN signal on `to`'s signal queue, copying `reason` out of the heap
     /// described by `src` (see [`ProcessTable::enqueue_exit_signal`]). `tag` is the monitor's
-    /// `erlang:monitor/3` user tag — read from the side table by the caller, since the records
-    /// carry none — and is a heap-independent immediate, carried verbatim.
+    /// `erlang:monitor/3` user tag — taken out of the side table by the caller, since the records
+    /// carry none — and it is **materialised on the receiver's own heap** here, because the queued
+    /// signal's tag slot is an in-heap sub-rootset the collector gathers and scatters
+    /// ([`materialise_tag_onto`]). Only a receiver-heap word is ever stored in it.
+    ///
+    /// Order matters: the **reason** is copied first (its collect-grow-retry is safe there, since
+    /// nothing of ours is on the receiver's heap yet), then the tag, which is only ever **grown**
+    /// into place and never triggers a collection — a collection at that point would dangle the
+    /// reason word just materialised.
     ///
     /// A `to` whose live terms are not all in the crate root set
     /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) **or**
     /// whose relocating collection the host's [`CollectionGate`] declines, and whose
-    /// full nursery refuses that copy, cannot hold the queued signal at all (see
+    /// full nursery refuses the reason copy — or whose nursery cannot take the tag without
+    /// relocating — cannot hold the queued signal at all (see
     /// [`ProcessTable::enqueue_exit_signal`]), so the DOWN is built into a heap fragment instead
     /// ([`ProcessTable::deliver_down_fragment`]) — a DOWN carries no exit policy, so it is the whole
     /// signal.
@@ -3236,7 +3365,7 @@ impl ProcessTable {
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
-        tag: Option<Eterm>,
+        tag: Option<TagSlot>,
         reason: Eterm,
         src: Option<&OffHeapTable>,
     ) -> Result<()> {
@@ -3244,33 +3373,59 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        // Read before the copy: the fragment route below needs `self` again, and `recipient`'s
+        // Read before the copies: the fragment route below needs `self` again, and `recipient`'s
         // borrow must be over by then.
         let refuses_collect = recipient.has_unpublished_roots() || decline;
-        match copy_reason_onto(recipient, reason, src, decline) {
-            Ok(reason) => {
-                recipient
-                    .signals_mut()
-                    .push(PendingSignal::down(reference, target, kind, tag, reason));
-                Ok(())
-            }
+        let reason = match copy_reason_onto(recipient, reason, src, decline) {
+            Ok(reason) => reason,
             Err(BeamError::Alloc(failure))
                 if refuses_collect
                     && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
-                self.deliver_down_fragment(
+                return self.deliver_down_fragment(
                     to,
                     reference,
                     target,
                     kind,
-                    tag,
+                    tag.as_ref(),
                     reason,
                     src,
                     refused_payload_words(failure),
-                )
+                );
             }
-            Err(error) => Err(error),
-        }
+            Err(error) => return Err(error),
+        };
+        let tag_word = match &tag {
+            Some(slot) if slot.is_fragment_backed() => {
+                match materialise_tag_onto(recipient, slot, decline) {
+                    Ok(word) => Some(word),
+                    Err(BeamError::Alloc(failure))
+                        if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+                    {
+                        // The tag cannot join the receiver's heap (no collection was run, so the
+                        // reason word above is still valid): deliver the whole DOWN through the
+                        // message's own heap fragment instead.
+                        return self.deliver_down_fragment(
+                            to,
+                            reference,
+                            target,
+                            kind,
+                            tag.as_ref(),
+                            reason,
+                            src,
+                            None,
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Some(slot) => Some(slot.root()),
+            None => None,
+        };
+        recipient
+            .signals_mut()
+            .push(PendingSignal::down(reference, target, kind, tag_word, reason));
+        Ok(())
     }
 
     /// Builds the `{'EXIT', From, Reason}` a receiver the family-aware [`exit_policy`] says will
@@ -3316,6 +3471,12 @@ impl ProcessTable {
     /// nursery refused the reason copy
     /// ([`ProcessTable::enqueue_down_signal`]).
     ///
+    /// `tag` is the monitor's user tag **still owned by its slot**: the whole payload — the tag, the
+    /// reason and the `{'DOWN', …}` envelope — is built on one scratch arena whose off-heap table
+    /// merges the slot's and the reason's source tables ([`stage_sources`]), then copied into the
+    /// fragment's own heap from that single table. Nothing of it ever enters the receiver's heap,
+    /// which is exactly what a receiver that must not be collected needs.
+    ///
     /// The DOWN never reaches the queue (its reason cannot live there), so this wakes a blocked
     /// `to` itself, exactly as [`ProcessTable::deliver_head_signal`] does for the queued form. The
     /// named monitor's `{Name, node}` descriptor (if any) is consumed here, exactly as the
@@ -3328,7 +3489,7 @@ impl ProcessTable {
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
-        tag: Option<Eterm>,
+        tag: Option<&TagSlot>,
         reason: Eterm,
         src: Option<&OffHeapTable>,
         held_words: Option<usize>,
@@ -3345,25 +3506,39 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        // The held figure prices the `reason` sub-graph only, so the `{'DOWN', …}` envelope — the
-        // tuple, the boxed reference and a named target — is added on top.
+        // The held figure prices the `reason` sub-graph only (the copy that refused was a copy of
+        // the reason, not of the envelope), so the `{'DOWN', …}` envelope — the tuple, the boxed
+        // reference, a named target and the user tag — is added on top.
         let held = held_words.map(|words| words.saturating_add(DOWN_ENVELOPE_WORDS));
-        enqueue_fragment_payload(recipient, from_term, reason, src, held, &mut |heap, reason| {
-            let reference_term = reference.to_eterm(heap)?;
+        let reason_src = src.unwrap_or_else(|| recipient.off_heap());
+        let StagedSources {
+            mut scratch,
+            table,
+            tag: tag_word,
+            reason: reason_word,
+        } = stage_sources(tag, reason, reason_src, DOWN_ENVELOPE_WORDS)?;
+        let payload = {
+            let reference_term = reference.to_eterm(&mut scratch)?;
             let target_term = match named {
-                Some(nt) => heap.tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
+                Some(nt) => scratch.tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
                 None => target.to_eterm(),
             };
             build_down_message_term(
-                heap,
+                &mut scratch,
                 &atoms,
-                tag,
+                tag_word,
                 reference_term,
                 kind_atom,
                 target_term,
-                reason,
-            )
-        })?;
+                reason_word,
+            )?
+        };
+        let (fragment, root) = copy_into_fragment(payload, &table, held)?;
+        let mut fragments = Fragments::new();
+        fragments.push(fragment);
+        recipient
+            .mailbox_mut()
+            .enqueue(Message::new(root, from_term).with_fragments(fragments));
         let woke = recipient.wake();
         if woke {
             self.ready.push(to);
@@ -3578,8 +3753,9 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// As [`ProcessTable::monitor_term`], plus [`error::unsupported_tag`] for a heap-resident
-    /// tag and [`error::unsupported`] for a tag on a remote target.
+    /// As [`ProcessTable::monitor_term`], plus the tag fragment's `BeamError::Alloc` when a
+    /// heap-resident tag cannot be copied, and [`error::unsupported`] for a tag on a remote
+    /// target.
     pub fn monitor_term_with_tag(
         &mut self,
         watcher: ProcessId,
@@ -3619,7 +3795,8 @@ impl ProcessTable {
         kind: MonitorKind,
         options: MonitorOptions,
     ) -> Result<MonitorRef> {
-        let tag = check_tag(options.tag)?;
+        // The tag option is handed to the port-table entry points unchanged: they own the
+        // ownership transfer (see `monitor_port_with_options`).
         if PortId::is_port(target) {
             return match kind {
                 MonitorKind::Port => Err(error::unsupported(
@@ -3646,7 +3823,7 @@ impl ProcessTable {
         match PidTarget::from_eterm(target)? {
             PidTarget::Local(pid) => self.monitor_with_options(watcher, pid, kind, options),
             PidTarget::Remote(remote) => {
-                if tag.is_some() {
+                if options.tag.is_some() {
                     // The wire monitor signal has no tag field (see the method docs).
                     return Err(error::unsupported(
                         "monitor/3: tag on a remote target (DOP_MONITOR_P carries no tag)",
@@ -4463,16 +4640,16 @@ impl ProcessTable {
 
         // 1. Monitors: the port's death resolves the incoming half here (drained by `close`)
         //    and the watcher's outgoing half below; then the watcher is told the port is down.
-        //    The records hold no tag field, so the monitor's `erlang:monitor/3` user tag is read
-        //    from the side table; the DOWN built below is its last use, so the entry is dropped.
+        //    The records hold no tag field, so the monitor's `erlang:monitor/3` user tag is
+        //    **taken out** of the side table — the DOWN built below is its last use, so the slot
+        //    goes with it and its fragment is released.
         for monitor in closed.monitors {
             if let Some(watcher) = self.get_mut(monitor.watcher) {
                 watcher
                     .port_monitors_mut()
                     .retain(|watch| watch.reference != monitor.reference);
             }
-            let tag = self.tags.get(&monitor.reference).copied();
-            forget_tag(&mut self.tags, monitor.reference);
+            let tag = self.tags.remove(&monitor.reference);
             // A port monitor cannot carry an alias in this crate
             // (`error::unsupported_port_monitor_alias`), so this is a no-op today; it is called
             // anyway so the DOWN site applies the one shared rule rather than relying on the
@@ -4500,8 +4677,9 @@ impl ProcessTable {
     }
 
     /// Enqueues `{'DOWN', Ref, port, Port, Reason}` into `to`'s mailbox — built on `to`'s own
-    /// heap — and wakes `to` when it was blocked. With `tag = Some`, the head atom is the
-    /// monitor's `erlang:monitor/3` user tag (`{Tag, Ref, port, Port, Reason}`).
+    /// heap, or into a heap fragment for a receiver whose heap must not move (see
+    /// [`enqueue_down_message`]) — and wakes `to` when it was blocked. With `tag = Some`, the head
+    /// word is the monitor's `erlang:monitor/3` **user tag** (`{Tag, Ref, port, Port, Reason}`).
     ///
     /// An unknown `to` is skipped (the watcher died earlier).
     fn enqueue_port_down_message(
@@ -4509,7 +4687,7 @@ impl ProcessTable {
         to: ProcessId,
         reference: MonitorRef,
         port: PortId,
-        tag: Option<Eterm>,
+        tag: Option<TagSlot>,
         reason: Eterm,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
@@ -4518,7 +4696,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, None, decline, |heap, reason| {
+        enqueue_down_message(recipient, from, reason, None, tag, decline, |heap, tag, reason| {
             let reference_term = reference.to_eterm(heap)?;
             build_down_message_port(heap, &atoms, tag, reference_term, port, reason)
         })?;
