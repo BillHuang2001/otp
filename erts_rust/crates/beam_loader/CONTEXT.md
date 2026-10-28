@@ -106,6 +106,7 @@ Every item is a typed error or a documented accept/reject divergence — never a
 - `src/` → the frozen API layer: container walk, opcode roster, operand/instruction decoder, IR types, `Instr` vocabulary, literal area, checksum, attributes/decoded-term tables, `load`, and `build_module` (`src/CONTEXT.md` carries the full API surface, the operand-tag table, decode bounds and the design decisions)
 - `src/chunk/` → the `.beam` chunk parsers (`AtU8`/`Code`/`ExpT`/`LocT`/`ImpT`/`FunT`/`Line`/`Type`/`LitT`/`Recs`/`StrT`/`CInf`/`Attr`/`Meta`), the chunk-id classification, and every chunk-level accept/reject bound (`src/chunk/CONTEXT.md`)
 - `src/lower/` → opcode → `Instr` mapping (`lower_instr`), `func_info` function grouping, the `Deallocate`+`Return` fusion, and post-lowering validation (`src/lower/CONTEXT.md`)
+- `src/labels.rs` → the per-image label/import index (`LabelMap`, `build_label_map`, the uncached `import_target` fallback, `retained_bytes`) and the `SharedLabelMap` slot that makes one immutable module image share exactly one map, plus the `label_map_builds`/`reset_label_map_builds` diagnostics counter
 - `tests/` → fixtures, rejection suites, whole-corpus sweeps, oracle cross-checks and the load-cost measurement (`tests/CONTEXT.md`)
 - `tests/fixtures/` → the committed `.erl` sources + oracle `.beam` images, with the regeneration recipe and wire summary in `README.md`
 - `tests/common/` → the `tests/`-level support module (`mod.rs`: installed-OTP discovery + raw ETF payload inspection)
