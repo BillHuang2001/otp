@@ -132,6 +132,10 @@ The narrow **stores** follow the same discipline — executed, not merely byte-p
   overrun the window. It then pins the encodings (`66 89 /r`, `89 /r`, `REX.W` clear), that **no**
   forced `REX` appears for an `rsp`/`rsi` source in those widths, and the `66`-then-`REX`-then-opcode
   prefix order with `REX.R`/`REX.B`.
+The immediate-operand encoders are pinned byte-wise and then executed:
+- `emits_the_immediate_operand_encodings` drives all four encoders over `Rax`/`Rcx`/`R8`/`R11` with the immediates `1`/`7`/`-8`/`-4`, pinning `REX.W` + opcode + register-form `ModRM` + the little-endian `imm32`, the `REX.B` of an extended operand, and the 7-byte length of every row.
+- `emits_the_immediate_operand_whole_32_bit_field` pins `i32::MIN` (`00 00 00 80`) and `i32::MAX` (`FF FF FF 7F`) through all four encoders, proving the whole field is written, and prices the `mov_ri` + `_rr` pair it replaces at 13 bytes.
+- `executes_test_ri_with_a_sign_extended_immediate`, `executes_cmp_ri_with_a_sign_extended_immediate` and `executes_and_ri_and_add_ri_with_sign_extended_immediates` observe the flags/result through `jcc`, and each carries a **sign-extension witness** — a value that would answer differently under a zero-extended field (bit 32 through `& -8`, the signed `0 < 0xFFFF_FFF8` comparison, and the `and`/`add` encoders read alone so a wrapped offset cannot mask the difference).
 The baseline tier's own `baseline/emit/*` tests assert the emitted byte sequences.
 
 ## Routing Table
