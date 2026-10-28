@@ -24,12 +24,13 @@ Files: `mod.rs` (buffer lifecycle, labels/fixups, raw byte emission, W^X), `enco
 ### Encoders (`encode.rs`, all `Result<()>`; every encoding `REX.W` unless noted)
 - move — `mov_rr` `:39`, `mov_ri` (movabs, 64-bit imm) `:46`, `mov_rm` (`[base+disp32]` load) `:53`, `mov_mr` (64-bit store) `:110`, `lea` `:192`.
 - narrow stores — `mov_mr8` `:143` (`88 /r`), `mov_mr16` `:152` (`66 89 /r`), `mov_mr32` `:161` (`89 /r`, `REX.W` clear) plus the shared private `emit_mov_mr_narrow`; see *Narrow memory stores* below.
-- arith/logic — `add_rr` `:209`, `sub_rr` `:214`, `cmp_rr` `:219`, `test_rr` `:224`, `and_rr` `:229`, `or_rr` `:234`, `xor_rr` `:239`, `imul_rr` `:252` (two-operand `0F AF /r`; sets OF/CF on 64-bit overflow — the `erlang:'*'/2` guard).
-- divide — `cqo` `:266` (`REX.W 99`, sign-extend `rax` into `rdx:rax`) and `idiv_rr` `:283` (`F7 /7`, 64-bit signed divide: quotient in `rax`, remainder in `rdx`; a zero divisor or `i64::MIN / -1` traps `#DE`, so the caller must refuse both).
-- shifts — `sar_ri` `:292`, `shr_ri` `:303`, `shl_ri` `:308` (`C1 /n ib`; `sar_ri`/`shl_ri` take a `u32` count and reject one above `u8::MAX` with `BadArg`, `shr_ri` takes the `u8` immediate directly) and the `cl`-count forms `shr_cl` `:318`/`shl_cl` `:326` (`D3 /n`).
-- stack — `push_r` `:357`, `pop_r` `:365`.
-- control flow — `jmp` (`rel32`) `:375`, `jcc` (`rel32`) `:381`, `call_label` (`rel32`) `:388`, `jmp_r` (indirect, `FF /4`, `0x41` REX.B for `r8`–`r15`, pinned by `tests.rs::jumps_through_a_register`) `:402`, `call_r` (indirect) `:411`, `ret` `:420`.
-- filler — `nop` `:427`, `int3` `:432`.
+- arith/logic — `add_rr` `:209`, `sub_rr` `:214`, `cmp_rr` `:219`, `test_rr` `:224`, `and_rr` `:229`, `or_rr` `:234`, `xor_rr` `:239`, `imul_rr` `:314` (two-operand `0F AF /r`; sets OF/CF on 64-bit overflow — the `erlang:'*'/2` guard).
+- immediate-operand arith/logic — `test_ri` `:270`, `cmp_ri` `:282`, `and_ri` `:292`, `add_ri` `:301`, all `(Reg, imm: i32)`; see *The imm32 form* below.
+- divide — `cqo` `:328` (`REX.W 99`, sign-extend `rax` into `rdx:rax`) and `idiv_rr` `:345` (`F7 /7`, 64-bit signed divide: quotient in `rax`, remainder in `rdx`; a zero divisor or `i64::MIN / -1` traps `#DE`, so the caller must refuse both).
+- shifts — `sar_ri` `:354`, `shr_ri` `:365`, `shl_ri` `:370` (`C1 /n ib`; `sar_ri`/`shl_ri` take a `u32` count and reject one above `u8::MAX` with `BadArg`, `shr_ri` takes the `u8` immediate directly) and the `cl`-count forms `shr_cl` `:380`/`shl_cl` `:388` (`D3 /n`).
+- stack — `push_r` `:419`, `pop_r` `:427`.
+- control flow — `jmp` (`rel32`) `:437`, `jcc` (`rel32`) `:443`, `call_label` (`rel32`) `:450`, `jmp_r` (indirect, `FF /4`, `0x41` REX.B for `r8`–`r15`, pinned by `tests.rs::jumps_through_a_register`) `:464`, `call_r` (indirect) `:473`, `ret` `:482`.
+- filler — `nop` `:489`, `int3` `:494`.
 ### Narrow (zero-extending) loads and run-time shift counts
 - `mov_rm32` `:65` — `8B /r` with `REX.W` **clear**, so the 32-bit register write zero-extends into the full 64-bit destination (the x86-64 rule) instead of keeping the old high half; a `REX` prefix is still emitted (without `W`) for an `r8`–`r15` operand.
 - `movzx_byte` `:78` — `REX.W 0F B6 /r`: an 8-bit load zero-extended into the 64-bit destination, so a `0xFF` source reads as `0xFF` and never `-1`, and only the addressed byte is read.
