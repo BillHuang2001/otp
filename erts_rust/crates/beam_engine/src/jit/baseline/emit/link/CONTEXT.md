@@ -109,9 +109,9 @@ the −7-byte single-store saving the exit's `ExitSpill::Done` mode gives back (
 
 ## Measured
 
-### The prologue Y-window publish is unconditional (a measured but rejected suppression)
-`emit/prologue.rs` emits `jit_publish_y` for **every** block that accesses a `Y` slot, because a block entry and a resumed slice both re-execute no prefix: a frame-changing helper re-publishes the window only mid-block, so a prologue that skipped the publish would leave the block reading `Y` slots through a window left over from a shallower frame depth.
-Suppressing it for a block whose every `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s `y_first` vs `frame_republish_first`) measured **−2.33 %** on `list_walk` and **−0.40 %** on `foreign_cowboy_bstr` retired instructions, and the rule is rejected on that soundness ground alone, not on its price.
+### The prologue Y-window publish is suppressed behind an in-block frame helper
+`emit/prologue.rs` emits `jit_publish_y` for a block that accesses a `Y` slot **unless** its first `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s `y_first` vs `frame_republish_first`, read by `Allocation::prologue_publishes_y`) — such a helper re-publishes the window itself on the arm that continues the block in-block, and a block is entered only at its own start, so a resume re-enters at the block entry and re-executes the prefix. The suppressed blocks emit the plain position store instead.
+The suppression measured **−2.33 %** on `list_walk` and **−0.40 %** on `foreign_cowboy_bstr` retired instructions.
 The figures, the round-by-round ratios and the corpus-wide `y_blocks` / `y_prologue_publishes` split are `../measure/CONTEXT.md`'s; the rule itself is `../prologue/CONTEXT.md`'s.
 
 ## Continuation sub-blocks (both layouts)

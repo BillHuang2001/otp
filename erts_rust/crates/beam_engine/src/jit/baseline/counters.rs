@@ -209,7 +209,8 @@ pub(crate) struct Counters {
     /// [`y_prologue_publishes`](Counters::y_prologue_publishes) counts emitted publishes
     /// beside the runtime [`publish_y`](Counters::publish_y).
     pub(crate) set_position: u64,
-    /// `jit_publish_y` calls (every block prologue whose body touches a `Y` slot).
+    /// `jit_publish_y` calls (every block prologue that publishes: the block touches a `Y`
+    /// slot and its first `Y` access does not follow an in-block frame helper).
     pub(crate) publish_y: u64,
     /// `jit_refresh_y` calls (the gated in-block Y-window re-publish).
     pub(crate) refresh_y: u64,

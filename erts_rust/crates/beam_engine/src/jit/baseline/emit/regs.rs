@@ -134,8 +134,10 @@ pub(crate) struct Allocation {
     /// The emitter's two Y-window decisions both read it, and both are compile-time
     /// (so a Y-free block pays nothing at run time):
     ///
-    /// * the **prologue** publishes the current frame's Y window iff `y_last.is_some()`
-    ///   (a block that may read `JitRuntime::y_base`/`y_end`);
+    /// * the **prologue** publishes the current frame's Y window unless every Y access of
+    ///   the block follows a frame-changing helper that re-publishes it itself
+    ///   ([`Allocation::prologue_publishes_y`], read off `y_last`/`y_first`/
+    ///   `frame_republish_first`);
     /// * the **post-deopt refresh** ([`Allocation::refresh_y_after`]) is emitted only
     ///   when a still-later instruction accesses a Y slot.
     ///
@@ -307,28 +309,32 @@ impl Allocation {
     /// ([`super::super::runtime::jit_publish_y`]) instead of only recording the position
     /// ([`super::super::emit::prologue`]'s inline store).
     ///
-    /// A block that accesses no Y slot publishes nothing; a block that does always
-    /// publishes. The publish is **idempotent** (`jit_publish_y` re-derives the window
-    /// from `machine.frames.last()` and a fresh `machine.stack.as_ptr()`, so a repeat
-    /// costs one helper call and changes no state), and it is the only thing that makes a
-    /// Y access safe at a block **entry** that does not re-execute a mid-block window
-    /// publisher.
+    /// A block that accesses no Y slot publishes nothing. A block that does publishes
+    /// **unless** every one of its Y accesses lies at or after an in-block instruction that
+    /// re-published the window itself ([`Allocation::frame_republish_first`]: an
+    /// `allocate`/`allocate_heap`/`trim`, each one positioned helper call whose success arm
+    /// derives the window from `Machine::push_frame_window`'s own `(y_base, y_count)` —
+    /// `jit_allocate`/`jit_allocate_heap`'s `publish_y_window`, `jit_trim`'s
+    /// `refresh_y_base`). A block is entered only at its own **start** — a fresh block entry,
+    /// and a resume, which parks on a block entry because `Machine::current_code` stores that
+    /// entry's pc mid-block and re-executes the prefix — and the block is linear, the only
+    /// ways out of its middle being a branch/exit into another range (each with its own
+    /// prologue), so reaching the first Y access necessarily ran that helper first: the
+    /// window is the live frame's before anything reads it, and the publish would be dead
+    /// work.
     ///
-    /// A suppression rule was tried and is **unsound**, which is why it is not here: a
-    /// block whose every Y access follows a frame-changing instruction was allowed to skip
-    /// the publish on the theory that instruction re-published the window first. That holds
-    /// only if the entry point really executes the block prefix, and a frame-changing
-    /// helper re-publishes the window only **mid-block** — so a block entered with a window
-    /// left over from a shallower frame depth (the resume path, which republishes nothing,
-    /// and any native entry whose prologue chose not to publish) read its Y slots through a
-    /// stale base. The failure surfaced as a `{badmatch, _}` out of `get_list` under the
-    /// default (baseline) tier on `bench_list_walk:walk/1`, with the interpreter — which
-    /// derives the window per instruction — correct.
-    /// [`Allocation::y_first`]/`frame_republish_first` survive as the
-    /// analysis's record and are read by the counters/tests; they no longer gate the
-    /// publish.
+    /// **Conservative by construction**: an `Allocation` whose analysis tables are absent (a
+    /// synthetic one a unit test built directly — `y_last` set but `y_first` absent) still
+    /// publishes. The only failure direction is therefore a redundant publish, never a Y
+    /// access against a window nothing published.
     pub(crate) fn prologue_publishes_y(&self) -> bool {
-        self.y_last.is_some()
+        if self.y_last.is_none() {
+            return false;
+        }
+        match (self.y_first, self.frame_republish_first) {
+            (Some(first), Some(republish)) => first <= republish,
+            _ => true,
+        }
     }
 }
 

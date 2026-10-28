@@ -4471,11 +4471,12 @@ fn the_move_y_gate_matches_the_move_inliner_exactly() {
 /// `machine.stack` (`Allocate`) re-published the window before the move reads it, and the
 /// move's own fallback (`refresh_y_after`) re-publishes it again.
 ///
-/// The block's prologue **publishes too** ([`Allocation::prologue_publishes_y`]: a block
-/// that touches a `Y` slot always publishes): a block entry need not execute the prefix
-/// that reached the frame change — a resume re-enters at the parked address — so the
-/// prologue publish is what makes a `Y` access safe at every entry, and suppressing it
-/// because "every Y access follows the `allocate`" was unsound.
+/// The block's prologue **does not** publish ([`Allocation::prologue_publishes_y`]: the
+/// first Y access follows the `allocate`, which re-publishes the window on its in-block
+/// continue arm). That is what makes the helper's own publication load-bearing rather than
+/// redundant, and it is sound because a block is entered only at its own start — a resume
+/// parks on a block entry and re-executes the prefix, so the `allocate` runs before the
+/// first `Y` read. The prologue emits the plain position store.
 #[test]
 fn the_y_window_gate_covers_the_inlined_y_moves() {
     let code = vec![
@@ -4520,8 +4521,8 @@ fn the_y_window_gate_covers_the_inlined_y_moves() {
     let labels = crate::interpreter::build_label_map(&module);
     let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
     assert!(
-        code_contains_helper(&function, jit_publish_y as *const ()),
-        "a Y-touching block publishes the window in its prologue, whatever its Y accesses follow"
+        !code_contains_helper(&function, jit_publish_y as *const ()),
+        "the `allocate` precedes every Y access, so the prologue emits the plain position store"
     );
     assert!(
         code_contains_helper(&function, jit_refresh_y as *const ()),
@@ -4682,35 +4683,36 @@ fn the_y_window_publication_is_gated_at_compile_time() {
 }
 
 // ---------------------------------------------------------------------------
-// the prologue's Y-window publish is unconditional for a Y-touching block
+// the prologue's Y-window publish is suppressed behind an in-block frame helper
 // ---------------------------------------------------------------------------
-/// A block that accesses any Y slot publishes the frame's Y window in its
-/// prologue, whatever the position of the frame-changing instruction.
+/// A block suppresses its prologue Y-window publish exactly when an in-block
+/// frame-changing helper re-publishes the window before the block's first Y access.
 ///
-/// The rule is [`Allocation::prologue_publishes_y`] = "the block touches a Y slot",
-/// and it is a soundness rule rather than a heuristic: a block is entered at its
-/// own start — a fresh block entry, or a resumed slice parked on a block entry — and
-/// an entry re-executes **no** prefix, so a window published only mid-block (by an
-/// in-block `allocate` / `allocate_heap` / `trim` helper calling
-/// `JitRuntime::refresh_y_base` on its continue arm) is absent exactly when a Y
-/// operand is resolved. The frame-changing instruction keeps working: it is one
-/// positioned helper call, and it re-publishes the window from
-/// `Machine::push_frame_window`'s own `(y_base, y_count)` on the arm that continues
-/// the block in-block.
+/// The rule is [`Allocation::prologue_publishes_y`]: a Y-touching block publishes
+/// **unless** its first Y access lies at or after an in-block `allocate` /
+/// `allocate_heap` / `trim`. A block is entered only at its own start — a fresh block
+/// entry, or a resumed slice parked on a block entry, which re-executes the prefix —
+/// and the frame-changing instruction is one positioned helper call that re-publishes
+/// the window from `Machine::push_frame_window`'s own `(y_base, y_count)` on the arm
+/// that continues the block in-block, so the window is the live frame's before anything
+/// reads it. A block that reaches a Y access with no such helper ahead of it publishes,
+/// and an allocation whose analysis tables are absent publishes too, so the only failure
+/// direction is a redundant publish.
 ///
 /// Four shapes, each compiled through [`compile_function`] with the structural
 /// counters on:
 ///
 /// 1. `allocate` **before** every Y access — the compiler's `sum/1` recursion shape
 ///    (`test is_nonempty_list` · `allocate` · `get_list {x,0} -> {y,0},{x,0}` ·
-///    `return`) — publishes in the prologue beside keeping `y_last` (so it still
-///    gets the gated post-helper refresh);
+///    `return`) — suppresses the prologue publish (the prologue emits the inline
+///    position store) while keeping `y_last` (so it still gets the gated post-helper
+///    refresh);
 /// 2. the mirrored shape with the Y access **before** the `allocate` publishes;
 /// 3. a Y-free block publishes nothing;
 /// 4. a Y access with **no** frame helper at all publishes (the
 ///    `frame_republish_first == None` arm, which reaches the same answer).
 #[test]
-fn a_y_touching_block_publishes_the_window_in_its_prologue_whatever_the_helper_order() {
+fn a_y_touching_block_suppresses_the_prologue_publish_when_a_frame_helper_republishes_first() {
     /// What one compiled shape produced: its block's [`Allocation`], whether the
     /// prologue emitted the window publish, and the counters of that compilation.
     struct Case {
@@ -4778,18 +4780,18 @@ fn a_y_touching_block_publishes_the_window_in_its_prologue_whatever_the_helper_o
         "the `allocate` is the block's first window-re-publishing helper"
     );
     assert!(
-        after_alloc.allocation.prologue_publishes_y(),
-        "a block that touches Y always publishes: the inline `allocate` only republishes \
-         mid-block, so a block entry that does not re-execute it needs the prologue's window"
+        !after_alloc.allocation.prologue_publishes_y(),
+        "the `allocate` re-publishes the window before the block's first Y access, \
+         so the prologue's publish would be dead work"
     );
     assert!(
-        after_alloc.publishes,
-        "the compiled prologue must emit `jit_publish_y` for this shape too"
+        !after_alloc.publishes,
+        "the compiled prologue emits the inline position store instead of `jit_publish_y`"
     );
     assert_eq!(after_alloc.counters.y_blocks, 1, "the block does touch Y");
     assert_eq!(
-        after_alloc.counters.y_prologue_publishes, 1,
-        "the prologue publish is emitted for every Y-touching block"
+        after_alloc.counters.y_prologue_publishes, 0,
+        "the suppressed prologue publishes nothing"
     );
     // (2) The mirrored shape: the Y access precedes the `allocate`, so the window must
     // be published before it can be read.

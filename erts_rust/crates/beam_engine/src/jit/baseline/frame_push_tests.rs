@@ -22,10 +22,12 @@
 //! A frame-changing instruction must leave the Y window and the frame geometry
 //! **re-derivable from Rust state** ([`Machine::push_frame_window`]), because
 //! emitted code cannot reproduce them at a later entry: a resume re-enters a
-//! block at its entry and re-executes no prefix. So `allocate` lowers to exactly
-//! one `jit_allocate` helper call, and a block that touches a Y slot publishes
-//! the window in its prologue -- the property below fails the moment a push
-//! commits state that a parked-then-resumed slice does not re-derive (measured
+//! block at its entry and re-executes that block's prefix. So `allocate` lowers to exactly
+//! one `jit_allocate` helper call, and that helper re-publishes the Y window from
+//! the `(y_base, y_count)` the push just computed -- which is why a block whose
+//! Y accesses all follow the push does not publish in its own prologue
+//! ([`Allocation::prologue_publishes_y`]). The property below fails the moment a
+//! push commits state that a parked-then-resumed slice does not re-derive (measured
 //! as a `badfun`-class structured error inside `gen_server:try_handle_call/4`,
 //! whose fun lives in a frame's Y slot).
 //!

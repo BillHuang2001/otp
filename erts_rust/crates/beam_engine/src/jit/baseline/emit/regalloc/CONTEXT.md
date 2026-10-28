@@ -35,11 +35,13 @@ whose `Value` route is never a Y-window access): `Allocation::y_last` (the highe
 accesses a Y slot — the compile-time gate for the prologue publish and the emitter's post-helper refresh), `Allocation::y_first`
 (its twin, the lowest such pc) and `Allocation::frame_republish_first` (the lowest pc of an
 `allocate`/`allocate_heap`/`trim`, whose helper re-publishes the Y window on the arm that
-continues the block in-block). `Allocation::prologue_publishes_y` is `y_last.is_some()`: a block that
-touches a `Y` slot publishes **unconditionally**, because a block entry and a resume re-execute no prefix,
-so a helper's mid-block re-publication cannot stand in for the prologue's — the window must stay
-re-derivable from Rust state at every enterable address. `y_first`/`frame_republish_first` survive as the
-analysis record the counters and the tests read; they no longer gate the publish. A `Y` slot is
+continues the block in-block). `Allocation::prologue_publishes_y` reads that triple: a block that
+touches no `Y` slot publishes nothing, and one whose first `Y` access lies at or after
+`frame_republish_first` suppresses the prologue publish — the block is entered only at its own start, a
+resume parks on a **block entry** and re-executes the prefix, so the helper runs before the first `Y`
+access and leaves the window the live frame's. An allocation with no tables (a synthetic one) and a
+block reaching a `Y` access with no frame helper ahead of it both publish, so the only failure direction
+is a redundant publish. A `Y` slot is
 **not** an x-register, so it is neither a candidate nor charged to any live interval, and it never raises
 `highest_native_register`: a stack slot must not refuse native entry (the driver's bound is
 `machine.x.len() > bound`).
