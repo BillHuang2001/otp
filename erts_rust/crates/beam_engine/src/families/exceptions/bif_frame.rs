@@ -411,5 +411,7 @@ fn build(
     )
 }
 
+// `pub(crate)` so the sibling route suites (`tests/error_info.rs`) reuse the
+// oracle's own item builder rather than growing a second copy that could drift.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -73,7 +73,10 @@ fn fixture() -> Module {
 }
 
 /// The atom `name` **as an immediate**, via the fixture's table.
-fn atom_of(module: &Module, name: &str) -> Eterm {
+///
+/// `pub(crate)` for the sibling route suites (`tests/error_info.rs`), which build
+/// the same expected item on a module of their own.
+pub(crate) fn atom_of(module: &Module, name: &str) -> Eterm {
     make_atom(
         module
             .atom_table
@@ -93,7 +96,10 @@ fn machine_with_a_catch_frame() -> Machine {
 /// The oracle's own item for `module:function(args…)`, built independently of the
 /// production builder from already-materialized terms (the test arena never
 /// collects, so the operand/expected split needs no rooting).
-fn expected_item(
+///
+/// `pub(crate)` so `tests/error_info.rs` asserts the very same shape the unit
+/// suite does — one definition, so the two cannot drift.
+pub(crate) fn expected_item(
     ctx: &mut MinimalContext,
     module: &Module,
     bif_module: &str,

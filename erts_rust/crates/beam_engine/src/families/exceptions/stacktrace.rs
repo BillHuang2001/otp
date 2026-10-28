@@ -114,15 +114,21 @@ use crate::terms::{ContextSink, Sink};
 ///    target publishes (`head` below, [`super::callee`]) is consed in front of the
 ///    frame list and carries the callee's real argument list — exactly C's innermost
 ///    item for an `undef`.
-/// 3. **The `error_info` extension is rendered, but only from a raise that carries
-///    one.** C's innermost item extends its `Location` with `{error_info, Map}`
-///    (`get_error_info_from_exc`); the engine renders it when the raise published the
-///    map (`beam_common::Raise::error_info`, an `erlang:error/3`), including a
-///    `{error_info,Map}`-only location for a frame with no source position. It never
-///    *derives* one: the format-module classification
-///    (`erl_erts_errors`/`erl_kernel_errors`/`erl_stdlib_errors`) for a failing BIF is
-///    the BIF layer's, so a raise that publishes no map cooks to the plain
-///    two-element location.
+/// 3. **The `error_info` extension rides the INNERMOST item, and never an outer
+///    one.** C's `save_stacktrace` packs `{error_info, Map}` into the exception's
+///    `ftrace` and `erts_build_mfa_item` starts **one** item's `Location` from it
+///    (`get_error_info_from_exc`), so the engine resolves it for the first item of
+///    the cooked list alone — by one of two routes:
+///    - the synthesized **head item** (`head` below, [`super::bif_frame`]) carries
+///      its own extension, derived from C's closed format-module table
+///      (`erl_erts_errors`/`erl_kernel_errors`/`erl_stdlib_errors`) or omitted
+///      entirely for a module outside it (C's `default:` arm leaves `Location`
+///      `[]`);
+///    - otherwise, a raise that published `beam_common::Raise::error_info` (an
+///      `erlang:error/3`) attaches it to the caller frame, including a
+///      `{error_info,Map}`-only location for a frame with no source position.
+///    The raise's map is consumed by that first item: every outer item keeps the
+///    plain two-element location.
 ///
 /// The *order* is C's: `build_stacktrace` prepends the current function last
 /// (`beam_common.c:1278-1288`), so the list runs innermost frame first.
@@ -556,8 +562,10 @@ struct ItemShape<'a> {
     /// reservation, from the re-seated latch (`Machine::with_roots` parks and re-seats
     /// it); nothing allocates between that read and the store.
     args: Option<Eterm>,
-    /// The `{error_info, Map}` extension of this item's `Location`, for the innermost
-    /// item of an `erlang:error/3` raise; `None` for every other item.
+    /// The `{error_info, Map}` extension of this item's `Location`: the **caller
+    /// frame** of an `erlang:error/3` raise, and `None` for every other item —
+    /// including a synthesized head item, which carries its own extension and is
+    /// consed in front of these shapes verbatim ([`super::bif_frame`]).
     ///
     /// C's `save_stacktrace` keeps the `EXC_ERROR_3` value as `c_p->fvalue`
     /// (`../../erts/emulator/beam/beam_common.c:1024-1026`) and packages it as
