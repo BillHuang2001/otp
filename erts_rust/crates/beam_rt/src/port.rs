@@ -1689,18 +1689,6 @@ impl PortRegistry {
         self.meta.contains_key(&id.number())
     }
 
-    /// The concrete driver behind the live port `id`, when it is a `T`.
-    ///
-    /// The registry's one downcast door: [`beam_io::Driver`] is `Any`, so
-    /// `dyn Driver::downcast_ref::<T>()` is the safe (no `unsafe` fat-pointer work) way for the
-    /// runtime to recover a built-in driver (`TcpInetDriver`, …) the port boxes instead of
-    /// replaying an option block — the C's `desc->drv_entry->drv_data` hand-off.
-    ///
-    /// `None` for an unknown/closed port, and for a port whose driver is another type.
-    pub fn driver_as<T: Driver + 'static>(&self, id: PortId) -> Option<&T> {
-        self.registry.driver_as::<T>(id)
-    }
-
     /// Whether `id` names a port the runtime currently holds.
     ///
     /// [`PortRegistry::close`] removes the metadata and the `beam_io` entry together, so
