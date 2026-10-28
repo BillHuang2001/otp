@@ -103,6 +103,40 @@
 //! (A **foreign** hash — a `LOCAL_EXT` image whose four payload bytes are not this VM's — is
 //! deliberately *not* a case: the oracle rejects it and this runtime decodes it, so pinning it
 //! would be a mismatch-fixing exercise, not an A.2 encoding claim.)
+//!
+//! ## The codec fast paths: re-encode identity and one whole-image pin
+//! `beam_codec` encodes through a tag-first dispatch, decodes containers on a stack-staged arm
+//! and buffers each image in a **reused thread-local scratch** instead of a per-call
+//! allocation. None of the three is visible in a single image, so the `etf/bench_payload_*`,
+//! `etf/scratch_reuse_*` and `etf/atom_*` cases pin them by the *relations* a fast path can
+//! break and a naive encoder cannot:
+//!
+//! * `etf/bench_payload_reencode_is_byte_identical` — the bench payload's image re-encodes from
+//!   its own decode to the very same bytes (a scratch that leaves stale tail bytes changes the
+//!   second image's length or content);
+//! * `etf/bench_payload_image_exact_bytes` — that payload's **whole** image, byte-for-byte. A
+//!   5-key flatmap encodes in sorted-key order (`bytes`, `chars`, `ints`, `mixed`, `neg`) in
+//!   both encoders, so the image is order-stable (measured three times);
+//! * `etf/scratch_reuse_after_a_larger_image_does_not_leak_bytes` — a small image taken *after*
+//!   a 5 000-element one is byte-identical to the small image taken before it. Relational: no
+//!   byte of either image reaches the golden, so the case pins the scratch's reset, not a codec;
+//! * `etf/atom_name_batch_reencodes_byte_identically` — a batch of atom names chosen to stress
+//!   the encoder's open-addressed name→index probe (names sharing their first 8 bytes, names
+//!   sharing their last 8, long names differing only in the final byte, an ASCII case pair and
+//!   the 254- and 255-byte names that sit on the `SMALL_ATOM_UTF8_EXT` length limb's edge),
+//!   each decoded back and re-encoded to its own image. The probe's tag only pre-filters — the
+//!   byte compare is authoritative — so a wrong hit shows up as a differing image.
+//! * `etf/atom_ext_and_small_atom_ext_agree` — a hand-written `ATOM_EXT` (100, 2-byte length)
+//!   image and its `SMALL_ATOM_EXT` (119, 1-byte length) twin decode to the same atom **and**
+//!   re-encode to the same bytes, which holds only if both tag forms reach one name→index entry.
+//! * `etf/atom_utf8_names_reencode_byte_identically` — multi-byte UTF-8 atoms (a Japanese name
+//!   and two accented ones) round trip and re-encode to their own images. All three are shorter
+//!   than 256 UTF-8 bytes, so the oracle encodes each as `SMALL_ATOM_UTF8_EXT` (119) — measured,
+//!   not assumed — but the case pins only the identity, so it is a claim about the name→index
+//!   probe, never about a tag choice.
+//!
+//! Only one of the six carries a byte golden, and it is the oracle's own measured image line;
+//! the rest are boolean identities, so no tag byte is ever guessed.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -1408,6 +1442,131 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- the codec fast paths (A.2): the tag-first encode dispatch, the stack-staged decode
+        // container arm and the **reused thread-local encode scratch**, pinned by re-encode
+        // identity and by one whole image (see the module docs) ------------------------------
+        Case {
+            id: "etf/bench_payload_reencode_is_byte_identical",
+            description: "the bench payload's term_to_binary image re-encodes from its own \
+                          decode to the very same bytes (a reused encode scratch that leaves \
+                          stale tail bytes changes the second image's length or content)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin P = #{ints => lists:seq(1,10), mixed => {ok, <<\"hello world\">>, 3.5}, \
+                       bytes => <<0,1,2,3,4,5,6,7,8,9,10,11>>, chars => \"char list\", neg => -42}, \
+                       B = term_to_binary(P), B =:= term_to_binary(binary_to_term(B)) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/bench_payload_image_exact_bytes",
+            description: "the bench payload's whole image, byte-for-byte: a 5-pair MAP_EXT in \
+                          sorted-key order (bytes, chars, ints, mixed, neg) whose values cover \
+                          BINARY_EXT, STRING_EXT, NEW_FLOAT_EXT, INT32_EXT and a nested tuple",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "#{ints => lists:seq(1,10), mixed => {ok, <<\"hello world\">>, 3.5}, \
+                       bytes => <<0,1,2,3,4,5,6,7,8,9,10,11>>, chars => \"char list\", neg => -42}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,116,0,0,0,5,119,5,98,121,116,101,115,109,0,0,0,12,0,1,2,3,4,5,6,7,\
+                     8,9,10,11,119,5,99,104,97,114,115,107,0,9,99,104,97,114,32,108,105,115,\
+                     116,119,4,105,110,116,115,107,0,10,1,2,3,4,5,6,7,8,9,10,119,5,109,105,120,\
+                     101,100,104,3,119,2,111,107,109,0,0,0,11,104,101,108,108,111,32,119,111,\
+                     114,108,100,70,64,12,0,0,0,0,0,0,119,3,110,101,103,98,255,255,255,214>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/scratch_reuse_after_a_larger_image_does_not_leak_bytes",
+            description: "a small image taken after a 5 000-element one is byte-identical to the \
+                          small image taken before it (the encode scratch is reset, not just \
+                          rewound): relational, so no image bytes reach the golden",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin Before = term_to_binary(x), _Big = term_to_binary(lists:seq(1,5000)), \
+                       After = term_to_binary(x), Before =:= After end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/atom_name_batch_reencodes_byte_identically",
+            description: "a batch of atom names aimed at the encoder's open-addressed name→index \
+                          probe (shared first-8 / shared last-8 windows, long names differing \
+                          only in the last byte, an ASCII case pair, and the 254- and 255-byte \
+                          names on the SMALL_ATOM length limb) each decodes back to itself and \
+                          re-encodes to its own image",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin Names = [a, aa, aaa, abcdefgh1, abcdefgh2, list_to_atom(\"1abcdefgh\"), \
+                       list_to_atom(\"2abcdefgh\"), abcdefghijklmnop1, abcdefghijklmnop2, hello, \
+                       'Hello', list_to_atom(lists:duplicate(254, $z)), \
+                       list_to_atom(lists:duplicate(255, $z))], \
+                       lists:all(fun(A) -> B = term_to_binary(A), binary_to_term(B) =:= A andalso \
+                       term_to_binary(binary_to_term(B)) =:= B end, Names) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/atom_ext_and_small_atom_ext_agree",
+            description: "a hand-written ATOM_EXT (100, 2-byte length) image and its \
+                          SMALL_ATOM_EXT (119, 1-byte length) twin decode to the same atom and \
+                          re-encode to the same bytes, so both tag forms reach one name→index \
+                          entry (the byte compare is what is authoritative, not the tag)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin F = fun(Name) -> Len = byte_size(Name), \
+                       Big = <<131,100,0,Len,Name/binary>>, Small = <<131,119,Len,Name/binary>>, \
+                       A = binary_to_term(Big), S = binary_to_term(Small), \
+                       {A =:= S, term_to_binary(S) =:= Small} end, \
+                       [F(<<\"hello\">>), F(<<\"aa\">>), F(<<\"abcdefgh1\">>)] end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{true,true},{true,true},{true,true}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/atom_utf8_names_reencode_byte_identically",
+            description: "multi-byte UTF-8 atoms (a Japanese name and two accented ones) decode \
+                          back to themselves and re-encode to their own images — the identity \
+                          only, so no tag byte is claimed",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin Mk = fun(Bin) -> binary_to_atom(Bin, utf8) end, \
+                       Names = [Mk(<<\"日本語\"/utf8>>), Mk(<<\"héllo\"/utf8>>), \
+                       Mk(<<\"ünïcode\"/utf8>>)], \
+                       lists:all(fun(A) -> B = term_to_binary(A), binary_to_term(B) =:= A andalso \
+                       term_to_binary(binary_to_term(B)) =:= B end, Names) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1936,6 +2095,133 @@ mod tests {
             assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
             assert_eq!(case.golden.stdout, Some(stdout), "{id}");
             assert_eq!(case.golden.exit_code, 0, "{id}");
+        }
+    }
+
+    /// The `beam_codec` fast paths (A.2) — the tag-first encode dispatch, the stack-staged
+    /// decode container arm and the **reused thread-local encode scratch**. Five of the six are
+    /// boolean identities; the one byte golden is the oracle's own measured image of the bench
+    /// payload, and it must stay the *whole* image (a prefix would not pin the scratch). Grow
+    /// this test with the family.
+    #[test]
+    fn the_codec_fast_path_family_pins_reencode_identity_and_the_bench_image() {
+        let cases = group();
+        let find = |id: &str| cases.iter().find(|c| c.id == id).expect("registered");
+
+        // The five relational cases: an identity line, never a guessed tag byte.
+        for (id, label, stdout) in [
+            (
+                "etf/bench_payload_reencode_is_byte_identical",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+            (
+                "etf/scratch_reuse_after_a_larger_image_does_not_leak_bytes",
+                "value",
+                "ok true",
+            ),
+            (
+                "etf/atom_name_batch_reencodes_byte_identically",
+                "value",
+                "ok true",
+            ),
+            (
+                "etf/atom_ext_and_small_atom_ext_agree",
+                "value",
+                "ok [{true,true},{true,true},{true,true}]",
+            ),
+            (
+                "etf/atom_utf8_names_reencode_byte_identically",
+                "value",
+                "ok true",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), label, "{id}");
+            assert_eq!(
+                case.golden,
+                Golden { stdout: Some(stdout), exit_code: 0 },
+                "{id}"
+            );
+        }
+
+        // Both bench-payload cases carry the *same* term, so the image case really pins the
+        // value the identity case round-trips.
+        for id in [
+            "etf/bench_payload_reencode_is_byte_identical",
+            "etf/bench_payload_image_exact_bytes",
+        ] {
+            let expr = find(id).expr().expect("an expression case");
+            for field in [
+                "ints => lists:seq(1,10)",
+                "mixed => {ok, <<\"hello world\">>, 3.5}",
+                "bytes => <<0,1,2,3,4,5,6,7,8,9,10,11>>",
+                "chars => \"char list\"",
+                "neg => -42",
+            ] {
+                assert!(expr.contains(field), "{id} must carry `{field}`: {expr}");
+            }
+        }
+
+        // The image is pinned *whole*: a 5-pair MAP_EXT of exactly 116 bytes.
+        let image = find("etf/bench_payload_image_exact_bytes")
+            .golden
+            .stdout
+            .expect("an image golden");
+        assert!(
+            image.starts_with("ok <<131,116,0,0,0,5,"),
+            "a 5-pair MAP_EXT: {image}"
+        );
+        assert!(image.ends_with(">>"), "a closed binary rendering: {image}");
+        let elements = image
+            .trim_start_matches("ok <<")
+            .trim_end_matches(">>")
+            .split(',')
+            .count();
+        assert_eq!(elements, 116, "the golden must be the whole image: {image}");
+
+        // ...in sorted-key order (`bytes` < `chars` < `ints` < `mixed` < `neg`, by name), which
+        // is what makes a flatmap image order-stable. Each needle is a key atom's own encoding
+        // (`SMALL_ATOM_UTF8_EXT` + length + the name), so it cannot match a value below it.
+        let mut previous = 0;
+        for key in [
+            "119,5,98,121,116,101,115",
+            "119,5,99,104,97,114,115",
+            "119,4,105,110,116,115",
+            "119,5,109,105,120,101,100",
+            "119,3,110,101,103",
+        ] {
+            let at = image.find(key).unwrap_or_else(|| panic!("key {key} in {image}"));
+            assert!(at > previous, "keys must be in sorted order: {key} in {image}");
+            previous = at;
+        }
+
+        // The atom batch must keep the names that make it a probe-stress: both shared-window
+        // pairs, both long names, the non-literal names and the length-limb edge.
+        let batch = find("etf/atom_name_batch_reencodes_byte_identically")
+            .expr()
+            .expect("an expression case");
+        for needle in [
+            "abcdefgh1",
+            "abcdefgh2",
+            "abcdefghijklmnop1",
+            "abcdefghijklmnop2",
+            "\"1abcdefgh\"",
+            "\"2abcdefgh\"",
+            "'Hello'",
+            "duplicate(254, $z)",
+            "duplicate(255, $z)",
+        ] {
+            assert!(batch.contains(needle), "the batch must carry {needle}: {batch}");
+        }
+
+        // The UTF-8 case's three names are the multi-byte ones, given as UTF-8 binaries.
+        let utf8 = find("etf/atom_utf8_names_reencode_byte_identically")
+            .expr()
+            .expect("an expression case");
+        for needle in ["日本語", "héllo", "ünïcode"] {
+            assert!(utf8.contains(needle), "the case must carry {needle}: {utf8}");
         }
     }
 }
