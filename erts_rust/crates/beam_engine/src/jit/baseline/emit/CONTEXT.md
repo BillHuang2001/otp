@@ -327,6 +327,26 @@ by construction).
   the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
   `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers
   live in `aggregate/list.rs`.
+- **A comparison `test` on two *boxed* operands is inlined only as far as its guard.** `compare_shape`
+  answers `Guard::Both` for two runtime operands, so the arm loads both, guards each as a small int and
+  word-compares; a rejection (either operand boxed — i.e. every structural `=:=`, `case`-clause bound
+  pattern included) falls through `emit_test_helper_branch` into **one `jit_test` call** whose whole body
+  is `cmp(a, b, ctx.atoms(module)).is_eq()` — a full `beam_term::compare` ordering walk, *not*
+  `compare::eq` (`../test_helper.rs`). The per-comparison cost is therefore one helper call plus the
+  entire structural walk.
+- **That walk allocates nothing and reads no atom name for two flat maps.** `beam_term::compare::maps::cmp_sorted_flatmaps`
+  borrows both keys/values slices (no pair list, no sort) after re-validating key order with one
+  `cmp_flatmap_keys` per adjacent pair, and `cmp_impl`'s raw-word identity test short-circuits every
+  small-int / atom / `NIL` leaf — while `cmp_flatmap_keys` compares atom **indices**, never names. So a
+  decoded copy compared against its original costs zero `AtomTable::name` reads, provided both sides
+  share one atom table (`beam_bifs`'s `binary_to_term` interns through a memoized image of the caller's
+  shared table and commits novel names at exactly the predicted indices).
+- **The canonical shape of that comparison is `copy_bound/etf_roundtrip`**, whose loop body
+  `case binary_to_term(B) of T -> …` the compiler lowers to exactly this test: a bound variable in a
+  pattern becomes a fresh var plus a `'=:='` guard (`lib/compiler/src/v3_core.erl:3800-3820`), which
+  `beam_ssa_codegen` turns into `{test,is_eq_exact,…}` (`lib/compiler/src/beam_ssa_codegen.erl:2092-2095`).
+  Nothing is planted per iteration for it — a `case` pushes no catch frame; the fail label is a static
+  `case_end` block (`families/exceptions`), taken only on a mismatch.
 
 ## The bitstring shape module (`bitstr_inline/`) — emission contract
 `bitstr_inline/` emits the sixteen `Bs*` lowerings — fifteen match-context shapes plus the `bs_create_bin` construction arm, whose **two shapes** (the private-append accumulator build and the bare build of `create_fresh.rs`) cover **four** routes (append, bit-granular, `binary all`, bare build) and whose helper calls all mutate no machine state; the per-shape predicates, the run-time guards and the helper-backed reasons are `../inlineset/CONTEXT.md`'s, and the file-by-file split is `bitstr_inline/CONTEXT.md`'s. This section owns only what an emitter change must keep.
