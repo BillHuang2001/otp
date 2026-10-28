@@ -1562,7 +1562,7 @@ fn a_tagged_down_with_a_heap_resident_tag_is_flushed_by_demonitor() {
         f.table
             .demonitor_flush(watcher, reference)
             .expect("the watcher is live"),
-        "the monitor still existed under that reference"
+        "the flush reports the removal (the DOWN resolved the monitor at the target's death)"
     );
     assert_eq!(
         f.mailbox_len(watcher),

@@ -313,6 +313,11 @@ pub struct AliasEntry {
 /// A `demonitor(Ref, [flush])` helper: it recognises the notification a [`MonitorRef`] produced, so
 /// the caller can drop it out of a mailbox.
 ///
+/// It is a **per-message** test, not a sweep: `ProcessTable::demonitor_flush` removes the **first**
+/// message this accepts and stops, which is ERTS's
+/// `erts_internal:flush_monitor_messages/3` under `Multi = false`
+/// (`erts/preloaded/src/erts_internal.erl:523-534`).
+///
 /// # The head is deliberately *not* inspected
 ///
 /// ERTS's flush is head-agnostic: `erts_internal:flush_monitor_messages/3`

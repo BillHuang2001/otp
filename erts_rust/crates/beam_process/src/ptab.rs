@@ -2188,13 +2188,38 @@ impl ProcessTable {
         Ok(true)
     }
 
-    /// `erlang:demonitor(Ref, [flush])`: [`ProcessTable::demonitor`] **and** the removal of any
-    /// already-queued DOWN for `reference` from `watcher`'s mailbox — **whatever its head is**.
+    /// `erlang:demonitor(Ref, [flush])`: [`ProcessTable::demonitor`] **and** the removal of **at
+    /// most one** already-queued DOWN for `reference` from `watcher`'s mailbox — **whatever its head
+    /// is**.
     ///
-    /// The monitor halves are dropped first (so the usual local/remote routing still happens),
-    /// then the mailbox is scanned with the queue cursor API and every message recognised by
-    /// [`payload_is_monitor_down_for`] as *this* reference's DOWN is removed. A fresh cursor is
-    /// derived after each removal because a removal shifts every later message down by one.
+    /// # The ERTS rules: no flush when the monitor was found, and at most ONE removal
+    ///
+    /// ERTS's `demonitor_2` (`erts/emulator/beam/bif.c:610-655`) traps to
+    /// `erts_internal:flush_monitor_messages/3` (`erts/preloaded/src/erts_internal.erl:515-534`)
+    /// **only** when the C `demonitor()` reported `am_false` (nothing on record under that
+    /// reference) or when it reported `am_true` **and** `Multi == am_true`; for a found monitor with
+    /// `Multi == am_false` it returns immediately and flushes nothing
+    /// (`case am_true: if (multi == am_true && flush) goto flush_messages; BIF_RET(res);`).
+    /// `Multi` is `am_true` only for the `ERTS_MON_TYPE_TIME_OFFSET` case (`bif.c:496-500`), i.e.
+    /// never for a process or port monitor — the only kinds this crate models.
+    ///
+    /// Both halves of that rule are observable from an ordinary Erlang program, so both are
+    /// honoured here:
+    ///
+    /// * **A found monitor flushes nothing.** This crate drops a monitor record (and its tag slot)
+    ///   at every DOWN site when the DOWN is created (see [`ProcessTable::demonitor`]'s note that a
+    ///   resolved monitor is no longer on record), so a DOWN *for this reference* cannot be queued
+    ///   while the monitor is still on record. Scanning anyway would remove a program-constructed
+    ///   5-tuple the oracle leaves alone: `R = monitor(process, P), self() ! {fake, R, a, b, c},
+    ///   demonitor(R, [flush])` keeps both the fake and the queue length at 2 on the oracle.
+    /// * **At most one message goes.** `flush_monitor_messages/3` with `Multi = false` removes the
+    ///   **first** matching `{_, Ref, _, _, _}` and returns `Res`; it recurses only for the
+    ///   `Multi = am_true` classes this crate does not model (a `time_offset` monitor's — see
+    ///   below). So the scan stops at the first match instead of sweeping the mailbox.
+    ///
+    /// The monitor halves are dropped first ([`ProcessTable::demonitor`], so the usual local/remote
+    /// routing still happens); only when none was on record is the mailbox scanned with the queue
+    /// cursor API.
     ///
     /// # Which messages are this monitor's DOWN
     ///
@@ -2211,6 +2236,11 @@ impl ProcessTable {
     /// The reference identity is the **sole** discriminator, so a *different* monitor's DOWN (any
     /// head), a message that is not a 5-tuple, and a 5-tuple carrying any other term at element 1
     /// all stay in the mailbox.
+    ///
+    /// **Not modelled**: the `Multi == am_true` classes — a `ERTS_MON_TYPE_TIME_OFFSET` monitor
+    /// (which this crate refuses at `monitor/2`'s type dispatch) and a `ERTS_MON_TYPE_PROC` monitor
+    /// still carrying `ERTS_ML_FLG_SPAWN_PENDING` (`bif.c:456-462`, a distributed spawn not yet
+    /// answered). Neither can be created here, so the multi-message sweep has no reachable trigger.
     ///
     /// # Return value
     ///
@@ -2230,30 +2260,28 @@ impl ProcessTable {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
-        let existed = self.demonitor(watcher, reference)?;
-        let removed = {
-            let Some(process) = self.get_mut(watcher) else {
-                return Ok(existed);
-            };
-            let mailbox = process.mailbox_mut();
-            let mut removed = false;
-            let mut cursor = mailbox.cursor();
-            loop {
-                let position = mailbox.position(cursor);
-                match mailbox.message_at(cursor).map(|message| message.payload()) {
-                    Some(payload) if payload_is_monitor_down_for(payload, reference) => {
-                        mailbox.remove_at(cursor);
-                        removed = true;
-                        // Positions shifted down by one: re-derive a cursor at the same index.
-                        cursor = mailbox.cursor_at(position);
-                    }
-                    Some(_) => mailbox.advance(&mut cursor),
-                    None => break,
-                }
-            }
-            removed
+        if self.demonitor(watcher, reference)? {
+            // The monitor was on record: ERTS's `am_true` + `Multi == am_false` arm returns without
+            // trapping to the flush at all (`bif.c:640-645`), so nothing is scanned.
+            return Ok(true);
+        }
+        let Some(process) = self.get_mut(watcher) else {
+            return Ok(false);
         };
-        Ok(existed || removed)
+        let mailbox = process.mailbox_mut();
+        let mut cursor = mailbox.cursor();
+        loop {
+            match mailbox.message_at(cursor).map(|message| message.payload()) {
+                Some(payload) if payload_is_monitor_down_for(payload, reference) => {
+                    // `flush_monitor_messages/3` with `Multi = false` removes the **first** match
+                    // and returns; the cursor stops here (`erts_internal.erl:523-534`).
+                    mailbox.remove_at(cursor);
+                    return Ok(true);
+                }
+                Some(_) => mailbox.advance(&mut cursor),
+                None => return Ok(false),
+            }
+        }
     }
 
     /// Removes the outgoing **remote** monitor `watcher` holds under `reference`, reporting
@@ -5304,6 +5332,47 @@ mod tests {
             table.demonitor_flush(ProcessId::new(999, 0), first),
             Err(BeamError::TermNotFound)
         ));
+    }
+
+    #[test]
+    fn demonitor_flush_of_a_live_monitor_removes_nothing() {
+        // ERTS's `demonitor_2` traps to `erts_internal:flush_monitor_messages/3` only for the
+        // `am_false` arm; a monitor that is still on record returns at `bif.c:640-645` without
+        // flushing. Observable: a program-built `{fake, Ref, a, b, c}` survives, and only a
+        // *second* flush (the record gone) takes it.
+        let (mut table, mut names) = table_and_names();
+        let fake = make_atom(names.intern("fake"));
+        let watcher = table.spawn_default().expect("watcher");
+        let target = table.spawn_default().expect("a live target");
+        let reference = table
+            .monitor(watcher, target, MonitorKind::Process)
+            .expect("both live");
+        let reference_term = reference
+            .to_eterm(table.get_mut(watcher).expect("watcher").heap_mut())
+            .expect("the watcher's heap holds a ref");
+        let payload = table
+            .get_mut(watcher)
+            .expect("watcher")
+            .heap_mut()
+            .tuple(&[fake, reference_term, make_small(1), make_small(2), make_small(3)])
+            .expect("the heap holds the tuple");
+        table
+            .deliver_simple(watcher, make_small(0), payload)
+            .expect("the watcher is live");
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 1);
+
+        // The monitor is on record ⇒ nothing is flushed, and the monitor half is still dropped.
+        assert!(table.demonitor_flush(watcher, reference).expect("watcher live"));
+        assert_eq!(
+            table.get(watcher).expect("watcher").mailbox().len(),
+            1,
+            "a found monitor flushes nothing"
+        );
+        assert!(table.get(watcher).expect("watcher").monitors().is_empty());
+
+        // The record is gone now, so the flush takes exactly that one message.
+        assert!(table.demonitor_flush(watcher, reference).expect("watcher live"));
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 0);
     }
 
     #[test]

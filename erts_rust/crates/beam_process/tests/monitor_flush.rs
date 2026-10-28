@@ -18,8 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! Integration evidence for **`erlang:demonitor(Ref, [flush])` being head-agnostic**: it must drop
-//! *this* monitor's DOWN **whatever its head is**, and only that one.
+//! Integration evidence for **`erlang:demonitor(Ref, [flush])`**: the head-agnostic pattern, the
+//! found-monitor short-circuit, and the one-shot removal — the three halves of ERTS's rule.
 //!
 //! # The two DOWN shapes
 //!
@@ -31,6 +31,21 @@
 //! which `erlang:demonitor/2`'s `[flush]` traps to, so a head test on the `'DOWN'` atom would leak
 //! a tagged DOWN into the caller's mailbox. That is the shape `gen_server`'s `mc_recv/5` leaves
 //! behind: it calls `demonitor(Mon, [flush])` right after the reply.
+//!
+//! # … plus the two rules around it
+//!
+//! The trap is reached **only** for the C `demonitor()`'s `am_false` arm (nothing on record under
+//! that reference) or an `am_true` with `Multi == am_true` — a class (time-offset / spawn-pending
+//! monitors) this crate cannot create. So:
+//!
+//! 1. **A found monitor flushes nothing** (`erts/emulator/beam/bif.c:630-645`: the `am_true` +
+//!    `Multi == am_false` arm returns without trapping). Every DOWN site in this crate drops the
+//!    monitor record when it creates the DOWN, so a DOWN for a *recorded* reference cannot be
+//!    queued anyway; scanning regardless would remove a program-constructed 5-tuple that the
+//!    oracle leaves alone (`oracle_a_found_monitor_flushes_nothing`).
+//! 2. **At most one message is removed**: `flush_monitor_messages/3` with `Multi = false` returns
+//!    after the first `{_, Ref, _, _, _}` it takes
+//!    (`oracle_flush_removes_at_most_one_matching_message`).
 //!
 //! # Identity is the sole discriminator
 //!
@@ -196,6 +211,11 @@ fn oracle_a_tagged_down_is_flushed_like_an_untagged_one() {
     // untagged one are queued separately and each `demonitor(Ref, [flush])` is measured on its
     // own. `message_queue_len` is 1 before and 0 after in **both** cases, and `demonitor/2`
     // answers `true` in both — the flush drops the message whatever its head is.
+    //
+    // The flush is reached in these shapes because the target's death **resolved** the monitor
+    // record: `demonitor/1` of it answers `false` afterwards (`tests/signals.rs` pins that), so the
+    // C takes its `am_false` arm and traps to `erts_internal:flush_monitor_messages/3`. A monitor
+    // that is *still* on record flushes nothing — see `oracle_a_found_monitor_flushes_nothing`.
     let expr = r#"
         Q = fun() -> element(2, erlang:process_info(self(), message_queue_len)) end,
         P1 = spawn(fun() -> receive go -> ok end end),
@@ -527,4 +547,272 @@ fn oracle_an_unflushed_tagged_down_still_arrives_and_flush_still_answers_true() 
         .demonitor_flush(watcher, reference)
         .expect("the watcher is live"));
     assert_eq!(f.mailbox_len(watcher), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 5: ERTS's found-monitor short-circuit — a live monitor flushes NOTHING
+// ---------------------------------------------------------------------------
+#[test]
+fn oracle_a_found_monitor_flushes_nothing() {
+    // Oracle probe (OTP 29.1.2 / erts-17.1.1):
+    //   P = spawn(fun() -> receive go -> ok end end),
+    //   R = erlang:monitor(process, P),
+    //   self() ! {fake, R, a, b, c}, self() ! {fake2, R, a, b, c},
+    //   `demonitor(R, [flush])` ⇒ `true`, `message_queue_len` **2 → 2**, heads `[fake, fake2]`
+    //   — the monitor is on record, so the C returns from `demonitor_2` without trapping to
+    //   `erts_internal:flush_monitor_messages/3` (`bif.c:640-645`) and the program-built 5-tuples
+    //   stay.
+    //   A **second** `demonitor(R, [flush])` (now the `am_false` arm: nothing on record) ⇒ `true`
+    //   and exactly one message gone: 2 → 1, heads `[fake2]`.
+    let expr = r#"
+        Q = fun() -> element(2, erlang:process_info(self(), message_queue_len)) end,
+        Heads = fun() -> [element(1, M) || M <- element(2, erlang:process_info(self(), messages))] end,
+        P = spawn(fun() -> receive go -> ok end end),
+        R = erlang:monitor(process, P),
+        self() ! {fake, R, a, b, c},
+        self() ! {fake2, R, a, b, c},
+        B = Q(), D1 = erlang:demonitor(R, [flush]), A1 = Q(), H1 = Heads(),
+        D2 = erlang:demonitor(R, [flush]), A2 = Q(), H2 = Heads(),
+        io:format("~p|~p|~p|~p~n~p|~p|~p~n", [B, D1, A1, H1, D2, A2, H2])
+    "#;
+    if !expect_oracle(expr, "2|true|2|[fake,fake2]\ntrue|1|[fake2]") {
+        return;
+    }
+    let mut f = Fixture::new();
+    let fake = f.atom_term("fake");
+    let fake2 = f.atom_term("fake2");
+    let a = f.atom_term("a");
+    let b = f.atom_term("b");
+    let c = f.atom_term("c");
+    let watcher = f.table.spawn_default().expect("a watcher process");
+    let sender = f.table.spawn_default().expect("a sender process");
+    let mut scratch = Heap::new(64).expect("a scratch arena");
+
+    // A monitor on a **live** target: the record exists, so the flush must not run at all.
+    let target = f.table.spawn_default().expect("a live target process");
+    let reference = f
+        .table
+        .monitor(watcher, target, MonitorKind::Process)
+        .expect("both pids are live");
+    let reference_term = reference
+        .to_eterm(&mut scratch)
+        .expect("the scratch arena holds a ref");
+    deliver_tuple(
+        &mut f,
+        &mut scratch,
+        watcher,
+        sender,
+        &[fake, reference_term, a, b, c],
+    );
+    deliver_tuple(
+        &mut f,
+        &mut scratch,
+        watcher,
+        sender,
+        &[fake2, reference_term, a, b, c],
+    );
+    assert_eq!(f.mailbox_len(watcher), 2, "the two program-built 5-tuples");
+
+    // `demonitor(R, [flush])` on a recorded monitor: `true`, and **nothing** is flushed (the
+    // oracle's 2 → 2). The monitor halves are dropped all the same.
+    assert!(
+        f.table
+            .demonitor_flush(watcher, reference)
+            .expect("the watcher is live"),
+        "`demonitor(R, [flush])` => true"
+    );
+    assert_eq!(
+        f.mailbox_len(watcher),
+        2,
+        "a found monitor flushes nothing: the oracle's message_queue_len is 2 before and after"
+    );
+    assert_eq!(
+        f.queued_heads(watcher),
+        vec![fake, fake2],
+        "both program-built 5-tuples stayed, in queue order"
+    );
+    assert!(
+        f.table
+            .get(watcher)
+            .expect("the watcher is live")
+            .monitors()
+            .is_empty(),
+        "the monitor half was removed, so nothing is on record any more"
+    );
+    assert!(
+        f.table
+            .get(target)
+            .expect("the target is still live")
+            .monitored_by()
+            .is_empty(),
+        "and the target's incoming entry went with it"
+    );
+
+    // The second flush takes the `am_false` arm and removes exactly the **first** match (the
+    // oracle's 2 → 1 with `[fake2]` left).
+    assert!(
+        f.table
+            .demonitor_flush(watcher, reference)
+            .expect("the watcher is live"),
+        "a queued message was removed"
+    );
+    assert_eq!(f.mailbox_len(watcher), 1, "one removed, one left");
+    assert_eq!(
+        f.queued_heads(watcher),
+        vec![fake2],
+        "the FIRST match went; the later one stayed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6: a fake queued *before* the real DOWN is the one flushed
+// ---------------------------------------------------------------------------
+#[test]
+fn oracle_a_fake_queued_before_a_tagged_down_is_the_one_flushed() {
+    // Oracle probe (OTP 29.1.2 / erts-17.1.1):
+    //   R = erlang:monitor(process, P, [{tag, mytag}]), self() ! {fake, R, a, b, c},
+    //   P ! go, timer:sleep(120),
+    //   `demonitor(R, [flush])` ⇒ `true`, `message_queue_len` 2 → 1, and the surviving message is
+    //   the **real** tagged DOWN `{mytag, Ref, process, Pid, normal}` — the flush removes the first
+    //   `{_, Ref, _, _, _}` (the fake) and stops.
+    let expr = r#"
+        Q = fun() -> element(2, erlang:process_info(self(), message_queue_len)) end,
+        P = spawn(fun() -> receive go -> ok end end),
+        R = erlang:monitor(process, P, [{tag, mytag}]),
+        self() ! {fake, R, a, b, c},
+        P ! go, timer:sleep(120),
+        B = Q(), D = erlang:demonitor(R, [flush]), A = Q(),
+        M = receive {H, RR, K, T, RS} -> {H, is_reference(RR), K, is_pid(T), RS}
+            after 1000 -> timeout end,
+        io:format("~p|~p|~p|~p~n", [B, D, A, M])
+    "#;
+    if !expect_oracle(expr, "2|true|1|{mytag,true,process,true,normal}") {
+        return;
+    }
+    let mut f = Fixture::new();
+    let mytag = f.atom("mytag");
+    let process = f.atom("process");
+    let normal = f.atom_term("normal");
+    let fake = f.atom_term("fake");
+    let a = f.atom_term("a");
+    let b = f.atom_term("b");
+    let c = f.atom_term("c");
+    let watcher = f.table.spawn_default().expect("a watcher process");
+    let sender = f.table.spawn_default().expect("a sender process");
+    let mut scratch = Heap::new(64).expect("a scratch arena");
+
+    let target = f.table.spawn_default().expect("a target process");
+    let reference = f
+        .table
+        .monitor_with_tag(watcher, target, MonitorKind::Process, Some(make_atom(mytag)))
+        .expect("both pids are live");
+    // The fake goes in **first**, so the real DOWN is queued behind it (the target's death is what
+    // resolves the monitor record, which is why the flush runs at all).
+    let reference_term = reference
+        .to_eterm(&mut scratch)
+        .expect("the scratch arena holds a ref");
+    deliver_tuple(
+        &mut f,
+        &mut scratch,
+        watcher,
+        sender,
+        &[fake, reference_term, a, b, c],
+    );
+    f.table.terminate(target, normal).expect("the target is live");
+    assert_eq!(f.mailbox_len(watcher), 2, "the fake, then the real tagged DOWN");
+
+    assert!(
+        f.table
+            .demonitor_flush(watcher, reference)
+            .expect("the watcher is live"),
+        "`demonitor(R, [flush])` => true"
+    );
+    assert_eq!(
+        f.mailbox_len(watcher),
+        1,
+        "the flush removed ONE message (the oracle's 2 → 1)"
+    );
+    assert_eq!(
+        assert_down(f.sole_payload(watcher), make_atom(mytag), process, normal),
+        reference,
+        "the survivor is the real tagged DOWN `{{mytag, Ref, process, Pid, normal}}`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7: the flush removes at most ONE matching message
+// ---------------------------------------------------------------------------
+#[test]
+fn oracle_flush_removes_at_most_one_matching_message() {
+    // Oracle probe (OTP 29.1.2 / erts-17.1.1): a **bare** `make_ref/0` reference (no monitor is
+    // recorded, so the `am_false` arm is taken) with two program-built `{_, Ref, _, _, _}` shapes
+    // ⇒ `demonitor(R, [flush])` answers `true`, `message_queue_len` 2 → 1 and the survivor's head
+    // is `f2`. `erts_internal:flush_monitor_messages/3` returns after the first match when
+    // `Multi = false` (`erts_internal.erl:523-534`).
+    let expr = r#"
+        Q = fun() -> element(2, erlang:process_info(self(), message_queue_len)) end,
+        Heads = fun() -> [element(1, M) || M <- element(2, erlang:process_info(self(), messages))] end,
+        R = make_ref(),
+        self() ! {f1, R, a, b, c},
+        self() ! {f2, R, a, b, c},
+        B = Q(), D = erlang:demonitor(R, [flush]), A = Q(), H = Heads(),
+        io:format("~p|~p|~p|~p~n", [B, D, A, H])
+    "#;
+    if !expect_oracle(expr, "2|true|1|[f2]") {
+        return;
+    }
+    let mut f = Fixture::new();
+    let f1 = f.atom_term("f1");
+    let f2 = f.atom_term("f2");
+    let a = f.atom_term("a");
+    let b = f.atom_term("b");
+    let c = f.atom_term("c");
+    let watcher = f.table.spawn_default().expect("a watcher process");
+    let sender = f.table.spawn_default().expect("a sender process");
+    let mut scratch = Heap::new(64).expect("a scratch arena");
+
+    // `make_ref/0`'s analogue: a reference minted from the table's shared space that backs no
+    // monitor (`ProcessTable::next_reference`).
+    let bare = f.table.next_reference();
+    assert!(
+        !f.table
+            .demonitor(watcher, bare)
+            .expect("the watcher is live"),
+        "a bare reference backs no monitor, so the flush's `am_false` arm is the one taken"
+    );
+    let bare_term = bare
+        .to_eterm(&mut scratch)
+        .expect("the scratch arena holds a ref");
+    deliver_tuple(
+        &mut f,
+        &mut scratch,
+        watcher,
+        sender,
+        &[f1, bare_term, a, b, c],
+    );
+    deliver_tuple(
+        &mut f,
+        &mut scratch,
+        watcher,
+        sender,
+        &[f2, bare_term, a, b, c],
+    );
+    assert_eq!(f.mailbox_len(watcher), 2);
+
+    assert!(
+        f.table
+            .demonitor_flush(watcher, bare)
+            .expect("the watcher is live"),
+        "a matching message was removed"
+    );
+    assert_eq!(
+        f.mailbox_len(watcher),
+        1,
+        "at most one message is flushed (the oracle's 2 → 1)"
+    );
+    assert_eq!(
+        f.queued_heads(watcher),
+        vec![f2],
+        "the first match went and the scan stopped there"
+    );
 }
