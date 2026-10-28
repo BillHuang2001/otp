@@ -401,6 +401,56 @@ impl PortRegistry {
         meta.owner = to;
         Ok(())
     }
+
+    // -- erlang:link/1, erlang:unlink/1 on a port -------------------------------
+
+    /// Adds `pid` to the port's link set — `erlang:link(Port)`.
+    ///
+    /// The port's links are **real state** in this runtime: [`PortExtras::links`] is what
+    /// [`PortRegistry::info`](super::PortRegistry) reports as `port_info(Port, links)` and what
+    /// the close-time snapshot walks to owe each link its `{'EXIT', Port, Reason}`
+    /// ([`super::exit`]). A port never re-connected has exactly one link — its owner
+    /// (`open_port/2`'s own link) — which is why the set is materialized as `[owner]` on the
+    /// first write rather than starting empty.
+    ///
+    /// A port this registry no longer holds answers nothing and changes nothing: ERTS discards
+    /// a link to a dead port and still reports success (`erlang:link/1` on the term of a closed
+    /// port ⇒ `true`, measured on OTP 29.1.2), which is the same rule the pid half of the BIF
+    /// applies to a pid no process backs.
+    pub(crate) fn link_port(&mut self, number: u64, pid: ProcessId) {
+        let Some(meta) = self.meta.get(&number) else {
+            return;
+        };
+        let owner = meta.owner;
+        // `open_port/2`'s own link is the set's first element; a repeated link adds nothing.
+        let links = self.extras.links.entry(number).or_insert_with(|| vec![owner]);
+        if !links.contains(&pid) {
+            links.push(pid);
+        }
+    }
+
+    /// Removes `pid` from the port's link set — `erlang:unlink(Port)`.
+    ///
+    /// This is the C's `erts_port_unlink` (`bif.c:1280`): the port's **connected** process
+    /// (`desc->connected`, this runtime's [`PortMeta::owner`](super::PortMeta)) is deliberately
+    /// **not** touched, so an unlinked port keeps delivering its data to the same process and
+    /// simply owes it no `'EXIT'` on close. The link set is materialized as `[owner]` first, so
+    /// the owner's own link is removable too (a port never re-connected reports `[]` afterwards,
+    /// as the oracle's does).
+    ///
+    /// A port this registry no longer holds is a successful no-op (`erlang:unlink/1` on the term
+    /// of a closed port ⇒ `true`, measured on OTP 29.1.2) — there is no link left to remove.
+    pub(crate) fn unlink_port(&mut self, number: u64, pid: ProcessId) {
+        let Some(meta) = self.meta.get(&number) else {
+            return;
+        };
+        let owner = meta.owner;
+        self.extras
+            .links
+            .entry(number)
+            .or_insert_with(|| vec![owner])
+            .retain(|linked| *linked != pid);
+    }
 }
 
 /// `erlang:port_connect/2`'s whole body, shared by its two entry points.

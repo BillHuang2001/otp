@@ -261,7 +261,7 @@ impl PortRegistry {
                             meta.async_callers.remove(id).unwrap_or(meta.owner)
                         }
                     };
-                    Some((recipient, meta.owner, meta.stream, meta.line))
+                    Some((recipient, meta.stream, meta.line))
                 }
                 None => fallbacks
                     .iter()
@@ -277,10 +277,10 @@ impl PortRegistry {
                                 .copied()
                                 .unwrap_or(snapshot.owner),
                         };
-                        (recipient, snapshot.owner, snapshot.stream, snapshot.line)
+                        (recipient, snapshot.stream, snapshot.line)
                     }),
             };
-            let Some((recipient, owner, stream, line)) = resolved else {
+            let Some((recipient, stream, line)) = resolved else {
                 if let CompletionEvent::InetAsync {
                     result: InetAsyncResult::Accepted { fd },
                     ..
@@ -295,10 +295,27 @@ impl PortRegistry {
                 CompletionEvent::InetAsync {
                     id,
                     result: InetAsyncResult::Accepted { fd },
-                } => CompletionEvent::InetAsync {
-                    id,
-                    result: self.adopt_accepted(port, fd, owner, stream, line),
-                },
+                } => {
+                    // The adopted port's **connected** process is the accept's **issuer** — the
+                    // C's `ErlDrvTermData owner = driver_caller(desc->inet.port)`
+                    // (`inet_drv.c:12232`) handed to `tcp_inet_copy(desc, s, owner, &err)`
+                    // (`:12236`), which calls `driver_create_port(port, owner, "tcp_inet", …)`
+                    // (`:11834`); the queued async accept does the same with the operation's own
+                    // `desc->inet.opt->caller` (`:13509`), and the multi-accept path with its
+                    // `driver_caller(desc->inet.port)` (`:12198`). It is **not** the listener's
+                    // owner: any
+                    // process may accept on another process's listening socket (that is exactly
+                    // what `ranch_acceptor` does), and the owner the new port must land on is the
+                    // one `erlang:port_info(S, connected)` reports — `inet.erl`'s
+                    // `tcp_controlling_process/2` compares it against `self()` before it will
+                    // transfer the socket, and this runtime's `{active, …}` delivery reads the
+                    // same `PortMeta.owner`. Naming the listener's owner here makes the acceptor
+                    // a stranger to its own socket (`{error, not_owner}`).
+                    CompletionEvent::InetAsync {
+                        id,
+                        result: self.adopt_accepted(port, fd, recipient, stream, line),
+                    }
+                }
                 other => other,
             };
             events.push(PortEvent::Completion {
@@ -314,8 +331,16 @@ impl PortRegistry {
     }
 
     /// Adopts the connection descriptor an `accept` operation took off a listening socket into a
-    /// new `tcp_inet` port owned by the same process — the runtime half of the C's
-    /// `tcp_inet_copy` (`inet_drv.c:11834`), which the driver cannot do itself.
+    /// new `tcp_inet` port **owned by the process that issued the accept** — the runtime half of
+    /// the C's `tcp_inet_copy` (`inet_drv.c:11834`), which the driver cannot do itself.
+    ///
+    /// `owner` is that issuer, never the **listener's** owner: it is the C's
+    /// `ErlDrvTermData owner = driver_caller(desc->inet.port)` (`inet_drv.c:12232`) that
+    /// `driver_create_port(port, owner, "tcp_inet", …)` (`:11834`) makes the new port's connected
+    /// process, so an acceptor that does not own the listening socket — `ranch_acceptor` accepts on
+    /// the `ranch_conns_sup`'s listener — gets a socket of its own. The value is the drain's
+    /// resolved recipient (`sweep_completions`): the accept's `async_callers` entry for the queued
+    /// route, `command_caller` for a synchronous `{inet_reply, …}`.
     ///
     /// The descriptor is **owned by the completion** the moment it is staged
     /// ([`InetAsyncResult::Accepted`]): `beam_io` never stores it and never closes it, so this is
