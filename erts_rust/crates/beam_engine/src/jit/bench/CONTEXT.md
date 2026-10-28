@@ -247,8 +247,9 @@ shared and heavily loaded.
 runtime-level regression: in this in-process, non-blocking loopback the baseline tier is **faster**,
 min-of-3 interpreter **13337.7 ns/op** vs baseline-jit **9268.9 ns/op** (≈ **1.44×**, i.e. ≈ **208.4
 ns** vs ≈ **144.8 ns** per `send` + `receive` round-trip over 64 rounds). The per-round instruction mix
-is **eight** deopts (`allocate_heap`, `put_tuple2`, `send`, `loop_rec`, `remove_message`, the two
-`Y`-operand `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`) against an inlined remainder
+is seven interpreter-step sites (`put_tuple2`, `send`, `loop_rec`, `remove_message`, the two
+`Y`-operand `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`) — the round's `allocate_heap`
+frame admission is an in-block helper call, not one of them — against an inlined remainder
 (the entry clause `is_eq_exact`, four `move`s, `is_tuple`/`test_arity`, two `get_tuple_element`s,
 `swap`, `call_last`), and here the inlined work outweighs the deopt overhead — so the shape does
 **not** reproduce the runtime-level 2.15×–3.31× default-tier deficit on the two-process `send_recv`
