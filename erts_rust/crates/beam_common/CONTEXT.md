@@ -254,6 +254,11 @@ those with `node`/`serial`, which M1 keeps at `0`, so the guarantee is over *loc
     the `len == 64` image, the rebuilt-from-parts context, the verbatim non-zero buffer tail and the
     `len > BLOCK_LEN` → `BeamError::BadArg` refusal; and the C buffering asymmetry (`len == 0` after
     one 64-byte update, `len == 64` unhashed after two 32-byte ones).
+  - `md5` also carries two `#[ignore]`d **diagnostics** (measurement, not assertion):
+    `print_beam_digests` (`MD5_BEAM_DIR=<dir>`) prints `hex path` for every `*.beam` under a directory,
+    asserting the one-shot and 1000-byte-streaming forms agree, so a corpus digest list can be diffed
+    across builds and against `md5sum`; `md5_throughput_microbench` (`MD5_BENCH_ROUNDS`, default 32)
+    hashes a 1 MiB payload in a loop for `perf stat -e cpu_core/instructions/u`.
 - Doctests: every public item carries a runnable example (`cargo test` runs them; do **not** pass
   `--lib` to the crate gate, which would skip them).
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_common` GREEN.
