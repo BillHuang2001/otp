@@ -51,9 +51,13 @@
 //! ## OTP-version skew
 //!
 //! The table describes *this* source tree (OTP 30). A live oracle of a
-//! different OTP release differs, because `ops.tab` itself differs; the test
-//! module of `super::erts_debug` therefore carries an explicit, documented
-//! exception set for the release skew and pins this roster's own length.
+//! different OTP release differs, because `ops.tab` itself differs, so the test
+//! module of `super::erts_debug` calibrates the comparison against a
+//! per-oracle-version `COHORTS` table: for each `(otp_release, erts version)`
+//! pair it records the rows this roster has and that oracle lacks, plus the
+//! rows respelled between the two releases. An oracle matching no cohort fails
+//! loudly instead of being compared with "no skew", and this roster's own
+//! length is pinned.
 
 /// The `opc[]` roster in dispatch order: `INSTRUCTIONS[N]` is the name of
 /// instruction `N`.
