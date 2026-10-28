@@ -60,6 +60,10 @@ use libc::{c_char, c_void};
 /// The **live-`erl` oracle harness** (the escript spawn/timeout/skip policy + the `PATH` probe) the
 /// C-driver suites share; each suite keeps its own escript text.
 pub mod oracle;
+/// The **TCP server harness** (`inet_server`'s end-to-end data path): a `Poller` + `PortRegistry`
+/// + `DriverRegistry` rig, the numeric `INET_REQ_*` control vocabulary, the condition-pumped
+/// round recipes and the raw-`port_control` oracle dump.
+pub mod server;
 /// The header the include-directory search keys on. `erl_driver.h` ships in the **same** directory
 /// as `erl_nif.h`, so one probe resolves the include directory for both ABIs.
 const HEADER: &str = "erl_driver.h";
