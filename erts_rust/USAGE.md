@@ -645,8 +645,9 @@ $ erts_rust/target/release/differential run wire/new_fun_ext_encode
 Useful companions: `differential list --by-contract` (per-contract split), `differential compare
 'EXPR'` (ad-hoc), `differential suite --strict --allowlist known-gaps.txt` (the binary's own suite).
 `run` accepts `--out-file <path>`, which is how the fast route works: one `differential run`
-per id at 16-way parallelism, then `differential merge --from <dir> --allowlist known-gaps.txt`
-(seconds, no re-run). Two caveats from the harness docs: run the sweep with **cwd = repository
+per id at 12-way parallelism, then `differential merge --from <dir> --allowlist known-gaps.txt
+--drift-allowlist known-drift.txt` (seconds, no re-run; 529 s measured for the whole corpus on a
+loaded shared host). Two caveats from the harness docs: run the sweep with **cwd = repository
 root** (the `selfhost/` expression cases compile a relative `lib/stdlib/src/*.erl`), and give each
 case its own private `TMPDIR` and a `setsid -w` session.
 

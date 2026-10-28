@@ -107,12 +107,18 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   Programming-Language-Benchmarks. Investigate them read-only; write through the task's tracked worktrees.
 
 ## Status
-- **Crate tree complete:** 15 crates under `crates/` + 2 tooling crates under `tools/`, each with its
+- **Crate tree complete:** 16 crates under `crates/` + 2 tooling crates under `tools/`, each with its
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
-  --all-targets` (warning-free); test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  --workspace --no-fail-fast`. The suite is green (**~13,300 passed / 0 failed** across all 15 crates;
-  ~45 min wall on a loaded host, so run it in crate chunks when iterating).
+  --all-targets` (**warning-free: 0 warnings**); test with `scripts/cargo.sh test --manifest-path
+  erts_rust/Cargo.toml --workspace --no-fail-fast`. The suite is green — **0 failed** (`14 559 passed /
+  85 ignored` across the 18 packages). No test is red on account of the host oracle: the tree's frozen
+  values (`system_info(version)` `17.1`, `stdlib` `8.1`, the 248-row instruction roster) are asserted
+  unconditionally, and only the *oracle* leg tolerates a different `erts` patch, so an `erts-17.1.1`
+  host is green. Two caveats: `tools/differential/tests/cli.rs` carries four end-to-end ratchet tests
+  that each sweep the whole corpus serially (multi-hour, and pre-existing — the 12-way sweep below is
+  the same check at ~9 min, so exclude them when iterating), and the crate-chunked route
+  (`-p <crate>`) is how to keep an iteration loop short.
 - **CI runs the workspace and the gate:** `.github/workflows/erts_rust.yml` (path-triggered on
   `erts_rust/**` and on the workflow file itself, plus `workflow_dispatch`) installs the pinned
   toolchain (`rust-toolchain.toml`), then runs `cargo build --workspace --all-targets`,
@@ -159,8 +165,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   **oracle-side crash flake** (the system `erl` dies by signal on ~2 of 5 solo runs; the Rust side is
   correct) — an OTP 29.1.1 upstream defect, a corpus-harness issue, not a runtime divergence.
   The full sweep is time-boxed: a serial `gate.sh` boots every CLI case (~2.5 s each, >100 min), so
-  the gate-equivalent route is `differential run <case-id>` at 16-way parallelism
-  (`compare.rs::verdict_with` folds the oracle-vs-golden drift check into every verdict).
+  the gate-equivalent route is `differential run <case-id>` at 12-way parallelism (~9 min for the whole
+  corpus on a loaded shared host; `compare.rs::verdict_with` folds the oracle-vs-golden drift check into
+  every verdict).
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry **667**
   keys = 556 declared + 111 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
   `MemoryHook::memory`, …): **367 are served in-crate** and **189 are seam-backed** (a typed
@@ -169,28 +176,25 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `beam_bifs/tests/roster_audit.rs` + `tests/seam_census.rs`**, so it cannot drift again.
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
   in `tools/bench/results/`) and in `BOTTLENECKS.md` §0, which names the **three non-interchangeable
-  records** and says which one is current — read it there rather than duplicating numbers. The current
-  record is **m20** and names both sides (sys = OTP 29.1.1/erts-17.1; rust = `beam_rt` at its default
-  baseline-JIT tier). Its marginals use a **paired** estimator: each round samples the N-op and the
-  0-op pass back to back and takes the median paired difference, which replaced a non-interleaved
-  schedule that had overstated every gap by up to ~56×. **m20 headline rust/sys ratios** (m19 in
-  parentheses): startup p50 **1.559×** (2.519) / p99 **1.553×** (2.513); compute loop **1.102×**
-  (1.706); `list_walk` **5.827×** (7.991); `gc_bound/churn` **5.564×** (14.114); `binary_append`
-  **11.340×** (16.250); `copy_bound` **1.785/6.477/3.080/2.890×**; `gc_class` **5.725/6.524/15.262×**;
-  `foreign` **8.572/11.595/13.906/16.976×** — **6.58/6.96/12.08/13.26×** after the bitstring inline
-  set landed; `file_io/handle_rw` **0.287×** (rust 3.5× faster) and `write_read` **0.458×** (rust
-  wins); `slice` wall **1.410×**, baseline peak RSS **0.949×** (rust's boot now peaks *below* the
-  oracle's), `erlang:memory(total)` **0.197×**. The honest residuals are published, not hidden: the
-  tier glue (`Machine::step_instruction_inner` / `enter_in_block` / `jit_step_one`, 18–25 % of
-  samples), allocator churn (14–22 %) and the GC root walk (14–27 %) are the next levers, and a
-  self-recursive BIF-free tail loop that never pre-empts grows its off-heap payload without a park
-  (bounded by `BEAM_RT_TIER=interpreter`) — see `BOTTLENECKS.md`. Measurable target
-  projects: `cowboy` **198 476 req/s** (p99 0.75 ms), `erlc` **9.919 files/s**, `elixir`
-  **4.709 files/s**, `khepri` (`rebar3 eunit` 81.0 s) and `plb` (dotnet 9 via the driver's
-  version-aware scan, wall 67.7 s); `emqx` skips honestly (`skipped(emqx-requires-otp-28)` — the
-  checkout pins OTP 28, the host is OTP 29.1.1). Load is recorded before/after every run: **the host
-  is shared**, so read the ratios and the deterministic `case_*_ops/calls/elements` counters, never
-  the absolute wall times. The four `foreign/*` rows are **engine-tier**: per call they cross **0**
+  records** and says which one is current — read it there rather than duplicating numbers. The
+  artifact-backed records are **m19** (the full suite behind `RESULTS.md` §2/§3 and the external
+  targets), **m21** (the GC before-record plus the eunit rows) and **m22** (the newest, the GC
+  after-record); a figure quoted without one of those artifacts behind it is not a record. Each record
+  names both sides (its own `sys` oracle and `beam_rt` at its default baseline-JIT tier) and its
+  marginals use a **paired** estimator: each round samples the N-op and the 0-op pass back to back and
+  takes the median paired difference, which replaced a non-interleaved schedule that had overstated
+  every gap by up to ~56×. Load is recorded before/after every run: **the host is shared**, so read the
+  ratios and the deterministic `case_*_ops/calls/elements` counters, never the absolute wall times.
+  The **direction** is stable across records: rust is slower on the compute/`list_walk`/`copy_bound`/
+  `gc_*`/`binary_append` rows and faster on the `file_io` rows (`handle_rw`, `write_read`), with `slice`
+  wall and baseline peak RSS within ~1×–1.5× of the oracle. The honest residuals are published, not
+  hidden: the tier glue (`Machine::step_instruction_inner` / `enter_in_block` / `jit_step_one`),
+  allocator churn and the GC root walk are the next levers, and a self-recursive BIF-free tail loop that
+  never pre-empts grows its off-heap payload without a park (bounded by `BEAM_RT_TIER=interpreter`) —
+  see `BOTTLENECKS.md`. Measurable target projects: `cowboy`, `erlc`, `elixir`, `khepri`, `plb` and
+  `emqx`, whose per-target figures, `sys`/`rust` rows and skip reasons live in
+  `tools/bench/RESULTS.md` (the `emqx` checkout pins OTP 28, so its row skips honestly as
+  `skipped(emqx-requires-otp-28)`). The four `foreign/*` rows are **engine-tier**: per call they cross **0**
   BIFs (`to_lower`, `capitalize_token`), **4** (`iolist_to_binary/1`, `encode`) and **16**
   (`bit_size/1`, `decode`), so ~90–100 % of each residual is the baseline tier's per-instruction
   machinery and `beam_bifs`/`beam_term`/`beam_alloc` cannot close it — the live per-frame split is
@@ -241,8 +245,12 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `beam_rt`/`beam_bifs` from an instruction and every tier funnels through
   `families::records::local_definition`; several
   structured-raise-reason degradations; the datagram/inet data path (`gen_udp:send/4`,
-  `inet:getstat/1`, `gen_tcp:connect/3` and `listen/2`); depth of live distribution interop. Every one
-  returns a typed error, never a wrong result.
+  `inet:getstat/1`, `gen_tcp:connect/3` and `listen/2`); depth of live distribution interop — `dist`/
+  `dist_extra` carry the live two-node loopback now, so what remains is depth, not absence; and the
+  `-eval` tree-walking evaluator's **application-nesting budget** (`beam_rt/src/eval/nesting.rs`: past
+  512 nested fun applications it compiles the rest, so a 50 000-deep self-recursive named fun answers
+  like the oracle, and past 16 nested *compiled* closures it raises a documented `unsupported`). Every
+  one returns a typed error, never a wrong result.
 - **Registered built-in drivers:** the three static `driver_tab.c` names — `tcp_inet`, `udp_inet`,
   `ram_file_drv` — are registered and `{spawn_driver,Name}` resolves through that membership gate
   (`fd`/`efile` answer `badarg` on the oracle too, and a refused name consumes no port id).
@@ -277,6 +285,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - `crates/beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas, term ops
 - `crates/beam_alloc/` → allocators (`erts_alloc` replacement), carriers, process heap / bump allocator
 - `crates/beam_codec/` → External Term Format (ETF) encode/decode (tags, `VERSION_MAGIC 131`)
+- `crates/beam_deflate/` → zlib 1.3.2 in safe Rust (`deflate`/`inflate`/`checksum`): the one encoder behind `beam_codec`'s ETF `COMPRESSED` tag and `beam_bifs`'s `zlib` BIFs
 - `crates/beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `crates/beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`) + layout-frozen structs
 - `crates/beam_loader/` → `.beam` file parsing, loader, `ops.tab` transforms, superinstructions

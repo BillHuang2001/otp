@@ -5,8 +5,10 @@ the mechanism, **what has already been tried and rejected**, and the next concre
 Written so a later round can pick a lever without re-measuring a dead end — see §5 for the
 consolidated rejected list before proposing anything.
 
-Every figure names **both sides**: `sys` = the system ERTS (`erl` on `PATH`, **Erlang/OTP 29.1.1 /
-erts-17.1**), `rust` = `erts_rust/target/release/beam_rt` at its **default baseline-JIT tier**.
+Every figure names **both sides**: `sys` = the system ERTS (`erl` on `PATH`; the host oracle is
+**Erlang/OTP 29.1.2 / erts-17.1.1**, while the records up to m19 measured against OTP 29.1.1 /
+erts-17.1 — a record's own load line and provenance note names its side, so never mix two records'
+`sys` columns), `rust` = `erts_rust/target/release/beam_rt` at its **default baseline-JIT tier**.
 Where a measurement is a **within-`beam_rt` A/B** (two rust builds) or a **within-crate** figure, the
 entry says so explicitly — those are not cross-runtime ratios.
 
