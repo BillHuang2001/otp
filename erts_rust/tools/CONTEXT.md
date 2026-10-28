@@ -47,10 +47,12 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `unsafe` is forbidden in both crates.
 
 ## Status
-- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=3463 agree=3462
-  mismatch=0 unsupported=1 skipped=0` (`gate.sh` is authoritative and always runs a strict,
-  allowlisted `differential suite`; re-run it for the live per-contract split, or `differential list
-  --by-contract` for the static one — do not copy a per-contract table into any CONTEXT.md, it drifts).
+- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=3469 agree=3465
+  mismatch=0 unsupported=1 skipped=0 oracle_drift=3` with `ratchet: allowlist=known-gaps.txt allowed=1
+  unauthorized=0 stale=0` and `drift: allowlist=known-drift.txt allowed=3 unauthorized=0 stale=0` ⇒ gate
+  exit `0` (`gate.sh` is authoritative and always runs a strict, allowlisted `differential suite`; re-run
+  it for the live per-contract split, or `differential list --by-contract` for the static one — do not
+  copy a per-contract table into any CONTEXT.md, it drifts).
   The single recorded capability gap (`known-gaps.txt`) is `wire/new_fun_ext_encode` (A.5, unclosable
   by design). One A.4 case (`driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail`) exposes an
   oracle-side crash flake (~2 of 5 solo runs kill the system `erl` by signal) — a corpus-harness defect.
@@ -65,14 +67,14 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
   measured via `beam_rt`'s `examples/perf_bif.rs`.
 
 ## Routing Table
-- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module`/`ModuleEnv` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`; `ModuleEnv` additionally carries an explicit spawn environment, through which the compiled dir reaches the code path), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 3463 cases), JSON reports
+- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module`/`ModuleEnv` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`; `ModuleEnv` additionally carries an explicit spawn environment, through which the compiled dir reaches the code path), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 3469 cases), JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`, Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX, `erlc` compiler), system-ERTS baseline, cross-runtime (`--runtime all`) comparison, result store + `compare`
 
 ## Notes for Agents
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
 - Oracle is the system Erlang on `PATH` (here OTP 29.1.2 / erts-17.1.1, while the tree pins OTP `30.0-rc0` / erts-`17.1`). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
-- **Gate coverage (verified against code):** a full `differential run` sweep folded with `differential merge` reports `summary: total=3463 agree=3459 mismatch=0 unsupported=1 skipped=0 oracle_drift=3` on this host (a case may declare several contracts, so the per-contract totals exceed `summary.total`).
+- **Gate coverage (verified against code):** a full `differential run` sweep folded with `differential merge` reports `summary: total=3469 agree=3465 mismatch=0 unsupported=1 skipped=0 oracle_drift=3` on this host (a case may declare several contracts, so the per-contract totals exceed `summary.total`).
   The three drifts are the erts-version goldens (`system_info/version`, `boot_extra/system_info_version_is_frozen_17_1`, `nif_abi/system_info_frozen_fields`), where **our side reproduces the committed golden and the oracle does not** — see `differential/known-drift.txt`.
   A `mismatch` means our runtime diverged from the golden and is never allowlisted; `oracle_drift` is a *host*-coupling verdict requiring positive evidence (`rust matched_golden && !oracle matched_golden && observables differ`) and is ratcheted exactly like a capability gap.
   All nine contracts A.1–A.9 have corpus cases; use `differential list

@@ -135,15 +135,17 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3463 agree=3462 mismatch=0
-  unsupported=1 skipped=0`** against the CI oracle (OTP 29.1.1 / erts-17.1) → `gate.sh` exits 0.
-  **No case disagrees** there.
-- The same corpus against an oracle that is **not** erts-17.1 reads
-  `agree=3459 mismatch=3 unsupported=1 skipped=0 allowed=1 unauthorized=0 stale=0`: the three
-  disagreements (`system_info/version`, `boot_extra/system_info_version_is_frozen_17_1`,
-  `nif_abi/system_info_frozen_fields`) are oracle-vs-golden **drift** — an OTP 29.1.2 / erts-17.1.1
-  host answers `<<"17.1.1">>` where the goldens pin `17.1`, while the Rust side matches the frozen
-  value — so `gate.sh` exits 1 on such a host by design, not from a divergence.
+- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3469 agree=3465 mismatch=0
+  unsupported=1 skipped=0 oracle_drift=3`** with `ratchet: allowlist=known-gaps.txt allowed=1
+  unauthorized=0 stale=0` and `drift: allowlist=known-drift.txt allowed=3 unauthorized=0 stale=0`
+  → `gate.sh` exits 0. **No case disagrees.**
+- The three drifts are host-oracle-version-specific: each golden pins the tree's `erts` version `17.1`
+  (`system_info/version`, `boot_extra/system_info_version_is_frozen_17_1`,
+  `nif_abi/system_info_frozen_fields`), so an `erts-17.1.1` oracle answers `<<"17.1.1">>` where this
+  runtime reproduces the frozen value. On an oracle whose `erts` version matches the tree's pin all three
+  reproduce and the drift ratchet reports `stale=3` (exit `3`), which is resolved there by trimming
+  `known-drift.txt` or passing an empty `--drift-allowlist`; the drift file is host-scoped data and can
+  never tolerate a `mismatch`.
 - The optional Cranelift tier reproduces that same line (`build -p beam_rt --features cranelift`
   plus `BEAM_RT_TIER=cranelift`), so the tier changes no observable; a `cranelift` request in a
   build without the feature is refused up front (exit 3, one `beam_rt: unsupported: …` line naming

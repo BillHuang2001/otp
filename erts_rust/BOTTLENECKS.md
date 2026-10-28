@@ -14,22 +14,26 @@ entry says so explicitly — those are not cross-runtime ratios.
 
 ## 0. Which record is current (read this before quoting a number)
 
-Four records exist and they are **not interchangeable**. They measure the same rows under
+Six records exist and they are **not interchangeable**. They measure overlapping rows under
 very different host load, which is why the same workload can appear at several ratios.
 
 | record | where | when | 1-min load | authoritative for |
 |---|---|---|---|---|
-| **m20** | `tools/bench/results/` + the m20 table in `CONTEXT.md` §Status | 2026-10-22 | 1.9–5.6 | **the current rust-vs-sys ratios for every `tools/bench` workload** (start-up, `slice`, `list_walk`, `copy_bound`, `gc_bound`, `gc_class`, `foreign`, `binary_append`, `file_io`, `ram_file`, the memory rows, the external targets), measured after the bitstring inline set, the atom-table `fork`, the `div`/`rem` inline and the port-timer fixes |
+| **m19** | `tools/bench/results/m19-*` | 2026-10-23/24 | 0.54–4.53 | **the most recent full-suite record, and the one behind `RESULTS.md` §2/§3 and the external-target rows**: twelve matched single-side passes over the nine `Runtimes::Both` workloads, the `--full` `baseline` pair, the memory rows, and the three-rep external stage over five targets plus the `emqx` skip |
+| **m21** | `tools/bench/results/m21-*` | 2026-10-27 | 5.65–19.57 (eunit stage 9.59–14.62) | the GC/allocator workstream's **before**-record over `baseline,gc_bound,gc_class,list_walk,slice` (`m21-xrun-gc-*`), read through `m21-xrun-ratios.txt`, plus the two eunit rows (`jsone`, `bbmustache` — `RESULTS.md` §9) |
+| **m22** | `tools/bench/results/m22-*` | 2026-10-27 | mid-load, same band as m21 | **the newest session**: that workstream's **after**-record over the same five workloads, read through `m22-vs-m21.txt` / `m22-xrun-ratios.txt` |
 | **Q** (quiet) | `crates/beam_engine/MEASURED.md` §*Cross-runtime record and the binary A/B* | 2026-10-20 | **1.02–2.37** | the quietest per-row ratios for `list_walk`, `etf_roundtrip`, `ets_copy`, `send_recv`, `send_recv_plain`, `churn`, all four `foreign/*`; and the code-change A/B |
 | **m17** | `tools/bench/RESULTS.md` (session `m17`, 2026-10-18) | 2026-10-18 | 3 → 92 | start-up p50/p99, `slice`, the memory rows, `binary_append`'s last **full-record** figure, the external targets |
 | **fresh** | measured by hand while writing this file (§1.3), **no `out/` copy archived** | now | 161 → 181 | only what it says: one `binary_append` single round on a heavily loaded host — a hand measurement, not a record |
 
-**m20 supersedes m17 and Q for the rows it measures** (it is later, and it is the only record taken
-after the last four code changes); **Q stays authoritative only for the rows m20 did not re-run**.
+**m19 is the most recent full-suite record and supersedes m17 for the rows it measures** (it is later);
+**`m21`/`m22` are later still but narrower**, covering only the GC workstream's row set, so they
+supersede m19 there and nowhere else; **Q stays authoritative for the quietest per-row ratios and the
+code-change A/B**.
 Concrete examples of the difference, all
 `rust`/`sys`:
 
-| row | m17 (loaded) | **Q (quiet, current)** |
+| row | m17 (loaded) | **Q (quiet)** |
 |---|---|---|
 | `list_walk` | 11.80× | **7.72×** |
 | `gc_bound/churn` | 18.75× | **14.77×** |
@@ -44,7 +48,8 @@ Concrete examples of the difference, all
 
 The direction of the difference is exactly what §1 predicts: **the sys side is comparatively
 load-insensitive and the rust side absorbs the variance**, so a loaded window inflates the ratio.
-Quote Q for "where do we stand"; quote the A/B for "did this change help".
+Quote Q for the quietest per-row ratios ("where do we stand on these rows"), m19 for the full-suite
+record; quote the A/B for "did this change help".
 
 ---
 
@@ -93,11 +98,12 @@ Q ran at load 1–2.4, m17 at 3–92, and the single round in §1.3 at 161–181
 Consequence: **read the ratios and the deterministic `case_*_ops/calls/elements` counters, never a
 single absolute wall time as a constant**, and never compare absolute times across sessions.
 
-Deterministic companions (m17, sys / rust): `etf_roundtrip_ops` 1 500 000 / 500 000,
+Deterministic companions (sys / rust): `etf_roundtrip_ops` 1 500 000 / 500 000,
 `ets_copy_ops` 2 000 000 / 250 000, `send_recv_ops` 500 000 / 90 000, `send_recv_plain_ops`
 1 000 000 / 300 000, `churn_ops` 200 000 / 10 000, `list_walk_elements` 100 000 000 / 50 000 000,
 `foreign` calls 1 500 000/50 000 · 1 500 000/40 000 · 3 000 000/60 000 · 3 000 000/60 000,
-`binary_append_calls` 50 000 / 2 000 (`binary_append_bytes` 3 276 800 000 / 131 072 000).
+`binary_append_calls` 50 000 / 4 000 (`binary_append_bytes` 3 276 800 000 / 262 144 000; the workload
+is calibrated at `n_rust` = 4 000, so an m19 `binary_append` figure is comparable only at its own `N`).
 
 ### 1.3 The one figure measured while writing this file
 
@@ -407,13 +413,14 @@ What is left is the per-instruction cost of the enclosing loop on the baseline t
 total** (`create/grow_tests.rs`) — against a copy-rebuild counterfactual of **536 903 680 B**, i.e.
 ~8 300× more bytes. The driver's own note for the §1.3 run states the measured path is the binary
 append, not a series of copies.
-Hard constraint: `n_rust` is capped at **2 000** because a larger `N` exceeds `beam_rt`'s
-non-overridable `RUN_DEADLINE = 60 s` (`crates/beam_rt/src/runtime/scheduler.rs:90`), so any increase
-in per-call cost silently turns this row into `failed(no-binary-append-run)`.
+`n_rust` is **4 000**, which gives ≈0.82 s of measured loop work against the loop-count rule's ≥0.5 s
+floor (≈204 µs/call on the conservative basis, 157.5 µs/call on the quiet marginal), so the row is not
+capped by `beam_rt`'s non-overridable `RUN_DEADLINE = 60 s`
+(`crates/beam_rt/src/runtime/scheduler.rs:90`).
 
 **Tried and rejected.** Nothing on the growth path was rejected — it was implemented and measured
-(0.449×). Rejected: raising `n_rust` past 2 000 (deadline, non-overridable); quoting
-`ns_per_call` across runs at different `N` (rust's figure is `N`-dependent).
+(0.449×). Rejected: quoting `ns_per_call` across runs at different `N` (rust's figure is
+`N`-dependent).
 
 **Next step.** (a) **re-publish the ratio** with a matched round (Q's row set did not include this
 workload, so the current rust/sys figure is not on record); (b) the remaining per-call cost is
@@ -608,7 +615,6 @@ Consolidated so a future round does not spend a day re-measuring a dead end.
   takes paired differences with a median+MAD gate, and withholds below `3 × max(1 ms, 1.4826·MAD)`.
   **Do not revert it.**
 * Runtime-major `--runtime all` passes as a headline source (up to 18 % ordering bias, m16).
-* Raising `binary_append`'s `n_rust` past 2 000 (the 60 s `RUN_DEADLINE` is non-overridable).
 * Quoting `foreign`/`binary_append` `ns_per_call` across runs at different `N`, and cross-session
   absolute wall-time diffs.
 

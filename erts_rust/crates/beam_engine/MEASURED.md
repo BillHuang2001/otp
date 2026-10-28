@@ -513,7 +513,7 @@ The reverted commits are `c181940692` + `926b9905b0` (L1), `470751dad3` + `d3c05
 
 ### This tree's gate
 The campaign left no code behind -- the tree is byte-identical to `bc7140386e` apart from this record and the crate `CONTEXT.md` constraint -- so the gate below was re-run at the final commit rather than inherited.
-- `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets` -> clean (the only warnings are three pre-existing `Atomic::fetch_update` deprecation notices in the sibling `beam_abi`).
+- `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets` -> **warning-free** (0 warnings, a forced rebuild included).
 - `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --no-fail-fast` -> **2 486 passed / 0 failed / 10 ignored** (the documented measurement/manual pins), the same figure as the base tree.
 - Full corpus on **all three tiers** (gate-equivalent 16-way `differential run` route, every non-agree case re-run serially; 1-min load 27-58 across the legs): `total=3463 agree=3459 mismatch=3 unsupported=1 skipped=0 allowed=1 unauthorized=0 stale=0` on baseline, interpreter and Cranelift -- the three mismatches are the erts-17.1.1 oracle drift and the one `unsupported` is the allowlisted `wire/new_fun_ext_encode`.
   One parallel-only `unsupported: ... process blocked` line (`flags/eval_instruction_is_not_an_init_argument`, interpreter tier) agreed on its serial re-run, i.e. the documented loaded-host artifact.

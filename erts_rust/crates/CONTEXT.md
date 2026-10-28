@@ -266,7 +266,7 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   is a bad test, and "loosening it until it cannot fail" is not the fix either.
 - Host load is not a result: read `/proc/loadavg` before and after a measurement run and prefer paired,
   interleaved sampling over absolute wall time (this host is shared).
-- **Current state: the workspace builds warning-free and every crate suite is green** apart from the per-crate OTP-version-skew tests (the host oracle is OTP 29.1.2 / erts-17.1.1 while this tree pins OTP 30.0-rc0 / erts-17.1).
+- **Current state: the workspace builds warning-free and every crate suite is green**, the host-version pins included: the tree's frozen values (`system_info(version)` `17.1`, `stdlib` `8.1`) are asserted unconditionally while only the oracle leg tolerates a different erts patch (see Test Strategy).
   Per-crate counts live in each crate's own `CONTEXT.md` — do not pin an
   aggregate total here, and check `git log` for the latest figure rather than trusting a copied one.
 
@@ -293,7 +293,7 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
 
 ## Status
 - **All 15 crates architected, implemented and tested.** The workspace build is warning-free; the test suite
-  is green apart from the OTP-version-skew tests (see Test Strategy) —
+  is green, host-version pins included (see Test Strategy) —
   re-run `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
   --no-fail-fast` for the current count. CI: `.github/workflows/erts_rust.yml` builds, tests, runs a
   non-blocking clippy and runs `../tools/differential/gate.sh` (exit-3 "capability gaps, no mismatch" is

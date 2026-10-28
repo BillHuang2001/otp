@@ -139,16 +139,16 @@ marginal at `N`=1 000 down to ~42 ms — one round read `-1.9 ms … 51.4 ms` an
 withheld as below timer resolution. `n_rust` for `handle_rw` should rise to ~20 000 once this
 lands (a `tools/bench` change, not made here).
 
-## 4. `file_io/ram_file` — why there was no rust row, and the patch that fixes it
+## 4. `file_io/ram_file` — the `{spawn, Cmd}` first-token resolution that makes the row run
 
-The absent row is **not** a `beam_io` gap: `ram_file_drv`, its 13 opcodes and its 77/77 reply
-encodings are shipped and pinned here. The runtime instead `execve`d a program called
-`ram_file_drv` (`/bin/sh: line 1: exec: ram_file_drv: not found`) and then hung for 60 s, because
-`ram_file.erl:383` opens the driver through the **`{spawn, Cmd}`** name form —
-`erlang:open_port({spawn,"ram_file_drv"}, Opts)` — and `beam_rt`'s `name_spec` classified every
-`("spawn",2)` as an OS child. The C resolves a command's **first token** against its driver list
-before it forks (`erts/emulator/beam/io.c:599-628`); this tree already had that rule for the
-`[exit_status]` refusal (`opens_a_driver_port`) and simply did not apply it when choosing the arm.
+The row is **not** a `beam_io` gap: `ram_file_drv`, its 13 opcodes and its 77/77 reply
+encodings are shipped and pinned here. It runs because `ram_file.erl:383` opens the driver through
+the **`{spawn, Cmd}`** name form — `erlang:open_port({spawn,"ram_file_drv"}, Opts)` — and
+`beam_rt`'s `name_spec` resolves a command's **first token** against its driver list before it forks,
+as the C does (`erts/emulator/beam/io.c:599-628`): that is the same rule the `[exit_status]`
+refusal (`opens_a_driver_port`) reads. Taking the OS-child arm instead forks
+`/bin/sh -c "exec ram_file_drv"` and hangs the owner in `ram_file:get_response/1`'s `receive`
+(`/bin/sh: line 1: exec: ram_file_drv: not found`).
 
 ```diff
 --- a/erts_rust/crates/beam_rt/src/port.rs
