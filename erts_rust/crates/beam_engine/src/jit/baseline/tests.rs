@@ -484,47 +484,113 @@ fn fast_path_constants_match_the_frozen_small_encoding() {
     }
     // The scratch registers must not overlap the cached x-registers or the
     // block's reserved `rbx`/`rsp`.
-    for reg in [FAST_A, FAST_B, FAST_T, FAST_C, FAST_R] {
+    for reg in [FAST_A, FAST_B, FAST_T, FAST_C] {
         assert!(!CACHE_REGISTERS.contains(&reg), "{reg:?} is a cache register");
         assert!(!SAVED_REGISTERS.contains(&reg), "{reg:?} is callee-saved");
     }
 }
 
+/// The emitted `+` arm's arithmetic: untag operand A, add operand B's tagged
+/// word, and let x86's signed-overflow flag be the whole range test.
+///
+/// `Some(word)` is the value the arm commits; `None` is its `jo` refusal, which
+/// hands the *whole* instruction to `jit_step_one`.
+fn emitted_add(a_word: i64, b_word: i64) -> Option<i64> {
+    // `a_word - SMALL_TAG` cannot overflow: every small word is
+    // `>= MIN_SMALL_WORD == i64::MIN + 15`.
+    let untagged = a_word - SMALL_TAG;
+    untagged.checked_add(b_word)
+}
+/// The emitted `-` arm's arithmetic: the subtraction's own overflow flag is the
+/// range test, then one re-tag.
+fn emitted_sub(a_word: i64, b_word: i64) -> Option<i64> {
+    // A non-overflowing difference is a multiple of 16 in
+    // `[i64::MIN, i64::MAX - 15]`, so the `+ 15` cannot overflow.
+    a_word.checked_sub(b_word).map(|d| d + SMALL_TAG)
+}
 #[test]
 fn tagged_word_arithmetic_reproduces_make_small() {
-    // The emitted fast path is exact because `make_small(v) == v*16 + 15`,
-    // so `a_word + b_word - 15 == make_small(va + vb)` whenever neither step
-    // overflows an `i64`; otherwise the `jo`/range guards bail to the helper.
+    // The arms use the tag encoding directly (`make_small(v) == v*16 + 15`), so
+    // the arithmetic's own overflow flag stands in for an explicit range test:
+    //   `+`:  `(a_word - 15) + b_word`, `jo` refuses;
+    //   `-`:  `(a_word - b_word) + 15`, `jo` on the subtraction refuses.
+    // Equivalence (the argument at the arm): `a_word - 15 == 16*va` exactly, so
+    // the sum the arm forms is `16*(va+vb) + 15`, which overflows `i64` exactly
+    // when `va+vb` leaves `[MIN_SMALL, MAX_SMALL]`; a non-overflowing result is a
+    // multiple of 16 plus 15 inside `[i64::MIN + 15, i64::MAX]`, i.e. exactly a
+    // small word, so it equals `make_small(va+vb)`. The difference is
+    // `16*(va-vb)`, which overflows exactly when `va-vb` leaves the range, and
+    // re-tagging a representable difference cannot overflow.
     for (a, b) in [
         (0, 0), (2, 3), (-4, 10), (7, -20), (-1, -1),
-        (MAX_SMALL - 2, 1), (MIN_SMALL + 2, -1), (MAX_SMALL, 0), (MIN_SMALL, 0),
-        (MAX_SMALL, MAX_SMALL), (MIN_SMALL, -1),
+        // The accepted set's boundaries, both signs and both operations.
+        (MAX_SMALL, 0), (MAX_SMALL - 1, 1), (MIN_SMALL, 0), (MIN_SMALL + 1, -1),
+        (MIN_SMALL, -1), (MAX_SMALL, 1), (MIN_SMALL, -1),
+        // Both sides at an extreme: the `jo` refuses (and the value genuinely is
+        // not a small integer), on `+` and `-` alike.
+        (MAX_SMALL, MAX_SMALL), (MIN_SMALL, MIN_SMALL), (MIN_SMALL, MAX_SMALL),
+        (MAX_SMALL, MIN_SMALL),
     ] {
         let a_word = make_small(a).raw() as i64;
         let b_word = make_small(b).raw() as i64;
-        let sum = a_word.checked_add(b_word).and_then(|s| s.checked_sub(SMALL_TAG));
-        let difference = a_word.checked_sub(b_word).and_then(|d| d.checked_add(SMALL_TAG));
-        for (word, expected) in [
-            (sum, a.checked_add(b)),
-            (difference, a.checked_sub(b)),
+        for (word, exact) in [
+            (emitted_add(a_word, b_word), a.checked_add(b)),
+            (emitted_sub(a_word, b_word), a.checked_sub(b)),
         ] {
             match word {
-                Some(word) if (MIN_SMALL_WORD..=MAX_SMALL_WORD).contains(&word) => {
-                    assert_eq!(
-                        word,
-                        make_small(expected.expect("in-range word")).raw() as i64,
-                        "{a} / {b}"
+                Some(word) => {
+                    let expected = exact.expect("an accepted word is in range");
+                    assert!(
+                        (MIN_SMALL_WORD..=MAX_SMALL_WORD).contains(&word),
+                        "{a} / {b}: accepted word outside the small window"
                     );
+                    assert_eq!(word, make_small(expected).raw() as i64, "{a} / {b}");
                 }
-                // Out of the window: the range check bails, and the true
-                // value genuinely is not a small integer.
-                Some(_) => assert!(
-                    matches!(expected, Some(v) if v < MIN_SMALL || v > MAX_SMALL),
-                    "{a} / {b} produced an out-of-window word in range"
+                // The `jo` refusal: the true value genuinely is not a small
+                // integer, so handing the instruction over is right.
+                None => assert!(
+                    matches!(exact, Some(v) if v < MIN_SMALL || v > MAX_SMALL),
+                    "{a} / {b} was refused in range"
                 ),
-                // An `i64` overflow: the `jo` guard bails.
-                None => {}
             }
+        }
+    }
+}
+#[test]
+fn the_combined_small_tag_guard_accepts_exactly_the_small_words() {
+    // `is_small(w) == ((w & 0xF) == 0xF)` because `make_small(v)` is a multiple
+    // of 16 plus 15. One masked AND of the two words therefore proves BOTH
+    // operands: `((a & b) & 0xF) == 0xF` iff both nibbles are `0xF` (an `or`
+    // would accept a pair with only one small operand).
+    let small: Vec<i64> = (MIN_SMALL..=MIN_SMALL + 4)
+        .chain(-3..=3)
+        .chain(MAX_SMALL - 4..=MAX_SMALL)
+        .map(|v| make_small(v).raw() as i64)
+        .collect();
+    // Words that are not small ints: their low nibble is not `0xF`. `i64::MIN`
+    // is exactly the word just below `MIN_SMALL_WORD`.
+    let non_small = [0i64, 0x10, 0x2B, MIN_SMALL_WORD - 1, i64::MIN];
+    for &a in &small {
+        for &b in &small {
+            assert_eq!(((a & b) & SMALL_MASK), SMALL_TAG, "both small: {a:#x} {b:#x}");
+        }
+        for &b in &non_small {
+            for (x, y) in [(a, b), (b, a)] {
+                assert_ne!(
+                    ((x & y) & SMALL_MASK),
+                    SMALL_TAG,
+                    "one operand non-small: {x:#x} {y:#x}"
+                );
+            }
+        }
+    }
+    for &a in &non_small {
+        for &b in &non_small {
+            assert_ne!(
+                ((a & b) & SMALL_MASK),
+                SMALL_TAG,
+                "both non-small: {a:#x} {b:#x}"
+            );
         }
     }
 }

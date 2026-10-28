@@ -51,7 +51,7 @@ them.
   (`emit_helper_call`) and the block/link emitters.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
   `MOVE_SCRATCH_2`=`r10` (`mod.rs`); `Y_SCRATCH`=`r9` and `SWAP_END`=`rax` (`r#move.rs`);
-  `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10`, `FAST_R`=`r11` (`arith.rs`);
+  `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10` (`arith.rs`);
   `TEST_A`=`rax`, `TEST_B`=`r8`, `TEST_C`=`r9`, `TEST_T`=`r10`, `TEST_H`=`r11` (`test.rs`);
   `GUARD_SCRATCH`=`r8` (`aggregate.rs`); `Y_ADDR_SCRATCH`=`r9` / `Y_ADDR_SCRATCH_2`=`r8`
   (`operands.rs`, the pre-computed Y destination addresses for a multi-destination writer).
