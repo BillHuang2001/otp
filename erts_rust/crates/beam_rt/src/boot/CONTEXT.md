@@ -246,6 +246,23 @@ so `gen_server:loop_hibernate/4` (`lib/stdlib/src/gen_server.erl:2338`) does not
   Pinned by `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` and, at the CLI, by
   `../tests/boot.rs::the_cli_boot_registers_a_live_logger_process` — both **pass**; the registration
   survives the whole 22-directive run to `{progress,started}`.
+- **The default logger handler is registered after the last directive** (`drive::install_default_logger_handler`,
+  called at the end of `bootscript::execute_reporting`). `logger_server:init/1` installs `logger_simple_h`
+  under the id `simple` (`lib/kernel/src/logger_server.erl:153-168`), and the oracle's `default`
+  (`logger_std_h` over `standard_io`) comes from `kernel:start/2` → `logger:add_handlers(kernel)`
+  (`lib/kernel/src/logger.erl:1671-1700`, config built by `init_default_config/2` at `:1800-1827` because
+  `kernel.app.src` carries no `logger` env) — a path this runtime does not complete, since
+  `application:start_boot(kernel, …)` drives the controller but not `kernel_sup`'s own `start/2` body.
+  So the boot completes the same transition itself, through the **real** `logger:add_handler/3`: the
+  request omits `filters` on purpose, so OTP's own first clause merges `filter_default => stop` and the
+  three default filters, and its second clause then `remove_handler(simple)` — the reason the oracle's set
+  is `[default]` and not `[default,simple]`. Nothing is written into the `logger` ETS table by hand.
+  Idempotent and non-fatal: `{error,{already_exist,_}}` counts as success (a second boot, a
+  `init:restart/0` re-boot each keep exactly one handler), and every other failure — a term or a
+  `BeamError` — is a typed `debug_trace` line, never a boot failure and never a panic.
+  Pinned, at the CLI and against the live oracle, by `../tests/logger_default_handler.rs` (the whole
+  rendered handler/primary state, every boot route, the duplicate refusal, `init:restart/0` and a log
+  event).
 - **The kernel application starts at directive 18 and stays up.** Directive 18's
   `application:start_boot/2` reaches `application_controller:start_boot_application/2`, whose
   `application:load(kernel)` returns `{error,{already_loaded,kernel}}` (the AC's own `init/2` loaded
