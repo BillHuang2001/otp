@@ -183,6 +183,8 @@ Files inside a subtree with its own `CONTEXT.md` are documented by that node and
 - `ExecutionContext::heap_available` has no call site: no heap-admission memoisation exists, so every `test_heap` crosses the host door unconditionally.
 - A host hook reached through `jit_ext_call`/`jit_local_call`/`jit_bif_value`/`jit_tail_call` sees a stale (block-entry-or-earlier) execution position.
 - The census under-reports on the native tiers (inlined instructions are invisible) and counts a caught raise as executed-only.
+- **The `allocate` frame push cannot be emitted inline** and stays one `jit_allocate` helper call: a resumed slice re-enters a block at its **entry** and re-executes that block's prefix, so the push must commit nothing that only Rust can re-derive (`Machine::push_frame_window`'s geometry and the Y window). `jit/baseline/frame_push_tests.rs` pins the geometry and `emit/heap.rs`'s `the_allocate_arm_pushes_the_frame_with_a_helper_call_only` the shape; the pricing of both rejected routes is `jit/baseline/measure/CONTEXT.md`'s *Rejected levers*.
+- **`BEAM_RT_TIER` silently falls back to the interpreter for an unrecognised value** (`beam_rt/src/runner/tier.rs`'s `mode_from_value`: only `auto`/`baseline`/`cranelift`/`jit-cranelift` are accepted, `baseline-jit` is not), so a campaign that "pins the baseline tier" with the wrong spelling measures the interpreter without saying so. Use `baseline` or leave the variable unset.
 - Opcode/operand coverage gaps, structured-raise degradations and the handoff list are the crate node's: `../INSTRUCTION_SURFACE.md` (`## Known Issues`, `## Handoffs`).
 
 ## Notes for Agents
