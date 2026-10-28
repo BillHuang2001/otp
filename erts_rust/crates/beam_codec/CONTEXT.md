@@ -99,7 +99,10 @@ Re-exported at the crate root and via `beam_codec::prelude::*`.
   creation: u32)`, `with_local_ext()`/`set_local_ext(bool)` (the `[local]`/ETS internal-node marker
   form), `with_deterministic()`/`set_deterministic(bool)` (full-term-order-sorted map keys),
   `with_fun_identity`, `encode(Eterm) -> Result<()>`, `as_bytes`/`len`/`is_empty`,
-  `finish() -> Vec<u8>`, `finish_compressed(level)`, `finish_local(hash: u32)`.
+  `finish() -> Vec<u8>`, `finish_compressed(level)`, `finish_local(hash: u32)`, plus the
+  caller-owned-buffer trio `with_writer(atoms, Writer)` / `new_body_with(atoms, Writer)` /
+  `take_writer() -> Writer` (see `scratch.rs`; `new`/`new_body` keep the `Writer` they always
+  built, so every existing signature and byte is unchanged).
   `pub enum AtomEncoding { Utf8, Latin1 }` (default `Utf8`; `Latin1` for nodes without
   `DFLAG_UTF8_ATOMS`; ignored under a non-`V2` flavour) and `pub enum MinorVersion { V0, V1, V2 }`
   (default `V2`). `pub struct FunIdentity { module: Atom, uniq: [u8; 16], old_index: u32, old_uniq:
