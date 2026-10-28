@@ -308,7 +308,9 @@ where
             if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
         {
             if recipient.has_unpublished_roots() || decline {
-                return enqueue_fragment_signal(recipient, from, reason, tag, &mut build);
+                // No user tag reaches this route (`enqueue_down_message` handles a tagged DOWN
+                // itself), so the payload's only graph root is the reason.
+                return enqueue_fragment_payload(recipient, from, reason, None, None, &mut build);
             }
             grow_receiver_for_signal(recipient, failure, decline)?;
             let term = build(recipient.heap_mut(), reason)?;
