@@ -45,9 +45,12 @@
 //!   residual: the call kept the pre-existing round-trip).
 //! * **Position / publish calls** — [`record_publish_y`] /
 //!   [`record_refresh_y`] from the two Y-window prologue helpers at **run** time, plus
-//!   [`record_set_position`] from the **emitter** at **compile** time (a plain position
-//!   store is three generated instructions and has no runtime site left to count): one per
-//!   Y-free block prologue and one per emitted `Bs*` arm.
+//!   [`record_set_position`] from the **emitter** at **compile** time (a position store is
+//!   three generated instructions, 24 B, with no helper call and hence no run-time body
+//!   that could count it): one per emitted block prologue, which emits the store
+//!   **unconditionally** — publishing block or not, because the Y-window publish is a
+//!   separate six-instruction, 35 B sequence emitted before the frame pushes — plus one per
+//!   emitted `Bs*` arm.
 //! * **`Y`-window traffic** — [`record_y_access`] (every emitted guarded `Y`-slot read
 //!   or write, with its emitted byte length) and [`record_y_invalidation`] (every
 //!   in-block helper call after which a later instruction of the same block still
@@ -196,16 +199,17 @@ pub(crate) struct Counters {
     /// of [`in_block_calls`](Counters::in_block_calls).
     pub(crate) in_block_call_declines: u64,
     /// Emitted **inline** position stores
-    /// ([`emit_position_store`](super::emit::emit_position_store)) — the static twin of
-    /// what used to be the `jit_set_position` **runtime** count.
+    /// ([`emit_position_store`](super::emit::emit_position_store)): the count of the sites
+    /// that carry one, taken at the emission site.
     ///
-    /// The store is three generated instructions writing `Machine::current_code`
-    /// through [`JitRuntime::current_code`](super::runtime::JitRuntime), so there is no
-    /// helper left whose body could count the executions (the runtime figure is now
-    /// structurally zero — nothing calls a position-store helper); the emission site is
-    /// the only place that knows how many sites carry one, so this counts **emitted
-    /// sites**: one per Y-free block prologue, plus one per emitted `Bs*` arm (the
-    /// bitstring helper's own store moved into the arm), exactly as
+    /// The store is three generated instructions (24 B) writing `Machine::current_code`
+    /// through [`JitRuntime::current_code`](super::runtime::JitRuntime), with no helper
+    /// call, so no run-time body exists whose executions could be counted; the emission
+    /// site is the only place that knows how many sites carry one, so this counts
+    /// **emitted sites**: one per block prologue — every prologue emits the store,
+    /// publishing or not, since the Y-window publish is a separate six-instruction, 35 B
+    /// sequence emitted before the frame pushes — plus one per emitted `Bs*` arm (the
+    /// bitstring arm stores its instruction's own pc), exactly as
     /// [`y_prologue_publishes`](Counters::y_prologue_publishes) counts emitted publishes
     /// beside the runtime [`publish_y`](Counters::publish_y).
     pub(crate) set_position: u64,
