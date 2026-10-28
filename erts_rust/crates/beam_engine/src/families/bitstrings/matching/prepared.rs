@@ -328,8 +328,9 @@ fn fast_eligible(flags: u32, nbits: usize) -> bool {
 /// keeps the `&mut Machine` the term builders need — and prepared on a miss.
 ///
 /// A **synthetic** image (all-zero [`Module::checksum`], the documented marker of an
-/// image with no content identity — `machine/label_cache.rs`) takes the generic walk
-/// and is not cached at all: `(function, code offset)` is not an identity there, so a
+/// image with no content identity, which is what
+/// [`ProgramWitness::describes`](super::super::programs::ProgramWitness) tests) takes the
+/// generic walk and is not cached at all: `(function, code offset)` is not an identity there, so a
 /// hit could answer for another instruction's descriptor list. A loaded `.beam` is
 /// cached by that key, which *is* its identity.
 pub(super) fn run_commands_prepared(

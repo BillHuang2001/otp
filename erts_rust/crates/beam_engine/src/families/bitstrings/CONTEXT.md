@@ -198,7 +198,7 @@ No `tools/differential` case exercises a bit-granular little-endian integer writ
   Our loader preserves the raw list, so `run_commands` re-derives a load-time fact on **every** execution (a comprehension enters it once per byte); an in-family re-discovery of the shapes measured a **regression**, so the only route left is a pure semantics-preserving **hoist** — `Instr::BsMatch { commands: Vec<Operand> }` carrying a typed `Vec<PreparedCommand>` with the command tag, flags, size/unit and `Dst` already resolved.
   **OWNER: `crates/beam_loader`** (and `beam_engine/src/lib.rs` for the `Instr` variants).
 - **`terms::number::make_integer_unrooted`** shows in the profile as CALL overhead, not allocation: its small-value arm is `make_small`, but the function is not inlined at its `src/operand.rs` call sites. **OWNER: the parent `src/` node.**
-- **`Machine::reset` + `interpreter::build_label_map`** are entry-path rows in the parent's `run_label_outcome`/`reset` path: `reset` refills the run's used register extents once per run entry, and the label-map build happens once per machine per module (`Machine::label_map`'s cache). **OWNER: the parent `src/` node.**
+- **`Machine::reset` + `interpreter::build_label_map`** are entry-path rows in the parent's `run_label_outcome`/`reset` path: `reset` refills the run's used register extents once per run entry, and the label-map build happens once per module **image** (`Module::label_map`, reached by `Machine::label_map`). **OWNER: the parent `src/` node.**
 - **`src/exec_census.rs`** costs one latched `bool` load and a branch per interpreted instruction while disabled (`Machine::census_on`); the instrument has no call site in this node. **OWNER: the parent `src/` node.**
 
 ## Notes for Agents

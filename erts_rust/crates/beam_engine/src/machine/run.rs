@@ -374,16 +374,18 @@ impl Machine {
     /// from `args`, the bottom frame is pushed, and the dispatch loop runs from the
     /// label's `(func, pc)`.
     ///
-    /// The module-wide label index is built **at most once per module**, not once per
-    /// run: the entry label is resolved against [`Machine::label_map`]'s cache and the
-    /// very same map is handed to the dispatch loop, so a machine that runs one module
-    /// repeatedly pays the whole-module build (a traversal of every function's label
-    /// table plus the module's entire import table) on its first run only. The cache is a
-    /// bounded LRU, so that also holds for the modules a run enters as in-machine
-    /// callees (which [`Machine::reset`] re-registers on every run) as long as the
-    /// working set fits its capacity; a module it had to evict is rebuilt, never served
-    /// wrong. A synthetic module — the `Module::default()`-shaped image with no load-time
-    /// digest — is never cached and is built per run, exactly as before.
+    /// The module-wide label index is built **at most once per module image, ever**,
+    /// not once per run: the entry label is resolved against the map the image owns
+    /// ([`Machine::label_map`] -> `Module::label_map`), and the very same map is handed
+    /// to the dispatch loop, so a machine that runs one module repeatedly pays the
+    /// whole-module build (a traversal of every function's label table plus the module's
+    /// entire import table) on its first run only — and so does every *other* machine
+    /// running that image, since the slot is the image's and not the machine's. Nothing
+    /// is evicted and nothing is keyed, so the in-machine callees a run enters
+    /// ([`Machine::reset`] re-registers them on every run) are hits too. The build is a
+    /// pure function of the image's immutable content, so a synthetic
+    /// (`Module::default()`-shaped) image takes the same route: one build per image, then
+    /// an `Arc` clone.
     pub fn run_label_outcome(
         &mut self,
         module: &Module,
@@ -579,12 +581,14 @@ mod tests {
         );
     }
 
-    /// A run builds the module-wide label index **exactly once**.
+    /// A fresh image's first run builds its label index **exactly once**.
     ///
-    /// The module here is synthetic (no content identity, so `label_cache` never holds
-    /// it), so the run pays exactly one `build_label_map` — resolving the entry label and
-    /// the dispatch loop share that one map instead of each deriving its own. The
-    /// `cfg(test)` counter ([`crate::interpreter`]) makes the count observable here.
+    /// The index belongs to the image (`Module::label_map`, `beam_loader`'s per-image
+    /// slot), so the run pays exactly one `build_label_map` on the image, and resolving
+    /// the entry label and the dispatch loop share that one map instead of each deriving
+    /// its own. (A synthetic image has no *content* identity, but it is still one image
+    /// with one slot, so this holds for it too — the invariant is per image, never per
+    /// machine.) The `cfg(test)` counter ([`crate::interpreter`]) makes it observable.
     #[test]
     fn run_export_builds_the_label_map_exactly_once() {
         let (module, name) = module_with_code(
@@ -613,8 +617,13 @@ mod tests {
         );
     }
 
-    /// The `resume_outcome` path builds its own (single) label index: a suspension
-    /// is re-entered by a fresh run, so it builds the map once when resumed.
+    /// The `resume_outcome` path builds **nothing**: the image already holds its map.
+    ///
+    /// A suspension is re-entered without a `reset`, and the map it resolves against is
+    /// the one the *image* kept from the run that produced the park — so the resume adds
+    /// zero builds. (Before the map moved onto the image the resume re-entered through
+    /// the machine's cache, which is why this once read one: the count is now about the
+    /// image, and the image cannot forget.)
     #[test]
     fn resume_outcome_builds_the_label_map_exactly_once() {
         let (module, name) = receive_module();
@@ -639,8 +648,8 @@ mod tests {
         );
         assert_eq!(
             crate::interpreter::label_map_builds(),
-            1,
-            "resume_outcome must build the module label index exactly once"
+            0,
+            "resume_outcome must build NO label index: the image already holds its map"
         );
     }
 

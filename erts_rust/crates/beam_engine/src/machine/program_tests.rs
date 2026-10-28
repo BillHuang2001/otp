@@ -350,7 +350,8 @@ fn the_same_address_with_different_content_is_not_retained() {
 /// namespace that moved is not retained either.
 ///
 /// A prepared program's type/command words resolve through the module's atom table, so the
-/// witness keys on the table's snapshot exactly as the label-map cache does. The check is
+/// witness keys on the table's snapshot — the content witness the label index gets for
+/// free by living *on* the image, which this machine-owned table cannot. The check is
 /// deliberately an equality — an atom appended after the fill discards the table even
 /// though an append preserves every earlier index — because the cost of a discard is one
 /// re-decode while the cost of a wrong namespace is a wrong answer.

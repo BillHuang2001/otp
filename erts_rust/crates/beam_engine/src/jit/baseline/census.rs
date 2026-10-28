@@ -309,7 +309,7 @@ fn compile_corpus(paths: &[PathBuf]) -> CorpusTally {
             continue;
         };
         tally.modules += 1;
-        let labels = crate::interpreter::build_label_map(&module);
+        let labels = module.label_map();
         for func in 0..module.functions.len() as u32 {
             match compile_function(&module, &labels, func) {
                 Ok(_) => tally.compiled += 1,

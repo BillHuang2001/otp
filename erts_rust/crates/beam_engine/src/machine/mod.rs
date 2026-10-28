@@ -90,7 +90,6 @@ use beam_term::Eterm;
 pub use self::catch::CatchFrame;
 pub(crate) use self::catch::namespace_atom;pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
-pub(crate) use self::label_cache::LabelMaps;
 pub(crate) use self::local_callee::{LocalVerdicts, Verdict};
 pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
@@ -108,9 +107,6 @@ mod context;
 mod deadline_tests;
 mod drive;
 mod frames;
-mod label_cache;
-#[cfg(test)]
-mod label_cache_tests;
 mod local_callee;
 mod location;
 mod offheap;
@@ -118,6 +114,8 @@ mod registers;
 mod run;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod label_share_tests;
 #[cfg(test)]
 mod program_tests;
 #[cfg(test)]
@@ -294,27 +292,6 @@ pub struct Machine {
     /// process blocked in, which is how a resume recovers the module identity of
     /// the reported `(func, pc)`.
     pub(crate) context: u32,
-    /// The **label-map cache**: a bounded LRU (`label_cache::LABEL_MAP_CAPACITY`, 32
-    /// entries) of already-built module-wide label indexes (plus the import table derived
-    /// from each), so a re-entered module does not rebuild its own — including the modules
-    /// a run enters as in-machine cross-module callees, which are resolved through
-    /// [`Machine::label_map_arc`] from the module-context registry and re-registered on
-    /// every run because [`Machine::reset`] clears that registry.
-    ///
-    /// [`interpreter::build_label_map`](crate::interpreter) is a whole-module value —
-    /// a traversal of every function's label table plus a resolution of the whole
-    /// import table — and it is a pure function of the module's immutable content, so
-    /// rebuilding it per run is pure overhead. Every label-map site reaches it through
-    /// [`Machine::label_map`] / [`Machine::label_map_arc`] (never the builder), which
-    /// is what makes the cache the single answer.
-    ///
-    /// **Content-keyed, not run-keyed**, so [`Machine::reset`] deliberately does
-    /// **not** clear it: a machine that runs one module repeatedly builds its map once.
-    /// The key is the module's load-time digest plus its atom-table snapshot plus its
-    /// address — see `label_cache.rs` for why that triple proves image identity, why the
-    /// bare `&Module` route can never stale-hit a recycled address, and why a synthetic
-    /// (all-zero-checksum) module is never cached.
-    pub(crate) label_maps: LabelMaps,
     /// The **raise-time snapshot** of the pre-unwind frame chain: the engine's
     /// replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
     ///
@@ -892,7 +869,6 @@ impl Machine {
             entry_literals: None,
             contexts: Contexts::new(),
             context: 0,
-            label_maps: LabelMaps::new(),
             raise_snapshot: Vec::new(),
             raise_propagated: false,
             pending_callee_head: false,
@@ -1513,8 +1489,8 @@ impl Machine {
     /// a fresh prepare needs it to be: same image **address** (the `(function, code
     /// offset)` key's numbers belong to that allocation), same content **digest** (the
     /// chunk subset a prepared program is derived from) and same **atom namespace**
-    /// (the index→name mapping the descriptors resolve through) — the identity argument
-    /// `machine/label_cache.rs` makes for the label map. An image with no content
+    /// (the index→name mapping the descriptors resolve through) — the identity rule
+    /// [`ProgramWitness::describes`] states for itself. An image with no content
     /// identity at all (an all-zero checksum, i.e. a hand-built/synthetic module) is
     /// never retained: `(function, code offset)` is not an identity there, so a retained
     /// entry could answer for a *different* instruction's descriptor list — a wrong
@@ -1533,41 +1509,40 @@ impl Machine {
     }
     /// The module-wide label index of `module` — **the** label-map door.
     ///
-    /// [`interpreter::build_label_map`](crate::interpreter) is a whole-module value (a
-    /// traversal of every function's label table plus a resolution of the module's
-    /// entire import table) and a pure function of the module's immutable content, so
-    /// this answers from [`Machine::label_maps`] after the first build for that module
-    /// and only builds on a miss. Every per-run label-map site goes through here (the
-    /// bare `&Module` route: `run_label_outcome`, the dispatch loop's fallback, the
-    /// native tier's per-run fallback), and the module-context registry uses
-    /// [`Machine::label_map_arc`].
+    /// The map belongs to the **image**: `beam_loader::labels::build_label_map` is a
+    /// whole-module value (a traversal of every function's label table plus a
+    /// resolution of the module's entire import table) and a pure function of the
+    /// image's immutable content, so it is a property of the image and not of whoever
+    /// runs it. `beam_loader`'s per-image slot
+    /// ([`Module::label_map`](beam_loader::Module::label_map), a `SharedLabelMap`) builds
+    /// it **at most once in that image's lifetime** and answers an `Arc` clone
+    /// afterwards, which is exactly what this door returns — so **every** machine
+    /// running the image, and every JIT artifact compiled from it, shares the one map
+    /// instead of each deriving a copy of the same immutable data.
     ///
-    /// The returned `Arc` is what lets a call site hold the map across the `&mut self`
-    /// calls a run makes. A **synthetic** module (no load-time digest) is never cached
-    /// and is built on every call, exactly as before the cache existed; a hit can never
-    /// answer with another module's map (see `label_cache.rs`).
-    #[inline]
-    pub(crate) fn label_map(&mut self, module: &Module) -> Arc<crate::interpreter::LabelMap> {
-        self.label_maps.resolve(module)
-    }
-
-    /// The module-wide label index of `module`, keeping the module alive for as long as
-    /// the cache names it — the `Arc` route.
+    /// The takeover is keyless by construction: the slot *is* the identity, so there is
+    /// no digest/atom-snapshot/address key to probe and no capacity bound or eviction to
+    /// apply (a per-machine LRU over the same immutable value was pure redundancy), and a
+    /// recycled address cannot alias anything because the map lives on the image that
+    /// owns it. A `Module::clone` is a **different image at a different address**, so it
+    /// starts with an empty slot and derives its own map (which is what keeps
+    /// [`LabelMap::import_target`](crate::interpreter::LabelMap::import_target)'s owner
+    /// check honest).
     ///
-    /// Used where the machine is handed the module **handle** rather than a borrow (the
-    /// module-context registry): holding the `Arc` in the entry means the module cannot
-    /// be dropped, so its address cannot be recycled while the entry holds it.
+    /// Every per-run label-map site goes through here (`run_label_outcome`, the dispatch
+    /// loop's fallback, the native tier's per-run fallback, the module-context registry),
+    /// and the returned `Arc` is what lets a call site hold the map across the `&mut self`
+    /// calls a run makes.
     #[inline]
-    pub(crate) fn label_map_arc(&mut self, module: &Arc<Module>) -> Arc<crate::interpreter::LabelMap> {
-        self.label_maps.resolve_arc(module)
+    pub(crate) fn label_map(&self, module: &Module) -> Arc<crate::interpreter::LabelMap> {
+        module.label_map()
     }
-
     /// Register `module` as an enterable module context and return its id (`>= 1`).
     ///
     /// Idempotent by the `Arc`'s allocation identity (see [`Contexts::register`]),
     /// so a repeated or recursive cross-module call reuses one context.
     pub(crate) fn register_context(&mut self, module: &Arc<Module>) -> u32 {
-        let labels = self.label_map_arc(module);
+        let labels = self.label_map(module);
         self.contexts.register(module, labels)
     }
 

@@ -54,7 +54,8 @@
 //! of one instruction. A *synthetic* image (`Module::default()`, the hand-built shape a
 //! test or an engine benchmark uses) has no such property: it freely re-uses `(0, 0)`
 //! for many different descriptor lists, and its all-zero `Module::checksum` is the
-//! documented marker of exactly that lack of content identity (`machine/label_cache.rs`).
+//! documented marker of exactly that lack of content identity (the field
+//! `ProgramWitness::describes` tests, below).
 //! So `bs_match` caches a program only for an image whose checksum is not all-zero
 //! (`matching::prepared`); a synthetic image keeps the generic walk, where a hit on
 //! another instruction's program — a wrong answer, not merely a slow one — cannot arise.
@@ -252,12 +253,13 @@ impl BitstrPrograms {
 ///   descriptor list lives in `Code`, the segment/command type atoms in `AtU8`, a
 ///   `string` segment's bytes in `StrT`, a literal width in `LitT`);
 /// * the **atom snapshot** says the descriptors resolve through the same index→name
-///   mapping — the same companion the label-map cache keys on, and for the same reason: a
+///   mapping — a companion the label index does not need, because that one lives *on*
+///   the image and so cannot outlive it, while this table lives on the machine and can: a
 ///   `Module::clone` (or a second load of one `.beam`) numbers atoms through its own
 ///   table.
 ///
 /// An image with **no** content identity (an all-zero [`Module::checksum`] — the synthetic
-/// shape a hand-built test image has, `machine/label_cache.rs`) is never retained:
+/// shape a hand-built test image has) is never retained:
 /// `(function, code offset)` is not an identity there, so the same key may name a
 /// different instruction's descriptor list from one run to the next.
 #[derive(Clone, Copy, PartialEq, Eq)]

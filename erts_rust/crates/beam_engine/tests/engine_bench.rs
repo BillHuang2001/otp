@@ -50,9 +50,10 @@
 //! `run_export` pays a **fixed per-run setup** that is *not* per-instruction
 //! work: `Machine::reset` (which refills only each register file's used extent)
 //! and the bottom frame. The module-wide `Label -> (func, pc)` map
-//! (`interpreter::build_label_map`) is **not** part of it: `Machine::label_map`
-//! caches it per machine per module (`src/machine/label_cache.rs`), so a timing
-//! loop that reuses one `Machine` builds it once, in the warm-up. Two
+//! (`beam_loader::labels::build_label_map`) is **not** part of it: the map is a slot
+//! on the module image itself (`Module::label_map`, reached through
+//! `Machine::label_map`), so a timing loop that reuses one image — on one `Machine`
+//! or many — builds it once, in the warm-up. Two
 //! consequences shape the design:
 //!
 //! 1. every **kind-isolating** body keeps the label count tiny (the pure no-op
@@ -221,9 +222,9 @@ fn finish_module(mut module: Module, name: &str, arity: u32, body: Vec<Instr>) -
 
 /// The module-wide `Label -> code offset` table the bench's synthetic modules carry.
 ///
-/// `Machine::label_map` builds the engine's own index once per machine per module and
-/// caches it, but a synthetic image (all-zero checksum) is never cached, so the bench
-/// modules pay one build in the warm-up rather than in the timed loop.
+/// `Machine::label_map` answers from the image's own slot (`Module::label_map`), which
+/// builds at most once in that image's lifetime, so the bench modules pay one build in
+/// the warm-up rather than in the timed loop.
 /// Duplicate `Instr::Label`s collapse (last wins), which is exactly what the
 /// no-op baseline relies on (see [`bench_dispatch_noop`]).
 fn collect_labels(code: &[Instr]) -> BTreeMap<Label, usize> {
@@ -321,7 +322,7 @@ fn bench_dispatch_noop() -> Report {
 /// [`bench_dispatch_noop`] (a sequence of `label` no-ops, `KIND_OPS + 2`
 /// instructions per run, the same iteration count), but each carries a label of
 /// its own, so the module's label map is `KIND_OPS + 1` entries wide. Because the
-/// map is cached per machine (`Machine::label_map`) the width is not a per-run
+/// map lives on the image (`Module::label_map`) the width is not a per-run
 /// cost: both workloads dispatch the same number of straight-line instructions,
 /// so their `ns/run` difference is noise, and [`report_attribution`] prints it.
 fn bench_dispatch_many_labels() -> Report {
@@ -1364,8 +1365,8 @@ fn report_attribution(reports: &[Report]) {
         // The two bodies have identical instruction counts and iteration counts.
         // The many-labels body carries `KIND_OPS` distinct body labels plus the
         // entry label; the no-op baseline carries the entry label plus its single
-        // *shared* body label. The map itself is built once per machine
-        // (`Machine::label_map`, warm-up), so the residual below prices the entry
+        // *shared* body label. The map itself is built once per image
+        // (`Module::label_map`, warm-up), so the residual below prices the entry
         // lookup over a wide table, not a build.
         assert_eq!(
             noop.instructions_per_run, many.instructions_per_run,
@@ -1380,7 +1381,7 @@ fn report_attribution(reports: &[Report]) {
             "engine_bench | label-map build: {many_labels} labels vs the baseline's {noop_labels} \
              (+{extra_labels:.0}, the same {instr} instructions/run and {iters} iterations) costs \
              {extra_ns_per_run:+.1} ns/run = {per_label_per_run:.3} ns per extra label per run \
-             (a label map is built once per machine and module, so this prices the entry lookup \
+             (a label map is built once per module image, so this prices the entry lookup \
              over a wide table)",
             instr = many.instructions_per_run,
             iters = many.iterations,

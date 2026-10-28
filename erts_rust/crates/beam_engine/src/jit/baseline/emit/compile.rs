@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use beam_common::Result;
 use beam_loader::{Block, Instr, Module};
 
-use crate::interpreter::{self, LabelMap};
+use crate::interpreter::LabelMap;
 use crate::jit::emitter::{CodeBuffer, Label as CodeLabel, DEFAULT_CAPACITY};
 
 use super::super::code::{CompiledFunction, CompiledModule, Summary};
@@ -56,7 +56,11 @@ use super::{allocate_registers_with_labels, emit_block, touch};
 /// [`CodeCache::get_or_compile`](crate::jit::cache::CodeCache::get_or_compile)
 /// produce, and the layout every whole-module introspection query answers for.
 pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
-    let labels = interpreter::build_label_map(module);
+    // The image owns the module-wide label/import index (`Module::label_map`): building
+    // it here would be a second copy of a value the image already determines, so this
+    // adds **zero** builds for an image any earlier consumer (a run, another artifact)
+    // has already touched, and exactly one for a fresh one.
+    let labels = module.label_map();
     let mut buffer = CodeBuffer::with_capacity(code_capacity_estimate(module))?;
     // A flat `[func][pc]` table, not a `HashMap`: the driver's per-block lookup sits on
     // the hot path of every cross-block jump — a `fib`-style loop re-enters the driver
@@ -864,6 +868,7 @@ mod tests {
     //! cross-module run below exercises at every call.
 
     use super::*;
+    use crate::interpreter;
     use crate::jit::Tier;
     use crate::machine::{Machine, RunOutcome};
     use crate::MinimalContext;
@@ -1026,17 +1031,20 @@ mod tests {
         module
     }
 
-    /// The module-wide label map is a **pipeline input**, not a per-block product: one
-    /// compilation builds it exactly once, however many functions, IR blocks and
+    /// The module-wide label map is a **pipeline input**, not a per-block product: a
+    /// compilation takes the **image's** one map (`Module::label_map`), so it builds
+    /// exactly one map for a fresh image — however many functions, IR blocks and
     /// continuation sub-blocks it lowers.
     ///
     /// Pinned by **count only, never timing**, through the `cfg(test)` tally
-    /// `crate::interpreter::label_map_builds`. Before the threading it was one whole-module
-    /// build per block *and* per continuation sub-block — on
-    /// `lib/stdlib/src/ordsets.erl`, 2 033 redundant builds out of 7 333 — so the pin is
-    /// only non-vacuous if the fixture really holds **more than one** continuation address
-    /// inside one block and more than one function; both are asserted here (hence the
-    /// two-call floor: a single frame-preserving call leaves exactly one continuation
+    /// `crate::interpreter::label_map_builds`. Each loop iteration uses a **fresh**
+    /// fixture image, so the count is the image's one build: before the threading it was
+    /// one whole-module build per block *and* per continuation sub-block — on
+    /// `lib/stdlib/src/ordsets.erl`, 2 033 redundant builds out of 7 333 — and before the
+    /// map moved onto the image it was that same single build per *compilation*. The pin
+    /// is only non-vacuous if the fixture really holds **more than one** continuation
+    /// address inside one block and more than one function; both are asserted here (hence
+    /// the two-call floor: a single frame-preserving call leaves exactly one continuation
     /// address and therefore no sub-block to lower).
     #[test]
     fn compiling_a_module_builds_its_label_map_once_however_many_functions_and_sub_blocks_it_has() {
@@ -1065,20 +1073,34 @@ mod tests {
                 interpreter::label_map_builds(),
                 1,
                 "{rounds} calls / {} functions: exactly one whole-module label-map build \
-                 per compilation — a per-block or per-sub-block rebuild would give one per \
-                 block plus one per continuation address",
+                 for this fresh image — a per-block or per-sub-block rebuild would give one \
+                 per block plus one per continuation address",
                 module.functions.len(),
+            );
+            // A second compilation of the SAME image adds nothing: the map is the image's.
+            interpreter::reset_label_map_builds();
+            compile_module(&module).expect("the second compilation succeeds");
+            assert_eq!(
+                interpreter::label_map_builds(),
+                0,
+                "{rounds} calls: recompiling one image takes its existing map, so it \
+                 builds none",
             );
         }
     }
 
-    /// `compile_function` takes its module-wide label map **from the caller**, so lowering
-    /// one function with a supplied map builds none at all: the per-block and per-sub-block
-    /// allocations thread it instead of rebuilding it.
+    /// `compile_function` takes its module-wide label map **from the caller** — which in
+    /// production is the image's own (`Module::label_map`) — so lowering one function
+    /// builds none at all: the per-block and per-sub-block allocations thread it instead
+    /// of rebuilding it.
+    ///
+    /// The map is fetched through the image first, so the one build it costs is the
+    /// *image's*, and it happens before the counter is reset: every `compile_function`
+    /// call after that is a pure hit.
     #[test]
     fn compiling_a_function_with_a_supplied_label_map_builds_none() {
         let module = with_second_function(call_dense_module(4));
-        let labels = interpreter::build_label_map(&module);
+        let labels = module.label_map();
         interpreter::reset_label_map_builds();
         compile_function(&module, &labels, 0).expect("the call-dense function compiles");
         assert_eq!(

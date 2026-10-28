@@ -72,15 +72,15 @@ use super::emit::compile_function;
 /// An entry is a raw pointer into a sealed executable mapping, so a `CompiledModule`
 /// must outlive every call into it and is neither `Send` nor `Sync`.
 pub struct CompiledModule {
-    /// The module-wide label map, built **once** at artifact creation.
+    /// The module-wide label map — a **shared handle** on the image's one map.
     ///
-    /// Every driver run resolves its labels/imports against it, so storing it here
-    /// removes a per-run [`build_label_map`](crate::interpreter::build_label_map) — a
-    /// per-module value does not need rebuilding for each run of the same artifact (the
-    /// lazy layout already built one per compile, and the eager layout one per
-    /// `compile_module`). `Module` is immutable once loaded, so the map is valid for
-    /// the artifact's whole life.
-    labels: crate::interpreter::LabelMap,
+    /// The map itself is the image's (`Module::label_map`, i.e. `beam_loader`'s
+    /// per-image slot), so the artifact stores an `Arc` clone rather than a private copy:
+    /// every driver run resolves its labels/imports against it, and an artifact compiled
+    /// from an image another consumer already touched adds **zero** whole-module builds
+    /// (a fresh image costs exactly one, at whichever consumer arrives first). `Module`
+    /// is immutable once loaded, so the map is valid for the artifact's whole life.
+    labels: std::sync::Arc<crate::interpreter::LabelMap>,
     /// The content fingerprint of the module this artifact was compiled for, when its
     /// load-time digest does **not** already identify it
     /// ([`needed_fingerprint`](crate::jit::cache::needed_fingerprint)).
@@ -239,7 +239,7 @@ impl CompiledModule {
         entries: Vec<Vec<*const u8>>,
         sub_entries: Vec<Vec<*const u8>>,
         summary: Summary,
-        labels: crate::interpreter::LabelMap,
+        labels: std::sync::Arc<crate::interpreter::LabelMap>,
         fingerprint: Option<u64>,
     ) -> CompiledModule {
         CompiledModule {
@@ -256,9 +256,10 @@ impl CompiledModule {
 
     /// The **lazy** artifact for `module`: nothing compiled yet, one slot per function.
     ///
-    /// The module-wide label map is built here (once) so each on-demand function
-    /// compilation can resolve its targets — and so every driver run of the artifact
-    /// can reuse it — without re-scanning the module. A synthetic module's content
+    /// The module-wide label map is taken from the image's own slot here (`Arc` clone)
+    /// so each on-demand function compilation can resolve its targets — and so every
+    /// driver run of the artifact can reuse it — without re-scanning the module. A
+    /// synthetic module's content
     /// fingerprint is likewise computed here, **once**, and kept on the artifact (see
     /// [`CompiledModule::fingerprint`]) so a cross-run cache can identify the module
     /// without re-hashing its whole decoded IR on every lookup; a real `.beam` keeps
@@ -266,7 +267,7 @@ impl CompiledModule {
     /// ([`needed_fingerprint`](crate::jit::cache::needed_fingerprint)).
     pub(crate) fn lazy(module: &Module) -> CompiledModule {
         CompiledModule {
-            labels: crate::interpreter::build_label_map(module),
+            labels: module.label_map(),
             fingerprint: crate::jit::cache::needed_fingerprint(module),
             layout: Layout::Lazy(LazyLayout {
                 functions: RefCell::new(vec![None; module.functions.len()]),
@@ -283,7 +284,8 @@ impl CompiledModule {
     pub(crate) fn fingerprint(&self) -> Option<u64> {
         self.fingerprint
     }
-    /// The module-wide label map this artifact holds, built once at creation.
+    /// The module-wide label map this artifact holds — a shared handle on the image's
+    /// one map, never a private copy.
     ///
     /// The native driver resolves a run's entry label and every import through it
     /// instead of rebuilding one per run (see [`super::NativeCode::labels`]).

@@ -133,8 +133,8 @@ pub(super) fn compile_module(
     function_sig.returns.push(AbiParam::new(types::I64));
 
     // The module-wide `Label -> (func, pc)` map an inlined `jump` resolves its
-    // target through.
-    let labels = crate::interpreter::build_label_map(module);
+    // target through — the image's own map (a shared handle, not a private copy).
+    let labels = module.label_map();
 
     let mut entry_pc: HashMap<u32, u32> = HashMap::new();
     let mut enter_pcs: HashMap<u32, Vec<u32>> = HashMap::new();

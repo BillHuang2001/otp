@@ -36,16 +36,28 @@
 //! `Err(BeamError)`. Every unsupported opcode/operand is a documented typed error,
 //! never a panic.
 //!
-//! The module is split by responsibility: this file owns the module docs and the
-//! [`LabelMap`] label/import index ([`build_label_map`], [`resolve`],
-//! [`resolve_label`], [`import_target`]); the sibling submodules own the dispatch
+//! The **label/import index** ([`LabelMap`]) is a pure function of a module image's
+//! immutable content, so it is owned by the **image**, not by the machine that runs it:
+//! `beam_loader::labels` holds the type, the whole-module build ([`build_label_map`])
+//! and the per-image slot (`beam_loader::labels::SharedLabelMap`, reached through
+//! [`Module::label_map`](beam_loader::Module::label_map)), which builds the map **at most
+//! once in the image's lifetime** and hands out an `Arc` clone after that. Every machine
+//! that runs the image — and every JIT artifact compiled from it — therefore shares the
+//! one allocation. This file re-exports that surface under its historical local names
+//! ([`LabelMap`], [`build_label_map`], [`resolve`], [`resolve_label`],
+//! [`import_target`]) so no consumer path changes.
+//!
+//! The module is split by responsibility: this file owns the module docs and those
+//! re-exports plus the two label resolvers; the sibling submodules own the dispatch
 //! loop (`dispatch`), the BIF marshalling (`bif`) and the `Test` evaluation
 //! (`test`).
 
 use beam_common::Result;
-use beam_loader::{ImportRef, Label, Module};
-
-use crate::error;
+use beam_loader::Label;
+// `Module`/`ImportRef` are named only by the test-only from-scratch resolver below and
+// by the `tests` submodule's `use super::*`.
+#[cfg(test)]
+use beam_loader::{ImportRef, Module};
 
 mod bif;
 mod dispatch;
@@ -85,327 +97,22 @@ use crate::Step;
 #[cfg(test)]
 use self::bif::STACK_ARGS;
 
-pub(crate) struct LabelMap {
-    slots: Slots,
-    /// `imports[ImportRef.0]`: the resolved `(module, function, arity)` of each
-    /// `Module::imports` entry (see [`ImportTarget`] and [`resolve_imports`]).
-    imports: ImportTable,
-    /// The address of the [`Module`] `imports` was resolved from; `0` (an address
-    /// no live `Module` can occupy) marks the table as unusable, so the lookup
-    /// falls back to the per-call [`import_target`] and can never feed a name from
-    /// a different module.
-    imports_owner: usize,
-}
-
-/// One `Module::imports` entry, resolved **once per run** into the
-/// `(module name, function name, arity)` triple
-/// [`ExecutionContext::call_bif`](crate::ExecutionContext::call_bif) takes.
-///
-/// Resolving one import costs two atom-table lookups, and the interpreter used to
-/// repeat them for *every* `gc_bif`/`bif`/`call_ext*` — the hottest instruction
-/// class (measured: ~5 ns per BIF call, against ~0.5 ns for a cache hit). The two
-/// names are stored **owned** rather than borrowed from the running [`Module`]:
-/// the map is also reached through a raw pointer inside the baseline JIT's
-/// [`JitRuntime`](crate::jit::baseline), which is a non-generic `#[repr(C)]` type,
-/// so the map cannot carry the module's lifetime. Copying the two names once per
-/// run is the whole price of the cache.
-struct ImportTarget {
-    /// The imported module's name (the string `call_bif` dispatches on).
-    module: Box<str>,
-    /// The imported function's name.
-    function: Box<str>,
-    /// The import's declared arity (what `call_bif` is called with).
-    arity: u32,
-}
-
-/// The per-run import table: `table[ImportRef.0]` is the resolved target, or the
-/// reason string of the typed error that resolving that import produced (an atom
-/// the module's atom table does not hold — see [`import_target`]). An index past
-/// the end is the typed `call: import out of range`, exactly as before.
-type ImportTable = Vec<std::result::Result<ImportTarget, &'static str>>;
-
-/// The two backing representations of a [`LabelMap`].
-enum Slots {
-    /// `slots[label.0]` over ids `0..=max`, each entry the target **packed** into
-    /// one word ([`pack_target`]); `slots[0]` is the unused `NO_FAIL` sentinel and
-    /// stays [`UNUSED_LABEL`].
-    ///
-    /// Packing the `(func index, code index)` pair into a single `u64` is what makes
-    /// [`LabelMap::resolve`] — one of the hottest non-dispatch operations in the
-    /// loop (every branch, `test`-fail, `call`, `select_val` and `return` resolves
-    /// one) — a single 8-byte load and one compare: the previous
-    /// `Option<(u32, u32)>` slot was 12 bytes, so every lookup paid a
-    /// `base + index * 12` `lea` chain *and* a separate discriminant-byte load and
-    /// branch, and the table was 1.5x larger.
-    Dense(Vec<u64>),
-    /// `(label id, target)` sorted by id, for a sparse id space.
-    Sparse(Vec<(u32, (u32, u32))>),
-}
-
-/// The "this label is not defined" sentinel of the dense slot table
-/// ([`Slots::Dense`]).
-///
-/// A packed target is `func_index << 32 | code_index`, so the sentinel collides
-/// only with the pair `(u32::MAX, u32::MAX)`: neither a module's function table nor
-/// a function's code array can be `u32::MAX` entries long, and `build_label_map`
-/// never emits a target with either half `u32::MAX` for a table that small. So a
-/// defined label and the sentinel can never be confused.
-const UNUSED_LABEL: u64 = u64::MAX;
-
-/// Pack a `(func index, code index)` label target into one word for
-/// [`Slots::Dense`] (the inverse of the unpacking [`LabelMap::resolve`] does).
-#[inline]
-const fn pack_target(target: (u32, u32)) -> u64 {
-    ((target.0 as u64) << 32) | target.1 as u64
-}
-
-/// Unpack a [`Slots::Dense`] word back into its `(func index, code index)` target.
-#[inline]
-const fn unpack_target(packed: u64) -> (u32, u32) {
-    ((packed >> 32) as u32, packed as u32)
-}
-
-impl LabelMap {
-    /// An empty index: every lookup is the typed [`crate::error::unknown_label`],
-    /// and every import falls back to the uncached [`import_target`].
-    pub(crate) fn new() -> LabelMap {
-        LabelMap {
-            slots: Slots::Dense(Vec::new()),
-            imports: Vec::new(),
-            imports_owner: 0,
-        }
-    }
-    /// Record `label -> (function index, code index)`, an existing entry for the
-    /// same label being replaced (labels are module-unique, so this only matters
-    /// for a malformed/duplicate table — and it matches the previous last-wins
-    /// `BTreeMap::insert`).
-    pub(crate) fn insert(&mut self, label: Label, target: (u32, u32)) {
-        match &mut self.slots {
-            Slots::Dense(slots) => {
-                let index = label.0 as usize;
-                if index >= slots.len() {
-                    slots.resize(index + 1, UNUSED_LABEL);
-                }
-                slots[index] = pack_target(target);
-            }
-            Slots::Sparse(entries) => match entries.binary_search_by_key(&label.0, |(id, _)| *id) {
-                Ok(found) => match entries.get_mut(found) {
-                    Some(entry) => entry.1 = target,
-                    None => {}
-                },
-                Err(at) => entries.insert(at, (label.0, target)),
-            },
-        }
-    }
-
-    /// Resolve `label` to its `(function index, code index)`; a label the module
-    /// does not define is the typed [`crate::error::unknown_label`].
-    #[inline]
-    pub(crate) fn resolve(&self, label: Label) -> Result<(u32, u32)> {
-        match &self.slots {
-            Slots::Dense(slots) => match slots.get(label.0 as usize) {
-                Some(&packed) if packed != UNUSED_LABEL => Ok(unpack_target(packed)),
-                _ => Err(error::unknown_label(label)),
-            },
-            Slots::Sparse(entries) => {
-                match entries.binary_search_by_key(&label.0, |(id, _)| *id) {
-                    Ok(found) => entries
-                        .get(found)
-                        .map(|(_, target)| *target)
-                        .ok_or_else(|| error::unknown_label(label)),
-                    Err(_) => Err(error::unknown_label(label)),
-                }
-            }
-        }
-    }
-
-    /// Resolve an import reference to `(module name, function name, arity)`.
-    ///
-    /// The hot path of every `gc_bif`/`bif`/`call_ext*`: a **cache hit** is one
-    /// address check, one bounds check and three loads from the per-run import
-    /// table ([`ImportTarget`]) instead of the two atom-table lookups
-    /// [`import_target`] performs per call.
-    ///
-    /// Nothing about the *semantics* changes: the table only answers when it was
-    /// built from **this** module (`imports_owner`), and a table miss — an index
-    /// past the end (`call: import out of range`), or an import whose module /
-    /// function atom is not in the module's table (`call: import module atom` /
-    /// `call: import function atom`) — is the exact typed error
-    /// [`import_target`] produces for the same import. A map this cache does not
-    /// cover (not built from this module: [`LabelMap::new`], `From`, ...) falls
-    /// straight through to [`import_target`], so the two can never disagree.
-    #[inline]
-    pub(crate) fn import_target<'a>(
-        &'a self,
-        module: &'a Module,
-        target: ImportRef,
-    ) -> Result<(&'a str, &'a str, u32)> {
-        if self.imports_owner == module as *const Module as usize {
-            match self.imports.get(target.0 as usize) {
-                Some(Ok(entry)) => {
-                    return Ok((&entry.module, &entry.function, entry.arity));
-                }
-                Some(Err(reason)) => return Err(error::unsupported(reason)),
-                None => return Err(error::unsupported("call: import out of range")),
-            }
-        }
-        import_target(module, target)
-    }
-}
-impl Default for LabelMap {
-    fn default() -> LabelMap {
-        LabelMap::new()
-    }
-}
-
-impl<const N: usize> From<[(Label, (u32, u32)); N]> for LabelMap {
-    fn from(pairs: [(Label, (u32, u32)); N]) -> LabelMap {
-        let mut map = LabelMap::new();
-        for (label, target) in pairs {
-            map.insert(label, target);
-        }
-        map
-    }
-}
-
-// A test-only counter of `build_label_map` calls on the current thread.
+// The label/import index was **lifted to the image it describes**: `beam_loader`'s
+// `labels` module now owns `LabelMap`, the whole-module `build_label_map` and the
+// per-image `SharedLabelMap` slot behind
+// [`Module::label_map`](beam_loader::Module::label_map). These re-exports keep every
+// `crate::interpreter::…` path (and every `&LabelMap` signature) unchanged, so the
+// engine's call sites did not move.
 //
-// It makes the build count observable: a run of a **synthetic** module (no content
-// identity, so `crate::machine::label_cache` never caches it) builds exactly once per
-// entry, and a real `.beam` module builds once on its first entry through a machine and
-// not at all on later entries while it stays resident in that machine's LRU. Compiled
-// only under `cfg(test)`, so it is
-// absent from production builds and from the `tests/` integration suites (which
-// link the non-test library) and cannot perturb their timing.
+// `LabelMap` is the type those signatures name and `build_label_map` still has a
+// non-test caller (`jit::baseline::emit::regalloc::allocate_registers`, the
+// `#[cfg_attr(not(test), allow(dead_code))]` convenience entry the emitter suites use),
+// so both stay ungated. The bare `import_target` is only the uncached fallback the
+// in-crate suites compare against, and the build tally is a diagnostic: those three are
+// test-only.
+pub(crate) use beam_loader::labels::{build_label_map, LabelMap};
 #[cfg(test)]
-thread_local! {
-    static LABEL_MAP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Test-only: reset the current thread's [`build_label_map`] call counter.
-#[cfg(test)]
-pub(crate) fn reset_label_map_builds() {
-    LABEL_MAP_BUILDS.with(|c| c.set(0));
-}
-
-/// Test-only: the current thread's [`build_label_map`] call count.
-#[cfg(test)]
-pub(crate) fn label_map_builds() -> usize {
-    LABEL_MAP_BUILDS.with(|c| c.get())
-}
-
-/// The upper bound on the label-count hint [`build_label_map`] reserves its entry
-/// buffer from.
-///
-/// The hint is [`Module::code_version`]'s `label_count` — the `Code` chunk header's
-/// label count, which is **exact** for a real `.beam` (28 for `tailcall.beam`, 1257
-/// for `lists.beam`, 1195 for `string.beam`, i.e. the whole buffer is filled without
-/// a reallocation). It is clamped because the count comes from the file: an absurd
-/// header must not turn into an eager multi-megabyte reservation. The reservation is
-/// only a hint in any case — the buffer still grows to whatever the module's label
-/// tables actually hold (and a hand-built `Module` reports `0`, which is why the
-/// clamp is a *cap*, never a requirement).
-const LABEL_HINT_CAP: usize = 8192;
-
-/// The initial capacity [`build_label_map`] reserves for its entry buffer.
-fn label_hint(module: &Module) -> usize {
-    (module.code_version.label_count as usize).min(LABEL_HINT_CAP)
-}
-
-pub(crate) fn build_label_map(module: &Module) -> LabelMap {
-    #[cfg(test)]
-    LABEL_MAP_BUILDS.with(|c| c.set(c.get() + 1));
-    // ONE traversal of the module's label tables, into an entry buffer that is then
-    // either packed into the dense slot table or kept as the sorted sparse list.
-    //
-    // The traversal — not the table filling — is what this costs: `Function::labels`
-    // is a `BTreeMap`, so reaching each element is a chase into a separately allocated
-    // node. The buffer's `len()` and the running `max` give the two facts the
-    // dense/sparse decision needs (`count` and `max`), so one walk answers both.
-    // Measured interleaved on one host (a reused scratch harness, 5k-20k builds per run):
-    //
-    // | module | labels | per build |
-    // |---|---|---|
-    // | `lists.beam` | 1256 | 6467 ns |
-    // | `string.beam` | 1194 | 5974 ns |
-    // | `tailcall.beam` | 27 | 193 ns |
-    //
-    // A build happens once per machine per module, never once per run: `Machine::label_map`
-    // serves it from the bounded LRU in `crate::machine::label_cache` (`LABEL_MAP_CAPACITY`
-    // entries keyed on the digest + atom snapshot + address, so a nested run alternating an
-    // entry module and its in-machine callees keeps every one of them resident; a synthetic
-    // all-zero-checksum image has no content identity and is rebuilt on every entry).
-    //
-    // The entries come out in **label-id order** within each function: a `BTreeMap`
-    // iterates in key order, so the concatenation of the per-function tables is ordered
-    // except across function boundaries. The dense branch does not care (it indexes by
-    // label id), and the sparse branch sorts explicitly, so a duplicated label id is
-    // last-wins either way.
-    //
-    // A real `.beam` numbers its labels `1..=count`, so `max + 1 == count + 1` and the
-    // dense table is exactly as large as the label set (verified across the installed
-    // OTP: density is exactly 1.0); the sparse form is for a pathological id space.
-    let mut entries: Vec<(u32, (u32, u32))> = Vec::with_capacity(label_hint(module));
-    let mut max = 0u32;
-    for (func_index, function) in module.functions.iter().enumerate() {
-        let func_index = func_index as u32;
-        for (label, &code_index) in &function.labels {
-            entries.push((label.0, (func_index, code_index as u32)));
-            if label.0 > max {
-                max = label.0;
-            }
-        }
-    }
-    let count = entries.len();
-    let imports = resolve_imports(module);
-    let imports_owner = module as *const Module as usize;
-    if max as u64 <= (count as u64).saturating_mul(4) + 64 {
-        let mut slots: Vec<u64> = vec![UNUSED_LABEL; max as usize + 1];
-        for (label, target) in &entries {
-            slots[*label as usize] = pack_target(*target);
-        }
-        LabelMap {
-            slots: Slots::Dense(slots),
-            imports,
-            imports_owner,
-        }
-    } else {
-        let mut sorted = entries;
-        sorted.sort_unstable_by_key(|(id, _)| *id);
-        LabelMap {
-            slots: Slots::Sparse(sorted),
-            imports,
-            imports_owner,
-        }
-    }
-}
-
-/// Resolve **every** import of `module` once, producing the per-run import table
-/// [`LabelMap::import_target`] looks up.
-///
-/// Each entry is either the resolved [`ImportTarget`] or the reason string of the
-/// typed error resolution produced, so the cached path reproduces
-/// [`import_target`]'s errors exactly (a missing module/function atom is
-/// remembered per import, never substituted by a different name).
-fn resolve_imports(module: &Module) -> ImportTable {
-    module
-        .imports
-        .iter()
-        .map(|import| {
-            let module_name = module
-                .atom_name(import.module)
-                .ok_or("call: import module atom")?;
-            let function_name = module
-                .atom_name(import.function)
-                .ok_or("call: import function atom")?;
-            Ok(ImportTarget {
-                module: module_name.into(),
-                function: function_name.into(),
-                arity: import.arity,
-            })
-        })
-        .collect()
-}
+pub(crate) use beam_loader::labels::{import_target, label_map_builds, reset_label_map_builds};
 
 /// Resolve a label against an already-built index; a missing label is a typed error.
 pub(crate) fn resolve(labels: &LabelMap, label: Label) -> Result<(u32, u32)> {
@@ -415,38 +122,15 @@ pub(crate) fn resolve(labels: &LabelMap, label: Label) -> Result<(u32, u32)> {
 /// Resolve a module-local label to its `(function index, code offset)` against a
 /// **fresh** build of the module's index — the test-only convenience.
 ///
-/// Production never calls this: a run resolves its labels against the machine's
-/// label-map cache ([`Machine::label_map`](crate::Machine), which
-/// [`Machine::run_label_outcome`](crate::Machine::run_label_outcome), the dispatch
-/// loop and the native tier all go through, so a re-entered module builds nothing),
-/// and a label handed in is resolved against the map the run will execute with
-/// ([`resolve`]). This per-call builder is compiled only for tests, where it pins the
-/// semantics of an index built from scratch — and so that no future site can quietly
-/// reintroduce a per-call whole-module build.
+/// Production never calls this: a run resolves its labels against the **image's** own
+/// index ([`Module::label_map`], reached through [`Machine::label_map`](crate::Machine),
+/// which [`Machine::run_label_outcome`](crate::Machine::run_label_outcome), the dispatch
+/// loop and the native tier all go through, so a re-entered image builds nothing), and a
+/// label handed in is resolved against the map the run will execute with ([`resolve`]).
+/// This per-call builder is compiled only for tests, where it pins the semantics of an
+/// index built from scratch — and so that no future site can quietly reintroduce a
+/// per-call whole-module build.
 #[cfg(test)]
 pub(crate) fn resolve_label(module: &Module, label: Label) -> Result<(u32, u32)> {
     build_label_map(module).resolve(label)
-}
-
-/// Resolve an import reference to `(module name, function name, arity)` — **the
-/// uncached fallback**.
-///
-/// This is the per-call resolution the interpreter used to run for every
-/// `gc_bif`/`bif`/`call_ext*` (two atom-table lookups and the `Vec` bounds check).
-/// [`LabelMap::import_target`] answers from the per-run cache instead; this
-/// function stays the definition of the import semantics and the path taken when
-/// the cache cannot answer (a map not built from this module), so both agree
-/// exactly — including on the three typed errors below.
-fn import_target(module: &Module, target: ImportRef) -> Result<(&str, &str, u32)> {
-    let import = module
-        .imports
-        .get(target.0 as usize)
-        .ok_or_else(|| error::unsupported("call: import out of range"))?;
-    let module_name = module
-        .atom_name(import.module)
-        .ok_or_else(|| error::unsupported("call: import module atom"))?;
-    let function_name = module
-        .atom_name(import.function)
-        .ok_or_else(|| error::unsupported("call: import function atom"))?;
-    Ok((module_name, function_name, import.arity))
 }

@@ -137,10 +137,10 @@ impl Machine {
         // process is scheduled in; the host reads the count when the slice returns).
         self.reductions = 0;
         // The entry module's label index. A run entry that already resolved its
-        // entry label hands its map in; otherwise it comes from the machine's
-        // label-map cache, which builds the whole-module value only on a miss (a
-        // re-entered module answers from the entry `Machine::reset` deliberately
-        // keeps — it is content-keyed, not run-keyed).
+        // entry label hands its map in; otherwise it comes from the image itself
+        // (`Module::label_map`), which builds the whole-module value at most once in
+        // that image's lifetime and answers an `Arc::clone` after that — so a
+        // re-entered module, from this machine or any other, costs no build.
         let built: Arc<LabelMap>;
         let entry_labels: &LabelMap = match labels {
             Some(map) => map,

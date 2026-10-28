@@ -105,10 +105,12 @@ pub fn is_undefined_lambda(error: &BeamError) -> bool {
 /// Raises a BEAM `error` with the reason atom `unsupported_opcode: <what>`; it is
 /// the documented sentinel for the not-yet-implemented opcode/operand subset and
 /// is **never** a panic.
+///
+/// The constructor itself is [`beam_loader::error::unsupported`]'s: the loader's
+/// label/import index reports its three import-table failures with the same sentinel,
+/// so one definition keeps the two from drifting apart into two spellings of one atom.
 pub fn unsupported(what: &str) -> BeamError {
-    BeamError::Raise(Raise::error(ExitReason::atom(format!(
-        "unsupported_opcode: {what}"
-    ))))
+    beam_loader::error::unsupported(what)
 }
 
 /// An X-register index outside the register file.

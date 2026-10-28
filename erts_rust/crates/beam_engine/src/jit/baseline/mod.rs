@@ -774,7 +774,8 @@ fn enter_compiled_cached(
 }
 
 /// The module-wide label map a driver run resolves labels/imports through: the tier's
-/// own (built once with the artifact) when it holds one, else the machine's cached one.
+/// own (the image's, held by the artifact) when it holds one, else the machine's answer
+/// from the image.
 ///
 /// `Deref`s to [`LabelMap`], so a driver call site passes it exactly as it passed the
 /// by-value map before ([`drive`] takes `&LabelMap`, [`interpreter::resolve`] too).
@@ -783,7 +784,7 @@ pub(crate) enum RunLabels<'a> {
     /// the run pays no per-run build.
     Stored(&'a interpreter::LabelMap),
     /// The map [`Machine::label_map`](crate::Machine) answered with because the tier
-    /// holds none — the machine's label-map cache, which builds on a miss only.
+    /// holds none — the image's own slot, which builds at most once per image.
     Built(std::sync::Arc<interpreter::LabelMap>),
 }
 
@@ -802,10 +803,9 @@ impl std::ops::Deref for RunLabels<'_> {
 /// entry points share (it mirrors [`Machine::run_label`](crate::Machine)).
 ///
 /// The label map is **reused** from the tier's artifact when it holds one
-/// ([`NativeCode::labels`], i.e. the compiled map) and taken from the machine's
-/// label-map cache otherwise ([`Machine::label_map`](crate::Machine)): it is a
-/// per-module value, so rebuilding it on every run of the same module is pure
-/// per-run overhead.
+/// ([`NativeCode::labels`], i.e. the image's map) and taken from the image otherwise
+/// ([`Machine::label_map`](crate::Machine)): it is a per-image value, so rebuilding it
+/// on every run of the same image — or once per machine — is pure redundancy.
 fn enter_machine<'a>(
     machine: &mut Machine,
     module: &Module,

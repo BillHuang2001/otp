@@ -381,11 +381,11 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // module handle it must be resumed in.
         self.contexts.clear();
         self.context = 0;
-        // The label-map cache is **deliberately not cleared**: unlike the entries above
-        // it is keyed on the module's content witness (digest + atom namespace) and its
-        // address, not on the run, so a map built for a module stays valid across every
-        // reset and a machine that runs one module repeatedly builds it once. A stale
-        // entry can never answer for another module (`label_cache.rs`).
+        // The label map is **deliberately not touched**: it is not the machine's at all
+        // but the image's (`beam_loader::SharedLabelMap`, reached through
+        // `Module::label_map`), so it outlives every reset by construction and a machine
+        // that runs one module repeatedly builds it once. A map can never answer for
+        // another image because the slot's identity *is* the image.
         //
         // The local-call verdict tables belong to the run that filled them (the cached
         // `Arc<Module>`s behind the registered contexts are dropped by `contexts.clear()`
@@ -401,8 +401,9 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // single bitstring cost on exactly that shape. `Machine::enter_run` re-binds the
         // table instead (`Machine::bind_entry_programs`), keeping it only when the new
         // entry module *is* the image it was filled from (address + content digest + atom
-        // namespace: `ProgramWitness::describes`, the identity argument
-        // `label_cache.rs` makes) and discarding it otherwise — so a fresh run can never
+        // namespace: `ProgramWitness::describes`, the same content-witness argument the
+        // label map gets from living on the image) and discarding it otherwise — so a
+        // fresh run can never
         // answer a `(func, pc)` from a previous run's image, and a synthetic image (all-zero
         // checksum, no content identity) is never retained at all. A registered context's
         // table is dropped with `contexts.clear()` above, and `resume_outcome` deliberately

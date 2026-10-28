@@ -3601,32 +3601,30 @@ fn the_compiled_block_wires_the_ext_call_helper_into_native_code() {
 }
 
 // ---------------------------------------------------------------------------
-// the artifact owns the module-wide label map
+// the artifact shares the image's module-wide label map
 // ---------------------------------------------------------------------------
 
-/// The compiled artifact **owns** the module-wide label map, so a run of it resolves
-/// its entry label and imports against that one map instead of rebuilding a per-module
-/// value on every run.
+/// The compiled artifact **shares the image's** module-wide label map, so a run of it
+/// resolves its entry label and imports against that one map instead of rebuilding a
+/// per-module value on every run.
 ///
 /// Before this, the native driver called [`interpreter::build_label_map`] again on
 /// every `run_compiled`/`run_compiled_outcome` (in `enter_machine`) **and** on every
 /// resume (in `run_compiled_resume_outcome`) — a whole traversal of the module's
 /// per-function `BTreeMap` label tables — even though the map is a property of the
-/// (immutable) module the artifact was compiled from. It is now built once, when the
-/// artifact is created: at `compile_module` for the eager layout,
-/// [`CompiledModule::lazy`] for the lazy one, and the driver reuses it through
-/// [`NativeCode::labels`].
+/// (immutable) module the artifact was compiled from. The map now lives on the image
+/// ([`Module::label_map`], `beam_loader`'s per-image slot) and the artifact holds an
+/// `Arc` clone of it ([`CompiledModule::lazy`], `compile_module`), so creating an
+/// artifact **adds no build at all** for an image any earlier consumer already touched.
 ///
-/// The counter is thread-local, so it sees only this test's own builds. The one build
-/// still attributable to a run is the export-entry resolution
-/// (`interpreter::resolve_label`, out of this crate-node's scope) — the assertion is
-/// therefore "at most one per run, never two", which is exactly what distinguishes the
-/// driver's map reuse from the old double build.
+/// The counter is thread-local, so it sees only this test's own builds, and it is
+/// **per image** — that is the invariant every assertion here states: the first consumer
+/// of a fresh image builds exactly one map, and every later consumer of that image (a
+/// run, another artifact, a resume) builds none.
 #[test]
 fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
     // `label; label; move 7 -> x0; return`, exported as `f/0`: every run returns 7.
-    let (module, name) = exported_module(
-        "f",
+    let body = || {
         vec![
             Instr::Label(Label(1)),
             Instr::Label(Label(2)),
@@ -3635,38 +3633,29 @@ fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
                 dst: Operand::X(0),
             },
             Instr::Return,
-        ],
-    );
-
+        ]
+    };
+    let (module, name) = exported_module("f", body());
     crate::interpreter::reset_label_map_builds();
-    // The eager artifact stores the module-wide map it built at compile time.
+    // The image owns the map; its **first** consumer builds it — here the eager compile.
     let compiled = compile_module(&module).expect("the module compiles");
-    let built_at_compilation = crate::interpreter::label_map_builds();
-    assert!(
-        built_at_compilation >= 1,
-        "the eager artifact holds a module-wide label map built at compile time, got \
-         {built_at_compilation}"
+    assert_eq!(
+        crate::interpreter::label_map_builds(),
+        1,
+        "a fresh image's first consumer builds its map exactly once"
     );
-
-    // One exported run.
+    // One exported run: the artifact holds the image's map, so the driver builds nothing.
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     let value = run_compiled(&compiled, &mut machine, &module, name, 0, &[], &mut ctx)
         .expect("the exported run returns");
     assert_eq!(value, make_small(7), "the exported run returns the moved x(0)");
-    let built_by_one_run = crate::interpreter::label_map_builds() - built_at_compilation;
-    // `Machine::label_map` now caches the map per machine (`machine/label_cache.rs`),
-    // and this fixture is **synthetic** (all-zero checksum), which is never cached — so
-    // this run's count is exactly one *if* it consults the machine at all. It does not:
-    // the eager artifact holds its own map, so the export entry resolves against that
-    // and the run builds **zero**.
     assert_eq!(
-        built_by_one_run, 0,
-        "a run of an artifact that holds its own label map must NOT build one in the \
-         driver: this run built {built_by_one_run} maps"
+        crate::interpreter::label_map_builds(),
+        1,
+        "a run of an artifact that holds the image's label map builds none"
     );
-
-    // Two more runs: the per-run cost is a constant, so nothing accumulates.
+    // Two more runs on fresh machines: the per-run cost stays zero, so nothing accumulates.
     for run in 1..3 {
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
@@ -3675,14 +3664,11 @@ fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
         assert_eq!(value, make_small(7), "run {run} returns the moved x(0)");
     }
     assert_eq!(
-        crate::interpreter::label_map_builds() - built_at_compilation,
-        3 * built_by_one_run,
-        "every run of one eager artifact builds the same number of maps: the driver \
-         adds none of its own"
+        crate::interpreter::label_map_builds(),
+        1,
+        "every run of one eager artifact builds no map at all"
     );
-
-    // The label-addressed entry resolves against the run's map, so on top of the
-    // export-path constant it adds nothing at all.
+    // The label-addressed entry resolves against the run's map, so it adds nothing either.
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     let outcome = run_compiled_label_outcome(
@@ -3697,42 +3683,66 @@ fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
     .expect("the label run returns");
     assert_eq!(outcome, RunOutcome::Returned(make_small(7)));
     assert_eq!(
-        crate::interpreter::label_map_builds() - built_at_compilation,
-        3 * built_by_one_run,
+        crate::interpreter::label_map_builds(),
+        1,
         "the label-addressed entry builds no map: it resolves against the artifact's"
     );
-
-    // The lazy artifact builds exactly one map, at creation.
+    // A **second** eager artifact from the same image shares that one map: zero builds.
+    let _second = compile_module(&module).expect("the second compilation succeeds");
+    assert_eq!(
+        crate::interpreter::label_map_builds(),
+        1,
+        "a second artifact of one image adds no build -- the map is the image's, not the \
+         artifact's"
+    );
+    // The lazy artifact likewise takes the image's map at creation: zero builds.
     let lazy = CompiledModule::lazy(&module);
     assert_eq!(
-        crate::interpreter::label_map_builds() - built_at_compilation,
-        3 * built_by_one_run + 1,
-        "CompiledModule::lazy builds exactly one map, at creation"
+        crate::interpreter::label_map_builds(),
+        1,
+        "CompiledModule::lazy takes the image's map instead of building one"
     );
-
-    // Its first entry compiles the function (a one-time cost); every run after that
-    // still pays only the export-path constant, never a second map.
+    // Its first entry compiles the function on demand (a one-time cost) and its second run
+    // reuses that function; neither builds a map.
+    for run in 1..=2 {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let value = run_compiled(&lazy, &mut machine, &module, name, 0, &[], &mut ctx)
+            .expect("the lazy artifact's entry compiles the function and returns");
+        assert_eq!(value, make_small(7), "lazy run {run} returns the moved x(0)");
+    }
+    assert_eq!(
+        crate::interpreter::label_map_builds(),
+        1,
+        "a lazy run builds no map either, before or after its first compilation"
+    );
+    // A **different** image is a different slot: exactly one more build, never a shared map.
+    let (other, other_name) = exported_module("f", body());
+    let other_compiled = compile_module(&other).expect("the other module compiles");
+    assert_eq!(
+        crate::interpreter::label_map_builds(),
+        2,
+        "a different image derives its own map"
+    );
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
-    let value = run_compiled(&lazy, &mut machine, &module, name, 0, &[], &mut ctx)
-        .expect("the lazy artifact's first entry compiles the function and returns");
-    assert_eq!(value, make_small(7));
-    let after_first_entry = crate::interpreter::label_map_builds();
-
-    let mut machine = Machine::new();
-    let mut ctx = MinimalContext::new();
-    let value = run_compiled(&lazy, &mut machine, &module, name, 0, &[], &mut ctx)
-        .expect("the second lazy run returns");
+    let value = run_compiled(
+        &other_compiled,
+        &mut machine,
+        &other,
+        other_name,
+        0,
+        &[],
+        &mut ctx,
+    )
+    .expect("the other exported run returns");
     assert_eq!(value, make_small(7));
     assert_eq!(
-        crate::interpreter::label_map_builds() - after_first_entry,
-        built_by_one_run,
-        "a lazy run whose function is already compiled costs the same per-run constant \
-         as an eager one (the driver rebuilds nothing, and the lazy artifact's map is \
-         the one built at creation)"
+        crate::interpreter::label_map_builds(),
+        2,
+        "and its runs build nothing more"
     );
 }
-
 // ---------------------------------------------------------------------------
 // Measurement (not an assertion): the declined `call_ext*` seam cost
 // ---------------------------------------------------------------------------
