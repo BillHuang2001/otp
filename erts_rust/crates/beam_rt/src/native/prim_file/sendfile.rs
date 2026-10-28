@@ -516,7 +516,19 @@ mod tests {
     //!
     //! `prim_sendfile` is driven **directly** (the dispatch arm in `prim_file_call` lands in
     //! a separate commit), through the same `RuntimeContext` shape `native::prim`'s suite
-    //! builds.
+    //! builds; [`the_prim_file_door_writes_the_whole_file_to_the_socket`] additionally takes
+    //! the named `prim_file:sendfile/8` door that `file:sendfile/5` uses.
+    //!
+    //! # The write is synchronous, and the command carries a caller tag
+    //!
+    //! No pump sits between the send and the peer's read: [`crate::PortRegistry::command`] runs
+    //! the `OUTPUT` task before it answers (`run_port_tasks`), which is the driver's
+    //! [`output`](beam_io::Driver::output) — `TcpInetDriver::write_command`'s `send(2)` — so the
+    //! bytes are on the wire when `prim_sendfile` returns. What the command **must** carry is the
+    //! `[n:be16][tag]` caller prefix: a bare payload is `init_caller`'s failure and the driver
+    //! kills the port with `einval` while `port_command` still reports the accept, which is
+    //! exactly the "headers, then nothing" hang this module removes (module docs, *the payload is
+    //! a port command*). [`super::with_empty_caller_tag`] supplies it.
     //!
     //! # Hermetic and bounded
     //!
@@ -832,7 +844,6 @@ mod tests {
     /// Oracle: `Off=0, Len=26` ⇒ `{ok,26}`, peer received the whole file
     /// `<<"abcdefghijklmnopqrstuvwxyz">>`.
     #[test]
-    #[ignore = "the loopback peer never sees the payload: a `port_command` on an adopted INET_REQ_FDOPEN descriptor returns Written without the driver flushing the socket, and a unit-test rig has no port round to drive `ready_output` — see the module report"]
     fn the_whole_file_is_written_verbatim() {
         let mut runtime = runtime();
         let (_dir, path) = content_file("sendfile_whole");
@@ -849,7 +860,6 @@ mod tests {
 
     /// Oracle: `Off=7, Len=7` ⇒ `{ok,7}`, peer received exactly `<<"hijklmn">>`.
     #[test]
-    #[ignore = "the loopback peer never sees the payload: a `port_command` on an adopted INET_REQ_FDOPEN descriptor returns Written without the driver flushing the socket, and a unit-test rig has no port round to drive `ready_output` — see the module report"]
     fn an_offset_and_length_window_is_written_verbatim() {
         let mut runtime = runtime();
         let (_dir, path) = content_file("sendfile_window");
@@ -866,7 +876,6 @@ mod tests {
 
     /// Oracle: `Len=0` ⇒ `{ok,26}` (the whole file from `Offset`), peer received all 26.
     #[test]
-    #[ignore = "the loopback peer never sees the payload: a `port_command` on an adopted INET_REQ_FDOPEN descriptor returns Written without the driver flushing the socket, and a unit-test rig has no port round to drive `ready_output` — see the module report"]
     fn a_zero_length_means_to_the_end_of_the_file() {
         let mut runtime = runtime();
         let (_dir, path) = content_file("sendfile_zero_length");
@@ -884,7 +893,6 @@ mod tests {
     /// Oracle: `Off=20, Len=100` ⇒ `{ok,6}` — the request is clamped to the trailing bytes,
     /// and the peer received exactly `<<"uvwxyz">>`.
     #[test]
-    #[ignore = "the loopback peer never sees the payload: a `port_command` on an adopted INET_REQ_FDOPEN descriptor returns Written without the driver flushing the socket, and a unit-test rig has no port round to drive `ready_output` — see the module report"]
     fn a_length_past_eof_is_clamped_to_the_trailing_bytes() {
         let mut runtime = runtime();
         let (_dir, path) = content_file("sendfile_clamped");
@@ -899,6 +907,45 @@ mod tests {
         assert_peer_reads(&mut port.peer, expected(20, 6));
     }
 
+    /// The **production door**: `prim_file:sendfile/8` called by name reaches the same write.
+    ///
+    /// The four matrix cases above call [`RuntimeContext::prim_sendfile`] directly, which is
+    /// what every assertion is about; this one takes the route a `cowboy_static` reply really
+    /// takes — `file:sendfile/5`'s external `prim_file:sendfile/8` call, i.e. the native
+    /// floor's `("sendfile", 8)` arm of `prim_file_call` (the `prim_file` entry a `call_ext`
+    /// reaches). A dispatch regression that swallowed the
+    /// payload would leave the peer with headers and no body, which is the hang this whole
+    /// module exists to remove.
+    #[test]
+    fn the_prim_file_door_writes_the_whole_file_to_the_socket() {
+        let mut runtime = runtime();
+        let (_dir, path) = content_file("sendfile_door");
+        let fd = open_read(&mut runtime, &path);
+        let mut port = match ConnectedPort::open(&mut runtime) {
+            Some(port) => port,
+            None => return,
+        };
+        // The oracle's argument order: `(Fd, Socket, Offset, Bytes, ChunkSize, Headers,
+        // Trailers, Flags)` — `file:sendfile/5`'s own `0`, `0` and empty lists.
+        let answer = call(
+            &mut runtime,
+            "prim_file",
+            "sendfile",
+            &[
+                fd,
+                port.term(),
+                make_small(0),
+                make_small(0),
+                make_small(65_536),
+                NIL,
+                NIL,
+                NIL,
+            ],
+        )
+        .expect("a prim_file:sendfile/8 answer");
+        assert_ok(&runtime, answer, 26);
+        assert_peer_reads(&mut port.peer, CONTENT);
+    }
     /// Oracle: `Off=100` (past EOF) ⇒ `{ok,0}` and the peer receives **nothing**.
     #[test]
     fn an_offset_past_eof_answers_ok_zero_and_writes_nothing() {
