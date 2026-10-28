@@ -238,9 +238,10 @@
 //! takes. The general door [`jit_open_append_bin_any`] / [`jit_open_append_bin_any_y`] is
 //! handed the plan's `unit` for exactly this test; the aligned route
 //! ([`create_door::emit_append_cursor`]) refuses unless `end_bits % 8 == 0` — the `unit == 8`
-//! form of the same gate, because a byte cursor needs a byte-aligned window end — and
-//! [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor) re-checks it so the
-//! machine-private half agrees with the seam on every input.
+//! form of the same gate, because a byte cursor needs a byte-aligned window end — and that
+//! emitted guard is the whole check: [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor)
+//! does not re-test it, keeping only the writable-registry clause and the overflow-safe
+//! `checked_mul(8)`/`checked_add` room rule.
 //!
 //! The `fail` arm is deliberately **not** part of this shape: `bs_create_bin`'s
 //! `NO_FAIL`-vs-label discrimination stays in the family, and every refusal above (and

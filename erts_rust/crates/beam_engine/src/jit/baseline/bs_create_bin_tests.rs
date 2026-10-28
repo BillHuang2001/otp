@@ -33,14 +33,20 @@
 //!   <the append door>                                    ; Aligned: inline shape proof + jit_append_cursor (X or Y)
 //!                                                        ; BitGranular: jit_open_append_bin_any[_y](slot, tail, unit)
 //!   test rax, rax ; je fallback                          ; the LAST guard, still before every write
-//!   <the field byte stores at the cursor in rax>         ; a Y field value is re-read (unguarded) per field
-//!   <the accumulator re-read (unguarded), the end commit>; THE ONLY MUTATION, last
-//!   <the accumulator re-read (unguarded) into Dst>       ; a Y Dst's address is re-derived too
+//!   <the field byte stores at the cursor in rax>         ; one load + `sar 4` per Field::Bits (a run of
+//!                                                        ; same-Loc one-byte fields shares one load), a Y value
+//!                                                        ; re-read (unguarded) per field
+//!   <one accumulator load, the pointer mask in place, end += tail_bits, one store> ; THE ONLY MUTATION, last
+//!   <the same kept accumulator word into Dst>            ; a Y Dst's address is re-derived too
 //!   jmp fast_done
 //! fallback:
 //!   <one interpreter step>                               ; re-reads an untouched accumulator
 //! fast_done:
 //! ```
+//!
+//! The aligned route's door neither spills nor publishes a position: `jit_append_cursor` cannot
+//! pre-empt, park, raise or collect, and the `fallback` arm parks through `jit_step_one`'s own
+//! arguments, so the position a reader sees there is the block entry — a valid resume point.
 //!
 //! A `fallback` is a **deopt**: `jit_step_one` re-executes the entire instruction in the
 //! interpreter with the same operands and re-reads the machine's live state. So any word the
