@@ -513,6 +513,7 @@ A.9's differential coverage is boot/version **observability** plus the in-proces
   closure whose identity/`num_free`/`env` are erl_eval internals no seam can derive faithfully (only a full
   `erl_eval`/`erl_parse` port would; fabricating them is forbidden). A compiled module's local fun encodes
   byte-exactly through `LocalFunIdentity`.
+- **A BIF that raises publishes no callee stacktrace item.** For `try binary:at(<<1:1>>, 0) catch error:_:Stk -> hd(Stk) end` the oracle's head item is `{binary,at,[<<1:1>>,0],[{error_info,#{module => erl_stdlib_errors}}]}`; this runtime's is the *calling* frame (`{M,'-f/N-fun-K',A,[{file,…},{line,…}]}`), with no callee item and no `error_info` location extension (the two residuals documented in `beam_engine/src/families/exceptions/CONTEXT.md`). Consequence, measured: `binary_module_SUITE:error_info/1` reports **95 errors** (72 `renamed` — the head names the caller, not `binary:at` — and 22 `no_explanation` — `erl_error` cannot reach `erl_stdlib_errors:format_error/1`), where the oracle answers `ok`; both divergences are the one missing head item.
 - Repo-root owned (outside this node): `../../CHANGE.md` documents Milestones 1–3 and still owes entries for
   the `beam_term` `map`/`bitstring`/`refc` foundation, the `RefCount` move into `beam_alloc` + the
   `RefcBinary` off-heap seam + `beam_gc::OffHeap` owning refc binaries, and the runtime parity work
