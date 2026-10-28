@@ -239,8 +239,11 @@ impl RuntimeContext<'_> {
             ("advise_nif", 4) => Some(self.prim_advise_nif(args)),
             // A **userspace** sendfile: `beam_io` refuses the inet driver's
             // `TCP_REQ_SENDFILE` (opcode 45), so the extent is read from the descriptor's
-            // host file and written through the port command seam. The answer matrix, the
-            // `{error,enotsup}` value for non-empty `Headers`/`Trailers` and the 16 MiB
+            // host file and written through the port command seam, which carries the driver's
+            // `[n:be16][tag]` caller prefix: this route sends the C's zero-length `[0,0]` (no
+            // `{inet_reply,…}` staged), and an untagged command is `EINVAL` — port reaped,
+            // payload silently lost (mechanism: `prim_file/sendfile.rs`). The answer matrix,
+            // the `{error,enotsup}` value for non-empty `Headers`/`Trailers` and the 16 MiB
             // payload cap are `prim_file/sendfile.rs`'s.
             ("sendfile", 8) => Some(self.prim_sendfile(args)),
             ("read_file_info", 1 | 2) => Some(self.prim_read_file_info(args, true)),
@@ -372,13 +375,13 @@ impl RuntimeContext<'_> {
 
     /// `prim_file:list_dir/1` and `prim_file:list_dir_all/1` — the directory entries as
     /// `{ok, Names}`, or `{error, Reason}` (`prim_file.erl`'s
-    /// `list_dir/1 = list_dir_1(Name, false)` / `list_dir_all/1 = list_dir_1(Name, true)`).
+    /// `list_dir/1 = list_dir_1(Name, true)` / `list_dir_all/1 = list_dir_1(Name, false)`).
     ///
     /// `list_dir_nif/1` answers the **raw** `readdir(3)` names as binaries, and the Erlang
     /// wrapper folds them through `decode_path/1` **prepending** each decoded name, so the
     /// result is the reverse of the native listing. A name the native encoding cannot decode
-    /// is *skipped* by `list_dir_all/1` (its `SkipInvalid` is `true`) and kept as its **raw
-    /// binary** by `list_dir/1`. Both are reproduced here; the one documented divergence is
+    /// is *skipped* by `list_dir/1` (its `SkipInvalid` is `true`) and kept as its **raw
+    /// binary** by `list_dir_all/1`. Both are reproduced here; the one documented divergence is
     /// the native listing itself, whose order is a property of the on-disk directory state
     /// (`readdir(3)`) that no implementation can pin.
     ///
@@ -408,8 +411,8 @@ impl RuntimeContext<'_> {
                     let name = self.charlist(text)?;
                     names.push(name);
                 }
-                // A name the native encoding cannot decode: `list_dir_all/1` skips it,
-                // `list_dir/1` keeps it as the raw byte string the C answered.
+                // A name the native encoding cannot decode: `list_dir/1` skips it,
+                // `list_dir_all/1` keeps it as the raw byte string the C answered.
                 None if skip_invalid => {}
                 None => {
                     let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str());
@@ -689,15 +692,15 @@ impl RuntimeContext<'_> {
     // -- prim_file:read_file_info/1,2 · read_link_info/1,2 · read_handle_info/1,2 ----
     //
     // The `#file_info{}` family. The C body is `efile_read_info`
-    // (`unix_prim_file.c:733-769`: `stat(2)`/`lstat(2)` plus two `access(2)` probes) and
-    // `efile_read_handle_info` (`:803-820`: `fstat(2)` plus `check_access/1` against the
-    // **effective** uid/gid), both feeding `build_file_info/2` (`:707-731`); the Erlang
-    // wrappers are `read_info_1/3` and `read_handle_info_1/2` (`prim_file.erl:647-676`).
+    // (`unix_prim_file.c:739-769`: `stat(2)`/`lstat(2)` plus two `access(2)` probes) and
+    // `efile_read_handle_info` (`:803-819`: `fstat(2)` plus `check_access/1` against the
+    // **effective** uid/gid), both feeding `build_file_info/2` (`:712-737`); the Erlang
+    // wrappers are `read_info_1/3` and `read_handle_info_1/2` (`prim_file.erl:657-681`).
     // The whole-file-descriptor half lives in the sibling [`super::prim_file`] module.
 
     /// `prim_file:read_file_info/1,2` **and** `prim_file:read_link_info/1,2` —
     /// `read_info_1(Name, FollowLinks, TimeType)` with `FollowLinks` = `1` / `0`
-    /// (`prim_file.erl:647-655`).
+    /// (`prim_file.erl:657-665`).
     ///
     /// Oracle: `read_file_info("f")`/`read_link_info("link")`⇒`{ok,#file_info{}}` (a
     /// 14-tuple); a missing path⇒`{error,enoent}` (the `stat(2)`/`lstat(2)` errno); a path the
@@ -833,7 +836,7 @@ impl RuntimeContext<'_> {
         self.call_bif("erlang", "posixtime_to_universaltime", 1, &[argument])
     }
 
-    /// The `access` atom `efile_access_to_atom/1` produces (`unix_prim_file.c:488-498`).
+    /// The `access` atom `efile_access_to_atom/1` produces (`prim_file_nif.c:488-498`).
     pub(super) fn access_atom(&mut self, (readable, writable): (bool, bool)) -> Result<Eterm> {
         let name = match (readable, writable) {
             (true, true) => "read_write",
@@ -845,7 +848,7 @@ impl RuntimeContext<'_> {
     }
 
     /// The **path** forms' `access` bits: two real `access(2)` probes, `R_OK` then `W_OK`
-    /// (`efile_read_info`, `unix_prim_file.c:746-754`), delegated to the crate that owns the
+    /// (`efile_read_info`, `unix_prim_file.c:757-762`), delegated to the crate that owns the
     /// `unsafe` FFI (`beam_io::fs_access`).
     ///
     /// The C **clears** a bit whose probe failed for any reason, so a failure is `false` and

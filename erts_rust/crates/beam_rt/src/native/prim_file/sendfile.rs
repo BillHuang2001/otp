@@ -84,8 +84,9 @@
 //! # The payload is a **port command**, and a port command carries a caller prefix
 //!
 //! `erlang:port_command/2` on an `inet` port does not hand the driver a bare payload: the
-//! Erlang caller frames it as `[n:be16][tag][payload]` (`lib/kernel/src/prim_inet.erl:587-589`,
-//! `prim_inet:send/3`'s `HdrAndData`), and the driver strips exactly one such prefix per command
+//! Erlang caller frames it as `[n:be16][tag][payload]` (`prim_inet:send/3`'s `HdrAndData`,
+//! `erts/preloaded/src/prim_inet.erl:582-589`; shipped by `send/4`), and the driver strips
+//! exactly one such prefix per command
 //! (`init_caller`, `erts/emulator/drivers/common/inet_drv.c:1820-1890`; `beam_io`'s
 //! `TcpInetDriver::strip_command_prefix`). A command without a well-formed prefix is the driver's
 //! `driver_failure_posix(port, EINVAL)` (`inet_drv.c:12667`): the payload is **dropped**, the port
