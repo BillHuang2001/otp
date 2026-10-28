@@ -81,6 +81,24 @@
 //! 9. the payload cap (below) ⇒ a typed `unsupported` gap;
 //! 10. read the extent, write it through `crate::port::busy_wait::issue`.
 //!
+//! # The payload is a **port command**, and a port command carries a caller prefix
+//!
+//! `erlang:port_command/2` on an `inet` port does not hand the driver a bare payload: the
+//! Erlang caller frames it as `[n:be16][tag][payload]` (`lib/kernel/src/prim_inet.erl:587-589`,
+//! `prim_inet:send/3`'s `HdrAndData`), and the driver strips exactly one such prefix per command
+//! (`init_caller`, `erts/emulator/drivers/common/inet_drv.c:1820-1890`; `beam_io`'s
+//! `TcpInetDriver::strip_command_prefix`). A command without a well-formed prefix is the driver's
+//! `driver_failure_posix(port, EINVAL)` (`inet_drv.c:12667`): the payload is **dropped**, the port
+//! is **reaped**, and `port_command` still answers `true` — the accept, not the write.
+//!
+//! This module writes through that same seam, so it must supply a prefix too. It uses the
+//! **zero-length** tag (`[0,0]`), which is the C's "no caller to reply to": the two bytes come off
+//! the queue, no `{inet_reply, …}` is staged (`echoable_caller_tag` → `None`), and the payload
+//! reaches the socket byte-for-byte. A real tag would be a monitor reference the driver answers
+//! with a completion nobody here receives: `prim_sendfile` is synchronous, so a stray reply would
+//! leak into the caller's mailbox. The C's own `TCP_REQ_SENDFILE` has no caller tag either —
+//! it is a control request.
+//!
 //! # Documented divergences and residuals
 //!
 //! * A live port that is **not** a `tcp_inet` one answers `{error,einval}` here.
@@ -316,7 +334,11 @@ impl super::RuntimeContext<'_> {
         }
         let sent = payload.len();
 
-        // 11. The port command seam, exactly as `port_command/2` drives it.
+        // 11. The port command seam, exactly as `port_command/2` drives it — with the
+        //     `[n:be16][tag]` **caller prefix** every `inet` driver strips first
+        //     ([`with_empty_caller_tag`]: `prim_inet:send/3` is what normally supplies it, and
+        //     a command without it is the driver's `init_caller` failure, a dead port).
+        let command = with_empty_caller_tag(payload);
         let may_pump = self.may_pump_scheduler();
         let owner = self.pid();
         let written = crate::port::busy_wait::issue(
@@ -324,7 +346,7 @@ impl super::RuntimeContext<'_> {
             may_pump,
             owner,
             socket_id,
-            move || Ok(payload.clone()),
+            move || Ok(command.clone()),
             beam_io::PortCommandOptions::EMPTY,
         )?;
         match written {
@@ -426,6 +448,28 @@ impl super::RuntimeContext<'_> {
     }
 }
 
+/// The bytes of one `port_command` on an `inet` port: `[n:be16][tag]` followed by `payload`, with
+/// the tag empty.
+///
+/// The `inet` drivers strip exactly one caller prefix per command
+/// (`init_caller`, `erts/emulator/drivers/common/inet_drv.c:1820`-`:1890`; `beam_io`'s
+/// `split_command_prefix`), and `[0,0]` is the C's zero-length tag: it is consumed, no
+/// `{inet_reply, …}` is staged for it, and the payload is written unchanged. `prim_inet:send/3`
+/// fills that slot with `term_to_binary(Mref, [local])` so *it* can match a reply; this route is
+/// synchronous and answers no reply, so the empty tag is the faithful choice (see the module docs'
+/// *caller prefix* section).
+///
+/// A command without this prefix is not a malformed payload the driver merely trims: its first two
+/// payload bytes are read as the tag length, a length past the command kills the port with
+/// `EINVAL` and the bytes are never written — which is what a `cowboy_static` sendfile body hung on.
+fn with_empty_caller_tag(payload: Vec<u8>) -> Vec<u8> {
+    let mut command = Vec::with_capacity(EMPTY_CALLER_TAG.len() + payload.len());
+    command.extend_from_slice(&EMPTY_CALLER_TAG);
+    command.extend_from_slice(&payload);
+    command
+}
+/// The zero-length `inet` caller tag — `[n:be16]` = `0`, no tag bytes.
+const EMPTY_CALLER_TAG: [u8; 2] = [0, 0];
 /// The [`InetState`] an `INET_REQ_GETSTATUS` reply carries, or `None` when the reply is
 /// not an accepted one.
 ///
