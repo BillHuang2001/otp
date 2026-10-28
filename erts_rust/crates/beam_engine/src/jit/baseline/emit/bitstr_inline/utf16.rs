@@ -313,10 +313,10 @@ fn utf16_fail_target(labels: &LabelMap, fail: Label) -> Option<(u32, u32)> {
 ///   mov  r8,  [ctx + 24]                 ; end        (consumed by the remaining test)
 ///   rcx = end.saturating_sub(start)
 ///   cmp  rcx, 16 ; jb fail_arm           ; fewer than 16 remaining bits -> the FAIL label
-///   <emit_subject_view>                  ; anything but an on-heap ErlHeapBits -> fallback
-///                                        ;   r10 = byte base, rax = readable bytes, rsi kept
-///   test rsi, 7 ; jne fallback           ; a non-byte-aligned start
-///   rdi = start / 8
+///   <emit_subject_view>                  ; an on-heap ErlHeapBits or a refc window, else fallback
+///                                        ;   r10 = byte base, rdx = bit position, rax = bytes
+///   test rdx, 7 ; jne fallback           ; a window position inside a byte
+///   rdi = rdx / 8
 ///   lea  rcx, [rdi + 2] ; cmp rcx, rax ; ja fallback   ; BEFORE the first load
 ///   add  rdi, r10                        ; the first word's first byte address
 ///   rcx = the first 16-bit BIG-ENDIAN word
@@ -512,22 +512,25 @@ fn emit_utf16(
 
     // Classify the inner subject and derive the readable window — one shared helper, so this
     // shape cannot disagree with `bs_get_integer2`/`bs_match`/`bs_skip_utf32` about what a
-    // subject is. A literal-area subject, a refc window, a match context, a bare `BinRef` and
-    // every non-bitstring take the fallback: the family's own answer, never a fabricated view.
-    let (base, _bit_pos, num_bytes) = emit_subject_view(buffer, MOVE_SCRATCH, Reg::Rsi, fallback)?;
+    // subject is. A literal-area subject, a match context, a bare `BinRef` and every
+    // non-bitstring take the fallback: the family's own answer, never a fabricated view.
+    let (base, bit_pos, num_bytes) = emit_subject_view(buffer, MOVE_SCRATCH, Reg::Rsi, fallback)?;
 
-    // A byte-aligned `start` is what makes the byte loads below exact: an on-heap subject's
-    // own bit offset is 0, so the field's first bit is bit `start % 8` of `base[start / 8]`.
-    // A 16-bit word straddling a byte boundary is the family's own bit-by-bit read, one
-    // interpreter step — never a shifted reimplementation.
+    // A byte-aligned **window position** is what makes the byte loads below exact: `bit_pos`
+    // is the position of the context's read point inside the returned window (an on-heap
+    // subject's own bit offset is 0, so it is `start` itself; a refc window starts at
+    // `start % 8` of the window's first byte, so it is `start + start % 8`), so the field's
+    // first bit is bit `bit_pos % 8` of `base[bit_pos / 8]`. A 16-bit word straddling a byte
+    // boundary is the family's own bit-by-bit read, one interpreter step — never a shifted
+    // reimplementation.
     buffer.mov_ri(Reg::Rcx, 7)?;
-    buffer.test_rr(Reg::Rsi, Reg::Rcx)?;
+    buffer.test_rr(bit_pos, Reg::Rcx)?;
     buffer.jcc(Cond::Ne, fallback)?;
 
-    // The FIRST word's over-read guard, emitted BEFORE the load: `start / 8 + 2 <=
-    // num_bytes`, with `num_bytes` the subject's own word-padded data extent. `rdi` becomes
+    // The FIRST word's over-read guard, emitted BEFORE the load: `bit_pos / 8 + 2 <=
+    // num_bytes`, with `num_bytes` the subject window's own readable extent. `rdi` becomes
     // the first word's first byte address and stays there for the pair's bytes 3-4.
-    buffer.mov_rr(Reg::Rdi, Reg::Rsi)?;
+    buffer.mov_rr(Reg::Rdi, bit_pos)?;
     buffer.shr_ri(Reg::Rdi, 3)?;
     buffer.lea(Reg::Rcx, Reg::Rdi, UTF16_BYTES)?;
     buffer.cmp_rr(Reg::Rcx, num_bytes)?;
