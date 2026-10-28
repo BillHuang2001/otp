@@ -22,9 +22,30 @@
 //!
 //! Both answer the subject word itself on a hit (the family's reuse arm, no reservation),
 //! and both classify a miss into [`MatchFail`] so the miss arm is either the caller's
-//! resolved fail label or the one interpreter step the family's allocating raise needs.
+//! resolved fail label or the bitstring family's own body.
 //! The `bs_start_match4` `resume` form is the same guard with a single
 //! `HEADER_SUB_BITS` compare.
+//!
+//! **The `fallback` label is the family helper, not a whole interpreter step.** A
+//! fresh subject — a heap-bits bitstring, or an `ErlSubBits` whose `orig` is a `BinRef`
+//! (a refc window) — is served by `matching::enter_match`'s `make_ctx`, i.e. by an
+//! allocation, which is why this shape cannot lower it in-block. The route for every
+//! guard rejection (and the `resume` form's non-context) is therefore
+//! [`emit_bitstr`], which emits the positioned call to
+//! [`jit_bitstr`](super::super::super::bitstr::jit_bitstr) — the *same* bitstring
+//! family body the interpreter's step reaches for a `Bs*` instruction, one dispatch hop
+//! sooner. `jit_bitstr` itself hands back to `jit_step_one` for any answer that is not
+//! the family's, so a variant or address this shape did not anticipate keeps the
+//! interpreter's exact diagnostic.
+//!
+//! That keeps the deopt contract intact: the fallback still re-executes the **whole**
+//! instruction from unmutated machine state — the guard phase above it stores nothing
+//! (the destination's Y-window guard rejects before any store, both fresh-subject
+//! branches are pure reads of the subject word, and the `resume` form's `HEADER_SUB_BITS`
+//! compare runs before its `Dst` store) — so a re-execution after a rejected guard
+//! re-runs the identical classification against the identical subject, exactly as it did
+//! when the fallback was one interpreter step. The only difference is which Rust body
+//! runs it.
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand, NO_FAIL};
@@ -32,10 +53,11 @@ use beam_loader::{Label, Module, Operand, NO_FAIL};
 use crate::interpreter::LabelMap;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
+use super::super::family::emit_bitstr;
 use super::super::link::{ExitSpill, Linker};
 use super::super::operands::{Loc, Y_ADDR_SCRATCH};
 use super::{
-    emit_step_and_continue, Allocation, BIN_REF_HEADER, BITSTRING_TAG_MASK_WORD, HEADER_DISP,
+    Allocation, BIN_REF_HEADER, BITSTRING_TAG_MASK_WORD, HEADER_DISP,
     HEAP_BITS_SUBTAG_WORD, MOVE_SCRATCH, MOVE_SCRATCH_2, NOT_BOXED_MASK, POINTER_MASK,
     SUB_BITS_HEADER, SUB_BITS_ORIG_DISP,
 };
@@ -55,7 +77,7 @@ use super::{record_inlined, SHAPE_START_MATCH3, SHAPE_START_MATCH4};
 pub(crate) enum MatchFail {
     /// `bs_start_match4 resume`: the source must already be a match context, and any
     /// other value is the family's `NO_FAIL` raise (building the reason allocates), so
-    /// a miss is the interpreter step.
+    /// a miss is the bitstring family helper.
     Resume,
     /// A resolvable module-local fail label, already resolved to its `(func, pc)` jump
     /// target — the family's `Step::Goto`.
@@ -121,7 +143,7 @@ impl StartMatchShape {
 ///
 /// A `NO_FAIL` fail code raises `{badmatch, Subject}` on a miss, and building that reason
 /// allocates — so it is classified [`MatchFail::Family`], which routes every miss to the
-/// interpreter step. A real fail label must resolve in the module's map, because the miss
+/// family helper. A real fail label must resolve in the module's map, because the miss
 /// transfer needs its `(function, code)` target; an unresolved one refuses here so the
 /// family reports its exact `unknown_label`.
 pub(crate) fn start_match3_shape(
@@ -177,9 +199,10 @@ pub(crate) fn start_match4_shape(
 /// Emit the shared `bs_start_match3`/`bs_start_match4` lowering (see
 /// [`try_inline_bs_start_match3`] for the return convention and the sequence).
 ///
-/// No path here allocates, so a moving collection cannot run part-way through one: the
-/// subject is read once and the reused context word is a **plain move** of the very word
-/// the family would re-bind.
+/// Nothing on the hit path allocates, so a moving collection cannot run part-way through
+/// one: the subject is read once and the reused context word is a **plain move** of the
+/// very word the family would re-bind. The only allocating path is the `fallback` label,
+/// which is one call to the bitstring family's own body (see the module docs).
 #[allow(clippy::too_many_arguments)]
 fn emit_start_match(
     buffer: &mut CodeBuffer,
@@ -195,7 +218,7 @@ fn emit_start_match(
     let fallback: CodeLabel = buffer.label();
     let fast_done: CodeLabel = buffer.label();
     // The match-failure arm. Only a resolved label needs its own block: every other
-    // failure class is the family's own work, i.e. the interpreter step.
+    // failure class is the family's own work, i.e. the family helper.
     let (miss, miss_target) = match fail {
         MatchFail::Label(target) => (buffer.label(), Some(target)),
         MatchFail::Resume | MatchFail::Family => (fallback, None),
@@ -236,14 +259,14 @@ fn emit_start_match(
             .store_at(buffer, Y_ADDR_SCRATCH, Reg::Rsi, allocation, highest_touched)?;
         buffer.jmp(fast_done)?;
         buffer.bind(fallback)?;
-        emit_step_and_continue(buffer, done, allocation, func, pc)?;
+        emit_bitstr(buffer, allocation, done, func, pc)?;
         buffer.bind(fast_done)?;
         return Ok(());
     }
 
     // Not an `ErlSubBits`: a heap-bits bitstring (or a refc window, handled below) is a
     // **fresh subject** the family re-wraps at bit 0 over its whole size — that
-    // reservation is the family's `make_ctx`, so it is the interpreter step. Anything
+    // reservation is the family's `make_ctx`, so it is the family helper. Anything
     // else (a bare `BinRef`, a tuple, an atom, …) is the match failure.
     let check_orig: CodeLabel = buffer.label();
     buffer.jcc(Cond::E, check_orig)?;
@@ -291,7 +314,7 @@ fn emit_start_match(
     }
 
     buffer.bind(fallback)?;
-    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    emit_bitstr(buffer, allocation, done, func, pc)?;
     buffer.bind(fast_done)?;
     Ok(())
 }
@@ -324,7 +347,7 @@ fn emit_start_match(
 /// miss:                               ; only when the fail label resolved
 ///   <the linker's exit to the fail label>
 /// fallback:
-///   <one interpreter step>            ; the family's `make_ctx` / `badmatch` raise
+///   <the bitstring family helper>     ; the family's `make_ctx` / `badmatch` raise
 /// ```
 #[allow(clippy::too_many_arguments)]
 pub(in crate::jit::baseline::emit) fn try_inline_bs_start_match3(

@@ -1949,9 +1949,32 @@ fn the_get_position_arm_emits_the_max_small_guard() {
     );
 }
 
-/// **The inlined extract emits no `jit_bitstr` helper call at all** — the property that
+/// The number of `movabs r11, <helper>` call sites the sealed code carries — a **count**
+/// where [`super::tests::code_contains_helper`] answers presence.
+///
+/// A count is what a per-shape argument needs now that one arm of a probe block legitimately
+/// carries a helper call: the fresh-subject `bs_start_match3` hands its instruction to the
+/// family helper (it must `make_ctx`, which allocates — `emit/bitstr_inline/start_match.rs`),
+/// so "does this block call the helper" is `true` for every block that starts a match and
+/// says nothing about the shape under test. The baseline is measured from a control block
+/// instead.
+fn helper_call_sites(function: &super::code::CompiledFunction, helper: *const ()) -> usize {
+    let code = super::tests::function_code_bytes(function);
+    let mut needle = vec![0x49u8, 0xBB];
+    needle.extend_from_slice(&(helper as u64).to_le_bytes());
+    code.windows(needle.len())
+        .filter(|window| *window == needle.as_slice())
+        .count()
+}
+/// **The inlined extract adds no `jit_bitstr` helper call** — the property that
 /// actually distinguishes the two routes on the *same* operand shape (an 8-bit
 /// `bs_get_integer2`, inlined, against a 64-bit one the width rule sends to the family).
+///
+/// The probe **counts** helper call sites rather than testing presence, because the
+/// enclosing `bs_start_match3` on a fresh subject carries one by design (the family must
+/// build the match context, which allocates). A `bs_start_match3`-only **control** block
+/// supplies that baseline, and each row is asserted as a difference against it: the inlined
+/// extract adds **zero** sites, the helper-routed one adds exactly one.
 ///
 /// This pin originally asserted the inlined block was **shorter**, and it is not: measured
 /// here at 1356 B inlined against 753 B on the helper route, and that is the correct
@@ -1960,12 +1983,13 @@ fn the_get_position_arm_emits_the_max_small_guard() {
 /// pays the extraction, while the inline arm emits that extraction — plus its match-context
 /// test, bounds check, byte-wise big-endian assembly and mask — into the block. Code size is
 /// therefore the wrong axis; what the shape buys is that the extraction is **native**, so
-/// the surviving claim is the one asserted below: the inlined block carries **no** helper
-/// call, and the helper-routed block does. (Both byte figures are printed, not baked, so a
+/// the surviving claim is the one asserted below: the inlined extract adds no helper call,
+/// and the helper-routed one adds one. (Both byte figures are printed, not baked, so a
 /// future change to either route reports itself here.)
 #[test]
 fn an_inlined_extract_emits_no_helper_call_unlike_the_helper_routed_one() {
-    let build = |size: i64| {
+    // `None` builds the control block: the start-match alone, with no extraction at all.
+    let build = |read: Option<i64>| {
         bitstr_module("inline_extract_size", &[], 1, move |_| {
             let mut code = vec![
                 Instr::Label(Label(1)),
@@ -1976,7 +2000,9 @@ fn an_inlined_extract_emits_no_helper_call_unlike_the_helper_routed_one() {
                     live: 1,
                     dst: Operand::X(1),
                 },
-                Instr::BsGetInteger2(Box::new(BsGetArgs {
+            ];
+            if let Some(size) = read {
+                code.push(Instr::BsGetInteger2(Box::new(BsGetArgs {
                     fail: Label(3),
                     ctx: Operand::X(1),
                     live: 2,
@@ -1984,50 +2010,62 @@ fn an_inlined_extract_emits_no_helper_call_unlike_the_helper_routed_one() {
                     unit: 1,
                     flags: 0,
                     dst: Operand::X(0),
-                })),
-                Instr::Return,
-            ];
+                })));
+            }
+            code.push(Instr::Return);
             code.extend(sentinel_block(Label(3)));
             code
         })
     };
-    let inlined_module = build(8);
+    let inlined_module = build(Some(8));
     let (emitted, snapshot) = emitted_shapes(&inlined_module);
     assert!(
         emitted.contains(&SHAPE_GET_INTEGER2),
         "the 8-bit read must be inlined (emitted {emitted:?})"
     );
     assert_eq!(static_deopts(&snapshot, "BsGetInteger2"), 0);
-    let helper_module = build(64);
+    let helper_module = build(Some(64));
     let (emitted, _) = emitted_shapes(&helper_module);
     assert!(
         !emitted.contains(&SHAPE_GET_INTEGER2),
         "the 64-bit read must stay on the helper (emitted {emitted:?})"
     );
-    // An **inline** arm never emits the family helper, and a helper-routed variant always
-    // does — that asymmetry is what "the shape is native" means at the byte level.
+    let control_module = build(None);
+    // An **inline** arm adds no family-helper call, and a helper-routed variant adds
+    // exactly one — that difference is what "the shape is native" means at the byte level.
     let helper_probe =
         super::bitstr::jit_bitstr as extern "C" fn(*mut super::runtime::JitRuntime<'_>, u32, u32) -> i64
             as *const ();
-    let labels = crate::interpreter::build_label_map(&inlined_module);
-    let inlined_function =
-        super::emit::compile_function(&inlined_module, &labels, 0).expect("the block compiles");
-    let inlined_len = inlined_function.buffer.len();
-    let labels = crate::interpreter::build_label_map(&helper_module);
-    let helper_function =
-        super::emit::compile_function(&helper_module, &labels, 0).expect("the block compiles");
-    let helper_len = helper_function.buffer.len();
+    let probe = |module: &Module| {
+        let labels = crate::interpreter::build_label_map(module);
+        let function =
+            super::emit::compile_function(module, &labels, 0).expect("the block compiles");
+        (
+            helper_call_sites(&function, helper_probe),
+            function.buffer.len(),
+        )
+    };
+    let (control_sites, _) = probe(&control_module);
+    let (inlined_sites, inlined_len) = probe(&inlined_module);
+    let (routed_sites, helper_len) = probe(&helper_module);
     eprintln!(
         "bitstring inline vs helper route on one 8-bit/64-bit bs_get_integer2 block: \
-         inlined {inlined_len} B, helper {helper_len} B"
+         inlined {inlined_len} B, helper {helper_len} B, control {control_sites} helper site(s)"
     );
     assert!(
-        !super::tests::code_contains_helper(&inlined_function, helper_probe),
-        "an inlined extract must not call the bitstring helper (the extraction is native)"
+        control_sites > 0,
+        "the control block's fresh-subject `bs_start_match3` must route to the family helper, \
+         so the difference below has a baseline to be measured against"
     );
-    assert!(
-        super::tests::code_contains_helper(&helper_function, helper_probe),
-        "a helper-routed extract must call the bitstring helper"
+    assert_eq!(
+        inlined_sites, control_sites,
+        "an inlined extract must add no bitstring-helper call (the extraction is native); the \
+         block already carries {control_sites} for its fresh-subject start-match"
+    );
+    assert_eq!(
+        routed_sites,
+        control_sites + 1,
+        "a helper-routed extract must add exactly one bitstring-helper call"
     );
 }
 

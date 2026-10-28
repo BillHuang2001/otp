@@ -57,7 +57,9 @@ use beam_common::Result as BeamResult;
 use beam_loader::{Instr, Label, LiteralArea, Module, Operand};
 use beam_term::{Atom, Eterm};
 
-use super::{match_string_shape, MAX_MATCH_BYTES, SHAPE_BS_MATCH_STRING};
+use super::{
+    match_string_shape, FRESH_START_MATCH_HELPER_CALLS, MAX_MATCH_BYTES, SHAPE_BS_MATCH_STRING,
+};
 use crate::context::MinimalContext;
 use crate::interpreter::{build_label_map, LabelMap};
 use crate::jit::baseline::bitstr::bitstr_calls;
@@ -239,8 +241,10 @@ fn assert_emitted(label: &str, module: &Module) {
 /// One row: both tiers agree on `subject`, and the baseline tier answers `expected`.
 ///
 /// Returns the number of `jit_bitstr` calls the **baseline** side made (the interpreter tier
-/// never reaches that helper), i.e. the honest measure of how many `Bs*` instructions this
-/// row deopted.
+/// never reaches that helper). That count is the module's own `bs_start_match3` on a fresh
+/// subject — [`FRESH_START_MATCH_HELPER_CALLS`], the one instruction here the arm cannot inline
+/// because the family must build the match context — plus one per `bs_match_string` run-time
+/// fallback, so a row asserting `FRESH_START_MATCH_HELPER_CALLS` proves the compare stayed native.
 fn one_row(label: &str, module: &Module, subject: &[u8], expected: i64) -> u64 {
     let before = bitstr_calls();
     let observed = with_both_tiers_bytes(module, subject, |interpreter, baseline| {
@@ -281,8 +285,9 @@ fn a_match_at_the_first_middle_and_last_pattern_byte_commits_the_compare() {
         // final byte: it is the straight-line `movzx`/`cmp` chain.
         let answer = one_row(label, &module, SUBJECT, i64::from(bits));
         assert_eq!(
-            answer, 0,
-            "{label}: a fully matching, byte-aligned row must deopt nothing (the arm is \
+            answer, FRESH_START_MATCH_HELPER_CALLS,
+            "{label}: a fully matching, byte-aligned row must fall back to nothing but the \
+             fresh-subject `bs_start_match3` that builds the match context (the arm is \
              self-contained)"
         );
     }
@@ -455,24 +460,26 @@ fn a_non_byte_aligned_start_deopts_to_exactly_one_interpreter_step() {
         8,
     );
 
-    // `bitstr_calls()` counts the **family** helper (`jit_bitstr`), which an inlined arm never
-    // reaches: its `fallback` is exactly one interpreter step (`emit_step_and_continue` ->
-    // `jit_step_one`), so that counter is the wrong instrument for this row and neither side may
-    // be expected to move it. The deopt proof is semantic and stronger: the emitted sequence
-    // carries its `test start,7` guard precisely because a non-byte-aligned window cannot be
-    // compared on the byte path at all. A guard that let the row through would compare the
-    // pattern against the wrong bytes and answer `-1`; the correct answer `8` -- equal to the
-    // byte-aligned twin's and to the interpreter's -- is therefore reachable only through the
-    // guard's `fallback`, and the pattern is still matched exactly once (a double commit on the
-    // fallback would leave the position past the window and answer `-1` too).
+    // `bitstr_calls()` counts the **family** helper (`jit_bitstr`). An inlined arm never reaches
+    // it, but this fixture's own `bs_start_match3` on a fresh subject does: the family must
+    // `make_ctx` (which allocates), so that one instruction goes to `jit_bitstr` and the counter
+    // reads `FRESH_START_MATCH_HELPER_CALLS` on both rows. Anything above that would be a
+    // `bs_match_string` fallback, which neither row may take. The deopt proof is semantic and
+    // stronger: the emitted sequence carries its `test start,7` guard precisely because a
+    // non-byte-aligned window cannot be compared on the byte path at all. A guard that let the
+    // row through would compare the pattern against the wrong bytes and answer `-1`; the correct
+    // answer `8` -- equal to the byte-aligned twin's and to the interpreter's -- is therefore
+    // reachable only through the guard's `fallback`, and the pattern is still matched exactly
+    // once (a double commit on the fallback would leave the position past the window and answer
+    // `-1` too).
     assert_eq!(
-        aligned_deopts, 0,
-        "the byte-aligned twin stays entirely native (`jit_bitstr` never runs)"
+        aligned_deopts, FRESH_START_MATCH_HELPER_CALLS,
+        "the byte-aligned twin stays entirely native apart from the fresh-subject start-match"
     );
     assert_eq!(
-        misaligned_deopts, 0,
-        "the inline fallback is one interpreter step, not a `jit_bitstr` call, so that counter \
-         must not move on either row (got {misaligned_deopts})"
+        misaligned_deopts, FRESH_START_MATCH_HELPER_CALLS,
+        "the misaligned row's `bs_match_string` must not add a family call of its own -- its \
+         guard already ran in-block (got {misaligned_deopts})"
     );
 }
 

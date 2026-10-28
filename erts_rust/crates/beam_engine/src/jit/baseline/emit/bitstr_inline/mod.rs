@@ -33,9 +33,12 @@
 //! predicate — returning `Ok(false)` with **zero bytes emitted** — so `emit_block`'s
 //! existing `_ if bitstrings::claimed(instr) => emit_bitstr(...)` arm keeps handling it
 //! exactly as before. A shape whose operands are addressable but whose *run-time* value
-//! is not a match context branches to a local `fallback` label that runs exactly one
-//! interpreter step ([`emit_step_and_continue`]), so the interpreter's own typed error
-//! (`bs_get_position: operand is not a match context`, …) is what the process sees.
+//! is not a match context branches to a local `fallback` label that runs exactly one step of
+//! the owning body, so the interpreter's own typed error
+//! (`bs_get_position: operand is not a match context`, …) is what the process sees. That step
+//! is [`emit_step_and_continue`] (one interpreter dispatch) everywhere except the
+//! start-match arm, whose two fresh-subject guards are served by `emit_bitstr` (the
+//! *family* helper `jit_bitstr`) because that is the body which must `make_ctx`.
 //!
 //! # Frozen layouts read here
 //!
@@ -351,6 +354,18 @@ pub(crate) fn inlined(shape: usize) -> u64 {
 fn record_inlined(shape: usize) {
     INLINED.with(|counts| counts[shape].set(counts[shape].get() + 1));
 }
+/// The one family-helper call a `Bs*`-arm block makes **by construction**: a
+/// `bs_start_match3`/`bs_start_match4` on a subject that is not yet a match context cannot be
+/// inlined — the family must `make_ctx`, which allocates — so the start-match arm's run-time
+/// guard hands that instruction to `jit_bitstr`, one step of the *family* body the interpreter's
+/// own step would reach (never a whole interpreter dispatch).
+///
+/// Every row suite whose fixture starts with `bs_start_match3` therefore sees **exactly** this
+/// many `bitstr_calls()` on a successful path, on top of whatever the row's own shape does. The
+/// suites assert against this constant instead of a bare `1`, so the number stays tied to the
+/// reason it is there — and so a later shape that really does fall back is still visible.
+#[cfg(test)]
+pub(crate) const FRESH_START_MATCH_HELPER_CALLS: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // The shared match-context guard

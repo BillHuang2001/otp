@@ -499,14 +499,26 @@ pub(crate) fn export(module: &Module, fixture_name: &str, name: &str) -> Atom {
 /// is a property of the (function, input) pair.
 #[derive(Clone, Copy)]
 enum Route {
-    /// Every `Bs*` instruction the row executes is natively inlined, so the family helper
-    /// (`jit_bitstr`) runs **not at all**: its run-time counter cannot move, and the honest
-    /// proof is the shapes' **compile-time** emission counter taken through a cache-free
-    /// [`emit::compile_function`](super::emit::compile_function)
-    /// (the `call_tests.rs::the_frame_preserving_local_call_records_no_static_deopt` route).
-    /// The process-wide content-keyed [`crate::jit::cache::CodeCache`] serves a warmed
-    /// artifact and re-emits nothing, so a normal tier run reads `0 -> 0` and proves nothing.
-    Inline(&'static [usize]),
+    /// Every `Bs*` instruction the row executes has a native arm of its own, and `family_calls`
+    /// is the **exact** number of shared-helper (`jit_bitstr`) calls one run still makes.
+    ///
+    /// That number is not zero for a row whose body starts a match: a `bs_start_match3`/
+    /// `bs_start_match4` on a **fresh (non-context) subject** must `make_ctx`, which allocates,
+    /// so the arm's run-time guard hands the instruction to the family helper by design
+    /// (`emit/bitstr_inline/start_match.rs`'s `fallback` — the family helper, never a whole
+    /// interpreter step). So the run-time counter is the **complement** of the arms, and the
+    /// honest proof that a shape is native stays the shapes' **compile-time** emission counter
+    /// taken through a cache-free [`emit::compile_function`](super::emit::compile_function)
+    /// (the `call_tests.rs::the_frame_preserving_local_call_records_no_static_deopt` route):
+    /// the process-wide content-keyed [`crate::jit::cache::CodeCache`] serves a warmed artifact
+    /// and re-emits nothing, so a normal tier run reads `0 -> 0` and proves nothing.
+    ///
+    /// Pinning the delta **exactly** is what keeps the negative half meaningful: a shape that
+    /// quietly stopped lowering would raise the count beyond `family_calls`.
+    Inline {
+        shapes: &'static [usize],
+        family_calls: u64,
+    },
     /// At least one executed instruction has no inline arm (`bs_get_tail`, a `get_tail`
     /// **`bs_match` command**, `bs_create_bin`'s non-construction shapes, a >32-bit `bs_match`
     /// field), so the family helper really does run and its run-time counter is the proof.
@@ -524,10 +536,12 @@ enum Route {
 /// family, paired with the arm that owns it (see [`Route`]):
 ///
 /// * `first8/1` — `bs_start_match3` + `bs_get_position` + `bs_match` + `bs_set_position` on
-///   the success path, **all four natively inlined** (the fail-path `bs_get_tail` never
+///   the success path, **all four arms natively emitted** (the fail-path `bs_get_tail` never
 ///   runs), so the proof is the four `inlined(SHAPE_*)` counters through a cache-free
-///   compile, and the helper's run-time counter is asserted **unchanged**;
-/// * `head16/1` — the exhaustive `<<X:16>>` form, same four inlined shapes, same proof;
+///   compile, beside the run-time counter's **exact** delta: the fresh-subject
+///   `bs_start_match3` must build the match context, which allocates, so that one instruction
+///   takes the family helper (and nothing else does);
+/// * `head16/1` — the exhaustive `<<X:16>>` form, same four shapes, same proof;
 /// * `bssmall:u64/1` — its `bs_match` reads 64 bits, outside the arm's width set, so the
 ///   **helper** runs and its counter is the proof;
 /// * `bsmatch:strlong/1` — **both**: its `bs_match_string` (the 80-bit literal) is natively
@@ -559,13 +573,19 @@ fn every_claimed_shape_runs_through_its_owning_arm_and_agrees_with_the_interpret
     // (fixture, function, argument, the expected small-int result — `None` for a binary
     // result, which the bit-exact cross-tier comparison covers on its own — and the owner).
     let cases: [(&str, &str, Arg, Option<i64>, Route); 5] = [
-        ("bitstrings", "first8", Arg::Bytes(subject), Some(1), Route::Inline(inlined_four)),
+        (
+            "bitstrings",
+            "first8",
+            Arg::Bytes(subject),
+            Some(1),
+            Route::Inline { shapes: inlined_four, family_calls: 1 },
+        ),
         (
             "bitstrings",
             "head16",
             Arg::Bytes(pair),
             Some(0x0102),
-            Route::Inline(inlined_four),
+            Route::Inline { shapes: inlined_four, family_calls: 1 },
         ),
         (
             "bssmall",
@@ -610,12 +630,18 @@ fn every_claimed_shape_runs_through_its_owning_arm_and_agrees_with_the_interpret
                 "{fixture_name}:{function}/1 must execute through the bitstring helper \
                  (counter {before} -> {after})"
             ),
-            Route::Inline(shapes) => {
-                // The negative half: nothing it executed stayed on the family.
+            Route::Inline {
+                shapes,
+                family_calls,
+            } => {
+                // The negative half: nothing beyond the row's own fresh-subject start-match
+                // stayed on the family.
                 assert_eq!(
-                    after, before,
-                    "{fixture_name}:{function}/1 is fully inlined, so the family helper must \
-                     not run (counter {before} -> {after})"
+                    after - before,
+                    family_calls,
+                    "{fixture_name}:{function}/1 has arms for every shape it executes, so the \
+                     family helper may only run for the fresh-subject start-match that must \
+                     build the match context (counter {before} -> {after})"
                 );
                 // The positive half: on a **cache-free** compile its own inline arms emitted.
                 assert_shapes_inlined(fixture_name, function, &module, atom, shapes);
