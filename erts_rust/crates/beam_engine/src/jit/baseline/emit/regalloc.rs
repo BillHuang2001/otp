@@ -557,6 +557,16 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         // `jit_call_store` followed by the same exit — and each terminates the block. So
         // they belong to the reset group, whatever their label resolves to.
         Instr::CallLast { .. } | Instr::CallOnly { .. } | Instr::Call { .. } => false,
+        // A `put_list` belongs to the reset group for the same reason: it is **one helper
+        // call** (`super::cons::emit_put_list` lowers exactly one `jit_put_list` call and
+        // the fallback's per-instruction step), and nothing the arm emits before that call
+        // writes a cache register -- the guard phase only *reads* the published Y window
+        // (the `dst` store guard and the two operand load guards all branch to the local
+        // `fallback` on a rejection, and a rejection reaches a helper too), and the inline
+        // position store writes `Machine::current_code`, not a register. The pre-call
+        // `SpillSite::Helper` spill has therefore already synced the cache with
+        // `machine.x`, so the reset this arm reports is exactly right.
+        Instr::PutList { .. } => false,
         // Everything else: a pure helper (`emit_deopt` for the `_` arm, or one of the
         // dedicated family/receive/frame/heap helpers) — a certain reset.
         _ => false,
@@ -628,6 +638,15 @@ pub(crate) fn cacheable_touches(
                 touches.extend(locations.iter().filter_map(|location| location.register()));
             }
         }
+        // A cons-cell **build** charges nothing: the in-block arm
+        // ([`super::cons::emit_put_list`]) never references a cache register. It reads
+        // `head`/`tail` and writes `dst` through `Machine::x`/`Machine::y` *inside*
+        // `jit_put_list`, and the emitted code around that call is the Y-window guard
+        // group (which only *reads* `machine.stack` through the published window) plus
+        // the position store (which writes `Machine::current_code`). Charging a register
+        // here would both evict a real one and — for a `Y` slot — raise the x-register
+        // bound the driver's native-entry guard reads, so the honest set is empty.
+        Instr::PutList { .. } => {}
         // A cons-cell read is charged its source and every destination, and only when
         // its `*_shape` claims it (a `Y` operand or an out-of-bound register keeps the
         // whole instruction on the helper, which contributes no native touch).
@@ -869,6 +888,12 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
         }
         // `init_yregs Registers` only writes (`NIL`) — it reads no x-register.
         Instr::InitYregs { .. } => {}
+        // A cons-cell **build** reads no *cache* register: `head`/`tail` are read
+        // inside `jit_put_list` out of `machine.x`/`machine.y`, after the pre-call
+        // `SpillSite::Helper` spill has made `machine.x` authoritative for every
+        // cached register. Reporting a read here would only make some other
+        // register block-live for the wrong reason.
+        Instr::PutList { .. } => {}
         Instr::GetList { source, head, tail } => {
             if let Some(shape) = get_list_shape(source, head, tail) {
                 reads.extend(shape.reads());
@@ -1098,6 +1123,17 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         Instr::InitYregs { registers } => super::operands::locate_all(registers)
             .map(|locations| locations.iter().filter_map(|location| location.register()).collect())
             .unwrap_or_default(),
+        // A cons-cell **build** writes no *cache* register, and nothing here has to store
+        // `dst` on the way out. `jit_put_list` writes it into `Machine::x`/`Machine::y`
+        // itself, so the two representations never diverge for a later reader:
+        // a later in-block *read* of `dst` makes it block-live, and `fill_sets`' join term
+        // (`live ∪ writes(pc)`) then reloads it out of `machine.x` — the `pc`-local
+        // `writes(pc)` contribution is therefore not needed for it; a later *inline write*
+        // sets the cache register outright; a later *helper* reads `machine.x`; and no exit
+        // spill has to store it because `spill_sets` clears at this purely-helper
+        // instruction (the pre-call spill already synced every dirty register). Reporting
+        // `dst` here would instead keep a stale value in a register across this `pc`.
+        Instr::PutList { .. } => Vec::new(),
         Instr::GetList { source, head, tail } => get_list_shape(source, head, tail)
             .map(|shape| shape.writes())
             .unwrap_or_default(),

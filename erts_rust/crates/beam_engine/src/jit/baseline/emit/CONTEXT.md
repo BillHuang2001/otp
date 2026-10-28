@@ -287,6 +287,13 @@ by construction).
   Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
   split, `a_frame_changing_helper_emits_no_separate_refresh_call` and the structural
   `the_allocate_arm_pushes_the_frame_with_a_helper_call_only`).
+- `cons.rs` -> the `put_list` arm `emit_put_list` (one `emit_positioned_helper_call` to
+  `../cons.rs::jit_put_list` — the instruction's own position published inline, since the helper stores
+  none — plus a `jmp` to `fast_done`, a local `fallback` running exactly one `emit_step_and_continue`,
+  and `emit_continue_check`), its refusal-only `put_list_shape` predicate, its `uses_y()` view and the
+  `#[cfg(test)]` `lowered`/`declined` emission counters. Unlike the `try_inline_*` shapes it answers
+  `Ok(false)` rather than `None` when it declines, so `emit_block`'s own arm falls through to
+  `emit_family` in one place instead of routing on a guard predicate.
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
   `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`) and `emit_bitstr` (the same
   arm for the `Bs*` family through `../bitstr.rs::jit_bitstr`, plus the inline position store its
