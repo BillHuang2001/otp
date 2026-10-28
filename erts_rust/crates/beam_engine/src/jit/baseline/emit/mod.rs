@@ -168,8 +168,8 @@ use regs::{fill, spill};
 // submodules changed no item path. Only the tests use them, hence `cfg(test)`.
 #[cfg(test)]
 pub(crate) use arith::{
-    fast_arith, uses_y, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T,
-    MAX_SMALL_WORD, MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
+    fast_arith, uses_y, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_T, MAX_SMALL_WORD,
+    MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
 };
 #[cfg(test)]
 pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
