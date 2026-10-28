@@ -147,7 +147,7 @@ One line per mechanism, with its owner; no figures here — every ns/element, ns
 8. **`beam_rt`'s `DispatchMemo`** — a roster `binary_search` plus two `String` allocations per key, per slice *and* per nested send/fun.
    Hoist it onto `ProcessEngine`/`RunnerState`, reuse it in `FunBridge::nested`/`SendBridge`, and key by atom ids to drop both `String`s; every input is immutable for the runtime's life (the one mutable input, the NIF registry, is consulted before `dispatch`).
 
-Additionally provable per-call redundancy, worth naming but not worth a lever: `CompiledModule::function`'s `Rc::clone`/drop plus a `RefCell` borrow per entry for an artifact alive for the whole run, and `set_current_code` written three times per element with the same value.
+Additionally provable per-call redundancy, worth naming but not worth a lever: `CompiledModule::function`'s `Rc::clone`/drop plus a `RefCell` borrow per entry for an artifact alive for the whole run, and `set_current_code` published twice per element (block entry, then the in-block transfer) with the same value.
 
 ## Known Issues
 - **The harness delegates the copy engine**: `MinimalContext` runs no `copy_struct` (the `Mailbox` seam hands the message over verbatim), so `send_split` prices only the engine side of the marginal; the copy/sizing buckets are measured on the runtime route and are `perf`-derived there.
