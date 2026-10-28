@@ -62,12 +62,15 @@
 //! `ptab.rs`, Design Decisions). An entry is created only when a tag is supplied and is
 //! removed the moment its monitor dies.
 //!
-//! A tag must be **heap-independent**: an immediate (an atom, small integer, local
-//! pid/port, `nil`) or a literal-area term. The side table holds only plain values — the
-//! crate's collector never scans it — so a term resident in a *per-process* heap could not
-//! be relocated and would dangle after a collection; a literal-area term, by contrast, is
-//! shared and never moves. A tag that is neither is therefore rejected by the
-//! `ptab.rs` entry points with a typed `unsupported`, so a caller never gets a wrong result.
+//! The tag is **owned** by its monitor, in a `crate::tag::TagSlot`: an immediate (an atom,
+//! small integer, local pid/port, `nil`) or a literal-area term is stored verbatim and
+//! allocates nothing, and every other shape is copied at monitor-creation time into the slot's
+//! own `beam_message::HeapFragment`, released with the monitor. The tag is therefore on **no
+//! process heap** — the crate's collector neither scans nor relocates it, and it is
+//! deliberately *not* a GC root (a monitor record is a plain value the collector never scans,
+//! so a tag word resident in a per-process heap could not be relocated and a later DOWN would
+//! carry a dangling tag). Every term shape the oracle accepts is accepted here; only a tag on
+//! a **remote** target is a typed `unsupported` (`DOP_MONITOR_P` carries no tag field).
 //!
 //! # Reference aliases (`erlang:alias/1`, `erlang:unalias/1`, `erlang:monitor/3` `{alias, Mode}`)
 //!

@@ -34,8 +34,6 @@
 //! * pid/port number-space exhaustion ⇒ [`system_limit`] (`SystemLimit`),
 //! * a named **port** monitor (`erlang:monitor(port, Name)`, whose name the local
 //!   process-only registry cannot resolve) ⇒ [`named_port_monitor`],
-//! * an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is not heap-independent (neither an
-//!   immediate nor a literal-area term) ⇒ [`unsupported_tag`],
 //! * an `erlang:monitor/3` `{alias, Mode}` option on a **port** monitor (whose DOWN/reply cleanup
 //!   sites hold no port table) ⇒ [`unsupported_port_monitor_alias`],
 //! * a genuinely unimplemented capability ⇒ [`unsupported`] (a BEAM `error` raise), so a caller
