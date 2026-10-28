@@ -151,14 +151,17 @@ const INPUT_ARG: i64 = 8 * 1024;
 /// deterministic per-call constant: a run at `N` calls prints `N * OUT_BYTES_PER_CALL`.
 const OUT_BYTES_PER_CALL: i64 = 4 * 2 * INPUT_ARG;
 
-/// The **m16-measured** per-call cost of one `expand/1` call on the Rust runtime, in ns.
+/// The **post-merge-measured** per-call cost of one `expand/1` call on the Rust runtime, in ns.
 ///
-/// Measured on the reference host with `/proc/loadavg` ∈ 30–60 (shared, heavily loaded) by
-/// direct `beam_rt` ladders over the staged module: ≈4.0–4.9 ms/call, rising with `N` (the
-/// documented per-call drift of the loop workloads). 4.9 ms is the value at [`CASE`]'s
-/// `n_rust`, so the pinned loop work is the conservative one.
+/// Measured on this shared host with a **child-CPU-time** (`user + sys`) ladder over the staged
+/// module, run against the merged release `beam_rt`: `N` ∈ {0, 1 000, 2 000, 3 000, 4 000,
+/// 5 000, 10 000}, 3–4 interleaved rounds pinned with `taskset -c 3`, one process at a time, with
+/// the `N = 0` pass's CPU time subtracted ⇒ ≈200–211 µs/call (median ≈204 µs/call; the user-only
+/// slope is ≈170 µs/call). The ladder is at `/proc/loadavg` ∈ 110–160, and CPU time is used
+/// because that is contention-insensitive where a wall-clock marginal is not. 204 µs is the
+/// value at [`CASE`]'s `n_rust`, so the pinned loop work is the conservative one.
 #[cfg_attr(not(test), allow(dead_code))]
-const MEASURED_PER_CALL_NS_RUST: f64 = 4_900_000.0;
+const MEASURED_PER_CALL_NS_RUST: f64 = 204_000.0;
 
 /// The one case: the loop counts per runtime.
 ///
@@ -166,10 +169,11 @@ const MEASURED_PER_CALL_NS_RUST: f64 = 4_900_000.0;
 /// timed loop must do enough work that its marginal cost stands clear of that runtime's own
 /// run-to-run boot/startup jitter** (the Rust side's boot jitter is ≈±0.1 s around a ≈0.7–1.5 s
 /// boot). The Rust-side floor is therefore **≥0.5 s of loop work**; at the measured
-/// [`MEASURED_PER_CALL_NS_RUST`] (≈4.9 ms/call) `n_rust = 2_000` calls is ≈9.8 s of work.
-/// `n_rust` is also capped by `beam_rt`'s own 60 s `run`-action deadline, which the ≈9.8 s
-/// leaves a 6× margin under. The oracle's much smaller startup jitter (tens of ms) needs a
-/// correspondingly smaller marginal: `n_sys = 50_000` calls at ≈110 µs/call is ≈5.5 s.
+/// [`MEASURED_PER_CALL_NS_RUST`] (≈204 µs/call) `n_rust = 4_000` calls is ≈0.82 s of work
+/// (≈0.64 s at a quieter host's ≈160 µs/call), i.e. ≥0.5 s with a 1.28–1.63× margin, and far
+/// inside `beam_rt`'s non-overridable 60 s `run`-action deadline. The oracle's much smaller
+/// startup jitter (tens of ms) needs a correspondingly smaller marginal: `n_sys = 50_000`
+/// calls at ≈110 µs/call is ≈5.5 s.
 ///
 /// **Maintenance rule:** when a case's measured per-call cost changes materially, re-derive
 /// `n_rust` so the loop work stays ≥0.5 s and re-pin it in
@@ -199,10 +203,10 @@ impl Case {
     }
 }
 
-/// The single case (m16 loop counts; see [`Case`]).
+/// The single case (see [`Case`]).
 static CASE: Case = Case {
     name: "binary_append",
-    n_rust: 2_000,
+    n_rust: 4_000,
     n_sys: 50_000,
 };
 
@@ -723,13 +727,13 @@ mod tests {
     }
 
     /// The loop-count rule from [`Case`]'s doc, pinned: the rust loop must be worth ≥0.5 s of
-    /// append work at the measured m16 per-call cost, and must stay far enough inside
+    /// append work at the measured per-call cost, and must stay far enough inside
     /// `beam_rt`'s 60 s `run`-action deadline that one `run` invocation still terminates there.
     /// A later calibration edits [`MEASURED_PER_CALL_NS_RUST`] and `CASE.n_rust` together —
     /// nothing else.
     #[test]
     fn the_rust_loop_count_clears_the_boot_jitter_band() {
-        assert_eq!(CASE.n_rust, 2_000, "the calibrated rust loop count");
+        assert_eq!(CASE.n_rust, 4_000, "the calibrated rust loop count");
         let work_s = CASE.n_rust as f64 * MEASURED_PER_CALL_NS_RUST / 1e9;
         assert!(work_s >= 0.5, "the rust loop must do ≥0.5 s of work: {work_s} s");
         assert!(
