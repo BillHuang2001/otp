@@ -23,6 +23,8 @@ Everything else is re-exported at the crate root and via `beam_loader::prelude::
 - `pub enum Opcode` — one variant per generic opcode of the full `genop.tab` roster, with `from_u8`/`as_u8`/`name`/`arity`, complete and lossless so an unmodelled instruction round-trips as `Instr::Generic`.
 - `LiteralArea`/`SharedLiteralArea` — the `LitT` literals materialized into one immutable, literal-tagged `beam_alloc::Heap` at load; `Module::literal(idx)` resolves `Operand::Literal(idx)`. `LiteralArea` (and therefore a loaded `Module`) is **not `Send`/`Sync`**.
 - `Module.checksum: [u8; 16]` — the module MD5, computed at load and precomputed for the `NEW_FUN_EXT` `uniq` field, so no `.beam` re-read is ever needed.
+- `LabelMap` / `SharedLabelMap` (from `labels`, re-exported at the crate root and in `prelude`) — one lazily built label/import index per module image, shared by every consumer through `Module::label_map() -> Arc<LabelMap>` (`build_label_map`, `import_target`, `label_map_builds`/`reset_label_map_builds` are the free entry points).
+- `Module::clone()` starts with an empty slot: a clone is a different image at a different address, so it derives its own `LabelMap` instead of reusing (or mis-attributing) the original's import table.
 
 ## The `.beam` in brief (byte layouts and bounds in `src/chunk/CONTEXT.md`)
 `u32 "FOR1" | u32 form_length (= filesize-8, includes the form type) | u32 "BEAM"` then `chunk entry*: u8[4] id | u32 size | payload | 0-3 pad`.
