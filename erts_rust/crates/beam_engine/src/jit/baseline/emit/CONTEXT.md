@@ -344,10 +344,12 @@ by construction).
   Each of the newer match-context shapes charges a path budget of its own on top of `BS_PATH_BYTES`, because its sequence is wider than the shared match-context guards it reuses: `BS_MATCH_STRING_PATH_BYTES = 2_304` per `bs_match_string` (one emitted triple per pattern byte, bounded by `match_string::MAX_MATCH_BYTES = 64`), `UTF32_PATH_BYTES`/`UTF16_PATH_BYTES` = 1 024 each and `UTF8_PATH_BYTES = 2_048`. Like the other path budgets they are charged whether or not a predicate claims the instruction, because the estimate runs before the predicate and an under-estimate is a `SystemLimit` compile error.
 - **The register-cache gate** (`regalloc.rs::{cacheable_touches, cacheable_reads, cacheable_writes, is_inlined}`) and the `Y` gate (`arith.rs::uses_y`) consult the same `*_shape` functions and the label-free `<Shape>::of(...)` constructors, so the emitted register set, the block's dirty-spill set and the `Y` refresh decision are derived from one decision. A shape's destination must be charged as **written** — the value lands in that cache register, so an uncharged write lets a stale register survive a block exit.
 
-## Emitted-store invalidation inventory (the inline `allocate` push)
+## Store-mutation inventory (the published `machine.stack`/`machine.frames` slots)
 
+No emitted code reads `JitRuntime::stack_store`/`frames_store`/`frame_template` today: the frame push is a `jit_allocate` helper call, so every store mutation happens in Rust.
+The inventory below is the precondition any future inline push would have to satisfy.
 `JitRuntime::stack_store`/`frames_store` are `*mut PubVec<…>` and the store header's
-`ptr`/`len`/`cap` **are** the truth — the emitted push and every Rust accessor read and
+`ptr`/`len`/`cap` **are** the truth — an emitted push and every Rust accessor would read and
 write the same words, so there is no mirror to commit and no staleness window.
 That is what makes this inventory decidable: a site either (a) leaves the header
 correct as it writes it (any `PubVec` method, which is the only way Rust may touch the
@@ -384,7 +386,7 @@ driver-side publication before any emitted code can use the store again:
 - Never touch the stores: `enter_in_block`/`commit_in_block_entry`/`cross_function_enter` (`:2234`/`:2247`/`:2283`/`:2328`), which only switch the entry tables.
 - Driver-side: `drive` (`mod.rs:1091`) publishes before the loop, the loop head (`:1257-1262`) re-publishes each iteration, `code.enter_cached` (`:1285`) and the deopt arm (`:1409-1418`) run inside an iteration that re-publishes at its head; `enter_machine` (`mod.rs:809`) resets and pushes frame 0 **before** the loop publishes. A `traced` run never builds a `JitRuntime` (`mod.rs:1100-1102`).
 
-### The two rules the emitter must keep
+### The two rules an emitted store access must keep
 
 - **Every capacity guard precedes every write.** A `grow` moves `ptr`, and the emitted
   arm re-reads `ptr` from the header after the guards, so the fast path can never name

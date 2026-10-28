@@ -329,31 +329,26 @@ pub(crate) struct JitRuntime<'a> {
     /// `&mut machine.stack` — the Erlang stack's [`PubVec`] **header**, whose
     /// `ptr`/`len`/`cap` words are at [`STORE_PTR_OFF`]/[`STORE_LEN_OFF`]/[`STORE_CAP_OFF`].
     ///
-    /// Read and **written** by generated code: the emitted `allocate` grows the stack by
-    /// the instruction's `StackNeed` in place — NIL-filling the Y words into the header's
-    /// spare capacity and publishing the new `len` itself — which is why the store's three
-    /// words are the live ones rather than a copy (see [`PubVec`]'s module docs). A push
-    /// whose capacity check fails leaves the block for [`jit_allocate`], so the growth
-    /// path (a `Vec` reallocation, which no published slot could survive) stays in Rust.
-    ///
-    /// The pointer is taken once per driver loop, exactly like [`Self::current_code`]:
-    /// `Machine` is not `repr(C)` and the driver's `&mut Machine` is the only one for the
-    /// whole loop, so the field's address is stable until the loop returns. Read by
-    /// generated code at [`RUNTIME_STACK_STORE_DISP`].
+    /// Published so an emitted frame push *could* grow the stack in place, but **no
+    /// emitted code reads it today**: `allocate` goes through [`jit_allocate`], and the
+    /// helper's `Machine::push_frame_window` is what moves the `Vec` and re-publishes the
+    /// Y window. The pointer is taken once per driver loop, exactly like
+    /// [`Self::current_code`]: `Machine` is not `repr(C)` and the driver's `&mut Machine`
+    /// is the only one for the whole loop, so the field's address is stable until the loop
+    /// returns.
     pub(crate) stack_store: *mut PubVec<Eterm>,
     /// `&mut machine.frames` — the call-frame stack's [`PubVec`] header, the frame-push
-    /// half of the same mechanism. Read by generated code at
-    /// [`RUNTIME_FRAMES_STORE_DISP`].
+    /// half of the same publication, and equally unread by emitted code today.
     pub(crate) frames_store: *mut PubVec<Frame>,
     /// The words of a `Frame { continuation: Continuation::Halt, y_base: 0, y_count: 0 }`
-    /// — what an emitted frame push copies into the frame store's spare capacity before
-    /// writing the two values that vary (the frame's `y_base` and `y_count`, at
+    /// — what an emitted frame push would copy into the frame store's spare capacity
+    /// before writing the two values that vary (the frame's `y_base` and `y_count`, at
     /// [`FRAME_Y_BASE_OFF`]/[`FRAME_Y_COUNT_OFF`]).
     ///
     /// The template is materialised in Rust (see [`frame_template`]) because `Frame` is a
     /// `repr(Rust)` struct: generated code must never encode its layout, so it copies whole
-    /// words from here and patches exactly the two fields the constants name. Read by
-    /// generated code at [`RUNTIME_FRAME_TEMPLATE_DISP`].
+    /// words from here and patches exactly the two fields the constants name. Like the two
+    /// store handles it is published for a push no emitted arm performs today.
     pub(crate) frame_template: [usize; FRAME_WORDS],
 }
 
@@ -802,21 +797,6 @@ const _: () = assert!(
 );
 const _: () = assert!(mem::align_of::<Frame>() <= mem::align_of::<usize>());
 
-/// The log2 of `size_of::<Frame>()`, when that is a power of two — what the emitted push
-/// scales the frame index by (`len * size_of::<Frame>()`).
-///
-/// `None` disables the inline push (the arm falls back to [`jit_allocate`]'s helper call)
-/// rather than emitting a multiply sequence whose `imul` the block ABI has no register
-/// budget for; a `Frame` is 32 bytes today, so the shift is the only shape ever emitted.
-pub(crate) const FRAME_SHIFT: Option<u32> = {
-    let size = mem::size_of::<Frame>();
-    if size.is_power_of_two() {
-        Some(size.trailing_zeros())
-    } else {
-        None
-    }
-};
-
 /// The byte offset of [`Machine::stack`]'s header words inside [`PubVec<Eterm>`]:
 /// `ptr`/`len`/`cap`, in that order (the store is `#[repr(C)]`, see [`PubVec`]).
 ///
@@ -850,25 +830,6 @@ const _: () = assert!(
         && FRAME_Y_COUNT_OFF + mem::size_of::<u32>() as i32 <= mem::size_of::<Frame>() as i32,
     "both patched fields must lie inside the frame slot the push writes"
 );
-
-/// The byte offset of [`JitRuntime::stack_store`] — `&mut machine.stack`, the Erlang
-/// stack's addressable header.
-///
-/// Computed with [`mem::offset_of!`], like every other `RUNTIME_*_DISP`: the field is
-/// **appended** to the struct so no pre-existing offset (and therefore no emitted byte of
-/// any other arm) moves.
-pub(crate) const RUNTIME_STACK_STORE_DISP: i32 =
-    mem::offset_of!(JitRuntime<'static>, stack_store) as i32;
-
-/// The byte offset of [`JitRuntime::frames_store`] — `&mut machine.frames`, the
-/// call-frame stack's addressable header.
-pub(crate) const RUNTIME_FRAMES_STORE_DISP: i32 =
-    mem::offset_of!(JitRuntime<'static>, frames_store) as i32;
-
-/// The byte offset of [`JitRuntime::frame_template`] — the words an emitted frame push
-/// copies into the frame store.
-pub(crate) const RUNTIME_FRAME_TEMPLATE_DISP: i32 =
-    mem::offset_of!(JitRuntime<'static>, frame_template) as i32;
 
 /// The template an emitted frame push writes: a `Frame` whose continuation is
 /// [`Continuation::Halt`] and whose two Y fields are zero (the push patches them).

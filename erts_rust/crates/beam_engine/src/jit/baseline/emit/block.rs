@@ -160,15 +160,6 @@ pub(crate) fn emit_block(
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
     // --- prologue -----------------------------------------------------------
-    if std::env::var_os("DBG_EMIT").is_some() {
-        eprintln!(
-            "DBG emit func={func} range={start}..{end} publish={} y_first={:?} repub={:?} y_last={:?}",
-            allocation.prologue_publishes_y(),
-            allocation.y_first,
-            allocation.frame_republish_first,
-            allocation.y_last
-        );
-    }
     #[cfg(test)]
     let block_start_bytes = buffer.len();
     emit_block_prologue(buffer, allocation, highest_touched, func, start)?;

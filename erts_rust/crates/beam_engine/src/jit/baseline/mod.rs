@@ -576,15 +576,6 @@ pub(crate) fn run_native_resume_outcome(
 ) -> Result<RunOutcome> {
     // One resume is one scheduling slice: start the reduction count at zero, exactly
     // as `Machine::drive` does for the interpreter's resume (`run_loop` -> `drive`).
-    if std::env::var_os("DBG_DRIVE").is_some() {
-        eprintln!(
-            "DBG resume m={:p} func={func} pc={pc} stack={} frames={} ctx={}",
-            machine as *const Machine,
-            machine.stack.len(),
-            machine.frames.len(),
-            machine.current_context(),
-        );
-    }
     machine.reset_reductions();
     machine.enter_run(module, func);
     // The tier's own module-wide label map when its artifact holds one, else the
@@ -1236,9 +1227,6 @@ fn drive(
     // (`Machine::switch_context` is called from `Machine::drive` and `switch_into`
     // only), so every rebind of `rt.module` is a driver site.
     rt.refresh_literals();
-
-    let dbg = std::env::var_os("DBG_DRIVE").is_some();
-    let mut dbg_iter: u32 = 0;
     loop {
         // ── The block-entry reduction charge: the native tier's pre-emption point ──
         //
@@ -1281,29 +1269,6 @@ fn drive(
             // The engine-side slice counter, bumped in the same step as the hook so
             // the two always agree (the interpreter driver's invariant).
             (*machine_ptr).reductions = (*machine_ptr).reductions.saturating_add(1);
-        }
-        if dbg && dbg_iter < 400 {
-            dbg_iter += 1;
-            // SAFETY: the loop head is only reached between block calls.
-            let m = unsafe { &*machine_ptr };
-            let (exp_b, exp_e, fy, fc) = match m.frames.last() {
-                Some(f) => (
-                    unsafe { m.stack.as_ptr().add(f.y_base) },
-                    unsafe { m.stack.as_ptr().add(f.y_base + f.y_count as usize) },
-                    f.y_base,
-                    f.y_count,
-                ),
-                None => (std::ptr::null(), std::ptr::null(), 0, 0),
-            };
-            let stale = exp_b != rt.y_base || exp_e != rt.y_end;
-            eprintln!(
-                "DBG head m={:p} it={dbg_iter} f={func} pc={pc} stack={} frames={} yb={:p} ye={:p} fy={fy} fc={fc} expb={exp_b:p} expe={exp_e:p} STALE={stale}",
-                machine_ptr,
-                m.stack.len(),
-                m.frames.len(),
-                rt.y_base,
-                rt.y_end
-            );
         }
         if reduce_on && !rt.charge_reduce(1) {
             // The host refused this iteration's charge: `charge_reduce` stored its own
@@ -1436,9 +1401,6 @@ fn drive(
             // Structural counter: no native entry for this address, so the driver
             // takes exactly one interpreter step (the documented per-instruction
             // deopt for an address the artifact compiled no block for).
-            if dbg {
-                eprintln!("DBG interp-step f={func} pc={pc}");
-            }
             #[cfg(test)]
             counters::record_driver_interp_step();
             // No native code is about to run, so no in-block return can be taken in this

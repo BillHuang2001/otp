@@ -317,14 +317,14 @@ impl Allocation {
     /// A suppression rule was tried and is **unsound**, which is why it is not here: a
     /// block whose every Y access follows a frame-changing instruction was allowed to skip
     /// the publish on the theory that instruction re-published the window first. That holds
-    /// only if the entry point really executes the block prefix, and the inline
-    /// `allocate`/`allocate_heap` frame push (`emit/heap.rs`, `INLINE_PUSH_MAX_Y`) publishes
-    /// only **mid-block** — so a block entered with a window left over from a shallower
-    /// frame depth (the resume path, which republishes nothing, and any native entry whose
-    /// prologue chose not to publish) read its Y slots through a stale base. The failure
-    /// surfaced as a `{badmatch, _}` out of `get_list` under the default (baseline) tier on
-    /// `bench_list_walk:walk/1`, with the interpreter — which derives the window per
-    /// instruction — correct. [`Allocation::y_first`]/`frame_republish_first` survive as the
+    /// only if the entry point really executes the block prefix, and a frame-changing
+    /// helper re-publishes the window only **mid-block** — so a block entered with a window
+    /// left over from a shallower frame depth (the resume path, which republishes nothing,
+    /// and any native entry whose prologue chose not to publish) read its Y slots through a
+    /// stale base. The failure surfaced as a `{badmatch, _}` out of `get_list` under the
+    /// default (baseline) tier on `bench_list_walk:walk/1`, with the interpreter — which
+    /// derives the window per instruction — correct.
+    /// [`Allocation::y_first`]/`frame_republish_first` survive as the
     /// analysis's record and are read by the counters/tests; they no longer gate the
     /// publish.
     pub(crate) fn prologue_publishes_y(&self) -> bool {

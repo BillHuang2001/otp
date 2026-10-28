@@ -4466,14 +4466,16 @@ fn the_move_y_gate_matches_the_move_inliner_exactly() {
     assert!(move_shape(src, dst).expect("Y->Y lowers").registers().is_empty());
 }
 
-/// A block whose inlined Y moves follow an in-block helper call is covered by the
-/// compile-time gate: `y_last` names the last Y access, so the helper's deopt arm
-/// (`Allocate`, which may reallocate `machine.stack`) re-publishes the window
-/// (`refresh_y_after`) before the move reads it — and, for exactly that reason, the
-/// block's prologue **skips** its own publish
-/// ([`Allocation::prologue_publishes_y`]: every Y access follows the `allocate`, whose
-/// helper re-published the window on the arm that continued the block, so a prologue
-/// publish would be overwritten before anything read it).
+/// A block whose inlined Y moves follow an in-block frame change is covered by the
+/// compile-time gate: `y_last` names the last Y access, so the helper that may move
+/// `machine.stack` (`Allocate`) re-published the window before the move reads it, and the
+/// move's own fallback (`refresh_y_after`) re-publishes it again.
+///
+/// The block's prologue **publishes too** ([`Allocation::prologue_publishes_y`]: a block
+/// that touches a `Y` slot always publishes): a block entry need not execute the prefix
+/// that reached the frame change — a resume re-enters at the parked address — so the
+/// prologue publish is what makes a `Y` access safe at every entry, and suppressing it
+/// because "every Y access follows the `allocate`" was unsound.
 #[test]
 fn the_y_window_gate_covers_the_inlined_y_moves() {
     let code = vec![
@@ -4518,8 +4520,8 @@ fn the_y_window_gate_covers_the_inlined_y_moves() {
     let labels = crate::interpreter::build_label_map(&module);
     let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
     assert!(
-        !code_contains_helper(&function, jit_publish_y as *const ()),
-        "every Y access follows the `allocate`, so the prologue's publish would be dead"
+        code_contains_helper(&function, jit_publish_y as *const ()),
+        "a Y-touching block publishes the window in its prologue, whatever its Y accesses follow"
     );
     assert!(
         code_contains_helper(&function, jit_refresh_y as *const ()),
