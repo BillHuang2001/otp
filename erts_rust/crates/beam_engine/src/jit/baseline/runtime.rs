@@ -2346,7 +2346,11 @@ fn commit_in_block_entry(
     // (`encode_target` is the same `func << 32 | pc` pattern), so the transfer packs its
     // target once — for the exit word — and reuses it for the position store.
     machine.set_current_code_word(word as u64);
-    machine.reductions = machine.reductions.saturating_add(1);
+    // Wrapping, not saturating: the counter is a **per-slice** budget that both drivers
+    // zero at slice entry, so reaching `u64::MAX` would mean that many charges inside one
+    // slice — unreachable, and a two-instruction (`add` + `cmov`) pair on the per-transfer
+    // hot path is not worth a value no run can observe.
+    machine.reductions = machine.reductions.wrapping_add(1);
     if machine.reduce_on && !runtime.charge_reduce(1) {
         // The host refused: its own typed error is already in `runtime.error` (see
         // [`JitRuntime::charge_reduce`]), and the transfer is **not** taken — nothing of the
