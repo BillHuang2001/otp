@@ -199,19 +199,6 @@ const POINTER_MASK: i64 = !(TAG_PTR_MASK as i64);
 /// The `HEADER_SUB_BITS` header word, as the word compare materialises it.
 const SUB_BITS_HEADER: i64 = HEADER_SUB_BITS.raw() as i64;
 
-/// The byte offset of an `ErlSubBits`'s `base_flags` word (word index 1): the payload byte
-/// pointer with the low [`FLAG_MASK`] bits carrying flags
-/// (`erts/emulator/beam/erl_bits.h:60-82`).
-const SUB_BITS_BASE_FLAGS_DISP: i32 = (core::mem::size_of::<Eterm>()) as i32;
-
-/// `ERL_SUB_BITS_FLAG_MASK` (`erts/emulator/beam/erl_bits.h:95`): the low bits of an
-/// `ErlSubBits`' `base_flags` word are flags, not part of the payload pointer.
-///
-/// A **derivation** of the frozen constant, like the `BSF_*` bits below:
-/// [`beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK`] is the owner and the value is pinned
-/// against it by `super::tests`.
-const FLAG_MASK: usize = beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK;
-
 /// The byte offset of an `ErlSubBits`'s `start` word (word index 2).
 const SUB_BITS_START_DISP: i32 = (2 * core::mem::size_of::<Eterm>()) as i32;
 
