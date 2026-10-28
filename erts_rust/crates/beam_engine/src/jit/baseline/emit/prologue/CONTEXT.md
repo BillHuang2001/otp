@@ -15,15 +15,19 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   `mov r10,[rdi+RUNTIME_CURRENT_CODE_DISP]`; `mov r11, movabs pack_current_code(func, block_start_pc)`;
   `mov [r10], r11` — 24 B, three instructions, no helper call, emitted before the cached loads,
   which is why nothing a block keeps live can sit in caller-saved scratch here) — or, when the block
-  accesses **any** `Y` slot (`Allocation::prologue_publishes_y`, i.e. `y_last.is_some()`),
+  accesses a `Y` slot **and** its first `Y` access is not preceded by an in-block frame-changing helper
+  (`Allocation::prologue_publishes_y` over `y_last`/`y_first`/`frame_republish_first`),
   `jit_publish_y(rt, func, pc)`, which does that same position store **and** re-publishes the current
   frame's Y window in one call — then load each cached register in
   `Allocation::entry_fill` from `machine.x` (the block's **live-in** slots: a cached register the block
   writes before it reads is not loaded at entry, because that writing instruction sets it).
-  The publish is unconditional for a Y-touching block **on soundness grounds**: a block is entered (or a
-  slice is resumed) without re-executing any prefix, so a frame helper's mid-block re-publication cannot
-  stand in for the prologue's — the window has to be re-derivable from Rust state at every enterable
-  address, and the prologue is where that happens.
+  The window must be re-derivable from Rust state at every enterable address: a block is entered only at
+  its own start (a fresh block entry, or a resume parked on a block entry, which re-executes the
+  prefix), an in-block `allocate`/`allocate_heap`/`trim` re-publishes it from
+  `Machine::push_frame_window`'s own `(y_base, y_count)`, and the prologue publishes exactly when the
+  block's first `Y` access is not preceded by such a helper — so a block whose every `Y` access follows
+  one pays no prologue publish, while an allocation with no analysis tables publishes (§ the only
+  failure direction is a redundant publish).
   `emit_position_store` is the **one** encoder of an instruction position (`pub(super)`, so
   `../family.rs`'s bitstring arm emits the same 24 B for each `Bs*` instruction before its helper call —
   `jit_bitstr` no longer stores the position itself; see `../CONTEXT.md`).
