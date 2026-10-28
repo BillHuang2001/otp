@@ -51,11 +51,16 @@ Re-exported at the crate root and via `beam_codec::prelude::*`.
 - `reader.rs`/`writer.rs` — `Reader<'a>`, a bounds-checked big-endian cursor (`position`,
   `remaining`, `is_empty`, `u8`/`u16be`/`u24be`/`u32be`/`u64be`, `bytes(n)`, `rest`, `peek_u8`;
   `u24be` is the 3-byte C `get_int24` used by `ATOM_INTERNAL_REF3`); `Writer`, a growable sink
-  (`new`, `with_capacity`, `u8`/`u16be`/`u32be`/`u64be`, `bytes`, `len`, `is_empty`, `as_slice`,
-  `into_vec`, `clear`) plus two crate-internal backward writes: the bounds-checked
-  `patch_u32be(pos, value) -> Result<()>` (patching the `NEW_FUN_EXT` size field) and
+  (`new`, `with_capacity`, **`from_vec`**, `u8`/`u16be`/`u32be`/`u64be`, `bytes`, `len`, `is_empty`,
+  `as_slice`, `into_vec`, `clear`, `capacity`/`reserve`) plus two crate-internal backward writes: the
+  bounds-checked `patch_u32be(pos, value) -> Result<()>` (patching the `NEW_FUN_EXT` size field) and
   `mask_last_byte(mask)` (clearing a bit-string tail's unused low bits in place). Both are safe
   Rust.
+- `scratch.rs` — `EncodeScratch`, the caller-owned reusable output buffer (`new`/`with_capacity`,
+  `writer() -> Writer`, `recycle(Writer)`, `clear`, `is_empty`, `capacity`), fed to
+  `Encoder::with_writer`/`Encoder::new_body_with` and taken back with `Encoder::take_writer`; it
+  carries capacity only, so recycling it cannot change a byte. `beam_bifs` keeps one per thread (the
+  encode-side twin of its `DECODE_SCRATCH`).
 - `atom_cache.rs` — read `AtomCache` (8 segments × 256 = 2048 slots; `set(index, atom)`,
   `get(index) -> Option<Atom>`, `clear`), filled by `beam_dist` and used to resolve
   `ATOM_CACHE_REF` (`82`; unset index ⇒ `BadArg`); write `pub trait AtomCacheWriter { fn intern(&mut
