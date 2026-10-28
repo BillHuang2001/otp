@@ -326,6 +326,44 @@ pub(crate) struct JitRuntime<'a> {
     /// code, so its position is immaterial to the emitted stream and it is **appended** so
     /// every pre-existing `#[repr(C)]` offset — and therefore every emitted byte — stays put.
     pub(crate) reduce_hook: Option<ReduceHook>,
+    /// The base of the executing module context's **local-call verdict slab**
+    /// (`LocalVerdicts::byte_slots`, one byte per [`Module::functions`] entry), or null when
+    /// that context has no table.
+    ///
+    /// Published by the driver at every block entry (see
+    /// [`enter_compiled_cached`](super::enter_compiled_cached), next to [`Self::tables`]),
+    /// because the block's local-call gate reads a callee's verdict inline instead of
+    /// calling [`jit_local_call`] — the switch from an `Instr::CallLast`/`CallOnly`'s helper
+    /// call to one `movzx` and one range compare (see [`super::emit::block`]).
+    ///
+    /// The slab is the right thing to publish, not a pointer to the `LocalVerdicts` value:
+    /// the contexts registry is a `Vec` a newly registered module context can reallocate
+    /// mid-slice, while the slab is one heap allocation that is only ever *replaced* at run
+    /// entry / [`Machine::reset`](crate::Machine) — never mid-slice (see
+    /// [`LocalVerdicts::byte_slots`](crate::machine::LocalVerdicts)). Null therefore means
+    /// "no verdict is knowable here", which the gate treats as a reject.
+    ///
+    /// Read by generated code at [`RUNTIME_VERDICT_SLOTS_DISP`].
+    pub(crate) verdict_slots: *const u8,
+    /// One past the last slot of [`Self::verdict_slots`] (`base + slot count`), or null when
+    /// no table is bound — the bound the gate's inline slot address is checked against, in
+    /// exactly the shape of the Y-window and literal-area guards (a null base makes every
+    /// index reject).
+    ///
+    /// Read by generated code at [`RUNTIME_VERDICT_SLOTS_END_DISP`].
+    pub(crate) verdict_slots_end: *const u8,
+    /// `&machine.local_call_invalidation_pending` — the one-byte flag
+    /// `erlang:load_nif/2`'s dispatch funnel **arms** when a host's local-call answer set may
+    /// have changed.
+    ///
+    /// The gate reads it and rejects on a non-zero byte, so an armed invalidation can never
+    /// be bypassed through the inline path: only the seam (`&mut self`) may consume it, and
+    /// the reject arm is exactly that path. It is a pointer because `Machine` is not
+    /// `#[repr(C)]` (the same rationale as [`Self::x_regs`]), and it is read as a **byte** —
+    /// generated code never forms a `&mut` to it and never reads it as a `bool`.
+    ///
+    /// Read by generated code at [`RUNTIME_VERDICT_PENDING_DISP`].
+    pub(crate) verdict_pending: *const u8,
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -594,6 +632,58 @@ impl JitRuntime<'_> {
         self.literals_base = base;
         self.literals_end = end;
     }
+
+    /// Publish the executing module context's **local-call verdict slab** and the
+    /// pending-invalidation flag's address — the state a block's local-call gate reads
+    /// inline (see [`JitRuntime::verdict_slots`]).
+    ///
+    /// Called from the two points where it can change: the [`JitRuntime`] construction
+    /// (after any start-context switch, so a resumed slice publishes the context it blocked
+    /// in) and every block entry ([`enter_compiled_cached`](super::enter_compiled_cached)),
+    /// which is also the point at which a context switch has already happened —
+    /// `switch_into` calls `Machine::switch_context` before the driver re-enters native code,
+    /// so `machine.current_context()` here **is** the module the entered block belongs to.
+    ///
+    /// Publication is a witness, not a guess: the slab it hands over is only ever replaced at
+    /// run entry (`Machine::bind_entry_verdicts`) or [`Machine::reset`](crate::Machine), both
+    /// of which precede the driver call, so within one driver call (one scheduling slice) the
+    /// pointer stays valid while the *verdict bytes* behind it change legitimately — which is
+    /// exactly the intent: the gate must observe a live verdict, and an armed invalidation
+    /// flag, at the moment it runs.
+    ///
+    /// A context with no table (an id never registered) publishes nulls, which the gate
+    /// treats as a reject, so an absent table costs one helper call and never a verdict.
+    pub(crate) fn refresh_verdicts(&mut self) {
+        // SAFETY: `rt.machine` is a non-null pointer to the driver's live `Machine`; no
+        // other `&mut Machine` exists while this Rust-side publication runs (the driver is
+        // between blocks). The two addresses taken here point into that `Machine`, which the
+        // driver owns and never moves for the whole loop, so they stay valid until the loop
+        // returns.
+        let machine = unsafe { &*self.machine };
+        // The flag lives in `Machine`, which is not `repr(C)`: its address is taken here
+        // rather than baked as an offset. Emitted code reads exactly one byte through it.
+        self.verdict_pending =
+            std::ptr::addr_of!(machine.local_call_invalidation_pending) as *const u8;
+        match machine.verdict_table() {
+            Some(table) => {
+                let (base, len) = table.byte_slots();
+                self.verdict_slots = base;
+                // `wrapping_add` (not `add`): the bound is arithmetic on a pointer, and an
+                // empty table's base (a dangling-but-aligned `Box` pointer) must not be
+                // treated as a dereferenceable allocation. A null base publishes a null end,
+                // so the emitted guard rejects every index.
+                self.verdict_slots_end = if base.is_null() {
+                    std::ptr::null()
+                } else {
+                    base.wrapping_add(len)
+                };
+            }
+            None => {
+                self.verdict_slots = std::ptr::null();
+                self.verdict_slots_end = std::ptr::null();
+            }
+        }
+    }
     /// Charge `n` reductions to the host — the **one** reduction door of this tier, shared
     /// by the driver's per-block-entry charge and by the per-transfer charge of
     /// [`commit_in_block_entry`].
@@ -825,6 +915,32 @@ pub(crate) const RUNTIME_RESUME_DISP: i32 =
 /// `RUNTIME_*_DISP` offset moves).
 pub(crate) const RUNTIME_CURRENT_CODE_DISP: i32 =
     mem::offset_of!(JitRuntime<'static>, current_code) as i32;
+
+/// The byte offset of [`JitRuntime::verdict_slots`] — the base of the executing module
+/// context's local-call verdict slab, which the block's local-call gate indexes by the
+/// callee's function index.
+///
+/// Appended after [`JitRuntime::reduce_hook`], so every pre-existing `RUNTIME_*_DISP` (and
+/// every emitted byte that bakes one) stays put; computed with [`mem::offset_of!`] so the
+/// constant cannot drift from the field's real position.
+pub(crate) const RUNTIME_VERDICT_SLOTS_DISP: i32 =
+    mem::offset_of!(JitRuntime<'static>, verdict_slots) as i32;
+
+/// The byte offset of [`JitRuntime::verdict_slots_end`] — one past the verdict slab's last
+/// slot, the bound the gate's inline slot address is compared against.
+///
+/// One pointer width past [`RUNTIME_VERDICT_SLOTS_DISP`]; computed from it so the two can
+/// never disagree about the field order.
+pub(crate) const RUNTIME_VERDICT_SLOTS_END_DISP: i32 =
+    RUNTIME_VERDICT_SLOTS_DISP + mem::size_of::<*const u8>() as i32;
+
+/// The byte offset of [`JitRuntime::verdict_pending`] — the address of
+/// `Machine::local_call_invalidation_pending`, whose byte the gate rejects on while it is
+/// armed.
+///
+/// One pointer width past [`RUNTIME_VERDICT_SLOTS_END_DISP`], on the same rationale.
+pub(crate) const RUNTIME_VERDICT_PENDING_DISP: i32 =
+    RUNTIME_VERDICT_SLOTS_END_DISP + mem::size_of::<*const u8>() as i32;
 // ---------------------------------------------------------------------------
 // The helper
 // ---------------------------------------------------------------------------

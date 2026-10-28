@@ -70,11 +70,13 @@ use super::super::receive::jit_receive;
 use super::super::runtime::{
     encode_local_call, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
     EXT_CALL_ONLY, LOCAL_CALL_LAST, LOCAL_CALL_ONLY, LOCAL_DECLINE,
+    RUNTIME_VERDICT_PENDING_DISP, RUNTIME_VERDICT_SLOTS_DISP, RUNTIME_VERDICT_SLOTS_END_DISP,
 };
 use super::super::{jit_ext_call, jit_local_call};
 use super::test::try_inline_test;
 use super::{
     emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, MOVE_SCRATCH,
+    RUNTIME_SLOT_DISP,
 };
 
 /// Emit `init_yregs Registers` natively, or report that the block must helper it.
@@ -631,7 +633,7 @@ pub(crate) fn emit_block(
                             target_pc,
                             *deallocate,
                             pc,
-                            ExitSpill::Done,
+                            ExitSpill::Required,
                         )?;
                     } else {
                         linker.emit_tail_exit_to_driver(
@@ -642,7 +644,7 @@ pub(crate) fn emit_block(
                             target_pc,
                             *deallocate,
                             pc,
-                            ExitSpill::Done,
+                            ExitSpill::Required,
                         )?;
                     }
                     terminated = true;
@@ -680,7 +682,7 @@ pub(crate) fn emit_block(
                         target_func,
                         target_pc,
                         pc,
-                        ExitSpill::Done,
+                        ExitSpill::Required,
                     )?;
                     terminated = true;
                     break;
@@ -1483,6 +1485,153 @@ fn emit_local_call_probe(
     deallocate: u32,
 ) -> Result<()> {
     let helper: LocalCallHelper = jit_local_call;
+    // The gate's two forward labels: the `jit_local_call` sequence below (everything the
+    // gate rejects to), and the point just past it, where the block's static exit begins
+    // (everything the gate accepts, or a helper-declined callee, continues to).
+    let (Ok(callee_disp), true) = (i32::try_from(callee), true) else {
+        // A callee index that cannot be a `disp32` slot offset (impossible for a real
+        // module's function table) keeps the ungated sequence: the gate would have to add
+        // an index register, which this emitter's addressing modes do not offer, and
+        // silently narrowing the index would read another callee's verdict.
+        return emit_local_call_helper(
+            buffer, allocation, done, helper, func, pc, callee, arity, kind, deallocate,
+        );
+    };
+    let reject = buffer.label();
+    let accepted = buffer.label();
+    emit_local_call_gate(buffer, callee_disp, reject, accepted)?;
+    // ── the reject arm: exactly today's sequence ──────────────────────────────────────
+    //
+    // Every reject condition lands here, and here the emitted code is byte-for-byte the
+    // pre-gate probe: the spill, the helper's five immediates, the `LOCAL_DECLINE` compare
+    // and the exit to the block epilogue. Nothing the gate computed survives into it (the
+    // helper re-reads `rt` from the block's own slot and takes its arguments from the
+    // immediates), so a reject is observationally the old path.
+    buffer.bind(reject)?;
+    emit_local_call_helper(
+        buffer, allocation, done, helper, func, pc, callee, arity, kind, deallocate,
+    )?;
+    // The helper declined the seam: the caller's own code runs, so the block continues into
+    // its static exit. Every other word left the block through `done` above.
+    buffer.bind(accepted)?;
+    Ok(())
+}
+
+/// Emit the **inline reject-only verdict gate**: read the executing module context's
+/// local-call verdict for the compile-time callee index straight out of the machine, and
+/// jump to `reject` unless it says "enter this callee in this machine".
+///
+/// # What it replaces, and why
+///
+/// [`emit_local_call_probe`] used to pay one `jit_local_call` call — the block's spill, five
+/// `movabs` immediates, the call, and `Machine::local_call_seam`'s own flag read, bounds
+/// check and range compare — in front of **every** `call_last`/`call_only`, on every
+/// iteration. The seam's answer, though, is a memoized byte
+/// (`machine::LocalVerdicts`) that the driver publishes into [`JitRuntime`] at every block
+/// entry, so the whole question is answerable in-line: three loads and two compares, no
+/// call, no spill, no `movabs`. The gate is **reject-only** — it can only send control to
+/// the unchanged helper — so it can never fabricate the host's answer, and
+/// [`Verdict::Unknown`](crate::machine::Verdict) (a callee's first call) and a
+/// host-**served** callee both still reach the helper and take exactly the path they took
+/// before.
+///
+/// # The guard sequence (each failure rejects)
+///
+/// 1. `JitRuntime::verdict_pending` (the address of `Machine::local_call_invalidation_pending`)
+///    is null — no flag to consult;
+/// 2. its byte is **non-zero**: an invalidation is armed, and only the seam (`&mut self`)
+///    may consume it, so the inline path must not read the slab at all;
+/// 3. `JitRuntime::verdict_slots` (the context's verdict slab) is null — the context has no
+///    table;
+/// 4. the slot address `slab + callee` is at or past `verdict_slots_end` — the exact runtime
+///    twin of `LocalVerdicts::get`'s `table.get(callee as usize)` answering `None`;
+/// 5. the verdict byte is `>= Verdict::Served` — i.e. `Served` (the host answers the callee
+///    as a BIF, so its code must not run) or `Unknown` (nothing is known yet, so the seam
+///    must derive the identity and ask).
+///
+/// A byte **below** `Verdict::Served` is `Declined` or `Unnameable` — the two verdicts that
+/// mean "run this callee's own code" — and that is the only case the gate accepts. The bound
+/// is the enum's own `Verdict::Served as u8`, so the verdict discriminants stay the single
+/// source of truth for the ordering the test depends on
+/// (`enters_in_machine_is_the_low_discriminant_range`).
+///
+/// # Why a reject is free of side effects
+///
+/// The gate writes no machine state: it loads `rt` from the block's own stack slot, loads
+/// three words out of it, and compares. It allocates nothing, roots nothing, calls no host
+/// and stores nothing, so a "reject" leaves the machine exactly as the instruction found it
+/// and the helper — which re-derives everything from its immediates — observes precisely
+/// what it observed before this gate existed. That is also why the gate may sit **before**
+/// the block's exit spill: the accepted path has not touched `machine.x`, so the exit that
+/// follows must still spill the block's cached registers, and the reject path's own spill
+/// is an idempotent rewrite of those same slots.
+///
+/// # Registers
+///
+/// `r10` (the block's `rt` scratch), `r11` (`MOVE_SCRATCH`), `rcx` and `rdx` are the
+/// System V **caller-saved** scratch registers this emitter uses strictly within one
+/// instruction's lowering — no value survives an instruction boundary in them, and none is
+/// a cache register, `rbx` (the `machine.x` base) or `rsp`. `rax` is deliberately untouched:
+/// the emitted arms read it only as a helper's word.
+pub(crate) fn emit_local_call_gate(
+    buffer: &mut CodeBuffer,
+    callee_disp: i32,
+    reject: CodeLabel,
+    accepted: CodeLabel,
+) -> Result<()> {
+    // r10 = rt (the block's reserved stack slot holds it), then the three published words.
+    buffer.mov_rm(Reg::R10, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    buffer.mov_rm(Reg::R11, Reg::R10, RUNTIME_VERDICT_PENDING_DISP)?;
+    // 1. An absent flag address means the runtime published no verdict state at all.
+    buffer.test_rr(Reg::R11, Reg::R11)?;
+    buffer.jcc(Cond::E, reject)?;
+    // 2. An armed invalidation must reach the seam, which consumes it. The byte is read,
+    //    never written, and never read as a `bool`: emitted code takes its address only.
+    buffer.movzx_byte(Reg::R11, Reg::R11, 0)?;
+    buffer.test_rr(Reg::R11, Reg::R11)?;
+    buffer.jcc(Cond::Ne, reject)?;
+    // 3. The verdict slab of the executing module context.
+    buffer.mov_rm(Reg::R11, Reg::R10, RUNTIME_VERDICT_SLOTS_DISP)?;
+    buffer.test_rr(Reg::R11, Reg::R11)?;
+    buffer.jcc(Cond::E, reject)?;
+    buffer.mov_rm(Reg::Rdx, Reg::R10, RUNTIME_VERDICT_SLOTS_END_DISP)?;
+    // 4. &slab[callee], bounds-checked against the published end in the same shape the
+    //    literal-area and Y-window guards use (a null base already rejected above).
+    buffer.lea(Reg::Rcx, Reg::R11, callee_disp)?;
+    buffer.cmp_rr(Reg::Rcx, Reg::Rdx)?;
+    buffer.jcc(Cond::Ae, reject)?;
+    // 5. The verdict byte itself: `>= Verdict::Served` leaves the caller's own code out of
+    //    it, either because the host serves the callee or because nothing is known yet.
+    buffer.movzx_byte(Reg::Rcx, Reg::Rcx, 0)?;
+    buffer.mov_ri(Reg::Rdx, i64::from(crate::machine::Verdict::FIRST_NOT_IN_MACHINE))?;
+    buffer.cmp_rr(Reg::Rcx, Reg::Rdx)?;
+    buffer.jcc(Cond::Ae, reject)?;
+    // Accepted: the callee's own code runs. Step over the helper sequence to the caller's
+    // static exit.
+    buffer.jmp(accepted)
+}
+
+/// Emit the **ungated** local-call probe: the `jit_local_call` helper with its five
+/// immediates, the `LOCAL_DECLINE` compare and the exit to `done` for every other word.
+///
+/// This is the gate's reject arm and, for a callee index too large to be a `disp32` slot
+/// offset, the whole probe. It is the sequence the probe emitted before the gate existed —
+/// unchanged, so a rejected callee (a `Served` or `Unknown` verdict, an armed invalidation,
+/// an absent table) takes byte-for-byte the path it always took, including the spill that
+/// makes the block's `machine.x` current before the helper reads it.
+#[allow(clippy::too_many_arguments)]
+fn emit_local_call_helper(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    helper: LocalCallHelper,
+    func: u32,
+    pc: u32,
+    callee: u32,
+    arity: u32,
+    kind: u32,
+    deallocate: u32,
+) -> Result<()> {
     emit_helper_call(
         buffer,
         allocation,
@@ -1494,11 +1643,13 @@ fn emit_local_call_probe(
             i64::from(kind),
             i64::from(deallocate),
         ],
-    pc)?;
+        pc,
+    )?;
     buffer.mov_ri(Reg::R11, LOCAL_DECLINE)?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)
 }
+
 
 /// Emit the native arm for one `call_ext*` instruction: the `jit_ext_call` helper
 /// (import resolution + frame discipline) followed by the same continuation check a

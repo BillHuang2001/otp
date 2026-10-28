@@ -87,7 +87,14 @@ The only tables that outlive a compile are `compile.rs`'s entry tables and the `
   not lookup tables.
 - **Re-derived, never cached:** `cacheable_touches`/`cacheable_reads`/`cacheable_writes`/`is_inlined`
   (`regalloc.rs:523`/`:666`/`:780`/`:422`) and the `uses_y` union (`arith.rs:361` + `bif.rs:323`) re-run
-  the shape predicates per instruction per call — there is no per-instruction verdict table. `regalloc`
+  the shape predicates per instruction per call — there is no per-instruction verdict table.
+## The inline local-call verdict gate (`block::emit_local_call_gate`)
+The `call_last`/`call_only` arms end in one inline reject-only gate instead of an unconditional helper call.
+It reads, in this order, all `JitRuntime` fields (`r10` = the block's `rt`, reloaded from `[rsp + RUNTIME_SLOT_DISP]` for the gate) and **rejects** on each failure: null pending address; non-zero pending byte (armed invalidation); null slab base; a callee slot address at/after the slab end (one `lea` at the compile-time callee index plus an unsigned `cmp`); and a slot byte `>= Verdict::FIRST_NOT_IN_MACHINE` (`Served`/`Unknown`).
+Gate-true (`Declined`/`Unnameable`) falls through to the block's static exit, which therefore passes `ExitSpill::Required` — the fall-through has not spilled; gate-false emits today's `jit_local_call` helper (5 immediates, `LOCAL_DECLINE` compare, `jcc Ne done`) byte for byte, whose own `SpillSite::Helper` spill makes the exit's second store a rewrite of the same words (helper calls preserve the callee-saved cache registers and the decline path writes no `machine.x`).
+Scratch discipline: the gate uses `r10`/`r11` (the block's `MOVE_SCRATCH` pair) and the helper-argument `rdx`/`rcx`, never a cache register (`r12`–`r15`/`rbp`), never `rbx`/`rsp`, never `rax`; it allocates, roots and calls nothing, so a reject leaves the machine byte-identical (deopt idempotency).
+Pins: `emit/local_call_gate_tests.rs` (every reject condition executed against a hand-published `JitRuntime`, the two entering verdicts accepted from the callee's own slot, and no `jit_local_call` immediate in the snippet) and `call_tests.rs` (`a_fresh_callee_and_a_served_callee_reach_the_seam_and_a_declined_one_does_not`, `an_armed_invalidation_is_consumed_by_the_next_local_call`).
+`regalloc`
   runs `uses_y` **twice** over the block (once for `y_last`'s max, once for `y_first`'s min) and
   `allocate_registers_with_labels` walks the block once for touches/writes, once for `written_set`, then
   once for the fill walk and once for the dirty walk.

@@ -551,27 +551,34 @@ fn probed_tail_call_module(name: &str, tail: Instr) -> (Module, Atom) {
     (module, name)
 }
 
-/// **The pin for the redundant exit spill.** A probed local tail call emits the seam probe's
-/// helper call — whose `SpillSite::Helper` spill at the instruction's own `pc` is the tier's
-/// mandatory root-set contract — and then the block exit. Both used to store the same dirty
-/// cached x-registers at the same `pc`; the exit now passes
-/// [`ExitSpill::Done`](super::emit::link) and stores nothing.
+/// **The pin for the probed local tail call's two spill sites.** The seam probe is now an
+/// inline reject-only verdict gate in front of the `jit_local_call` helper, so the shape has
+/// two exiting paths and each owns its own spill:
 ///
-/// The three assertions that matter, per shape:
+/// * the **helper** path (a `Served`/`Unknown` verdict, an armed invalidation, an absent
+///   table) spills at `SpillSite::Helper` before the call — mandatory, because the helper is
+///   the interpreter and reads `machine.x`;
+/// * the **accepted** path (a `Declined`/`Unnameable` verdict) writes nothing before the
+///   block's static exit, so the exit itself must spill — the gate never touched
+///   `machine.x`, and a cached register that is not stored here would be invisible to the
+///   callee it is about to enter.
 ///
-/// * the probe's helper spill is still there — **exactly one** `Helper` spill call, storing
-///   the block's one dirty register (so the surviving store is real, not vacuous);
-/// * the exit records **zero** spill calls and zero stores at `SpillSite::Exit` (the
-///   redundant sequence is gone);
+/// Both sites therefore record exactly one spill call storing the block's one dirty
+/// register, per shape. The assertions that matter:
+///
+/// * exactly one `Helper` spill call, storing the block's one dirty register (so the store
+///   is real, not vacuous);
+/// * exactly one `Exit` spill call with the same store count — the exit is reached by the
+///   accepted path, which has not spilled anything;
 /// * the instruction was lowered rather than deopted (`instr_instances`, no static deopt) —
 ///   so the pin cannot pass because the arm never ran.
 ///
-/// The exact byte saving is pinned in [`super::emit::link`]'s
-/// `a_done_exit_emits_exactly_the_spill_it_skips_less` (the `Required`-vs-`Done` length
-/// equality on all three exits); this test prints the shape's own emitted size, and the
-/// per-site store counts are its byte-level evidence (a store *is* one `mov`).
+/// The `Required`-vs-`Done` length relation on all three exits is pinned in
+/// [`super::emit::link`]'s `a_done_exit_emits_exactly_the_spill_it_skips_less`; this test
+/// prints the shape's own emitted size, and the per-site store counts are its byte-level
+/// evidence (a store *is* one `mov`).
 #[test]
-fn the_probed_local_call_records_one_spill_call_and_none_at_the_exit() {
+fn the_probed_local_call_spills_once_per_path() {
     for (variant, what, tail) in [
         (
             "CallOnly",
@@ -645,16 +652,17 @@ fn the_probed_local_call_records_one_spill_call_and_none_at_the_exit() {
             emitted.spill_stores_by_site,
         );
 
-        // … and the exit no longer stores the very same words a second time.
+        // … and the exit owns its own spill, because the gate's accepted path stored nothing.
         assert_eq!(
             emitted
                 .spill_calls_by_site
                 .get(&SpillSite::Exit)
                 .copied()
                 .unwrap_or(0),
-            0,
-            "{what}: the exit must emit no second spill — the probe already stored this pc's \
-             dirty set; spill calls by site: {:?}",
+            1,
+            "{what}: the exit must spill — the accepted gate path leaves `machine.x` untouched, \
+             so the block's dirty set is still only in its cache registers; spill calls by \
+             site: {:?}",
             emitted.spill_calls_by_site,
         );
         assert_eq!(
@@ -663,8 +671,9 @@ fn the_probed_local_call_records_one_spill_call_and_none_at_the_exit() {
                 .get(&SpillSite::Exit)
                 .copied()
                 .unwrap_or(0),
-            0,
-            "{what}: … and store no register at the exit site; spill stores by site: {:?}",
+            1,
+            "{what}: … and store the block's one dirty register at the exit site; spill stores \
+             by site: {:?}",
             emitted.spill_stores_by_site,
         );
 
@@ -733,6 +742,9 @@ fn the_slimmed_tail_exits_transfer_the_same_program_and_report_the_same_declined
         compiled: std::ptr::null(),
         current_code,
         reduce_hook: None,
+        verdict_slots: std::ptr::null(),
+        verdict_slots_end: std::ptr::null(),
+        verdict_pending: std::ptr::null(),
     };
 
     // (a) a frame the `deallocate` operand matches: the pop succeeds, so the answer is

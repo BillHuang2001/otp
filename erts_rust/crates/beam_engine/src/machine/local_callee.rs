@@ -142,7 +142,11 @@ pub(crate) enum Verdict {
 impl Verdict {
     /// The first discriminant that does **not** enter the callee in this machine — the
     /// upper bound of the range [`Verdict::enters_in_machine`] tests.
-    const FIRST_NOT_IN_MACHINE: u8 = Verdict::Served as u8;
+    ///
+    /// `pub(crate)` because the baseline tier's emitted local-call gate bakes it as an
+    /// immediate (`emit::block::emit_local_call_gate`) rather than repeating the value, so
+    /// the discriminants above stay the single source of the ordering that range depends on.
+    pub(crate) const FIRST_NOT_IN_MACHINE: u8 = Verdict::Served as u8;
     /// Does this verdict keep the caller's unchanged **in-machine jump** (so the host
     /// needs no dispatch and the seam answers `Ok(None)`)?
     ///
@@ -286,6 +290,37 @@ impl LocalVerdicts {
     #[cfg(test)]
     pub(crate) fn slots(&self) -> usize {
         self.table.len()
+    }
+
+    /// The table's **slot slab** as emitted code reads it: the base of the one-byte-
+    /// per-function verdict array and how many slots it holds.
+    ///
+    /// This is the shape a compiled block publishes into its runtime block so the
+    /// local-call gate can read a callee's verdict with one `movzx` instead of calling
+    /// [`Machine::local_call_seam`](crate::Machine) at all — and it is deliberately the
+    /// **slab**, not `&LocalVerdicts`:
+    ///
+    /// * a `LocalVerdicts` value lives inside a [`ModuleContext`](crate::machine::ModuleContext)
+    ///   behind an `Arc`, and the entry module's lives inline in `Machine::entry_verdicts`;
+    ///   the registry that holds the contexts (`Contexts::entries`) is a `Vec` that a
+    ///   **new module context registered mid-slice** can reallocate, which moves every
+    ///   `ModuleContext` *handle* (and would move any pointer into one);
+    /// * the slab is a `Box<[Cell<Verdict>]>` — one heap allocation whose address no
+    ///   `Vec` growth can change;
+    /// * the slab is only ever **replaced** (and so freed) by
+    ///   [`LocalVerdicts::for_module`]/[`LocalVerdicts::clear`], which run at run entry
+    ///   (`Machine::bind_entry_verdicts`) and at [`Machine::reset`](crate::Machine) —
+    ///   never mid-slice. That is exactly what makes a publication taken at every block
+    ///   entry a sound witness for the slice it runs in.
+    ///
+    /// A `Verdict` is `#[repr(u8)]` and a `Cell<Verdict>` is one byte with the same
+    /// layout, so a slot read as a `u8` is the discriminant [`Verdict::enters_in_machine`]
+    /// compares against — the same byte [`LocalVerdicts::enters_in_machine`] reads. The
+    /// accessor changes no behaviour and adds no second memo: the slab it exposes **is**
+    /// the memo, and every invalidation door above still writes through it.
+    #[inline]
+    pub(crate) fn byte_slots(&self) -> (*const u8, usize) {
+        (self.table.as_ptr() as *const u8, self.table.len())
     }
 
     /// Test-only: one identity derivation was spent on this table.

@@ -1543,3 +1543,370 @@ fn an_uncompilable_callee_declines_to_the_driver() {
         snapshot.driver_interp_steps,
     );
 }
+
+// ---------------------------------------------------------------------------
+// The inline verdict gate: whom it sends to the helper, and whom it does not
+// ---------------------------------------------------------------------------
+
+/// The local callees an instrumented host was actually **consulted** about, in order.
+type Consulted = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+/// A context that serves `h/0` of `seam_once` as a BIF and answers `erlang:'+'/2`, and
+/// records every `resolve_local_call` consultation.
+fn seam_counting_context(consulted: &Consulted) -> MinimalContext {
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(
+        |module: &str, function: &str, arity: u32, args: &[Eterm]| {
+            if module == "seam_once" && function == "h" && arity == 0 {
+                return Ok(make_small(42));
+            }
+            if module == "erlang" && function == "+" && arity == 2 && args.len() == 2 {
+                if !beam_term::is_small(args[0]) || !beam_term::is_small(args[1]) {
+                    return Err(beam_error_bad_arith());
+                }
+                let (a, b) = (
+                    beam_term::signed_value(args[0]),
+                    beam_term::signed_value(args[1]),
+                );
+                return Ok(make_small(a + b));
+            }
+            Err(crate::error::unsupported(&format!(
+                "bif {module}:{function}/{arity}"
+            )))
+        },
+    ));
+    let consulted = consulted.clone();
+    ctx.set_local_call_resolver(Box::new(move |module: &str, function: &str, arity: u32| {
+        consulted
+            .borrow_mut()
+            .push(format!("{module}:{function}/{arity}"));
+        Ok(module == "seam_once" && function == "h" && arity == 0)
+    }));
+    ctx
+}
+
+/// `f/0` calls `g/0` **twice** (the first call's verdict is `Unknown`, the second's
+/// `Declined`) and `h/0` once (a callee the host **serves** as a BIF), summing the three
+/// results with `erlang:'+'/2`: `7 + 42 + 7`.
+///
+/// `g`'s and `h`'s bodies both write a sentinel into `x(0)` (`7` and `99`), so a wrong
+/// transfer is visible in the value.
+fn seam_once_module() -> Module {
+    build_module(
+        "seam_once",
+        &[("erlang", "+", 2)],
+        vec![
+            (
+                "f",
+                0,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Label(Label(2)),
+                    Instr::Allocate {
+                        stack_need: beam_loader::HeapNeed::Words(3),
+                        live: 0,
+                    },
+                    // y(0) = g()
+                    Instr::Call {
+                        arity: 0,
+                        target: Label(5),
+                    },
+                    Instr::Move {
+                        src: Operand::X(0),
+                        dst: Operand::Y(0),
+                    },
+                    // y(1) = h()
+                    Instr::Call {
+                        arity: 0,
+                        target: Label(7),
+                    },
+                    Instr::Move {
+                        src: Operand::X(0),
+                        dst: Operand::Y(1),
+                    },
+                    // y(2) = g()
+                    Instr::Call {
+                        arity: 0,
+                        target: Label(5),
+                    },
+                    Instr::Move {
+                        src: Operand::X(0),
+                        dst: Operand::Y(2),
+                    },
+                    Instr::Move {
+                        src: Operand::Y(0),
+                        dst: Operand::X(0),
+                    },
+                    Instr::Move {
+                        src: Operand::Y(1),
+                        dst: Operand::X(1),
+                    },
+                    Instr::Move {
+                        src: Operand::Y(2),
+                        dst: Operand::X(2),
+                    },
+                    Instr::GcBif {
+                        arity: 2,
+                        bif: ImportRef(0),
+                        fail: NO_FAIL,
+                        live: 3,
+                        args: vec![Operand::X(0), Operand::X(1)],
+                        dst: Operand::X(0),
+                    },
+                    Instr::GcBif {
+                        arity: 2,
+                        bif: ImportRef(0),
+                        fail: NO_FAIL,
+                        live: 3,
+                        args: vec![Operand::X(0), Operand::X(2)],
+                        dst: Operand::X(0),
+                    },
+                    Instr::DeallocateReturn(3),
+                ],
+            ),
+            (
+                "g",
+                0,
+                vec![
+                    Instr::Label(Label(5)),
+                    Instr::Move {
+                        src: Operand::Integer(7),
+                        dst: Operand::X(0),
+                    },
+                    Instr::Return,
+                ],
+            ),
+            (
+                "h",
+                0,
+                vec![
+                    Instr::Label(Label(7)),
+                    Instr::Move {
+                        src: Operand::Integer(99),
+                        dst: Operand::X(0),
+                    },
+                    Instr::Return,
+                ],
+            ),
+        ],
+        &[("f", 0, Label(2))],
+    )
+}
+
+/// **A fresh (`Unknown`) callee and a served callee both reach the seam; only a
+/// memoised `Declined` one skips it.**
+///
+/// The inline gate reads the machine's verdict byte directly, so the two claims it
+/// could break are pinned by *observing the host* rather than by counting emitted
+/// instructions:
+///
+/// * the run's value is `7 + 42 + 7 = 56` on **both** tiers — the third call, whose
+///   verdict is now `Declined`, really transfers into `g` (and `h`'s body, whose
+///   `x(0) = 99` would change the sum, never runs);
+/// * the host was consulted exactly **once per distinct callee** (`g`, then `h`) — so
+///   the first `g` call went through the helper and the third did not, which is the
+///   whole of the gate's contract;
+/// * the memo the gate reads is left in exactly the state the seam put it in
+///   (`Declined` for `g`, `Served` for `h`), i.e. the gate never writes it.
+#[test]
+fn a_fresh_callee_and_a_served_callee_reach_the_seam_and_a_declined_one_does_not() {
+    let module = seam_once_module();
+    let name = export_atom(&module, "f");
+
+    let consulted = Consulted::default();
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = seam_counting_context(&consulted);
+    let interpreted = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect("the interpreter run completes");
+    assert_eq!(
+        interpreted,
+        RunOutcome::Returned(make_small(56)),
+        "the interpreter's own seam sees the same three callees"
+    );
+    drop(interpreter_ctx);
+
+    let consulted = Consulted::default();
+    let mut baseline = Machine::new();
+    let mut baseline_ctx = seam_counting_context(&consulted);
+    let native = baseline
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut baseline_ctx,
+            Tier::BaselineJit,
+        )
+        .expect("the baseline run completes");
+    assert_eq!(
+        native,
+        RunOutcome::Returned(make_small(56)),
+        "one transferred g(), one served h() and one transferred g() again"
+    );
+    assert_eq!(
+        consulted.borrow().as_slice(),
+        ["seam_once:g/0", "seam_once:h/0"],
+        "the helper ran for every verdict below `Declined`, and only for those"
+    );
+    drop(baseline_ctx);
+
+    let table = baseline.verdict_table().expect("the run made a verdict table");
+    let labels = crate::interpreter::build_label_map(&module);
+    let (g_func, _) = labels.resolve(Label(5)).expect("label 5 resolves");
+    let (h_func, _) = labels.resolve(Label(7)).expect("label 7 resolves");
+    assert_eq!(
+        table.get(g_func),
+        crate::machine::Verdict::Declined,
+        "the seam's own `Declined` answer is what the gate reads on the third call"
+    );
+    assert_eq!(
+        table.get(h_func),
+        crate::machine::Verdict::Served,
+        "a served callee keeps the `Served` verdict the gate rejects on"
+    );
+}
+
+/// A context that serves `served_local_call:g/0` as a BIF and records every consultation —
+/// the `served_call_context` shape with the instrumentation [`an_armed_invalidation_is_consumed_by_the_next_local_call`]
+/// needs.
+fn served_counting_context(consulted: &Consulted) -> MinimalContext {
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(
+        |module: &str, function: &str, arity: u32, _args: &[Eterm]| {
+            if module == "served_local_call" && function == "g" && arity == 0 {
+                return Ok(make_small(42));
+            }
+            Err(crate::error::unsupported(&format!(
+                "bif {module}:{function}/{arity}"
+            )))
+        },
+    ));
+    let consulted = consulted.clone();
+    ctx.set_local_call_resolver(Box::new(move |module: &str, function: &str, arity: u32| {
+        consulted
+            .borrow_mut()
+            .push(format!("{module}:{function}/{arity}"));
+        Ok(module == "served_local_call" && function == "g" && arity == 0)
+    }));
+    ctx
+}
+
+/// A [`MinimalContext`] behind a **budget** that refuses its first charge past it with
+/// its own typed error — used only to park the machine at `f`'s entry, before any
+/// instruction runs, so a test can change machine state and then resume.
+struct ParkingContext {
+    inner: MinimalContext,
+    budget: Option<u32>,
+    charges: u32,
+}
+
+impl ExecutionContext for ParkingContext {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+
+    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        self.inner.resolve_local_call(module, function, arity)
+    }
+
+    fn reduce(&mut self, _n: u32) -> Result<()> {
+        self.charges += 1;
+        if let Some(budget) = self.budget {
+            if self.charges > budget {
+                return Err(crate::error::unsupported(PREEMPTION));
+            }
+        }
+        Ok(())
+    }
+
+    fn wants_reduce(&self) -> bool {
+        true
+    }
+}
+
+/// **An armed invalidation is consumed by the next local call, so the gate cannot ride
+/// a stale verdict.**
+///
+/// The flag is what `erlang:load_nif/2` sets when the answer set changes; only a
+/// `&mut` path may consume it, so the gate **rejects** on a non-zero byte and the
+/// helper's seam clears it. The pin is end to end: park the machine at `f`'s entry
+/// (nothing has run), arm the flag, resume — the run's local call must go through the
+/// helper (the host is consulted, the served value `42` comes back, and the flag is
+/// clear afterwards). A gate that accepted the fast path with the flag armed would
+/// leave it set past the end of the run.
+#[test]
+fn an_armed_invalidation_is_consumed_by_the_next_local_call() {
+    let module = served_local_call_module();
+    let name = export_atom(&module, "f");
+
+    let consulted = Consulted::default();
+    let mut machine = Machine::new();
+    let mut ctx = ParkingContext {
+        inner: served_counting_context(&consulted),
+        budget: Some(0),
+        charges: 0,
+    };
+    let parked = machine.run_export_outcome_with_tier(
+        &module,
+        name,
+        0,
+        &[],
+        &mut ctx,
+        Tier::BaselineJit,
+    );
+    assert!(parked.is_err(), "a zero budget refuses its first charge");
+    assert!(
+        consulted.borrow().is_empty(),
+        "the park is ahead of every instruction, so no callee was consulted yet"
+    );
+
+    machine.local_call_invalidation_pending.set(true);
+    ctx.budget = None;
+
+    let (func, pc) = machine
+        .current_code()
+        .expect("the park published the instruction it refused to run");
+    let resumed = machine
+        .resume_outcome_with_tier(&module, func, pc, &mut ctx, Tier::BaselineJit)
+        .expect("the resumed slice completes");
+    assert_eq!(
+        resumed,
+        RunOutcome::Returned(make_small(42)),
+        "the resumed slice still takes the seam and serves the callee"
+    );
+    assert_eq!(
+        consulted.borrow().as_slice(),
+        ["served_local_call:g/0"],
+        "the seam ran exactly once for the one local call"
+    );
+    assert!(
+        !machine.local_call_invalidation_pending.get(),
+        "the seam consumed the armed invalidation; the gate must never ride a stale verdict"
+    );
+}

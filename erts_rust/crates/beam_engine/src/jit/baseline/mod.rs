@@ -234,6 +234,11 @@ mod cross_tests;
 #[cfg(test)]
 #[path = "tail_exit_tests.rs"]
 mod tail_exit_tests;
+// The inline local-call verdict gate's executed pins: which arm each published verdict
+// state reaches, and that the gate writes no machine state on either path.
+#[cfg(test)]
+#[path = "emit/local_call_gate_tests.rs"]
+mod local_call_gate_tests;
 #[cfg(test)]
 #[path = "y_operand_tests.rs"]
 mod y_operand_tests;
@@ -728,6 +733,20 @@ fn enter_compiled_cached(
         (*rt).tables = compiled.entry_tables(func, cached);
         (*rt).compiled = compiled as *const CompiledModule;
     }
+    // Publish the executing module context's local-call verdict slab and the pending
+    // invalidation flag (`JitRuntime::refresh_verdicts`), so a block's local-call gate can
+    // read a callee's verdict with one load instead of calling the seam helper. This is the
+    // right site and the right cadence: it runs once per **block entry** (O(1), two pointer
+    // stores beside the two above), and every way the table can change is separated from it
+    // by at least one entry — `Machine::reset` and `bind_entry_verdicts` (which *replace*
+    // the slab) run before the driver call, `switch_into` switches the machine's context
+    // before the driver re-enters native code here, and the verdict *bytes* themselves are
+    // live, which is what the gate must observe.
+    //
+    // SAFETY: `rt` is the live driver-owned runtime block and `(*rt).machine` points at the
+    // driver's live `Machine`; no block is running here (the driver is between entries), so
+    // `&mut *rt` aliases nothing, and the method only writes three Rust-side pointer fields.
+    unsafe { (*rt).refresh_verdicts() };
     // Structural counter: the lookup is entered (the register-file guard passed).
     #[cfg(test)]
     counters::record_block_entered();
@@ -1208,6 +1227,9 @@ fn drive(
         compiled: std::ptr::null(),
         current_code,
         reduce_hook,
+        verdict_slots: std::ptr::null(),
+        verdict_slots_end: std::ptr::null(),
+        verdict_pending: std::ptr::null(),
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run
@@ -1219,6 +1241,11 @@ fn drive(
     // (`Machine::switch_context` is called from `Machine::drive` and `switch_into`
     // only), so every rebind of `rt.module` is a driver site.
     rt.refresh_literals();
+    // Publish the local-call verdict slab and the invalidation flag's address (see
+    // `JitRuntime::refresh_verdicts`): the per-block-entry publication re-does this, but a
+    // runtime built for a resume in a registered context must already name that context's
+    // table rather than nulls.
+    rt.refresh_verdicts();
 
     loop {
         // ── The block-entry reduction charge: the native tier's pre-emption point ──

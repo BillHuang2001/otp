@@ -108,6 +108,9 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         // of these suites latched `reduce_on`) goes through the `dyn` door exactly as it
         // always did (`runtime::JitRuntime::charge_reduce`'s fallback).
         reduce_hook: None,
+        verdict_slots: std::ptr::null(),
+        verdict_slots_end: std::ptr::null(),
+        verdict_pending: std::ptr::null(),
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
@@ -2817,6 +2820,9 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
         // of these suites latched `reduce_on`) goes through the `dyn` door exactly as it
         // always did (`runtime::JitRuntime::charge_reduce`'s fallback).
         reduce_hook: None,
+        verdict_slots: std::ptr::null(),
+        verdict_slots_end: std::ptr::null(),
+        verdict_pending: std::ptr::null(),
     };
     assert_eq!(
         enter_compiled(&eager, &module, &mut rt as *mut JitRuntime<'_>, 0, f_pc),
@@ -3222,6 +3228,9 @@ fn run_ext_call(
         // of these suites latched `reduce_on`) goes through the `dyn` door exactly as it
         // always did (`runtime::JitRuntime::charge_reduce`'s fallback).
         reduce_hook: None,
+        verdict_slots: std::ptr::null(),
+        verdict_slots_end: std::ptr::null(),
+        verdict_pending: std::ptr::null(),
     };
     // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
     let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);
