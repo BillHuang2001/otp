@@ -44,21 +44,21 @@ use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 use crate::chunk::record::{RawRecord, RawRecordDefault};
 use crate::chunk::Chunks;
-use crate::decoded::DecodedTerm;
 use crate::decode::RawInstr;
+use crate::decoded::DecodedTerm;
 use crate::error::bad_file;
 use crate::ir::{Export, FunDescriptor, Import, Module, RecordDefinition, RecordField};
 use crate::labels::SharedLabelMap;
 use crate::literal::LiteralArea;
 use crate::operand::{Label, Operand};
 
+pub mod fuse;
 mod group;
 mod instr;
 mod validate;
-pub mod fuse;
 
-pub use group::{build_blocks, group_functions};
 use group::group_functions_checked;
+pub use group::{build_blocks, group_functions};
 
 /// Assembles the IR [`Module`] from the parsed chunks and the decoded instructions.
 ///
@@ -149,8 +149,12 @@ pub fn build_module(
     // The `Recs` native-record definitions: wire atom indices become interned atoms,
     // and a bignum field default is appended to the *same* synthesized-literal set as a
     // wide instruction operand, so it is materialized by the machinery below.
-    let pending_records =
-        build_records(&chunks.records, &atoms, chunks.literals.len(), &mut synthesized)?;
+    let pending_records = build_records(
+        &chunks.records,
+        &atoms,
+        chunks.literals.len(),
+        &mut synthesized,
+    )?;
 
     // The `Code` header's declared label/function counts and the `Line`/`ImpT` tables
     // bound what the assembled code may reference (`jit/asm_load.c`): a defined label must
@@ -186,7 +190,9 @@ pub fn build_module(
             return Err(bad_file("fun descriptor label is zero"));
         }
         if !validate::is_defined_label(&functions, label) {
-            return Err(bad_file("fun descriptor label is not a label in the module"));
+            return Err(bad_file(
+                "fun descriptor label is not a label in the module",
+            ));
         }
         if !fun_labels.insert(raw.label) {
             return Err(bad_file("lambda already defined for label"));
@@ -230,10 +236,8 @@ pub fn build_module(
     // (`beam_asm.erl:307-310`); decode it into a real term through the module's own
     // atom table (so its keys share the module's atom identity) — the value
     // `module_info(attributes)` serves. A malformed payload is a typed error.
-    let attribute_table = crate::attributes::AttributeTable::decode(
-        chunks.attributes.as_deref(),
-        &mut atom_table,
-    )?;
+    let attribute_table =
+        crate::attributes::AttributeTable::decode(chunks.attributes.as_deref(), &mut atom_table)?;
 
     // The `CInf` chunk is `term_to_binary([{version,?COMPILER_VSN}|Compile])`
     // (`beam_asm.erl:236,309`) — the value `module_info(compile)` serves — and the `Meta`
@@ -1874,7 +1878,10 @@ mod tests {
 
         let fun = module.fun(0).unwrap();
         assert_eq!(module.atom_name(fun.function), Some("f"));
-        assert_eq!((fun.arity, fun.label, fun.index, fun.num_free, fun.uniq), (1, Label(2), 0, 3, 7));
+        assert_eq!(
+            (fun.arity, fun.label, fun.index, fun.num_free, fun.uniq),
+            (1, Label(2), 0, 3, 7)
+        );
         assert_eq!(module.fun(1), None);
     }
 
@@ -2035,12 +2042,17 @@ mod tests {
             .expect("rewrite");
         assert_eq!(
             rewritten[0].operands.to_vec(),
-            vec![Operand::list(vec![Operand::Integer(1), Operand::Literal(0)])]
+            vec![Operand::list(vec![
+                Operand::Integer(1),
+                Operand::Literal(0)
+            ])]
         );
         // `SMALL_BIG_EXT`, a 9-byte magnitude, sign 1 (`negative`), all `FF`.
         assert_eq!(
             synthesized,
-            vec![vec![131u8, 110, 9, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255]]
+            vec![vec![
+                131u8, 110, 9, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255
+            ]]
         );
     }
 
@@ -2064,13 +2076,19 @@ mod tests {
 
         // Index 1 is past the file's single literal.
         let mut bad = minimal_stream();
-        bad.insert(3, raw(Opcode::r#move, vec![Operand::Literal(1), Operand::X(1)]));
+        bad.insert(
+            3,
+            raw(Opcode::r#move, vec![Operand::Literal(1), Operand::X(1)]),
+        );
         let err = build_module(&chunks, &bad, beam_term::AtomTable::new()).unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
 
         // Control: index 0 is defined, and resolves to the file's `0`.
         let mut ok = minimal_stream();
-        ok.insert(3, raw(Opcode::r#move, vec![Operand::Literal(0), Operand::X(1)]));
+        ok.insert(
+            3,
+            raw(Opcode::r#move, vec![Operand::Literal(0), Operand::X(1)]),
+        );
         let module = build_module(&chunks, &ok, beam_term::AtomTable::new()).unwrap();
         assert_eq!(module.literals().len(), 1);
         assert!(module.literal(0).is_some());

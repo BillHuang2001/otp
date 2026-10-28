@@ -194,13 +194,15 @@ fn group(instrs: &[RawInstr], check: &mut Option<Check<'_, '_>>) -> Result<Vec<F
                     } => (module, function, arity),
                     _ => return Err(bad_file("func_info does not lower to func_info")),
                 };
-                let (func_label, func_label_idx) = last_label
-                    .ok_or_else(|| bad_file("func_info without a preceding label"))?;
+                let (func_label, func_label_idx) =
+                    last_label.ok_or_else(|| bad_file("func_info without a preceding label"))?;
                 // Only line markers may sit between the function label and the
                 // `func_info` that defines the function (`beam_file.c:2502-2589`).
                 for between in &instrs[func_label_idx + 1..idx] {
                     if !matches!(lower_instr(between)?, Instr::Line(_)) {
-                        return Err(bad_file("func_info is not immediately preceded by its label"));
+                        return Err(bad_file(
+                            "func_info is not immediately preceded by its label",
+                        ));
                     }
                 }
                 // The entry label follows `func_info` immediately.

@@ -40,8 +40,8 @@
 //! `Vec<Operand>` and its layout is pinned), and lowering materializes a `Vec` only
 //! for the variants that need one.
 
-use core::ops::{Deref, DerefMut};
 use crate::operand::Operand;
+use core::ops::{Deref, DerefMut};
 
 /// How many operands an [`RawOperands`] holds without a heap allocation.
 ///
