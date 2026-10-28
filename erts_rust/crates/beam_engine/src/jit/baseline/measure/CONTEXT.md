@@ -93,6 +93,23 @@ The reference point for an entry- or call-path change is `list_walk`'s **instruc
 - **The in-crate decomposition harness** (`foreign_bstr_to_lower_decomposition`, release) reads `instr_per_call = 438.00`, `local_call_requests_per_call = 61.00`, `driver_round_trips_per_call = 3.00` — the deterministic figures to quote; its ns/call is both N- and load-dependent, so a cross-session absolute is meaningless. What remains on this workload is **not** call setup: 438 IR instructions for a 30-byte lowercase (≈14.6 per byte) is per-instruction execution cost, which is what the two `bs_*` inline sets below attack.
 - **Cross-runtime ratios belong to `../../../../../../tools/bench/RESULTS.md`** — read them there, never a copy here. Both sides scale with host load, so the ratio is the comparable figure, an absolute ns is a same-window reading only, and `case_list_walk_elements` (100 M sys / 50 M rust) is the contention-immune anchor. The tier-vs-interpreter per-process effect reads 1.0–1.3× (`../../../../MEASURED.md`, N=30 interleaved sampling), and the untouched interpreter column has been seen to drift ~29 % across one 7-run set: quote a min-over-N and compare only figures from the same run set.
 
+### `list_walk`'s deterministic per-call counters (baseline tier)
+`BENCH_TIER=baseline erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib -- list_walk_decomposition --ignored --nocapture --test-threads=1`
+drives the in-crate `../../../bench/list_walk.rs` harness (20 walks of 1 000 elements per call, 100
+calls, the fixture `erlc`-compiled per run) and ends with the `baseline-census` block.
+Those counters are deterministic, so they are the pair to quote for any entry/call-path change:
+`instr_per_call` **169 418.00**, `local_call_requests_per_call` **3.00**,
+`driver_round_trips_per_call` **2.00**, `step_one_per_call` **0.00**, `step_ext_per_call` **0.00**,
+`driver_interp_steps_per_call` **0.00**, `in_block_calls_per_call` **21.00**,
+`in_block_call_declines_per_call` **0.00**, `block_entry_lookups` **200** (hits 200, misses 0),
+`deopt_count` **empty** (`Allocate` included: the frame push is a natively-called helper, never a
+deopt), plus `instr_per_call`-normalised `rooted_calls_per_call` **1 000.00** and
+`bif_calls_per_call` **0.00** (the small-int `+`/`-` are inlined by this tier).
+They read **identically** at `e6ba57dff9` and at `6be815d640`; only the `ns` rows differ between the
+two runs (2 % apart at 1-min load 27–64, i.e. below this host's resolution — not evidence).
+`block_entry_misses = 0` and an empty `deopt_count` are what make the ns rows safe to ignore: the
+tier's work per call is the same on both sides, so no timing comparison is needed to compare them.
+
 ## The `foreign` byte-loop kernels: where the tier's cycles go
 `tools/bench`'s four `foreign` cases (`cowboy_bstr:to_lower/1`, `cowboy_bstr:capitalize_token/1`, `emqx_base62:encode/1`, `emqx_base62:decode/1`) are **BIF-free compiled BEAM code**, not host dispatch: the decomposition harness reads `bif_calls_per_call = 0.00` for both Cowboy cases (`rooted_calls_per_call = 2.00`, `local_call_requests_per_call` 2–3, `driver_round_trips_per_call = 3.00`, `step_one`/`step_ext` `0`, `deopt_count` empty, `block_entry_misses = 0`), so the ratio is the **bitstring family's per-instruction cost** and any "BIF-call gap" framing of these four cases is wrong.
 Measured on the runtime path (`to_lower/1` at N = 400 000, `cpu_core/cycles/u -F 2000`, `taskset -c 3`, self time) the prepared-program table already **hits**: `bitstrings::exec` 21.4 %, `matching::exec` 16.4 %, `exec_other` 7.6 %, `create::exec::{closure}` 4.6 %, `jit_bitstr` 4.1 %, and **no `drop_glue` rows at all** — the cost is inside the family, spread over ~20 symbols with no single >10 % hotspot (`exec`/`exec_other`/`create::exec` ≈41 % of self time on `to_lower`).
