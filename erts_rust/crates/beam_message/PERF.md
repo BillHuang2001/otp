@@ -63,51 +63,53 @@ The payload is the exact `copy_bound` 5-key map (**70 words / 27 objects / 21 co
 outer tuple only: a literal-area subterm is shared by identity). Reproduction:
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message --test traversals -- --nocapture`.
 
-**The per-shape table** (this pass, `/proc/loadavg` 17.02 → 17.02, dev profile, identical across all 8 windows/row):
+**The per-shape table** (this pass, dev profile, identical across all 8 windows/row; the block/byte columns are the
+deterministic ones, so they are what a reader quotes — per-send wall clock is §4):
 
 ```
-shape                       src_objs src_words   w_objs  w_words residency   blocks       bytes top-4 alloc sizes               ns_min
-literal {From,Lit} (fits)         28       73        1        3   on-heap        1         480 480-487B:1                         421
-heap twin {From,Map} (fits)       28       73       28       73   on-heap        3         672 64-71B:1 128-135B:1 480-487B:1       737
-heap twin, 1 word short           28       73        0        0   refused        2         192 64-71B:1 128-135B:1               1688
-heap twin, full heap (frag)       28       73       28       73  fragment        5        1312 32-39B:1 64-71B:1 128-135B:1 480-487B:1      4954
-ets_copy 233-w nursery            28       73        0        0   refused        2         192 64-71B:1 128-135B:1               1551
+shape                       src_objs src_words   w_objs  w_words residency   blocks       bytes top-4 alloc sizes
+literal {From,Lit} (fits)         28       73        1        3   on-heap        1         480 480-487B:1
+heap twin {From,Map} (fits)       28       73       28       73   on-heap        1         480 480-487B:1
+heap twin, 1 word short           28       73        0        0   refused        0           0 -
+heap twin, full heap (frag)       28       73       28       73  fragment        3        1120 32-39B:1 480-487B:1 608-615B:1
+ets_copy 233-w nursery            28       73        0        0   refused        0           0 -
 ```
 
 **Reading:**
-
-* **Neither `fits` row reaches the pricing walk**: one copy traversal (`try_copy_fast`) and no preflight at all.
-  Their blocks are the copy's fix-up `Vec<Fixup>` ladder (64 B, 128 B) plus the enqueued message's queue buffer
-  (480 B, once per mailbox); the literal row writes no child, so it has no fix-up allocation and pays the queue
-  buffer alone.
-  The per-row histograms the same run prints are `1 block / 480 B` (`480-487B:1`) for the literal row and
-  `3 / 672 B` (`64-71B:1 128-135B:1 480-487B:1`) for the heap twin.
-* **A refusal is 2 blocks / 192 B, all of it the copy's own trial fix-up `Vec<Fixup>`** — the same ladder a fit's
-  copy half pays (`64-71B:1 128-135B:1`).
-  The pricing walk runs on the calling thread's retained `SizingScratch` (`src/preflight.rs`) and **allocates
-  nothing when warm**, and it writes no term, so the abandoned trial still leaves `used() == peak_used()`.
+* **The copy itself allocates nothing.** Every `fits` and `refused` row above runs the copy on the calling
+  thread's **retained** fix-up worklist (`src/copy.rs`'s `WARM_WORKLIST`, a `Vec<Fixup>` that each copy
+  clears — never drops — on entry and leaves empty at return), so the per-call `Vec` ladder (`64 B` +
+  `128 B`) a copy used to pay in both `fits` rows and in every refusal is gone.
+  The single block a `fits` row shows is the **enqueued message's queue buffer** (480 B, once per mailbox),
+  which §3 attributes to the enqueue half, not to the copy.
+* **A refusal is 0 blocks / 0 B**: the abandoned trial and the pricing walk both run on warm thread-local
+  scratch (`src/copy.rs`, `src/preflight.rs`) and neither writes a term, so `used() == peak_used()` still
+  holds and nothing is allocated.
   The walk's count is exact and the typed `Alloc(Message)` refusal carries it.
-* **The fragment row adds exactly three allocations on top of that 192 B**: the fragment's `roots` vector
-  (32 B = 4 × `Eterm`), the fragment's backing region (608 B = the 73-word payload plus the fragment region's own
-  header), and the queue's first buffer (480 B) — 192 + 32 + 608 + 480 = **1 312 B**
-  (`32-39B:1 64-71B:1 128-135B:1 480-487B:1 608-615B:1`), with nothing re-copied and no second sizing walk.
+* **The fragment row adds exactly three allocations**: the fragment's `roots` vector (32 B = 4 x `Eterm`),
+  the fragment's backing region (608 B = the 73-word payload plus the region's own header) and the queue's
+  first buffer (480 B) — 32 + 608 + 480 = **1 120 B**, with nothing re-copied and no second sizing walk.
+* **The `ns_min` column is gone.** It was a single-shot wall clock on a shared host — the same shape moved by
+  2x between runs — so it was never a result; §4 is the wall-clock record and this table is structural.
 * Deterministic, not timing: every counter window is asserted **identical** across `REPEATS = 8` runs and the
   histogram is asserted to sum to the block count, so a stray concurrent allocation fails the run instead of
   inflating a published figure.
-
-**The pricing walk is allocation-free once the thread's scratch is warm** — `tests/traversals.rs`,
-`report_a_warm_preflight_allocates_nothing`, same run, `/proc/loadavg` 17.02:
+**The pricing walk and the copy worklist are both allocation-free once the thread is warm** —
+`tests/traversals.rs`, `report_a_warm_preflight_allocates_nothing` / `report_a_warm_copy_allocates_nothing`:
 
 ```
-cold (fresh scratch)     9 blocks   1452 B  64-71B:2 128-135B:2 48-55B:1 88-95B:1 160-167B:1 256-263B:1
-warm (retained)          2 blocks    192 B  64-71B:1 128-135B:1
-cold again (shrunk)      9 blocks   1452 B  (identical to the cold row)
+                                    blocks  bytes  histogram
+pricing walk, cold (fresh scratch)       9   1452  64-71B:2 128-135B:2 48-55B:1 88-95B:1 160-167B:1 256-263B:1
+pricing walk, warm (retained)            0      0  -
+pricing walk, cold again (shrunk)        9   1452  (identical to the cold row)
+
+copy worklist, cold (fresh worklist)     2    192  64-71B:1 128-135B:1
+copy worklist, warm (retained)           0      0  -
+copy worklist, cold again (shrunk)       2    192  (identical to the cold row)
 ```
-
-The walk's own **7 blocks / 1 260 B** are gone once the thread's scratch is warm, and
-`beam_message::shrink_warm_scratch()` (then re-growing) reproduces the cold figure exactly — i.e. the win is the
-retained scratch, and a host that lets one thread's scratch grow pays 192 B per refusal rather than 1 452 B.
-
+`beam_message::shrink_warm_scratch()` / `shrink_warm_worklist()` (then re-growing) reproduce the cold figures
+exactly, so the win is the retained buffer: a host that lets one thread's buffers grow pays **0 B** per copy
+rather than 192 B, and 0 B rather than 1 452 B per refusal.
 **Traversals per send shape:**
 
 | shape | copy trails | pricing trails | what happens |
@@ -142,28 +144,28 @@ asserted — every destination starts with a **fully empty** off-heap table, whi
 A destination whose off-heap table is non-empty is the one case this figure would understate.
 
 Allocations per message — the counting `#[global_allocator]`, `allocs / bytes`:
-
-| shape | `copy_struct` | `send` (warm queue) | enqueue half = warm send − copy | `send` (cold queue) |
+| shape | `copy_struct` | `send` (warm queue) | enqueue half = warm send - copy | `send` (cold queue) |
 |---|---|---|---|---|
 | small tuple | 0 / 0 B | 0 / 0 B | **0 / 0 B** | 1 / 480 B |
-| 10-int list | 1 / 64 B | 1 / 64 B | **0 / 0 B** | 2 / 544 B |
-| HAMT map (64 keys) | 4 / 960 B | 4 / 960 B | **0 / 0 B** | 5 / 1 440 B |
-| **`send_recv` payload** | **2 / 192 B** | **2 / 192 B** | **0 / 0 B** | 3 / 672 B |
-
+| 10-int list | 0 / 0 B | 0 / 0 B | **0 / 0 B** | 1 / 480 B |
+| HAMT map (64 keys) | 0 / 0 B | 0 / 0 B | **0 / 0 B** | 1 / 480 B |
+| **`send_recv` payload** | **0 / 0 B** | **0 / 0 B** | **0 / 0 B** | 1 / 480 B |
 **Reading:**
-
-* **The enqueue half allocates nothing**: warm `send` minus the bare copy is `0` allocations / `0` bytes for every
-  shape, so the `Message` build and the FIFO push issue no allocation at all.
-  The cold-queue `send` is exactly one allocation larger than the copy (480 B, identical for every shape) — that is the
-  queue's **first buffer**, paid once per mailbox, never per message.
-* **The copy's allocations are the fix-up worklist `Vec<Fixup>` and nothing else** (§8). A `Fixup` is 16 B
-  (`(*mut Eterm, Eterm)`), so the event counts are the `Vec`'s capacity doublings: 0 for the small tuple (no non-shared
-  children), 1 × 64 B (cap 4) for the 10-int list, 2 × 64 + 128 B = **192 B (cap 4 → 8) for the `send_recv` payload**,
-  4 × 64 + 128 + 256 + 512 B = 960 B (cap 4 → 32) for the 64-key HAMT.
-* The payload's per-message cost is therefore **2 blocks / 192 B, all of it the worklist**; it moves only if the worklist
-  does, not with load, profile or shape-independent tuning.
-* The 1 120 B touched for the payload is 70 words: 42 cons-cell words (21 × 2, header-less) + 22 headed payload words +
-  6 header words; header overhead is 8.6 %, max object 8 words.
+* **The copy allocates nothing, for every shape.** The fix-up worklist is a `Vec<Fixup>` **retained per thread**
+  (`src/copy.rs`'s `WARM_WORKLIST`, cleared on entry, empty at return, 16 B per entry) and the HAMT shape — the widest
+  worklist in the census — no longer pays its capacity ladder either (§8).
+  `beam_message::shrink_warm_worklist()` hands a high-water-mark buffer back and changes no result.
+* **The enqueue half allocates nothing** either: warm `send` minus the bare copy is `0` allocations / `0` bytes for
+  every shape, so the `Message` build and the FIFO push issue no allocation at all.
+  The cold-queue `send` is exactly **one** allocation, the same 480 B for every shape — the queue's **first buffer**,
+  paid once per mailbox and never per message.
+* So a message costs **0 blocks** on a warm path and 480 B on the first send into a fresh mailbox; nothing in the
+  census moves with load, profile or shape-independent tuning.
+* **The copy-vs-enqueue time split in that table is a single-shot `Instant` reading on a shared host** (load 310 at
+  the time of the run above, which is why `HAMT map`'s "enqueue" column is even negative). Never quote those ns — the
+  deterministic columns and §4's paired figures are the record.
+The 1 120 B touched for the payload is 70 words: 42 cons-cell words (21 x 2, header-less) + 22 headed payload words +
+6 header words; header overhead is 8.6 %, max object 8 words.
 
 ## 4. Wall clock — release (the shipping profile)
 
@@ -395,22 +397,51 @@ Every deterministic companion counter is identical between and within sides (`gc
   The session is not comparable in absolute terms: quote the paired ratio and the re-measured `sys` denominator,
   and flag the gap rather than explaining it.
 
-## 8. The fix-up worklist is a `Vec<Fixup>` — and that is the right call in release
-The copy loop's per-call worklist is `Vec<Fixup>` (`src/copy.rs`), 16 B per entry, and §3 shows it is the **only**
-per-message allocation: 0 / 1 / 2 / 4 allocation events for the four shapes.
-
-An allocation-avoiding replacement (a `WorkStack`: `[MaybeUninit<Fixup>; WORK_INLINE]` inline plus a `Vec` spill) removes
-those events deterministically (counters: **0** per `copy_struct` on every shape but the 64-key HAMT) and does **not**
-pay for itself.
-Measured in **release** (`opt-level = 3`, `lto = "thin"`, `taskset -c 3`, 6 interleaved pairs, `/proc/loadavg` 17–23,
-`WORK_INLINE = 8`): the `send_recv` payload was **neutral** (best-of-20 000 **187 ns vs 186 ns**) and the 10-int list was
-**17 % slower** (best 90 ns vs 76 ns).
-In **dev** (`opt-level = 1`) the regression is larger and visible on every list-shaped copy (deep list 2000 cons cells
-+25 %, 64-key HAMT +11 %) and is a codegen effect of the inlined `pop` round-tripping the fix-up through a stack slot,
-not frame size or `MaybeUninit` initialisation (both variants measured).
-The `Vec<Fixup>` therefore ships: it is non-regressive in the shipping profile, and the allocation is not where the
-per-send cost is.
-
+### 7.4 This pass — the retained worklist and the one-pass cons chain
+Two release `beam_rt` binaries from one tree, differing **only** in `beam_message`'s copy path (the baseline kept as
+`$TMPDIR/beam_rt-before`), driven by the same `bench` binary via `$BEAM_RT`. Two instruments, because the host was
+unusable for wall clock through most of the session (1-min load ranged 23 -> 223; every run below is `taskset -c 3`).
+**Deterministic retired instructions per operation** (`perf stat -e cpu_core/instructions/u`): the marginal
+estimator — the N-op pass minus the 0-op pass on the same boot, so per-op startup cancels — 3 independent sets,
+`send_recv` N = 800 000, `send_recv_plain` N = 300 000:
+| case | before instr/op | after instr/op | delta |
+|---|---|---|---|
+| `copy_bound`/`send_recv` | 70 400 | 66 800 | **-5.2 %** |
+| `copy_bound`/`send_recv_plain` | 31 560 | 31 780 | +0.7 % (noise) |
+| control: a two-process round trip with a **1-word** payload (no payload copy at all, `erlc`-compiled fixture, same driving recipe) | 30 716 | 30 843 | +0.4 % (load drift — no regression) |
+**Paired wall clock**, 15 alternating rounds per case (`before,after`, then the order reversed),
+`/proc/loadavg` **23.1 -> 30.4**:
+| case | before ns/op | after ns/op | delta | per-round duration spread |
+|---|---|---|---|---|
+| `copy_bound`/`send_recv` | 6 288.9 | 5 833.3 | **-7.2 %** | 5.1-7.9 ms |
+| `copy_bound`/`send_recv_plain` | 3 350.0 | 3 913.3 | +16.8 %, **not a result** | 0.58-1.77 ms (3x) |
+`send_recv` agrees in direction and rough size across both instruments; `send_recv_plain` separates from neither the
+instructions nor (at this load) the wall clock, and §7.2/§7.3 record it as the least claim-worthy row. The
+instructions figure does establish that the change is not a regression on it: that row's payload copies are 3 words
+(the literal is shared), so the work the change removes — a per-call worklist allocation, and one bounds test per cons
+cell — is small there by construction.
+The row-level attribution behind the ceiling: the per-op payload copy is **957 of `send_recv`'s 70 400 instructions**
+and the whole `beam_message::copy` subtree is ~10.7 % **inclusive** (it contains the enqueue and the off-heap drain).
+Removing the copy *entirely* would therefore move the row ~1-3 %, not 25 % — see §10 for where the rest is and which
+node owns it.
+## 8. The fix-up worklist is `Vec<Fixup>`, retained per thread
+The copy loop's worklist is `Vec<Fixup>` (`src/copy.rs`, 16 B per entry) held in a **`thread_local!`**
+(`WARM_WORKLIST`) that every copy **clears on entry** and leaves empty at return — the same discipline as the pricing
+scratch (§2). The consequences are the whole of this pass's structural win: the worklist allocation is **gone from
+every shape** (0 blocks / 0 B, §2), and `beam_message::shrink_warm_worklist()` is the host's lever to hand a
+high-water-mark buffer back after an outlier payload.
+Retaining capacity across calls is sound because a `Fixup` holds raw destination pointers plus source words that are
+valid **only during one copy**: the vector is cleared before each use, is empty at return, is never registered and is
+never scanned — it is not a GC root and it cannot keep a term alive.
+An *inline* replacement (a `WorkStack`: `[MaybeUninit<Fixup>; WORK_INLINE]` inline plus a `Vec` spill) was measured
+before the retained-`Vec` change and does **not** pay for itself, in release (`opt-level = 3`, `lto = "thin"`,
+`taskset -c 3`, 6 interleaved pairs, `/proc/loadavg` 17-23, `WORK_INLINE = 8`): the `send_recv` payload was
+**neutral** (best-of-20 000 **187 ns vs 186 ns**) and the 10-int list was **17 % slower** (best 90 ns vs 76 ns).
+In dev (`opt-level = 1`) the regression is larger and visible on every list-shaped copy (deep list 2000 cons cells
++25 %, 64-key HAMT +11 %) — a codegen effect of the inlined pop round-tripping the fix-up through a stack slot, not
+frame size or `MaybeUninit` initialisation (both variants measured).
+So the worklist stays a `Vec`, but a **retained** one: that removes the allocation without paying the inline stack's
+per-pop penalty.
 ## 9. The shared-term test runs once per copied object, not twice
 
 A fix-up is only ever recorded for a child already proven **not** shared, so the worklist's pop side calls
@@ -430,28 +461,42 @@ median of the per-run means, `best` = median of the runs' best-of-20 000, ns/sen
 
 The saving scales with the number of copied objects, which is exactly the per-object guard it removes; the 10-int list,
 one guard per cell on a 2-word object, is flat.
-Deterministic counters are unaffected (the payload is still 2 blocks / 192 B in the copy, 0 in the enqueue half), and the
-current measurement of the payload `send` (§4: ≈ 199 ns mean / 176 ns best) sits at the 210/181 column's cost.
+Deterministic counters are unaffected by this optimisation — the copy now allocates **0 blocks / 0 B** (§2) and the
+enqueue half pays the queue's first buffer alone — and the payload `send` (§4) sits at the 210/181 column's cost.
 
 ## 10. What remains (by owner)
-
-This crate's copy path is **one walk** on every shape it performs: no preflight for a fit, one exact pricing walk for
-a refusal, with the refusal derived from that same walk, and the fragment sized from the same figure — a host that
-already holds the refusal takes `send_fragmented_after_refusal`, so the fragment path never re-walks.
-Every remaining cost is somebody else's seam:
-
-* **`beam_term` (`src/size.rs`) — the shape of the walk itself.** The walk now runs on a caller-owned
-  `SizingScratch`, so **its own allocations are gone on the warm path** (§2's cold/warm pin). What remains in
-  `beam_term` is the shape of the walk: the bounded form still re-walks (`is_acyclic`'s two more hash tables) when a
-  caller wants an exact price **and** a work limit, and a bounded fixed-stack cycle check would replace the path set
-  entirely (the legacy C has no cycle check at all — it trusts acyclic heaps).
-  The adoptable shapes are in `## Handoffs` of `CONTEXT.md`.
+This crate's copy path is **one walk** on every shape it performs — no preflight for a fit, one exact pricing walk for
+a refusal, the refusal derived from that same walk, the fragment sized from that same figure — and it now allocates
+**nothing** per copy and nothing per refusal (§2).
+**The copy is no longer where `copy_bound`'s time is.** On the measured rows the per-op payload copy is **957 of
+70 400 instructions** (`send_recv`, ~1.4 %) and the whole `beam_message::copy` subtree ~10.7 % **inclusive** (it
+contains the enqueue and the off-heap drain); the plain row's copies are 3 words, the literal being shared (§6). So
+even a complete elimination of the copy would move `send_recv` by ~1-3 % (§7.4) — the residual is the messaging
+machinery around it, and it lives outside this node:
+* **OUT OF SCOPE (`beam_bifs` -> `beam_rt`): the `hook_sets` predicates are ~21 % of both messaging rows.**
+  `beam_bifs/src/hook_sets.rs`'s `needs_process_hook`/`needs_fun_caller`/`needs_dict_hook`/... are
+  `binary_search_by` probes over `&'static [(&str, &str, u32)]` tables with a `__memcmp_avx2_movbe` comparator, and
+  `beam_rt`'s `RuntimeContext::uses_*` calls them on **every** dispatch. Measured: `<[(&str, &str, u32)]>::binary_search_by`
+  plus `memcmp` is **~21.3 % of instructions** on `send_recv` *and* on `send_recv_plain` — the largest single in-tree
+  block on either row. The module's own doc comment ("an allocation-free `binary_search` membership test … so calling
+  one on every dispatch is free") does not survive measurement at these table sizes: one string compare per probe,
+  log2(N) probes, per BIF call.
+  The fix shape is a **per-key flag computed once at registry build** (or gating the predicate on the BIF actually
+  being dispatched, rather than asking on every call) — `beam_bifs` + `beam_rt` work, reported to the coordinating
+  parent rather than edited from this node.
+* **`beam_rt`'s per-op machinery**, ~97 % of `send_recv_plain` (shares of that row's instructions, `perf` at
+  N = 800 000): `hook_sets` as above, then `RuntimeContext::mailbox_parts` 3.8 %, `drop_glue::<RuntimeContext>`
+  4.6 %, `gc_walk::Walk::seed_process_roots` 2.0 %, `deliver_message_with_off_heap` 1.3 %, `ProcessId` SipHash keys
+  2.3 %, `BifRegistry::lookup` 2.0 %.
+* **`beam_term` (`src/size.rs`) — the shape of the walk itself.** It runs on the caller's retained `SizingScratch`,
+  so its allocations are gone on the warm path (§2); what remains is the walk's own shape: the bounded form still
+  re-walks when a caller wants an exact price **and** a work limit, and a bounded fixed-stack cycle check would
+  replace the `HashSet` path set entirely (the legacy C has no cycle check at all — it trusts acyclic heaps). No
+  production caller passes a finite limit, so this is off the measured path; the adoptable shapes are in `## Handoffs`
+  of `CONTEXT.md`.
 * **`beam_codec` — `send_recv` vs `send_recv_plain`.** The delta between those two cases (§6) is the worker's
-  `binary_to_term(term_to_binary(T))` round trip; the plain case's copies are 3 words, so the copy is not part of it.
-  Measure the codec's share before claiming any.
-* **The runtime's own per-op cost is the whole story for `send_recv_plain`** (≈ 3.06 µs/op against this crate's
-  ≈ 0.41 µs of send, §6), and §7.2 records the one unattributed move in it.
-
+  `binary_to_term(term_to_binary(T))` round trip — 38 880 of `send_recv`'s 70 400 instructions/op — while the plain
+  case's copies are 3 words: the copy is not part of that pair.
 ## 11. Reproduce
 
 ```sh
