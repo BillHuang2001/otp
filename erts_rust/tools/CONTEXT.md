@@ -68,7 +68,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 
 ## Notes for Agents
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
-- Oracle is the system Erlang on `PATH` (OTP 29.1.1 / erts-17.1). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
+- Oracle is the system Erlang on `PATH` (here OTP 29.1.2 / erts-17.1.1, while the tree pins OTP `30.0-rc0` / erts-`17.1`). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
 - **Gate coverage (verified against code):** `differential suite` reports `summary: total=3463 agree=3462
   mismatch=0 unsupported=1 skipped=0` (a case may declare several contracts, so the per-contract totals
