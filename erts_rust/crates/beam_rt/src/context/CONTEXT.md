@@ -187,7 +187,7 @@ Memory-attribution facts, each verified in code; the region semantics are [`gc/C
 * `process_bridge.rs` → the `ProcessHook` arm over the real `ProcessTable` + `Rc<RefCell<PortRegistry>>`.
 * `module_info.rs` → the `ModuleInfo` arm (`get_module_info/1,2` from the loaded module's IR).
 * `persistent_term.rs` → the `PersistentTerm` arm (the seven `persistent_term:*` BIFs over the runtime's shared store).
-* `runtime_hooks.rs` → the `RuntimeHooks` arm + the shared `is_active_export`; its `link`/`unlink` pair classifies a **remote** pid through `link_target` and routes it via `ProcessTable::link_term`/`unlink_term`.
+* `runtime_hooks.rs` → the `RuntimeHooks` arm + the shared `is_active_export`; its `link`/`unlink` pair classifies a **remote** pid through `link_target` and routes it via `ProcessTable::link_term`/`unlink_term`, and a **port** target moves the port's own link set (`PortRegistry::link_port`/`unlink_port`, the C's `erts_port_unlink`) without ever touching `PortMeta.owner` — which is what makes `inet.erl`'s `tcp_controlling_process/2` reach `ok`.
 * `memory_hook.rs` → the `MemoryHook` arm + `RuntimeMemory` (`erlang:memory/0,1`).
 * `signal.rs` → the `os:set_signal/2` arm over one process-global `beam_io::SignalFacility` in a `thread_local`.
 * `trace.rs` → the execution-trace seam (`call`/`return_from`/`return_to` over `ExecutionContext::trace_event`).
