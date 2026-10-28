@@ -138,7 +138,7 @@ use crate::interpreter::{ImportFrame, LabelMap};
 use crate::machine::{Continuation, Machine};
 use crate::Step;
 
-use super::runtime::{encode_target, fold_step, JitRuntime};
+use super::runtime::{fold_step, JitRuntime};
 
 /// The block-ABI word [`jit_call_store`] answers when it has **stored the
 /// continuation**: "the `Call`'s `Continuation::Address` is in the live frame — transfer
@@ -333,14 +333,21 @@ fn call_store_impl(
             // owns; the borrows derived from it above are dead by now (the outcome owns no
             // reference into it), so this borrow does not alias them.
             let runtime = unsafe { &mut *rt };
-            let target = encode_target(callee, callee_pc);
             let word = super::runtime::enter_in_block(runtime, callee, callee_pc);
             // The in-block transfer was taken exactly when the resolver published an entry;
             // a decline (no artifact, an uncovered address, a failed lazy compile, an
             // unsatisfied register bound) and a refused pre-emption charge leave it null.
             #[cfg(test)]
             super::counters::record_in_block_call(!runtime.resume_entry.is_null());
-            if word == target {
+            // `enter_in_block` answers one of exactly two things: the target word it encoded
+            // (`encode_target(callee, callee_pc)`, so re-encoding it here only to compare
+            // would be one pack per transfer for a value already in the register) on both
+            // the accepted and the declined arm, or the negative `ERROR` sentinel on a
+            // refused charge. The **sign** is therefore the same test as `word == target`,
+            // and the emitted arm re-tests `resume_entry` itself (see `emit/link.rs`'s
+            // `emit_in_block_call`), so a decline mapping to `Stored` keeps behaving as
+            // before: `CALL_STORED` + null `resume_entry` takes the declined exit.
+            if word >= 0 {
                 CallOutcome::Stored
             } else {
                 CallOutcome::Word(word)

@@ -1257,8 +1257,10 @@ fn drive(
         unsafe {
             (*machine_ptr).set_current_code(func, pc);
             // The engine-side slice counter, bumped in the same step as the hook so
-            // the two always agree (the interpreter driver's invariant).
-            (*machine_ptr).reductions = (*machine_ptr).reductions.saturating_add(1);
+            // the two always agree (the interpreter driver's invariant). Wrapping, not
+            // saturating: the counter is zeroed at every slice entry, so `u64::MAX`
+            // charges inside one slice is unreachable and the extra `cmov` is not worth it.
+            (*machine_ptr).reductions = (*machine_ptr).reductions.wrapping_add(1);
         }
         if reduce_on && !rt.charge_reduce(1) {
             // The host refused this iteration's charge: `charge_reduce` stored its own

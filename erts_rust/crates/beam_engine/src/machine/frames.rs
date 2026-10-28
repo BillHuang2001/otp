@@ -223,7 +223,8 @@ impl Machine {
     /// stack length is already the frame's `y_base`, so there is nothing to write.
     #[inline]
     pub(crate) fn push_frame(&mut self, y_count: u32) -> Result<()> {
-        self.push_frame_window(y_count).map(|_| ())
+        self.push_frame_window(y_count);
+        Ok(())
     }
 
     /// [`Machine::push_frame`] that also hands back the pushed frame's
@@ -235,8 +236,13 @@ impl Machine {
     /// instead of re-deriving them from `Machine::frames.last()` afterwards. The
     /// returned pair describes the frame this call pushed — the machine's new top
     /// frame — for as long as the caller does not push, pop or `trim` in between.
+    ///
+    /// Infallible: `Vec::resize` and `Vec::push` have no failure mode, so an `Err` here
+    /// would be a branch on a condition that never holds — a cost on every frame push of
+    /// every non-tail call (the pops keep their `Result`; theirs is a real
+    /// frame-discipline check).
     #[inline]
-    pub(crate) fn push_frame_window(&mut self, y_count: u32) -> Result<(usize, u32)> {
+    pub(crate) fn push_frame_window(&mut self, y_count: u32) -> (usize, u32) {
         let y_base = self.stack.len();
         if y_count != 0 {
             self.stack
@@ -247,7 +253,7 @@ impl Machine {
             y_base,
             y_count,
         });
-        Ok((y_base, y_count))
+        (y_base, y_count)
     }
 
     /// Pop the innermost frame (and its Y slots).
