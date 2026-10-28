@@ -385,6 +385,15 @@ pub fn execute_reporting(
             });
         }
     }
+    // The script's tail is the point `kernel:start/2`'s own work has completed: the
+    // `{kernelProcess, logger, …}` directive started `logger_server` and the
+    // `{apply,{application,start_boot,[kernel,permanent]}}` directive brought the kernel
+    // supervisor tree up. The oracle's `kernel` start-up then registers OTP's `default` logger
+    // handler (`logger:add_handlers(kernel)`, `lib/kernel/src/logger.erl:1671-1700`) — a step
+    // this runtime owes because it drives the script itself rather than completing
+    // `application:start_boot/2`. It runs **after** every directive and **before** the action
+    // (see [`drive::install_default_logger_handler`]), is idempotent, and never fails the pass.
+    drive::install_default_logger_handler(runtime);
     Ok(())
 }
 

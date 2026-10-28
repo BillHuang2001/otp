@@ -372,6 +372,28 @@ pub(super) fn apply_boot_call(
     args: &[Eterm],
     deadline: Instant,
 ) -> Result<()> {
+    apply_boot_call_value(runtime, mfa, args, deadline).map(|_| ())
+}
+
+/// [`apply_boot_call`], keeping the callee's **returned value**.
+///
+/// A boot directive discards its value (`init` does), but the runtime's own post-boot work
+/// needs to read one: [`install_default_logger_handler`] asks `logger:add_handler/3`, whose
+/// answer is the `ok`/`{error,{already_exist,Id}}` term that tells a re-run from a failure.
+/// The value is **stable**: a `RuntimeContext::new` context (the one both entries build) has no
+/// process table, so every allocation of the run — the returned container included — comes from
+/// the runtime's pointer-stable arena (`context::gc::alloc_words`), not from a collectable
+/// young space.
+///
+/// # Errors
+///
+/// Exactly [`apply_boot_call`]'s.
+pub(super) fn apply_boot_call_value(
+    runtime: &mut Runtime,
+    mfa: &Mfa,
+    args: &[Eterm],
+    deadline: Instant,
+) -> Result<Eterm> {
     let arity = args.len() as u32;
     // Settle the routing **before** the blocking-aware entry below: the seam takes `&mut self`,
     // so its context is scoped to the resolution alone (it only loads/caches a module — it has
@@ -407,12 +429,13 @@ pub(super) fn apply_boot_call(
     // an `apply` directive's value, but the function may still have stored a term that
     // references an off-heap payload this short-lived machine built (see
     // `Runtime::adopt_escaped_binaries`).
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Eterm> {
         let mut outcome = entered.map_err(|err| error::name_atom_raise(err, runtime.atoms()))?;
         loop {
             match outcome {
-                // `init` discards an `apply` directive's value, exactly as it discards `-s`'s.
-                RunOutcome::Returned(_) => return Ok(()),
+                // `init` discards an `apply` directive's value, exactly as it discards `-s`'s;
+                // [`apply_boot_call_value`]'s caller does not.
+                RunOutcome::Returned(value) => return Ok(value),
                 // A BIF park re-executes its own instruction once the host re-enters, so it is
                 // driven exactly like a `receive` park: one scheduler round, then resume.
                 RunOutcome::Wait { func, pc } | RunOutcome::Suspend { func, pc } => {
@@ -451,11 +474,204 @@ pub(super) fn apply_boot_call(
 /// This is [`ExecutionContext::call_bif`] reached exactly as the engine reaches it for any
 /// external call (a loaded NIF, the runtime-native floor, a registered `beam_bifs` BIF, or —
 /// for a module the runtime has not loaded, or an export it does not have — a load-on-demand
-/// external module call). The value is discarded because `init` discards it.
-fn call_bif(runtime: &mut Runtime, mfa: &Mfa, args: &[Eterm]) -> Result<()> {
+/// external module call). A boot directive discards the value (`init` does); the returned term is
+/// kept for the caller that needs it, and is stable for the reason [`apply_boot_call_value`]
+/// gives.
+fn call_bif(runtime: &mut Runtime, mfa: &Mfa, args: &[Eterm]) -> Result<Eterm> {
     let mut context = RuntimeContext::new(runtime);
-    let _ = context.call_bif(&mfa.module, &mfa.function, args.len() as u32, args)?;
-    Ok(())
+    context.call_bif(&mfa.module, &mfa.function, args.len() as u32, args)
+}
+
+/// How long the post-boot `logger:add_handler(default, …)` registration may spend driving the
+/// scheduler.
+///
+/// Its own bound, not the boot pass's [`DRIVE_DEADLINE`]: `execute_reporting` hands that deadline
+/// to the script's directives, so by the end of a long boot it may already be spent. The
+/// registration is two `gen_server` round trips to the booted `logger_server` (plus
+/// `logger_olp`/`logger_sup` start-ups), each of which needs a scheduler slice — normally a
+/// handful of milliseconds. A registration that cannot finish inside this window is a
+/// **degradation** on the [`crate::debug_trace`] channel, never a boot failure.
+const LOGGER_INSTALL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The atom names the default-logger-handler registration mentions.
+///
+/// Interned **before** the call: `logger_std_h`, `logger_h_common` and `logger_formatter` are
+/// loaded on demand *inside* it, and a module's atom table is a fork of the shared one taken at
+/// its load time — so a name first interned later would not be in that fork.
+const LOGGER_INSTALL_ATOMS: [&str; 14] = [
+    "default",
+    "logger_std_h",
+    "config",
+    "type",
+    "standard_io",
+    "formatter",
+    "logger_formatter",
+    "single_line",
+    "legacy_header",
+    "true",
+    "false",
+    "ok",
+    "error",
+    "already_exist",
+];
+
+/// Registers OTP's **`default` logger handler** (`logger_std_h` over `standard_io`), the way
+/// `kernel`'s start-up does.
+///
+/// The oracle's handler set is `[default]` because `kernel:start/2` runs
+/// `logger:internal_init_logger/0` + `logger:add_handlers(kernel)` once the kernel supervisor tree
+/// exists (`lib/kernel/src/logger.erl:1572-1635`, `:1671-1700`): `add_handlers/2` answers
+/// `application:get_env(kernel, logger)` — empty in `kernel.app.src` — so `init_default_config/2`
+/// (`:1800-1827`) seeds `{handler,default,logger_std_h,#{config=>#{type=>standard_io},
+/// formatter=>{logger_formatter,#{single_line=>false,legacy_header=>true}}}}` and
+/// `logger:add_handler/3` creates it, **removing `simple`** on success (`:831-850`). This runtime
+/// drives the boot script itself instead of completing `application:start_boot(kernel,…)`, so
+/// nothing on that path ran and a fresh node kept `logger_server:init/1`'s `simple` fallback —
+/// which answers `logger:get_handler_ids/0` → `[simple]` and makes `get_handler_config(default)`
+/// `{error,{not_found,default}}` where the oracle answers a `logger_std_h` config.
+///
+/// So the registration is the **real** `logger:add_handler/3` with exactly the config
+/// `init_default_config/2` builds — not a synthesized answer. Two consequences are deliberate:
+///
+/// * `simple` is removed by OTP's own clause, so the resulting set is `[default]`, not
+///   `[default,simple]`;
+/// * the config carries **no `filters` key**, so `add_handler/3`'s first clause
+///   (`logger.erl:831-837`) merges its `filter_default => stop` and the default
+///   `remote_gl`/`domain`/`no_domain` filters — the oracle's exact
+///   `get_handler_config(default)` (§ the `default` handler's `filters`). Passing an explicit
+///   `filters` list would skip that clause and the answer would lose them.
+///
+/// # Idempotent, and never fatal
+///
+/// A re-run against the same live `logger_server` — a boot script executed twice, `init:restart/0`
+/// after the system was cleared — answers `{error,{already_exist,default}}`, which is **success**
+/// (nothing was duplicated). Every other answer and every raise is a *degradation*: it is
+/// recorded on the [`crate::debug_trace`] channel (`BEAM_RT_BOOT_TRACE`) with the typed error or
+/// the returned term, and the boot continues. A node whose logger keeps `simple` is the honest
+/// end state; a failed `logger_std_h` must never be why a boot script stops.
+///
+/// # Errors
+///
+/// None — this is the post-boot step of a pass that has already completed, so its outcome is
+/// reported, not propagated (see above).
+pub(super) fn install_default_logger_handler(runtime: &mut Runtime) {
+    let trace_enabled = crate::debug_trace::enabled();
+    let mut interned: Vec<(&'static str, Eterm)> = Vec::with_capacity(LOGGER_INSTALL_ATOMS.len());
+    for name in LOGGER_INSTALL_ATOMS {
+        let term = runtime.intern(name);
+        interned.push((name, term));
+    }
+    let atom = |name: &str| -> Eterm {
+        interned
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, term)| *term)
+            .expect("every name of LOGGER_INSTALL_ATOMS is interned above")
+    };
+    // `#{config => #{type => standard_io},
+    //    formatter => {logger_formatter, #{single_line => false, legacy_header => true}}}`
+    // — `init_default_config/2`'s `DefaultConfig` (`logger.erl:1800-1804`).
+    let config = (|| -> Result<Eterm> {
+        let mut context = RuntimeContext::new(runtime);
+        // `make_flatmap` (not `make_map`): a two-pair map needs no key ordering, and the
+        // general builder wants the atom table the context itself borrows mutably.
+        let type_config = beam_engine::terms::make_flatmap(
+            &mut context,
+            &[(atom("type"), atom("standard_io"))],
+        )?;
+        let format_config = beam_engine::terms::make_flatmap(
+            &mut context,
+            &[(atom("single_line"), atom("false")), (atom("legacy_header"), atom("true"))],
+        )?;
+        let formatter = beam_engine::terms::make_tuple(
+            &mut context,
+            &[atom("logger_formatter"), format_config],
+        )?;
+        beam_engine::terms::make_flatmap(
+            &mut context,
+            &[(atom("config"), type_config), (atom("formatter"), formatter)],
+        )
+    })();
+    let config = match config {
+        Ok(config) => config,
+        Err(err) => {
+            if trace_enabled {
+                crate::debug_trace::trace(format_args!(
+                    "logger: default handler registration skipped: its config term could not be \
+                     built: {err}"
+                ));
+            }
+            return;
+        }
+    };
+    let mfa = Mfa {
+        module: "logger".to_string(),
+        function: "add_handler".to_string(),
+        args: Vec::new(),
+    };
+    let args = [atom("default"), atom("logger_std_h"), config];
+    let deadline = Instant::now() + LOGGER_INSTALL_DEADLINE;
+    match apply_boot_call_value(runtime, &mfa, &args, deadline) {
+        Ok(value) if value == atom("ok") => {
+            if trace_enabled {
+                crate::debug_trace::trace(format_args!(
+                    "logger: default handler = logger_std_h over standard_io"
+                ));
+            }
+        }
+        // `{error,{already_exist,default}}` — a re-run against the same live logger server:
+        // success (the handler set is already what this step produces).
+        Ok(value) if is_already_exist(value, atom("error"), atom("already_exist")) => {
+            if trace_enabled {
+                crate::debug_trace::trace(format_args!(
+                    "logger: default handler was already registered"
+                ));
+            }
+        }
+        Ok(value) => {
+            if trace_enabled {
+                let rendered = match runtime.format_term_w(value, None) {
+                    Ok(text) => text.trim_end().to_string(),
+                    Err(_) => "<unprintable term>".to_string(),
+                };
+                crate::debug_trace::trace(format_args!(
+                    "logger: default handler registration degraded: logger:add_handler/3 \
+                     returned {rendered}"
+                ));
+            }
+        }
+        Err(err) => {
+            if trace_enabled {
+                crate::debug_trace::trace(format_args!(
+                    "logger: default handler registration degraded: logger:add_handler/3 failed: \
+                     {err}"
+                ));
+            }
+        }
+    }
+}
+
+/// Whether `value` is `{error,{already_exist,_}}` — the `Error` shape `logger:add_handler/3`
+/// answers for a handler id that already exists (`logger_server:add_handler/3`,
+/// `lib/kernel/src/logger_server.erl:170-174`).
+fn is_already_exist(value: Eterm, error_atom: Eterm, already_exist_atom: Eterm) -> bool {
+    if !matches!(beam_engine::terms::tuple_arity(value), Ok(2)) {
+        return false;
+    }
+    let Ok(tag) = beam_engine::terms::tuple_element(value, 0) else {
+        return false;
+    };
+    if tag != error_atom {
+        return false;
+    }
+    let Ok(reason) = beam_engine::terms::tuple_element(value, 1) else {
+        return false;
+    };
+    if !matches!(beam_engine::terms::tuple_arity(reason), Ok(2)) {
+        return false;
+    }
+    matches!(beam_engine::terms::tuple_element(reason, 0),
+             Ok(why) if why == already_exist_atom)
 }
 #[cfg(test)]
 mod tests {
