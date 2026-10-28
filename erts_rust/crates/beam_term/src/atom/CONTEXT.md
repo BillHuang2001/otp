@@ -63,7 +63,8 @@ allocation pins can derive their budget instead of hard-coding a slack.
   container the other side of a fork can see — that is the whole isolation guarantee.
 - **`shard_of` is a pure function of the name bytes** (no seed, no table state, no allocation), so
   a fork and its parent — and any number of fork generations — agree on where a name lives without
-  coordinating.
+  coordinating. The same holds for `hash_of`/`shard_of_hash`/`probe_index`, which is what lets the
+  probe slot be a pure function too (a seeded hasher could not be).
 - `NAMES_PER_CHUNK` and `INDEX_SHARDS` are **tuning constants, not contracts**: `NAMES_PER_CHUNK`
   moves the copy granularity, `INDEX_SHARDS` the shard granularity, and no caller may depend on
   either value (the two `pub` constants exist only for the allocation-budget arithmetic).
