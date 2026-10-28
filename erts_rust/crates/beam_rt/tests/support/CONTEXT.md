@@ -3,8 +3,10 @@
 ## Intent
 The plumbing every `beam_rt` integration suite shares: the toolchain probe, the bounded oracle
 probe, the loud-skip helpers, and the two live-node pair harnesses.
-Each suite pulls it in with `mod support;`; `nif_a3.rs` is the one module that is instead pulled
-in by `#[path = "support/nif_a3.rs"] mod nif_a3;` from the three `nif_a3_*` suites.
+Each suite pulls it in with `mod support;`; two modules are instead pulled in by a `#[path]`
+attribute from the suites that use them — `nif_a3.rs` by the three `nif_a3_*` suites, and
+`cowboy.rs` by `cowboy_serve.rs` and `cowboy_static_serve.rs` — so the rest of the crate's test
+binaries never compile them.
 Nothing here is a test — this directory carries no assertions of its own.
 
 ## API Surface
