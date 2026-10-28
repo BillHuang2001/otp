@@ -44,6 +44,7 @@
 //! (`../../erts/emulator/beam/external.c`), which has no explicit depth limit and
 //! relies on the emulator thread's stack.
 
+mod container;
 mod export_gate;
 mod fun;
 mod local_node;
@@ -699,47 +700,25 @@ impl<'a> Decoder<'a> {
                     }
                     arity
                 };
-                // Pre-sized from the wire arity but clamped to
-                // `CONTAINER_PREALLOC_CAP`: a normal tuple spends one allocation
-                // instead of a chain of `Vec` growths, while an attacker-controlled
-                // arity still cannot drive an unbounded allocation (the cap is the
-                // bound, and an arity above it just grows the buffer on demand).
-                // The reserved slots are never trusted as decoded elements, so a
-                // truncated read still fails on the first short read.
-                let mut elems = Vec::with_capacity(arity.min(CONTAINER_PREALLOC_CAP));
-                for _ in 0..arity {
-                    elems.push(self.decode(heap, atoms)?);
-                }
-                heap.tuple(&elems)
+                // Elements are staged (a stack array for a small tuple, a
+                // `CONTAINER_PREALLOC_CAP`-clamped `Vec` above) and built by
+                // `decode_tuple`.
+                self.decode_tuple(heap, atoms, arity)
             }
             Tag::Nil => Ok(NIL),
             Tag::String => {
                 let len = usize::from(self.reader.u16be()?);
                 let bytes = self.reader.bytes(len)?;
-                // A string is a list of smalls, built back-to-front.
-                let mut tail = NIL;
-                for &byte in bytes.iter().rev() {
-                    tail = heap.cons(make_small(i64::from(byte)), tail)?;
-                }
-                Ok(tail)
+                // A string is a list of smalls; `write_byte_list` lays the whole
+                // spine down in one heap reservation instead of a cons per byte.
+                crate::term::write_byte_list(heap, bytes)
             }
             Tag::List => {
                 let len = self.reader.u32be()? as usize;
-                // Pre-sized like a tuple (see `CONTAINER_PREALLOC_CAP`): bounded by
-                // the cap, so a claimed length can over-reserve at most that much
-                // and the elements still come from the wire one short read at a
-                // time.
-                let mut elems = Vec::with_capacity(len.min(CONTAINER_PREALLOC_CAP));
-                for _ in 0..len {
-                    elems.push(self.decode(heap, atoms)?);
-                }
                 // The tail is the next term: `NIL` for a proper list, otherwise
-                // the improper tail.
-                let mut tail = self.decode(heap, atoms)?;
-                for elem in elems.into_iter().rev() {
-                    tail = heap.cons(elem, tail)?;
-                }
-                Ok(tail)
+                // the improper tail. `decode_list` stages the elements and links
+                // the spine in one reservation.
+                self.decode_list(heap, atoms, len)
             }
             Tag::Map => {
                 let count = self.reader.u32be()? as usize;
@@ -750,37 +729,11 @@ impl<'a> Decoder<'a> {
                 if (count >> 31) != 0 {
                     return Err(bad_arg());
                 }
-                // Pre-sized like a tuple (see `CONTAINER_PREALLOC_CAP`): the pair
-                // buffer gets one allocation for a normal map instead of a chain of
-                // `Vec` growths, while a count the wire only claims can over-reserve
-                // at most the cap and a truncated stream still fails on the first
-                // short read. The wire order is interleaved `K1,V1,…,Kn,Vn`.
-                let mut pairs = Vec::with_capacity(count.min(CONTAINER_PREALLOC_CAP));
-                for _ in 0..count {
-                    let key = self.decode(heap, atoms)?;
-                    let value = self.decode(heap, atoms)?;
-                    pairs.push((key, value));
-                }
-                // ERTS canonicalizes the map here (the `external.c:5438-5456`
-                // fixup): `count <= MAP_SMALL_MAP_LIMIT` becomes a FLAT map with
-                // keys sorted in `erts_cmp_flatmap_keys` order
-                // (`erts_validate_and_sort_flatmap`, `erl_map.c:3187`), a larger
-                // count a HAMT (`erts_hashmap_from_array(..., 1)`, `erl_map.c:644`,
-                // keyed by `erts_map_hash`). `write_map` is that constructor, so the
-                // decoded map carries ERTS's storage order and re-encodes
-                // byte-identically (see the crate `CONTEXT.md`, §"Map key encode
-                // order").
-                let map = crate::term::make_map(heap, &pairs, atoms)?;
-                // `write_map` collapses duplicate keys (last value wins), whereas
-                // ERTS **rejects** them in both representations (`external.c:5448`
-                // `error_map_fixup`, reached when the fixup's duplicate check
-                // fails). `maps:from_list/1` is what collapses, not the codec, so a
-                // produced key count below the wire count means a duplicate was
-                // present and the image is malformed.
-                if beam_term::map::map_size(map, atoms)? != count {
-                    return Err(bad_arg());
-                }
-                Ok(map)
+                // The wire order is interleaved `K1,V1,…,Kn,Vn`; `decode_map`
+                // stages the pairs (a stack array for a small map, a
+                // `CONTAINER_PREALLOC_CAP`-clamped `Vec` above), builds the
+                // canonical ERTS map over them and rejects a duplicate key.
+                self.decode_map(heap, atoms, count)
             }
 
             // ---------------------------------------------------------------
@@ -912,7 +865,15 @@ impl<'a> Decoder<'a> {
     /// is interned (`erts_atom_put`). This is the C's own split
     /// (`external.c:4530-4539`).
     fn atom_term(&self, name: &str, atoms: &mut AtomTable) -> Result<Eterm> {
-        if name.chars().count() > MAX_ATOM_CHARS {
+        // The bound is in *characters*, and an ASCII name has one byte per
+        // character, so `len()` is the count without a UTF-8 scan — the common case
+        // for every atom on the wire. A non-ASCII name falls back to the scan.
+        let chars = if name.is_ascii() {
+            name.len()
+        } else {
+            name.chars().count()
+        };
+        if chars > MAX_ATOM_CHARS {
             return Err(bad_arg());
         }
         if self.safe {

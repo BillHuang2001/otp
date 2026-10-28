@@ -53,6 +53,26 @@ impl Writer {
             buf: Vec::with_capacity(capacity),
         }
     }
+    /// Wraps a caller-owned byte buffer, continuing at its end.
+    ///
+    /// The reusable-buffer constructor: an empty `buf` behaves exactly like
+    /// [`Writer::new`], while a non-empty one is appended to (its existing bytes are
+    /// never rewritten). Paired with [`Writer::into_vec`]/[`Writer::clear`], this lets
+    /// a host keep one allocation across encodes instead of one per call.
+    pub fn from_vec(buf: Vec<u8>) -> Writer {
+        Writer { buf }
+    }
+    /// The number of bytes the buffer can hold without reallocating.
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+    /// Ensures room for at least `additional` more bytes, reallocating at most once.
+    ///
+    /// Equivalent to `Vec::reserve`; the appends already reserve as they grow, so this
+    /// exists for a caller that knows the final size up front.
+    pub fn reserve(&mut self, additional: usize) {
+        self.buf.reserve(additional);
+    }
 
     /// Appends one byte.
     pub fn u8(&mut self, value: u8) {

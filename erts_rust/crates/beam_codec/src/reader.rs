@@ -80,11 +80,18 @@ impl<'a> Reader<'a> {
 
     /// Reads a big-endian `u32`.
     ///
-    /// A short read yields `BeamError::BadArg`.
+    /// A short read yields `BeamError::BadArg`. `bytes(4)` is both the bounds check
+    /// and the cursor advance, so the four bytes are assembled directly (the wire
+    /// lengths and counts this reads are on every decode's hot path, where a
+    /// slice→array conversion costs more than the assembly).
     pub fn u32be(&mut self) -> Result<u32> {
         let bytes = self.bytes(4)?;
-        let arr: [u8; 4] = bytes.try_into().map_err(|_| bad_arg())?;
-        Ok(u32::from_be_bytes(arr))
+        // `bytes` is exactly four bytes (the length `bytes(4)` was asked for), so
+        // each indexing below is in bounds and cannot panic.
+        Ok((u32::from(bytes[0]) << 24)
+            | (u32::from(bytes[1]) << 16)
+            | (u32::from(bytes[2]) << 8)
+            | u32::from(bytes[3]))
     }
 
     /// Reads a big-endian 24-bit value (`0..=16_777_215`).

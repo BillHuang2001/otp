@@ -62,6 +62,7 @@ pub mod error;
 pub mod off_heap;
 pub mod reader;
 pub mod ref_wire;
+pub mod scratch;
 pub mod tag;
 #[allow(unsafe_code)]
 pub mod term;
@@ -87,6 +88,7 @@ pub use crate::error::{
     UNSUPPORTED_REASON,
 };
 pub use crate::reader::Reader;
+pub use crate::scratch::EncodeScratch;
 pub use crate::ref_wire::{
     ref_id_to_numbers, ref_numbers_to_id, representable_ref_id, representable_ref_numbers,
     REF1_NUM_MASK, REF_MASK, REF_NUMBERS,

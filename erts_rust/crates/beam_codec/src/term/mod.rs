@@ -54,13 +54,22 @@
 //! never panics and never exhibits undefined behaviour on a mismatched term.
 
 mod binary;
+mod classify;
 mod fun;
+mod list;
 mod r#ref;
 mod record;
 pub use binary::{
     bit_count_to_bytes, bitstring_bytes, bitstring_parts, bitstring_size_bits, make_binary,
     make_bitstring, make_refc_binary, BITSTRING_POINTER_FLAG_MASK,
 };
+/// The tag-first **boxed classification** ([`classify`]): one header read yields the
+/// [`BoxedTag`](beam_term::prelude::BoxedTag) the encoder dispatches on, so the safe
+/// `encode` layer never reads a heap word itself.
+pub use classify::boxed_tag;
+/// The **bulk list writer** ([`list`]): the `STRING_EXT`/`LIST_EXT` decode arms carve
+/// a whole cons spine in one heap reservation instead of one per cell.
+pub use list::{write_byte_list, write_list};
 /// The whole fun / export forwarding layer ([`fun`]): the boxed fun-term
 /// constructors, the term-level accessors and the frozen layout surface
 /// (`fun_kind_of_header`/`fun_words`/`fun_desc_words`/`fun_true_arity` plus

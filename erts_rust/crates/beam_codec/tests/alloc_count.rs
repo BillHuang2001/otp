@@ -91,14 +91,14 @@ const ENCODE_ALLOCS: u64 = 1;
 
 /// One `decode_term` into a fresh `Heap` + a fresh `AtomTable`.
 ///
-/// Exactly **26** = the decoder's floor of **3** plus the `AtomTable`'s **23**.
+/// Exactly **24** = the decoder's floor of **1** plus the `AtomTable`'s **23**.
 ///
-/// The floor is the same 3 the warm decode spends: each container buffer is pre-sized from
-/// its wire count clamped to `CONTAINER_PREALLOC_CAP` (64), so each of them is one
-/// allocation — the 3-tuple's element buffer (3 slots), the 5-pair map's pair buffer
-/// (5 slots) and `beam_term::map::write_map`'s dedup-and-sort buffer. The payload's two
-/// lists are byte lists, so they arrive as `STRING_EXT` and build no buffer; the binary,
-/// the float and the smalls allocate nothing.
+/// The floor is the same 1 the warm decode spends: the only allocation left on the wire
+/// path is `beam_term::map::write_map`'s dedup-and-sort buffer. A tuple of at most
+/// [`STACK_STAGE`] elements and a map of at most that many pairs are staged in a stack
+/// array (`src/decode/container.rs`), so neither allocates, and a byte list's cons spine
+/// is one heap reservation (no buffer at all). The payload's two lists are byte lists, so
+/// they arrive as `STRING_EXT`; the binary, the float and the smalls allocate nothing.
 ///
 /// The `AtomTable` share for the payload's **6** novel names (`a`…`e`, `ok`) is
 /// **6 × 3 + 5**:
@@ -121,19 +121,19 @@ const ENCODE_ALLOCS: u64 = 1;
 /// what makes the warm decode's atom share zero. A per-term buffer added to the wire path
 /// would make this regress, and so would an `intern` that materializes each name once per
 /// container.
-const DECODE_FRESH_ALLOCS: u64 = 26;
+const DECODE_FRESH_ALLOCS: u64 = 24;
 
 /// One `decode_term` into a `Heap` + an `AtomTable` that already holds the atoms.
 ///
-/// Exactly **3** — the decoder's own allocation floor, the same 3 a fresh decode spends:
-/// one pre-sized buffer each for the tuple, the map pairs and `write_map`'s
-/// dedup-and-sort scratch.
+/// Exactly **1** — the decoder's own allocation floor, the same 1 a fresh decode spends:
+/// `beam_term::map::write_map`'s dedup-and-sort scratch. The tuple and the map pairs are
+/// stack-staged (see [`STACK_STAGE`]) and the byte lists are one heap reservation each.
 /// Every name the image carries is already interned.
 /// `AtomTable::intern` then takes its `index.get` early return and allocates nothing.
 /// The `AtomTable` share is therefore zero by construction.
 /// The way this regresses is a new per-container buffer in the decoder, or a
-/// container buffer that grows again instead of being pre-sized.
-const DECODE_WARM_ALLOCS: u64 = 3;
+/// container buffer that grows again instead of being stack-staged.
+const DECODE_WARM_ALLOCS: u64 = 1;
 
 #[test]
 fn the_codec_allocation_counts_are_pinned() {

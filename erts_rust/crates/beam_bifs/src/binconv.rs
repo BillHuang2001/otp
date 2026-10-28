@@ -231,7 +231,7 @@ use std::cell::RefCell;
 use beam_codec::compress::compress as zlib_compress;
 use beam_codec::{
     decode_term_with_options_and_gate_used, decode_term_with_options_used, AtomCache, DecodeOptions,
-    Decoder, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
+    Decoder, EncodeScratch, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
 };
 use beam_common::Result;
 use beam_term::{atom_val, Atom, AtomTable, Eterm};
@@ -277,46 +277,26 @@ fn uint_arg(term: Eterm) -> Result<usize> {
 /// a binary (including a non-byte-aligned bitstring) — the oracle's
 /// `is_not_bitstring`/`TAIL_BITS` rejections.
 ///
-/// # Why this copies (measured, deliberately not "optimised")
+/// # The owned form (the borrowing one is [`bits::with_bytes`])
 ///
-/// This is the one **payload-proportional** allocation left on the
-/// `binary_to_term`/`binary_to_list`/`binary_to_atom`/`integer_from_binary` path: the
-/// whole input image is copied into a fresh `Vec` before the codec sees it
-/// (`tests/binconv_alloc.rs` measures 1 allocation / 4102 bytes for a 4 KiB image, and
-/// 101 of the 285 bytes the five-key map's decode allocates).
+/// A **borrowing** accessor is the right shape wherever the bytes are only *read*
+/// during the call — [`access::with_binary_bytes`](crate::access::with_binary_bytes)
+/// lends them to a closure instead of returning them, because a returned `&[u8]` is
+/// not expressible: the only route to a term's payload is
+/// [`beam_term::bitstring::bitstring_parts`] (an `unsafe` raw-pointer API, since an
+/// `Eterm` is a bare machine word carrying no lifetime), and an off-heap refc binary's
+/// payload is refcounted by the runtime's `beam_gc::OffHeap` sweep, an ownership the
+/// term does not express.
 ///
-/// It stays a copy because a **borrowing** accessor cannot be written inside this
-/// crate's safe-Rust boundary:
+/// `binary_to_term/1,2` takes that form ([`decode_term_bif`]): the decoder only reads
+/// the image and builds the term on the context heap, so the whole-image copy that
+/// used to sit here (1 allocation / 4102 bytes for a 4 KiB image) is gone.
 ///
-/// * The only route to a term's payload bytes is
-///   [`beam_term::bitstring::bitstring_parts`] — an `unsafe` raw-pointer API. An
-///   `Eterm` is a bare machine word, so the returned `*const u8` carries no lifetime
-///   tied to the term; producing `&[u8]` from it needs an unchecked lifetime
-///   extension, which is exactly the kind of `unsafe` that `binconv.rs`/`bits.rs` must
-///   not carry (`src/access.rs` is the crate's only sanctioned `unsafe` module, and
-///   even there the lifetime would be unprovable, not merely unwritten).
-/// * The bytes may also live in an **off-heap refc binary**, whose payload is
-///   refcounted and released by the runtime's `beam_gc::OffHeap` sweep — the term does
-///   not express that ownership as a Rust lifetime, so a borrowed slice could outlive
-///   it in principle.
-/// * Two borrow hazards would have to be excluded at *every* call site: the decoder
-///   writes the result onto [`BifContext::heap`] **while** reading the source bytes
-///   (a bump arena that never reallocates, so the write cannot move them — but the
-///   aliasing is only sound because the two are distinct arenas, which a `&[u8]`
-///   derived from a raw pointer would not record), and several sites
-///   (`binary_to_list/3`, `binary_part/3`) return a term built from a *slice* of the
-///   buffer.
-///
-/// That closure-scoped accessor now exists —
-/// [`access::with_binary_bytes`](crate::access::with_binary_bytes) lends the bytes to
-/// a closure instead of returning them — and the iolist encode ([`iolist_bytes`]) uses
-/// it, so a binary element is copied straight into the destination with no temporary.
-/// This function keeps the **owned** form deliberately: its callers (the codec's
-/// decoder, `binary_to_list/3`, `binary_part/3`) need a buffer that outlives a single
-/// closure (or a slice of one), so those sites' copies are unchanged and their
-/// measured cost stands (`tests/binconv_alloc.rs` pins 1 allocation / image bytes for
-/// the 4 KiB decode). Adopting the borrowing form on the decode path is a recorded
-/// follow-up, not part of this module's iolist work.
+/// This function keeps the **owned** form for the BIFs that need a buffer or a slice of
+/// one to outlive a single closure — `binary_to_list/1,3` (the byte list is built from
+/// a slice of it), `binary_to_float/1`, `integer_from_binary/2` and
+/// `atom_from_binary/3` (the text is parsed / interned after the read). Their copies
+/// are unchanged and their measured cost stands (`tests/binconv_alloc.rs`).
 fn bytes_arg(term: Eterm) -> Result<Vec<u8>> {
     bits::bytes(term)
 }
@@ -706,8 +686,45 @@ fn atom_from_binary(
 /// `unsupported_external_term` for an internal id with no resolvable local node, or a
 /// tag the codec cannot write).
 fn term_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let bytes = encode_image(ctx, args[0], &T2bOptions::default())?;
-    make_bin(ctx, &bytes)
+    // The plain path encodes into the thread's reusable buffer ([`ENCODE_SCRATCH`]):
+    // `make_bin` copies the image onto the context heap, so the buffer is dead the
+    // moment the term is built and its capacity can serve the next call. The bytes are
+    // the same encoder's — `Encoder::with_writer` over a writer with the encoder's own
+    // 128-byte reservation — so the image is byte-identical to `encode_image`'s
+    // (`Encoder::new` + `finish`), and only the allocation is reused.
+    with_encode_scratch(|scratch| {
+        let options = T2bOptions::default();
+        let encoder = term_encoder_with(ctx, args[0], &options, Some(scratch.writer()))?;
+        let writer = encoder.take_writer();
+        let image = make_bin(ctx, writer.as_slice())?;
+        scratch.recycle(writer);
+        Ok(image)
+    })
+}
+// The reusable output buffer behind `term_to_binary/1`'s plain path.
+//
+// `beam_codec`'s encoder owns its writer and `Encoder::take_writer`/`finish` move the
+// `Vec` out, so without this slot every `term_to_binary/1` allocated an image buffer
+// per call even though `make_bin` copies the image onto the context heap immediately
+// (the bytes never outlive the call). The buffer's **capacity** is reused; its
+// contents never are (`EncodeScratch::recycle` clears it), so an image is always the
+// current call's own bytes. It is the encode-side twin of [`DECODE_SCRATCH`] and
+// carries no term or codec state.
+thread_local! {
+    static ENCODE_SCRATCH: RefCell<Option<EncodeScratch>> = const { RefCell::new(None) };
+}
+/// Runs `body` with this thread's reusable encode buffer ([`ENCODE_SCRATCH`]).
+///
+/// The buffer is *taken* for the call — an [`Encoder`] owns its writer, and
+/// [`EncodeScratch::writer`] moves the `Vec` into it — and put back afterwards, so a
+/// nested encode starts from a fresh buffer instead of aliasing this one. A call that
+/// fails after taking the buffer leaves it empty (the capacity is re-acquired on the
+/// next call); no byte of any image depends on the slot.
+fn with_encode_scratch<T>(body: impl FnOnce(&mut EncodeScratch) -> T) -> T {
+    let mut scratch = ENCODE_SCRATCH.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    let out = body(&mut scratch);
+    ENCODE_SCRATCH.with(|cell| *cell.borrow_mut() = Some(scratch));
+    out
 }
 
 /// `term_to_binary(Term, Options)` — the `compressed` family and `{minor_version, N}`.
@@ -1006,6 +1023,21 @@ fn term_encoder<'c>(
     term: Eterm,
     options: &T2bOptions,
 ) -> Result<Encoder<'c>> {
+    term_encoder_with(ctx, term, options, None)
+}
+/// [`term_encoder`] over a caller-supplied output buffer.
+///
+/// `writer` is a recycled buffer ([`EncodeScratch::writer`]) for the plain
+/// `term_to_binary/1` path; `None` builds the encoder's own writer
+/// ([`Encoder::new`]), which is what every other caller wants. Both shapes encode the
+/// same bytes — [`Encoder::with_writer`] writes `VERSION_MAGIC` first, exactly like
+/// [`Encoder::new`] — so this only decides where the image is written.
+fn term_encoder_with<'c>(
+    ctx: &'c mut BifContext<'_>,
+    term: Eterm,
+    options: &T2bOptions,
+    writer: Option<beam_codec::writer::Writer>,
+) -> Result<Encoder<'c>> {
     let local = ctx.local_node();
     let identity = ctx.local_fun_identity(term)?;
     // `Encoder::new` writes the version byte into the writer first, so finishing the
@@ -1016,7 +1048,11 @@ fn term_encoder<'c>(
         1 => MinorVersion::V1,
         _ => MinorVersion::V2,
     };
-    let mut encoder = Encoder::new(ctx.atoms()).with_minor_version(minor_version);
+    let encoder = match writer {
+        Some(writer) => Encoder::with_writer(ctx.atoms(), writer),
+        None => Encoder::new(ctx.atoms()),
+    };
+    let mut encoder = encoder.with_minor_version(minor_version);
     if options.deterministic {
         encoder = encoder.with_deterministic();
     }
@@ -1567,7 +1603,22 @@ fn decode_term_bif(
     safe: bool,
     used: bool,
 ) -> Result<Eterm> {
-    let data = bytes_arg(input)?;
+    // The image is read through the borrowing accessor: this used to copy the whole
+    // image into a fresh `Vec` (one allocation plus a memmove of every byte) before the
+    // decoder could look at it. The decoder only *reads* the slice — a decoded term is
+    // built on the context heap, never aliased into the source — so the bytes are not
+    // needed past this call and the borrow can stay scoped here. A non-binary is the
+    // same `badarg` the copying form reported.
+    bits::with_bytes(input, |data| decode_term_image(ctx, data, safe, used))
+}
+/// [`decode_term_bif`]'s body over the borrowed image (see that function's docs for the
+/// `safe`/`used`/identity semantics).
+fn decode_term_image(
+    ctx: &mut BifContext<'_>,
+    data: &[u8],
+    safe: bool,
+    used: bool,
+) -> Result<Eterm> {
     // Read the local node identity *before* `ctx.heap()` — the accessor takes
     // `&mut self`, so it cannot be called while the heap is borrowed. It is installed
     // on the decoder through the codec's option seam so an incoming identifier that
@@ -1611,9 +1662,9 @@ fn decode_term_bif(
             // exactly as before.
             let decoded = match gate {
                 Some(gate) => {
-                    decode_term_with_options_and_gate_used(&data, heap, scratch, &options, gate)
+                    decode_term_with_options_and_gate_used(data, heap, scratch, &options, gate)
                 }
-                None => decode_term_with_options_used(&data, heap, scratch, &options),
+                None => decode_term_with_options_used(data, heap, scratch, &options),
             };
             // A failed decode leaves the scratch possibly ahead of the shared table (the
             // next call's `prefix_matches` rebuilds it); nothing is committed.
@@ -4117,5 +4168,34 @@ halt()."#;
         assert_eq!(reg.len(), 24);
         // `float_to_binary/3` is deliberately absent: erts-17.1 has no such BIF.
         assert!(!reg.contains("erlang", "float_to_binary", 3));
+    }
+
+    /// The `term_to_binary/1` fast path encodes into the thread's reusable buffer
+    /// ([`ENCODE_SCRATCH`]): two consecutive calls must agree with each other and with
+    /// `beam_codec::encode_term` (the `Encoder::new` + `finish` shape), so reusing the
+    /// buffer can never change an image.
+    #[test]
+    fn the_reused_encode_buffer_changes_no_byte() {
+        with_ctx(|ctx| {
+            let elems = [
+                beam_term::make_small(1),
+                beam_term::make_small(2),
+                beam_term::make_small(-3),
+            ];
+            let term = ctx.heap().tuple(&elems).expect("the tuple fits");
+            let first = term_to_binary_1(ctx, &[term]).expect("encodes");
+            let second = term_to_binary_1(ctx, &[term]).expect("encodes again");
+            let bytes = |t| bits::with_bytes(t, |b| Ok(b.to_vec())).expect("a binary");
+            assert_eq!(
+                bytes(first),
+                bytes(second),
+                "a recycled buffer is indistinguishable from a fresh one"
+            );
+            assert_eq!(
+                bytes(first),
+                beam_codec::encode_term(term, ctx.atoms()).expect("the reference encode"),
+                "the scratch path is `Encoder::new` + `finish`, byte for byte"
+            );
+        });
     }
 }
