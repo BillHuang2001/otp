@@ -171,10 +171,16 @@ The aligned and bit-granular sequences commit the window end exactly once, after
   Accepted as the last and only one, its own bit offset is `0` (it starts at the accumulator's window end), so the destination position it lands on is static and route (c) lowers it.
   No unproven shape can write a byte on that route: the door refuses at run time, in this order and with nothing written — a slot index that is not a `u32`, a target that is not this machine's writable accumulator, a window end that is not a whole number of bytes (`end_bits % 8 != 0`, C's `unit == 8` position gate), a source that is not a readable bitstring (`raw::heap_bits`: a non-bitstring, an engine match context or a bare `BinRef`), a null source base, a source window whose start is not byte-aligned, a source size that is not a multiple of 8 bits, an `end + size` overflow, a room shortfall against the payload's capacity, and source/destination byte ranges that overlap (a source that is a sub-binary of the accumulator's own payload).
 The source gate is **any byte-aligned bitstring window** — an on-heap `ErlHeapBits` and an off-heap refc binary alike — because the door reads the source's parts through `raw::heap_bits`, the very accessor the family's own `binary all` body uses (`create::segments::segment_source`), so the served copy and the `fallback` step share one definition of the source's bytes.
-- **A fresh non-append `[integer 8]`** (e.g. `emqx_base62:decode/2`'s temp `<<DecodeChar>>`):
-  `raw::make_binary` **allocates** a fresh result (an on-heap `ErlHeapBits` or the refc pair)
-  through the rooted seam, which a straight-line helper-free sequence cannot do without an
-  admission point. It stays on `jit_bitstr`.
+- **A bare (accumulator-less) `bs_create_bin`** — no `private_append` group, e.g.
+  `emqx_base62:decode/2`'s temp `<<DecodeChar>>` — is the **fresh** route, not a refusal:
+  `seam::fresh_plan` accepts a field list of statically sized unsigned big-endian `integer`
+  segments summing to `1..=64` bits, `CreateBinShape::of` reports it when the append plan
+  declines, and `create_fresh.rs` emits the sequence (every field's guarded load and
+  `is_small` test first, the fields packed into one word, then **one** positioned
+  `jit_make_heap_binary` call — the admission point the rooted reserve needs — and the
+  destination store). Anything the fresh plan declines (a `binary`/`string`/`float`/`utf*`
+  segment, a `Dynamic`/`All` width, a `little`/`signed`/`native` flag, a zero-width field, a
+  total past one word) stays on `jit_bitstr`.
 - **`BitGranular` + `ConstBytes`** in one plan: refused by the predicate (`CreateBinShape::of`
   -> `None`), because the aligned half would commit a window end before the bit fields have
   passed their own room check.
