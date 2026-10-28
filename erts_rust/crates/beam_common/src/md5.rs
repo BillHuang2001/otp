@@ -54,6 +54,10 @@
 //! `unwrap`), **safe Rust** (the crate root carries `#![forbid(unsafe_code)]`) and dependency-free
 //! (this crate's only dependency remains `libc`, which this module does not even need).
 //!
+//! The file sits at the ~1000-line target because roughly half of it is the `tests` module (the
+//! RFC 1321 vectors, the oracle-derived pad-boundary table and the two measurement diagnostics); the
+//! implementation itself is ~500 lines and has no second responsibility to split off.
+//!
 //! # Examples
 //!
 //! ```
