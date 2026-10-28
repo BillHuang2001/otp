@@ -256,6 +256,21 @@ Retained after the load, per `Module` (`../beam_loader/src/ir.rs:283`), with the
 **Post-boot retention by the code server is therefore at most ≈ 11.3 MiB, of which at most ≈ 10.5 MiB is the IR (the pre-fusion census bound; fusion only lowers it).** The dead share is small but free: `locals` 44.6 KiB + raw `meta` 2.2 KiB + the three decoded tables ≈ 214 KiB live (≈ 0.3–0.4 MiB of heap) with no consumer.
 `get_module_info(M, attributes|compile)` does **not** read the decoded tables — it re-decodes the raw bytes through a fresh 8 192-word scratch `Heap` per call (`src/context/module_info.rs:257-261`).
 
+### Boot cost by execution tier (measured: retired instructions are not time)
+Boot cost of `-noshell -eval 'halt().'` under `taskset -c 3`, 21 interleaved rounds, 1-min load 457–490 recorded per round (the retired-instruction method itself is `STARTUP_COST.md`'s):
+
+| program | boot CPU p50 (µs+stime, ms) | boot CPU min (ms) | peak RSS p50 (MiB) | retired user instr | cycles | task-clock p50 (ms) |
+|---|---|---|---|---|---|---|
+| default (`JitMode::Auto`, interpreter during the boot phase) | 130.9 | 123.1 | 49.62 | 1.19 G | 389 M | 124.8 |
+| `BEAM_RT_TIER=baseline` | 145.0 | 135.9 | 57.00 | 0.958 G | 433 M | 142.7 |
+| `BEAM_RT_TIER=interpreter` | — | — | — | 1.192 G | 366 M | 126.5 |
+| pre-round build | 166.2 | 155.4 | 58.93 | 1.089 G | 503 M | 161.4 |
+| system oracle (29.1.2 / erts-17.1.1) | 152.4 | 133.6 | 59.32 | 0.79 G | 468/366 M | 137–185 |
+
+The interpreter boot retires ~25 % **more** user instructions but ~10 % **fewer** cycles and ~13 % **less** CPU time than the baseline-JIT boot, because the JIT's compile work (`mmap`/`mprotect`/first-touch page faults on code buffers) is kernel-side and stall-bound — invisible to `cpu_core/instructions/u` and expensive in cycles/task-clock — so a retired-instruction count must not be read as a time ratio for this comparison.
+Steady state is unaffected by the tier rule: a per-element instruction count over the `list_walk` shape (body-recursive `sum([H|T])` over a 1 000-element list, taken as a two-point slope between N=1 000 and N=5 000 walks, i.e. 1 M vs 5 M walked elements) reads **350.2** retired instructions per walked element on the pre-round build, **352.2** on the default build and **352.4** with the baseline tier pinned, while the same shape under `BEAM_RT_TIER=interpreter` reads **2 543** per element — what a boot-entered process would cost for the rest of its life if the one-way upgrade at the first post-boot slice boundary did not happen, so the per-element parity between the default build and the pinned-baseline build is itself the evidence that the upgrade lands.
+No wall-clock conclusion is drawn from this session (the host's 1-min load was 457–490, so a wall ratio there is not a record); the load-robust instruments are `ru_utime+ru_stime`, `cpu_core/cycles/u` and `task-clock`.
+
 ## Test Strategy
 The crate's test strategy — the colocated unit suites, the seam/GC/owner-death suites, the one-per-contract integration suites, the per-call harnesses, the gate commands, the gate-equivalent full-corpus sweep and the test-hygiene rules — is **[`TEST_STRATEGY.md`](TEST_STRATEGY.md)**; per-suite routing and the distribution (A.5) evidence are **[`tests/CONTEXT.md`](tests/CONTEXT.md)**.
 The two-strategy workload-class A/B is `tests/gc_strategy_classes.rs` (the intended `MatureKind` asserted **inside** the measured process), with `tests/gc_strategy.rs`/`tests/gc_immix_payload.rs` the selection and scale controls — record in [`GC_STRATEGY_MEASURED.md`](GC_STRATEGY_MEASURED.md); the in-process `compile:file/2` (A.9) harness is `examples/compile_bench.rs`.
