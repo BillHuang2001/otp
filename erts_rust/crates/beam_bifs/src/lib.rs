@@ -62,6 +62,11 @@
 //!   `RuntimeHooks`), so a host gates a seam off the authoritative list instead of a
 //!   privately re-derived copy. (`AtomInterner` has no bounded consumer set and is
 //!   deliberately absent.)
+//! * `snifs` — the generated static-NIF roster ([`snifs`], [`Snif`]) behind
+//!   `erlang:system_info(snifs)`: the declared `bif.tab` rows, yielded in the oracle's
+//!   list order. Pure **data** re-exported at the crate root (unlike [`bif_tab`], which
+//!   is validation tooling), so a host that publishes `system_info(snifs)` never
+//!   re-derives the roster or its order.
 
 #![deny(unsafe_code)]
 
@@ -105,6 +110,7 @@ mod reason;
 mod records;
 mod registry;
 mod runtime;
+mod snifs;
 mod string;
 mod term_conv;
 mod term_ops;
@@ -131,6 +137,7 @@ pub use crate::hook_sets::{
 };
 pub use crate::reason::{exit_reason_from_term, reason_term_from_exit_reason};
 pub use crate::registry::{default_registry, BifFn, BifRegistry};
+pub use crate::snifs::{snifs, Snif};
 pub use crate::zlib::serves_local_call;
 
 /// The conventional glob-import surface for downstream crates.
