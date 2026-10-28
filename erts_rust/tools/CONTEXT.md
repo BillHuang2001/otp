@@ -72,9 +72,10 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
 - Oracle is the system Erlang on `PATH` (here OTP 29.1.2 / erts-17.1.1, while the tree pins OTP `30.0-rc0` / erts-`17.1`). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
-- **Gate coverage (verified against code):** `differential suite` reports `summary: total=3463 agree=3462
-  mismatch=0 unsupported=1 skipped=0` (a case may declare several contracts, so the per-contract totals
-  exceed `summary.total`). All nine contracts A.1–A.9 have corpus cases; use `differential list
+- **Gate coverage (verified against code):** a full `differential run` sweep folded with `differential merge` reports `summary: total=3463 agree=3459 mismatch=0 unsupported=1 skipped=0 oracle_drift=3` on this host (a case may declare several contracts, so the per-contract totals exceed `summary.total`).
+  The three drifts are the erts-version goldens (`system_info/version`, `boot_extra/system_info_version_is_frozen_17_1`, `nif_abi/system_info_frozen_fields`), where **our side reproduces the committed golden and the oracle does not** — see `differential/known-drift.txt`.
+  A `mismatch` means our runtime diverged from the golden and is never allowlisted; `oracle_drift` is a *host*-coupling verdict requiring positive evidence (`rust matched_golden && !oracle matched_golden && observables differ`) and is ratcheted exactly like a capability gap.
+  All nine contracts A.1–A.9 have corpus cases; use `differential list
   --by-contract` (or the run report) for the live per-contract split — never copy it into a CONTEXT.md
   (it drifts). A.4 (driver C ABI) is covered end to end by the `driver_c` group
   (a real C driver `.so` driven through the port lifecycle and the `port_command` echo round trip),
