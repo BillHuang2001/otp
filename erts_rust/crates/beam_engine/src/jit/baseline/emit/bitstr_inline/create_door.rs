@@ -22,30 +22,57 @@
 //! only the machine-private capacity lookup left as a call.
 //!
 //! [`emit_append_cursor`] replaces the whole-door helper the aligned route used to call with
+//! exactly this sequence — 25 instructions / **155 B** for a cached x-register accumulator,
+//! which [`emit_append_cursor`]'s own byte-length pin records:
 //!
 //! ```text
-//!   <the accumulator term, from its x-register or its Y slot>    ; no store
-//!   test rax, 1                     ; is_boxed        off fallback   (test_ri)
-//!   test rax, 3                     ; not a header    off fallback   (test_ri)
-//!   and  rax, -8                    ; boxed_val, IN PLACE
-//!   cmp  [rax + HEADER], HEADER_SUB_BITS  off fallback            (cmp_ri)
-//!   start == 0                      off fallback                 (mov + test)
-//!   base = [rax + BASE] & !FLAGS    off fallback / zero          (mov + and_ri + test)
-//!   end = [rax + END], end % 8 == 0 off fallback                 (mov + test_ri)
-//!   mov rdi,rt ; <position store> ; movabs rcx,tail_bits
-//!   movabs r11,jit_append_cursor ; call r11                      ; the one remaining call
-//!   test rax, rax ; je fallback                                  ; the door's own refusal
+//!   mov  rax, <accumulator>         ; cache register, or [rbx + x], or the Y slot  (no store)
+//!   test rax, 1                     ; is_boxed              off fallback   (test_ri imm32)
+//!   jne  fallback
+//!   test rax, 3                     ; not a bare header     off fallback   (test_ri imm32)
+//!   je   fallback
+//!   and  rax, -8                    ; boxed_val, IN PLACE                  (and_ri imm32)
+//!   mov  rcx, [rax + HEADER]
+//!   cmp  rcx, HEADER_SUB_BITS       ; not an ErlSubBits     off fallback   (cmp_ri imm32)
+//!   jne  fallback
+//!   mov  rcx, [rax + START]
+//!   test rcx, rcx                   ; start != 0            off fallback
+//!   jne  fallback
+//!   mov  rsi, [rax + BASE]
+//!   and  rsi, !FLAGS                ; the payload pointer                  (and_ri imm32)
+//!   test rsi, rsi                   ; null base             off fallback
+//!   je   fallback
+//!   mov  rdx, [rax + END]
+//!   test rdx, 7                     ; end % 8 != 0          off fallback   (test_ri imm32)
+//!   jne  fallback
+//!   mov  rdi, [rsp + RUNTIME_SLOT]  ; rdi = rt             (the ABI's first argument)
+//!   movabs rcx, tail_bits           ; rcx = the plan's tail width
+//!   movabs r11, jit_append_cursor
+//!   call r11                                                               ; the one call
+//!   test rax, rax                   ; the call's refusal    off fallback   ; the door's own
+//!   je   fallback
 //! ```
 //!
-//! `rax` answers the **byte cursor** `base + end / 8` on success and `0` on every refusal,
-//! which is exactly what the aligned field phase stores its bytes at.
+//! Every mask and constant guard is a **register-immediate** form (`imm32`), so no `movabs`
+//! appears in the guard group; the two `movabs` left are the tail width and the callee's
+//! address. `rax` answers the **byte cursor** `base + end / 8` on success and `0` on every
+//! refusal, which is exactly what the aligned field phase stores its bytes at.
+//!
+//! The door emits **no position store**: the block prologue already published this block's
+//! entry, a valid resume point whose re-execution re-runs the block prefix, and the call
+//! cannot raise, park, pre-empt, allocate or collect (see `## Nothing here publishes a
+//! position`).
+//!
+//! The door also emits **no pre-call spill**: the accumulator is read through [`Loc::load_x`]
+//! (a cached x-register comes out of its callee-saved machine register) or [`emit_y_slot_value`]
+//! (a `Y` slot), and nothing here needs `machine.x` or `machine.stack` to be written back.
 //!
 //! The boxed pointer is untagged **in place** (`and rax, -8`) rather than in a second
-//! register, and the accumulator's **term word is dead from that point on**: every later use
-//! of the accumulator re-reads it — from its x-register's cache register or from `machine.x`
-//! (`Loc::load_x`), or from its `Y` slot (`emit_y_slot_value`) — in phase (5)'s window-end
-//! commit and phase (6)'s destination store, and the post-call `test rax, rax` reads the
-//! **call's** answer, not the term. No path after the `and` can observe the untagged word.
+//! register, and the accumulator's **term word is dead from that point on**: the post-call
+//! `test rax, rax` reads the **call's** answer, and the phases after the door re-read the
+//! accumulator from its x-register or `Y` slot — once, in phase (5), which keeps that word in
+//! `rdx` across the window-end commit and the destination store. No path after the `and` can
+//! observe the untagged term word.
 //!
 //! # Why the proof is here and not in the helper
 //!
@@ -75,16 +102,48 @@
 //! re-executable: `fallback` is one interpreter step re-running the instruction with the
 //! same operands, and it must see an accumulator the block's prefix has not touched. The one
 //! mutation the build performs — the `ErlSubBits.end` advance — is emitted last, by
-//! [`super::super::create`]'s phase 5, after every field byte store.
+//! [`super::super::create`]'s phase 5, after every field byte store; the destination store
+//! that follows it writes a register or a stack slot, never memory the `fallback` can read as
+//! payload or window state.
+//!
+//! The door's own `rsp` frame is untouched (it reads `rt` out of the block's `rt` slot), and
+//! the `fallback` arm's own **spill** — `emit_step_and_continue` → `emit_helper_call`, which
+//! writes every dirty cached x-register back into `machine.x` before the step — is what keeps
+//! the deopt path sound: `jit_step_one` reads `machine.x`, so the block must not be the only
+//! holder of an x-register the interpreter step is about to observe. This door deliberately
+//! does **not** spill, because it also never leaves a cached x-register's authoritative value
+//! only in its machine register: `Loc::load_x` reads it without writing anything, and the
+//! call's answer is consumed from `rax` after the return.
+//!
+//! # Nothing here publishes a position
+//!
+//! The sequence emits **no** `Machine::current_code` store, so between the block prologue's
+//! publication and the next instruction's the published position names the **block entry**,
+//! not this call. That is sound because nothing in that window can observe a wrong position:
+//!
+//! 1. `jit_append_cursor` cannot raise, park, pre-empt, allocate or collect — it is a
+//!    read-only `&Machine` query (see its own docs), so no suspension, stacktrace or
+//!    pre-emption address is ever taken against this instruction;
+//! 2. the `fallback` arm publishes through `jit_step_one`'s own `(func, pc)` arguments, i.e.
+//!    the interpreter step stores this instruction's position itself before it runs the
+//!    instruction, exactly as the interpreter would;
+//! 3. a block exit or an in-block native transfer republishes — the driver's loop head
+//!    re-decodes `(func, pc)`, and `commit_in_block_entry` stores the target;
+//! 4. the block prologue already published a valid resume point (the block entry), and a
+//!    resume from it re-executes the block prefix, which re-derives everything this door reads
+//!    from the machine's own state;
+//! 5. no tier-side count (reduction, spill, `Y`-traffic) is charged here, so no counter that
+//!    a position store would bracket can disagree.
 //!
 //! # Registers
 //!
 //! Only caller-saved scratch: `rax` (the term, untagged in place, then the door's answer),
-//! `rcx`/`rdx` (the header / `start` compare scratch and a guard's constant, then the ABI's
-//! third and fourth arguments), `rsi` (the payload base, the ABI's second argument) and `rdi`
-//! (the runtime). `rbx` (`machine.x`'s base), `rsp` and every cache register are untouched, so
-//! `emit/regalloc.rs` needs no change; `rsi`/`rdx`/`rcx` are argument **registers**, i.e.
-//! nothing is kept live across the call.
+//! `rcx` (the header / `start` compare scratch, then the ABI's **fourth** argument — the
+//! plan's `tail_bits`), `rdx` (the window end, the ABI's **third** argument), `rsi` (the
+//! payload base, the ABI's **second** argument), `rdi` (the runtime, the ABI's first) and
+//! `r11` (the callee). `rbx` (`machine.x`'s base), `rsp` and every cache register are
+//! untouched, so `emit/regalloc.rs` needs no change; `rsi`/`rdx`/`rcx` are argument
+//! **registers**, i.e. nothing is kept live across the call.
 //!
 //! # The frozen layouts it reads
 //!
@@ -130,9 +189,10 @@ const SUB_BITS_POINTER_MASK: i64 = !(ERL_SUB_BITS_FLAG_MASK as i64);
 
 // Every mask and constant guard below is used through one of [`CodeBuffer`]'s
 // **register-immediate** encoders (`test_ri`/`cmp_ri`/`and_ri`/`add_ri`), which take the
-// constant as a sign-extended `imm32`. The four twins below are that form, each pinned
+// constant as a sign-extended `imm32`. The five twins below are that form, each pinned
 // against the `i64` item it narrows, so a mask that outgrew an `imm32` would fail the build
-// rather than silently drop its high bits.
+// rather than silently drop its high bits. (`POINTER_MASK_I32` is shared with
+// [`super::super::create`]'s window-end commit, which reuses it rather than duplicating it.)
 
 /// [`NOT_BOXED_MASK`] as the `imm32` of [`CodeBuffer::test_ri`].
 const NOT_BOXED_MASK_I32: i32 = NOT_BOXED_MASK as i32;
@@ -277,4 +337,50 @@ pub(super) fn emit_append_cursor(
     // (8) The door's own refusal point — and the only test of `rax` on this path.
     buffer.test_rr(Reg::Rax, Reg::Rax)?;
     buffer.jcc(Cond::E, fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Emit the door for a cached x-register accumulator and return the emitted byte length.
+    fn emitted_len() -> usize {
+        let mut allocation = Allocation::default();
+        // `x(0)` lives in its callee-saved machine register for the whole block.
+        allocation.slots.push((0, Reg::R12));
+        let mut buffer = CodeBuffer::new().expect("an executable code buffer");
+        let fallback = buffer.label();
+        let mut highest_touched = None;
+        emit_append_cursor(&mut buffer, &allocation, Loc::X(0), 40, fallback, &mut highest_touched)
+            .expect("the aligned append door emits");
+        buffer.len()
+    }
+
+    /// The door's emitted sequence, byte for byte — the invariant that no `movabs` (10 B) crept
+    /// back into the guard group and no extra instruction was added anywhere.
+    ///
+    /// Fixed encodings make the length a closed-form constant, so the pin is deterministic.
+    /// Update it **deliberately** whenever the sequence legitimately changes, and re-state the
+    /// breakdown below.
+    #[test]
+    fn the_emitted_sequence_has_the_pinned_length() {
+        // 25 instructions / 155 B for a cached x-register accumulator:
+        //   3 B    accumulator load             1 instr   `mov rax, r12`
+        // 112 B    guard group                 18 instrs `movabs`-free, imm32 forms only
+        //  31 B    marshalling + call           4 instrs
+        //   9 B    refusal                      2 instrs
+        // 155 B   total                       25 instrs
+        //
+        // Marshalling + call (31 B / 4): `mov rdi, [rsp+RUNTIME_SLOT]` (8 B, base `rsp`),
+        //   `movabs rcx, tail_bits` (10 B), `movabs r11, jit_append_cursor` (10 B), `call r11`
+        //   (3 B). Refusal (9 B / 2): `test rax, rax` (3 B) + `je fallback` (6 B) — the door's
+        //   own last two instructions.
+        // The guard group is where a regression would show: a `movabs` (10 B) in place of an
+        //   imm32 test/and (6 B) adds 4 B per occurrence, and any extra instruction shows up
+        //   here. Guard order (each `jcc` going to `fallback`): `test rax, NOT_BOXED`/`jne`,
+        //   `test rax, PRIMARY`/`je`, `and rax, POINTER_MASK`, `mov rcx, [rax+HEADER]`/
+        //   `cmp rcx`/`jne`, `mov rcx, [rax+START]`/`test rcx`/`jne`, `mov rsi, [rax+BASE]`/
+        //   `and rsi`/`test rsi`/`je`, `mov rdx, [rax+END]`/`test rdx, 7`/`jne`.
+        assert_eq!(emitted_len(), 155, "the pinned post-L4..L6 sequence");
+    }
 }
