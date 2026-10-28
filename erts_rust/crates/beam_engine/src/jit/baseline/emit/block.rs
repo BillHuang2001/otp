@@ -65,7 +65,10 @@ use super::operands;
 use super::prologue::emit_block_prologue;
 use super::r#move::{try_inline_move, try_inline_swap};
 use super::select::try_inline_select_val;
-use super::super::call::{jit_call_store, jit_call_store_linked, CALL_STORED};
+use super::super::call::{
+    jit_call_store, jit_call_store_in_machine, jit_call_store_in_machine_linked,
+    jit_call_store_linked, CALL_STORED,
+};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
     encode_local_call, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
@@ -733,50 +736,78 @@ pub(crate) fn emit_block(
             Instr::Call { target, arity } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
                     // The helper is handed the **whole compile-time resolution** of the
-                    // instruction — the call site, the resolved callee (and its `pc`,
-                    // which the transfer enters) and the `arity` operand — so it never
-                    // re-reads `module.functions` nor re-resolves a label per call (see
-                    // `super::super::call`). `arity` is matched out of the pattern here
-                    // rather than ignored: it is the seam's register-argument count.
+                    // instruction — the call site and the resolved callee (and its `pc`,
+                    // which the transfer enters) — so it never re-reads
+                    // `module.functions` nor re-resolves a label per call (see
+                    // `super::super::call`). `arity` rides the seam-consulting shape only:
+                    // it is the seam's register-argument count.
                     //
                     // The **linked** callee needs no resolution, so it keeps the plain
                     // helper (byte-identical to before); an uncompiled one asks for the
                     // linking twin.
                     let linked = linker.is_compiled(target_func, target_pc);
-                    let helper: *const () = if linked {
-                        jit_call_store as *const ()
-                    } else {
-                        jit_call_store_linked as *const ()
-                    };
-                    emit_helper_call(
-                        buffer,
-                        allocation,
-                        helper,
-                        &[
-                            i64::from(func),
-                            i64::from(pc),
-                            i64::from(target_func),
-                            i64::from(target_pc),
-                            i64::from(*arity),
-                        ],
-                        pc,
-                    )?;
-                    buffer.mov_ri(Reg::R11, CALL_STORED)?;
-                    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
-                    buffer.jcc(Cond::Ne, done)?;
-                    if linked {
-                        linker.emit_exit(
+                    // The same inline verdict gate the two tail forms use. A memoized
+                    // `Declined`/`Unnameable` byte — the seam's own `Ok(None)` answer —
+                    // runs the seam-skipping store helper; everything else (a callee's
+                    // first call, a host-served callee, an armed invalidation, an absent
+                    // table) takes the seam-consulting helper, byte for byte the sequence
+                    // this arm emitted before the gate existed. Both arms answer
+                    // `CALL_STORED` on a store, so the compare and the compile-time-chosen
+                    // transfer below are shared shape-for-shape.
+                    let (Ok(callee_disp), true) = (i32::try_from(target_func), true) else {
+                        // A callee index that cannot be a `disp32` slot offset keeps the
+                        // ungated sequence: the gate would have to add an index register,
+                        // which this emitter's addressing modes do not offer, and silently
+                        // narrowing the index would read another callee's verdict.
+                        emit_call_store(
                             buffer,
                             allocation,
                             done,
+                            &linker,
+                            func,
+                            pc,
                             target_func,
                             target_pc,
-                            pc,
-                            ExitSpill::Done,
+                            *arity,
+                            linked,
+                            CallSeam::Consult,
                         )?;
-                    } else {
-                        emit_in_block_call(buffer, allocation, done, target_func, target_pc)?;
-                    }
+                        terminated = true;
+                        break;
+                    };
+                    let reject = buffer.label();
+                    let accepted = buffer.label();
+                    emit_local_call_gate(buffer, callee_disp, reject, accepted)?;
+                    // ── the reject arm: exactly today's sequence ─────────────────────
+                    buffer.bind(reject)?;
+                    emit_call_store(
+                        buffer,
+                        allocation,
+                        done,
+                        &linker,
+                        func,
+                        pc,
+                        target_func,
+                        target_pc,
+                        *arity,
+                        linked,
+                        CallSeam::Consult,
+                    )?;
+                    // ── the accepted arm: the seam-skipping store helper ─────────────
+                    buffer.bind(accepted)?;
+                    emit_call_store(
+                        buffer,
+                        allocation,
+                        done,
+                        &linker,
+                        func,
+                        pc,
+                        target_func,
+                        target_pc,
+                        *arity,
+                        linked,
+                        CallSeam::Skip,
+                    )?;
                     terminated = true;
                     break;
                 }
@@ -1650,6 +1681,101 @@ fn emit_local_call_helper(
     buffer.jcc(Cond::Ne, done)
 }
 
+
+/// Which store helper the frame-preserving `call`'s arm asks for — the only difference
+/// between the gate's two arms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallSeam {
+    /// The seam-consulting helper (`jit_call_store` / `jit_call_store_linked`): every
+    /// reject of [`emit_local_call_gate`], and the whole sequence for a callee index the
+    /// gate cannot address.
+    Consult,
+    /// The seam-skipping helper (`jit_call_store_in_machine` /
+    /// `jit_call_store_in_machine_linked`): the gate read a memoized
+    /// `Declined`/`Unnameable` verdict, so the store is the seam's declined path and the
+    /// `arity` operand (the seam's only consumer) is no longer passed.
+    Skip,
+}
+
+/// Emit the frame-preserving `call`'s **store-and-transfer** sequence: one store helper,
+/// the [`CALL_STORED`] compare, and the compile-time-selected transfer to the callee.
+///
+/// The two arms of the inline verdict gate share this shape exactly — only the store
+/// helper and its argument list differ ([`CallSeam`]) — so an accepted callee takes the
+/// same `cmp`s, the same `jcc Ne, done` and the same transfer as a rejected one, and the
+/// helper's answer has one meaning on both arms.
+///
+/// The transfer is one of two, chosen here at compile time:
+///
+/// * the callee's block is part of **this** compilation (`linker.is_compiled`) — the
+///   linker's linked exit, with [`ExitSpill::Done`] because the helper call in front of it
+///   already stored the dirty set at this `pc`;
+/// * it is another function the **lazy** artifact has not compiled — the in-block call
+///   ([`emit_in_block_call`]), which tail-jumps into the callee's entry the *linked*
+///   helper resolved (and, on a decline, hands the driver the resolved target's word).
+///
+/// The continuation check is the **frame-only** body of `emit/heap.rs`'s private
+/// `emit_frame_change_continue`, re-implemented here because the word it compares against
+/// differs: a served non-tail local call folds its `Step::Next` to
+/// `encode_target(func, pc + 1)`, so the store needs a sentinel of its own
+/// ([`CALL_STORED`]). It deliberately does **not** refill — the helper wrote no x-register
+/// on the transfer path, and a `call` has no x-register operand — and, like the two tail
+/// forms, it must not refill either: the exit below spills first, which is the tier's
+/// whole liveness/root-set model.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_store(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    linker: &Linker<'_>,
+    func: u32,
+    pc: u32,
+    callee: u32,
+    callee_pc: u32,
+    arity: u32,
+    linked: bool,
+    seam: CallSeam,
+) -> Result<()> {
+    let helper: *const () = match (linked, seam) {
+        (true, CallSeam::Consult) => jit_call_store as *const (),
+        (false, CallSeam::Consult) => jit_call_store_linked as *const (),
+        (true, CallSeam::Skip) => jit_call_store_in_machine as *const (),
+        (false, CallSeam::Skip) => jit_call_store_in_machine_linked as *const (),
+    };
+    // The call site and the resolved target, in `emit_helper_call`'s argument order; the
+    // `arity` operand only when the seam is consulted (it is that seam's register-argument
+    // count, and `emit_helper_call` emits one `movabs` per argument).
+    let mut args = [0_i64; 5];
+    args[0] = i64::from(func);
+    args[1] = i64::from(pc);
+    args[2] = i64::from(callee);
+    args[3] = i64::from(callee_pc);
+    let used = match seam {
+        CallSeam::Consult => {
+            args[4] = i64::from(arity);
+            args.len()
+        }
+        CallSeam::Skip => args.len() - 1,
+    };
+    emit_helper_call(buffer, allocation, helper, &args[..used], pc)?;
+    buffer.mov_ri(Reg::R11, CALL_STORED)?;
+    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+    buffer.jcc(Cond::Ne, done)?;
+    if linked {
+        linker.emit_exit(
+            buffer,
+            allocation,
+            done,
+            callee,
+            callee_pc,
+            pc,
+            ExitSpill::Done,
+        )?;
+    } else {
+        emit_in_block_call(buffer, allocation, done, callee, callee_pc)?;
+    }
+    Ok(())
+}
 
 /// Emit the native arm for one `call_ext*` instruction: the `jit_ext_call` helper
 /// (import resolution + frame discipline) followed by the same continuation check a

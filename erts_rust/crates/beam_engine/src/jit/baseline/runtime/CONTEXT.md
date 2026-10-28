@@ -136,3 +136,11 @@ The reduction charge and the in-block transfer are pinned by `tests/jit_reductio
 - `../CONTEXT.md` → the tier contract (the two artifact layouts, the deopt rule, the inline set, the routing table).
 - `../emit/CONTEXT.md` → the emitters that call these helpers; `../emit/prologue/CONTEXT.md` → the prologue, the position store and the Y-window publish/refresh gates.
 - `../measure/CONTEXT.md` → the measured round-trip, reduction and in-block-transfer figures.
+
+## The inline local-call verdict gate at `Instr::Call`
+
+The frame-preserving `Instr::Call` arm emits `emit::block::emit_local_call_gate` in front of **two** helper sequences, exactly as the tail forms (`call_only`/`call_last`) already do.
+Reject arm: unchanged `jit_call_store`/`jit_call_store_linked`, `movabs r11, CALL_STORED` + `cmp rax, r11` + `jcc Ne, done`, then the compile-time-selected `ExitSpill::Done` exit or `emit_in_block_call`.
+Accept arm: `jit_call_store_in_machine`/`jit_call_store_in_machine_linked` with the same four immediates (`func`, `pc`, callee func, callee pc) and the same shared `CALL_STORED` discriminator and exit, one `movabs` shorter because the seam-owned `arity` is gone.
+`callee_disp` is the callee's function index, so a target function index that is not an `i32` keeps today's single ungated sequence (the same fallback the tail sites use).
+`emit::block::emit_call_store` is the one emitter both arms go through (`CallSeam::{Consult, Skip}`), so no byte of the reject arm moved.

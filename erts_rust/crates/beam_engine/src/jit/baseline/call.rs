@@ -131,7 +131,10 @@
 #![allow(unsafe_code)]
 
 use beam_common::BeamError;
-use beam_loader::{Instr, Module};
+// `Instr` is read only by the debug-build resolution self-check.
+#[cfg(debug_assertions)]
+use beam_loader::Instr;
+use beam_loader::Module;
 
 use crate::context::ExecutionContext;
 use crate::interpreter::{ImportFrame, LabelMap};
@@ -187,12 +190,36 @@ enum CallMode {
     StoreAndLink,
 }
 
+/// Whether the helper consults the host's local-call seam before storing.
+///
+/// The two `jit_call_store*` entry points consult it and the two
+/// `jit_call_store_in_machine*` ones do not; the emitted block picks between them with
+/// [`emit_local_call_gate`](super::emit::emit_local_call_gate), whose accepted arm means
+/// the machine's memoized verdict is already `Declined`/`Unnameable` — i.e. the seam's own
+/// `Ok(None)` answer, derived once per callee.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeamKind {
+    /// Ask the seam first, on this very call ([`jit_call_store`] /
+    /// [`jit_call_store_linked`]): [`Verdict::Unknown`](crate::machine::Verdict) (a
+    /// callee's first call), a `Served` callee, an armed invalidation and every other
+    /// path the gate rejects to. Carries the instruction's `arity` operand, the seam's
+    /// register-argument count.
+    Consult(u32),
+    /// Skip the seam: the emitted gate read the memoized "enter this callee in this
+    /// machine" verdict, so the store is the seam's declined path
+    /// ([`jit_call_store_in_machine`] / [`jit_call_store_in_machine_linked`]) and no
+    /// `arity` is needed — only the seam consumed it.
+    Skip,
+}
+
 /// The compile-time-resolved facts about the local `call` a block emitted this helper
-/// for: the call site (`func`, `pc`) plus everything the emitter already knows about the
-/// instruction — its resolved target (`callee`, `callee_pc`) and its `arity` operand.
+/// for: the call site (`func`, `pc`) plus the resolved target (`callee`, `callee_pc`) the
+/// emitter had to compute for its transfer anyway.
 ///
 /// Passing them is what keeps the helper off the emitter's own work: it is exactly the
 /// interpreter arm's step-1 `resolve` result, handed over instead of re-derived per call.
+/// The instruction's `arity` operand rides the [`SeamKind`] instead, because the seam is
+/// its only consumer.
 #[derive(Clone, Copy, Debug)]
 struct CallSite {
     /// The **calling** function index.
@@ -207,9 +234,6 @@ struct CallSite {
     /// over the whole resolution and a debug build can prove the pair is the
     /// instruction's own.
     callee_pc: u32,
-    /// The instruction's `arity` operand: the callee's register-argument count, which
-    /// only the local-call seam consumes.
-    arity: u32,
 }
 
 /// Store the continuation of the local `call` at `(func, pc)` — or report what to do
@@ -242,7 +266,17 @@ pub(crate) extern "C" fn jit_call_store(
     callee_pc: u32,
     arity: u32,
 ) -> i64 {
-    call_store_impl(rt, func, pc, callee, callee_pc, arity, CallMode::Store)
+    call_store_impl(
+        rt,
+        CallSite {
+            func,
+            pc,
+            callee,
+            callee_pc,
+        },
+        CallMode::Store,
+        SeamKind::Consult(arity),
+    )
 }
 
 /// [`jit_call_store`] for a callee whose block is **not** part of this compilation (the
@@ -271,33 +305,97 @@ pub(crate) extern "C" fn jit_call_store_linked(
     callee_pc: u32,
     arity: u32,
 ) -> i64 {
-    call_store_impl(rt, func, pc, callee, callee_pc, arity, CallMode::StoreAndLink)
+    call_store_impl(
+        rt,
+        CallSite {
+            func,
+            pc,
+            callee,
+            callee_pc,
+        },
+        CallMode::StoreAndLink,
+        SeamKind::Consult(arity),
+    )
 }
 
-/// The body both `extern "C"` entry points share: the store + the local-call seam
-/// ([`store_continuation`]), then — for [`CallMode::StoreAndLink`] only, and only when the
-/// continuation was actually stored — the in-block transfer resolution
-/// ([`enter_in_block`](super::runtime::enter_in_block)).
+/// [`jit_call_store`] for a callee whose host verdict is **already known**: the emitted
+/// block's inline verdict gate (`emit::emit_local_call_gate`) read a memoized
+/// `Declined`/`Unnameable` byte for this callee, which is the seam's own `Ok(None)` answer
+/// (`Verdict::enters_in_machine`), so this helper performs the store half only and never
+/// consults the host.
+///
+/// It is the seam-declined arm of [`jit_call_store`] with the seam removed: the very same
+/// [`store_only`] body — the call site (`func`, `pc + 1`) tagged with the context
+/// executing now, and the same out-of-line [`fold_error`] on a frame-less store — and the
+/// same [`CALL_STORED`] answer, so the emitted `cmp`/`jcc` and the compile-time-selected
+/// transfer are identical to the gated helper's.
+///
+/// Four arguments instead of five: `arity` existed only for the seam, and
+/// `emit_helper_call` emits one `movabs` per argument, so dropping it is what keeps the
+/// accepted arm cheaper than the reject arm it replaces on the hot path.
+pub(crate) extern "C" fn jit_call_store_in_machine(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    callee: u32,
+    callee_pc: u32,
+) -> i64 {
+    call_store_impl(
+        rt,
+        CallSite {
+            func,
+            pc,
+            callee,
+            callee_pc,
+        },
+        CallMode::Store,
+        SeamKind::Skip,
+    )
+}
+
+/// [`jit_call_store_linked`] for a callee whose host verdict is **already known** — the
+/// [`jit_call_store_in_machine`] twin: the store-only arm plus the same in-block transfer
+/// resolution on the `StoreAndLink` mode (lazy compile, register-file bound, the skipped
+/// driver iteration), so the accepted arm of the emitted gate costs one store helper and
+/// no seam consultation while keeping the transfer the linked shape had.
+pub(crate) extern "C" fn jit_call_store_in_machine_linked(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    callee: u32,
+    callee_pc: u32,
+) -> i64 {
+    call_store_impl(
+        rt,
+        CallSite {
+            func,
+            pc,
+            callee,
+            callee_pc,
+        },
+        CallMode::StoreAndLink,
+        SeamKind::Skip,
+    )
+}
+
+/// The body all four `extern "C"` entry points share: the store half — through the
+/// host's local-call seam ([`store_continuation`]) or, for [`SeamKind::Skip`], the very
+/// same store without it ([`store_only`]) — then the transfer half
+/// ([`resolve_transfer`]) and the block-ABI answer ([`finish`]).
+///
+/// One definition each: the four entry points differ only in [`CallMode`] (the transfer
+/// shape) and [`SeamKind`] (whether the seam runs), so no store or transfer logic is
+/// duplicated across them.
 ///
 /// It allocates no BEAM-heap term: resolving the callee's entry may lazily **compile** that
 /// function, which allocates Rust/machine-code memory only, so no GC root-set publication
 /// is involved and the machine's registers are untouched.
 fn call_store_impl(
     rt: *mut JitRuntime<'_>,
-    func: u32,
-    pc: u32,
-    callee: u32,
-    callee_pc: u32,
-    arity: u32,
+    site: CallSite,
     mode: CallMode,
+    seam: SeamKind,
 ) -> i64 {
-    let site = CallSite {
-        func,
-        pc,
-        callee,
-        callee_pc,
-        arity,
-    };
     let outcome = {
         // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
         // `JitRuntime` and never aliases it for the duration of the call; every pointer
@@ -312,29 +410,51 @@ fn call_store_impl(
         // SAFETY: `runtime.module` points at the module the driver is running, which
         // outlives the loop.
         let module = unsafe { &*runtime.module };
-        // SAFETY: `runtime.entry_module` points at the run's entry module, which the
-        // driver holds alive for the whole loop.
-        let entry_module = unsafe { &*runtime.entry_module };
         // SAFETY: `runtime.labels` points at the driver's `labels` local, which outlives
         // the loop.
         let labels = unsafe { &*runtime.labels };
-        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as
-        // a raw pointer; the driver holds no `&mut` to it while the helper runs.
-        let ctx = unsafe { &mut *runtime.ctx };
-
-        store_continuation(machine, entry_module, module, labels, site, ctx)
+        match seam {
+            SeamKind::Consult(arity) => {
+                // SAFETY: `runtime.entry_module` points at the run's entry module, which
+                // the driver holds alive for the whole loop.
+                let entry_module = unsafe { &*runtime.entry_module };
+                // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext`
+                // reborrowed as a raw pointer; the driver holds no `&mut` to it while the
+                // helper runs.
+                let ctx = unsafe { &mut *runtime.ctx };
+                store_continuation(machine, entry_module, module, labels, site, arity, ctx)
+            }
+            // The seam's answer is memoized as "enter this callee in this machine", so the
+            // store is its declined path and nothing consults the host.
+            SeamKind::Skip => store_only(machine, module, labels, site, None),
+        }
     };
-    // The transfer is resolved only for the linked entry point and only once the
-    // continuation is in place: a **served** callee's own code never runs, so it must get
-    // neither a return address nor a transfer, and a folded diagnostic has already left.
-    let outcome = match (outcome, mode) {
+    let outcome = resolve_transfer(rt, &site, outcome, mode);
+    finish(rt, &site, outcome)
+}
+
+/// The **transfer half**: for [`CallMode::StoreAndLink`] and a stored continuation, resolve
+/// the callee's native entry so the emitted block can tail-jump into it, performing the
+/// driver iteration the transfer replaces (position store, reduction bump, pre-emption
+/// charge — all inside [`enter_in_block`](super::runtime::enter_in_block)).
+///
+/// Taken **only** once the continuation is in place: a served callee's own code never runs,
+/// so it must get neither a return address nor a transfer, and a folded diagnostic has
+/// already left. One definition for all four entry points.
+fn resolve_transfer(
+    rt: *mut JitRuntime<'_>,
+    site: &CallSite,
+    outcome: CallOutcome,
+    mode: CallMode,
+) -> CallOutcome {
+    match (outcome, mode) {
         (CallOutcome::Stored, CallMode::StoreAndLink) => {
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver
-            // owns; the borrows derived from it above are dead by now (the outcome owns no
-            // reference into it), so this borrow does not alias them.
+            // owns; the borrows derived from it in `call_store_impl` are dead by now (the
+            // outcome owns no reference into it), so this borrow does not alias them.
             let runtime = unsafe { &mut *rt };
-            let target = encode_target(callee, callee_pc);
-            let word = super::runtime::enter_in_block(runtime, callee, callee_pc);
+            let target = encode_target(site.callee, site.callee_pc);
+            let word = super::runtime::enter_in_block(runtime, site.callee, site.callee_pc);
             // The in-block transfer was taken exactly when the resolver published an entry;
             // a decline (no artifact, an uncovered address, a failed lazy compile, an
             // unsatisfied register bound) and a refused pre-emption charge leave it null.
@@ -347,23 +467,30 @@ fn call_store_impl(
             }
         }
         (outcome, _) => outcome,
-    };
+    }
+}
+
+/// The **block-ABI answer**: [`CALL_STORED`] for a stored continuation, the carried word
+/// otherwise, and a folded step (a served callee's, or a raise — `set_continuation`'s and
+/// the seam's alike) through [`fold_step`], the one definition of that encoding.
+fn finish(rt: *mut JitRuntime<'_>, site: &CallSite, outcome: CallOutcome) -> i64 {
     match outcome {
         CallOutcome::Stored => CALL_STORED,
         CallOutcome::Word(word) => word,
         CallOutcome::Fold(step) => {
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver
-            // owns; the `&mut` derived from it above is dead by now, so this borrow does
+            // owns; the `&mut` derived from it earlier is dead by now, so this borrow does
             // not alias it.
             let runtime = unsafe { &mut *rt };
-            fold_step(runtime, *step, func, pc)
+            fold_step(runtime, *step, site.func, site.pc)
         }
     }
 }
 
-/// The Rust body of [`jit_call_store`] — separate from the `extern "C"` helper so the
-/// exit path's borrows are provably dead before [`fold_step`] takes the runtime again
-/// (the same split [`jit_step_one`](super::jit_step_one)/
+/// The Rust body of the two **seam-consulting** entry points: the host seam's answer, or
+/// the continuation store its declined path takes ([`store_only`]). Separate from the
+/// `extern "C"` helper so the exit path's borrows are provably dead before [`fold_step`]
+/// takes the runtime again (the same split [`jit_step_one`](super::jit_step_one)/
 /// [`jit_local_call`](super::jit_local_call) use).
 fn store_continuation(
     machine: &mut Machine,
@@ -371,33 +498,13 @@ fn store_continuation(
     module: &Module,
     labels: &LabelMap,
     site: CallSite,
+    arity: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> CallOutcome {
-    let CallSite {
-        func,
-        pc,
-        callee,
-        callee_pc,
-        arity,
-    } = site;
-    // The emitter's arguments ARE the interpreter arm's step-1 `resolve` result, so a
-    // release build has nothing left to derive. A debug build proves it: the address
-    // names this very `call`, its `arity` operand is the one handed to the seam, and the
-    // resolved pair is the resolution of the instruction's own target label. This is a
-    // `debug_assert!`, never a run-time branch — the shipped path pays nothing for it.
-    debug_assert!(
-        match module
-            .functions
-            .get(func as usize)
-            .and_then(|function| function.code.get(pc as usize))
-        {
-            Some(Instr::Call { target, arity: operand }) =>
-                *operand == arity
-                    && matches!(labels.resolve(*target), Ok(resolved) if resolved == (callee, callee_pc)),
-            _ => false,
-        },
-        "jit_call_store: the emitter passes the `call`'s own resolution for          (func={func}, pc={pc})"
-    );
+    let CallSite { func, pc, callee, .. } = site;
+    // The emitter's arguments ARE the interpreter arm's step-1 `resolve` result — proved
+    // in debug builds, paid for by no release build (see [`debug_assert_resolution`]).
+    debug_assert_resolution(&site, module, labels, Some(arity));
     // Step 2: the host's local-call seam, **before** anything is stored — a served
     // callee's code never runs, so it must not be left a return address.
     match machine.local_call_seam(
@@ -425,19 +532,79 @@ fn store_continuation(
         // Step 3: the continuation store, byte for byte what the interpreter's arm
         // stores — the call site (`func`, `pc + 1`) tagged with the context executing
         // now. `arity` plays no part in it.
-        Ok(None) => {
-            let continuation = Continuation::Address {
-                func,
-                pc: pc + 1,
-                context: machine.current_context(),
-            };
-            match machine.set_continuation(continuation) {
-                Ok(()) => CallOutcome::Stored,
-                Err(err) => fold_error(machine, module, Box::new(err), func, pc),
-            }
-        }
+        Ok(None) => store_only(machine, module, labels, site, Some(arity)),
     }
 }
+
+/// The **store half** of the local `call`, without the host seam: the interpreter's
+/// continuation store, byte for byte — the call site (`func`, `pc + 1`) tagged with the
+/// context executing **now** — and the same out-of-line [`fold_error`] when there is no
+/// live frame to take it.
+///
+/// One definition for both routes into it: the seam's declined arm (with the instruction's
+/// `arity` in hand, so the debug self-check can compare it) and the emitted gate's accepted
+/// arm ([`SeamKind::Skip`], where `arity` is `None` because only the seam ever consumed
+/// it). The store is **not** inlined into the emitted code: the continuation slot lives in
+/// `Machine::frames`, which a compiled block cannot address.
+#[inline]
+fn store_only(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &LabelMap,
+    site: CallSite,
+    arity: Option<u32>,
+) -> CallOutcome {
+    debug_assert_resolution(&site, module, labels, arity);
+    let continuation = Continuation::Address {
+        func: site.func,
+        pc: site.pc + 1,
+        context: machine.current_context(),
+    };
+    match machine.set_continuation(continuation) {
+        Ok(()) => CallOutcome::Stored,
+        Err(err) => fold_error(machine, module, Box::new(err), site.func, site.pc),
+    }
+}
+
+/// Debug-build self-check: the emitter's arguments ARE the interpreter arm's step-1
+/// `resolve` result, so a release build has nothing left to derive and pays nothing here.
+///
+/// What is proved: the address names this very `call`, its resolved pair is the resolution
+/// of the instruction's own target label, and — when the caller still carries it — the
+/// `arity` operand is the one handed to the seam.
+#[cfg(debug_assertions)]
+fn debug_assert_resolution(
+    site: &CallSite,
+    module: &Module,
+    labels: &LabelMap,
+    arity: Option<u32>,
+) {
+    let CallSite {
+        func,
+        pc,
+        callee,
+        callee_pc,
+    } = *site;
+    debug_assert!(
+        match module
+            .functions
+            .get(func as usize)
+            .and_then(|function| function.code.get(pc as usize))
+        {
+            Some(Instr::Call { target, arity: operand }) =>
+                arity.map_or(true, |arity| arity == *operand)
+                    && matches!(labels.resolve(*target), Ok(resolved) if resolved == (callee, callee_pc)),
+            _ => false,
+        },
+        "jit_call_store: the emitter passes the `call`'s own resolution for (func={func}, pc={pc})"
+    );
+}
+
+/// Release build: the shipped path derives nothing, so the self-check is an empty body the
+/// optimiser removes (the arguments are still passed, at zero cost).
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn debug_assert_resolution(_: &CallSite, _: &Module, _: &LabelMap, _: Option<u32>) {}
 
 /// The local-call seam's **served** arm, out of line: record the step's own position and
 /// hand the folded step to the driver.

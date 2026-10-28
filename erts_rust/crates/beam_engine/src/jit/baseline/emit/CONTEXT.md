@@ -417,3 +417,11 @@ driver-side (re)publication before any emitted code can use a store:
 - **The Y-window publication must be re-derivable at every enterable address.** The window follows from `Machine` state alone (`push_frame_window`'s `(y_base, y_count)` on a push, `refresh_y_base` on a `trim`/pop), so a block entry or a resumed slice can always re-derive it: the in-block `allocate`/`allocate_heap`/`trim` helper re-publishes it on the arm that continues the block, a block entry re-executes the block prefix, and the prologue publishes whenever the block's first Y access is not preceded by such a helper.
   The **post-publish alternate** is inside that set and owes it nothing: `jit_deallocate_return` re-publishes the caller's window from `frames.last()` and a freshly taken `stack` pointer straight after its `pop_frame_take_continuation`, *before* it asks for the alternate and before the transfer commits, so entering there repeats no publish.
   `../frame_push_tests.rs` pins the behavioural half (each frame pushed exactly once across a sliced and resumed run) and `heap.rs`'s `the_allocate_arm_pushes_the_frame_with_a_helper_call_only` the structural half.
+
+## The inline local-call verdict gate at `Instr::Call`
+
+The frame-preserving `Instr::Call` arm emits `emit::block::emit_local_call_gate` in front of **two** helper sequences, exactly as the tail forms (`call_only`/`call_last`) already do.
+Reject arm: unchanged `jit_call_store`/`jit_call_store_linked`, `movabs r11, CALL_STORED` + `cmp rax, r11` + `jcc Ne, done`, then the compile-time-selected `ExitSpill::Done` exit or `emit_in_block_call`.
+Accept arm: `jit_call_store_in_machine`/`jit_call_store_in_machine_linked` with the same four immediates (`func`, `pc`, callee func, callee pc) and the same shared `CALL_STORED` discriminator and exit, one `movabs` shorter because the seam-owned `arity` is gone.
+`callee_disp` is the callee's function index, so a target function index that is not an `i32` keeps today's single ungated sequence (the same fallback the tail sites use).
+`emit::block::emit_call_store` is the one emitter both arms go through (`CallSeam::{Consult, Skip}`), so no byte of the reject arm moved.
