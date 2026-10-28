@@ -83,6 +83,7 @@
 //! | [`proc_signals`] | A.7 — the group leader, the `dt_*` switches, `erlang:statistics/1`, `spawn_monitor`/`monitor` |
 //! | [`proc_control`] | A.7 — `monitor`/`demonitor`, the `exit/1,2` taxonomy, `register`/`unregister`/`whereis`, the run-queue priorities |
 //! | [`gc`] | A.1/A.7 — the per-process collector observed through the values it must preserve (forced collections, collector-stressing programs, the `garbage_collect`/`process_info` BIF surface) |
+//! | [`copypath`] | A.1 — the **process copy boundary**: a long cons chain (integer / longer than the receiver's remaining heap / conses of distinct refc binaries / improper / mixed nested elements) sent to a spawned process and echoed back, byte-identical |
 //! | [`system_info`] | A.8 — introspection (incl. `erlang:memory/0,1` — a Rust capability gap — and the trace / `seq_trace` / `halt` surface) |
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
 //! | [`boot_prereq`] | A.9 — the boot-path prerequisite primitives (preloaded set, boot-script applications, `register`/`whereis`, group-leader inheritance, the `-boot` flag, the `proc_lib` start wait) |
@@ -114,6 +115,7 @@ mod bits;
 mod boot;
 mod boot_extra;
 mod boot_prereq;
+mod copypath;
 mod driver;
 mod driver_c;
 mod driver_abi;
@@ -701,6 +703,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(flags_apply::group());
     cases.extend(format_limit::group());
     cases.extend(gc::group());
+    cases.extend(copypath::group());
     cases.extend(mexec::group());
     cases.extend(mexec_extra::group());
     cases.extend(modules::group());
