@@ -736,24 +736,31 @@ pub(crate) fn emit_block(
                     // helper (byte-identical to before); an uncompiled one asks for the
                     // linking twin.
                     let linked = linker.is_compiled(target_func, target_pc);
+                    // The **plain** store never enters the callee, so it is handed no
+                    // `callee_pc`: the immediate would be emitted (one 10-byte `movabs`)
+                    // and then never read on the release path, where only a `debug_assert!`
+                    // cross-check consumed it. The linking twin still carries the pair —
+                    // it resolves the entry through it.
+                    let plain = [
+                        i64::from(func),
+                        i64::from(pc),
+                        i64::from(target_func),
+                        i64::from(*arity),
+                    ];
+                    let linking = [
+                        i64::from(func),
+                        i64::from(pc),
+                        i64::from(target_func),
+                        i64::from(target_pc),
+                        i64::from(*arity),
+                    ];
                     let helper: *const () = if linked {
                         jit_call_store as *const ()
                     } else {
                         jit_call_store_linked as *const ()
                     };
-                    emit_helper_call(
-                        buffer,
-                        allocation,
-                        helper,
-                        &[
-                            i64::from(func),
-                            i64::from(pc),
-                            i64::from(target_func),
-                            i64::from(target_pc),
-                            i64::from(*arity),
-                        ],
-                        pc,
-                    )?;
+                    let args: &[i64] = if linked { &plain } else { &linking };
+                    emit_helper_call(buffer, allocation, helper, args, pc)?;
                     buffer.mov_ri(Reg::R11, CALL_STORED)?;
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
                     buffer.jcc(Cond::Ne, done)?;
