@@ -130,6 +130,7 @@ pub(crate) mod bitstr_inline;
 mod block;
 mod compare;
 mod compile;
+mod cons;
 mod family;
 mod frame;
 mod heap;

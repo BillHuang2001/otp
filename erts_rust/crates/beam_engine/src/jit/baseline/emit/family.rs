@@ -102,7 +102,12 @@ pub(super) fn emit_bitstr(
 /// `position` selects [`emit_positioned_helper_call`] (the bitstring arm: the helper no
 /// longer stores the instruction position itself) over the plain
 /// [`emit_helper_call`] (the generic arm: its helper still does).
-fn emit_step_helper(
+///
+/// `pub(super)` so [`super::cons::emit_put_list`] (the `put_list` construction arm) reuses
+/// this **one** emission instead of writing a second spill-then-call sequence: the three
+/// arms differ only in which helper they call and whether they publish the position
+/// inline, never in the emitted shape.
+pub(super) fn emit_step_helper(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     done: CodeLabel,

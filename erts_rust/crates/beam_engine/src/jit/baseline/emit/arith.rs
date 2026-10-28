@@ -475,6 +475,15 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
         // guarded frame window, so either one being a `Y` slot arms the block's publish.
         Instr::BsGetUtf8 { ctx, dst, .. } => super::bitstr_inline::Utf8Shape::of_get(ctx, dst)
             .map_or(false, |shape| shape.uses_y()),
+        // A cons-cell **build** reaches the published frame window only through its guard
+        // group, which needs that window current: the `dst` store guard and the two operand
+        // load guards all read `JitRuntime::{y_base,y_end}`. The gated post-helper
+        // `jit_refresh_y` already comes from `emit_continue_check`
+        // (`Allocation::refresh_y_after`), exactly as for every other helper-call arm, so
+        // nothing extra is emitted here. A shape `put_list_shape` refuses emits zero bytes
+        // and so must answer `false`.
+        Instr::PutList { head, tail, dst } => super::cons::put_list_shape(head, tail, dst)
+            .map_or(false, |shape| shape.uses_y()),
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }
