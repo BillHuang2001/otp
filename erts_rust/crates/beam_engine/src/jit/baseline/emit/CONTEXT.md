@@ -95,8 +95,14 @@ The only tables that outlive a compile are `compile.rs`'s entry tables and the `
 - **Keyed by `(func, pc)`, two different structures with the same key** (`compile.rs`):
   `block_labels: BTreeMap<(u32, u32), CodeLabel>` (`:86` eager / `:179` lazy — a **label** per block
   start, so a forward branch is an ordinary `rel32` fixup) and the driver-facing entry tables
-  `entries: Vec<Vec<Option<*const u8>>>` + `sub_entries` (`:65`/`:73`, lazy `:178`/`:189` — **flat
+  `entries`/`sub_entries` (`Vec<Vec<*const u8>>` for the eager layout's `[func][pc]`, `Vec<*const u8>`
+  for a lazy function's `[pc]`, each slot null when that address compiled no block — **flat
   indexing**, chosen over a `HashMap` because the driver probes it on every cross-block jump).
+  The **last** step of each layout, after `emit_sub_blocks`/`emit_shared_sub_blocks` and before
+  `buffer.seal()`, folds the two into one: `merge_sub_entries` null-fills each block-start table with
+  the continuation sub-block entry at the same pc (a pc is at most one of the two, and a block start
+  still wins), so the published table answers both shapes with one lookup. Addresses do not move —
+  the fold runs after every label is bound and only rewrites slot contents.
   `Linker` (`link.rs:229`) holds only `&BTreeMap<(u32, u32), CodeLabel>`; it owns no fixup table — the
   `rel32` patching is the `CodeBuffer`'s own label machinery.
 - **`LabelMap`** (`../../interpreter/mod.rs:88`) is the one *pre-decoded* table stored **in** the
@@ -116,7 +122,7 @@ The rest is one level down, each child owning one mechanism:
 - `link/CONTEXT.md` → the exits, the `CALL_STORED` in-block transfer, the tail forms' baked probe, and the continuation sub-blocks.
 - `regs/CONTEXT.md` → the register cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`) and its store/fill models; the only owner of that contract.
 - `test/CONTEXT.md` → the `test`-family shapes, the comparison helper and the refusal census.
-- `bitstr_inline/CONTEXT.md` → the native lowerings of the sixteen `Bs*` shapes (fifteen match-context shapes plus the private-append construction shape), their shared emitters, the new shape modules and the per-shape counters.
+- `bitstr_inline/CONTEXT.md` → the native lowerings of the sixteen `Bs*` arms / seventeen shapes (fifteen match-context shapes plus the `bs_create_bin` construction arm's private-append build and bare build), their shared emitters, the new shape modules and the per-shape counters.
 
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder, and the
@@ -274,11 +280,13 @@ by construction).
   into it, so a return chain does not grow the native stack; otherwise the word leaves for the driver),
   plus its unit tests (the frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
-  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
+  frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers, `allocate`
+  included: one `jit_allocate` call plus the continue arm, no emitted frame push) and the private
   `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
   `encode_target(func, pc+1)`, no register refill and no emitted refresh — the helper re-published the
   Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
-  split, and `a_frame_changing_helper_emits_no_separate_refresh_call`).
+  split, `a_frame_changing_helper_emits_no_separate_refresh_call` and the structural
+  `the_allocate_arm_pushes_the_frame_with_a_helper_call_only`).
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
   `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`) and `emit_bitstr` (the same
   arm for the `Bs*` family through `../bitstr.rs::jit_bitstr`, plus the inline position store its
@@ -321,20 +329,62 @@ by construction).
   live in `aggregate/list.rs`.
 
 ## The bitstring shape module (`bitstr_inline/`) — emission contract
-`bitstr_inline/` emits the sixteen `Bs*` lowerings — fifteen match-context shapes plus `bs_create_bin`'s construction shape, whose three routes' helper calls mutate nothing; the per-shape predicates, the run-time guards and the helper-backed reasons are `../inlineset/CONTEXT.md`'s, and the file-by-file split is `bitstr_inline/CONTEXT.md`'s. This section owns only what an emitter change must keep.
-- **The arms** are sixteen `match` arms in `block.rs` placed **above** the `_ if bitstrings::claimed(instr) => emit_bitstr(...)` guard arm (an arm after a `_ if` guard is unreachable), each calling its `try_inline_bs_*` entry and falling through to `emit_bitstr` when it answers `Ok(false)` having emitted **zero bytes**. The `bs_create_bin` arm is the one that never sets `terminated`: the construction shape continues in-block on its `fast_done` path only.
+`bitstr_inline/` emits the sixteen `Bs*` lowerings — fifteen match-context shapes plus the `bs_create_bin` construction arm, whose **two shapes** (the private-append accumulator build and the bare build of `create_fresh.rs`) cover **four** routes (append, bit-granular, `binary all`, bare build) and whose helper calls all mutate no machine state; the per-shape predicates, the run-time guards and the helper-backed reasons are `../inlineset/CONTEXT.md`'s, and the file-by-file split is `bitstr_inline/CONTEXT.md`'s. This section owns only what an emitter change must keep.
+- **The arms** are sixteen `match` arms in `block.rs` placed **above** the `_ if bitstrings::claimed(instr) => emit_bitstr(...)` guard arm (an arm after a `_ if` guard is unreachable), each calling its `try_inline_bs_*` entry and falling through to `emit_bitstr` when it answers `Ok(false)` having emitted **zero bytes**. The `bs_create_bin` arm is the one that never sets `terminated`: its two construction shapes continue in-block on their `fast_done` path only.
 - **`emit_bit_extract(buffer, base, bit_pos, nbits, num_bytes, scratch, fallback)`** is the one field reader, and its **over-read guard is emitted before every load it protects** — `j + W <= num_bytes` in the aligned form, `j + 2 <= num_bytes` in the bit-granular one, where `j = bit_pos / 8`. Both loads are **byte-wise and assembled most-significant byte first**, because an x86 multi-byte load is little-endian and would yield the byte-reversed value with no error surfaced.
   The aligned form covers `nbits ∈ {8, 16, 32}` at `bit_pos % 8 == 0` and reads `W = nbits / 8` bytes; the granular form covers `nbits < 16` at any bit position, reading a two-byte window, shifting by `16 - rem - nbits` and masking to `nbits` bits. A `nbits > 32`, or a 16/32-bit field off an 8-bit boundary, jumps to `fallback`.
   Register contract: `base`/`bit_pos`/`num_bytes` are read-only, the sequence works in `Rcx`/`Rdi`, and `scratch` must be none of those.
-- **`emit_subject_view(buffer, ctx, pos, fallback)`** answers the readable window `(base, bit_pos, num_bytes)` of the **one** subject form it lowers, and sends every other form to `fallback` — one interpreter step, so the family answers the true value or its own typed error: non-boxed or `TAG_LITERAL_PTR` → `fallback`; a **`HEADER_SUB_BITS` inner subject** → `fallback` (a refc window's byte base is its own payload pointer, never the context's `base_flags`, and a match context is not a readable subject at all); a masked header `!= HEAP_BITS_SUBTAG` → `fallback` (a bare `BinRef`, a tuple, an atom, … is the family's typed error). The accepted arm is the on-heap `ErlHeapBits`: `base = orig + HEAP_BITS_DATA_DISP`, `bit_pos = pos` (the form's bit offset is always 0), and `num_bytes = round_up_8(ceil(bits / 8)) = ((bits + 63) >> 6) << 3` — the block's **word-padded data extent**, not the strict `ceil(bits / 8)`, because an `ErlHeapBits` is `[header, size, data…]` with its data region padded to a whole word, so the padding bytes are allocated and readable while a field's bits always lie inside the logical subject, so the padding byte can never contribute a bit of the result. The narrow bound refused the two-byte granular window a 6-bit field of a **1-byte** subject needs and forced a per-character deopt.
-  The residual is a **typed refusal, never a wrong result**: a refc-window inner subject (an `ErlSubBits` over a `BinRef`) and every subject form this view does not classify take one interpreter step. A refc-window arm is not re-openable as a guard widening — it would have to read the window's base, and the header it can see is `HEADER_SUB_BITS`, which carries no `BinRef`; its `base_flags`/`start`/`end` formula would not be `raw::heap_bits`'.
-  `bs_get_integer2` and `bs_match`'s `integer` command both call it, so the two cannot drift apart.
+- **`emit_subject_view(buffer, ctx, pos, fallback)`** answers the readable window `(base, bit_pos, num_bytes)` of the **two** subject forms it classifies, and sends every other form to `fallback` — one interpreter step, so the family answers the true value or its own typed error: non-boxed or `TAG_LITERAL_PTR` → `fallback`; a **`HEADER_SUB_BITS` inner subject whose own `orig` is not a `BinRef`** → `fallback` (a match context, whose `base_flags` is `0` and which has no payload at all); an `end < start` window → `fallback`; a masked header `!= HEAP_BITS_SUBTAG` → `fallback` (a bare `BinRef`, a tuple, an atom, … is the family's typed error). The two accepted arms:
+  (a) an **on-heap `ErlHeapBits`**: `base = orig + HEAP_BITS_DATA_DISP`, `bit_pos = pos` (the form's bit offset is always 0), and `num_bytes = round_up_8(ceil(bits / 8)) = ((bits + 63) >> 6) << 3` — the block's **word-padded data extent**, not the strict `ceil(bits / 8)`, because an `ErlHeapBits` is `[header, size, data…]` with its data region padded to a whole word, so the padding bytes are allocated and readable while a field's bits always lie inside the logical subject, so the padding byte can never contribute a bit of the result. The narrow bound refused the two-byte granular window a 6-bit field of a **1-byte** subject needs and forced a per-character deopt.
+  (b) a **refc window**, an `ErlSubBits` whose own `orig` is a `BinRef`: `base = (base_flags & !ERL_SUB_BITS_FLAG_MASK) + start / 8`, `rem = start % 8`, `bit_pos = pos + rem`, and `num_bytes = ceil((rem + end - start) / 8)` — the **strict** bound, never word-rounded, because an off-heap payload's reserved extent is not word-asserted and `base + num_bytes` must never exceed the bytes the window really covers. The form is expressible because the window's `start`/`end`/`base_flags` are the **inner `orig`'s own words**, which the header test reveals; the arm this tier refused earlier read the *match context's* `base_flags` (always `0`) and used absolute rather than window-relative coordinates.
+  Nothing on either arm writes a machine word or allocates, so a `fallback` re-executes the instruction against the machine exactly as the interpreter left it.
+  The four byte-oriented shapes — `bs_match_string` and the `bs_skip`/`bs_get_utf8`/`utf16`/`utf32` pairs — take the returned `bit_pos` for **both** their `% 8` alignment test and their `start / 8` byte index, so a refc window whose own `start` is not byte-aligned takes that shape's `fallback` instead of comparing the wrong bytes.
+  `bs_get_integer2` and `bs_match`'s `integer` command also call it, handing `bit_pos` to `emit_bit_extract`, so no shape can drift from another.
 - **`emit_ctx_guard`** is the match-context guard every shape opens with (`is_boxed`, then `*boxed_val == HEADER_SUB_BITS`) and it leaves the block base in `MOVE_SCRATCH` for the shape's own word reads; a shape that must also guard a `Y` destination calls `Loc::guard_store` **first**, so a rejection writes nothing.
 - **The label shape is three labels.** `fallback` → `emit_step_and_continue` (exactly one interpreter step, the family's own typed error); `fast_done` → in-block continuation; `fail_arm` → `linker.emit_exit(..., ExitSpill::Required)` to the shape's resolved fail label, a **terminator on that path only**, so the hitting path still continues in-block. `emit_fallback_and_done` is the shared two-label tail; `bs_match` instead jumps to `fast_done` after its last command and reaches `fail_arm` from any command's guard.
-- **Every match-context shape is position-store-free.** None of the fifteen allocates or raises, so the driver's position stays the block's; a `fallback` step stores its own through the normal deopt. The **construction** shape is the exception: it publishes the instruction's own `(func, pc)` before its route's door — inline, through `bitstr_inline/create_door.rs::emit_append_cursor`'s position store on the aligned route, through `emit_positioned_helper_call` for `jit_open_append_bin_any`/`_any_y` and for the `jit_write_bit_field` calls of a plan carrying a wider-than-57-bit field (one per field, narrow ones included), and for the whole-binary route's `jit_append_binary_all` — because a helper can be entered and a `fallback` taken from the `test rax,rax` arm must park on this instruction rather than on the block entry.
+- **Every match-context shape is position-store-free.** None of the fifteen allocates or raises, so the driver's position stays the block's; a `fallback` step stores its own through the normal deopt. The **construction** shape stores no position on its aligned route either — `jit_append_cursor` cannot pre-empt, park, raise or collect, so `bitstr_inline/create_door.rs::emit_append_cursor` emits no position store and no pre-call spill and the block entry stays published (a `fallback` taken from its `test rax,rax` arm parks through `jit_step_one`'s own arguments). The rest of the arm does publish the instruction's own `(func, pc)` before its route's door — through `emit_positioned_helper_call` for `jit_open_append_bin_any`/`_any_y` and for the `jit_write_bit_field` calls of a plan carrying a wider-than-57-bit field (one per field, narrow ones included), and for the whole-binary route's `jit_append_binary_all` — because those helpers can be entered and a `fallback` taken from their refusal arm must park on this instruction rather than on the block entry.
 - **The code-size budgets.** `compile.rs::function_capacity_estimate` adds `BS_PATH_BYTES = 448` for **every** bitstring instruction and `BS_MATCH_COMMAND_BYTES = 320` for **every** accepted `bs_match` command, whether or not a predicate claims it — a predicate runs at emit time, the estimate runs before it, and an under-estimate is a `SystemLimit` compile error.
-  `BS_PATH_BYTES` is sized on `bs_get_integer2`'s widest path (≈380 B: the `Y` guard ≈50, the context guard ≈40, the remaining-window guard and fail arm ≈60, the subject classification ≈130, the extractor ≈60, the tag/commit/store ≈40) in front of the ≈150 B `emit_step_and_continue` fallback `INSTRUCTION_BYTES` already covers; `BS_MATCH_COMMAND_BYTES` on the widest command, `integer` (≈300 B: the remaining guard ≈35, the subject classification ≈130, the extractor ≈90, the position advance + tag/store ≈45), with `ensure_*`/`skip` under 60 B each.
+  `BS_PATH_BYTES` is sized on `bs_get_integer2`'s widest path in front of the ≈150 B `emit_step_and_continue` fallback `INSTRUCTION_BYTES` already covers, and `BS_MATCH_COMMAND_BYTES` on the widest command, `integer`; each shape that calls `emit_subject_view` pays the view's 343 B once, ~184 B of it the refc arm, and `ensure_*`/`skip` are under 60 B each.
   `CREATE_BIN_PATH_BYTES = 16_384` is added for **every** `bs_create_bin` (`create_bin_paths`), on top of that instruction's own `INSTRUCTION_BYTES`: the construction shape's stores are emitted one byte at a time, so the budget is sized on the worst accepted shape — `MAX_FIELDS = 16` fields × 8 bytes plus `MAX_TAIL_BYTES = 256` constant bytes, with the guards, the helper call and the destination store added.
   Each of the newer match-context shapes charges a path budget of its own on top of `BS_PATH_BYTES`, because its sequence is wider than the shared match-context guards it reuses: `BS_MATCH_STRING_PATH_BYTES = 2_304` per `bs_match_string` (one emitted triple per pattern byte, bounded by `match_string::MAX_MATCH_BYTES = 64`), `UTF32_PATH_BYTES`/`UTF16_PATH_BYTES` = 1 024 each and `UTF8_PATH_BYTES = 2_048`. Like the other path budgets they are charged whether or not a predicate claims the instruction, because the estimate runs before the predicate and an under-estimate is a `SystemLimit` compile error.
 - **The register-cache gate** (`regalloc.rs::{cacheable_touches, cacheable_reads, cacheable_writes, is_inlined}`) and the `Y` gate (`arith.rs::uses_y`) consult the same `*_shape` functions and the label-free `<Shape>::of(...)` constructors, so the emitted register set, the block's dirty-spill set and the `Y` refresh decision are derived from one decision. A shape's destination must be charged as **written** — the value lands in that cache register, so an uncharged write lets a stale register survive a block exit.
 
+## Store-mutation inventory (`machine.stack` / `machine.frames`)
+
+`Machine::stack` and `Machine::frames` are private `Vec`s: no emitted code names either store, and no `JitRuntime` field publishes a header or a frame image.
+A frame-changing instruction is exactly one helper call (`jit_allocate`/`jit_allocate_heap`/`jit_trim`/`jit_deallocate`), so every store mutation happens in Rust and the published Y window stays re-derivable from `Machine` state at every enterable address.
+The inventory below is therefore the **precondition any future inline frame push would have to meet**, not a description of emitted traffic: such a push would have to name every site that can move `machine.stack`/`machine.frames`, prove that no emitted code reads a stale pointer after a reallocation, and keep its Y-window publication re-derivable at every enterable address rather than mid-block only.
+The reason it is decidable at all is that a `Vec` write either leaves the store valid as written (any `Vec` method, the only way Rust touches the storage) or **moves the allocation** (a growth/`resize`), which invalidates any pointer taken before it.
+
+### Erlang stack (`machine.stack`)
+
+- `machine/frames.rs` `push_frame_window`'s `resize` — grows the store (may reallocate) and writes the Y words; re-derives the window.
+- `machine/frames.rs` `pop_frame`/`pop_frame_checked`/`pop_frame_take_continuation`'s `truncate` — length only, no move.
+- `machine/frames.rs` `trim`'s `copy_within` + `truncate` — in-place, no move.
+- `machine/mod.rs` `with_parked_loose_terms`'s `push`/`truncate` — the dominant hidden mutator: reachable from **every** rooted hand-off, and the `push` can reallocate.
+- `machine/registers.rs` `Machine::reset`'s `clear`, `machine/catch.rs` the unwind `truncate` — length only.
+- In-place Y-slot word writes in `machine/frames.rs` — no reallocation.
+- Root hand-offs borrow the words, never a cached pointer: `machine/mod.rs` (`RootSet::new`, `for_each_root_mut`, the census walk, `stack_mut`), `families/bitstrings/raw.rs`.
+
+### Call frames (`machine.frames`)
+
+- `machine/frames.rs` `push_frame_window`'s `push` — may reallocate.
+- `machine/frames.rs` `pop_frame`/`pop_frame_checked`/`pop_frame_take_continuation`'s `pop` and their cold re-push.
+- `machine/frames.rs` `last_mut`/`trim` field writes — in place.
+- `machine/catch.rs` `truncate`, `machine/registers.rs` `clear` — length only.
+
+### Helpers reachable from emitted code
+
+Each of these either re-derives the Y window before the block continues, or is followed by a
+driver-side (re)publication before any emitted code can use a store:
+
+- Re-derive the window in place (they never hand out a store pointer): `jit_allocate`, `jit_allocate_heap`, `jit_test_heap`, `jit_trim`, `jit_deallocate`, `jit_deallocate_return`, `jit_tail_call`, `jit_return`, `jit_call_store`/`jit_call_store_linked`/`call_store_impl` (`call.rs`), `jit_publish_y`, `jit_refresh_y`, `refresh_y_base`, `publish_y_window`.
+- Run interpreted instructions (which may push/pop/trim/`with_parked_loose_terms`) and return a block-ABI word the driver folds: `jit_step_one`, `jit_step_ext`, `jit_ext_call`, `jit_local_call`/`probe_local_call`, `jit_bif_value`, `jit_family`, `jit_receive`, `jit_bitstr`.
+- Never touch the stores: `enter_in_block`/`commit_in_block_entry`/`cross_function_enter`, which only switch the entry tables.
+- Driver-side: `drive` (`mod.rs`) publishes the runtime before the loop and `JitRuntime::refresh_literals` runs at every module rebind; `code.enter_cached` and the deopt arm run inside an iteration. A `traced` run never builds a `JitRuntime`.
+
+### What an emitted store access would have to keep
+
+- **Every capacity guard precedes every write.** A growth moves the allocation, so an emitted arm would have to re-read the store after its guards and could never name freed memory; today the whole push is the `jit_allocate` helper call, which lets the `Vec` grow and re-derives the window itself.
+- **The commit order is `fill`, then `len`.** The Y words are written into spare capacity before the stack length is bumped, so a collection (or the census walk) never sees a length covering a word the push has not written.
+- **The Y-window publication must be re-derivable at every enterable address.** The window follows from `Machine` state alone (`push_frame_window`'s `(y_base, y_count)` on a push, `refresh_y_base` on a `trim`/pop), so a block entry or a resumed slice can always re-derive it: the in-block `allocate`/`allocate_heap`/`trim` helper re-publishes it on the arm that continues the block, a block entry re-executes the block prefix, and the prologue publishes whenever the block's first Y access is not preceded by such a helper. `../frame_push_tests.rs` pins the behavioural half (each frame pushed exactly once across a sliced and resumed run) and `heap.rs`'s `the_allocate_arm_pushes_the_frame_with_a_helper_call_only` the structural half.

@@ -138,7 +138,7 @@ use crate::interpreter::{ImportFrame, LabelMap};
 use crate::machine::{Continuation, Machine};
 use crate::Step;
 
-use super::runtime::{encode_target, fold_step, JitRuntime};
+use super::runtime::{fold_step, JitRuntime};
 
 /// The block-ABI word [`jit_call_store`] answers when it has **stored the
 /// continuation**: "the `Call`'s `Continuation::Address` is in the live frame — transfer
@@ -167,7 +167,12 @@ enum CallOutcome {
     Word(i64),
     /// Hand this folded step (a **served** callee's, or the interpreter's own error
     /// variant) back to the driver.
-    Fold(std::result::Result<Step, Box<BeamError>>),
+    ///
+    /// Boxed on purpose: this is the seam-**served** / error answer, never the steady state
+    /// (that is [`Self::Stored`]), so keeping it behind one pointer is what keeps the hot
+    /// `CallOutcome` value — and, with it, `call_store_impl`'s frame — small. The allocation
+    /// is Rust-side only: no BEAM-heap term is involved.
+    Fold(Box<std::result::Result<Step, Box<BeamError>>>),
 }
 
 /// Which transfer the emitted block asked for — the only difference between the two
@@ -328,14 +333,21 @@ fn call_store_impl(
             // owns; the borrows derived from it above are dead by now (the outcome owns no
             // reference into it), so this borrow does not alias them.
             let runtime = unsafe { &mut *rt };
-            let target = encode_target(callee, callee_pc);
             let word = super::runtime::enter_in_block(runtime, callee, callee_pc);
             // The in-block transfer was taken exactly when the resolver published an entry;
             // a decline (no artifact, an uncovered address, a failed lazy compile, an
             // unsatisfied register bound) and a refused pre-emption charge leave it null.
             #[cfg(test)]
             super::counters::record_in_block_call(!runtime.resume_entry.is_null());
-            if word == target {
+            // `enter_in_block` answers one of exactly two things: the target word it encoded
+            // (`encode_target(callee, callee_pc)`, so re-encoding it here only to compare
+            // would be one pack per transfer for a value already in the register) on both
+            // the accepted and the declined arm, or the negative `ERROR` sentinel on a
+            // refused charge. The **sign** is therefore the same test as `word == target`,
+            // and the emitted arm re-tests `resume_entry` itself (see `emit/link.rs`'s
+            // `emit_in_block_call`), so a decline mapping to `Stored` keeps behaving as
+            // before: `CALL_STORED` + null `resume_entry` takes the declined exit.
+            if word >= 0 {
                 CallOutcome::Stored
             } else {
                 CallOutcome::Word(word)
@@ -351,7 +363,7 @@ fn call_store_impl(
             // owns; the `&mut` derived from it above is dead by now, so this borrow does
             // not alias it.
             let runtime = unsafe { &mut *rt };
-            fold_step(runtime, step, func, pc)
+            fold_step(runtime, *step, func, pc)
         }
     }
 }
@@ -405,7 +417,7 @@ fn store_continuation(
         pc,
         ctx,
     ) {
-        Err(err) => CallOutcome::Fold(decorate(machine, module, Err(err), func, pc)),
+        Err(err) => fold_error(machine, module, err, func, pc),
         // Served: the seam ran the callee as a BIF and produced this step. The exact
         // suspension/raise position an interpreted `call` records is its own instruction
         // address (`Machine::step_instruction` stores it before it runs the arm), so a
@@ -413,10 +425,10 @@ fn store_continuation(
         // (see [`jit_receive`](super::receive::jit_receive)). Only this arm needs it: a
         // declined seam transfers into the callee, whose block immediately stores its own
         // position, so a store here would be overwritten before anything could observe it.
-        Ok(Some(step)) => {
-            machine.set_current_code(func, pc);
-            CallOutcome::Fold(decorate(machine, module, Ok(step), func, pc))
-        }
+        //
+        // Out of line ([`served`]): a served callee is a module's unexported `*_nif` stub,
+        // so this arm never runs on the ordinary local-call path the helper exists for.
+        Ok(Some(step)) => served(machine, module, step, func, pc),
         // Step 3: the continuation store, byte for byte what the interpreter's arm
         // stores — the call site (`func`, `pc + 1`) tagged with the context executing
         // now. `arity` plays no part in it.
@@ -428,12 +440,41 @@ fn store_continuation(
             };
             match machine.set_continuation(continuation) {
                 Ok(()) => CallOutcome::Stored,
-                Err(err) => {
-                    CallOutcome::Fold(decorate(machine, module, Err(Box::new(err)), func, pc))
-                }
+                Err(err) => fold_error(machine, module, Box::new(err), func, pc),
             }
         }
     }
+}
+
+/// The local-call seam's **served** arm, out of line: record the step's own position and
+/// hand the folded step to the driver.
+///
+/// `#[cold]`/`#[inline(never)]` because only a callee the host serves as a BIF (a module's
+/// unexported `*_nif` stub) reaches it — never the ordinary same-module `call` — so its
+/// body must not sit inside the frame of every call. Nothing about the semantics moves: the
+/// position store still names the `call` instruction itself, and it still happens only here.
+#[cold]
+#[inline(never)]
+fn served(machine: &mut Machine, module: &Module, step: Step, func: u32, pc: u32) -> CallOutcome {
+    machine.set_current_code(func, pc);
+    CallOutcome::Fold(Box::new(decorate(machine, module, Ok(step), func, pc)))
+}
+
+/// The helper's **error** arm, out of line: apply the uniform raise funnel to a propagating
+/// [`BeamError`] and hand the folded error to the driver.
+///
+/// One definition for both raise sources — the local-call seam's own `Err` and
+/// [`Machine::set_continuation`]'s — so neither charges the hot frame for it.
+#[cold]
+#[inline(never)]
+fn fold_error(
+    machine: &mut Machine,
+    module: &Module,
+    err: Box<BeamError>,
+    func: u32,
+    pc: u32,
+) -> CallOutcome {
+    CallOutcome::Fold(Box::new(decorate(machine, module, Err(err), func, pc)))
 }
 
 /// Apply the uniform raise funnel's **entry-context** half to the `call`'s outcome —
@@ -442,6 +483,11 @@ fn store_continuation(
 /// run's entry context (`0`) the active module IS the entry module, so a propagating
 /// raise is decorated here; a non-zero context is left to the driver, which knows the
 /// true entry module.
+///
+/// `#[cold]`/`#[inline(never)]`: every caller is a raising path (the two [`fold_error`]
+/// sources and the seam's served arm), so the funnel must stay out of the hot frame.
+#[cold]
+#[inline(never)]
 fn decorate(
     machine: &mut Machine,
     module: &Module,

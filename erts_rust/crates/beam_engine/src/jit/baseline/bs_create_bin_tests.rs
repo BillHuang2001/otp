@@ -33,14 +33,20 @@
 //!   <the append door>                                    ; Aligned: inline shape proof + jit_append_cursor (X or Y)
 //!                                                        ; BitGranular: jit_open_append_bin_any[_y](slot, tail, unit)
 //!   test rax, rax ; je fallback                          ; the LAST guard, still before every write
-//!   <the field byte stores at the cursor in rax>         ; a Y field value is re-read (unguarded) per field
-//!   <the accumulator re-read (unguarded), the end commit>; THE ONLY MUTATION, last
-//!   <the accumulator re-read (unguarded) into Dst>       ; a Y Dst's address is re-derived too
+//!   <the field byte stores at the cursor in rax>         ; one load + `sar 4` per Field::Bits (a run of
+//!                                                        ; same-Loc one-byte fields shares one load), a Y value
+//!                                                        ; re-read (unguarded) per field
+//!   <one accumulator load, the pointer mask in place, end += tail_bits, one store> ; THE ONLY MUTATION, last
+//!   <the same kept accumulator word into Dst>            ; a Y Dst's address is re-derived too
 //!   jmp fast_done
 //! fallback:
 //!   <one interpreter step>                               ; re-reads an untouched accumulator
 //! fast_done:
 //! ```
+//!
+//! The aligned route's door neither spills nor publishes a position: `jit_append_cursor` cannot
+//! pre-empt, park, raise or collect, and the `fallback` arm parks through `jit_step_one`'s own
+//! arguments, so the position a reader sees there is the block entry — a valid resume point.
 //!
 //! A `fallback` is a **deopt**: `jit_step_one` re-executes the entire instruction in the
 //! interpreter with the same operands and re-reads the machine's live state. So any word the
@@ -90,17 +96,17 @@
 use std::cell::Cell;
 
 use beam_loader::{BsGetArgs, HeapNeed, Instr, Label, Module, Operand, Reg, NO_FAIL};
-use beam_term::{Atom, Eterm};
+use beam_term::{make_atom, Atom, Eterm};
 
 use super::bitstr::bitstr_calls;
 use super::bitstr_inline_tests::{
     atom, bitstr_module, compile_cache_free, emitted_shapes, static_deopts, visited_instances,
 };
 use super::counters;
-use super::emit::bitstr_inline::{self, SHAPE_CREATE_BIN};
+use super::emit::bitstr_inline::{self, SHAPE_CREATE_BIN, SHAPE_CREATE_FRESH};
 use super::runtime::append_binary_all_calls;
 use super::tests::assert_same_outcome;
-use crate::context::MinimalContext;
+use crate::context::{ExecutionContext, MinimalContext};
 use crate::families::bitstrings::bit_size;
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
@@ -386,6 +392,32 @@ enum ArgKind {
     Bytes(&'static [u8]),
     /// A float.
     Float(f64),
+    /// An atom term (an immediate), named by the module's own atom table.
+    Atom(Atom),
+    /// A hand-built `ErlSubBits` accumulator in one of the two forms the append door must
+    /// **refuse** at run time ([`RefusedAcc`]).
+    Refused(RefusedAcc),
+}
+
+/// The two `ErlSubBits` shapes that are *not* a writable accumulator payload, built by hand
+/// because no program can hand either to `bs_create_bin`.
+///
+/// Both are well-formed `ErlSubBits` terms (a live `orig` in the same arena, `start = 0`,
+/// `end` = that binary's bit size), so every guard that protects a **dereference** accepts
+/// them: `is_boxed`, the header, `start == 0`, a non-null base and `end % 8 == 0` all pass.
+/// What refuses them is a fact about the machine, and the rows below pin that the refusal is
+/// the interpreter's, i.e. exactly one deopt — never an in-block byte written through a base
+/// that is not a payload this machine owns.
+#[derive(Clone, Copy)]
+enum RefusedAcc {
+    /// A **match context**: `base_flags == 0` (what the family's `make_ctx` writes), so the
+    /// masked base is null — the writable-payload registry cannot possibly answer.
+    MatchContext(&'static [u8]),
+    /// A **window over an on-heap binary**: `base_flags` is that heap binary's own data
+    /// pointer, which can never be a key in `Machine::writable_payloads` (its keys are the
+    /// `RefcBinary::data_ptr()` of payloads this machine allocated, pruned in lockstep with
+    /// `retain_refc_binaries`, so a freed or reused address is never one).
+    HeapWindow(&'static [u8]),
 }
 
 impl ArgKind {
@@ -396,7 +428,48 @@ impl ArgKind {
                 crate::terms::make_heap_binary(ctx, bytes).expect("the argument builds")
             }
             ArgKind::Float(value) => crate::terms::make_float(ctx, value).expect("the argument builds"),
+            ArgKind::Atom(atom) => make_atom(atom),
+            ArgKind::Refused(refused) => refused_accumulator(ctx, refused),
         }
+    }
+}
+
+/// Build the [`RefusedAcc`] term: a live `orig` binary in this arena plus a 5-word
+/// `ErlSubBits` window over it, written by the **same** writer the family's `make_ctx` and
+/// `build_writable_bitstring` use, so the window is a well-formed term of exactly the shape the
+/// append door inspects.
+///
+/// The two forms differ in **one** word: the `base_flags` slot. A match context carries the `0`
+/// the family's `make_ctx` writes (`raw.rs::make_ctx` leaves `base_flags == 0` forever — `set_ctx_start`/
+/// `set_ctx_end` touch only the window's two words), and a window over an on-heap binary carries
+/// that binary's own payload address.
+fn refused_accumulator(ctx: &mut MinimalContext, refused: RefusedAcc) -> Eterm {
+    let bytes = match refused {
+        RefusedAcc::MatchContext(bytes) | RefusedAcc::HeapWindow(bytes) => bytes,
+    };
+    let orig = crate::terms::make_heap_binary(ctx, bytes).expect("the accumulator's subject builds");
+    let base_flags = match refused {
+        RefusedAcc::MatchContext(_) => Eterm::from_raw(0),
+        // SAFETY: `orig` is a live on-heap binary in this arena (`make_heap_binary` just returned
+        // it) and `bitstring_parts` only reads its header, its size word and its payload address;
+        // the arena grows in place, so nothing moves it.
+        RefusedAcc::HeapWindow(_) => {
+            Eterm::from_raw(unsafe { beam_term::bitstring::bitstring_parts(orig) }.0 as usize)
+        }
+    };
+    let hp = ctx.alloc_words(5).expect("the window block reserves in the arena");
+    // SAFETY: `hp` is 5 exclusively-owned, writable words in this arena (the reservation just
+    // succeeded and the arena never moves or reuses a handed-out region), `orig` is live in the
+    // same arena, and `base_flags` either is null-with-`start == 0` (never dereferenced) or names
+    // that binary's payload, which covers bits `0..bytes.len() * 8`.
+    unsafe {
+        beam_term::bitstring::write_sub_bits(
+            hp,
+            base_flags,
+            Eterm::from_raw(0),
+            Eterm::from_raw(bytes.len() * 8),
+            orig,
+        )
     }
 }
 
@@ -3661,6 +3734,76 @@ fn a_binary_all_source_one_byte_past_the_capacity_refuses_and_writes_nothing() {
     );
 }
 
+/// `f/2` whose append **target is the first argument**: no `bs_init_writable`, so the accumulator
+/// the emitted proof inspects is exactly `x(0)` as the caller supplied it. A caller-supplied
+/// accumulator is the one way to reach the two accumulator forms a writable build never produces,
+/// and the row needs the door's guards to see them.
+fn accumulator_argument_module(name: &str) -> Module {
+    bin_module(name, 2, &[], |module| {
+        let mut segments = append_seg(module, Operand::X(0));
+        segments.extend(int_seg(module, Operand::X(1), 8));
+        vec![create_bin(Operand::X(0), segments, 2)]
+    })
+}
+/// **A refused accumulator takes exactly one interpreter step, then the family's `badarg`.**
+///
+/// The append door's emitted proof admits only a **writable** payload, and since the `orig is
+/// BinRef` test left the emitted sequence the refusals rest on two things only: the masked base
+/// being non-null, and `Machine::writable_payloads` answering inside `jit_append_cursor`. The two
+/// forms below are exactly those two cases, each built by the same writer the family's `make_ctx`
+/// and `build_writable_bitstring` use:
+/// * a **match context** (`base_flags == 0`, the word `raw.rs::make_ctx` writes and never
+///   rewrites — `set_ctx_start`/`set_ctx_end` touch only the window's two words) masks to a null
+///   base, so the emitted non-null guard rejects before the helper, and
+/// * an **`ErlSubBits` window over an on-heap binary** carries that binary's process-heap payload
+///   address, which can never be a key of `Machine::writable_payloads` (its keys are
+///   `RefcBinary::data_ptr()` of payloads this machine allocated, pruned in lockstep with
+///   `retain_refc_binaries` by `machine/offheap.rs`, so a freed or reused address is never a key),
+///   so every emitted guard passes and `jit_append_cursor` answers `0`.
+/// Either way the instruction is **un-applied** when the fallback runs, and the interpreter step
+/// is what decides the result: the group is a `private_append`, so the accumulator is its
+/// **source**, `raw::heap_bits` answers `None` for both forms (`is_refc_binary` is false), and the
+/// family raises `SegReason::BadArg` — C's `is_not_bitstring(Src)` arm — on both tiers.
+///
+/// Pinned: the shape is emitted natively (so the row proves a *refusal*, not a compile-time
+/// decline), the baseline run deopts exactly once and never reaches `jit_bitstr`, and both tiers
+/// raise the same bare `badarg`.
+#[test]
+fn a_refused_accumulator_takes_one_step_and_the_familys_badarg() {
+    let module = accumulator_argument_module("refused_acc");
+    let name = atom(&module, "f");
+    let (shapes, _) = emitted_shapes(&module);
+    assert!(
+        shapes.contains(&SHAPE_CREATE_BIN),
+        "the construction arm must be emitted for this shape, else the row pins a decline"
+    );
+    for (label, refused) in [
+        ("match context", RefusedAcc::MatchContext(b"abcd")),
+        ("on-heap window", RefusedAcc::HeapWindow(b"abcdefgh")),
+    ] {
+        let args = [ArgKind::Refused(refused), ArgKind::Int(0x41)];
+        with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert!(
+                    matches!(outcome, Err(beam_common::BeamError::BadArg)),
+                    "{label}: {tier}: a refused accumulator source is the family's bare `badarg` \
+                     (got {outcome:?})"
+                );
+            }
+        });
+        let report = run_counting(&module, name, &args, Tier::BaselineJit);
+        assert_eq!(
+            runtime_deopts(&report.counters, "BsCreateBin"),
+            1,
+            "{label}: the arm must reject at run time, exactly once"
+        );
+        assert_eq!(
+            report.bitstr_calls, 0,
+            "{label}: the block's own fallback runs `jit_step_one`, not the family helper"
+        );
+    }
+}
 /// A declined shape's row: its module plus the arguments it needs.
 struct DeclinedRow {
     label: &'static str,
@@ -4772,3 +4915,217 @@ fn a_whole_byte_build_at_a_mid_byte_window_end_refuses_the_aligned_route() {
     );
     assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The **bare** build (`Route::Fresh`) — the value path
+// ---------------------------------------------------------------------------
+/// **The bare build's value path, end to end at one width** — the smoke pin for
+/// [`bitstr_inline::Route::Fresh`].
+///
+/// `<<C>>` over a single byte is the bare `bs_create_bin`: no `private_append` group, so
+/// `seam::append_plan` declines it and the fields *are* the whole result. It is exactly the
+/// `<<DecodeChar>>` construction `emqx_base62:decode/2` wraps its per-character append in —
+/// one statically sized unsigned big-endian `integer 8` field — and `create_fresh` lowers it
+/// as one packing sequence plus one `jit_make_heap_binary` call.
+///
+/// The row is deliberately one width, not a sweep (the wider sweep is a separate task): what
+/// it establishes is that the arm's value path is *connected* — the built term is the 8-bit
+/// field's byte, on both tiers and against an independently computed expectation — and that
+/// the compiled run stayed **in block**: the bare route consults no append door at all, so
+/// `bitstr_calls()` must not move across the run (this fixture holds no `bs_init_writable`
+/// either). `jit_step_one` at zero is the second half of that claim: a guard that refused
+/// would show up there long before it showed up in the bytes.
+#[test]
+fn a_bare_build_packs_its_eight_bit_field_in_block_and_answers_the_family_value() {
+    // `f(Value)` — the field *is* the whole result, so the destination is the argument's own
+    // register: the compiler emits this shape whenever the built binary replaces its only
+    // source, and the emitted sequence loads every field before it stores the result.
+    let module = bin_module("bscb_fresh_int8", 1, &[], |module| {
+        vec![create_bin(
+            Operand::X(0),
+            int_seg(module, Operand::X(0), 8),
+            1,
+        )]
+    });
+    // The route the fixture is: bare, not an append build.
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("a one-field bare build is an inlinable shape");
+    assert_eq!(
+        shape.route(),
+        bitstr_inline::Route::Fresh,
+        "a build with no `private_append` group is the bare route"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_FRESH),
+        "the bare build's arm must emit (emitted {emitted:?})"
+    );
+    assert!(
+        !emitted.contains(&SHAPE_CREATE_BIN),
+        "no accumulator is involved, so the append shape must not emit (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "the bare shape must lower, not statically deopt"
+    );
+
+    let name = atom(&module, "f");
+    for value in [0i64, 0x41, 0xFF, -1] {
+        let expected = big_endian(value, 1);
+        let label = format!("bare integer 8 of {value:#x}");
+        // (1) The compiled run: one byte, the field's low eight bits, and **no** family
+        // helper call anywhere in it.
+        let report = run_counting(&module, name, &[ArgKind::Int(value)], Tier::BaselineJit);
+        assert_eq!(
+            report.bits,
+            Some(8),
+            "{label}: the built bitstring is the field's own width"
+        );
+        assert_eq!(
+            report.bytes.as_deref(),
+            Some(&expected[..]),
+            "{label}: the packed field's byte"
+        );
+        assert_eq!(
+            report.bitstr_calls, 0,
+            "{label}: the bare route consults no append door, so `jit_bitstr` must not run"
+        );
+        assert_eq!(
+            report.counters.step_one, 0,
+            "{label}: the arm must stay native (jit_step_one ran {} times)",
+            report.counters.step_one
+        );
+        // (2) Both tiers, and the family's own value: the interpreter runs the family's
+        // `bs_create_bin` body, so agreeing with it is agreeing with the reference lowering.
+        with_both_tiers_args(&module, name, &[ArgKind::Int(value)], |interpreter, baseline| {
+            assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert_eq!(
+                    returned_bytes(&label, tier, outcome),
+                    expected,
+                    "{tier}: {label}: the family's own packed byte"
+                );
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The append door's machine-private half, pinned against the seam it is the remainder of
+// ---------------------------------------------------------------------------
+/// **`runtime::append_cursor` answers exactly what `seam::open_append` decides**, for the one
+/// accumulator form a real build produces, over the four cases that clause matrix has: a
+/// registered payload, an unregistered address, room that fits and room that does not.
+///
+/// The helper is the remainder of `seam::open_append` once the emitted proof has established
+/// the term shape itself (`create_door.rs`), so the two must agree on every clause that does
+/// **not** depend on the term: the writable-payload registry lookup (`base` is the key), its
+/// byte-to-bit `checked_mul(8)` conversion and the `end + tail <= capacity` room rule. The
+/// test therefore drives both against the same machine state and asserts they answer the same
+/// thing, then reads the helper's own answer as the byte cursor `base + end_bits / 8`.
+///
+/// **Byte alignment is the DOOR's guard, not this helper's.** `emit_append_cursor` emits
+/// `test rdx, 7 / jne fallback` before the call (`append_unit_allows(end_bits, 8)`,
+/// `erl_bits.c:1778-1784`), so the helper is only ever reached at a byte-aligned window end and
+/// deliberately does not re-check it: an unaligned end is the general door's
+/// (`jit_open_append_bin_any`) business. Every row below is at an aligned end, which is the
+/// only input the helper's contract admits.
+///
+/// What this row still proves: the registry and room clauses agree clause-for-clause with the
+/// seam, the answer is the byte cursor and not the base, and a refusal is the `0` sentinel —
+/// never a fabricated cursor.
+#[test]
+fn append_cursor_answers_exactly_what_the_seams_open_append_decides() {
+    use crate::families::bitstrings::create::seam;
+    use super::runtime::append_cursor;
+
+    let module = accumulator_module("append_cursor_pin", &[], |module| {
+        int_seg(module, Operand::X(1), 8)
+    });
+    let name = atom(&module, "f");
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let hint = crate::terms::make_integer(&mut ctx, 16).expect("the capacity hint builds");
+    let value = crate::terms::make_integer(&mut ctx, 0x41).expect("the field value builds");
+    // The interpreter runs the family's own build, so the accumulator below is the shape a real
+    // `private_append` produces: a writable `ErlSubBits` over a payload this machine owns,
+    // whose window end is the field's 8 bits.
+    let outcome = machine.run_export_outcome_with_tier(
+        &module,
+        name,
+        2,
+        &[hint, value],
+        &mut ctx,
+        Tier::Interpreter,
+    );
+    let accumulator = returned("append_cursor", "interpreter", &outcome);
+
+    // (1) The registry-match, room-fits case: both answer `Some`, and the helper's value is the
+    // byte cursor `base + end_bits / 8` — not the base, which is what a missing division or a
+    // missing registry lookup would look like.
+    let (base, end_bits) = seam::open_append(&machine, accumulator, 0)
+        .expect("a freshly built accumulator is a writable payload of this machine with room");
+    assert_eq!(
+        end_bits, 8,
+        "the accumulator's window end is the one appended field's 8 bits"
+    );
+    assert_eq!(
+        append_cursor(&machine, base, end_bits, 0),
+        (base + end_bits / 8) as i64,
+        "the door answers the byte cursor, not the payload base"
+    );
+
+    // (2) The room clause, at its exact boundary: a tail that exactly fills the payload is
+    // accepted by both, one bit more is refused by both.
+    let capacity_bits = machine
+        .writable_capacity(base as *const u8)
+        .expect("the accumulator's payload is registered writable")
+        * 8;
+    let exact_tail = capacity_bits - end_bits;
+    assert_eq!(
+        seam::open_append(&machine, accumulator, exact_tail as u32),
+        Some((base, end_bits)),
+        "a tail that exactly fills the payload is room enough"
+    );
+    assert_eq!(
+        append_cursor(&machine, base, end_bits, exact_tail),
+        (base + end_bits / 8) as i64,
+        "the exact-fit tail answers the cursor"
+    );
+    let one_bit_too_much = exact_tail + 1;
+    assert_eq!(
+        seam::open_append(&machine, accumulator, one_bit_too_much as u32),
+        None,
+        "one bit past the capacity is refused by the seam"
+    );
+    assert_eq!(
+        append_cursor(&machine, base, end_bits, one_bit_too_much),
+        0,
+        "…and refused by the helper, as the `0` sentinel — never a cursor"
+    );
+
+    // (3) The registry-miss case: an address this machine never registered answers `None` / `0`
+    // even though it is a perfectly plausible address, so the room rule is never reached.
+    let unregistered = base + 4096;
+    assert_eq!(
+        machine.writable_capacity(unregistered as *const u8),
+        None,
+        "the probe address is not a payload of this machine"
+    );
+    assert_eq!(
+        append_cursor(&machine, unregistered, end_bits, 0),
+        0,
+        "an unregistered base is the `0` sentinel"
+    );
+}
+// ---------------------------------------------------------------------------
+// The bare route's value sweep — a child module, because this file carries the append route
+// ---------------------------------------------------------------------------
+/// The value half of [`bitstr_inline::Route::Fresh`] (the bare `bs_create_bin` lowering):
+/// the `1..=64` width sweep, the multi-field packing, the `Y`-slot destination and the two
+/// refusals. Split out of this file, whose own subject is the append route's shape and
+/// mutation order.
+#[path = "bs_create_bin_fresh_tests.rs"]
+mod fresh;

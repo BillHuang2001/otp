@@ -26,7 +26,7 @@
 //! The transfer itself is not new: a **frame-preserving** local `call` into another
 //! function of the module, and the `return` that lands back on the caller's
 //! continuation, are both resolved in-block by
-//! [`super::runtime::enter_in_block`] (its `resolve_resume_entry` first tries the
+//! [`super::runtime::enter_in_block`] (its published-tables arm first tries the
 //! **published** `EntryTables` — the function the driver last entered — and only a
 //! *different* function falls through to the artifact). This suite pins that split, so
 //! the cost of the artifact lookup is a measured quantity rather than an assumption:

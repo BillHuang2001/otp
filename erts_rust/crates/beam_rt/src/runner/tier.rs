@@ -169,10 +169,11 @@ pub(super) enum JitMode {
     Interpreter,
     /// The native baseline tier for **every** process entry, requested explicitly.
     ///
-    /// The `BEAM_RT_TIER=baseline` value. It selects exactly what [`JitMode::Auto`] selects
-    /// today, so it is a measurement/debugging alias of the default rather than a different
-    /// policy; the two are kept distinct because the environment surface names both and
-    /// `interpreter` must remain the only value that turns the tier off.
+    /// The `BEAM_RT_TIER=baseline` value, or its [`Tier::name`] spelling `baseline-jit`. It
+    /// selects exactly what [`JitMode::Auto`] selects today, so it is a measurement/debugging
+    /// alias of the default rather than a different policy; the two are kept distinct because
+    /// the environment surface names both and `interpreter` must remain the only value that
+    /// turns the tier off.
     Baseline,
     /// The optional Cranelift hot tier — `BEAM_RT_TIER=cranelift` (or, spelled as
     /// [`Tier::name`] spells it, `jit-cranelift`).
@@ -196,32 +197,52 @@ pub(super) enum JitMode {
 ///   tier for every process entry (see the module docs).
 /// * `Some("auto")` → [`JitMode::Auto`] — the same mode, named explicitly.
 /// * `Some("baseline")` → [`JitMode::Baseline`] — the same selection, forced explicitly.
-/// * `Some("cranelift")` and `Some("jit-cranelift")` → [`JitMode::Cranelift`] — the optional hot
-///   tier. `"jit-cranelift"` is accepted because it is exactly [`Tier::name`]'s spelling, i.e.
-///   the same name the engine reports and parses; `"hot"` is deliberately **not** accepted —
-///   it names no tier, and a vague near-miss that silently changed the tier would be a
-///   typo-safety hazard. Whether the backend is actually compiled in is the `cranelift` Cargo
-///   feature's business (see [`JitMode::Cranelift`]), never this function's.
-/// * `Some("interpreter")` and any other value → [`JitMode::Interpreter`] — an unknown value
-///   resolves to the always-correct interpreter rather than being an error (so a typo re-enables
-///   the reference tier instead of silently enabling the JIT).
+/// * `Some("cranelift")` → [`JitMode::Cranelift`] — the optional hot tier, under the runtime's own
+///   spelling of it.
+/// * `Some(<a `Tier::name()` spelling>)` → the mode that selects that tier: `"baseline-jit"` →
+///   [`JitMode::Baseline`], `"jit-cranelift"` → [`JitMode::Cranelift`], `"interpreter"` →
+///   [`JitMode::Interpreter`]. The roster spellings are resolved through [`Tier::from_name`],
+///   i.e. the engine's own name table rather than a second copy of it here, so a value copied
+///   out of a tier report (`available_tiers`, a tier column in a measurement record) selects the
+///   tier it names. That is a typo-safety property and not a convenience: an unaccepted
+///   `"baseline-jit"` used to land on the *always-available* interpreter, which made a session
+///   believe it measured the default native tier while it measured the reference one. A name
+///   that is **not** on the roster stays unaccepted — `"jit-beamasm"` is the historical
+///   Cargo-feature alias for the baseline backend (`beam_engine`'s `jit-beamasm`), not a
+///   [`Tier`] name ([`Tier::from_name`] answers `None` for it), and `"hot"` names no tier at all.
+///   Whether the Cranelift backend is actually compiled in is the `cranelift` Cargo feature's
+///   business (see [`JitMode::Cranelift`]), never this function's.
+/// * `Some("interpreter")` — by the roster spelling or by the fallback below — and any other
+///   value → [`JitMode::Interpreter`] — an unknown value resolves to the always-correct
+///   interpreter rather than being an error (so a typo re-enables the reference tier instead of
+///   silently enabling the JIT).
 ///
 /// Pure (no environment read), so a test can pin the semantics without mutating the
 /// process environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is `unsafe` in
 /// edition 2024).
 pub(super) fn mode_from_value(value: Option<&str>) -> JitMode {
+    let Some(value) = value else {
+        return JitMode::Auto;
+    };
     match value {
-        None | Some("auto") => JitMode::Auto,
-        Some("baseline") => JitMode::Baseline,
-        Some("cranelift") | Some("jit-cranelift") => JitMode::Cranelift,
-        _ => JitMode::Interpreter,
+        "auto" => JitMode::Auto,
+        "baseline" => JitMode::Baseline,
+        "cranelift" => JitMode::Cranelift,
+        // Every remaining accepted spelling is the engine roster's own (`Tier::name`), so the
+        // string table is the engine's and a roster name can never drift from this match.
+        spelling => match Tier::from_name(spelling) {
+            Some(Tier::BaselineJit) => JitMode::Baseline,
+            Some(Tier::Cranelift) => JitMode::Cranelift,
+            Some(Tier::Interpreter) | None => JitMode::Interpreter,
+        },
     }
 }
 
 /// The process-wide default tier mode from the `BEAM_RT_TIER` environment variable.
 ///
 /// The variable's semantics are [`mode_from_value`]'s: `interpreter`, `auto`, `baseline`,
-/// `cranelift` (and the engine's `jit-cranelift` spelling of it) are the accepted values, an
+/// `cranelift` and every [`Tier::name`] roster spelling that selects an available tier
+/// (`baseline-jit`, `jit-cranelift`, `interpreter`) are the accepted values, an
 /// unset value is the default [`JitMode::Auto`] and an unknown one the always-correct
 /// [`JitMode::Interpreter`]. Read **once** (a `OnceLock`), so a long-running process pays no
 /// repeated `getenv`. The environment is read here and nowhere else — in particular a

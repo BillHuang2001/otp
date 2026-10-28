@@ -1680,6 +1680,16 @@ fn the_unset_default_resolves_to_auto() {
         JitMode::Cranelift,
         "`jit-cranelift` is `Tier::name()`'s spelling of the same request"
     );
+    // `baseline-jit` is `Tier::name()`'s spelling of the **default** native tier. Accepting it is
+    // a correctness property, not a convenience: the fallback for an unaccepted value is the
+    // always-available interpreter, so a measurement/debugging session that copied the roster
+    // name out of a tier report would otherwise have measured the reference tier while believing
+    // it measured the default one.
+    assert_eq!(
+        mode_from_value(Some("baseline-jit")),
+        JitMode::Baseline,
+        "`baseline-jit` is `Tier::name()`'s spelling of the default native tier"
+    );
     // An unknown value is the always-correct interpreter, never an error and never a JIT —
     // including `"hot"`, which names no tier and must not quietly mean the Cranelift one.
     for unknown in ["jit", "", "hot", "cranelift-jit", "CRANELIFT"] {
@@ -1691,6 +1701,59 @@ fn the_unset_default_resolves_to_auto() {
     }
     // The derived `Default` is the same tier an unset variable resolves to.
     assert_eq!(JitMode::default(), JitMode::Auto);
+}
+
+/// **Every [`Tier::name`] spelling the roster defines resolves to the mode that selects that
+/// tier** — the round trip a value copied out of a tier report depends on, and the pin that keeps
+/// this table from drifting when the engine's roster grows or is renamed.
+///
+/// The names are not restated here: the table is driven by [`Tier::ALL`] / [`Tier::name`], and the
+/// second half asserts the resolution reaches the same tier back through the selection seam, so a
+/// future tier whose name resolves to the wrong mode — or to the interpreter fallback — fails this
+/// test rather than silently mis-measuring a session.
+///
+/// `"jit-beamasm"` is deliberately **not** a tier name: it is the historical Cargo-feature alias
+/// for the baseline backend, so it stays on the interpreter fallback (and is asserted to be
+/// unaccepted by the roster itself, which is why this test does not accept it either).
+#[test]
+fn every_roster_tier_name_resolves_to_its_own_mode() {
+    let rt = runtime();
+    // A mode alone decides the tier (there is no per-module predicate), so one minimal entry
+    // serves every row — an unresolved fun entry is the shape requiring no loaded module.
+    let entry = ProcessEntry::Fun {
+        fun: make_small(0),
+        target: None,
+    };
+    for tier in Tier::ALL {
+        let mode = mode_from_value(Some(tier.name()));
+        let expected = match tier {
+            Tier::Interpreter => JitMode::Interpreter,
+            Tier::BaselineJit => JitMode::Baseline,
+            Tier::Cranelift => JitMode::Cranelift,
+        };
+        assert_eq!(
+            mode,
+            expected,
+            "{:?} is the roster name of {tier:?}, so it must select that tier's mode",
+            tier.name()
+        );
+        assert_eq!(
+            select_entry_tier(&rt, &mut RunnerState::default(), &entry, mode),
+            tier,
+            "{:?} must reach {tier:?} through the selection seam",
+            tier.name()
+        );
+    }
+    assert_eq!(
+        Tier::from_name("jit-beamasm"),
+        None,
+        "`jit-beamasm` is the Cargo-feature alias of the baseline backend, not a tier name"
+    );
+    assert_eq!(
+        mode_from_value(Some("jit-beamasm")),
+        JitMode::Interpreter,
+        "a name the roster does not define keeps the always-correct interpreter fallback"
+    );
 }
 
 // -- end-to-end tier equivalence on the scheduled path --------------------

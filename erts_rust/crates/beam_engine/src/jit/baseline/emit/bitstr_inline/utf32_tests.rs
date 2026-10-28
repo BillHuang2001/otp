@@ -66,7 +66,10 @@ use beam_common::Result as BeamResult;
 use beam_loader::{Instr, Label, Module, Operand};
 use beam_term::{Atom, Eterm};
 
-use super::{get_utf32_shape, skip_utf32_shape, SHAPE_GET_UTF32, SHAPE_SKIP_UTF32};
+use super::{
+    get_utf32_shape, skip_utf32_shape, FRESH_START_MATCH_HELPER_CALLS, SHAPE_GET_UTF32,
+    SHAPE_SKIP_UTF32,
+};
 use crate::context::MinimalContext;
 use crate::interpreter::build_label_map;
 use crate::jit::baseline::bitstr::bitstr_calls;
@@ -451,13 +454,16 @@ fn a_non_byte_aligned_start_deopts_to_exactly_one_interpreter_step() {
         "the character must be consumed exactly once from a bit offset of 36 (a double commit \
          would answer 100, a missing one 36)"
     );
-    // The fallback is exactly one interpreter step (`emit_step_and_continue` -> `jit_step_one`),
-    // not a `jit_bitstr` call, so that counter is not the instrument for this row: the semantic
-    // pin above is stronger (only the family's byte-wise reader can produce 68 from a
-    // non-aligned window).
+    // `bitstr_calls()` counts the **family** helper (`jit_bitstr`), which this row's inlined arm
+    // never reaches for the skip itself — and the module's own `bs_start_match3` on a fresh
+    // subject does reach, once, because the family must `make_ctx` (which allocates). So the
+    // exact expectation is `FRESH_START_MATCH_HELPER_CALLS`, not `0`; anything above it would be
+    // a skip fallback. The semantic pin above is the real proof (only the family's byte-wise
+    // reader can produce 68 from a non-aligned window).
     assert_eq!(
-        deopts, 0,
-        "the inline fallback is one interpreter step, not a `jit_bitstr` call (got {deopts})"
+        deopts, FRESH_START_MATCH_HELPER_CALLS,
+        "the misaligned skip must add no family call of its own beyond the fresh-subject \
+         start-match (got {deopts})"
     );
 }
 

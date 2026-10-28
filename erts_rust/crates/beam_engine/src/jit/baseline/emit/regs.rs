@@ -134,8 +134,10 @@ pub(crate) struct Allocation {
     /// The emitter's two Y-window decisions both read it, and both are compile-time
     /// (so a Y-free block pays nothing at run time):
     ///
-    /// * the **prologue** publishes the current frame's Y window iff `y_last.is_some()`
-    ///   (a block that may read `JitRuntime::y_base`/`y_end`);
+    /// * the **prologue** publishes the current frame's Y window unless every Y access of
+    ///   the block follows a frame-changing helper that re-publishes it itself
+    ///   ([`Allocation::prologue_publishes_y`], read off `y_last`/`y_first`/
+    ///   `frame_republish_first`);
     /// * the **post-deopt refresh** ([`Allocation::refresh_y_after`]) is emitted only
     ///   when a still-later instruction accesses a Y slot.
     ///
@@ -308,19 +310,23 @@ impl Allocation {
     /// ([`super::super::emit::prologue`]'s inline store).
     ///
     /// A block that accesses no Y slot publishes nothing. A block that does publishes
-    /// **unless** every one of its Y accesses lies at or after an in-block helper that has
-    /// already re-published the window itself ([`Allocation::frame_republish_first`]: an
-    /// `allocate`/`allocate_heap`/`trim`, whose helper calls
-    /// `JitRuntime::refresh_y_base` on its success arm). A block's control flow is linear
-    /// — it is entered only at its own start and the only ways out of the middle are a
-    /// branch/exit into another range (each with **its own** prologue) — so reaching the
-    /// first Y access necessarily executed that helper first and the prologue's window is
-    /// overwritten before anything reads it: the publish would be dead work.
+    /// **unless** every one of its Y accesses lies at or after an in-block instruction that
+    /// re-published the window itself ([`Allocation::frame_republish_first`]: an
+    /// `allocate`/`allocate_heap`/`trim`, each one positioned helper call whose success arm
+    /// derives the window from `Machine::push_frame_window`'s own `(y_base, y_count)` —
+    /// `jit_allocate`/`jit_allocate_heap`'s `publish_y_window`, `jit_trim`'s
+    /// `refresh_y_base`). A block is entered only at its own **start** — a fresh block entry,
+    /// and a resume, which parks on a block entry because `Machine::current_code` stores that
+    /// entry's pc mid-block and re-executes the prefix — and the block is linear, the only
+    /// ways out of its middle being a branch/exit into another range (each with its own
+    /// prologue), so reaching the first Y access necessarily ran that helper first: the
+    /// window is the live frame's before anything reads it, and the publish would be dead
+    /// work.
     ///
-    /// **Conservative by construction**: an `Allocation` whose tables the analysis did not
-    /// fill (a synthetic one a unit test built directly — `y_last` set but `y_first`
-    /// absent) still publishes. The only failure direction is therefore a redundant
-    /// publish, never a Y access against a window nothing published.
+    /// **Conservative by construction**: an `Allocation` whose analysis tables are absent (a
+    /// synthetic one a unit test built directly — `y_last` set but `y_first` absent) still
+    /// publishes. The only failure direction is therefore a redundant publish, never a Y
+    /// access against a window nothing published.
     pub(crate) fn prologue_publishes_y(&self) -> bool {
         if self.y_last.is_none() {
             return false;

@@ -40,7 +40,7 @@ use beam_common::BeamError;
 use beam_loader::{ImportRef, Instr, Module};
 use beam_term::Eterm;
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, ReduceHook};
 use crate::error;
 use crate::machine::{Continuation, Machine};
 use crate::Step;
@@ -269,12 +269,13 @@ pub(crate) struct JitRuntime<'a> {
     /// which tail-jumps to it (leaving the block's native frame first, so the target's own
     /// prologue rebuilds one) instead of returning a word for the driver to decode. The
     /// skipped driver iteration's work is performed by the helper *before* the transfer —
-    /// see [`resume_in_block`] — so the resumed block is entered exactly as a
+    /// see [`commit_in_block_entry`] — so the resumed block is entered exactly as a
     /// driver-entered one. Read by generated code at [`RUNTIME_RESUME_DISP`]; always null
     /// for every other helper.
     pub(crate) resume_entry: *const u8,
     /// The block-entry tables of the function the driver last entered natively
-    /// ([`EntryTables`]) — what [`resume_in_block`] resolves a continuation through first.
+    /// ([`EntryTables`]) — what [`enter_in_block`] resolves a continuation through first, on
+    /// the same-function fast path that needs no artifact lookup at all.
     ///
     /// Published by the driver at every driver-loop iteration in which it enters native
     /// code, and set to [`EntryTables::NONE`] at every iteration that takes an interpreter
@@ -282,7 +283,7 @@ pub(crate) struct JitRuntime<'a> {
     /// and written **only by Rust**.
     pub(crate) tables: EntryTables,
     /// The compiled artifact whose code is currently executing, or null when no native code
-    /// is running — what [`resume_in_block`] resolves a **cross-function** continuation
+    /// is running — what [`cross_function_enter`] resolves a **cross-function** continuation
     /// through (see [`CompiledModule::native_entry_tables`]).
     ///
     /// The driver owns the artifact for the whole slice (the caller-owned one in module
@@ -304,6 +305,27 @@ pub(crate) struct JitRuntime<'a> {
     /// written **only** by generated code and by the driver (which still stores the
     /// same field directly at its loop head — see `Machine::set_current_code`).
     pub(crate) current_code: *mut u64,
+    /// The run's **devirtualised reduction charge** — the host's own
+    /// [`ExecutionContext::reduce`] behind a monomorphised shim
+    /// ([`ExecutionContext::reduce_hook`]), built once per driver call because this driver
+    /// call **is** one scheduling slice.
+    ///
+    /// Filled when the driver latches [`Machine::reduce_on`] from
+    /// [`ExecutionContext::wants_reduce`] (the same one-answer-per-run gate the interpreter
+    /// latches), so `Some` and `reduce_on == true` are the two halves of one decision and a
+    /// host whose hook is the default no-op pays nothing at all. The **one** consumer is
+    /// [`Self::charge_reduce`], hence every per-transfer charge
+    /// ([`commit_in_block_entry`]) and the driver's own per-block-entry charge: what used to
+    /// be a `*mut dyn` reborrow plus a vtable load per charge is one indirect call.
+    ///
+    /// `None` while `reduce_on` is `false`; a `None` with `reduce_on == true` (a hand-built
+    /// runtime, e.g. in a unit test) still charges, through the `dyn` door — see
+    /// [`Self::charge_reduce`], which keeps that path semantically identical.
+    ///
+    /// Read and written **only by Rust** (the driver and the helpers), never by generated
+    /// code, so its position is immaterial to the emitted stream and it is **appended** so
+    /// every pre-existing `#[repr(C)]` offset — and therefore every emitted byte — stays put.
+    pub(crate) reduce_hook: Option<ReduceHook>,
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -324,15 +346,15 @@ pub(crate) struct EntryTables {
     /// The function these tables belong to — a continuation in **another** function is a
     /// different mapping, which only the driver may switch to.
     pub(crate) func: u32,
-    /// `entries[pc]`: the block's native entry, or `None` for an address this function
+    /// `entries[pc]`: the block's native entry, or null for an address this function
     /// compiled no block start for.
-    pub(crate) entries: *const Option<*const u8>,
+    ///
+    /// A null **sentinel** rather than `Option<*const u8>` (16 bytes on this toolchain —
+    /// a raw pointer carries no null niche), so the table is half the width and the probe
+    /// pays no tag load.
+    pub(crate) entries: *const *const u8,
     /// The number of slots in `entries` (the function's code length).
     pub(crate) entries_len: usize,
-    /// `sub_entries[pc]`: the **continuation sub-block** starting at `pc`, or `None`.
-    pub(crate) sub_entries: *const Option<*const u8>,
-    /// The number of slots in `sub_entries`.
-    pub(crate) sub_entries_len: usize,
 }
 
 impl EntryTables {
@@ -345,11 +367,9 @@ impl EntryTables {
         func: u32::MAX,
         entries: std::ptr::null(),
         entries_len: 0,
-        sub_entries: std::ptr::null(),
-        sub_entries_len: 0,
     };
 
-    /// The tables of `func` from that function's own two entry vectors.
+    /// The entry table of `func`, from that function's own folded entry vector.
     ///
     /// The **one** place an [`EntryTables`] is built, so the driver's publication
     /// ([`CompiledModule::entry_tables`]) and an in-block transfer's re-publication
@@ -358,17 +378,15 @@ impl EntryTables {
     ///
     /// [`CompiledModule::entry_tables`]: super::code::CompiledModule::entry_tables
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
-    pub(crate) fn of(
-        func: u32,
-        entries: &[Option<*const u8>],
-        sub_entries: &[Option<*const u8>],
-    ) -> EntryTables {
+    /// `entries` must be the function's **already folded** table: the compiler fills each
+    /// block start's slot and, wherever it left a null, the continuation sub-block's entry
+    /// (`emit::compile::merge_sub_entries`). One slot therefore answers both shapes a
+    /// transfer can name, and a null slot means that address compiled no entry at all.
+    pub(crate) fn of(func: u32, entries: &[*const u8]) -> EntryTables {
         EntryTables {
             func,
             entries: entries.as_ptr(),
             entries_len: entries.len(),
-            sub_entries: sub_entries.as_ptr(),
-            sub_entries_len: sub_entries.len(),
         }
     }
     /// The native entry for `(func, pc)` in these tables — a real block start first, then a
@@ -382,20 +400,18 @@ impl EntryTables {
             return None;
         }
         let pc = pc as usize;
-        if pc < self.entries_len {
-            // SAFETY: `entries` points at the `entries_len`-slot vector of the compiled
-            // function this table was published for (see the struct docs), and `pc` is in
-            // bounds of it.
-            if let Some(entry) = unsafe { *self.entries.add(pc) } {
-                return Some(entry);
-            }
+        if pc >= self.entries_len {
+            return None;
         }
-        if pc < self.sub_entries_len {
-            // SAFETY: as above — `sub_entries` points at that function's
-            // `sub_entries_len`-slot continuation table and `pc` is in bounds of it.
-            return unsafe { *self.sub_entries.add(pc) };
+        // SAFETY: `entries` points at the `entries_len`-slot folded entry vector of the
+        // compiled function this table was published for (see the struct docs), and `pc`
+        // is in bounds of it. A slot is null when that address compiled no entry.
+        let entry = unsafe { *self.entries.add(pc) };
+        if entry.is_null() {
+            None
+        } else {
+            Some(entry)
         }
-        None
     }
 }
 impl JitRuntime<'_> {
@@ -511,6 +527,52 @@ impl JitRuntime<'_> {
         };
         self.literals_base = base;
         self.literals_end = end;
+    }
+    /// Charge `n` reductions to the host — the **one** reduction door of this tier, shared
+    /// by the driver's per-block-entry charge and by the per-transfer charge of
+    /// [`commit_in_block_entry`].
+    ///
+    /// Answers `true` when the host accepted the charge and `false` when it refused it; a
+    /// refusal's error is already stored in [`Self::error`] **unchanged** (the shim writes
+    /// the host's own [`BeamError`] there), so the caller's refusal arm only has to take it
+    /// back out and answer [`ERROR`].
+    ///
+    /// The dispatch is the run-cached [`Self::reduce_hook`], i.e. one indirect call through a
+    /// monomorphised shim: no `*mut dyn` fat-pointer move and no vtable load per charge. A
+    /// runtime that carries **no** hook (a hand-built one, e.g. in a unit test) while
+    /// [`Machine::reduce_on`] is latched still charges — through the same
+    /// [`ExecutionContext::reduce`] door the hook wraps — so the count and the ordering a
+    /// host observes never depend on whether the hook was latched.
+    #[inline]
+    pub(crate) fn charge_reduce(&mut self, n: u32) -> bool {
+        if let Some(hook) = self.reduce_hook {
+            return hook.charge(n, &mut self.error);
+        }
+        // SAFETY: `self.ctx` is the driver's live `&mut dyn ExecutionContext` reborrowed as a
+        // raw pointer; no other `&mut` to it exists while this helper runs (the driver is
+        // blocked in the block call that reached us, or is at its own loop head).
+        let ctx = unsafe { &mut *self.ctx };
+        match ctx.reduce(n) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err);
+                false
+            }
+        }
+    }
+    /// Take the refusal [`Self::charge_reduce`] stored, for a caller whose own error channel
+    /// is a `Result`.
+    ///
+    /// Never on a hot path (a refused charge is a pre-emption), and
+    /// a `false` from the shim without an error would be a shim-contract violation rather
+    /// than a legitimately empty refusal — so it answers a **typed** error naming the site
+    /// instead of silently accepting the charge.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn take_reduce_refusal(&mut self) -> BeamError {
+        self.error.take().unwrap_or_else(|| {
+            crate::error::unsupported("reduce hook refused a charge without an error")
+        })
     }
 }
 
@@ -1459,10 +1521,16 @@ pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
 /// itself (`route::Aligned`'s inline proof in [`super::emit::bitstr_inline`]'s
 /// `create_door`): `raw::writable_append_target`'s
 /// registry clause — the payload base is the key — its `checked_mul(8)` byte-to-bit
-/// conversion, the `unit == 8` append-position gate and the `end + tail <= capacity` room
-/// rule. Every one of them answers exactly what that seam function answers for the same
-/// machine state, which is what keeps an inline-proof mistake a **refusal** (one
-/// interpreter step) and never a wrong result.
+/// conversion and the `end + tail <= capacity` room rule. Every one of them answers exactly
+/// what that seam function answers for the same machine state, which is what keeps an
+/// inline-proof mistake a **refusal** (one interpreter step) and never a wrong result.
+///
+/// **Precondition: `end_bits % 8 == 0`.** C's append-position gate for a whole-byte build
+/// (`append_unit_allows`, `erl_bits.c:1778-1784`) is *the door's* `test rdx, 7 / jne
+/// fallback` guard, emitted before this call, so it is not re-checked here — this helper is
+/// reached from [`emit_append_cursor`](super::emit::bitstr_inline::create_door) only. A
+/// caller with an unaligned window end must take the general door
+/// ([`jit_open_append_bin_any`]) instead.
 ///
 /// `0` is a safe decline signal: a real payload base is a live allocation address and can
 /// never be null, and the cursor is `base` plus a non-negative byte offset.
@@ -1490,6 +1558,13 @@ pub(crate) extern "C" fn jit_append_cursor(
 /// The decision body of [`jit_append_cursor`], split out so a test can pin it against
 /// `seam::open_append` (the seam's byte-aligned door, `#[cfg(test)]` and kept as that door's
 /// reference answer) without a `JitRuntime`.
+///
+/// **Precondition: `end_bits % 8 == 0`.** C's whole-byte append-position gate
+/// (`append_unit_allows(end_bits, 8)`, `erl_bits.c:1778-1784`) is *the aligned door's* run-time
+/// guard — `emit_append_cursor` emits `test rdx, 7 / jne fallback` before the call — so this
+/// function does not re-check it: the byte cursor `base + end_bits / 8` is only meaningful at a
+/// byte-aligned window end, and the door is this helper's only caller. An unaligned window end is
+/// the general door's ([`jit_open_append_bin_any`]) business, not this one's.
 pub(crate) fn append_cursor(
     machine: &Machine,
     base: usize,
@@ -1505,11 +1580,6 @@ pub(crate) fn append_cursor(
     else {
         return 0;
     };
-    // C's append-position gate for a whole-byte build (`append_unit_allows(end_bits, 8)`,
-    // `erl_bits.c:1778-1784`), kept here so this door agrees with the seam's on every input.
-    if end_bits % 8 != 0 {
-        return 0;
-    }
     let Some(new_end) = end_bits.checked_add(tail_bits) else {
         return 0;
     };
@@ -1782,6 +1852,48 @@ pub(crate) extern "C" fn jit_append_binary_all(
     append_binary_all(machine, acc_slot, src_slot, flags)
 }
 
+/// Build a binary from a **packed** bit field — the fresh (`accumulator`-less)
+/// `bs_create_bin` shape's one allocating door.
+///
+/// `value` carries every statically sized big-endian unsigned `integer` segment of the
+/// instruction already folded into one `nbits`-wide field, **field 0 in the most
+/// significant position and each field pre-masked to its own width** (the emitter packs
+/// it, so no allocation, no root and no `ExecutionContext` call happens in-block); the
+/// seam's [`make_fresh_binary`](crate::families::bitstrings::create::seam::make_fresh_binary)
+/// left-aligns those bits into a freshly allocated payload on the process heap and is
+/// byte-exact versus the family's own `exec`.
+///
+/// Answers the built term's raw word, or **`0`** ([`THE_NON_VALUE`], never a valid build
+/// result) for a refusal or an `Err`. `0` is the block ABI's one decline point: the
+/// emitted arm tests `rax` once and branches to `fallback`, which re-runs the instruction
+/// through [`jit_bitstr`] — so the family re-derives and re-reports the same typed error
+/// rather than this helper swallowing it.
+pub(crate) extern "C" fn jit_make_heap_binary(
+    rt: *mut JitRuntime<'_>,
+    value: i64,
+    nbits: usize,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is blocked
+    // in the block call that reached us), and it holds no `&mut` to either half while the
+    // helper runs.
+    let runtime = unsafe { &mut *rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`. This
+    // helper **does** write through it (the build reserves and fills process-heap words),
+    // which is why it takes the unique borrow the two appending doors above deliberately do
+    // not need; the driver is blocked in the block call, so no other `&mut Machine` exists.
+    let machine = unsafe { &mut *runtime.machine };
+    // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as a raw
+    // pointer, and the driver holds no `&mut` to it while the helper runs.
+    let ctx = unsafe { &mut *runtime.ctx };
+    match crate::families::bitstrings::create::seam::make_fresh_binary(machine, ctx, value as u64, nbits)
+    {
+        Ok(term) => term.raw() as i64,
+        // A refusal (`Err`) is the family's own path and the emitted `je` sends the
+        // instruction there; `0` is `THE_NON_VALUE`, which no build can produce.
+        Err(_) => 0,
+    }
+}
 /// How many times [`append_binary_all`] has executed on this thread and how many of those
 /// executions were **served** (answered the accumulator, i.e. really appended) rather than
 /// refused, as `(calls, served)`.
@@ -2008,6 +2120,18 @@ pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, dea
 /// the run's entry module, so `func`/`pc` and that module name every live frame, while
 /// a raise inside a cross-module callee is left bare for the driver, which knows the
 /// true entry module.
+///
+/// This is where a failing frame helper publishes the failing instruction's own position —
+/// the one place that position is observable on an error — so the successful transfer paths
+/// store nothing and only a `Halt` publishes the returning instruction
+/// ([`halt_word`]).
+///
+/// Out of line and `#[cold]`: it is the failure path of the frame-discipline and
+/// heap/frame-admission helpers, and inlining it into them (which is where `objdump` used
+/// to find it) charged every one of those hot helpers, and every block that calls one, for
+/// a body only a raising run reaches. The store is therefore free on every hot path.
+#[cold]
+#[inline(never)]
 fn report_frame_error(
     runtime: &mut JitRuntime<'_>,
     func: u32,
@@ -2019,6 +2143,9 @@ fn report_frame_error(
     // `Machine`, and no other `&mut Machine` exists while the helper runs (the driver
     // is blocked in the block call that reached us).
     let machine = unsafe { &mut *runtime.machine };
+    // The same position store `Machine::step_instruction` makes at entry: the failing
+    // instruction is the address every reader of the position must name from here on.
+    machine.set_current_code(func, pc);
     let err = if machine.current_context() == 0 {
         // SAFETY: `runtime.module` points at the `&Module` the driver is running,
         // which outlives the loop; in context `0` that module is the run's entry
@@ -2052,7 +2179,7 @@ fn report_frame_error(
 /// the arm keeps today's return-to-driver path for a `Halt`, a cross-context continuation,
 /// an artifact that holds no code for the address and every declined bound.
 ///
-/// There are two servable shapes, both resolved by [`resume_in_block`]:
+/// There are two servable shapes, one arm each in [`enter_in_block`]:
 ///
 /// * the **same function** the driver last entered — the shape **every** non-tail call
 ///   returns in when the callee is that same function, since the stored continuation is the
@@ -2063,12 +2190,21 @@ fn report_frame_error(
 ///   transfer is a legal `jmp` into another RX mapping; only the block-entry tables the
 ///   helper resolves through differ, and they are re-published for the target before the
 ///   jump so a nested return in the new function takes the same fast path.
-fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 {
+/// The position of the returning instruction is not published here: a taken transfer
+/// publishes its **target** (via [`commit_in_block_entry`]) and a decline is republished by
+/// the driver's own loop-head decode. The one shape no other store covers is a `Halt`, which
+/// ends the run, and [`halt_word`] publishes it there.
+fn return_word(
+    runtime: &mut JitRuntime<'_>,
+    continuation: Continuation,
+    func: u32,
+    pc: u32,
+) -> i64 {
     // Cleared on **every** call, so the emitted arm can never observe a stale entry from an
     // earlier return (the two arms read exactly the value their own helper wrote).
     runtime.resume_entry = std::ptr::null();
     match continuation {
-        Continuation::Halt => HALT,
+        Continuation::Halt => halt_word(runtime, func, pc),
         Continuation::Address {
             func,
             pc,
@@ -2083,10 +2219,32 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
             }
             // The in-block transfer itself is shared with a frame-preserving `call`'s callee
             // (see [`enter_in_block`]): both are "continue the driver's loop at `(func, pc)`
-            // without going back to the driver", so they must never diverge.
-            enter_in_block(runtime, func, pc)
+            // without going back to the driver", so they must never diverge. The clear above
+            // is this path's, so it takes the twin that does not repeat it.
+            enter_in_block_cleared(runtime, func, pc)
         }
     }
+}
+
+/// Publish the returning instruction as the finished run's position and answer [`HALT`].
+///
+/// A `Halt` is the outermost `return`: the run is over, so the driver's loop head never
+/// republishes and nothing else in this path stores anything. The interpreter's own last
+/// recorded position for the same program is the returning instruction, and the
+/// execution-position introspection (`Machine::current_code` and the `{M,F,A}` items built
+/// from it) is readable after a completed run, so this arm publishes exactly that.
+///
+/// Cold by construction: a run reaches it once, at its outermost `return`, never in a loop,
+/// so it stays out of the per-transfer path.
+#[cold]
+#[inline(never)]
+fn halt_word(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`; no
+    // other `&mut Machine` exists while the helper runs (the driver is blocked in the block
+    // call that reached us).
+    let machine = unsafe { &mut *runtime.machine };
+    machine.set_current_code(func, pc);
+    HALT
 }
 
 /// Resolve `(func, pc)` to a native block entry of the artifact the driver published and
@@ -2094,12 +2252,13 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
 /// for the tier's two in-block transfers: a `return`'s continuation ([`return_word`]) and a
 /// frame-preserving `call`'s callee ([`super::call::jit_call_store_linked`]).
 ///
-/// Clears [`JitRuntime::resume_entry`] on **every** call (so no emitted arm can observe a
-/// stale entry from an earlier transfer), then:
+/// [`JitRuntime::resume_entry`] is left **null** on every arm that publishes no entry (see
+/// [`enter_in_block_cleared`]), so no emitted arm can observe a stale entry from an earlier
+/// transfer. The arms are:
 ///
 /// * a **resolved** entry is stored in [`JitRuntime::resume_entry`] and the target's
 ///   `(func, pc)` word is returned — the arm tail-jumps to the entry;
-/// * a **decline** ([`resume_in_block`]'s `Ok(None)`: no published artifact, an address no
+/// * a **decline** ([`cross_function_enter`]'s no-hit: no published artifact, an address no
 ///   block covers, a missing function, a failed lazy compile, an unsatisfied register-file
 ///   bound) returns the same word with `resume_entry` still null — the arm leaves the word
 ///   for the driver, which decodes it exactly as it did before the transfer existed;
@@ -2107,76 +2266,82 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
 ///   returns [`ERROR`] — with **no** uncaught-raise funnel, exactly as the driver loop
 ///   head's own `ctx.reduce(1)?` applies none on that path.
 ///
+/// # The hot/cold split
+///
+/// The **same-function** transfer is the hot shape — a call's own `pc + 1` returns in the
+/// function that made it — and the published tables ([`EntryTables`]) answer it with two
+/// `Vec` indexings and no artifact lookup, no table re-publication and no bound re-check.
+/// That arm is `#[inline]` and shares [`commit_in_block_entry`] with the cold one, so an
+/// emitted `return`/`call` arm gets the whole same-function path merged into its own body.
+/// Everything the artifact is needed for — a **different** function of the same artifact,
+/// which a call into another function returns into — is the `#[cold]`
+/// [`cross_function_enter`], kept out of line because it is not the shape a hot loop takes.
+///
 /// The position the transfer publishes is the target's entry — the address a driver
 /// iteration would have published — so a `ctx.reduce` refusal parks the machine exactly
 /// where a driver-side refusal parks it and the resumed slice executes each instruction
 /// exactly once.
+///
+/// [`enter_in_block_cleared`] carries the body; this entry point exists because the
+/// `return` half ([`return_word`]) must clear before its own `match` (the `HALT`/`ENTER`
+/// arms leave the field for the emitted arm to read) and so calls the body directly.
+#[inline]
 pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
-    runtime.resume_entry = std::ptr::null();
+    enter_in_block_cleared(runtime, func, pc)
+}
+/// The body of [`enter_in_block`], shared with the `return` half's already-cleared call.
+///
+/// # `resume_entry` is cleared on exactly the arms that do not publish an entry
+///
+/// The emitted arm reads [`JitRuntime::resume_entry`] and treats null as "the transfer was
+/// declined", so a stale entry from an earlier transfer must never survive a call. The
+/// clear therefore sits on the two arms that publish nothing —
+/// [`cross_function_enter`] (whose own head clears, because its decline answers before any
+/// store) and the refused-charge arm below — while the accepted arm overwrites the field
+/// outright. No emitted code runs between the clear and either arm: both are reached from
+/// inside this body.
+#[inline]
+fn enter_in_block_cleared(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     let word = encode_target(func, pc);
-    match resume_in_block(runtime, func, pc) {
-        Ok(Some(entry)) => {
-            runtime.resume_entry = entry;
-            word
-        }
-        Ok(None) => word,
-        Err(err) => {
-            runtime.error = Some(err);
-            ERROR
-        }
+    match runtime.tables.entry(func, pc) {
+        // The same-function shape: the published tables already describe this function, so
+        // there is nothing to re-publish and no artifact to ask.
+        Some(entry) => match commit_in_block_entry(runtime, word) {
+            Ok(()) => {
+                runtime.resume_entry = entry;
+                word
+            }
+            Err(err) => {
+                runtime.resume_entry = std::ptr::null();
+                runtime.error = Some(err);
+                ERROR
+            }
+        },
+        None => cross_function_enter(runtime, func, pc, word),
     }
 }
 
-/// Resolve a return's continuation to a **block entry of this artifact** and perform the
-/// driver work the in-block transfer replaces — or answer `None` and leave everything to
-/// the driver.
+/// Perform the driver iteration the in-block transfer replaces — the step both halves of
+/// [`enter_in_block`] share, in the driver loop head's own order:
 ///
-/// This is the one place the tier skips a driver round-trip, so it reproduces the skipped
-/// iteration's work exactly, in the driver loop head's own order:
-///
-/// 1. the target entry is resolved — from the published tables when they already name the
-///    target function ([`EntryTables`]), else from the artifact
-///    ([`cross_function_entry`]). The answer declines unless the address names a block
-///    (real block start first, then continuation sub-block) of **this artifact's** code —
-///    the resolution is [`CompiledModule::native_entry_tables`], the same precedence
-///    [`CompiledModule::entry`] gives the driver — and, for a function other than the one
-///    the tables describe, unless the machine's register file satisfies that function's
-///    bound;
-/// 2. `Machine::set_current_code(func, pc)` — the address the driver would have published,
+/// 1. `Machine::set_current_code(func, pc)` — the address the driver would have published,
 ///    stored **before** the charge, so a refusal parks the machine exactly where a
 ///    driver-side refusal would have (the block about to run is untouched);
-/// 3. `Machine::reductions` bumped by one, the engine-side slice counter the driver bumps
-///    in the same step as the hook;
-/// 4. `ExecutionContext::reduce(1)` when the run latched [`Machine::reduce_on`] — the
+/// 2. `Machine::reductions` bumped by one, the engine-side slice counter the driver bumps in
+///    the same step as the hook;
+/// 3. `ExecutionContext::reduce(1)` when the run latched [`Machine::reduce_on`] — the
 ///    per-block-entry pre-emption charge. A refusal is returned **unchanged** and the
-///    transfer is not taken;
-/// 5. for a **cross-function** transfer, the target function's block-entry tables replace
-///    the published ones, so a nested return inside the new function resolves through them
-///    instead of falling back to the driver.
-///
-/// The register-file bound is not re-checked for the **same-function** shape, and that is
-/// sound by construction: the bound is a property of the **function**, checked when the
-/// driver entered it, and this transfer stays inside it — for a lazy artifact that is the
-/// entered function's own highest natively-touched register, which covers every one of its
-/// blocks, and for an eager artifact it is the whole-module maximum. `machine.x` never
-/// shrinks during a run, so a bound that held then still holds now. A **different**
-/// function's bound is a different number, so [`cross_function_entry`] checks it.
+///    transfer is not taken.
 ///
 /// The block has already spilled its cached x-registers into `machine.x` before calling the
 /// helper ([`super::emit::emit_helper_call`]'s pre-call spill), so a `reduce` that inspects
 /// the machine sees the interpreter's exact root set — the same state the driver's own
 /// charge runs in.
-///
-/// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
-/// [`CompiledModule::entry`]: super::code::CompiledModule::entry
-fn resume_in_block(
+#[inline]
+fn commit_in_block_entry(
     runtime: &mut JitRuntime<'_>,
-    func: u32,
-    pc: u32,
-) -> std::result::Result<Option<*const u8>, BeamError> {
-    let Some((entry, tables)) = resolve_resume_entry(runtime, func, pc) else {
-        return Ok(None);
-    };
+    word: i64,
+) -> std::result::Result<(), BeamError> {
     // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`; no
     // other `&mut Machine` exists while the helper runs (the driver is blocked in the block
     // call that reached us).
@@ -2184,20 +2349,67 @@ fn resume_in_block(
     // The driver loop head's order: publish the position, bump the slice counter, then
     // offer the hook. Nothing of the target block has run, so a refusal is a clean
     // pre-emption rather than a replayed prefix.
-    machine.set_current_code(func, pc);
-    machine.reductions = machine.reductions.saturating_add(1);
-    if machine.reduce_on {
-        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as a
-        // raw pointer; the driver holds no `&mut` to it while the helper runs.
-        let ctx = unsafe { &mut *runtime.ctx };
-        ctx.reduce(1)?;
+    //
+    // `word` **is** the `pack_current_code(func, pc)` the two-argument form would compute
+    // (`encode_target` is the same `func << 32 | pc` pattern), so the transfer packs its
+    // target once — for the exit word — and reuses it for the position store.
+    machine.set_current_code_word(word as u64);
+    // Wrapping, not saturating: the counter is a **per-slice** budget that both drivers
+    // zero at slice entry, so reaching `u64::MAX` would mean that many charges inside one
+    // slice — unreachable, and a two-instruction (`add` + `cmov`) pair on the per-transfer
+    // hot path is not worth a value no run can observe.
+    machine.reductions = machine.reductions.wrapping_add(1);
+    if machine.reduce_on && !runtime.charge_reduce(1) {
+        // The host refused: its own typed error is already in `runtime.error` (see
+        // [`JitRuntime::charge_reduce`]), and the transfer is **not** taken — nothing of the
+        // target block has run, and the position published above is the target's entry, so
+        // the machine is parked exactly where a driver-side refusal parks it.
+        return Err(runtime.take_reduce_refusal());
     }
-    if let Some(tables) = tables {
-        // The transfer is taken: the function whose blocks are about to run is the one the
-        // tables describe from here on.
-        runtime.tables = tables;
+    Ok(())
+}
+
+/// The **cold** half of [`enter_in_block`]: resolve an entry the published tables do not
+/// describe — an address in **another function of the same artifact** — and commit it.
+///
+/// Kept out of line (`#[cold]`, `#[inline(never)]`) because it is not the shape a hot loop
+/// takes: a `call`'s own continuation returns in the calling function, which the published
+/// tables already describe, and every other shape either declines here or never returns.
+///
+/// It declines — answering the unchanged target `word` with `resume_entry` still null, no
+/// artifact publication and nothing committed — on exactly the shapes the driver's fallback
+/// must keep; see [`cross_function_entry`] for the list and for why the register-file bound
+/// is checked here but not for the same-function shape.
+///
+/// On a hit the target function's block-entry tables replace the published ones **after** the
+/// commit, so a nested return inside the new function resolves through them instead of
+/// falling back to the driver, and [`JitRuntime::resume_entry`] carries the entry the emitted
+/// arm tail-jumps to.
+#[cold]
+#[inline(never)]
+fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: i64) -> i64 {
+    // Cleared here, at the head, because this body is the transfer's **decline** home: the
+    // early return below answers before any store, and a caller arrives with the field
+    // whatever the previous transfer left there. The accepted arms overwrite it.
+    runtime.resume_entry = std::ptr::null();
+    let Some((entry, tables)) = cross_function_entry(runtime, func, pc) else {
+        return word;
+    };
+    match commit_in_block_entry(runtime, word) {
+        Ok(()) => {
+            if let Some(tables) = tables {
+                // The transfer is taken: the function whose blocks are about to run is the
+                // one the tables describe from here on.
+                runtime.tables = tables;
+            }
+            runtime.resume_entry = entry;
+            word
+        }
+        Err(err) => {
+            runtime.error = Some(err);
+            ERROR
+        }
     }
-    Ok(Some(entry))
 }
 
 /// Resolve `(func, pc)` to a native entry plus, when the target is a function the published
@@ -2213,6 +2425,14 @@ fn resume_in_block(
 /// published (an interpreter step's iteration), an address the artifact compiled no block
 /// for, an address in a function this module does not have, and a function whose
 /// register-file bound the machine does not satisfy.
+///
+/// The register-file bound is not re-checked for the **same-function** shape
+/// ([`enter_in_block`]), and that is sound by construction: the bound is a property of the
+/// **function**, checked when the driver entered it, and such a transfer stays inside it —
+/// for a lazy artifact that is the entered function's own highest natively-touched register,
+/// which covers every one of its blocks, and for an eager artifact it is the whole-module
+/// maximum. `machine.x` never shrinks during a run, so a bound that held then still holds
+/// now. A **different** function's bound is a different number, so it is checked here.
 fn cross_function_entry(
     runtime: &JitRuntime<'_>,
     func: u32,
@@ -2280,19 +2500,6 @@ fn note_native_write_extent(runtime: &JitRuntime<'_>, artifact: &CompiledModule)
     machine.note_x_dirty(extent);
 }
 
-/// [`cross_function_entry`] behind the published-tables fast path: the same-function shape
-/// answers without touching the artifact, and no tables need re-publishing (they already
-/// describe that function).
-fn resolve_resume_entry(
-    runtime: &JitRuntime<'_>,
-    func: u32,
-    pc: u32,
-) -> Option<(*const u8, Option<EntryTables>)> {
-    match runtime.tables.entry(func, pc) {
-        Some(entry) => Some((entry, None)),
-        None => cross_function_entry(runtime, func, pc),
-    }
-}
 /// The **`deallocate`** helper: pop the current frame with the interpreter's exact
 /// `Instr::Deallocate` semantics and hand the block the address to continue at.
 ///
@@ -2321,8 +2528,9 @@ pub(crate) extern "C" fn jit_deallocate(
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
+        // No position store: `pop_frame_checked` cannot park or reach a host door, the
+        // block's own entry is already published (a valid resume point), and a raise
+        // reports through `report_frame_error`, which stores this instruction.
         machine.pop_frame_checked(deallocate)
     };
     match popped {
@@ -2351,6 +2559,11 @@ pub(crate) extern "C" fn jit_deallocate(
 /// names a block entry of the function already running, in which case
 /// [`JitRuntime::resume_entry`] carries that entry and the emitted arm tail-jumps to it
 /// (see [`return_word`]).
+///
+/// The helper stores no position of its own: a taken transfer publishes its target, a
+/// decline is republished by the driver's loop-head decode, a `Halt` publishes this
+/// instruction as the finished run's position ([`halt_word`]), and the failure path
+/// publishes it in [`report_frame_error`].
 pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
@@ -2360,12 +2573,10 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
         machine.take_continuation()
     };
     match continuation {
-        Ok(continuation) => return_word(runtime, continuation),
+        Ok(continuation) => return_word(runtime, continuation, func, pc),
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -2380,11 +2591,14 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
 /// `Instr::DeallocateReturn(N)`), so a `call`-heavy module pays it once per function
 /// exit on each tier. The two halves are the interpreter's, in the interpreter's
 /// order — [`Machine::pop_frame_checked`] first, so a mismatched operand raises from
-/// the live frame exactly as `Instr::Deallocate` does, then [`return_word`] — and the
-/// position the helper records is the fused instruction's own `(func, pc)`, which is
-/// what `step_instruction` records for `Instr::DeallocateReturn` (the emitter passes
-/// the `return`'s `pc` when it fuses a separate pair, which is the last instruction
-/// the interpreter would have recorded in that case).
+/// the live frame exactly as `Instr::Deallocate` does, then [`return_word`] — and it
+/// stores no position of its own: a taken transfer publishes its target, a decline is
+/// republished by the driver's loop-head decode, a `Halt` publishes this instruction as
+/// the finished run's position ([`halt_word`]), and the failure path publishes it in
+/// [`report_frame_error`] (the fused instruction's own `(func, pc)`, which is what
+/// `step_instruction` records for `Instr::DeallocateReturn`; the emitter passes the
+/// `return`'s `pc` when it fuses a separate pair, which is the last instruction the
+/// interpreter would have recorded in that case).
 ///
 /// Like [`jit_return`] it always transfers control, so the caller leaves the block
 /// with the helper's word in `rax` — or tail-jumps to the same-function block entry
@@ -2403,12 +2617,10 @@ pub(crate) extern "C" fn jit_deallocate_return(
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
-        machine.pop_frame_checked(deallocate).and_then(|()| machine.take_continuation())
+        machine.pop_frame_take_continuation(deallocate)
     };
     match outcome {
-        Ok(continuation) => return_word(runtime, continuation),
+        Ok(continuation) => return_word(runtime, continuation, func, pc),
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -2427,11 +2639,26 @@ pub(crate) extern "C" fn jit_deallocate_return(
 /// never admits a heap need.
 ///
 /// This is the *non-terminating* member of the family: the interpreter's arm returns
-/// `Step::Next`, so the block continues in-block at `pc + 1` on success (and leaves with
-/// [`ERROR`] otherwise — `push_frame` cannot fail today, but the funnel is shared).
+/// `Step::Next`, so the block continues in-block at `pc + 1`; the push itself cannot
+/// fail (see [`Machine::push_frame_window`]), so this helper has **no** failure arm.
 /// `push_frame` touches no x-register, so the block refills nothing — but it **is** a
-/// frame change, so the Y window is re-published on the continue arm when a later
-/// instruction of the block still accesses a Y slot.
+/// frame change, so the Y window is re-published here when a later instruction of the
+/// block still accesses a Y slot.
+///
+/// # Why this helper stores no execution position
+///
+/// The only readers of [`Machine::current_code`] are a park/resume, a stacktrace and
+/// `process_info`, and none of them can be reached from inside this helper: it allocates
+/// nothing, calls no host door and cannot raise, so it can neither park nor unwind. The
+/// position it would store is also **not the last published one in the wrong sense** —
+/// the driver's loop head / the in-block transfer published this block's own entry (or a
+/// continuation sub-block's), which is a valid resume point that re-executes the block
+/// prefix, and the block continues in-block afterwards. Every way *out* of the helper's
+/// neighbourhood republishes: a park leaves through the driver's loop head or
+/// [`commit_in_block_entry`], an inspection leaves through the next
+/// instruction-granular helper (`jit_step_one`/`jit_family`/`jit_test`/...), and a
+/// failing frame helper leaves through [`report_frame_error`], which stores `(func, pc)`
+/// itself. So the store was dead work on every path that has a reader.
 pub(crate) extern "C" fn jit_allocate(
     rt: *mut JitRuntime<'_>,
     func: u32,
@@ -2442,26 +2669,17 @@ pub(crate) extern "C" fn jit_allocate(
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
     // holds points at an object the driver owns and keeps alive for the whole loop.
     let runtime = unsafe { &mut *rt };
-    let pushed = {
-        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
-        // `Machine`; no other `&mut Machine` exists while the helper runs.
-        let machine = unsafe { &mut *runtime.machine };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
-        machine.push_frame_window(stack_need)
-    };
-    match pushed {
-        // The push is a frame change (`machine.stack` may have been grown, and the window
-        // now belongs to the *new* frame), so publish it here: the block continues
-        // in-block after an `allocate`, and the emitted continue arm no longer pays a
-        // separate `jit_refresh_y` call for it. The publish uses the `(y_base, y_count)`
-        // the push just computed rather than re-deriving them.
-        Ok((y_base, y_count)) => {
-            runtime.publish_y_window(y_base, y_count);
-            encode_target(func, pc + 1)
-        }
-        Err(err) => report_frame_error(runtime, func, pc, err),
-    }
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`; no
+    // other `&mut Machine` exists while the helper runs.
+    let machine = unsafe { &mut *runtime.machine };
+    // The push is a frame change (`machine.stack` may have been grown, and the window now
+    // belongs to the *new* frame), so publish it here: the block continues in-block after
+    // an `allocate`, and the emitted continue arm no longer pays a separate
+    // `jit_refresh_y` call for it. The publish uses the `(y_base, y_count)` the push just
+    // computed rather than re-deriving them.
+    let (y_base, y_count) = machine.push_frame_window(stack_need);
+    runtime.publish_y_window(y_base, y_count);
+    encode_target(func, pc + 1)
 }
 
 /// The **`allocate_heap`** helper: admit the heap need, **then** push the frame — the
@@ -2490,26 +2708,30 @@ pub(crate) extern "C" fn jit_allocate_heap(
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
     // holds points at an object the driver owns and keeps alive for the whole loop.
     let runtime = unsafe { &mut *rt };
-    let pushed = {
+    let admitted = {
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
         // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
         // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
-        // The same position store `Machine::step_instruction` makes at entry.
+        // The position store stays: it precedes `ensure_heap`, a host door that may
+        // collect or raise, so it is the address such a raise must be reported at.
         machine.set_current_code(func, pc);
         // The interpreter's own order: admit (`ensure_heap`), then push the frame.
-        machine
-            .ensure_heap(heap_need, live, ctx)
-            .and_then(|()| machine.push_frame_window(stack_need))
+        machine.ensure_heap(heap_need, live, ctx)
     };
-    match pushed {
-        // The push is a frame change and the admission before it may have collected, so
-        // publish the window here; the emitted continue arm keeps its register refill
-        // (a collecting host rewrote `machine.x`) but no longer pays a separate
-        // `jit_refresh_y` call.
-        Ok((y_base, y_count)) => {
+    match admitted {
+        Ok(()) => {
+            // The push is a frame change and the admission before it may have collected,
+            // so publish the window here; the emitted continue arm keeps its register
+            // refill (a collecting host rewrote `machine.x`) but no longer pays a
+            // separate `jit_refresh_y` call. The push itself cannot fail.
+            //
+            // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+            // `Machine`; no other `&mut Machine` exists while the helper runs.
+            let machine = unsafe { &mut *runtime.machine };
+            let (y_base, y_count) = machine.push_frame_window(stack_need);
             runtime.publish_y_window(y_base, y_count);
             encode_target(func, pc + 1)
         }
@@ -2575,8 +2797,9 @@ pub(crate) extern "C" fn jit_trim(
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
-        // The same position store `Machine::step_instruction` makes at entry.
-        machine.set_current_code(func, pc);
+        // No position store: `trim` cannot park or reach a host door, the block's own
+        // entry is already published (a valid resume point), a raise reports through
+        // `report_frame_error` and every later instruction-granular helper republishes.
         machine.trim(n)
     };
     match trimmed {

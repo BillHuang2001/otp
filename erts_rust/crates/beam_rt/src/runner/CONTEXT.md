@@ -36,12 +36,13 @@ Per-suite routing: [`tests/CONTEXT.md`](tests/CONTEXT.md). Every measured figure
 |---|---|---|
 | unset | `Auto` (**the `#[default]`**) | the native baseline tier for **every** process entry |
 | `auto` | `Auto` | the default, named explicitly |
-| `baseline` | `Baseline` | the same selection, forced explicitly (a measurement/debugging alias) |
-| `cranelift`, `jit-cranelift` | `Cranelift` | the optional hot tier; sane only in a build with the `cranelift` Cargo feature (below) |
+| `baseline`, `baseline-jit` | `Baseline` | the same selection, forced explicitly (a measurement/debugging alias; `baseline-jit` is `Tier::BaselineJit::name()`) |
+| `cranelift`, `jit-cranelift` | `Cranelift` | the optional hot tier; sane only in a build with the `cranelift` Cargo feature (below); `jit-cranelift` is `Tier::Cranelift::name()` |
 | `interpreter`, **anything else** | `Interpreter` | the always-correct reference tier and the **only kill switch**; an unknown value resolves here rather than being an error |
 
 `env_default()` reads the variable once (a `OnceLock`), so a long-running process pays one `getenv`; `mode_from_value` itself is pure (no environment read), which is how a test pins the semantics without `set_var` (edition 2024 makes it `unsafe`).
-`jit-cranelift` is accepted because it is exactly `Tier::Cranelift::name()`'s spelling, so a value copied from a tier report selects that tier back; `hot` is deliberately **not** a value — it names no tier.
+Beside the runtime's own spellings, `mode_from_value` accepts **every `Tier::name()` the engine roster defines** for the two always-available tiers, resolved through `Tier::from_name` (the engine's table, never a second copy here), so a value copied out of a tier report selects the tier it names — `baseline-jit` unaccepted was a measurement hazard, because the fallback is the always-available interpreter (a session would believe it measured the default native tier while it measured the reference one).
+A name the roster does not define stays unaccepted: `hot` names no tier, and `jit-beamasm` is the historical Cargo-feature alias for the baseline *backend* (`beam_engine`'s `jit-beamasm`), not a `Tier` name — `Tier::from_name("jit-beamasm")` is `None` and the value resolves to `Interpreter`. Pinned by `tests.rs::every_roster_tier_name_resolves_to_its_own_mode` (table driven by `Tier::ALL`/`Tier::name`, asserted back through `select_entry_tier`) and `the_unset_default_resolves_to_auto`.
 
 ### When the machine exists (the first slice does not build one)
 The `Machine` is built **eagerly at engine registration**: the one engine constructor `RunnerState::spawn_with_stability` (`entry.rs:504-535`) inserts `ProcessEngine { machine: Machine::new(), .. }` (`entry.rs:511-514`), so a process owns its machine from spawn — its pid enters `RunnerState::engines` before `Runtime::spawn_process_with_policy` enqueues it — and no engine ever shares or recycles its machine.

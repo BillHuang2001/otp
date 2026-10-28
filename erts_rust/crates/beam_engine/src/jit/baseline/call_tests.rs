@@ -317,11 +317,18 @@ fn the_lowered_call_still_gives_its_continuation_a_native_sub_block() {
 
     // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
     // continuation pc 4 is strictly inside that block.
-    assert!(function.entries[4].is_none(), "pc 4 is not an IR block start");
-    assert!(function.sub_entries[4].is_some(), "pc 4 has a sub-block entry");
+    // The published table is the **folded** one: `entries[4]` carries the continuation
+    // sub-block's own entry (`emit::compile::merge_sub_entries`), which is what lets the
+    // transfer probe answer both shapes with one lookup. `sub_entries` survives as the
+    // raw sub-block table, so the two agree at a continuation address.
+    assert!(
+        !function.entries[4].is_null() && function.entries[4] == function.sub_entries[4],
+        "pc 4's folded slot is its continuation sub-block entry"
+    );
+    assert!(!function.sub_entries[4].is_null(), "pc 4 has a sub-block entry");
     // An IR block start is still served by the block table, and gains no sub-block.
-    assert!(function.entries[1].is_some(), "pc 1 is the `Label(2)` block start");
-    assert!(function.sub_entries[1].is_none(), "a block start needs no sub-block");
+    assert!(!function.entries[1].is_null(), "pc 1 is the `Label(2)` block start");
+    assert!(function.sub_entries[1].is_null(), "a block start needs no sub-block");
     // A sub-block is not a block: the summary counts the two IR blocks only.
     assert_eq!(function.summary.block_count, 2, "only the IR blocks are counted");
 
@@ -1535,4 +1542,220 @@ fn an_uncompilable_callee_declines_to_the_driver() {
         "the driver's own interpreter step serves the declined callee: {:?}",
         snapshot.driver_interp_steps,
     );
+}
+// ---------------------------------------------------------------------------
+// (h) the accepted/declined split is the helper's answer **sign**
+// ---------------------------------------------------------------------------
+//
+// `call_store_impl` used to re-encode the target (`encode_target(callee, callee_pc)`)
+// and compare it with `enter_in_block`'s answer. That pack is dead work: the resolver
+// answers exactly two things — the target word, on **both** its accepted and its
+// declined arm, and the negative `ERROR` sentinel on a refused pre-emption charge — so
+// `word >= 0` is the same test. The emitted arm is untouched by that: it tests
+// `rax == CALL_STORED` and then re-tests `JitRuntime::resume_entry`, so a decline that
+// maps to `Stored` still takes the declined exit.
+
+/// Build the hand-rolled [`JitRuntime`] the three arms below run against, exactly as
+/// `src/jit/baseline/tests.rs` does for the layout/prologue pins: real machine, real label
+/// map, real context, no artifact and no run-cached reduction hook (so a charge goes
+/// through the `dyn` door).
+fn helper_runtime<'a>(
+    machine: &'a mut Machine,
+    module: &'a Module,
+    labels: &'a LabelMap,
+    ctx: &'a mut dyn ExecutionContext,
+    tables: super::runtime::EntryTables,
+) -> super::runtime::JitRuntime<'a> {
+    // The prologue every run entry performs (`Machine::enter_run`), so the local-call
+    // seam's verdict table describes the module this helper is about to probe: the helper
+    // is only ever reached from inside a run.
+    machine.bind_entry_verdicts(module);
+    let current_code = std::ptr::addr_of_mut!(machine.current_code);
+    let x_regs = machine.x.as_mut_ptr();
+    super::runtime::JitRuntime {
+        machine,
+        x_regs,
+        module,
+        entry_module: module,
+        labels,
+        ctx: ctx as *mut (dyn ExecutionContext + 'a),
+        error: None,
+        enter: None,
+        suspend: None,
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
+        literals_base: std::ptr::null(),
+        literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
+        tables,
+        compiled: std::ptr::null(),
+        current_code,
+        reduce_hook: None,
+    }
+}
+
+/// **The linked `call` answers `CALL_STORED` exactly when `enter_in_block`'s word is
+/// non-negative**, on all three of that resolver's arms.
+///
+/// The equivalence is what lets `call_store_impl` drop its second `encode_target` pack:
+///
+/// * **accepted** — the published [`EntryTables`](super::runtime::EntryTables) cover
+///   `(callee, callee_pc)`: the word is the target word and `resume_entry` is the entry, so
+///   the helper answers `CALL_STORED` (negative, a sentinel — the arm reads
+///   `resume_entry`, not the word);
+/// * **declined** — no artifact published and no tables: the word is **still** the target
+///   word (non-negative, equal to `encode_target(callee, callee_pc)`) with `resume_entry`
+///   null, so the arm's own `resume_entry` test takes the declined exit;
+/// * **refused charge** — a host `reduce` that refuses: the word is `ERROR` (negative) and
+///   `resume_entry` stays null, which is the pre-emption park.
+#[test]
+fn the_linked_call_answers_stored_exactly_when_enter_in_block_is_non_negative() {
+    let module = charge_parking_module();
+    let labels = crate::interpreter::build_label_map(&module);
+    let (callee, callee_pc) = labels.resolve(Label(3)).expect("label 3 resolves");
+    // The call site: `f/0`'s `call g/0` at pc 4 (see `charge_parking_module`).
+    let (func, pc, arity) = (0u32, 4u32, 0u32);
+    let target = encode_target(callee, callee_pc);
+    assert!(
+        target >= 0,
+        "a real `(func, pc)` word is non-negative, or the sign test would not be the \
+         equality test"
+    );
+    // The accepted arm's premise: a folded entry table that answers `(callee, callee_pc)`.
+    let entry = 0x1000 as *const u8;
+    let slots: Vec<*const u8> = (0..=callee_pc as usize).map(|_| entry).collect();
+    let tables = super::runtime::EntryTables::of(callee, &slots);
+    // (1) **accepted**: the word is the target, `resume_entry` is the entry, and the helper
+    //     the emitted arm calls answers `CALL_STORED`.
+    {
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("a bottom frame for the continuation store");
+        let mut ctx = MinimalContext::new();
+        let mut rt = helper_runtime(&mut machine, &module, &labels, &mut ctx, tables);
+        let word = super::runtime::enter_in_block(&mut rt, callee, callee_pc);
+        assert_eq!(word, target, "the accepted arm answers the target word");
+        assert_eq!(
+            rt.resume_entry, entry,
+            "the accepted arm publishes the entry the arm tail-jumps to"
+        );
+        assert!(word >= 0, "so the sign test says `Stored`");
+    }
+    {
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("a bottom frame for the continuation store");
+        let mut ctx = MinimalContext::new();
+        let mut rt = helper_runtime(
+            &mut machine,
+            &module,
+            &labels,
+            &mut ctx,
+            super::runtime::EntryTables::NONE,
+        );
+        let answer = super::call::jit_call_store_linked(
+            &mut rt as *mut super::runtime::JitRuntime<'_>,
+            func,
+            pc,
+            callee,
+            callee_pc,
+            arity,
+        );
+        assert_eq!(
+            answer, CALL_STORED,
+            "a taken transfer answers the sentinel, which is negative and read through \
+             `resume_entry`, never decoded as a target"
+        );
+    }
+    // (2) **declined**: no artifact and no tables, so the word is the target with
+    //     `resume_entry` null — `Stored` with a null entry, i.e. the declined exit.
+    {
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("a bottom frame for the continuation store");
+        let mut ctx = MinimalContext::new();
+        let mut rt = helper_runtime(
+            &mut machine,
+            &module,
+            &labels,
+            &mut ctx,
+            super::runtime::EntryTables::NONE,
+        );
+        let word = super::runtime::enter_in_block(&mut rt, callee, callee_pc);
+        assert_eq!(
+            word, target,
+            "a decline answers the pre-existing target word, so the sign test still says \
+             `Stored` and the arm's own `resume_entry` test takes the declined exit"
+        );
+        assert!(
+            rt.resume_entry.is_null(),
+            "a decline must leave `resume_entry` null, or the arm would jump to a stale entry"
+        );
+        assert_eq!(word >= 0, word == target, "the two tests agree on a decline");
+    }
+    {
+        // The same decline, through the helper the emitted code calls. Because the
+        // resolver's declined word is the target word (non-negative), the helper answers
+        // `CALL_STORED` here too — and that is exactly the contract: the emitted arm
+        // re-tests `resume_entry` and takes its declined exit when it is null, which hands
+        // the driver the very word it decoded before the transfer existed.
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("a bottom frame for the continuation store");
+        let mut ctx = MinimalContext::new();
+        let mut rt = helper_runtime(
+            &mut machine,
+            &module,
+            &labels,
+            &mut ctx,
+            super::runtime::EntryTables::NONE,
+        );
+        let answer = super::call::jit_call_store_linked(
+            &mut rt as *mut super::runtime::JitRuntime<'_>,
+            func,
+            pc,
+            callee,
+            callee_pc,
+            arity,
+        );
+        assert_eq!(
+            answer, CALL_STORED,
+            "a declined transfer maps to `Stored` (its word IS the target), so the emitted \
+             arm's own `resume_entry` test is what takes the declined exit"
+        );
+        assert!(
+            rt.resume_entry.is_null(),
+            "the decline's distinguishing state is a null `resume_entry`, so the arm exits \
+             with the target word the resolver answered"
+        );
+    }
+    // (3) **refused charge**: the resolver is reached with a live charge gate and a host
+    //     that refuses, so the answer is `ERROR` — negative, and `resume_entry` null.
+    {
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("a bottom frame for the continuation store");
+        machine.reduce_on = true;
+        let mut ctx = BudgetCtx::new(Some(0));
+        let mut rt = helper_runtime(&mut machine, &module, &labels, &mut ctx, tables);
+        let word = super::runtime::enter_in_block(&mut rt, callee, callee_pc);
+        assert_eq!(
+            word, ERROR,
+            "a refused charge answers the error sentinel, never the target word"
+        );
+        assert!(
+            word < 0,
+            "so the sign test says `not Stored` where `word == target` would have said the \
+             same, because the target word is non-negative"
+        );
+        assert!(
+            rt.resume_entry.is_null(),
+            "a refused charge must leave `resume_entry` null: nothing of the target ran"
+        );
+        assert!(
+            rt.error.is_some(),
+            "the host's typed error rides the runtime, exactly as the driver expects"
+        );
+        assert_eq!(
+            ctx.charges,
+            1,
+            "the refusal is the transfer's own charge (the driver's own charge is not \
+             part of this hand-built runtime)"
+        );
+    }
 }

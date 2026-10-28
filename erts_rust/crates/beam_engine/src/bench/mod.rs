@@ -91,7 +91,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beam_loader::{load_file, Module};
-use beam_term::{is_small, signed_value, Atom, Eterm, NIL};
+use beam_term::{is_small, signed_value, Atom, Eterm};
 
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
@@ -242,17 +242,12 @@ struct Measurement {
     counters: Counters,
     /// Off-heap payloads the phase's machines were holding at their last call.
     refc_payloads: u64,
-    /// The last measured call's raw result.
+    /// The last measured call's result, **copied out inside the batch loop** ([`run_calls`]),
+    /// while the machine that produced it and the host that owns its heap were both alive.
     ///
-    /// Kept for the workloads that still key their own report off it
-    /// ([`long_append`](long_append)); the generic report uses [`Measurement::snapshot`],
-    /// because a term is only guaranteed readable while the host that built it is alive.
-    result: Eterm,
-    /// The last measured call's result, **copied out while the host was still alive**.
-    ///
-    /// `measure` captures this at the end of the phase, before the batch's [`CountingContext`]
-    /// (and with it the region heap every term of that batch lives on) is dropped, so the
-    /// generic report's correctness predicate never reads a retired heap.
+    /// A raw `Eterm` cannot be carried out of a phase: a fixture's result may be a refc binary
+    /// whose payload lives in the batch [`Machine`]'s off-heap reservoir, which is freed when
+    /// that machine drops.
     snapshot: ResultSnapshot,
     /// `(decided_without_cmp, decided_by_cmp)`: how the phase's `select_val` pairs were
     /// answered, from `crate::interpreter`'s test-only pair tally (see the `select` node).
@@ -263,7 +258,7 @@ struct Measurement {
     select_answers: (usize, usize),
 }
 
-/// What a measured call returned, copied out while its host was alive.
+/// What a measured call returned, copied out while its machine and host were alive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ResultSnapshot {
     /// The result was a binary: its bytes.
@@ -276,7 +271,7 @@ enum ResultSnapshot {
 }
 
 impl ResultSnapshot {
-    /// Snapshot `term`; call this while the host that built it is still alive.
+    /// Snapshot `term`; call this while the machine and the host that built it are still alive.
     fn of(term: Eterm) -> ResultSnapshot {
         if is_small(term) {
             return ResultSnapshot::Small(signed_value(term));
@@ -353,24 +348,20 @@ fn measure_result(
     let mut ctx = CountingContext::new(Arc::clone(module));
     let mut samples = Vec::with_capacity(SUB_RUNS);
     let mut refc_payloads = 0u64;
-    let mut result = NIL;
+    let mut snapshot = ResultSnapshot::Opaque;
     crate::interpreter::reset_select_answers();
     for _ in 0..SUB_RUNS {
         let phase = run_calls(module, entry, tier, per_run, batch, &mut ctx, prepare)?;
         samples.push(ns_per_call(phase.elapsed, per_run));
         refc_payloads += phase.refc_payloads;
-        result = phase.result;
+        snapshot = phase.snapshot;
     }
     let select_answers = crate::interpreter::select_answers();
-    // The result term lives on the last batch's host heap, which is dropped when `ctx` is; take
-    // the copy now (see `Measurement::snapshot`).
-    let snapshot = ResultSnapshot::of(result);
     Ok(Measurement {
         iters: per_run * SUB_RUNS,
         samples,
         counters: ctx.counters,
         refc_payloads,
-        result,
         snapshot,
         select_answers,
     })
@@ -382,8 +373,13 @@ struct Phase {
     elapsed: Duration,
     /// Off-heap payloads the dropped machines held at their last measured call.
     refc_payloads: u64,
-    /// The last call's raw result term.
-    result: Eterm,
+    /// The last call's result, **copied out before the batch's machine was dropped**.
+    ///
+    /// The payload of a refc-binary result lives in the batch [`Machine`]'s off-heap reservoir
+    /// (`Machine::refc_binaries`), and the term itself on the batch host's heap, so the raw
+    /// `Eterm` is dead as soon as the batch ends: the copy has to be taken inside the batch
+    /// loop, which is the ownership rule every workload's correctness predicate reads.
+    snapshot: ResultSnapshot,
 }
 
 /// Builds the argument term a batch's timed calls reuse.
@@ -406,6 +402,10 @@ fn bstr_input(ctx: &mut CountingContext, _machine: &mut Machine) -> beam_common:
 /// not charged to the engine and not included in the timing, and the batch's [`Machine`] is
 /// dropped before the next one starts — `Machine::refc_binaries` and the host's region heap
 /// never give memory back, so a single long-lived pair would measure the harness' own growth.
+///
+/// Because that machine **is** dropped, the last call's result is copied out (as a
+/// [`ResultSnapshot`]) at the end of each batch, while the machine and `ctx` are still alive; the
+/// raw term never leaves the batch.
 fn run_calls(
     module: &Arc<Module>,
     entry: Atom,
@@ -418,7 +418,8 @@ fn run_calls(
     let batch = batch.max(1);
     let mut elapsed = Duration::ZERO;
     let mut refc_payloads = 0u64;
-    let mut result = NIL;
+    // An empty phase (no call ran) yields the same snapshot `ResultSnapshot::of(NIL)` would.
+    let mut snapshot = ResultSnapshot::Opaque;
     let mut remaining = calls;
     while remaining > 0 {
         let n = remaining.min(batch);
@@ -435,9 +436,10 @@ fn run_calls(
         // calls' cost, so the batch's payload count starts here.
         let payloads_before = machine.refc_binaries().len();
         let start = Instant::now();
+        let mut result = None;
         for _ in 0..n {
             match machine.run_export_outcome_with_tier(module, entry, 1, &[input], ctx, tier)? {
-                RunOutcome::Returned(value) => result = value,
+                RunOutcome::Returned(value) => result = Some(value),
                 RunOutcome::Wait { .. } => {
                     panic!("{} blocked in a receive: this fixture has none", tier.name())
                 }
@@ -453,12 +455,18 @@ fn run_calls(
         // Every batch starts from a fresh machine, so the growth of its payload roster is
         // exactly the number of off-heap payloads the batch's timed calls created.
         refc_payloads += (machine.refc_binaries().len() - payloads_before) as u64;
+        // The result's payload lives in `machine`'s off-heap reservoir and its words on `ctx`'s
+        // heap, so this copy has to happen here, before either is dropped (and outside the timed
+        // region). Reading the term after the batch is a use-after-free.
+        if let Some(result) = result {
+            snapshot = ResultSnapshot::of(result);
+        }
         remaining -= n;
     }
     Ok(Phase {
         elapsed,
         refc_payloads,
-        result,
+        snapshot,
     })
 }
 

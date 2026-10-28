@@ -160,7 +160,7 @@
 use std::sync::Arc;
 
 use beam_alloc::{GrowOutcome, ReservedHeap};
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_loader::{Label, Module, RecordDefinition};
 use beam_term::{Atom, AtomTable, Eterm};
 
@@ -530,8 +530,113 @@ impl FunOutcome {
     }
 }
 
+/// The **devirtualised** form of the [`ExecutionContext::reduce`] hook: a
+/// monomorphised shim over the host's own `reduce` plus the host it charges, so a
+/// caller that already holds this value pays one indirect call for a charge — no
+/// `dyn` fat-pointer move and no vtable load.
+///
+/// Built once per run ([`ExecutionContext::reduce_hook`]) at the run entry that latches
+/// [`Machine::reduce_on`](crate::machine::Machine::reduce_on), and held by the native
+/// tiers' driver for the whole slice: the per-transfer pre-emption charge of
+/// `beam_engine`'s baseline tier is the transfer granularity a natively linked block
+/// never crosses (`src/jit/baseline/runtime.rs::commit_in_block_entry`).
+///
+/// **The charge is the host's.** A shim only saves dispatch: `n` units are offered to
+/// exactly the same `reduce` the vtable door reaches, the refusal is the host's own
+/// typed error (stored where the caller asks for it), and a run whose
+/// [`wants_reduce`](ExecutionContext::wants_reduce) is `false` never builds a hook at
+/// all. `Copy` because it is two words and is read out of the runtime block on every
+/// charge.
+#[derive(Clone, Copy)]
+pub struct ReduceHook {
+    /// The monomorphised `reduce` shim (see [`ReduceHookSource`]).
+    charge: unsafe fn(*mut (), u32, *mut Option<BeamError>) -> bool,
+    /// The host, as the **thin** data pointer of the `&mut Self` the shim was built
+    /// from — the address that `dyn` erased into a fat pointer, kept as the one word
+    /// the shim needs.
+    ctx: *mut (),
+}
+impl ReduceHook {
+    /// Charge `n` reductions, answering `true` when the host accepted the charge and
+    /// `false` when it refused it — in which case the host's own typed error has been
+    /// moved into `error`, **unchanged**.
+    ///
+    /// `error` is only written on the refusal, so the accepted path — the steady state
+    /// of a budgeted slice — costs the call and nothing else. A caller must therefore
+    /// read `error` only when this answers `false`; every caller in this crate does
+    /// (a refusal is the rare path of a pre-emption).
+    #[inline]
+    pub fn charge(self, n: u32, error: &mut Option<BeamError>) -> bool {
+        // SAFETY: `self.ctx` is the `&mut Self` data pointer this value was built from
+        // ([`ReduceHookSource::build_reduce_hook`]), and `self.charge` is the shim
+        // monomorphised for that same `Self` — so casting the pointer back inside the shim
+        // reconstructs a `&mut Self` at its own address. The shim's contract (and this
+        // call's) is the one the vtable door's is: no other `&`/`&mut` to the host is
+        // alive for the duration of the call, which is what the engine's helpers
+        // guarantee by owning the only reborrow of the host for the whole slice. `error`
+        // is a live, distinct, exclusively borrowed local of the caller.
+        unsafe { (self.charge)(self.ctx, n, error) }
+    }
+}
+/// The monomorphised `reduce` shim for a host `T`: charge `T::reduce(n)` and report it
+/// as a `bool` plus an out-parameter error.
+///
+/// [`BeamError`] is a large return-by-value type, so a `Result<()>` crossing this seam
+/// would make every *accepted* charge write the whole error union into a stack slot (and
+/// the ABI would pass it indirectly). Answering `bool` keeps the accepted path to a
+/// register, and the refusal — the pre-emption's rare path — writes the host's own error
+/// through `error`.
+///
+/// # Safety
+///
+/// `ctx` must be the thin data pointer of a live `&mut T` ([`ReduceHookSource`] is the
+/// only producer) and `error` must be a valid, exclusively borrowed, initialised
+/// `Option<BeamError>` for the call.
+unsafe fn reduce_charge_shim<T: ExecutionContext>(
+    ctx: *mut (),
+    n: u32,
+    error: *mut Option<BeamError>,
+) -> bool {
+    // SAFETY: per this function's own contract `ctx` came from a `&mut T` of the caller's
+    // host and no other borrow of that host is alive for the call, so reconstructing the
+    // `&mut T` here is exactly the reborrow the caller would otherwise have made.
+    let host = unsafe { &mut *(ctx as *mut T) };
+    match host.reduce(n) {
+        Ok(()) => true,
+        Err(err) => {
+            // SAFETY: `error` is the caller's live, exclusively borrowed, initialised
+            // `Option<BeamError>` (see the contract above); writing the refusal through it is
+            // the whole point of the out-parameter.
+            unsafe { *error = Some(err) };
+            false
+        }
+    }
+}
+/// The seam that pairs a host with its monomorphised [`ReduceHook`].
+///
+/// Never called directly: it is the blanket-implemented half of
+/// [`ExecutionContext`], so the hook is built by the **concrete** type's own
+/// instantiation — which is what makes [`reduce_charge_shim`] a direct `T::reduce` call
+/// instead of another virtual one — while a caller holding only `&mut dyn
+/// ExecutionContext` reaches it through [`ExecutionContext::reduce_hook`]'s vtable slot.
+pub trait ReduceHookSource {
+    /// Build the run-cached charge hook for **this** host.
+    fn build_reduce_hook(&mut self) -> ReduceHook;
+}
+impl<T: ExecutionContext> ReduceHookSource for T {
+    #[inline]
+    fn build_reduce_hook(&mut self) -> ReduceHook {
+        ReduceHook {
+            charge: reduce_charge_shim::<T>,
+            // `&mut T` -> `*mut T` -> `*mut ()` (a thin-pointer reborrow: the address the
+            // shim casts back to `*mut T`). Sound by construction — the pair never outlives
+            // the borrow it was built from, because the run that builds it owns the host.
+            ctx: self as *mut T as *mut (),
+        }
+    }
+}
 /// Everything the engine needs from the runtime (BIF dispatch, heap/GC, limits).
-pub trait ExecutionContext {
+pub trait ExecutionContext: ReduceHookSource {
     /// Dispatch `module:function/arity` with `args`, returning the result term.
     ///
     /// Failure is return-based: an `Err` (a `BadArith`/`BadArg`/`Raise`/…) that the
@@ -1293,6 +1398,30 @@ pub trait ExecutionContext {
     fn reduce(&mut self, n: u32) -> Result<()> {
         let _ = n;
         Ok(())
+    }
+    /// Build the run-cached, **devirtualised** form of [`reduce`](ExecutionContext::reduce)
+    /// — a [`ReduceHook`] over this host.
+    ///
+    /// Consulted **once per run**, at the same entry that latches
+    /// [`Machine::reduce_on`](crate::machine::Machine::reduce_on) from
+    /// [`wants_reduce`](ExecutionContext::wants_reduce), and only when that answer is
+    /// `true`; the native tiers' driver then keeps it for the whole slice. The hook charges
+    /// the host's own `reduce` through a **monomorphised** shim
+    /// ([`ReduceHookSource::build_reduce_hook`], blanket-implemented for every
+    /// `ExecutionContext`), so the per-transfer charge in
+    /// `src/jit/baseline/runtime.rs::commit_in_block_entry` is one indirect call with no
+    /// vtable load and no `dyn` fat-pointer move — while the charge itself, its `n`, its
+    /// ordering and its refusal error are **unchanged**: the same `reduce` runs, exactly
+    /// once per transfer, and a refusal still stores the host's own typed error and parks
+    /// the machine at the transfer target.
+    ///
+    /// The default body is the blanket impl's hook, so **no implementor changes**: a host
+    /// that overrides `reduce` gets the devirtualised charge automatically, and a host
+    /// whose `reduce` is the default no-op never sees a hook built at all (its
+    /// `wants_reduce` is `false`).
+    #[inline]
+    fn reduce_hook(&mut self) -> ReduceHook {
+        ReduceHookSource::build_reduce_hook(self)
     }
 
     /// Cheap reduction-hook gate: does [`reduce`](ExecutionContext::reduce) need to
@@ -2603,6 +2732,155 @@ mod tests {
         );
     }
 
+    /// A host that pre-empts: `reduce` records every charge and refuses past a budget with
+    /// its **own** typed error — what `BudgetContext` does on a scheduler slice.
+    struct PreemptingHost {
+        charges: u32,
+        budget: Option<u32>,
+    }
+    impl ExecutionContext for PreemptingHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Err(beam_common::BeamError::BadArg)
+        }
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn reduce(&mut self, n: u32) -> Result<()> {
+            self.charges += n;
+            match self.budget {
+                Some(budget) if self.charges > budget => Err(crate::error::unsupported(
+                    "tests: reduction budget exhausted",
+                )),
+                _ => Ok(()),
+            }
+        }
+        fn wants_reduce(&self) -> bool {
+            true
+        }
+    }
+    /// A **second, structurally different** host: proof that the shim behind a hook is the
+    /// one monomorphised for the host it was built from (a shim shared across types, or a
+    /// mis-cast data pointer, would charge the wrong object).
+    struct SecondHost {
+        charges: u32,
+    }
+    impl ExecutionContext for SecondHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Err(beam_common::BeamError::BadArg)
+        }
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn reduce(&mut self, n: u32) -> Result<()> {
+            self.charges += 100 * n;
+            Ok(())
+        }
+        fn wants_reduce(&self) -> bool {
+            true
+        }
+    }
+    #[test]
+    fn a_reduce_hook_charges_the_concrete_host_behind_a_dyn_pointer() {
+        // The hook is built from `&mut dyn ExecutionContext`, exactly as the tiers' driver
+        // builds it, and must still reach the **concrete** host's own `reduce`.
+        let mut host = PreemptingHost {
+            charges: 0,
+            budget: None,
+        };
+        let hook = {
+            let dyn_ctx: &mut dyn ExecutionContext = &mut host;
+            dyn_ctx.reduce_hook()
+        };
+        let mut error = None;
+        assert!(hook.charge(1, &mut error), "an unbudgeted charge is accepted");
+        assert!(hook.charge(3, &mut error), "`n` reaches the host verbatim");
+        assert_eq!(host.charges, 4, "every unit of every charge arrived");
+        assert!(error.is_none(), "an accepted charge stores no error");
+    }
+    #[test]
+    fn a_refused_reduce_hook_charge_hands_back_the_hosts_own_error() {
+        let mut host = PreemptingHost {
+            charges: 0,
+            budget: Some(1),
+        };
+        let hook = {
+            let dyn_ctx: &mut dyn ExecutionContext = &mut host;
+            dyn_ctx.reduce_hook()
+        };
+        let mut error = None;
+        assert!(hook.charge(1, &mut error), "the first charge is inside budget");
+        assert!(!hook.charge(1, &mut error), "the second is refused");
+        let refused = error.expect("a refusal carries the host's error");
+        match refused {
+            beam_common::BeamError::Raise(raise) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("unsupported_opcode: tests: reduction budget exhausted"),
+                "the refusal is the host's own typed error, unchanged"
+            ),
+            other => panic!("expected the host's typed raise, got {other:?}"),
+        }
+        assert_eq!(host.charges, 2, "the refused charge still reached the host");
+    }
+    #[test]
+    fn each_hosts_hook_charges_that_host_and_not_another() {
+        let mut first = PreemptingHost {
+            charges: 0,
+            budget: None,
+        };
+        let mut second = SecondHost { charges: 0 };
+        let first_hook = {
+            let dyn_ctx: &mut dyn ExecutionContext = &mut first;
+            dyn_ctx.reduce_hook()
+        };
+        let second_hook = {
+            let dyn_ctx: &mut dyn ExecutionContext = &mut second;
+            dyn_ctx.reduce_hook()
+        };
+        let mut error = None;
+        assert!(first_hook.charge(1, &mut error));
+        assert!(second_hook.charge(1, &mut error));
+        assert_eq!(first.charges, 1, "the first hook charged the first host");
+        assert_eq!(
+            second.charges, 100,
+            "the second hook charged the second host through its own reduce"
+        );
+    }
+    #[test]
+    fn a_minimal_contexts_hook_charges_nothing_and_never_refuses() {
+        // The hook exists for every host (it is blanket-built), so the *gate* is what keeps
+        // a non-pre-empting host out of the charge path: `MinimalContext` still answers
+        // `false` and its hook charges the default no-op.
+        let mut ctx = MinimalContext::new();
+        assert!(!ctx.wants_reduce(), "MinimalContext opts out of the hook");
+        let hook = ctx.reduce_hook();
+        let mut error = None;
+        assert!(hook.charge(1, &mut error));
+        assert!(error.is_none());
+    }
     #[test]
     fn default_apply_forwards_to_call_bif() {
         // The default `apply` delegates to `call_bif`; here `call_bif` always

@@ -840,3 +840,245 @@ fn a_legitimately_deopting_shape_is_still_idempotent() {
         snapshot.step_one
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9. An off-heap refc-binary window is a bitstring subject the arm lowers
+// ---------------------------------------------------------------------------
+/// The `long_append` bench workload's program, verbatim.
+///
+/// `crate::bench::long_append`'s `SOURCE` holds the same text, but that module is private to
+/// `crate::bench` (`mod long_append;` inside a `#[cfg(test)] mod bench;`), and the bench's
+/// driving scaffolding (`compile_fixture`, `measure`, `CountingContext`) is private to
+/// `crate::bench` in the same way — this `baseline` child cannot reach any of it, so the pin
+/// stages and drives the workload itself rather than widening a non-test module's visibility
+/// for one test.
+const LONG_APPEND_SOURCE: &str = r#"-module(long_append).
+-export([input/1, expand/1]).
+
+input(N) ->
+    <<16#00112233445566778899aabbccddeeff:N/unit:8,
+      16#ffeeddccbbaa99887766554433221100:N/unit:8>>.
+
+expand(Bin) -> << <<C:8,C:8,C:8,C:8>> || <<C:8>> <= Bin >>.
+"#;
+
+/// `input/1`'s argument: two 8 KiB integer segments, so the subject is 16 KiB — 256× the
+/// 64-byte on-heap binary limit, i.e. it can only be an off-heap refc binary.
+const LONG_APPEND_N: usize = 8 * 1024;
+
+/// The two 16-byte markers `input/1` encodes, big-endian, at the tail of each segment.
+const LONG_APPEND_MARKERS: [u128; 2] = [
+    0x0011_2233_4455_6677_8899_aabb_ccdd_eeff,
+    0xffee_ddcc_bbaa_9988_7766_5544_3322_1100,
+];
+
+/// What `input(N)` returns: each marker zero-extended to an `N`-byte segment.
+fn long_append_input_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 * LONG_APPEND_N);
+    for marker in LONG_APPEND_MARKERS {
+        let encoded = marker.to_be_bytes();
+        bytes.resize(bytes.len() + LONG_APPEND_N - encoded.len(), 0);
+        bytes.extend_from_slice(&encoded);
+    }
+    bytes
+}
+
+/// What `expand/1` must return: four copies of every input byte (64 KiB).
+fn long_append_expected_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 * long_append_input_bytes().len());
+    for byte in long_append_input_bytes() {
+        bytes.extend_from_slice(&[byte; 4]);
+    }
+    bytes
+}
+
+/// Stage [`LONG_APPEND_SOURCE`] in a temp directory and compile it with the system `erlc`.
+///
+/// `Err` means **skip** (no spawnable `erlc`, or one that refused the source): the pin needs a
+/// real `.beam` because the subject has to be a real off-heap refc binary built by the engine's
+/// own append path.
+fn stage_long_append_fixture() -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "beam_engine_bs_match_refc_window_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let source = dir.join("long_append.erl");
+    std::fs::write(&source, LONG_APPEND_SOURCE)
+        .map_err(|error| format!("write {}: {error}", source.display()))?;
+    let erlc = std::env::var("ERLC").unwrap_or_else(|_| "erlc".to_string());
+    let compiled = std::process::Command::new(&erlc)
+        .arg("+deterministic")
+        .arg("-o")
+        .arg(&dir)
+        .arg(&source)
+        .output()
+        .map_err(|error| format!("no usable `{erlc}` on PATH ({error})"))?;
+    if !compiled.status.success() {
+        return Err(format!(
+            "`{erlc}` exited {} on {}: {}",
+            compiled.status,
+            source.display(),
+            String::from_utf8_lossy(&compiled.stderr)
+        ));
+    }
+    Ok(dir.join("long_append.beam"))
+}
+
+/// **A `bs_match` over an off-heap refc-binary window takes no interpreter step.**
+///
+/// The subject of the `long_append` comprehension (`expand/1` = `<< <<C:8,C:8,C:8,C:8>> ||
+/// <<C:8>> <= Bin >>`) is an `ErlSubBits` whose own `orig` is a `BinRef`, i.e. the refc-window
+/// form [`super::emit::bitstr_inline`]'s subject view now classifies. Before that arm the view
+/// refused the form and the arm's `fallback` paid **one whole interpreter step per element** —
+/// exactly **16 384** `BsMatch` deopts for one call over a 16 KiB subject (1.000 per append).
+/// Tier agreement cannot see the regression: a deopted instruction is executed by the
+/// interpreter on *both* sides, so an arm that silently degraded back to a deopt would still
+/// agree. This pin is therefore made of the run-time counters, not of a value comparison: the
+/// per-variant deopt attribution must record no `BsMatch`, the residual per-instruction deopts
+/// must stay the accumulator's own growth fallbacks rather than a per-element cost, and the
+/// bitstring family's own helper ([`super::bitstr::bitstr_calls`]) must not become the
+/// per-element route — the shape is lowered natively. The workload's own 64 KiB result is
+/// checked byte for byte, so a shape that lowered into a wrong value cannot pass.
+///
+/// The two counter figures that are *not* zero are worth naming, so a later reader does not
+/// mistake them for the regression: `bs_create_bin` still takes its own capacity fallback a
+/// handful of times over the build (8 measured — the writable payload's growth events, a
+/// function of the growth schedule, not of the 16 384 elements), and `jit_bitstr` runs twice
+/// per call for instructions that have no inline shape at all (`bs_init_writable`, and the
+/// single fresh-subject `bs_start_match3`, which must `make_ctx`).
+#[test]
+fn a_bs_match_over_an_off_heap_refc_window_takes_no_interpreter_step() {
+    let beam = match stage_long_append_fixture() {
+        Ok(beam) => beam,
+        Err(why) => {
+            println!("SKIP: {why} -- the off-heap refc-window `bs_match` pin did not run");
+            return;
+        }
+    };
+    let module = beam_loader::load_file(&beam)
+        .unwrap_or_else(|error| panic!("load {}: {error:?}", beam.display()));
+    let input_entry = atom(&module, "input");
+    let expand_entry = atom(&module, "expand");
+
+    let mut ctx = MinimalContext::new();
+    let mut machine = Machine::new();
+    // Setup: the 16 KiB subject, built by the fixture's own `input/1` on the interpreter and
+    // untimed/unrecorded. It is an off-heap refc binary (256× the on-heap limit) whose payload
+    // lives in this machine's reservoir — the same store `expand/1` will read it from.
+    let subject = match machine
+        .run_export_outcome_with_tier(
+            &module,
+            input_entry,
+            1,
+            &[beam_term::make_small(LONG_APPEND_N as i64)],
+            &mut ctx,
+            Tier::Interpreter,
+        )
+        .unwrap_or_else(|error| panic!("the fixture's input/1: {error:?}"))
+    {
+        RunOutcome::Returned(value) => value,
+        other => panic!("the fixture's input/1 must return: {other:?}"),
+    };
+    assert!(
+        machine
+            .refc_binaries()
+            .iter()
+            .any(|payload| payload.len() == 2 * LONG_APPEND_N),
+        "the subject must be an off-heap refc binary (no {} -byte payload in the machine's \
+         reservoir: {:?})",
+        2 * LONG_APPEND_N,
+        machine
+            .refc_binaries()
+            .iter()
+            .map(|payload| payload.len())
+            .collect::<Vec<_>>()
+    );
+    let subject_bytes = crate::terms::binary_bytes(subject).expect("the subject is a binary");
+    assert_eq!(
+        subject_bytes,
+        long_append_input_bytes().as_slice(),
+        "the fixture's input/1 must build the modelled 16 KiB subject"
+    );
+
+    // The append pass, on the baseline tier, with the run-time counters on. `bitstr_calls` is a
+    // monotonic per-thread tally (the counters' `reset` does not touch it), so the pin reads a
+    // delta around the pass rather than the absolute value.
+    counters::reset();
+    counters::set_enabled(true);
+    let family_before = super::bitstr::bitstr_calls();
+    let outcome = machine.run_export_outcome_with_tier(
+        &module,
+        expand_entry,
+        1,
+        &[subject],
+        &mut ctx,
+        Tier::BaselineJit,
+    );
+    let family_calls = super::bitstr::bitstr_calls() - family_before;
+    counters::set_enabled(false);
+    let snapshot = counters::snapshot();
+
+    let result = match outcome.unwrap_or_else(|error| panic!("the fixture's expand/1: {error:?}"))
+    {
+        RunOutcome::Returned(value) => value,
+        other => panic!("the fixture's expand/1 must return: {other:?}"),
+    };
+    let expected = long_append_expected_bytes();
+    let produced = crate::terms::binary_bytes(result).expect("the result is a binary");
+    println!(
+        "off_heap_refc_window: produced {} of {} bytes, step_one {}, BsMatch deopts {}, \
+         bitstr_calls {}",
+        produced.len(),
+        expected.len(),
+        snapshot.step_one,
+        snapshot
+            .deopts_by_variant
+            .get("BsMatch")
+            .copied()
+            .unwrap_or(0),
+        family_calls
+    );
+    assert_eq!(
+        produced,
+        expected.as_slice(),
+        "expand/1 must return four copies of every input byte"
+    );
+    // **The pin.** Before the refc-window subject arm this pass recorded exactly one `BsMatch`
+    // deopt per element (16 384 for this subject); with the shape lowered natively the
+    // per-variant attribution holds no `BsMatch` at all.
+    let match_deopts = snapshot
+        .deopts_by_variant
+        .get("BsMatch")
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        match_deopts, 0,
+        "a `bs_match` over the off-heap refc-binary window must not deopt: it paid one whole \
+         interpreter step per element ({} for this subject) before the refc-window subject arm \
+         landed (deopts by variant: {:?})",
+        2 * LONG_APPEND_N,
+        snapshot.deopts_by_variant
+    );
+    // What is left is the accumulator's own construction, never a per-element figure: measured
+    // 8, and a payload growing 32 B -> 64 KiB cannot take more than ~12 doublings, so this
+    // bound separates a constant of the growth schedule from the total a per-element regression
+    // would show (16 384 — which the assertion above also catches by name).
+    assert!(
+        snapshot.step_one < 64,
+        "the residual per-instruction deopts must be the writable accumulator's growth \
+         fallbacks, not a per-element cost; jit_step_one ran {} times (deopts by variant: {:?})",
+        snapshot.step_one,
+        snapshot.deopts_by_variant
+    );
+    // `jit_bitstr` is reached once per call for `bs_init_writable` (family-owned: it has no
+    // inline shape) and once for the single fresh-subject match start (`bs_start_match3` must
+    // `make_ctx`, which allocates); the per-element `bs_match` is not on the family's route.
+    assert!(
+        family_calls <= 2,
+        "the bitstring family helper must not become the per-element route ({} calls for {} \
+         elements): the `bs_match` shape has to be lowered natively",
+        family_calls,
+        2 * LONG_APPEND_N
+    );
+}

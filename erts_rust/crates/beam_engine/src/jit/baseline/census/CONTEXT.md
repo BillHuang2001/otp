@@ -220,6 +220,40 @@ and `UTF8_PATH_BYTES` (2 048) per UTF-8 one, so neither an unbounded `bs_match` 
 maximum-width construction arm nor a longest literal pattern or character sequence can
 under-allocate the `CodeBuffer`.
 
+### The `allocate` arm — one helper call, and its zero-delta two-tree check
+Table 4 has **no `allocate` row**: the per-kind instrument prices seventeen shapes from sixteen arms plus the unlinked
+`call_last` exit, and the frame push is not among them.
+The arm's emission is therefore checked in two other ways, both recorded here.
+**Shape (emitter pin).** `../emit/heap.rs::the_allocate_arm_pushes_the_frame_with_a_helper_call_only`
+asserts the arm's emitted bytes carry the `jit_allocate` helper immediate and **no** store into
+`RUNTIME_YBASE_DISP`/`RUNTIME_YEND_DISP` across every `(base, src)` register pair, so an in-block
+push fails in the emitter instead of at run time; its behavioural twin is
+`../tests.rs::frame_push_tests::a_sliced_and_resumed_baseline_run_pushes_each_frame_exactly_once`
+(a sliced, resumed run pushes each frame exactly once).
+**Total (two-tree pair).** `Allocate` never appears in the deopting-variant set (Table 1's eight
+rows), so every visited `Allocate` instance takes the in-block arm; and the corpus-wide emitted
+bytes and every block/instance/deopt counter are **identical** at `e6ba57dff9` and at `6be815d640`,
+each side censusing its own corpus:
+
+| figure | `e6ba57dff9` | `6be815d640` |
+|---|---|---|
+| corpus | 38 fixtures (422 functions) + 1321 OTP (102 646 functions) = **1359** modules / **103 068** functions | identical |
+| emitted bytes (grand total) | **300 261 600** | **300 261 600** |
+| blocks / Σ ranges / visited instances | 597 567 / 3 586 283 / 3 114 282 | identical |
+| deopts / deopting variants | 119 175 / 8 | identical |
+| Y prologue (blocks / publish / elided / invalidations) | 185 460 / 133 236 / 52 224 / 544 852 | identical |
+| fixture `code_len` total | 341 465 | identical |
+Method: `git worktree add $TMPDIR/base-e6ba57dff9 e6ba57dff9`, then the three gate commands below
+(static census, emitted-byte table, register-cache census) with `--test-threads=1` in **each** tree
+and its own `CARGO_TARGET_DIR` under `$TMPDIR`; the two `--nocapture` logs differ only in the target
+path, the elapsed time and the harness's own test count.
+The denominator is the pair's own: today's reading is **11 OTP functions below** the
+`103 079`-function record in the header (the fixture half is byte-identical — 38 modules, 422
+functions, 341 465 B `code_len`), because the OTP half follows the installed tree while the fixture
+half is version-controlled.
+Quoting the pair, not the two absolutes separately, is what makes it evidence: on this corpus the
+emitted stream carries the frame push exactly once per `Allocate` and nothing else.
+
 ### Table 4b — bitstring refusal attribution
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_refusal_attribution_census_is_printed -- --nocapture`
 The instrument is `emit/test/refusal_census.rs`; it walks the same corpus and classifies every `Bs*`

@@ -249,9 +249,10 @@ pub(crate) fn match_string_shape(
 ///   rcx = end.saturating_sub(start)
 ///   cmp  rcx, Bits ; jb fail_arm         ; fewer remaining bits than the pattern needs
 ///   test rsi, 7 ; jne fallback           ; a non-byte-aligned start (no pattern bytes -> skipped)
-///   <emit_subject_view>                  ; anything but an on-heap ErlHeapBits -> fallback
-///                                        ;   r10 = byte base, rax = readable bytes, rsi kept
-///   rdi = start / 8
+///   <emit_subject_view>                  ; an on-heap ErlHeapBits or a refc window, else fallback
+///                                        ;   r10 = byte base, rdx = bit position, rax = bytes
+///   test rdx, 7 ; jne fallback           ; a window position inside a byte
+///   rdi = rdx / 8
 ///   lea  rcx, [rdi + ceil(Bits / 8)] ; cmp rcx, num_bytes ; ja fallback
 ///   add  rdi, r10                        ; the first compared byte's address
 ///   for k in 0 .. Bits / 8:
@@ -327,23 +328,26 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_match_string(
 
     // Classify the inner subject and derive the readable window — one shared helper, so this
     // shape cannot disagree with `bs_get_integer2`/`bs_match` about what a subject is. A
-    // literal-area subject, a refc window, a match context, a bare `BinRef` and every
-    // non-bitstring take the fallback: the family's own answer, and never a fabricated view.
-    let (base, _bit_pos, num_bytes) = emit_subject_view(buffer, MOVE_SCRATCH, Reg::Rsi, fallback)?;
+    // literal-area subject, a match context, a bare `BinRef` and every non-bitstring take the
+    // fallback: the family's own answer, and never a fabricated view.
+    let (base, bit_pos, num_bytes) = emit_subject_view(buffer, MOVE_SCRATCH, Reg::Rsi, fallback)?;
 
     if !shape.pattern.is_empty() {
-        // A byte-aligned `start` is what makes the byte compare below exact: an on-heap
-        // subject's own bit offset is 0, so the first compared bit is bit `start % 8` of
-        // `base[start / 8]`. Anything else is the family's bit-by-bit `bits_equal`, one
-        // interpreter step — never a shifted reimplementation.
+        // A byte-aligned **window position** is what makes the byte compare below exact:
+        // `bit_pos` is the position of the context's read point inside the returned window
+        // (an on-heap subject's own bit offset is 0, so it is `start` itself; a refc window
+        // starts at `start % 8` of the window's first byte, so it is `start + start % 8`), so
+        // the first compared bit is bit `bit_pos % 8` of `base[bit_pos / 8]`. Anything else is
+        // the family's bit-by-bit `bits_equal`, one interpreter step — never a shifted
+        // reimplementation.
         buffer.mov_ri(Reg::Rcx, 7)?;
-        buffer.test_rr(Reg::Rsi, Reg::Rcx)?;
+        buffer.test_rr(bit_pos, Reg::Rcx)?;
         buffer.jcc(Cond::Ne, fallback)?;
 
-        // The over-read guard, emitted BEFORE the first load: `start / 8 + nbytes <=
-        // num_bytes`, with `num_bytes` the subject's own word-padded data extent.
+        // The over-read guard, emitted BEFORE the first load: `bit_pos / 8 + nbytes <=
+        // num_bytes`, with `num_bytes` the subject window's own readable extent.
         let nbytes = shape.pattern.len();
-        buffer.mov_rr(Reg::Rdi, Reg::Rsi)?;
+        buffer.mov_rr(Reg::Rdi, bit_pos)?;
         buffer.shr_ri(Reg::Rdi, 3)?;
         buffer.lea(Reg::Rcx, Reg::Rdi, nbytes as i32)?;
         buffer.cmp_rr(Reg::Rcx, num_bytes)?;

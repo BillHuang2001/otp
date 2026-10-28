@@ -24,12 +24,13 @@ Files: `mod.rs` (buffer lifecycle, labels/fixups, raw byte emission, W^X), `enco
 ### Encoders (`encode.rs`, all `Result<()>`; every encoding `REX.W` unless noted)
 - move — `mov_rr` `:39`, `mov_ri` (movabs, 64-bit imm) `:46`, `mov_rm` (`[base+disp32]` load) `:53`, `mov_mr` (64-bit store) `:110`, `lea` `:192`.
 - narrow stores — `mov_mr8` `:143` (`88 /r`), `mov_mr16` `:152` (`66 89 /r`), `mov_mr32` `:161` (`89 /r`, `REX.W` clear) plus the shared private `emit_mov_mr_narrow`; see *Narrow memory stores* below.
-- arith/logic — `add_rr` `:209`, `sub_rr` `:214`, `cmp_rr` `:219`, `test_rr` `:224`, `and_rr` `:229`, `or_rr` `:234`, `xor_rr` `:239`, `imul_rr` `:252` (two-operand `0F AF /r`; sets OF/CF on 64-bit overflow — the `erlang:'*'/2` guard).
-- divide — `cqo` `:266` (`REX.W 99`, sign-extend `rax` into `rdx:rax`) and `idiv_rr` `:283` (`F7 /7`, 64-bit signed divide: quotient in `rax`, remainder in `rdx`; a zero divisor or `i64::MIN / -1` traps `#DE`, so the caller must refuse both).
-- shifts — `sar_ri` `:292`, `shr_ri` `:303`, `shl_ri` `:308` (`C1 /n ib`; `sar_ri`/`shl_ri` take a `u32` count and reject one above `u8::MAX` with `BadArg`, `shr_ri` takes the `u8` immediate directly) and the `cl`-count forms `shr_cl` `:318`/`shl_cl` `:326` (`D3 /n`).
-- stack — `push_r` `:357`, `pop_r` `:365`.
-- control flow — `jmp` (`rel32`) `:375`, `jcc` (`rel32`) `:381`, `call_label` (`rel32`) `:388`, `jmp_r` (indirect, `FF /4`, `0x41` REX.B for `r8`–`r15`, pinned by `tests.rs::jumps_through_a_register`) `:402`, `call_r` (indirect) `:411`, `ret` `:420`.
-- filler — `nop` `:427`, `int3` `:432`.
+- arith/logic — `add_rr` `:209`, `sub_rr` `:214`, `cmp_rr` `:219`, `test_rr` `:224`, `and_rr` `:229`, `or_rr` `:234`, `xor_rr` `:239`, `imul_rr` `:314` (two-operand `0F AF /r`; sets OF/CF on 64-bit overflow — the `erlang:'*'/2` guard).
+- immediate-operand arith/logic — `test_ri` `:270`, `cmp_ri` `:282`, `and_ri` `:292`, `add_ri` `:301`, all `(Reg, imm: i32)`; see *The imm32 form* below.
+- divide — `cqo` `:328` (`REX.W 99`, sign-extend `rax` into `rdx:rax`) and `idiv_rr` `:345` (`F7 /7`, 64-bit signed divide: quotient in `rax`, remainder in `rdx`; a zero divisor or `i64::MIN / -1` traps `#DE`, so the caller must refuse both).
+- shifts — `sar_ri` `:354`, `shr_ri` `:365`, `shl_ri` `:370` (`C1 /n ib`; `sar_ri`/`shl_ri` take a `u32` count and reject one above `u8::MAX` with `BadArg`, `shr_ri` takes the `u8` immediate directly) and the `cl`-count forms `shr_cl` `:380`/`shl_cl` `:388` (`D3 /n`).
+- stack — `push_r` `:419`, `pop_r` `:427`.
+- control flow — `jmp` (`rel32`) `:437`, `jcc` (`rel32`) `:443`, `call_label` (`rel32`) `:450`, `jmp_r` (indirect, `FF /4`, `0x41` REX.B for `r8`–`r15`, pinned by `tests.rs::jumps_through_a_register`) `:464`, `call_r` (indirect) `:473`, `ret` `:482`.
+- filler — `nop` `:489`, `int3` `:494`.
 ### Narrow (zero-extending) loads and run-time shift counts
 - `mov_rm32` `:65` — `8B /r` with `REX.W` **clear**, so the 32-bit register write zero-extends into the full 64-bit destination (the x86-64 rule) instead of keeping the old high half; a `REX` prefix is still emitted (without `W`) for an `r8`–`r15` operand.
 - `movzx_byte` `:78` — `REX.W 0F B6 /r`: an 8-bit load zero-extended into the 64-bit destination, so a `0xFF` source reads as `0xFF` and never `-1`, and only the addressed byte is read.
@@ -50,7 +51,12 @@ Emitted bytes, for a low base and a low source **outside** the 8-bit aliasing gr
 
 The prefix order is the architectural one — the legacy `66` operand-size prefix *before* the `REX` — and the `REX` bits are width-independent (`REX.R` for an `r8`–`r15` source, `REX.B` for one as a base, plus the `SIB` byte an `rsp`/`r12` base forces), so each of those adds one byte.
 **The trap that is handled — the 8-bit `REX` aliasing rule.** Without a `REX` prefix, byte-register codes `4..=7` name the **legacy high bytes** `AH`/`CH`/`DH`/`BH`, not `SPL`/`BPL`/`SIL`/`DIL`; the low-byte names exist only when a `REX` prefix is present. `emit_rex` emits *nothing* when every field is low, so a naive byte store with `src` = `Rsp`/`Rbp`/`Rsi`/`Rdi` (codes 4–7) and a low base would silently store a **different register** — `DH` instead of `SIL`, i.e. bits 8–15 of `rdx` — which is a wrong store, not a typed error. `emit_mov_mr_narrow` therefore **forces a bare `REX` (`0x40`, no `W`/`R`/`B`)** exactly when `src`'s low three bits are `4..=7` **and** no `REX` extension bit is needed anyway, making that case 7 bytes instead of 6. When an `r8`–`r15` operand already forces a `REX`, that prefix satisfies the rule and no byte is added. `mov_mr16`/`mov_mr32` carry no such rule — the 16- and 32-bit names have no high-byte alias — so they emit only the `REX` bits their operands need.
-Absent on purpose (add a tested method, don't guess): `mov r/m64, imm32`, **every `_ri` immediate arithmetic/logic form** (`add_ri`/`sub_ri`/`and_ri`/`or_ri`/`xor_ri`/`cmp_ri`/`test_ri` — synthesize as `mov_ri` into a scratch + the `_rr` form, 13 B for a 3 B op), `setcc` (a boolean in a register is `mov_ri 0` + `cmp`/`jcc` + `mov_ri 1`, or two labels), a **sign-extending** `movsx` (only the `movzx` forms above exist), `ud2`, `neg`/`not`, memory-operand arithmetic, indexed addressing (`[base + index*scale]` — no SIB index is ever emitted, so scale with `shl_ri` + `lea`/`add_rr`), SSE/AVX, `syscall`.
+### The imm32 form (sign-extended 32-bit immediate)
+`test_ri`/`cmp_ri`/`and_ri`/`add_ri` take an `i32` and encode the 64-bit form with a **sign-extended `imm32`** written little-endian: `REX.W F7 /0 id` for `test`, `REX.W 81 /7|/4|/0 id` for `cmp`/`and`/`add`, so the immediate covers `-2^31..=2^31-1` and sign-extends into all 64 bits.
+Each is 7 bytes for every register, `REX.B` (`0x49` instead of `0x48`) for an `r8`–`r15` operand, and replaces a `mov_ri(scratch, const)` + `test_rr`/`cmp_rr`/`and_rr`/`add_rr` pair — one instruction and ten bytes fewer, because `mov_ri` is the 10-byte `movabs`.
+The uniform `81 /n`/`F7 /0` shapes are used for every register, so the shorter accumulator-only forms (`3D`/`25`/`05` and `A9`) are deliberately never emitted; `emit_ri` is the shared `81 /n` body.
+No imm8 (`83 /n ib`) form exists and `mov_ri` is unchanged.
+Absent on purpose (add a tested method, don't guess): `mov r/m64, imm32`, the `sub_ri`/`or_ri`/`xor_ri` immediate forms (synthesize as `mov_ri` into a scratch + the `_rr` form), `setcc` (a boolean in a register is `mov_ri 0` + `cmp`/`jcc` + `mov_ri 1`, or two labels), a **sign-extending** `movsx` (only the `movzx` forms above exist), `ud2`, `neg`/`not`, memory-operand arithmetic, indexed addressing (`[base + index*scale]` — no SIB index is ever emitted, so scale with `shl_ri` + `lea`/`add_rr`), SSE/AVX, `syscall`.
 
 ## W^X design (never RWX)
 `with_capacity` maps anonymous private `PROT_READ|PROT_WRITE` (`mod.rs:320-329`); `seal` flips the
@@ -126,6 +132,10 @@ The narrow **stores** follow the same discipline — executed, not merely byte-p
   overrun the window. It then pins the encodings (`66 89 /r`, `89 /r`, `REX.W` clear), that **no**
   forced `REX` appears for an `rsp`/`rsi` source in those widths, and the `66`-then-`REX`-then-opcode
   prefix order with `REX.R`/`REX.B`.
+The immediate-operand encoders are pinned byte-wise and then executed:
+- `emits_the_immediate_operand_encodings` drives all four encoders over `Rax`/`Rcx`/`R8`/`R11` with the immediates `1`/`7`/`-8`/`-4`, pinning `REX.W` + opcode + register-form `ModRM` + the little-endian `imm32`, the `REX.B` of an extended operand, and the 7-byte length of every row.
+- `emits_the_immediate_operand_whole_32_bit_field` pins `i32::MIN` (`00 00 00 80`) and `i32::MAX` (`FF FF FF 7F`) through all four encoders, proving the whole field is written, and prices the `mov_ri` + `_rr` pair it replaces at 13 bytes.
+- `executes_test_ri_with_a_sign_extended_immediate`, `executes_cmp_ri_with_a_sign_extended_immediate` and `executes_and_ri_and_add_ri_with_sign_extended_immediates` observe the flags/result through `jcc`, and each carries a **sign-extension witness** — a value that would answer differently under a zero-extended field (bit 32 through `& -8`, the signed `0 < 0xFFFF_FFF8` comparison, and the `and`/`add` encoders read alone so a wrapped offset cannot mask the difference).
 The baseline tier's own `baseline/emit/*` tests assert the emitted byte sequences.
 
 ## Routing Table

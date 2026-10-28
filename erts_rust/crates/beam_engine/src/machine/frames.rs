@@ -223,7 +223,8 @@ impl Machine {
     /// stack length is already the frame's `y_base`, so there is nothing to write.
     #[inline]
     pub(crate) fn push_frame(&mut self, y_count: u32) -> Result<()> {
-        self.push_frame_window(y_count).map(|_| ())
+        self.push_frame_window(y_count);
+        Ok(())
     }
 
     /// [`Machine::push_frame`] that also hands back the pushed frame's
@@ -235,8 +236,13 @@ impl Machine {
     /// instead of re-deriving them from `Machine::frames.last()` afterwards. The
     /// returned pair describes the frame this call pushed — the machine's new top
     /// frame — for as long as the caller does not push, pop or `trim` in between.
+    ///
+    /// Infallible: `Vec::resize` and `Vec::push` have no failure mode, so an `Err` here
+    /// would be a branch on a condition that never holds — a cost on every frame push of
+    /// every non-tail call (the pops keep their `Result`; theirs is a real
+    /// frame-discipline check).
     #[inline]
-    pub(crate) fn push_frame_window(&mut self, y_count: u32) -> Result<(usize, u32)> {
+    pub(crate) fn push_frame_window(&mut self, y_count: u32) -> (usize, u32) {
         let y_base = self.stack.len();
         if y_count != 0 {
             self.stack
@@ -247,7 +253,7 @@ impl Machine {
             y_base,
             y_count,
         });
-        Ok((y_base, y_count))
+        (y_base, y_count)
     }
 
     /// Pop the innermost frame (and its Y slots).
@@ -297,6 +303,38 @@ impl Machine {
         }
     }
 
+    /// [`Machine::pop_frame_checked`] followed by [`Machine::take_continuation`], as one
+    /// step over the frame stack.
+    ///
+    /// This is the pair `Instr::DeallocateReturn` performs — pop the returning frame, then
+    /// follow the continuation the **caller's** slot holds — and it is the shape every
+    /// function exit of every non-tail call takes, so the two halves are fused here to read
+    /// the frame stack once instead of twice. Both halves keep their own semantics exactly:
+    /// a size mismatch restores the frame verbatim and leaves the continuation slot
+    /// **untouched**, and the success path's `std::mem::replace(…, Continuation::Halt)` is
+    /// still the single read-and-clear ([`Machine::take_continuation`]'s contract).
+    #[inline]
+    pub(crate) fn pop_frame_take_continuation(&mut self, n: u32) -> Result<Continuation> {
+        match self.frames.pop() {
+            Some(frame) => {
+                if frame.y_count != n {
+                    // Cold: nothing has been popped as far as any observer can tell —
+                    // `Frame` is `Copy`, so this restores the identical frame, and the
+                    // capacity is already there (`push` cannot reallocate here).
+                    self.frames.push(frame);
+                    return Err(error::unsupported("deallocate: frame size mismatch"));
+                }
+                self.stack.truncate(frame.y_base);
+                match self.frames.last_mut() {
+                    Some(caller) => {
+                        Ok(std::mem::replace(&mut caller.continuation, Continuation::Halt))
+                    }
+                    None => Err(error::unsupported("run: no current frame")),
+                }
+            }
+            None => Err(error::unsupported("deallocate: no frame")),
+        }
+    }
     /// `trim N` — shrink the current frame to its **highest** Y slots.
     ///
     /// Reproduces C's `i_trim` (`../../erts/emulator/beam/emu/instrs.tab:593`):

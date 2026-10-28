@@ -62,6 +62,12 @@
 //! other changes only the field-write phase; the `binary all` tail keeps the destination
 //! and source guards and folds its commit into its one helper call.
 //!
+//! The fourth route, [`Route::Fresh`], is *not* an append build at all: a `bs_create_bin`
+//! with no `private_append` group has no accumulator to advance, so its fields are the whole
+//! result. [`CreateBinShape::of`] reports it when the append plan declines, and the emitted
+//! sequence is [`create_fresh`]'s (the fields packed into one word, then one
+//! `jit_make_heap_binary` call); `self.source` is `None` on that route.
+//!
 //! # The mutation order is the whole correctness argument
 //!
 //! The family's build performs exactly one mutation beyond the field bytes: C's
@@ -141,7 +147,8 @@
 //! bit-granular door takes the accumulator as an x-register or `Y`-slot
 //! index, and `jit_write_bit_field` takes the field value the same way plus one flags word
 //! ([`WRITE_ACC_IN_Y`] / [`WRITE_VALUE_IN_Y`]) naming which machine file holds each. The
-//! block's spill before every helper call makes `machine.x` authoritative, and a `Y` slot is
+//! bit-granular route's door spills the block's cached x-registers before its helper call, so
+//! `machine.x` is authoritative when that route's helpers run, and a `Y` slot is
 //! reached through `Machine::y`, so an index is all such a helper needs.
 //! The aligned route's call is the exception the block can afford: it passes the payload base
 //! and the window end it has just loaded from the accumulator's own block, in the ABI's own
@@ -231,9 +238,10 @@
 //! takes. The general door [`jit_open_append_bin_any`] / [`jit_open_append_bin_any_y`] is
 //! handed the plan's `unit` for exactly this test; the aligned route
 //! ([`create_door::emit_append_cursor`]) refuses unless `end_bits % 8 == 0` — the `unit == 8`
-//! form of the same gate, because a byte cursor needs a byte-aligned window end — and
-//! [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor) re-checks it so the
-//! machine-private half agrees with the seam on every input.
+//! form of the same gate, because a byte cursor needs a byte-aligned window end — and that
+//! emitted guard is the whole check: [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor)
+//! does not re-test it, keeping only the writable-registry clause and the overflow-safe
+//! `checked_mul(8)`/`checked_add` room rule.
 //!
 //! The `fail` arm is deliberately **not** part of this shape: `bs_create_bin`'s
 //! `NO_FAIL`-vs-label discrimination stays in the family, and every refusal above (and
@@ -254,7 +262,7 @@ use super::super::operands::{x_offset, y_offset, Loc, Y_ADDR_SCRATCH, Y_ADDR_SCR
 use super::super::{
     emit_positioned_helper_call, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, RUNTIME_SLOT_DISP,
 };
-use super::{emit_fallback_and_done, IMMED1_MASK, POINTER_MASK, SMALL_TAG, SUB_BITS_END_DISP};
+use super::{emit_fallback_and_done, POINTER_MASK, SMALL_TAG, SUB_BITS_END_DISP};
 
 #[cfg(test)]
 use super::{record_inlined, SHAPE_CREATE_BIN};
@@ -270,7 +278,7 @@ use create_binary::emit_binary_all;
 use create_field::{
     emit_bit_field_store, FieldScratch, MAX_INLINE_FIELD_BITS, PRODUCTION_FIELD_SCRATCH,
 };
-use create_door::emit_append_cursor;
+use create_door::{emit_append_cursor, POINTER_MASK_I32};
 
 // The gold-standard oracle for `emit_bit_field_store`: the sequence is executed for every
 // width, window offset and window end over a byte-pre-filled payload and compared with the
@@ -317,6 +325,11 @@ const MAX_TAIL_BYTES: usize = 256;
 /// [`MAX_TAIL_BYTES`] in bits, the form the plan's `tail_bits` is compared against.
 const MAX_TAIL_BITS: u32 = MAX_TAIL_BYTES as u32 * 8;
 
+/// The commit's advance is a register-immediate `add` ([`CodeBuffer::add_ri`], a
+/// sign-extended `imm32`), so the compile-time tail must fit one. A cap that grew past
+/// `i32::MAX` would fail the build here rather than silently truncate the window advance.
+const _: () = assert!(MAX_TAIL_BITS <= i32::MAX as u32);
+
 /// The scratch the `Y` accumulator's up-front guard computes its slot address in, and the
 /// scratch its window bound goes to.
 ///
@@ -329,7 +342,7 @@ const SOURCE_GUARD_SCRATCH: Reg = MOVE_SCRATCH;
 /// The `Y` accumulator guard's window-bound scratch (see [`SOURCE_GUARD_SCRATCH`]).
 const SOURCE_GUARD_END: Reg = MOVE_SCRATCH_2;
 
-/// Which of the two straight-line sequences a shape is emitted with (see the module docs).
+/// Which straight-line sequence a shape is emitted with (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Route {
     /// Every field is a whole number of bytes: field bytes are stored at
@@ -338,6 +351,11 @@ pub(crate) enum Route {
     /// At least one field is not a whole number of bytes: every field goes through the
     /// seam's bit-granular write rule at an absolute bit position.
     BitGranular,
+    /// A **bare** build: no `private_append` group, so there is no accumulator to append to
+    /// and no door to open. The fields are packed into one word and materialized as a whole
+    /// term by `jit_make_heap_binary` (see `create_fresh.rs`); [`CreateBinShape::append_source`]
+    /// is `None` on this route.
+    Fresh,
 }
 
 /// One field of a lowered build, fully resolved for emission: the value's location and the
@@ -374,18 +392,25 @@ enum PreparedField<'a> {
 pub(crate) struct CreateBinShape {
     /// The accumulator operand's location: an in-bound x-register or an addressable `Y`
     /// slot (the emitted call's door follows from which — see the module docs).
-    source: Loc,
+    ///
+    /// `None` for the **bare** build ([`Route::Fresh`]): such an instruction has no
+    /// `private_append` group at all, so there is no accumulator to append *to* — its
+    /// fields are the whole result. [`Self::append_source`] is the one accessor every
+    /// append-route site goes through.
+    source: Option<Loc>,
     /// The destination: an x-register or an addressable `Y` slot.
-    dst: Loc,
+    pub(super) dst: Loc,
     /// The plan's append **unit** (`1`, `2`, `4` or `8`) — the general door's position
     /// gate (`seam::open_append_any`'s fourth argument). Carried as a compile-time
-    /// constant because it is the plan's, not the instruction's.
-    unit: usize,
+    /// constant because it is the plan's, not the instruction's — and `None` on the
+    /// [`Route::Fresh`] route, which consults no append door.
+    unit: Option<usize>,
     /// The summed width of the fields, in bits: exactly the figure the accumulator's
-    /// window end advances by (`seam::AppendPlan::tail_bits`).
-    tail_bits: u32,
+    /// window end advances by (`seam::AppendPlan::tail_bits`), and on [`Route::Fresh`] the
+    /// built bitstring's own bit size (`seam::FreshPlan::total_bits`).
+    pub(super) tail_bits: u32,
     /// The fields, in instruction order.
-    fields: Vec<seam::Field>,
+    pub(super) fields: Vec<seam::Field>,
     /// The **bit** offset of each field from the write start, parallel to [`Self::fields`]
     /// — the one offset figure both routes derive from (the aligned route divides by 8).
     field_bit_offsets: Vec<u32>,
@@ -442,12 +467,31 @@ impl CreateBinShape {
     /// emitter and the refusal census all derive the same answer from this one call — which
     /// is also why the route ([`Self::route`]) is a function of the shape rather than a
     /// second predicate.
+    ///
+    /// Two plans are consulted, in this order: the **append** plan (the accumulator is the
+    /// instruction's first segment group), and — when that declines — the **bare** build's
+    /// (see [`Self::from_fresh_plan`]). A segment list the append plan accepts never reaches
+    /// the second, so the two routes' shapes are disjoint by construction.
     pub(crate) fn of(
         module: &Module,
         dst: &Operand,
         segments: &[Operand],
     ) -> Option<CreateBinShape> {
-        let plan = seam::append_plan(module, segments)?;
+        let Some(plan) = seam::append_plan(module, segments) else {
+            return Self::from_fresh_plan(module, dst, &seam::fresh_plan(module, segments)?);
+        };
+        Self::from_append_plan(module, dst, &plan)
+    }
+
+    /// The shape of an **append** plan (see [`Self::of`]).
+    ///
+    /// `dst` is the operand the built term lands in; `plan` is
+    /// [`seam::append_plan`]'s answer, already resolved by the seam.
+    fn from_append_plan(
+        _module: &Module,
+        dst: &Operand,
+        plan: &seam::AppendPlan,
+    ) -> Option<CreateBinShape> {
         // An in-bound x-register or an addressable `Y` slot: the `Y` forms carry the
         // accumulator to the helper as a slot index and re-derive the slot's address
         // post-helper behind the one up-front guard (see the module docs). Every other
@@ -505,11 +549,11 @@ impl CreateBinShape {
             return None;
         }
         let shape = CreateBinShape {
-            source,
+            source: Some(source),
             dst,
-            unit: plan.unit,
+            unit: Some(plan.unit),
             tail_bits: plan.tail_bits,
-            fields: plan.fields,
+            fields: plan.fields.clone(),
             field_bit_offsets,
             binary_all,
         };
@@ -527,7 +571,66 @@ impl CreateBinShape {
         Some(shape)
     }
 
-    /// Which of the two straight-line sequences this shape is emitted with (see the module
+    /// The shape of a **bare** build — a `bs_create_bin` whose segments carry no
+    /// `private_append` accumulator at all, so the fields *are* the whole result
+    /// ([`Route::Fresh`]).
+    ///
+    /// Carries no source and no unit: nothing is appended to and no append door is consulted.
+    /// The field list, the running bit offsets and the total width come straight from
+    /// [`seam::fresh_plan`], which is the one place that decides which segment sets have a
+    /// bit-exact packed form; this function only refuses what the emitter cannot address (an
+    /// unresolvable value or destination) and applies the shape cap.
+    ///
+    /// Reached only from [`CreateBinShape::of`] once the append plan declines, so a segment
+    /// list that *is* an append build never takes this route.
+    fn from_fresh_plan(
+        _module: &Module,
+        dst: &Operand,
+        fresh: &seam::FreshPlan,
+    ) -> Option<CreateBinShape> {
+        let dst = Loc::of(dst)?;
+        if fresh.fields.len() > MAX_FIELDS {
+            return None;
+        }
+        let mut field_bit_offsets = Vec::with_capacity(fresh.fields.len());
+        let mut offset_bits: u32 = 0;
+        for field in &fresh.fields {
+            // `fresh_plan` accepts statically sized unsigned integer segments only, so a
+            // `ConstBytes` field cannot appear; a future field kind refuses the whole shape
+            // rather than being silently dropped from the field list.
+            let seam::Field::Bits { value, bits } = field else {
+                return None;
+            };
+            if *bits == 0 || *bits > 64 {
+                return None;
+            }
+            Loc::of(value)?;
+            field_bit_offsets.push(offset_bits);
+            offset_bits = offset_bits.checked_add(*bits)?;
+        }
+        if offset_bits != fresh.total_bits {
+            return None;
+        }
+        Some(CreateBinShape {
+            source: None,
+            dst,
+            unit: None,
+            tail_bits: fresh.total_bits,
+            fields: fresh.fields.clone(),
+            field_bit_offsets,
+            binary_all: None,
+        })
+    }
+
+    /// The accumulator's location on the **append** routes, `None` on [`Route::Fresh`].
+    ///
+    /// Every append-route site goes through this accessor instead of the field directly, so a
+    /// fresh shape cannot reach a door that expects an accumulator to exist.
+    fn append_source(&self) -> Option<Loc> {
+        self.source
+    }
+
+    /// Which of the three straight-line sequences this shape is emitted with (see the module
     /// docs).
     ///
     /// `Route::Aligned` exactly when every field is a whole number of bytes, i.e. when the
@@ -537,6 +640,11 @@ impl CreateBinShape {
     /// because a plan whose tail width disagreed with its fields would otherwise publish a
     /// window over bits nobody wrote.
     pub(crate) fn route(&self) -> Route {
+        // The single discriminator: a shape with no accumulator is a bare build, and neither
+        // append sequence can be emitted for it.
+        if self.source.is_none() {
+            return Route::Fresh;
+        }
         let aligned = self.tail_bits % 8 == 0
             && self.fields.iter().all(|field| match field {
                 seam::Field::Bits { bits, .. } => bits % 8 == 0,
@@ -550,10 +658,10 @@ impl CreateBinShape {
         }
     }
 
-    /// The accumulator's **slot index**, which is how it crosses to a door helper (an
+    /// A location's **slot index**, which is how an accumulator crosses to a door helper (an
     /// x-register index or a `Y`-slot index — see the module docs).
-    fn source_slot(&self) -> u32 {
-        match self.source {
+    pub(super) fn slot_of(loc: Loc) -> u32 {
+        match loc {
             Loc::X(x) => x,
             Loc::Y(k) => k,
         }
@@ -561,10 +669,10 @@ impl CreateBinShape {
 
     /// The x-register indices the shape touches — the accumulator, every field value and the
     /// `binary all` source (a `Y` slot contributes nothing: it is a stack slot, never a
-    /// cached x-register).
+    /// cached x-register). A fresh shape has no accumulator entry.
     pub(crate) fn registers(&self) -> Vec<u32> {
         let mut registers = Vec::with_capacity(2 + self.fields.len());
-        registers.extend(self.source.register());
+        registers.extend(self.append_source().and_then(Loc::register));
         registers.extend(self.binary_all.and_then(Loc::register));
         registers.extend(self.fields.iter().filter_map(bits_register));
         registers
@@ -592,7 +700,7 @@ impl CreateBinShape {
     /// Whether the lowering accesses the current frame's Y window — a `Y` destination, a
     /// `Y` accumulator, a `Y` field value or a `Y` `binary all` source.
     pub(crate) fn uses_y(&self) -> bool {
-        self.source.is_y()
+        self.append_source().is_some_and(Loc::is_y)
             || self.dst.is_y()
             || self.binary_all.is_some_and(Loc::is_y)
             || self.fields.iter().any(|field| match field {
@@ -635,6 +743,28 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     let Some(shape) = CreateBinShape::of(module, dst, segments) else {
         return Ok(false);
     };
+    // A bare build is a whole different sequence (no accumulator, no door): it goes to
+    // `create_fresh`, which owns that route's emitted bytes.
+    if shape.route() == Route::Fresh {
+        return super::create_fresh::emit_fresh_build(
+            buffer,
+            &shape,
+            allocation,
+            done,
+            func,
+            pc,
+            highest_touched,
+        );
+    }
+    // Every route below is an **append** build, so the accumulator and the plan's unit both
+    // exist; the two `let ... else` arms keep the sequence panic-free (a shape without them
+    // emits zero bytes and stays on the family).
+    let Some(source) = shape.append_source() else {
+        return Ok(false);
+    };
+    let Some(unit) = shape.unit else {
+        return Ok(false);
+    };
     let Some(prepared) = prepare_fields(&shape) else {
         return Ok(false);
     };
@@ -666,9 +796,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     // unguarded re-reads of that slot (sections 4-6) are behind a proven in-frame address.
     // The frame cannot move between this guard and those reads: the helper only reads
     // machine state and runs no interpreter step.
-    shape
-        .source
-        .guard_load(buffer, SOURCE_GUARD_SCRATCH, SOURCE_GUARD_END, fallback)?;
+    source.guard_load(buffer, SOURCE_GUARD_SCRATCH, SOURCE_GUARD_END, fallback)?;
 
     // (1c) The `Y` **`binary all` source**'s frame-window guard, on the same terms as (1b):
     // guard only, because the helper reaches the term through `Machine::y` itself. The frame
@@ -685,6 +813,18 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     //
     // The `binary all` route has no static field at all, so its guard phase is the (1c)
     // source guard and nothing else.
+    //
+    // `IMMED1_MASK == SMALL_TAG` (the small-integer tag *is* the all-ones immediate tag;
+    // the assertion beside those constants pins it), so `(v & mask) == tag` is
+    // `(v & SMALL_TAG) == SMALL_TAG` and one `movabs` serves every field of the append.
+    // `rax` is free across the loop: [`Loc::load`] writes only `dst` (plus its `end`
+    // scratch on a `Y` read) and nothing between the hoist and the last guard calls out.
+    if prepared
+        .iter()
+        .any(|field| matches!(field, PreparedField::Bits { .. }))
+    {
+        buffer.mov_ri(Reg::Rax, SMALL_TAG)?;
+    }
     for field in &prepared {
         let PreparedField::Bits { value, .. } = field else {
             continue;
@@ -697,9 +837,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
             fallback,
             highest_touched,
         )?;
-        buffer.mov_ri(Reg::Rax, IMMED1_MASK)?;
         buffer.and_rr(Reg::Rdx, Reg::Rax)?;
-        buffer.mov_ri(Reg::Rax, SMALL_TAG)?;
         buffer.cmp_rr(Reg::Rdx, Reg::Rax)?;
         buffer.jcc(Cond::Ne, fallback)?;
     }
@@ -714,23 +852,24 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
     // the copy is run-time-length, so there is no static field phase, and the helper performs
     // the build's single `ErlSubBits.end` commit itself — which is why no window-end commit is
     // emitted for it below. Its `0` answer is the same `fallback`.
-    let source_slot = shape.source_slot();
+    let source_slot = CreateBinShape::slot_of(source);
     if let Some(src) = shape.binary_all {
-        emit_binary_all(buffer, &shape, src, allocation, fallback, func, pc)?;
+        emit_binary_all(buffer, source, src, allocation, fallback, func, pc)?;
     } else {
         match route {
+            // Unreachable: a bare build returned above. Answering "emit nothing" keeps that
+            // arm honest rather than substituting one of the append doors.
+            Route::Fresh => return Ok(false),
             Route::Aligned => emit_append_cursor(
                 buffer,
                 allocation,
-                shape.source,
+                source,
                 shape.tail_bits,
-                func,
-                pc,
                 fallback,
                 highest_touched,
             )?,
             Route::BitGranular => {
-                let helper: OpenAppendAnyHelper = match shape.source {
+                let helper: OpenAppendAnyHelper = match source {
                     Loc::X(_) => jit_open_append_bin_any,
                     Loc::Y(_) => jit_open_append_bin_any_y,
                 };
@@ -741,7 +880,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
                     &[
                         i64::from(source_slot),
                         i64::from(shape.tail_bits),
-                        i64::from(shape.unit as u32),
+                        i64::from(unit as u32),
                     ],
                     func,
                     pc,
@@ -753,11 +892,16 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
 
         // (4) The field writes — the route's own phase (see the module docs).
         match route {
-            Route::Aligned => emit_aligned_fields(buffer, &prepared, highest_touched)?,
+            // Unreachable: a bare build returned above (see the arm above).
+            Route::Fresh => return Ok(false),
+            Route::Aligned => {
+                emit_aligned_fields(buffer, allocation, &prepared, highest_touched)?
+            }
+
             Route::BitGranular => {
                 emit_bit_fields(
                     buffer,
-                    &shape,
+                    source,
                     &prepared,
                     allocation,
                     func,
@@ -772,36 +916,45 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         // build's result, and **the only mutation** the sequence performs beyond the payload
         // bytes. (The `binary all` route's commit is inside its helper: its advance is the
         // source's run-time width, not a compile-time constant.)
-        match shape.source {
-            Loc::X(x) => {
-                buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-                touch(highest_touched, x);
-            }
-            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
+        //
+        // One load of the accumulator serves this phase **and** phase (6)'s destination
+        // store: the term goes to `rdx` (kept for the store), the untagged boxed pointer is
+        // masked **in place** out of `rax` (`and rax, -8`, an imm32 form rather than a
+        // `movabs`+`and` pair), and the commit is the one write through it. The old shape
+        // reloaded the accumulator for the destination store and materialised the mask in a
+        // register, i.e. one load and two instructions of pure overhead per append.
+        match source {
+            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rax, highest_touched)?,
+            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rax, k)?,
         }
-        buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
-        buffer.and_rr(Reg::Rdx, Reg::Rax)?;
-        buffer.mov_rm(Reg::Rcx, Reg::Rdx, SUB_BITS_END_DISP)?;
-        buffer.mov_ri(Reg::Rax, i64::from(shape.tail_bits))?;
-        buffer.add_rr(Reg::Rcx, Reg::Rax)?;
-        buffer.mov_mr(Reg::Rdx, SUB_BITS_END_DISP, Reg::Rcx)?;
+        buffer.mov_rr(Reg::Rdx, Reg::Rax)?;
+        buffer.and_ri(Reg::Rax, POINTER_MASK_I32)?;
+        buffer.mov_rm(Reg::Rcx, Reg::Rax, SUB_BITS_END_DISP)?;
+        // `tail_bits` is bounded by [`MAX_TAIL_BITS`] (the assertion beside it keeps the
+        // `u32 as i32` narrowing provable), so the advance is a register-immediate `add`.
+        buffer.add_ri(Reg::Rcx, shape.tail_bits as i32)?;
+        buffer.mov_mr(Reg::Rax, SUB_BITS_END_DISP, Reg::Rcx)?;
     }
 
     // (6) The accumulator term into the destination — the very word the instruction was
     // given, because the seam proved the build takes the in-place route (`grow`, republish
     // and promotion to the copy-rebuild form all decline). Nothing after this may fail.
+    //
+    // The term is `rdx` on the append routes (phase (5) kept it across the commit) and on
+    // the `binary all` route it is read here, because that helper owns its own commit.
     if let Loc::Y(k) = shape.dst {
         // The window guard already ran and nothing between it and here moved the frame (the
         // helper only reads machine state), so the slot address is re-derived without a
-        // second guard.
+        // second guard. It is derived into `Y_ADDR_SCRATCH`, which the three-instruction
+        // re-derivation writes alone, so `rdx` (the term) and `rax` (the door's answer /
+        // the boxed pointer) survive it.
         emit_y_slot_address(buffer, Y_ADDR_SCRATCH, k)?;
     }
-    match shape.source {
-        Loc::X(x) => {
-            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-            touch(highest_touched, x);
+    if shape.binary_all.is_some() {
+        match source {
+            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
+            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
         }
-        Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
     }
     shape
         .dst
@@ -813,20 +966,42 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
 /// The **aligned** route's field-write phase: the byte stores at the write cursor the append
 /// door returned in `rax`.
 ///
-/// Every value is re-read after the helper: an x-register from `machine.x` (`rbx` is
-/// callee-saved, and the spill before the call made that array authoritative for a cached
-/// register too), a `Y` slot through its re-derived address — once per field into `rcx`,
-/// since its four-instruction re-derivation should not be paid per byte.
+/// Every value is re-read after the helper: an x-register through [`Loc::load_x`], which reads
+/// a **cached** value out of its callee-saved machine register and an uncached one out of
+/// `machine.x` — the door's helper only reads machine state, so neither representation can be
+/// stale — and a `Y` slot through its re-derived address, once per field into `rcx`, since its
+/// four-instruction re-derivation should not be paid per byte.
 ///
 /// `rax` (the cursor) is never clobbered: `rdx` carries the extracted byte and `rcx` a `Y`
 /// value, and the displacement is `cursor + offset_bits / 8`.
+///
+/// A **run** of consecutive one-byte fields (`bits == 8`) that all read the same [`Loc`] shares
+/// one load and one `sar 4`: they all extract the same byte, so one extraction serves every store
+/// and the run costs `2 + n` instructions instead of `3n`. A wider field is never grouped — its
+/// descending `sar 8` chain restarts per field — so it keeps the per-field sequence below.
 fn emit_aligned_fields(
     buffer: &mut CodeBuffer,
+    allocation: &Allocation,
     prepared: &[PreparedField<'_>],
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
-    for field in prepared {
-        match field {
+    let mut at = 0usize;
+    while at < prepared.len() {
+        let run = one_byte_run(prepared, at);
+        if run > 1 {
+            if let PreparedField::Bits { value, .. } = &prepared[at] {
+                read_field_value(buffer, allocation, value, highest_touched)?;
+                buffer.sar_ri(Reg::Rdx, 4)?;
+                for field in &prepared[at..at + run] {
+                    if let PreparedField::Bits { offset_bits, .. } = field {
+                        buffer.mov_mr8(Reg::Rax, (*offset_bits / 8) as i32, Reg::Rdx)?;
+                    }
+                }
+            }
+            at += run;
+            continue;
+        }
+        match &prepared[at] {
             PreparedField::Bits {
                 value,
                 bits,
@@ -836,27 +1011,32 @@ fn emit_aligned_fields(
                 // [`MAX_TAIL_BYTES`], so the displacement is a small `disp32`.
                 let offset = (*offset_bits / 8) as i32;
                 let nbytes = (*bits / 8) as usize;
-                match *value {
-                    Loc::X(_) => {}
-                    Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rcx, k)?,
-                }
-                for i in 0..nbytes {
-                    match *value {
-                        Loc::X(x) => {
-                            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-                            touch(highest_touched, x);
-                        }
-                        Loc::Y(_) => buffer.mov_rr(Reg::Rdx, Reg::Rcx)?,
-                    }
-                    // Byte `i` (MSB first) of the big-endian field is word bits
-                    // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift
-                    // is ARITHMETIC precisely because the caller wants
-                    // `(value as i64 as u64).to_be_bytes()`: the raw word's bit 63 is the
-                    // small value's sign bit, so `sar` sign-extends the 60-bit value to the
-                    // 64 bits `push_byte_field` receives, where a logical shift's zero fill
-                    // would corrupt a negative 8-byte field's top byte (`-1` as `0F FF …`).
-                    buffer.sar_ri(Reg::Rdx, (4 + 8 * (nbytes - 1 - i)) as u32)?;
+                // One load per field, into `Rdx`, and the bytes are then peeled off it in
+                // place — never one load per byte (a wider field used to pay `nbytes` loads of
+                // the same word and `nbytes` full-width shifts).
+                read_field_value(buffer, allocation, value, highest_touched)?;
+                // Byte `i` (MSB first) of the big-endian field is word bits
+                // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift is
+                // ARITHMETIC precisely because the caller wants
+                // `(value as i64 as u64).to_be_bytes()`: the raw word's bit 63 is the small
+                // value's sign bit, so `sar` sign-extends the 60-bit value to the 64 bits
+                // `push_byte_field` receives, where a logical shift's zero fill would corrupt
+                // a negative 8-byte field's top byte (`-1` as `0F FF …`).
+                //
+                // The field is emitted **descending**, shifting the one loaded word in place:
+                // arithmetic right shifts compose, so `sar 4` then one `sar 8` between bytes
+                // leaves exactly the value `sar (4 + 8 * (nbytes - 1 - i))` would have at
+                // step `i`, i.e. every store writes the byte the ascending form wrote, at its
+                // own offset. The offsets are visited in the other order, which nothing can
+                // observe: they are disjoint bytes of one field, all written before the
+                // build's single window-end commit, and a re-execution rewrites the same
+                // bytes at the same offsets in the same order.
+                buffer.sar_ri(Reg::Rdx, 4)?;
+                for i in (0..nbytes).rev() {
                     buffer.mov_mr8(Reg::Rax, offset + i as i32, Reg::Rdx)?;
+                    if i > 0 {
+                        buffer.sar_ri(Reg::Rdx, 8)?;
+                    }
                 }
             }
             PreparedField::Const { bytes, offset_bits } => {
@@ -879,8 +1059,60 @@ fn emit_aligned_fields(
                 }
             }
         }
+        at += 1;
     }
     Ok(())
+}
+
+/// How many consecutive [`PreparedField::Bits`] fields starting at `start` are one-byte fields
+/// reading the **same** location — the run [`emit_aligned_fields`] shares one extraction across.
+///
+/// A run of one is the "no grouping" answer, so a caller can treat `> 1` as the grouped case.
+fn one_byte_run(prepared: &[PreparedField<'_>], start: usize) -> usize {
+    let PreparedField::Bits {
+        value,
+        bits: 8,
+        ..
+    } = &prepared[start]
+    else {
+        return 1;
+    };
+    let mut run = 1usize;
+    while let Some(PreparedField::Bits {
+        value: next,
+        bits: 8,
+        ..
+    }) = prepared.get(start + run)
+    {
+        if next != value {
+            break;
+        }
+        run += 1;
+    }
+    run
+}
+
+/// Load a field value into `rdx`: an x-register through [`Loc::load_x`] (a **cached** value out of
+/// its callee-saved machine register, an uncached one out of `machine.x`), a `Y` slot through its
+/// re-derived address in `rcx`.
+///
+/// The `Y` form re-derives the slot address rather than reusing a hoisted one: nothing between the
+/// up-front window guard and here pushes a frame (the append door only reads machine state), so the
+/// published window still holds the slot and a second guard must not be emitted.
+fn read_field_value(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    value: &Loc,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    match *value {
+        Loc::X(_) => value.load_x(buffer, allocation, Reg::Rdx, highest_touched),
+        Loc::Y(k) => {
+            emit_y_slot_value(buffer, Reg::Rcx, k)?;
+            buffer.mov_rr(Reg::Rdx, Reg::Rcx)?;
+            Ok(())
+        }
+    }
 }
 
 /// The **general** (bit-granular) route's field-write phase.
@@ -905,7 +1137,7 @@ fn emit_aligned_fields(
 /// written are the same bytes a re-execution writes.
 fn emit_bit_fields(
     buffer: &mut CodeBuffer,
-    shape: &CreateBinShape,
+    source: Loc,
     prepared: &[PreparedField<'_>],
     allocation: &Allocation,
     func: u32,
@@ -916,10 +1148,10 @@ fn emit_bit_fields(
     if prepared.iter().all(|field| {
         matches!(field, PreparedField::Bits { bits, .. } if *bits <= MAX_INLINE_FIELD_BITS)
     }) {
-        return emit_bit_fields_inline(buffer, shape, prepared, highest_touched);
+        return emit_bit_fields_inline(buffer, source, prepared, highest_touched);
     }
-    let acc_in_y = shape.source.is_y();
-    let src_slot = i64::from(shape.source_slot());
+    let acc_in_y = source.is_y();
+    let src_slot = i64::from(CreateBinShape::slot_of(source));
     let helper: WriteBitFieldHelper = jit_write_bit_field;
     for field in prepared {
         // `try_inline_bs_create_bin` gated this route on `Bits`-only field lists (see the
@@ -974,12 +1206,13 @@ fn emit_bit_fields(
 /// the `is_small` refusal is this arm's up-front per-field guard (see
 /// [`super::create_field`]).
 ///
-/// Every value is re-read from the machine after the helper: a cached x-register was
-/// spilled before the call, so `machine.x` (via `rbx`) is authoritative, and a `Y` slot is
-/// reached through its own re-derived address behind the up-front guard.
+/// Every value is re-read from the machine after the helper: this route's door
+/// ([`emit_positioned_helper_call`]) spills the block's cached x-registers before its call, so
+/// `machine.x` (via `rbx`) is authoritative, and a `Y` slot is reached through its own
+/// re-derived address behind the up-front guard.
 fn emit_bit_fields_inline(
     buffer: &mut CodeBuffer,
-    shape: &CreateBinShape,
+    source: Loc,
     prepared: &[PreparedField<'_>],
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
@@ -988,7 +1221,7 @@ fn emit_bit_fields_inline(
     } = PRODUCTION_FIELD_SCRATCH;
     // The door's answer (the payload base) into the register the whole phase keeps it in.
     buffer.mov_rr(base, Reg::Rax)?;
-    match shape.source {
+    match source {
         Loc::X(x) => {
             buffer.mov_rm(end, Reg::Rbx, x_offset(x))?;
             touch(highest_touched, x);
@@ -1026,7 +1259,7 @@ fn emit_bit_fields_inline(
 ///
 /// Sound only behind the up-front [`Loc::guard_load`] of the same slot (see the module
 /// docs): the frame cannot change between them, so the guard's proof still holds here.
-fn emit_y_slot_address(buffer: &mut CodeBuffer, dst: Reg, k: u32) -> Result<()> {
+pub(super) fn emit_y_slot_address(buffer: &mut CodeBuffer, dst: Reg, k: u32) -> Result<()> {
     buffer.mov_rm(dst, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     buffer.mov_rm(dst, dst, RUNTIME_YBASE_DISP)?;
     buffer.lea(dst, dst, y_offset(k))

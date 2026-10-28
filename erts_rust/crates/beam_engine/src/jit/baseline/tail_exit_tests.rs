@@ -393,7 +393,7 @@ fn the_unlinked_tail_exit_records_no_call_last_deopt() {
         "the fixture's block must emit native bytes"
     );
     assert!(
-        compiled.entries.iter().any(|entry| entry.is_some()),
+        compiled.entries.iter().any(|entry| !entry.is_null()),
         "the fixture's function must compile at least one block"
     );
     assert!(
@@ -602,7 +602,7 @@ fn the_probed_local_call_records_one_spill_call_and_none_at_the_exit() {
             emitted.instr_deopts,
         );
         assert!(
-            compiled.entries.iter().any(|entry| entry.is_some()),
+            compiled.entries.iter().any(|entry| !entry.is_null()),
             "{what}: the fixture's function must compile at least one block"
         );
 

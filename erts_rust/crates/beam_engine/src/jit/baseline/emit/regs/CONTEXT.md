@@ -16,8 +16,8 @@ and its test-only site classification live in one ~300-line file. Owned by `./er
     `pc - block_start`: the cached x-registers a `spill` at that pc must store. Always one entry per pc in
     `[block_start, end]` -- **including the block exit pc `end`** -- derived by `../regalloc.rs`'s forward
     dirty walk. An **empty** table means "no dirty analysis was computed".
-  - `y_last: Option<u32>` -- the highest pc of the block whose instruction accesses a `Y` slot (the
-    compile-time gate for the prologue Y-window publish and the gated post-helper refresh).
+  - `y_last: Option<u32>` -- the highest pc of the block whose instruction accesses a `Y` slot: one of the three inputs to the publish gate (`Allocation::prologue_publishes_y` answers "no publish" for `y_last == None`) and the gate on the post-helper refresh.
+  - `y_first: Option<u32>` -- the lowest such pc, beside `frame_republish_first: Option<u32>` (the lowest pc of an `allocate`/`allocate_heap`/`trim`): the other two inputs to `Allocation::prologue_publishes_y`, which publishes unless `y_first <= frame_republish_first` -- every `Y` access then follows a helper that re-published the window itself.
   - `slot(x)`, `is_written(x)`, `spill_slots()` (the whole-block written `(x, Reg)` pairs),
     `spill_slots_at(pc)` (the `(x, Reg)` pairs **dirty at `pc`**, else `spill_slots()` when the table is
     empty or does not cover `pc`), `refresh_y_after(pc)`.

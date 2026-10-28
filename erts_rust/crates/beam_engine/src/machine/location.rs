@@ -196,6 +196,17 @@ impl Machine {
     pub(crate) fn set_current_code(&mut self, func: u32, pc: u32) {
         self.current_code = pack_current_code(func, pc);
     }
+    /// [`Machine::set_current_code`] for a caller that already holds the packed word.
+    ///
+    /// A native in-block transfer both **publishes** its target (`set_current_code`) and
+    /// **exits with** that target as the block-return word
+    /// ([`encode_target`](crate::jit::baseline::runtime::encode_target)), and the two
+    /// encodings are the same bit pattern (`func << 32 | pc`, `func` unsigned). Packing
+    /// once and storing that word here is exactly the same machine state as the
+    /// two-argument form, one shift-and-or cheaper per transfer.
+    pub(crate) fn set_current_code_word(&mut self, word: u64) {
+        self.current_code = word;
+    }
     /// The `(function index, arity)` the run was entered at — the engine's
     /// analogue of ERTS's `$initial_call`.
     ///

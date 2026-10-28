@@ -112,7 +112,9 @@ use crate::machine::{Machine, RunOutcome};
 use crate::terms::binary_bytes;
 
 use super::counting::CountingContext;
-use super::{compile_fixture, env_usize, measure, selected_tiers, Measurement, Prepare};
+use super::{
+    compile_fixture, env_usize, measure, selected_tiers, Measurement, Prepare, ResultSnapshot,
+};
 
 /// The module name the fixture compiles to.
 const MODULE: &str = "long_append";
@@ -268,11 +270,7 @@ fn foreign_long_append_decomposition() {
         report(measurement, *tier, instr_per_call, &expected);
     }
     if let [(_, first), (_, second)] = measurements.as_slice() {
-        assert_eq!(
-            binary_bytes(first.result).ok(),
-            binary_bytes(second.result).ok(),
-            "the two tiers disagree on {MODULE}:{ENTRY}/1"
-        );
+        super::assert_tiers_agree(first, second, &format!("{MODULE}:{ENTRY}/1"));
     }
     report_growth(&module, entry, input_entry, argument, &expected);
 }
@@ -334,9 +332,7 @@ fn report(measurement: &Measurement, tier: Tier, instr_per_call: f64, expected: 
     let per_call = |count: u64| count as f64 / calls;
     let min = measurement.min();
     let counters = &measurement.counters;
-    let correct = binary_bytes(measurement.result)
-        .map(|bytes| bytes == expected)
-        .unwrap_or(false);
+    let correct = measurement.snapshot == ResultSnapshot::Binary(expected.to_vec());
     println!("---");
     println!("tier = {}", tier.name());
     println!("iters = {}", measurement.iters);
@@ -382,7 +378,10 @@ fn report(measurement: &Measurement, tier: Tier, instr_per_call: f64, expected: 
         correct,
         "{} returned {} bytes, not the expected {}",
         tier.name(),
-        binary_bytes(measurement.result).map_or(0, |bytes| bytes.len()),
+        match &measurement.snapshot {
+            ResultSnapshot::Binary(bytes) => bytes.len(),
+            _ => 0,
+        },
         expected.len()
     );
     assert_eq!(
@@ -431,6 +430,9 @@ fn report_growth(
         Ok(RunOutcome::Returned(value)) => value,
         other => panic!("the fixture's {ENTRY}/1: {other:?}"),
     };
+    // Both terms are read here with `machine` and `ctx` still alive, which is the ownership rule:
+    // the accumulator's payload lives in `machine`'s off-heap reservoir, so neither comparison may
+    // be moved past that machine's drop.
     assert_eq!(
         binary_bytes(input).ok(),
         Some(input_bytes().as_slice()),
@@ -504,4 +506,96 @@ fn report_growth(
              last append built, not the accumulation."
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The result-ownership pin
+// ---------------------------------------------------------------------------
+
+/// Calls the ownership pin measures (five sub-runs of [`PIN_BATCH`] calls).
+const PIN_ITERS: usize = 15;
+/// Calls per fresh machine/host batch in the ownership pin: equal to the sub-run length, so every
+/// sub-run is exactly one batch and every batch's machine really drops before the next one starts.
+const PIN_BATCH: usize = 3;
+/// Untimed warmup calls of the ownership pin (one more batch, so one more dropped machine).
+const PIN_WARMUP: usize = 3;
+
+/// A measured result is readable only while the batch [`Machine`] that produced it is alive.
+///
+/// [`super::run_calls`] gives every batch a fresh [`Machine`] and drops it at the batch's end, and
+/// this fixture's result is a 64 KiB **refc binary** whose payload lives in that machine's
+/// off-heap reservoir (`Machine::refc_binaries`) — so the measured result has to be copied out as
+/// a [`ResultSnapshot`] **inside** the batch loop. Carrying the raw `Eterm` out of the batch and
+/// reading it afterwards is a use-after-free (SIGSEGV once the carrier is unmapped; silently wrong
+/// bytes before that).
+///
+/// This runs several batches on both tiers, so each assertion reads a copy whose machine (and
+/// whose host arena) has long been dropped, and compares the bytes. Deterministic, so it is a
+/// **gate**, not a measurement: it asserts no timing and skips loudly when the system `erlc` (which
+/// compiles the fixture) is unavailable.
+#[test]
+fn the_measured_result_is_readable_after_the_batch_machine_was_dropped() {
+    let beam = match compile_fixture(MODULE, SOURCE, "long_append_ownership") {
+        Ok(beam) => beam,
+        Err(why) => {
+            println!("SKIP: {why} -- the result-ownership pin did not run");
+            return;
+        }
+    };
+    let module = Arc::new(
+        load_file(&beam).unwrap_or_else(|error| panic!("load {}: {error:?}", beam.display())),
+    );
+    let entry = atom_for(&module, ENTRY);
+    let input_entry = atom_for(&module, INPUT_ENTRY);
+    let argument = make_small(N_ARG as i64);
+    let prepare = |ctx: &mut CountingContext, machine: &mut Machine| -> beam_common::Result<Eterm> {
+        match machine.run_export_outcome_with_tier(
+            &module,
+            input_entry,
+            1,
+            &[argument],
+            ctx,
+            Tier::Interpreter,
+        )? {
+            RunOutcome::Returned(value) => Ok(value),
+            RunOutcome::Wait { .. } => {
+                panic!("the fixture's input/1 blocked in a receive: it has none")
+            }
+            RunOutcome::Suspend { .. } => {
+                panic!("the fixture's input/1 suspended on a BIF: the bench host never suspends")
+            }
+        }
+    };
+
+    let expected = expected_bytes();
+    let mut measurements = Vec::new();
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let measurement = measure(
+            &module,
+            entry,
+            tier,
+            PIN_ITERS,
+            PIN_BATCH,
+            PIN_WARMUP,
+            &prepare,
+        );
+        match &measurement.snapshot {
+            ResultSnapshot::Binary(bytes) => assert_eq!(
+                bytes, &expected,
+                "{} reported bytes that are not the ones it measured -- the result was read after \
+                 the batch machine that produced it was dropped",
+                tier.name()
+            ),
+            other => panic!(
+                "{} snapshotted {other:?}, not the {OUTPUT_BYTES}-byte result",
+                tier.name()
+            ),
+        }
+        measurements.push(measurement);
+    }
+    super::assert_tiers_agree(
+        &measurements[0],
+        &measurements[1],
+        &format!("{MODULE}:{ENTRY}/1"),
+    );
 }

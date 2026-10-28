@@ -42,17 +42,19 @@
 //! **No driver-loop iteration runs** between the unwind — `Machine::unwind_to_frame`
 //! truncates `machine.frames` **and** `machine.stack` — and the handler.
 //!
-//! That is sound today only because the **two emitted points that can re-derive the
-//! `[y_base, y_end)` window are both unconditional**: the handler block's prologue publish
-//! (`jit_publish_y`) and the gated in-block refresh after the `try_case` family helper
-//! (`jit_refresh_y`, emitted because the block's `y(0)` read follows it) each re-derive the
-//! window from the *live* frame A, so either one alone keeps the read correct. A future
-//! change that makes a block prologue's window derivation — or the position store /
-//! reduction charge that shares its prologue helper — conditional on prior state (for
-//! instance a cross-block "the window is already current" witness) must first close this
-//! hole: on this route nothing between the unwind and the handler's `Y` read observes the
-//! frame change, so with both derivations skipped the handler reads frame B's stale window
-//! (a raw stack word, 59) where the interpreter reads 11.
+//! That is sound today because the **two emitted points that can re-derive the
+//! `[y_base, y_end)` window both fire on this route**: the handler block's prologue
+//! publishes (`jit_publish_y` — its `y(0)` read is its first `Y` access with no frame
+//! helper ahead of it, so `Allocation::prologue_publishes_y` is true), and the gated
+//! in-block refresh after the `try_case` family helper also re-derives it (`jit_refresh_y`,
+//! emitted because the block's `y(0)` read follows it); each re-derives the window from the
+//! *live* frame A, so either one alone keeps the read correct. Both are decided statically
+//! from the block's own shape, never from prior run-time state. A future change that makes
+//! a block prologue's window derivation depend on **prior state** (or on the position store
+//! / reduction charge that shares its prologue helper) must first close this hole: on this
+//! route nothing between the unwind and the handler's `Y` read observes the frame change,
+//! so with both derivations skipped the handler reads frame B's stale window (a raw stack
+//! word, 59) where the interpreter reads 11.
 //!
 //! The tiers must agree, and neither may deopt: the shape is fully lowered, so a
 //! `jit_step_one` here would hide the emitted window discipline behind the interpreter's own

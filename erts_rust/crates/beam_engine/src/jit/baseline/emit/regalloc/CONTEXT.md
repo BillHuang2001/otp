@@ -1,7 +1,7 @@
 # `emit/regalloc` — the register picker and the block's gate derivation
 
 ## Intent
-`regalloc.rs::allocate_registers_with_labels`: the live-interval x-register selection (≤5 cache slots) and the three gates derived from the same scans — the Y publish/refresh triple (`y_last`/`y_first`/`frame_republish_first` → `prologue_publishes_y`) and the per-`pc` dirty set (`spill_sets`).
+`regalloc.rs::allocate_registers_with_labels`: the live-interval x-register selection (≤5 cache slots) and the gates derived from the same scans — the Y triple (`y_last` → the prologue publish and the post-helper refresh; `y_first`/`frame_republish_first` the recorded window-helper geometry) and the per-`pc` dirty set (`spill_sets`).
 The selector is a greedy linear scan by descending interval length, tie-broken by ascending register index; physical assignment is by first-appearance order, so it is deterministic.
 Membership is **fixed for the whole block** — the correctness contract that keeps the two representations from disagreeing.
 
@@ -32,14 +32,16 @@ structural counters; they hold no production state.
 `allocate_registers_with_labels` also derives the block's Y-gate triple, all from the same `arith::uses_y` scan (the
 union of every lowering's per-shape Y test — including `bif::bif_uses_y` for the named-BIF accessors,
 whose `Value` route is never a Y-window access): `Allocation::y_last` (the highest pc whose instruction
-accesses a Y slot — the compile-time gate for the emitter's post-helper refresh), `Allocation::y_first`
+accesses a Y slot — the compile-time gate for the prologue publish and the emitter's post-helper refresh), `Allocation::y_first`
 (its twin, the lowest such pc) and `Allocation::frame_republish_first` (the lowest pc of an
-`allocate`/`allocate_heap`/`trim`, whose helper calls `JitRuntime::refresh_y_base` on the arm that
-continues the block in-block). `y_first` and `frame_republish_first` together answer
-`Allocation::prologue_publishes_y`, the prologue-publish gate: a block publishes **unless** every Y
-access lies at or after that helper, because then the helper's own re-publish overwrites the prologue's
-window before anything reads it (a block's control flow is linear — it is entered only at its own start,
-and every way out of the middle lands in another emitted range with its own prologue). A `Y` slot is
+`allocate`/`allocate_heap`/`trim`, whose helper re-publishes the Y window on the arm that
+continues the block in-block). `Allocation::prologue_publishes_y` reads that triple: a block that
+touches no `Y` slot publishes nothing, and one whose first `Y` access lies at or after
+`frame_republish_first` suppresses the prologue publish — the block is entered only at its own start, a
+resume parks on a **block entry** and re-executes the prefix, so the helper runs before the first `Y`
+access and leaves the window the live frame's. An allocation with no tables (a synthetic one) and a
+block reaching a `Y` access with no frame helper ahead of it both publish, so the only failure direction
+is a redundant publish. A `Y` slot is
 **not** an x-register, so it is neither a candidate nor charged to any live interval, and it never raises
 `highest_native_register`: a stack slot must not refuse native entry (the driver's bound is
 `machine.x.len() > bound`).
