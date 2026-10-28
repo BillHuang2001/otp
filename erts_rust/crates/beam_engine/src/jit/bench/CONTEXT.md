@@ -60,9 +60,10 @@ Thirteen workloads, split by how the baseline tier lowers them:
   `send_recv(0, Acc) -> Acc; send_recv(N, Acc) -> Self ! {Self, N}, receive {Self, T} ->
   send_recv(N - 1, Acc + T) end` — the same instruction sequence the installed `erlc` emits, with
   `self/0` replaced by a small-int constant in `Y(0)` (one `MinimalContext` process has no `self/0`
-  BIF). Per round, **eight** instructions deopt to `jit_step_one` (the `allocate_heap` frame push,
-  the `put_tuple2` message build, `send`, `loop_rec`, `remove_message`, the two `Y`-operand
-  `gc_bif`s and the `Y`-operand bound-variable `is_eq_exact`), while the rest of the body is
+  BIF). The round's frame admission is one in-block `jit_allocate_heap` helper call, not a
+  `jit_step_one` step; the interpreter-step sites are the `put_tuple2` message build, `send`,
+  `loop_rec`, `remove_message`, the two `Y`-operand `gc_bif`s and the `Y`-operand bound-variable
+  `is_eq_exact`, while the rest of the body is
   inlined (the entry clause `is_eq_exact`, the four `move`s, the `is_tuple`/`test_arity` header
   tests, the two `get_tuple_element`s, `swap`, `call_last`). The mailbox is `LoopbackMailbox`, a
   one-process FIFO whose `send_message` enqueues the message the very next `receive` scans, so the
