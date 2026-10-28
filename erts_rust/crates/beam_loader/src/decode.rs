@@ -51,6 +51,7 @@ use crate::error::bad_file;
 use crate::ir::{CodeVersion, TypeTable};
 use crate::opcode::Opcode;
 use crate::operand::{AllocKind, Label, Operand, Reg, TypeIndex};
+pub use crate::raw::RawOperands;
 
 /// The `u` (unsigned) operand tag: the low three bits of the tag byte.
 const TAG_U: u8 = 0;
@@ -237,7 +238,11 @@ pub struct RawInstr {
     /// The instruction's opcode.
     pub opcode: Opcode,
     /// The decoded operands, in the order the opcode declares them.
-    pub operands: Vec<Operand>,
+    ///
+    /// Held inline up to [`crate::raw::INLINE_OPERANDS`] operands (≈97.5 % of real
+    /// instructions) so decoding one allocates nothing; a wider instruction spills to
+    /// the heap. Read it as a slice — [`RawOperands`] derefs to `[Operand]`.
+    pub operands: RawOperands,
     /// The byte offset of the opcode in the `Code` instruction stream.
     pub offset: u32,
 }
@@ -323,7 +328,11 @@ pub fn decode_stream(
         // `Opcode::arity` (a linear scan of the roster) — see [`opcode_arity`]. The
         // `derived_arity_table_must_match_the_roster` unit test pins the two together.
         let arity = usize::from(opcode_arity(op_byte));
-        let mut operands = Vec::with_capacity(arity);
+        // Operands live inline in the instruction (see [`RawOperands`]): at most three
+        // of them, covering ≈97.5 % of real instructions, allocate nothing, and only a
+        // wider instruction spills to the heap. A per-instruction `Vec` here would cost
+        // one malloc/free pair for *every* decoded instruction.
+        let mut operands = RawOperands::default();
         for index in 0..arity {
             let operand = decode_operand(&mut r, atoms, types)?;
             // `LoadAssert((i + 1) == arity)` (`beam_file.c:2352`): a `z,1` argument list is
@@ -792,7 +801,10 @@ mod tests {
 
         assert_eq!(instrs.len(), 2);
         assert_eq!(instrs[0].opcode, Opcode::r#move);
-        assert_eq!(instrs[0].operands, vec![Operand::X(0), Operand::X(1)]);
+        assert_eq!(
+            instrs[0].operands.to_vec(),
+            vec![Operand::X(0), Operand::X(1)]
+        );
         assert_eq!(instrs[0].offset, 0);
         assert_eq!(instrs[1].opcode, Opcode::int_code_end);
         assert_eq!(instrs[1].offset, 3);
@@ -816,7 +828,7 @@ mod tests {
 
         assert_eq!(instrs[0].opcode, Opcode::gc_bif2);
         assert_eq!(
-            instrs[0].operands,
+            instrs[0].operands.to_vec(),
             vec![
                 Operand::Label(Label(0)),
                 Operand::Integer(2),
@@ -845,7 +857,7 @@ mod tests {
 
         assert_eq!(instrs[0].opcode, Opcode::is_eq_exact);
         assert_eq!(
-            instrs[0].operands,
+            instrs[0].operands.to_vec(),
             vec![Operand::Label(Label(7)), Operand::X(0), Operand::Atom(atom),]
         );
         assert_eq!(

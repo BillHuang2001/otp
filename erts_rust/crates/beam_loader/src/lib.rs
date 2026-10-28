@@ -74,6 +74,7 @@ pub mod load;
 pub mod lower;
 pub mod opcode;
 pub mod operand;
+pub mod raw;
 
 pub use crate::attributes::{AttributeTable, SharedAttributeTable};
 pub use crate::decoded::{DecodedTerm, SharedDecodedTerm};
@@ -86,6 +87,7 @@ pub use crate::literal::{LiteralArea, SharedLiteralArea};
 pub use crate::load::{load, load_file};
 pub use crate::opcode::*;
 pub use crate::operand::*;
+pub use crate::raw::{RawOperands, INLINE_OPERANDS};
 
 /// The conventional glob-import surface for downstream crates.
 ///

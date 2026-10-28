@@ -273,7 +273,7 @@ fn atom_at(atoms: &[Atom], index: u32) -> Result<Atom> {
 /// chunk), so the bound is enforced here, where the module's literal table is in hand.
 fn check_static_literals(instrs: &[RawInstr], literal_count: usize) -> Result<()> {
     for instr in instrs {
-        for operand in &instr.operands {
+        for operand in instr.operands.iter() {
             check_static_literal(operand, literal_count)?;
         }
     }
@@ -333,7 +333,7 @@ fn rewrite_wide_integers(
     let mut rewritten = Vec::with_capacity(instrs.len());
     for instr in instrs {
         let mut instr = instr.clone();
-        for operand in &mut instr.operands {
+        for operand in instr.operands.iter_mut() {
             rewrite_wide_integer(operand, &mut next, synthesized);
         }
         rewritten.push(instr);
@@ -511,11 +511,12 @@ mod tests {
     use beam_common::BeamError;
     use beam_term::prelude::atom_val;
 
-    /// One decoded instruction with the given opcode and operands.
+    /// One decoded instruction with the given opcode and operands (the operand
+    /// vector is adopted as [`RawOperands`], exactly as the decoder builds it).
     fn raw(opcode: Opcode, operands: Vec<Operand>) -> RawInstr {
         RawInstr {
             opcode,
-            operands,
+            operands: operands.into(),
             offset: 0,
         }
     }
@@ -1811,7 +1812,7 @@ mod tests {
             // The lambda body's entry label from the `FunT` entry.
             RawInstr {
                 opcode: Opcode::label,
-                operands: vec![Operand::Integer(i64::from(chunks.funs[0].label))],
+                operands: vec![Operand::Integer(i64::from(chunks.funs[0].label))].into(),
                 offset: 0,
             },
             raw(Opcode::r#return, vec![]),
@@ -1964,7 +1965,7 @@ mod tests {
         let rewritten = rewrite_wide_integers(&instrs, 4, &mut synthesized)
             .unwrap()
             .expect("a wide operand forces a rewrite");
-        assert_eq!(rewritten[0].operands, vec![Operand::Literal(4)]);
+        assert_eq!(rewritten[0].operands.to_vec(), vec![Operand::Literal(4)]);
         assert_eq!(
             synthesized,
             vec![vec![
@@ -2046,7 +2047,7 @@ mod tests {
             .unwrap()
             .expect("rewrite");
         assert_eq!(
-            rewritten[0].operands,
+            rewritten[0].operands.to_vec(),
             vec![Operand::list(vec![Operand::Integer(1), Operand::Literal(0)])]
         );
         // `SMALL_BIG_EXT`, a 9-byte magnitude, sign 1 (`negative`), all `FF`.

@@ -263,11 +263,12 @@ mod tests {
     use crate::operand::Operand;
     use beam_common::BeamError;
 
-    /// One decoded instruction with the given opcode and operands.
+    /// One decoded instruction with the given opcode and operands (the operand
+    /// vector is adopted as [`RawOperands`], exactly as the decoder builds it).
     fn raw(opcode: Opcode, operands: Vec<Operand>) -> RawInstr {
         RawInstr {
             opcode,
-            operands,
+            operands: operands.into(),
             offset: 0,
         }
     }
