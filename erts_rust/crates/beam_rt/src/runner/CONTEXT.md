@@ -114,6 +114,21 @@ The copy's `SourcePayloads` come from `Runtime::source_payloads` — the executi
 So a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared rather than tripping the valve, whether the process built it or received it; the recorded exit reason is derived from the stabilized error (`reason::exit_reason`: atom → the stabilized live term → interned `Display` text), so one copy serves both exit propagation and every later rendering.
 A reason that cannot be copied is the honest `error:system_limit`, never a stored dangling word; `Runtime::as_action_process` is the same boundary for the `-eval`/`-s`/`-run`/boot-directive routes.
 
+## The death-path reason — bare vs signalled (one death, two terms)
+`run`'s single `Err(error)` arm names two reason terms, and they are **not** the same term for every class.
+- The **bare** reason is `reason::exit_reason`'s: the raise's own reason untouched by its class (an atom, or the raise's already-stabilized live term, or plumbing's interned `Display` text).
+- The **signalled** reason is `reason::signalled_reason`'s: ERTS's *exit value*, built by `crate::report::exit_value` — the one definition of that shape.
+- An **`error`**-class raise signals `{Reason, Stacktrace}`; an uncaught **`throw`** signals `{{nocatch, Value}, Stacktrace}` (the C promotes a throw reaching the top of the stack, `beam_common.c:508-516`).
+- An **`exit`**-class raise signals the bare reason (`bye`, `normal`, `shutdown`, `kill`) — unchanged; `erlang:exit/2`-style kill paths never pass through this arm.
+- A **non-raise** [`BeamError`](beam_common::BeamError) (runtime plumbing) has no exception class and no stacktrace, so it signals its bare interned `Display` text — a deliberate asymmetry: the pair is a property of an *exception*, and an invented empty trace would fabricate a shape the oracle never produces.
+- A `max_heap_size` kill signals the bare `killed` atom: it is a termination, never an exception, so it has no exit value.
+- The bare reason is what the crash report is given (`report::report_crash`), and the report builds its own exit value on a private heap from it, so a report and a signal can never disagree.
+- The signalled reason is what `RunOutcome::Exit(reason)` carries — hence what `ProcessTable::terminate` copies into every linked peer's `{'EXIT', Pid, R}` and every monitor's `'DOWN'` — and what `RunnerState::exits` records.
+- The exit value is built on a private `beam_alloc::Heap` sized by `report::term_words(frames)` and copied onto the runtime-lifetime `-eval` store (`Runtime::stabilize_term`) **while that heap is still alive**; the heap is released on return and the process's own heap is never referenced.
+- A build/stabilize failure degrades to the bare reason through `reason::signalled_or_bare` and is surfaced through `crate::debug_trace` (never a lost death, never a fabricated shape) — the same rule `report::report_crash` documents for a report it cannot build.
+- `RunnerState::errors` keeps the structured `BeamError` unchanged, so the CLI's `unsupported`/`error` classification is unaffected by the signal's shape.
+- Oracle check: the six-mode `died:main/1` fixture (`error`/`throw`/`exit`/`normal`/`shutdown`/`kill`, a trapping parent's `receive {'EXIT', Pid, R}`) prints signal rows byte-identical to OTP 29.1.2's, and its `error`/`throw` rows equal this runtime's own report exit value.
+
 ## The slice boundary's off-heap refc-binary prune
 `run`'s `Yield` arm is the **one** site that prunes the machine's payload reservoir: `RuntimeRunner::reclaim_off_heap_binaries` → `context::gc::reclaim`, immediately after the boundary collection and before `take_max_heap_kill` on the same park.
 It is here because a prune is sound only against the process's **complete** root set, and the park is the one site holding `&mut Machine` (the runner just drove it), `&mut Process` (through the table) and `&mut Runtime` at once; an admission door runs *inside* a slice, where the engine is held out of `RunnerState::engines` and the `ExecutionContext` seam exposes no `&mut Machine` at all.
