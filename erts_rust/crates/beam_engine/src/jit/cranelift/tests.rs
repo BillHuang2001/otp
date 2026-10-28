@@ -148,6 +148,8 @@ fn the_compiled_function_runs_the_export_natively() {
     // own `(func, pc)` into before executing its instruction. Taken before the `machine`
     // borrow below, exactly as the driver does.
     let current_code = std::ptr::addr_of_mut!(machine.current_code);
+    let stack_store = std::ptr::addr_of_mut!(machine.stack);
+    let frames_store = std::ptr::addr_of_mut!(machine.frames);
     let machine_ptr: *mut Machine = &mut machine;
     let ctx_ptr = &mut ctx as *mut dyn ExecutionContext;
     let mut rt = JitRuntime {
@@ -176,6 +178,9 @@ fn the_compiled_function_runs_the_export_natively() {
         // No run-cached reduction hook (a hand-built runtime block); a charge would go
         // through `charge_reduce`'s `dyn` fallback.
         reduce_hook: None,
+        stack_store,
+        frames_store,
+        frame_template: crate::jit::baseline::runtime::frame_template(),
     };
 
     let word = code
@@ -705,6 +710,8 @@ fn a_native_entry_declares_the_register_write_extent() {
     // own `(func, pc)` into before executing its instruction. Taken before the `machine`
     // borrow below, exactly as the driver does.
     let current_code = std::ptr::addr_of_mut!(machine.current_code);
+    let stack_store = std::ptr::addr_of_mut!(machine.stack);
+    let frames_store = std::ptr::addr_of_mut!(machine.frames);
     let machine_ptr: *mut Machine = &mut machine;
     let ctx_ptr = &mut ctx as *mut dyn ExecutionContext;
     let mut rt = JitRuntime {
@@ -728,6 +735,9 @@ fn a_native_entry_declares_the_register_write_extent() {
         // No run-cached reduction hook (a hand-built runtime block); a charge would go
         // through `charge_reduce`'s `dyn` fallback.
         reduce_hook: None,
+        stack_store,
+        frames_store,
+        frame_template: crate::jit::baseline::runtime::frame_template(),
     };
 
     let word = code
