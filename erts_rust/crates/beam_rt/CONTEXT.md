@@ -155,6 +155,7 @@ The design rationale and binding invariants of the runtime glue — the mature-G
 * The copy-out grows the nursery before copying (`copy_out_hint` via `hint_grow_gate`) — GC *The BIF-result copy-out*.
 * `system_info/1` hands its value off the scratch region, so a retained value is sound (`tests/system_info_retained.rs`) — GC *The scratch-heap lifetime and the dangling-boxed-argument class*.
 * Two other load-sensitive failure shapes exist — both real exit codes, neither a signal — G *Scheduler / runner* / *A.7/A.9 boot*.
+* Two suites pin the **host oracle's patch version**, so they fail on any OTP whose patch differs even though the Rust side matches the frozen value — `src/native/application.rs:1264-1305` pins stdlib `8.1` (a `stdlib-8.1.1` host answers `8.1.1`) and `tests/system_info_retained.rs:110` compares the retained `system_info(version)` against the oracle (golden `A="17.1"`, a `erts-17.1.1` host answers `17.1.1`, so the golden assertion at `:101` passes and only the oracle assertion fails).
 ## Notes for Agents
 * **Read `../CONTEXT.md` and the two `../../ERTS_RUST_REWRITE_*.md` design docs before changing the glue**; this crate is where the Stage-1 engine meets the Stage-5 core.
 * **Run the crate gate** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt` (a bare `cargo` from the repo root fails; the sandbox `$HOME` is read-only, hence the wrapper) and the compatibility gate `erts_rust/tools/differential/gate.sh` — [`TEST_STRATEGY.md`](TEST_STRATEGY.md) holds the commands and the gate-equivalent sweep.
