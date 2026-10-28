@@ -103,17 +103,66 @@ fn decode_small_chain(term: Eterm) -> Option<Vec<i64>> {
     Some(out)
 }
 
-/// The oracle's `~w` rendering of an expression, or `None` when no `erl` is on `PATH`
-/// (the caller skips loudly — a green run without the oracle proves no parity).
+/// The oracle's `~w` rendering of an expression, or `None` when the oracle cannot
+/// answer — no `erl` on `PATH`, a non-zero exit, or no answer within
+/// [`ORACLE_TIMEOUT`]. The caller skips loudly: a green run without the oracle proves
+/// no parity, and an oracle row must never block the suite.
+///
+/// `halt(0)` is part of the evaluation, not an afterthought: `erl -noshell -eval` runs
+/// the expression and then **keeps running**, so a `Command::output()` on that shape
+/// waits forever. The bounded wait below is the second line of defence (a loaded host
+/// can make even a halting `erl` miss a generous deadline); the child is killed on
+/// expiry and the row reports the skip instead of hanging.
 fn erl_w(eval: &str) -> Option<String> {
-    let output = std::process::Command::new("erl")
-        .args(["-noshell", "-env", "ERL_CRASH_DUMP", "/dev/null", "-eval", eval])
-        .output()
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    const ORACLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    let mut child = Command::new("erl")
+        .args([
+            "-noshell",
+            "-env",
+            "ERL_CRASH_DUMP",
+            "/dev/null",
+            "-eval",
+            &format!("{eval}, halt(0)"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut out = String::new();
+                child.stdout.take()?.read_to_string(&mut out).ok()?;
+                return Some(out.trim().to_string());
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "skipping the erl row: no answer within {ORACLE_TIMEOUT:?} for `{eval}`"
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// **The arm lowers `put_list` and the variant records no static deopt.**
