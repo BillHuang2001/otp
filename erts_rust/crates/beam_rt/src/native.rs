@@ -47,14 +47,23 @@
 //! | `erl_distribution:start_link/0,1` | the Erlang-level distribution **supervisor** `kernel_sup` starts as its `net_sup` child: answered `ignore` because this runtime's distribution is the native [`beam_dist`](crate::dist)/`DistNode`, not the `inet_tcp`/`prim_inet` stack that supervisor would run (contract A.5, `src/native/net/`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:get_object_code/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) — and, for `get_object_code/1`, its `.beam` bytes |
-//! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
+//! | *(none — the `application` namespace is entirely `lib/kernel/src/application.erl` bodies)* | every `application:*` key is a one-line delegation to the **live** `application_controller` the boot script starts (directive 14, `src/boot/drive.rs`), which answers from its `ac_tab`; the floor owns no key, so the whole namespace is entered in-machine |
 //! | `prim_file:get_cwd/0,1`, `prim_file:read_file/1`, `prim_file:open/2`, `prim_file:read/2`, `prim_file:write/2`, `prim_file:close/1`, `prim_file:position/2` | the file-system **primitives** `file.erl` delegates to: they are the host's own `getcwd`/`open`/`read`/`write`/`close`/`lseek` (`std::env`/`std::fs`), which only the host can perform |
 //!
-//! The `init`/`code`/`application` calls are **preloaded-module surface** (contract
-//! A.7): the oracle serves them from `init.beam`/`code.beam`/`application.beam`, but
+//! `application` is deliberately **absent** from that table: its whole namespace is
+//! `lib/kernel/src/application.erl` bodies, and every one of them is a one-line delegation
+//! to the **live** `application_controller` the boot script starts (directive 14,
+//! `../boot/drive.rs`). That server holds the `ac_tab` the whole `application:*` query
+//! surface reads — the ten `ac_tab`-backed keys (`get_env/1,2,3`, `get_all_env/1`,
+//! `get_key/1,2`, `get_all_key/1`, `get_application/0,1`, `loaded_applications/0`) and
+//! `which_applications/0`, whose `#state.running` list `start_application` really
+//! populates on this boot path — so the floor owns **no** key of the namespace and every
+//! call is entered in-machine (see [`floor_keys`]).
+//!
+//! The `init`/`code` calls are **preloaded-module surface** (contract
+//! A.7): the oracle serves them from `init.beam`/`code.beam`, but
 //! those modules are written against the process/message machinery Milestone-1 does not
-//! run (for `application`, that is the `application_controller`/`application_master`
-//! process pair plus a group leader), so this runtime answers them directly from its own
+//! run, so this runtime answers them directly from its own
 //! state instead of loading a module it cannot execute. `os:cmd/1` is the same story for
 //! the spawn **driver** (contract A.4): the port machinery is a later stage, but the host
 //! is perfectly able to spawn a shell.
@@ -89,14 +98,13 @@
 //!
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
 //! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
-//! `erlang:*` process/registry/reference entries in [`process`], the `application:*`
-//! entries in [`application`], the `prim_file:*` primitives in [`prim`], the `erl_ddll:*`
+//! `erlang:*` process/registry/reference entries in [`process`], the
+//! `prim_file:*` primitives in [`prim`], the `erl_ddll:*`
 //! loaded-driver-list entries in [`ddll`], the distribution **identity** in [`node`] and the
 //! distribution **node set + connector** (`erlang:nodes/0,1,2`, `net_adm:ping/1`,
 //! `net_kernel:connect_node/1`, `erl_distribution:start_link/0,1`) in [`net`]. The submodules
 //! reach the shared helpers through `super` (they are `pub(super)`).
 
-mod application;
 mod code;
 mod ddll;
 mod erts_internal;
@@ -131,7 +139,7 @@ use crate::error;
 /// The module namespaces [`RuntimeContext::try_native`] serves — the floor's own dispatch.
 ///
 /// Every one of them is a module the code server can *also* load as a `.beam` (`erlang`,
-/// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`, `erl_ddll`,
+/// `io`, `init`, `os`, `code`, `erts_internal`, `prim_file`, `erl_ddll`,
 /// `net_adm`, `net_kernel`, `erl_distribution`), so the cross-module-call seam
 /// ([`RuntimeContext::resolve_external_call`]) must answer `Ok(None)` for all of them:
 /// entering the module body would run it *instead of* the host implementation. The list is
@@ -143,8 +151,10 @@ use crate::error;
 /// namespace is refused or only [`floor_keys`]' enumerated keys is decided there. The
 /// `erl_distribution` entry is key-granular (the floor serves exactly `start_link/0,1`), so
 /// the rest of the module stays enterable — see [`floor_keys`].
-pub(crate) const FLOOR_MODULES: [&str; 14] = [
-    "application",
+///
+/// `application` is **not** a member: the floor serves no key of that namespace (the live
+/// `application_controller` owns all of them), so the whole module is entered in-machine.
+pub(crate) const FLOOR_MODULES: [&str; 13] = [
     "code",
     "erl_ddll",
     "erl_distribution",
@@ -214,6 +224,11 @@ pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
 /// `None` for a namespace [`try_native`] serves through a **wildcard** arm
 /// (`erts_internal`, `prim_file`, `erl_ddll`) or for one whose arms are too numerous to
 /// mirror here (`erlang`); those keep the module-wide exclusion.
+///
+/// A namespace the floor has withdrawn from **entirely** has no arm at all: it is not in
+/// [`FLOOR_MODULES`] (so every key of it is enterable) and not in this list either.
+/// `application` is the one such namespace — its `.app`-resource view was withdrawn in
+/// favour of the live `application_controller`, which owns every one of its keys.
 fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
     match module {
         // The `io` **device** surface: `put_chars/1,2` plus the `io.erl` request wrappers
@@ -248,22 +263,6 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
         // refused (→ `call_bif` → `try_native`) while the module's Erlang wrappers are
         // ordinary `.beam` bodies.
         "prim_tty" => Some(&prim_tty::NIF_KEYS),
-        // `application` is partly `lib/kernel/src/application.erl` bodies (`set_env/3,4`,
-        // `load/1`, `start_boot/2`, `unset_env/2,3`, …), each a thin wrapper that delegates
-        // to `application_controller` — the mirror of the `io` case.
-        "application" => Some(&[
-            ("get_env", 1),
-            ("get_env", 2),
-            ("get_env", 3),
-            ("get_all_env", 1),
-            ("get_key", 1),
-            ("get_key", 2),
-            ("get_application", 0),
-            ("get_application", 1),
-            ("get_all_key", 1),
-            ("loaded_applications", 0),
-            ("which_applications", 0),
-        ]),
         // `code` is the same shape: the floor answers the *queries* below **and** the
         // path-mutating entries (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`,
         // `del_path/1`). Entering the `lib/kernel/src/code.erl` bodies instead would reach the
@@ -474,23 +473,13 @@ impl RuntimeContext<'_> {
             ("code", "add_pathz", 1 | 2) => Some(self.code_add_pathz(args)),
             ("code", "add_path", 1 | 2) => Some(self.code_add_pathz(args)),
             ("code", "del_path", 1) => Some(self.code_del_path(args)),
-            ("application", "get_env", 1) => Some(self.application_get_env_1()),
-            ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
-            ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
-            ("application", "get_all_env", 1) => Some(self.application_get_all_env_1(args)),
-            ("application", "get_key", 2) => Some(self.application_get_key_2(args)),
-            ("application", "get_application", 0) => Some(self.application_get_application_0()),
-            ("application", "get_application", 1) => {
-                Some(self.application_get_application_1(args))
-            }
-            ("application", "get_all_key", 1) => Some(self.application_get_all_key_1(args)),
-            ("application", "get_key", 1) => Some(self.application_get_key_1(args)),
-            ("application", "loaded_applications", 0) => {
-                Some(self.application_loaded_applications())
-            }
-            ("application", "which_applications", 0) => {
-                Some(self.application_which_applications())
-            }
+            // `application` has **no** arm here: every key of the namespace is a
+            // `lib/kernel/src/application.erl` one-line delegation to the live
+            // `application_controller` (see [`FLOOR_MODULES`]), which answers from the `ac_tab`
+            // it really populates. An `.app`-resource floor over the same keys shadowed that
+            // server: `application:set_env/4` (never floored) wrote `ac_tab` while
+            // `application:get_env/2` read the resource file, so a value written by the
+            // running node was invisible to the very next read.
             ("erlang", "make_ref", 0) => Some(self.make_ref_0()),
             ("erlang", "send_after", 3) => Some(self.send_after_3(args)),
             ("erlang", "cancel_timer", 1) => Some(self.cancel_timer_1(args)),
@@ -1338,8 +1327,11 @@ mod tests {
     /// A namespace belongs here only when the floor really owns an enumerated key set; a new
     /// `try_native` arm for one of them must be reflected in [`floor_keys`], which the drift
     /// guard above pins key by key.
-    const KEY_GRANULAR_NAMESPACES: [&str; 6] = [
-        "application",
+    ///
+    /// A namespace the floor owns **no** key of is in neither this table nor
+    /// [`MODULE_WIDE_NAMESPACES`] and is not a [`FLOOR_MODULES`] member: `application` (the live
+    /// `application_controller` owns every key, so the whole module is entered in-machine).
+    const KEY_GRANULAR_NAMESPACES: [&str; 5] = [
         "code",
         "erl_distribution",
         "init",
