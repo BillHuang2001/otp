@@ -23,7 +23,7 @@ Inlined groups, by arm:
 - **`CallExt`**/**`CallExtOnly`**/**`CallExtLast`** via `emit_ext_call` — natively executed, with the module transfer a driver round-trip by design.
 - **The receive family** `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage` (`receive.rs::jit_receive`), and **the whole family-owned surface** — `put_list`/`put_tuple2`, the native-record set, `make_fun3`/`call_fun`/`call_fun2`/`apply`/`apply_last`, the try/catch/raise set, floats, maps, `recv_marker_*` — via `family.rs::jit_family`.
 - **The bitstring family** (`crate::families::bitstrings::claimed`) via `bitstr.rs::jit_bitstr`; **sixteen** of its shapes are lowered in-block instead (below).
-- **The frame-discipline trio** `Deallocate`/`Return`/`DeallocateReturn` and **the heap / frame-admission four** `allocate`/`allocate_heap`/`test_heap`/`trim`.
+- **The frame-discipline trio** `Deallocate`/`Return`/`DeallocateReturn` and **the heap / frame-admission four** `allocate`/`allocate_heap`/`test_heap`/`trim` — each one positioned helper call, `allocate` included: a frame-changing instruction emits no frame push, because the `Y` window must stay re-derivable from `Machine` state at every enterable address (below).
 - **Everything else is the `_` arm.** `FuncInfo` is deliberately there: it is the failed-head-clause `error:function_clause` raise, not a metadata no-op, so it must deopt.
 
 Three roster rules:
