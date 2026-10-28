@@ -45,12 +45,9 @@
 //!   residual: the call kept the pre-existing round-trip).
 //! * **Position / publish calls** — [`record_publish_y`] /
 //!   [`record_refresh_y`] from the two Y-window prologue helpers at **run** time, plus
-//!   [`record_set_position`] from the **emitter** at **compile** time (a position store is
-//!   three generated instructions, 24 B, with no helper call and hence no run-time body
-//!   that could count it): one per emitted block prologue, which emits the store
-//!   **unconditionally** — publishing block or not, because the Y-window publish is a
-//!   separate six-instruction, 35 B sequence emitted before the frame pushes — plus one per
-//!   emitted `Bs*` arm.
+//!   [`record_set_position`] from the **emitter** at **compile** time (a plain position
+//!   store is three generated instructions and has no runtime site left to count): one per
+//!   Y-free block prologue and one per emitted `Bs*` arm.
 //! * **`Y`-window traffic** — [`record_y_access`] (every emitted guarded `Y`-slot read
 //!   or write, with its emitted byte length) and [`record_y_invalidation`] (every
 //!   in-block helper call after which a later instruction of the same block still
@@ -199,17 +196,16 @@ pub(crate) struct Counters {
     /// of [`in_block_calls`](Counters::in_block_calls).
     pub(crate) in_block_call_declines: u64,
     /// Emitted **inline** position stores
-    /// ([`emit_position_store`](super::emit::emit_position_store)): the count of the sites
-    /// that carry one, taken at the emission site.
+    /// ([`emit_position_store`](super::emit::emit_position_store)) — the static twin of
+    /// what used to be the `jit_set_position` **runtime** count.
     ///
-    /// The store is three generated instructions (24 B) writing `Machine::current_code`
-    /// through [`JitRuntime::current_code`](super::runtime::JitRuntime), with no helper
-    /// call, so no run-time body exists whose executions could be counted; the emission
-    /// site is the only place that knows how many sites carry one, so this counts
-    /// **emitted sites**: one per block prologue — every prologue emits the store,
-    /// publishing or not, since the Y-window publish is a separate six-instruction, 35 B
-    /// sequence emitted before the frame pushes — plus one per emitted `Bs*` arm (the
-    /// bitstring arm stores its instruction's own pc), exactly as
+    /// The store is three generated instructions writing `Machine::current_code`
+    /// through [`JitRuntime::current_code`](super::runtime::JitRuntime), so there is no
+    /// helper left whose body could count the executions (the runtime figure is now
+    /// structurally zero — nothing calls a position-store helper); the emission site is
+    /// the only place that knows how many sites carry one, so this counts **emitted
+    /// sites**: one per Y-free block prologue, plus one per emitted `Bs*` arm (the
+    /// bitstring helper's own store moved into the arm), exactly as
     /// [`y_prologue_publishes`](Counters::y_prologue_publishes) counts emitted publishes
     /// beside the runtime [`publish_y`](Counters::publish_y).
     pub(crate) set_position: u64,
@@ -218,19 +214,6 @@ pub(crate) struct Counters {
     pub(crate) publish_y: u64,
     /// `jit_refresh_y` calls (the gated in-block Y-window re-publish).
     pub(crate) refresh_y: u64,
-    /// [`EntryTables::post_publish_entry`] probes — a transfer that asked for a block's
-    /// **post-publish alternate** entry because it had just republished the target frame's
-    /// Y window itself. Only [`jit_deallocate_return`] sets the preference, so this counts
-    /// the `deallocate_return` transfers that reached a same-function continuation.
-    ///
-    /// [`EntryTables::post_publish_entry`]: super::runtime::EntryTables::post_publish_entry
-    /// [`jit_deallocate_return`]: super::runtime::jit_deallocate_return
-    pub(crate) post_publish_requests: u64,
-    /// Of those probes, the ones that **found** an alternate entry, i.e. the transfers that
-    /// entered past the target's own `jit_publish_y` instead of repeating it. A probe with
-    /// no alternate falls back to the folded entry and merely republishes an identical
-    /// window, so `post_publish_requests - post_publish_entries` is that (harmless) residual.
-    pub(crate) post_publish_entries: u64,
     /// Emitted **guarded Y-slot reads** ([`super::emit::emit_guarded_y_load`]): one
     /// frame-window guard plus one load, per inlined `Y` source.
     pub(crate) y_loads: u64,
@@ -497,18 +480,6 @@ pub(crate) fn record_publish_y() {
 /// A `jit_refresh_y` call (the gated in-block Y-window refresh).
 pub(crate) fn record_refresh_y() {
     with(|c| c.refresh_y += 1);
-}
-/// One [`EntryTables::post_publish_entry`] probe, recording whether it found an alternate
-/// entry: `taken` is that answer.
-///
-/// [`EntryTables::post_publish_entry`]: super::runtime::EntryTables::post_publish_entry
-pub(crate) fn record_post_publish_probe(taken: bool) {
-    with(|c| {
-        c.post_publish_requests += 1;
-        if taken {
-            c.post_publish_entries += 1;
-        }
-    });
 }
 
 /// One emitted guarded Y-slot access: `load` distinguishes a read

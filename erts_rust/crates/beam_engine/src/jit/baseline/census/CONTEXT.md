@@ -19,12 +19,7 @@ This node owns the census *record*; the instruments' code lives in the files the
     `"Test(IsTuple)"`, …) in `deopts_by_variant`, so which `test` shapes still deopt is readable per
     predicate;
   - the driver round-trips;
-  - the prologue position/publish calls (`record_set_position` a **compile-time** count of emitted
-    inline position stores, `record_publish_y`/`record_refresh_y` the two Y-window helpers at run
-    time);
-  - the **post-publish alternate probe** (`record_post_publish_probe(taken)` filling
-    `post_publish_requests`/`post_publish_entries`: how many transfers asked for a block's
-    post-publish alternate entry and how many found one);
+  - the prologue position/publish calls;
   - the **register-cache traffic** (`record_spill`/`record_fill`/`record_block`: per-block
     IR/byte/cache/write-set sizes plus spill/fill stores by site), where one recorded run yields all
     **three** spill **store** models (the **dirty** set `spill` emits via `spill_slots_at(pc)`, the

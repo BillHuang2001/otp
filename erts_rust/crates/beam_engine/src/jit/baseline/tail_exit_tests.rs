@@ -44,10 +44,7 @@
 //! * a `deallocate` that does **not** match the live frame, which must keep the
 //!   interpreter's exact typed frame error;
 //! * an **undefined** label, the negative control that must still deopt and keep the
-//!   interpreter's exact `unknown_label` error;
-//! * the pop **guard**, whose answer space is exactly the successor word or the negative
-//!   `ERROR` — the invariant that makes the linked exit's sign test sound and the
-//!   unlinked exit's absent guard correct.
+//!   interpreter's exact `unknown_label` error.
 //!
 //! The last test is the structural pin: emitting one function that contains the call
 //! records the instruction as an *instance* and records **no** deopt for it — statically
@@ -152,49 +149,6 @@ fn tail_call_with(name: &str, callee: Vec<Instr>, deallocate: u32, target: Label
     (module, name)
 }
 
-/// A **single-function** module whose `f/0` tail-calls a later block of its own body
-/// (`call_last` → `Label(3)`, a compiled block's entry), i.e. the **linked** route
-/// ([`Linker::emit_tail_exit`](super::emit::link)).
-///
-/// The first block writes `7` and pops a zero-slot frame; the successor overwrites
-/// `x(0)` with `42`, so a transfer to the wrong address or a lost pop changes the value.
-fn self_tail_call_module(name: &str) -> (Module, Atom) {
-    let module = build_module(
-        name,
-        &[],
-        vec![(
-            "f",
-            0u32,
-            vec![
-                Instr::Label(Label(1)),
-                Instr::Label(Label(2)),
-                Instr::Allocate {
-                    stack_need: HeapNeed::Words(0),
-                    live: 0,
-                },
-                Instr::Move {
-                    src: Operand::Integer(7),
-                    dst: Operand::X(0),
-                },
-                Instr::CallLast {
-                    arity: 0,
-                    target: Label(3),
-                    deallocate: 0,
-                },
-                Instr::Label(Label(3)),
-                Instr::Move {
-                    src: Operand::Integer(42),
-                    dst: Operand::X(0),
-                },
-                Instr::Return,
-            ],
-        )],
-        &[("f", 0, Label(2))],
-    );
-    let name = export_atom(&module, "f");
-    (module, name)
-}
-
 // ---------------------------------------------------------------------------
 // value identity across the unlinked tail exit
 // ---------------------------------------------------------------------------
@@ -254,7 +208,39 @@ fn a_tail_call_to_an_earlier_function_agrees_with_the_interpreter() {
 /// compilation emits the direct jump — must keep working.
 #[test]
 fn a_self_tail_call_agrees_with_the_interpreter() {
-    let (module, name) = self_tail_call_module("tail_exit_self");
+    let module = build_module(
+        "tail_exit_self",
+        &[],
+        vec![(
+            "f",
+            0u32,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Allocate {
+                    stack_need: HeapNeed::Words(0),
+                    live: 0,
+                },
+                Instr::Move {
+                    src: Operand::Integer(7),
+                    dst: Operand::X(0),
+                },
+                Instr::CallLast {
+                    arity: 0,
+                    target: Label(3),
+                    deallocate: 0,
+                },
+                Instr::Label(Label(3)),
+                Instr::Move {
+                    src: Operand::Integer(42),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let name = export_atom(&module, "f");
     with_both_tiers(&module, name, |interpreter, baseline| {
         assert_same_outcome(
             "call_last/self",
@@ -551,34 +537,27 @@ fn probed_tail_call_module(name: &str, tail: Instr) -> (Module, Atom) {
     (module, name)
 }
 
-/// **The pin for the probed local tail call's two spill sites.** The seam probe is now an
-/// inline reject-only verdict gate in front of the `jit_local_call` helper, so the shape has
-/// two exiting paths and each owns its own spill:
+/// **The pin for the redundant exit spill.** A probed local tail call emits the seam probe's
+/// helper call — whose `SpillSite::Helper` spill at the instruction's own `pc` is the tier's
+/// mandatory root-set contract — and then the block exit. Both used to store the same dirty
+/// cached x-registers at the same `pc`; the exit now passes
+/// [`ExitSpill::Done`](super::emit::link) and stores nothing.
 ///
-/// * the **helper** path (a `Served`/`Unknown` verdict, an armed invalidation, an absent
-///   table) spills at `SpillSite::Helper` before the call — mandatory, because the helper is
-///   the interpreter and reads `machine.x`;
-/// * the **accepted** path (a `Declined`/`Unnameable` verdict) writes nothing before the
-///   block's static exit, so the exit itself must spill — the gate never touched
-///   `machine.x`, and a cached register that is not stored here would be invisible to the
-///   callee it is about to enter.
+/// The three assertions that matter, per shape:
 ///
-/// Both sites therefore record exactly one spill call storing the block's one dirty
-/// register, per shape. The assertions that matter:
-///
-/// * exactly one `Helper` spill call, storing the block's one dirty register (so the store
-///   is real, not vacuous);
-/// * exactly one `Exit` spill call with the same store count — the exit is reached by the
-///   accepted path, which has not spilled anything;
+/// * the probe's helper spill is still there — **exactly one** `Helper` spill call, storing
+///   the block's one dirty register (so the surviving store is real, not vacuous);
+/// * the exit records **zero** spill calls and zero stores at `SpillSite::Exit` (the
+///   redundant sequence is gone);
 /// * the instruction was lowered rather than deopted (`instr_instances`, no static deopt) —
 ///   so the pin cannot pass because the arm never ran.
 ///
-/// The `Required`-vs-`Done` length relation on all three exits is pinned in
-/// [`super::emit::link`]'s `a_done_exit_emits_exactly_the_spill_it_skips_less`; this test
-/// prints the shape's own emitted size, and the per-site store counts are its byte-level
-/// evidence (a store *is* one `mov`).
+/// The exact byte saving is pinned in [`super::emit::link`]'s
+/// `a_done_exit_emits_exactly_the_spill_it_skips_less` (the `Required`-vs-`Done` length
+/// equality on all three exits); this test prints the shape's own emitted size, and the
+/// per-site store counts are its byte-level evidence (a store *is* one `mov`).
 #[test]
-fn the_probed_local_call_spills_once_per_path() {
+fn the_probed_local_call_records_one_spill_call_and_none_at_the_exit() {
     for (variant, what, tail) in [
         (
             "CallOnly",
@@ -652,17 +631,16 @@ fn the_probed_local_call_spills_once_per_path() {
             emitted.spill_stores_by_site,
         );
 
-        // … and the exit owns its own spill, because the gate's accepted path stored nothing.
+        // … and the exit no longer stores the very same words a second time.
         assert_eq!(
             emitted
                 .spill_calls_by_site
                 .get(&SpillSite::Exit)
                 .copied()
                 .unwrap_or(0),
-            1,
-            "{what}: the exit must spill — the accepted gate path leaves `machine.x` untouched, \
-             so the block's dirty set is still only in its cache registers; spill calls by \
-             site: {:?}",
+            0,
+            "{what}: the exit must emit no second spill — the probe already stored this pc's \
+             dirty set; spill calls by site: {:?}",
             emitted.spill_calls_by_site,
         );
         assert_eq!(
@@ -671,9 +649,8 @@ fn the_probed_local_call_spills_once_per_path() {
                 .get(&SpillSite::Exit)
                 .copied()
                 .unwrap_or(0),
-            1,
-            "{what}: … and store the block's one dirty register at the exit site; spill stores \
-             by site: {:?}",
+            0,
+            "{what}: … and store no register at the exit site; spill stores by site: {:?}",
             emitted.spill_stores_by_site,
         );
 
@@ -685,206 +662,6 @@ fn the_probed_local_call_spills_once_per_path() {
             emitted.block_emitted_bytes,
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// the slimmed pop guard: the same transfer, the same declined word
-// ---------------------------------------------------------------------------
-
-/// The **pop guard** of a local tail call is a representation change, never a semantic
-/// one, and this pins all three of its obligations as invariants (no byte count):
-///
-/// 1. **the helper's answer space is exactly two words** — called directly,
-///    [`jit_tail_call`](super::runtime::jit_tail_call) answers the very `target` word it
-///    was handed when the checked pop succeeds, and the negative
-///    [`ERROR`](super::runtime::ERROR) sentinel (with the typed error in `rt.error`) when
-///    it fails. For a non-negative `word` that makes "answer `!=` word" and "answer is
-///    negative" the *same* predicate, which is what the linked exit's emitted
-///    `test rax, rax` / `js <done>` guard tests — and why
-///    [`Linker::emit_tail_exit_to_driver`](super::emit::link) needs no guard at all
-///    (both answers leave for the same epilogue with `rax` untouched);
-/// 2. **the same transfer** — the *linked* route still reaches the successor block's
-///    value on both tiers, and the run-time counter view shows the pop + transfer stayed
-///    native (no `CallLast` interpreter step) after the guard was narrowed;
-/// 3. **the same declined word** — a `deallocate` that does not match the live frame
-///    still reaches the driver as that `ERROR` sentinel, decoded into the interpreter's
-///    own typed frame error, never a substituted value.
-#[test]
-fn the_slimmed_tail_exits_transfer_the_same_program_and_report_the_same_declined_word() {
-    // ---- (1) the helper's answer space is exactly two words -------------------
-    //
-    // `jit_tail_call` is the whole of the frame discipline a compiled block cannot do
-    // itself (`Machine::pop_frame_checked`, the call the interpreter's `call_last` arm
-    // makes), and its body has exactly one arm per answer: the `target` it was handed,
-    // or `ERROR`. `pop_frame_checked` restores the frame verbatim on a size mismatch, so
-    // a failure leaves the machine untouched as well as reporting a word.
-    let module = Module::default();
-    let labels = LabelMap::new();
-    let mut machine = Machine::new();
-    let mut ctx = MinimalContext::new();
-    let current_code = std::ptr::addr_of_mut!(machine.current_code);
-    let mut rt = JitRuntime {
-        machine: &mut machine,
-        x_regs: machine.x.as_mut_ptr(),
-        module: &module,
-        entry_module: &module,
-        labels: &labels,
-        ctx: &mut ctx,
-        error: None,
-        enter: None,
-        suspend: None,
-        y_base: std::ptr::null_mut(),
-        y_end: std::ptr::null_mut(),
-        literals_base: std::ptr::null(),
-        literals_end: std::ptr::null(),
-        resume_entry: std::ptr::null(),
-        tables: super::runtime::EntryTables::NONE,
-        compiled: std::ptr::null(),
-        current_code,
-        reduce_hook: None,
-        verdict_slots: std::ptr::null(),
-        verdict_slots_end: std::ptr::null(),
-        verdict_pending: std::ptr::null(),
-    };
-
-    // (a) a frame the `deallocate` operand matches: the pop succeeds, so the answer is
-    // the very word the block passed in — non-negative, and a valid continuation
-    // (`decode_target` round-trips it), which is the invariant the guard rests on.
-    let target = super::runtime::encode_target(3, 9);
-    assert!(
-        target >= 0 && super::runtime::decode_target(target) == Some((3, 9)),
-        "the fixture's target word must be a non-negative, decodable continuation"
-    );
-    let depth = machine.frames.len();
-    machine
-        .push_frame(2)
-        .expect("a bare machine accepts a frame");
-    let answered = super::runtime::jit_tail_call(&mut rt, target, 2);
-    assert_eq!(
-        answered, target,
-        "a successful checked pop hands back the successor word it was given"
-    );
-    assert!(
-        rt.error.is_none(),
-        "a successful pop stores no error, got {:?}",
-        rt.error
-    );
-    assert_eq!(
-        machine.frames.len(),
-        depth,
-        "the successful pop consumes exactly the frame it checked"
-    );
-
-    // (b) a frame whose size the `deallocate` operand does not match: the checked pop
-    // restores the frame and answers the negative sentinel, with the typed error in the
-    // runtime. So for `word >= 0`, "answer != word" and "answer is negative" are the
-    // same predicate — which is exactly what the emitted `test rax, rax; js <done>`
-    // guard tests, and what licenses the unlinked exit's unconditional fall-through to
-    // the epilogue (its `rax` is either the successor word or this `ERROR`, and the
-    // driver decodes both the same way it always did).
-    let depth = machine.frames.len();
-    machine
-        .push_frame(2)
-        .expect("a bare machine accepts a second frame");
-    let declined = super::runtime::jit_tail_call(&mut rt, target, 5);
-    assert_eq!(
-        declined,
-        super::runtime::ERROR,
-        "a failed checked pop must answer the `ERROR` sentinel, not a value"
-    );
-    assert!(
-        declined < 0,
-        "the declined answer must be negative (the only non-transfer answer)"
-    );
-    assert!(
-        rt.error.is_some(),
-        "a failed pop must store its typed error for the driver"
-    );
-    assert_eq!(
-        machine.frames.len(),
-        depth + 1,
-        "the failed pop must leave the machine's frame stack untouched (the frame it could \
-         not check is still there)"
-    );
-    println!("=== jit_tail_call answer space === target={target} declined={declined}");
-
-    // ---- (2) the same transfer on the LINKED route ----------------------------
-    //
-    // `emit_tail_exit` is the arm the narrowed guard sits in: the pop still happens in
-    // the block, and a successful pop still jumps straight into the successor's compiled
-    // entry, so the successor's value is the run's result.
-    let (module, name) = self_tail_call_module("tail_exit_slimmed_link");
-    with_both_tiers(&module, name, |interpreter, baseline| {
-        assert_same_outcome(
-            "call_last/slimmed-linked",
-            interpreter,
-            baseline,
-            &module.atom_table,
-        );
-        assert_eq!(
-            (
-                returned("interpreter", interpreter),
-                returned("baseline", baseline)
-            ),
-            (make_small(42), make_small(42)),
-            "the guarded linked tail exit must still reach the successor block"
-        );
-    });
-
-    // … and through the **runtime** path (the lazy per-function artifact + the driver),
-    // where the counter view proves the pop + transfer never fell back to an interpreter
-    // step: the guard changed the bytes, not the route. `clear_baseline_cache` first, so
-    // the emission figures are this run's and not a warmed cache's zeros.
-    crate::jit::cache::clear_baseline_cache();
-    counters::reset();
-    counters::set_enabled(true);
-    let mut machine = Machine::new();
-    let mut ctx = MinimalContext::new();
-    let outcome = machine.run_export_outcome_with_tier(
-        &module,
-        name,
-        0,
-        &[],
-        &mut ctx,
-        Tier::BaselineJit,
-    );
-    counters::set_enabled(false);
-    let run = counters::snapshot();
-    assert_eq!(
-        returned("baseline", &outcome),
-        make_small(42),
-        "the run-time path must reach the successor block's value"
-    );
-    assert_eq!(
-        run.deopts_by_variant.get("CallLast").copied().unwrap_or(0),
-        0,
-        "the guarded tail exit must stay native; run-time deopts by opcode: {:?}",
-        run.deopts_by_variant,
-    );
-    assert!(
-        run.block_emitted_bytes > 0,
-        "the run's blocks must emit native bytes (so the zero deopt count is not vacuous)"
-    );
-
-    // ---- (3) the same declined word ------------------------------------------
-    //
-    // The unlinked exit emits no guard, so the failed pop's `ERROR` is what the epilogue
-    // `ret`s to the driver; the driver must decode it into the interpreter's own typed
-    // frame error, identical on both tiers.
-    let (module, name) = tail_call_with("tail_exit_slimmed_mismatch", callee_code(), 5, Label(1));
-    with_both_tiers(&module, name, |interpreter, baseline| {
-        let interpreter_reason = failed("interpreter", interpreter);
-        let baseline_reason = failed("baseline", baseline);
-        assert_eq!(
-            interpreter_reason, baseline_reason,
-            "a failed pop must surface the identical error with the guard narrowed"
-        );
-        assert!(
-            baseline_reason.contains("frame size mismatch"),
-            "the driver must decode the helper's `ERROR` into the frame-size error, got \
-             {baseline_reason}"
-        );
-    });
 }
 
 /// The removed store is not observable: the probed `call_only` shape still returns the

@@ -176,9 +176,6 @@ fn the_compiled_function_runs_the_export_natively() {
         // No run-cached reduction hook (a hand-built runtime block); a charge would go
         // through `charge_reduce`'s `dyn` fallback.
         reduce_hook: None,
-        verdict_slots: std::ptr::null(),
-        verdict_slots_end: std::ptr::null(),
-        verdict_pending: std::ptr::null(),
     };
 
     let word = code
@@ -731,9 +728,6 @@ fn a_native_entry_declares_the_register_write_extent() {
         // No run-cached reduction hook (a hand-built runtime block); a charge would go
         // through `charge_reduce`'s `dyn` fallback.
         reduce_hook: None,
-        verdict_slots: std::ptr::null(),
-        verdict_slots_end: std::ptr::null(),
-        verdict_pending: std::ptr::null(),
     };
 
     let word = code

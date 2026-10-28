@@ -138,11 +138,6 @@ mod liveness;
 mod r#move;
 mod operands;
 mod prologue;
-/// The emitted length of one `emit_publish_y` sequence, measured by the emitter itself —
-/// the derivation a post-publish-alternate pin asserts the offset against instead of a
-/// byte count copied from the encoder's arithmetic.
-#[cfg(test)]
-pub(crate) use prologue::publish_y_len;
 mod regalloc;
 mod regs;
 mod select;
@@ -203,11 +198,6 @@ pub(crate) use compile::{compile_function, compile_module};
 // `compile.rs`, which emits each block's code, and by the other emitter submodules' docs)
 // stays exactly what it was.
 pub(crate) use block::emit_block;
-// The inline local-call verdict gate, re-exported for its executed pins
-// (`emit/local_call_gate_tests.rs`, declared in `baseline/mod.rs`) — the one caller outside
-// this module tree, and a test-only one.
-#[cfg(test)]
-pub(crate) use block::emit_local_call_gate;
 
 // ---------------------------------------------------------------------------
 // Compilation
