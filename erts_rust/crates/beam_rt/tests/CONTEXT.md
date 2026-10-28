@@ -115,6 +115,7 @@ The action's own process never becomes a scheduler slice: its `receive … after
 * `eval_off_heap_reclaim.rs` — the escaped-payload store is pruned at each statement boundary, so an expression building `N` off-heap payloads holds `O(1)` (none).
 * `eval_port_receive.rs` — a port frame drained by `-eval`'s `receive … after` lands in the owning mailbox, so non-matching frames survive for the next receive (`erl`).
 * `eval_spawn.rs` — a spawned `-eval` closure with recorded source is compiled into a synthetic `beam_rt_eval_fun_<index>` module, loaded with `code:load_binary/3` and run as a real `ProcessEntry::Export`, so it parks in a bare `receive` and in `timer:sleep/1` and resumes on a message (none).
+* `eval_deep_recursion.rs` — fun-application nesting on the `-eval` route: a 50 000- and a 100 000-deep self-recursive named fun and a non-tail 50 000-deep one answer the oracle's value with exit 0 (never a signal), while the shape that alternates compiled module → `apply_fun` → walker answers the typed `unsupported: eval fun application: …` gap (exit 3, empty stdout) (`erl`).
 * `eval_exempt_receiver_signal.rs` — a `'DOWN'`/`'EXIT'` control signal aimed at the `-eval` route's relocation-exempt root, with a roomy and a saturated nursery (none).
 * `send.rs` — `erlang:send/2`/`erlang:'!'/2` over the `SendHook` seam (local, remote, port and alias destinations) (`erl`).
 * `empty_binary_result.rs` — the `run` route prints an empty binary from both representations (on-heap `<<>>`, off-heap refc accumulator) (none).
