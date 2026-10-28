@@ -190,11 +190,12 @@ pub(crate) fn publish_y_len() -> Result<usize> {
 /// and never modifies it; the bitstring arm reloads it from the block's `rt` slot), so
 /// the load needs no stack slot. A position store cannot fail, so nothing is checked.
 pub(super) fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
-    // Structural counter: one emitted inline position store (a Y-free block prologue's
-    // entry, or one bitstring arm's instruction). A **compile-time** count — the store is
-    // generated code now, so there is no helper call left at run time to record it; the
-    // count is the number of sites that emit this sequence (the emission site is the only
-    // place that knows).
+    // Structural counter: one emitted inline position store (every block prologue's
+    // entry — publishing or not, since the store and the Y-window publish are separate
+    // sequences — or one bitstring arm's instruction). A **compile-time** count — the
+    // store is generated code, so there is no helper call left at run time to record it;
+    // the count is the number of sites that emit this sequence (the emission site is the
+    // only place that knows).
     #[cfg(test)]
     super::super::counters::record_set_position();
     buffer.mov_rm(Reg::R10, Reg::Rdi, RUNTIME_CURRENT_CODE_DISP)?;
