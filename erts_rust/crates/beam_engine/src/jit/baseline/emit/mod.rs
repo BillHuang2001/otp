@@ -173,6 +173,11 @@ pub(crate) use arith::{
 };
 #[cfg(test)]
 pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
+// The `put_list` arm's test-only counters: the only proof that the shape lowered natively (a
+// deopted instruction is executed by the interpreter on **both** tiers, so tier agreement
+// cannot show it).
+#[cfg(test)]
+pub(crate) use cons::{declined, lowered, reset_counters};
 #[cfg(test)]
 pub(crate) use r#move::{move_shape, MoveShape};
 #[cfg(test)]

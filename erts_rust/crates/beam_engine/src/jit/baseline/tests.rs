@@ -7001,3 +7001,6 @@ mod raise_tier_tests;
 #[cfg(test)]
 #[path = "frame_push_tests.rs"]
 mod frame_push_tests;
+#[cfg(test)]
+#[path = "put_list_tests.rs"]
+mod put_list_tests;
