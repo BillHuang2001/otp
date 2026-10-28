@@ -345,11 +345,6 @@ fn a_run_time_rejected_put_list_takes_exactly_one_interpreter_step() {
     );
 }
 
-/// The harness's `run_counting` consumes its module, so hand each tier its own copy.
-fn module_clone(module: &Module) -> Module {
-    module.clone()
-}
-
 /// A host whose heap is permanently exhausted: every rooted allocation is the typed
 /// refusal, everything else forwards to a real [`MinimalContext`].
 struct RefusingHeap {
