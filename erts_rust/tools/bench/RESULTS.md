@@ -213,7 +213,9 @@ names it (**sys / rust**): `etf_roundtrip_ops` 1 500 000 / 500 000, `ets_copy_op
 10 000, `list_walk_elements` 100 000 000 / 50 000 000, `foreign` `calls` 1 500 000 / 50 000
 (`bstr_to_lower`), 1 500 000 / 40 000 (`bstr_capitalize_token`), 3 000 000 / 60 000
 (`emqx_base62_encode`), 3 000 000 / 60 000 (`emqx_base62_decode`), `binary_append_calls` 50 000 / 2 000
-(`binary_append_bytes` 3 276 800 000 / 131 072 000), `file_io` `write_read` 200 000 / 20 000 ops,
+(`binary_append_bytes` 3 276 800 000 / 131 072 000 — an **m19** count: the workload is now calibrated at
+`n_rust` = 4 000, so a new run reports `binary_append_calls` 4 000 and 262 144 000 bytes, and an m19
+`binary_append` figure is comparable only at its own `N`), `file_io` `write_read` 200 000 / 20 000 ops,
 `handle_rw` 200 000 / 1 000 ops, `ram_file` 200 000 / — (sys-only), `gc_class` `send_recv` 200 000 /
 25 000 ops, `ets_copy` 400 000 / 40 000 ops, `compile` 8 / 2 ops. **Never compare raw `wall_ms` across
 two sides with different `N`** — only the per-unit normalization is comparable, and a `gc_class/compile`
@@ -439,11 +441,11 @@ Archive `out/` copies into `results/` with **only** the mechanical normalisation
   `vm_memory_total_bytes` (0.213×) is an **accounting** figure, never a footprint.
 - **`foreign`'s and `binary_append`'s `case_<name>_ns_per_call` remain `N`-dependent on rust** (a
   common-mode per-op heap retention), so those per-call figures are comparable **only across runs at the
-  same `N`**; the counts are the ones in §3.3. `binary_append`'s `n_rust` = 2 000 is additionally **capped
-  by the runtime, not by the loop-count rule**: `beam_rt`'s `RUN_DEADLINE = 60 s`
-  (`crates/beam_rt/src/runtime/scheduler.rs:90`) is **non-overridable**, and any future increase in
-  per-call cost silently turns that row into `failed(no-binary-append-run)` — re-derive `n_rust` from the
-  measured cost before changing anything there.
+  same `N`**; the counts are the ones in §3.3. `binary_append`'s `n_rust` is now **4 000**, re-derived from
+  the merged runtime's measured ≈204 µs/call so the loop does ≈0.82 s of work and clears the ≥0.5 s rule —
+  the row no longer sits at the runtime's deadline cap, though `beam_rt`'s `RUN_DEADLINE = 60 s`
+  (`crates/beam_rt/src/runtime/scheduler.rs:90`) remains **non-overridable** and the maintenance rule still
+  applies: re-derive `n_rust` from the measured cost before changing anything there.
 - **No self-hosted build (contract A.9).** `erlc_compiler` and `elixir_compiler` are `Runtimes::SysOnly`
   and shell out to the system `erlc`/`elixirc`; nothing in the driver runs a compiler **under** `beam_rt`.
 - **Honesty caveats that travel with every figure here:** the host is shared, so absolute wall times are

@@ -93,7 +93,7 @@ Two rounds caught a load excursion and are kept as separate archived files rathe
   `m22-memory.md`.
 - **`slice` is new in this record** and is the only N=1 (whole-process) comparison: every case is 0.984–1.046x of the
   oracle's wall time and 1.008–1.013x of its peak RSS — the first m-record in which a whole `beam_rt` process is at parity
-  (m20's record read `slice` wall 1.410x). Each case checks its runtime's stdout against the expected constant, so a
+  (m19's record read `slice` wall 1.410x). Each case checks its runtime's stdout against the expected constant, so a
   broken case fails the row instead of silently skewing a median.
 - **The host is shared**: quote the ratios and the deterministic `case_*_ops`/`_elements` counters, never an absolute wall
   time as a constant. Absolute rust times move several-fold between sessions while the ratios move tens of percent.

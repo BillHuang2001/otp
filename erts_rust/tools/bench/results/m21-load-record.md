@@ -16,7 +16,7 @@ Sides: `sys` = the system ERTS on `PATH` — **Erlang/OTP 29.1.2 / erts-17.1.1**
 `version=29`); `rust` = `erts_rust/target/release/beam_rt` at its default baseline-JIT tier
 (`version=30`). **Note the oracle moved:** earlier records (m17–m19; the artifact-less m20 named in `BOTTLENECKS.md` §0 has no reports here) named OTP **29.1.1 / erts-17.1**;
 this host's `erl` is **29.1.2 / erts-17.1.1**. Both sides, every pass, are recorded in
-`m21-xrun-ratios.txt` §G; ratios are therefore vs *this* oracle, not the one m20 quoted.
+`m21-xrun-ratios.txt` §G; ratios are therefore vs *this* oracle, not the one m19 quoted.
 
 ## Command shape (one matched round = two single-side passes, alternating order)
 
