@@ -18,10 +18,11 @@ Thirteen workloads, split by how the baseline tier lowers them:
   caller's frame — and therefore the Y slot holding the head — stays live across the recursive call,
   so its `gc_bif '+'/2` names a `Y` operand and a `Y` destination; the tier inlines both behind its
   per-block published frame window, as it does the `Move` guarding the recursion, so the body is
-  mostly native). The only per-level deopts are the `Allocate{2}` frame push and the **non-tail**
-  local `Call`, whose return address `pc + 1` — which `beam_loader` does not cut a block at — has its
-  own native **continuation sub-block**, so the driver re-enters natively at the post-call
-  continuation instead of stepping the block tail one interpreter instruction at a time.
+  mostly native). The frame push is one in-block `jit_allocate` helper call, never a `jit_step_one`
+  step, and so is the **non-tail** local `Call`, whose return address `pc + 1` — which `beam_loader`
+  does not cut a block at — has its own native **continuation sub-block**, so the driver re-enters
+  natively at the post-call continuation instead of stepping the block tail one interpreter
+  instruction at a time.
 * **Inlined** (the tier handles the body natively) — in `inlined.rs`: **`slice:fib/1`** (a real
   `.beam` fixture), **`kernel/2`**, **`wide/2`**, **`aggr/2`** and **`cmp/2`**.
 * **Cross-module** — in `workloads.rs`: **`cross/2`**, a two-module
