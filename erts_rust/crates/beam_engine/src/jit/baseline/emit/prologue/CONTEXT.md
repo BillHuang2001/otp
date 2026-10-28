@@ -15,13 +15,15 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   `mov r10,[rdi+RUNTIME_CURRENT_CODE_DISP]`; `mov r11, movabs pack_current_code(func, block_start_pc)`;
   `mov [r10], r11` — 24 B, three instructions, no helper call, emitted before the cached loads,
   which is why nothing a block keeps live can sit in caller-saved scratch here) — or, when the block
-  must publish the window
-  (`Allocation::prologue_publishes_y`: it accesses a Y slot and **not** every one of those accesses
-  follows an in-block `allocate`/`allocate_heap`/`trim`, whose helper re-published the window itself),
+  accesses **any** `Y` slot (`Allocation::prologue_publishes_y`, i.e. `y_last.is_some()`),
   `jit_publish_y(rt, func, pc)`, which does that same position store **and** re-publishes the current
   frame's Y window in one call — then load each cached register in
   `Allocation::entry_fill` from `machine.x` (the block's **live-in** slots: a cached register the block
   writes before it reads is not loaded at entry, because that writing instruction sets it).
+  The publish is unconditional for a Y-touching block **on soundness grounds**: a block is entered (or a
+  slice is resumed) without re-executing any prefix, so a frame helper's mid-block re-publication cannot
+  stand in for the prologue's — the window has to be re-derivable from Rust state at every enterable
+  address, and the prologue is where that happens.
   `emit_position_store` is the **one** encoder of an instruction position (`pub(super)`, so
   `../family.rs`'s bitstring arm emits the same 24 B for each `Bs*` instruction before its helper call —
   `jit_bitstr` no longer stores the position itself; see `../CONTEXT.md`).
