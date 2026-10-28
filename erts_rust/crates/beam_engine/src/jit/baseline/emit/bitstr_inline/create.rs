@@ -386,17 +386,18 @@ pub(crate) struct CreateBinShape {
     /// append-route site goes through.
     source: Option<Loc>,
     /// The destination: an x-register or an addressable `Y` slot.
-    dst: Loc,
+    pub(super) dst: Loc,
     /// The plan's append **unit** (`1`, `2`, `4` or `8`) — the general door's position
     /// gate (`seam::open_append_any`'s fourth argument). Carried as a compile-time
     /// constant because it is the plan's, not the instruction's — and `None` on the
     /// [`Route::Fresh`] route, which consults no append door.
     unit: Option<usize>,
     /// The summed width of the fields, in bits: exactly the figure the accumulator's
-    /// window end advances by (`seam::AppendPlan::tail_bits`).
-    tail_bits: u32,
+    /// window end advances by (`seam::AppendPlan::tail_bits`), and on [`Route::Fresh`] the
+    /// built bitstring's own bit size (`seam::FreshPlan::total_bits`).
+    pub(super) tail_bits: u32,
     /// The fields, in instruction order.
-    fields: Vec<seam::Field>,
+    pub(super) fields: Vec<seam::Field>,
     /// The **bit** offset of each field from the write start, parallel to [`Self::fields`]
     /// — the one offset figure both routes derive from (the aligned route divides by 8).
     field_bit_offsets: Vec<u32>,
@@ -1144,7 +1145,7 @@ fn emit_bit_fields_inline(
 ///
 /// Sound only behind the up-front [`Loc::guard_load`] of the same slot (see the module
 /// docs): the frame cannot change between them, so the guard's proof still holds here.
-fn emit_y_slot_address(buffer: &mut CodeBuffer, dst: Reg, k: u32) -> Result<()> {
+pub(super) fn emit_y_slot_address(buffer: &mut CodeBuffer, dst: Reg, k: u32) -> Result<()> {
     buffer.mov_rm(dst, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     buffer.mov_rm(dst, dst, RUNTIME_YBASE_DISP)?;
     buffer.lea(dst, dst, y_offset(k))
