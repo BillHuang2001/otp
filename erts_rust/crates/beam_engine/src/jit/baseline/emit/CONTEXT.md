@@ -172,7 +172,11 @@ all three exits) and `../tail_exit_tests.rs::the_probed_local_call_records_one_s
 (per probed tail shape: exactly **one** `SpillSite::Helper` spill call, **zero** `SpillSite::Exit`
 calls/stores, and the instruction lowered rather than deopted, so the pin cannot pass vacuously); the
 tail forms' interpreter agreement under the probe is
-`../tail_exit_tests.rs::the_probed_tail_call_still_agrees_with_the_interpreter`. The corpus-wide
+`../tail_exit_tests.rs::the_probed_tail_call_still_agrees_with_the_interpreter`, and the tail exits'
+pop guard is pinned as a set of invariants by
+`../tail_exit_tests.rs::the_slimmed_tail_exits_transfer_the_same_program_and_report_the_same_declined_word`
+(the helper's two-word answer space, the linked route's value with no `CallLast` step at run time, and
+the failed pop's typed frame error on both tiers). The corpus-wide
 traffic behind the figures quoted above is `../census.rs::
 the_register_cache_traffic_census_over_the_corpus_is_printed`, and the per-kind sizes
 `../census.rs::the_per_kind_emitted_code_size_table_is_printed`.
@@ -268,7 +272,8 @@ by construction).
   `CDR_DISP`, `Half`, `ListShape` + impl, `get_list_shape`/`get_hd_shape`/`get_tl_shape`, `shape`,
   `try_inline_get_list`/`try_inline_get_hd`/`try_inline_get_tl`, `emit_list_read`.
 - `link.rs` -> `Linker` (`is_compiled`, `emit_exit`, `emit_tail_exit`, `emit_tail_exit_to_driver` —
-  each taking a trailing `store_pc` separate from the branch target), `emit_in_block_call` (the
+  each taking a trailing `store_pc` separate from the branch target), `emit_tail_pop_guard` (the linked
+  tail exit's `test rax, rax` + `js` sign guard; the unlinked exit emits none), `emit_in_block_call` (the
   frame-preserving `call`'s in-block transfer: the `RUNTIME_RESUME_DISP` probe, frame teardown, `jmp r11`,
   and the declined arm's pre-existing `encode_target` word), `emit_frame_teardown`, and the
   byte-level linker unit tests (alongside `test.rs`'s own unit tests).

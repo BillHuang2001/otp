@@ -107,6 +107,15 @@ arguments it now passes (the packed callee/arity word, the kind, the frame size:
 the −7-byte single-store saving the exit's `ExitSpill::Done` mode gives back (see
 `## Spill/fill discipline`); the corpus-wide totals are there too.
 
+### The tail exits' frame-pop guard
+`link.rs::emit_tail_exit` follows the `jit_tail_call` call with `test rax, rax` + `js <done>`
+(`link.rs::emit_tail_pop_guard`), which is the whole success predicate because the helper's answer space is exactly two words: the `target` it was handed, or the negative `ERROR` with the typed error in `rt.error`.
+"The answer is not `word`" and "the answer is negative" are therefore the same predicate: every block-ABI continuation word is non-negative (`encode_target` sets the sign bit only for a function index at or above 2^31, and `decode_target` answers `None` for a negative word), so the guard materialises no compiled-in constant.
+A `word` that could be negative — unreachable for a compiled block, but expressible in the type — keeps the exact `movabs r11, word` + `cmp` + `jne` comparison rather than resting on that invariant.
+`link.rs::emit_tail_exit_to_driver` emits **no guard at all**: both of the helper's answers leave for the same `done` epilogue with `rax` untouched, so a compare would select between two identical destinations, and the epilogue's `ret` hands the driver exactly the word to decode.
+Sizes for one dirty cached `x(0)` (a 7-byte spill) with `rbx` + `r12` popped: the linked exit **81 B / 12 instructions**, the resolved-but-unlinked exit **53 B / 7 instructions**.
+The per-kind authoritative table is the census in `../../census/CONTEXT.md` (`../../census.rs::the_per_kind_emitted_code_size_table_is_printed`); the two exits' parity is pinned by `../../tail_exit_tests.rs::the_slimmed_tail_exits_transfer_the_same_program_and_report_the_same_declined_word`.
+
 ## Measured
 
 ### The prologue Y-window publish is suppressed behind an in-block frame helper
