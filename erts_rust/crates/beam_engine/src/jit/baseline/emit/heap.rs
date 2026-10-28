@@ -71,29 +71,66 @@
 //! [`Allocation::refresh_y_after`]: super::Allocation::refresh_y_after
 
 use beam_common::Result;
+use beam_term::NIL;
 
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::runtime::{
     encode_target, jit_allocate, jit_allocate_heap, jit_test_heap, jit_trim, AllocateHeapHelper,
-    FrameSizeHelper, HeapNeedHelper,
+    FrameSizeHelper, HeapNeedHelper, FRAME_SHIFT, FRAME_WORDS, FRAME_Y_BASE_OFF, FRAME_Y_COUNT_OFF,
+    RUNTIME_FRAME_TEMPLATE_DISP, RUNTIME_FRAMES_STORE_DISP, RUNTIME_STACK_STORE_DISP,
+    RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP, STORE_CAP_OFF, STORE_LEN_OFF, STORE_PTR_OFF,
 };
+use super::prologue::emit_position_store;
 use super::{
     emit_continue_check, emit_continue_check_helper_refresh, emit_helper_call, Allocation,
+    RUNTIME_SLOT_DISP,
 };
+
+/// The largest `StackNeed` whose frame push is emitted inline.
+///
+/// The push's Y fill is an unrolled run of `mov [base + k*8], NIL`, so a wide frame would
+/// cost more emitted bytes than the helper call it replaces (and more than the block cache
+/// wants to hold). Above this bound the arm emits the helper call alone — the same two
+/// instructions it emitted before the inline push existed.
+const INLINE_PUSH_MAX_Y: u32 = 16;
 
 /// Lower `allocate StackNeed Live` — push a stack frame, then continue in-block at
 /// `pc + 1`.
 ///
-/// The helper ([`jit_allocate`]) makes the interpreter's own `Machine::push_frame` call
-/// (no heap admission: `allocate` deliberately skips C's `$AH` check) and answers either
-/// `encode_target(func, pc + 1)` (the interpreter's `Step::Next`) or `ERROR`. The pop's
+/// The push itself is emitted **inline** behind a capacity check on the two stores
+/// ([`emit_inline_frame_push`]); the helper ([`jit_allocate`], which makes the
+/// interpreter's own `Machine::push_frame` call — no heap admission: `allocate`
+/// deliberately skips C's `$AH` check) is the cold/taken-on-miss fallback, taken when
+/// either store would have to grow. A growing store reallocates, which is exactly what the
+/// published header cannot survive, so the capacity check must precede every write.
+///
+/// The helper answers either `encode_target(func, pc + 1)` (the interpreter's
+/// `Step::Next`) or `ERROR`; both continue arms are the same compare-and-branch. The pop's
 /// analogue [`super::emit_deallocate`]: no register refill (the push touches no
-/// x-register), but the frame changed, so the Y window is re-published when a later
-/// instruction of this block still accesses a Y slot.
+/// x-register), but the frame changed, so the Y window is re-published by the push itself
+/// when a later instruction of this block still accesses a Y slot.
 ///
 /// [`Machine::push_frame`]: crate::Machine
 pub(super) fn emit_allocate(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    stack_need: u32,
+) -> Result<()> {
+    match FRAME_SHIFT {
+        Some(shift) if stack_need <= INLINE_PUSH_MAX_Y => {
+            emit_inline_frame_push(buffer, allocation, done, func, pc, stack_need, shift)
+        }
+        _ => emit_allocate_helper(buffer, allocation, done, func, pc, stack_need),
+    }
+}
+
+/// The cold half of [`emit_allocate`] — one [`jit_allocate`] round-trip, then the
+/// frame-change continue arm.
+fn emit_allocate_helper(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     done: CodeLabel,
@@ -109,6 +146,117 @@ pub(super) fn emit_allocate(
         &[i64::from(func), i64::from(pc), i64::from(stack_need)],
     pc)?;
     emit_frame_change_continue(buffer, done, func, pc)
+}
+
+/// Emit the frame push inline: a capacity check on both stores, then the position store
+/// and every store `Machine::push_frame_window` makes.
+///
+/// # Emitted shape (the whole arm, in order)
+///
+/// ```text
+///   mov   rdi, [rsp + rt]                ; rt
+///   mov   r10, [rdi + stack_store]       ; &mut machine.stack
+///   mov   r11, [rdi + frames_store]      ; &mut machine.frames
+///   mov   rax, [r10 + len]               ; old stack len  (= the new frame's y_base)
+///   mov   rcx, [r10 + cap]
+///   lea   r8,  [rax + stack_need]        ; new stack len
+///   cmp   r8,  rcx
+///   ja    cold                           ; would grow -> helper
+///   mov   rdx, [r11 + len]               ; old frame count
+///   mov   rcx, [r11 + cap]
+///   lea   r9,  [rdx + 1]                 ; new frame count
+///   cmp   r9,  rcx
+///   ja    cold                           ; would grow -> helper
+///   <position store>                     ; inline, three instructions
+///   ... NIL fill of the Y slots, frame-template copy, two field patches, both len bumps
+///   jmp   cont
+/// cold:
+///   call  jit_allocate(rt, func, pc, stack_need)
+///   <frame-change continue>
+/// cont:
+/// ```
+///
+/// # Deopt idempotency
+///
+/// A `fallback` is a deopt: `jit_step_one` re-executes the whole instruction with the same
+/// operands. Both guard branches fire **before any write at all**, so a deopt from here
+/// leaves the machine untouched and the re-execution (which takes the helper) applies the
+/// push exactly once. The position store is the one write before the push, and it is the
+/// same word the helper would store.
+///
+/// # Register budget
+///
+/// Everything caller-saved is dead at a frame helper (cached x-registers and `rbx` live in
+/// callee-saved registers): `rax`/`rcx`/`rdx`/`rsi`/`rdi`/`r8`/`r9`/`r10`/`r11` are used
+/// freely here and no value survives into the next instruction.
+fn emit_inline_frame_push(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    stack_need: u32,
+    frame_shift: u32,
+) -> Result<()> {
+    let cold = buffer.label();
+    let cont = buffer.label();
+    // rt (the push reads both store handles and the frame template through it).
+    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    buffer.mov_rm(Reg::R10, Reg::Rdi, RUNTIME_STACK_STORE_DISP)?;
+    buffer.mov_rm(Reg::R11, Reg::Rdi, RUNTIME_FRAMES_STORE_DISP)?;
+    // Stack capacity: `old_len + stack_need <= cap`. Both figures are **words**
+    // (`PubVec<Eterm>`'s `len`/`cap` are element counts), so no scaling here; `r8` is
+    // also the length the push commits further down.
+    buffer.mov_rm(Reg::Rax, Reg::R10, STORE_LEN_OFF)?;
+    buffer.mov_rm(Reg::Rcx, Reg::R10, STORE_CAP_OFF)?;
+    buffer.lea(Reg::R8, Reg::Rax, stack_need as i32)?;
+    buffer.cmp_rr(Reg::R8, Reg::Rcx)?;
+    buffer.jcc(Cond::A, cold)?;
+    // Frame capacity: `frames.len() + 1 <= frames.cap()`.
+    buffer.mov_rm(Reg::Rdx, Reg::R11, STORE_LEN_OFF)?;
+    buffer.mov_rm(Reg::Rcx, Reg::R11, STORE_CAP_OFF)?;
+    buffer.lea(Reg::R9, Reg::Rdx, 1)?;
+    buffer.cmp_rr(Reg::R9, Reg::Rcx)?;
+    buffer.jcc(Cond::A, cold)?;
+    // Position: the instruction being executed (the helper stores the same word).
+    // This clobbers `r10`/`r11`, so both store handles are re-read below.
+    emit_position_store(buffer, func, pc)?;
+    buffer.mov_rm(Reg::R10, Reg::Rdi, RUNTIME_STACK_STORE_DISP)?;
+    buffer.mov_rm(Reg::R11, Reg::Rdi, RUNTIME_FRAMES_STORE_DISP)?;
+    // The new frame's Y window: `stack.ptr + old_len` .. `+ stack_need` words.
+    buffer.mov_rm(Reg::Rcx, Reg::R10, STORE_PTR_OFF)?;
+    buffer.mov_rr(Reg::Rsi, Reg::Rax)?;
+    buffer.shl_ri(Reg::Rsi, 3)?;
+    buffer.add_rr(Reg::Rsi, Reg::Rcx)?;
+    buffer.mov_mr(Reg::Rdi, RUNTIME_YBASE_DISP, Reg::Rsi)?;
+    buffer.lea(Reg::Rcx, Reg::Rsi, (stack_need * 8) as i32)?;
+    buffer.mov_mr(Reg::Rdi, RUNTIME_YEND_DISP, Reg::Rcx)?;
+    // Y slots, filled exactly as `resize(.., Eterm::default())` fills them.
+    buffer.mov_ri(Reg::Rcx, NIL.raw() as i64)?;
+    for k in 0..stack_need {
+        buffer.mov_mr(Reg::Rsi, (k * 8) as i32, Reg::Rcx)?;
+    }
+    buffer.mov_mr(Reg::R10, STORE_LEN_OFF, Reg::R8)?;
+    // The frame slot: template words, then the two fields the push computes.
+    buffer.mov_rm(Reg::Rcx, Reg::R11, STORE_PTR_OFF)?;
+    buffer.mov_rr(Reg::Rsi, Reg::Rdx)?;
+    buffer.shl_ri(Reg::Rsi, frame_shift)?;
+    buffer.add_rr(Reg::Rsi, Reg::Rcx)?;
+    for k in 0..FRAME_WORDS {
+        buffer.mov_rm(Reg::Rcx, Reg::Rdi, RUNTIME_FRAME_TEMPLATE_DISP + (k * 8) as i32)?;
+        buffer.mov_mr(Reg::Rsi, (k * 8) as i32, Reg::Rcx)?;
+    }
+    buffer.mov_mr(Reg::Rsi, FRAME_Y_BASE_OFF, Reg::Rax)?;
+    buffer.mov_ri(Reg::Rcx, i64::from(stack_need))?;
+    buffer.mov_mr32(Reg::Rsi, FRAME_Y_COUNT_OFF, Reg::Rcx)?;
+    buffer.mov_mr(Reg::R11, STORE_LEN_OFF, Reg::R9)?;
+    buffer.jmp(cont)?;
+    // Cold: the store must grow (or a Frame is not a whole number of words), so the
+    // helper reallocates and re-publishes; its continue arm folds `ERROR` into `done`.
+    buffer.bind(cold)?;
+    emit_allocate_helper(buffer, allocation, done, func, pc, stack_need)?;
+    buffer.bind(cont)?;
+    Ok(())
 }
 
 /// Lower `allocate_heap StackNeed HeapNeed Live` — admit the heap need, then push the
@@ -297,13 +445,6 @@ mod tests {
         let allocation = cached_allocation();
         let cases: Vec<(&str, *const (), Vec<u8>)> = vec![
             (
-                "allocate",
-                jit_allocate as *const (),
-                lowered(|buffer, done| {
-                    emit_allocate(buffer, &allocation, done, 4, 7, 2)
-                }),
-            ),
-            (
                 "allocate_heap",
                 jit_allocate_heap as *const (),
                 lowered(|buffer, done| {
@@ -440,5 +581,49 @@ mod tests {
         });
         assert!(contains(&heap_refreshed, &refresh_immediate()));
         assert!(!contains(&heap_plain, &refresh_immediate()));
+    }
+    /// `allocate` is the one family member that is *not* a bare helper call: its push is
+    /// emitted inline behind the two capacity guards, and the helper is the cold half.
+    #[test]
+    fn an_allocate_pushes_inline_behind_both_capacity_guards_and_keeps_the_helper_cold() {
+        let allocation = cached_allocation();
+        let spill = spill_bytes(&allocation);
+        let rt_load = encoded(|buffer| {
+            buffer.mov_rm(Reg::Rdi, Reg::Rsp, super::super::RUNTIME_SLOT_DISP).unwrap()
+        });
+        let guarded = lowered(|buffer, done| emit_allocate(buffer, &allocation, done, 4, 7, 2));
+        assert!(
+            guarded.starts_with(&rt_load),
+            "the inline push loads `rt` out of the block's own slot first"
+        );
+        assert!(
+            !guarded.starts_with(&spill),
+            "the inline push is not a call, so it spills nothing on its success path"
+        );
+        let needle = helper_immediate(jit_allocate);
+        let call = guarded
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("the cold half still calls `jit_allocate`");
+        assert!(
+            call > rt_load.len(),
+            "the helper call sits behind the capacity guards, not in front of them"
+        );
+        // The cold half is the pre-existing shape: spill, then the call. Anchoring the
+        // spill *before* the helper's immediate is what proves the guards are the only
+        // thing standing between the block and the old code path.
+        let spill_at = guarded
+            .windows(spill.len())
+            .position(|window| window == spill)
+            .expect("the cold half spills the root set before the call");
+        assert!(spill_at < call, "the cold half spills before it calls");
+        // A frame wider than the inline bound keeps the old single-call shape.
+        let wide = lowered(|buffer, done| {
+            emit_allocate(buffer, &allocation, done, 4, 7, super::INLINE_PUSH_MAX_Y + 1)
+        });
+        assert!(
+            wide.starts_with(&spill),
+            "a wide frame takes the helper first, like before the inline push existed"
+        );
     }
 }
