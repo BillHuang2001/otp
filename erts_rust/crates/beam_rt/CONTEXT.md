@@ -152,7 +152,9 @@ The design rationale and binding invariants of the runtime glue — the mature-G
 * The `-eval` store's written volume, not the region pass, sets one statement's RSS — GC *GC / heap model*.
 * The store's written prefix in one statement is bounded by its copy-out volume — GC *GC / heap model*.
 * A user process's nursery is live-set sized and flat in N — GC *GC / heap model*, `src/runner/MEASURED.md`.
-* Execution tier defaults to `JitMode::Auto` — G *Execution tier*, `src/runner/CONTEXT.md`.
+* Execution tier defaults to `JitMode::Auto`, which is **phase-scoped**: the interpreter while the runtime is in its boot phase (`Runtime::in_boot_phase` — the boot-script window `default_spawn_policy` already keys on) and the native baseline tier in steady state; a boot-entered process is upgraded one-way at its first post-boot slice boundary, and a pinned `BEAM_RT_TIER` value (`interpreter`/`baseline`/`cranelift`) is phase-independent — G *Execution tier*, `src/runner/CONTEXT.md`.
+* An upgraded process's code ranges are not added to the `+JPperf` map (the snapshot is taken on a first entry only); the map is diagnostic-only — G *Execution tier*.
+* The native-tier pre-emption residual (a natively linked tail loop with no allocation never pre-empts) is reached only in steady state, because boot-phase code runs on the interpreter — G *Execution tier*.
 * CLI divergences and subset gaps (`-smp disable`, `-setcookie`, the `-eval`/`-s`/`-run` subsets) — [`src/cli/CONTEXT.md`](src/cli/CONTEXT.md).
 * A compiled module's local fun encodes faithfully; an `erl_eval` lambda stays `unsupported: local_fun` — A3, G *Funs*.
 * A NIF-created thread's own host, its `enif_send` substitution and typed gaps — A3.
