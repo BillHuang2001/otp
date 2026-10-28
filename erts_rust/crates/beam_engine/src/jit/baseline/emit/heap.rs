@@ -93,7 +93,14 @@ use super::{
 /// cost more emitted bytes than the helper call it replaces (and more than the block cache
 /// wants to hold). Above this bound the arm emits the helper call alone — the same two
 /// instructions it emitted before the inline push existed.
-const INLINE_PUSH_MAX_Y: u32 = 16;
+// The inline frame push is **suspended**: it publishes the Y window only mid-block, and a
+// block that is entered without re-executing its prefix (the resume path republishes
+// nothing) then reads its Y slots through a stale window -- `bench_list_walk:walk/1` under
+// the default (baseline) tier raised `{badmatch,_}` out of `get_list` while the interpreter
+// answered `2002500500`. Every `allocate`/`allocate_heap` now takes the `jit_allocate`
+// helper, whose success arm re-publishes the window from `Machine::push_frame_window`'s own
+// figures. Restoring the inline arm requires making its publication entry-complete first.
+const INLINE_PUSH_MAX_Y: u32 = 0;
 
 /// Lower `allocate StackNeed Live` — push a stack frame, then continue in-block at
 /// `pc + 1`.
