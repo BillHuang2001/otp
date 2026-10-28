@@ -100,7 +100,7 @@ use super::counters;
 use super::emit::bitstr_inline::{self, SHAPE_CREATE_BIN, SHAPE_CREATE_FRESH};
 use super::runtime::append_binary_all_calls;
 use super::tests::assert_same_outcome;
-use crate::context::MinimalContext;
+use crate::context::{ExecutionContext, MinimalContext};
 use crate::families::bitstrings::bit_size;
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
@@ -388,6 +388,30 @@ enum ArgKind {
     Float(f64),
     /// An atom term (an immediate), named by the module's own atom table.
     Atom(Atom),
+    /// A hand-built `ErlSubBits` accumulator in one of the two forms the append door must
+    /// **refuse** at run time ([`RefusedAcc`]).
+    Refused(RefusedAcc),
+}
+
+/// The two `ErlSubBits` shapes that are *not* a writable accumulator payload, built by hand
+/// because no program can hand either to `bs_create_bin`.
+///
+/// Both are well-formed `ErlSubBits` terms (a live `orig` in the same arena, `start = 0`,
+/// `end` = that binary's bit size), so every guard that protects a **dereference** accepts
+/// them: `is_boxed`, the header, `start == 0`, a non-null base and `end % 8 == 0` all pass.
+/// What refuses them is a fact about the machine, and the rows below pin that the refusal is
+/// the interpreter's, i.e. exactly one deopt — never an in-block byte written through a base
+/// that is not a payload this machine owns.
+#[derive(Clone, Copy)]
+enum RefusedAcc {
+    /// A **match context**: `base_flags == 0` (what the family's `make_ctx` writes), so the
+    /// masked base is null — the writable-payload registry cannot possibly answer.
+    MatchContext(&'static [u8]),
+    /// A **window over an on-heap binary**: `base_flags` is that heap binary's own data
+    /// pointer, which can never be a key in `Machine::writable_payloads` (its keys are the
+    /// `RefcBinary::data_ptr()` of payloads this machine allocated, pruned in lockstep with
+    /// `retain_refc_binaries`, so a freed or reused address is never one).
+    HeapWindow(&'static [u8]),
 }
 
 impl ArgKind {
@@ -399,7 +423,47 @@ impl ArgKind {
             }
             ArgKind::Float(value) => crate::terms::make_float(ctx, value).expect("the argument builds"),
             ArgKind::Atom(atom) => make_atom(atom),
+            ArgKind::Refused(refused) => refused_accumulator(ctx, refused),
         }
+    }
+}
+
+/// Build the [`RefusedAcc`] term: a live `orig` binary in this arena plus a 5-word
+/// `ErlSubBits` window over it, written by the **same** writer the family's `make_ctx` and
+/// `build_writable_bitstring` use, so the window is a well-formed term of exactly the shape the
+/// append door inspects.
+///
+/// The two forms differ in **one** word: the `base_flags` slot. A match context carries the `0`
+/// the family's `make_ctx` writes (`raw.rs::make_ctx` leaves `base_flags == 0` forever — `set_ctx_start`/
+/// `set_ctx_end` touch only the window's two words), and a window over an on-heap binary carries
+/// that binary's own payload address.
+fn refused_accumulator(ctx: &mut MinimalContext, refused: RefusedAcc) -> Eterm {
+    let bytes = match refused {
+        RefusedAcc::MatchContext(bytes) | RefusedAcc::HeapWindow(bytes) => bytes,
+    };
+    let orig = crate::terms::make_heap_binary(ctx, bytes).expect("the accumulator's subject builds");
+    let base_flags = match refused {
+        RefusedAcc::MatchContext(_) => Eterm::from_raw(0),
+        // SAFETY: `orig` is a live on-heap binary in this arena (`make_heap_binary` just returned
+        // it) and `bitstring_parts` only reads its header, its size word and its payload address;
+        // the arena grows in place, so nothing moves it.
+        RefusedAcc::HeapWindow(_) => {
+            Eterm::from_raw(unsafe { beam_term::bitstring::bitstring_parts(orig) }.0 as usize)
+        }
+    };
+    let hp = ctx.alloc_words(5).expect("the window block reserves in the arena");
+    // SAFETY: `hp` is 5 exclusively-owned, writable words in this arena (the reservation just
+    // succeeded and the arena never moves or reuses a handed-out region), `orig` is live in the
+    // same arena, and `base_flags` either is null-with-`start == 0` (never dereferenced) or names
+    // that binary's payload, which covers bits `0..bytes.len() * 8`.
+    unsafe {
+        beam_term::bitstring::write_sub_bits(
+            hp,
+            base_flags,
+            Eterm::from_raw(0),
+            Eterm::from_raw(bytes.len() * 8),
+            orig,
+        )
     }
 }
 
@@ -3664,6 +3728,76 @@ fn a_binary_all_source_one_byte_past_the_capacity_refuses_and_writes_nothing() {
     );
 }
 
+/// `f/2` whose append **target is the first argument**: no `bs_init_writable`, so the accumulator
+/// the emitted proof inspects is exactly `x(0)` as the caller supplied it. A caller-supplied
+/// accumulator is the one way to reach the two accumulator forms a writable build never produces,
+/// and the row needs the door's guards to see them.
+fn accumulator_argument_module(name: &str) -> Module {
+    bin_module(name, 2, &[], |module| {
+        let mut segments = append_seg(module, Operand::X(0));
+        segments.extend(int_seg(module, Operand::X(1), 8));
+        vec![create_bin(Operand::X(0), segments, 2)]
+    })
+}
+/// **A refused accumulator takes exactly one interpreter step, then the family's `badarg`.**
+///
+/// The append door's emitted proof admits only a **writable** payload, and since the `orig is
+/// BinRef` test left the emitted sequence the refusals rest on two things only: the masked base
+/// being non-null, and `Machine::writable_payloads` answering inside `jit_append_cursor`. The two
+/// forms below are exactly those two cases, each built by the same writer the family's `make_ctx`
+/// and `build_writable_bitstring` use:
+/// * a **match context** (`base_flags == 0`, the word `raw.rs::make_ctx` writes and never
+///   rewrites — `set_ctx_start`/`set_ctx_end` touch only the window's two words) masks to a null
+///   base, so the emitted non-null guard rejects before the helper, and
+/// * an **`ErlSubBits` window over an on-heap binary** carries that binary's process-heap payload
+///   address, which can never be a key of `Machine::writable_payloads` (its keys are
+///   `RefcBinary::data_ptr()` of payloads this machine allocated, pruned in lockstep with
+///   `retain_refc_binaries` by `machine/offheap.rs`, so a freed or reused address is never a key),
+///   so every emitted guard passes and `jit_append_cursor` answers `0`.
+/// Either way the instruction is **un-applied** when the fallback runs, and the interpreter step
+/// is what decides the result: the group is a `private_append`, so the accumulator is its
+/// **source**, `raw::heap_bits` answers `None` for both forms (`is_refc_binary` is false), and the
+/// family raises `SegReason::BadArg` — C's `is_not_bitstring(Src)` arm — on both tiers.
+///
+/// Pinned: the shape is emitted natively (so the row proves a *refusal*, not a compile-time
+/// decline), the baseline run deopts exactly once and never reaches `jit_bitstr`, and both tiers
+/// raise the same bare `badarg`.
+#[test]
+fn a_refused_accumulator_takes_one_step_and_the_familys_badarg() {
+    let module = accumulator_argument_module("refused_acc");
+    let name = atom(&module, "f");
+    let (shapes, _) = emitted_shapes(&module);
+    assert!(
+        shapes.contains(&SHAPE_CREATE_BIN),
+        "the construction arm must be emitted for this shape, else the row pins a decline"
+    );
+    for (label, refused) in [
+        ("match context", RefusedAcc::MatchContext(b"abcd")),
+        ("on-heap window", RefusedAcc::HeapWindow(b"abcdefgh")),
+    ] {
+        let args = [ArgKind::Refused(refused), ArgKind::Int(0x41)];
+        with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert!(
+                    matches!(outcome, Err(beam_common::BeamError::BadArg)),
+                    "{label}: {tier}: a refused accumulator source is the family's bare `badarg` \
+                     (got {outcome:?})"
+                );
+            }
+        });
+        let report = run_counting(&module, name, &args, Tier::BaselineJit);
+        assert_eq!(
+            runtime_deopts(&report.counters, "BsCreateBin"),
+            1,
+            "{label}: the arm must reject at run time, exactly once"
+        );
+        assert_eq!(
+            report.bitstr_calls, 0,
+            "{label}: the block's own fallback runs `jit_step_one`, not the family helper"
+        );
+    }
+}
 /// A declined shape's row: its module plus the arguments it needs.
 struct DeclinedRow {
     label: &'static str,
