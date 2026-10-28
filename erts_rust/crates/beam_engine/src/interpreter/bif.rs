@@ -34,6 +34,7 @@ use beam_term::{make_atom, Eterm, NIL};
 
 use crate::context::{BifOutcome, ExecutionContext};
 use crate::error;
+use crate::families::exceptions::bif_frame;
 use crate::machine::{namespace_atom, Machine};
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
@@ -148,7 +149,19 @@ impl Machine {
             // No fail label ⇒ a *raise*: land in a live catch frame (C falls
             // through to `find_func_info`/`handle_error`) or propagate the typed
             // error.
-            Err(e) if fail == NO_FAIL => self.raise_bif_error(module, e, ctx),
+            //
+            // The BIF that failed **is** the innermost cooked-stacktrace frame (C's
+            // `save_stacktrace`, `beam_common.c:877-1063`): [`bif_frame::bif_head_item`]
+            // synthesizes `{Module, Function, ArgList, [{error_info, #{module =>
+            // FormatModule}}]}` from this instruction's own import and its own real
+            // argument operands, and declines (`None` — today's behaviour) for the three
+            // raising BIFs, for a raise that cannot land, and for anything it cannot
+            // name. A guard failure (`fail != NO_FAIL`, the arm below) arms nothing.
+            Err(e) if fail == NO_FAIL => {
+                let head =
+                    bif_frame::bif_head_item(self, ctx, module, module_name, function_name, args)?;
+                self.raise_bif_error_with_head(module, e, head, ctx)
+            }
             // Guard failure: jump to the fail label.
             Err(_) => {
                 let (func, pc) = resolve(labels, fail)?;

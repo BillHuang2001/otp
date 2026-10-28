@@ -115,6 +115,7 @@ use raise::{classify_class, install_class_atom, raise_error_atom, raise_error_tu
 use stacktrace::symbolic_stacktrace;
 
 mod raise;
+pub(crate) mod bif_frame;
 pub(crate) mod callee;
 pub(crate) mod stacktrace;
 
