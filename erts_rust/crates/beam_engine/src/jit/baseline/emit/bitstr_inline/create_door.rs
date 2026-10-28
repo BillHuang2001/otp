@@ -25,12 +25,13 @@
 //!
 //! ```text
 //!   <the accumulator term, from its x-register or its Y slot>    ; no store
-//!   is_boxed        off fallback                                 ; guard
-//!   not a bare header word  off fallback                         ; guard
-//!   header == HEADER_SUB_BITS       off fallback                 ; guard
-//!   start == 0                      off fallback                 ; guard
-//!   base = [p + BASE] & !FLAGS      off fallback / zero          ; 2 guards
-//!   end = [p + END], end % 8 == 0   off fallback                 ; guard
+//!   test rax, 1                     ; is_boxed        off fallback   (test_ri)
+//!   test rax, 3                     ; not a header    off fallback   (test_ri)
+//!   and  rax, -8                    ; boxed_val, IN PLACE
+//!   cmp  [rax + HEADER], HEADER_SUB_BITS  off fallback            (cmp_ri)
+//!   start == 0                      off fallback                 (mov + test)
+//!   base = [rax + BASE] & !FLAGS    off fallback / zero          (mov + and_ri + test)
+//!   end = [rax + END], end % 8 == 0 off fallback                 (mov + test_ri)
 //!   mov rdi,rt ; <position store> ; movabs rcx,tail_bits
 //!   movabs r11,jit_append_cursor ; call r11                      ; the one remaining call
 //!   test rax, rax ; je fallback                                  ; the door's own refusal
@@ -38,6 +39,13 @@
 //!
 //! `rax` answers the **byte cursor** `base + end / 8` on success and `0` on every refusal,
 //! which is exactly what the aligned field phase stores its bytes at.
+//!
+//! The boxed pointer is untagged **in place** (`and rax, -8`) rather than in a second
+//! register, and the accumulator's **term word is dead from that point on**: every later use
+//! of the accumulator re-reads it — from its x-register's cache register or from `machine.x`
+//! (`Loc::load_x`), or from its `Y` slot (`emit_y_slot_value`) — in phase (5)'s window-end
+//! commit and phase (6)'s destination store, and the post-call `test rax, rax` reads the
+//! **call's** answer, not the term. No path after the `and` can observe the untagged word.
 //!
 //! # Why the proof is here and not in the helper
 //!
@@ -71,12 +79,12 @@
 //!
 //! # Registers
 //!
-//! Only caller-saved scratch: `rax` (the term, then the door's answer), `rcx`/`rdx` (constant
-//! and compare scratch, then the ABI's third and fourth arguments), `rsi` (the payload base,
-//! the ABI's second argument), `r8` (the accumulator's block pointer, dead before the call)
-//! and `rdi` (the runtime). `rbx` (`machine.x`'s base), `rsp` and every cache register are
-//! untouched, so `emit/regalloc.rs` needs no change; `rsi`/`rdx`/`rcx` are argument
-//! **registers**, i.e. nothing is kept live across the call.
+//! Only caller-saved scratch: `rax` (the term, untagged in place, then the door's answer),
+//! `rcx`/`rdx` (the header / `start` compare scratch and a guard's constant, then the ABI's
+//! third and fourth arguments), `rsi` (the payload base, the ABI's second argument) and `rdi`
+//! (the runtime). `rbx` (`machine.x`'s base), `rsp` and every cache register are untouched, so
+//! `emit/regalloc.rs` needs no change; `rsi`/`rdx`/`rcx` are argument **registers**, i.e.
+//! nothing is kept live across the call.
 //!
 //! # The frozen layouts it reads
 //!
@@ -121,6 +129,28 @@ const _: () = assert!(
 /// the payload pointer (`beam_term::ERL_SUB_BITS_FLAG_MASK` is `0x3`).
 const SUB_BITS_POINTER_MASK: i64 = !(ERL_SUB_BITS_FLAG_MASK as i64);
 
+// Every mask and constant guard below is used through one of [`CodeBuffer`]'s
+// **register-immediate** encoders (`test_ri`/`cmp_ri`/`and_ri`/`add_ri`), which take the
+// constant as a sign-extended `imm32`. The four twins below are that form, each pinned
+// against the `i64` item it narrows, so a mask that outgrew an `imm32` would fail the build
+// rather than silently drop its high bits.
+
+/// [`NOT_BOXED_MASK`] as the `imm32` of [`CodeBuffer::test_ri`].
+const NOT_BOXED_MASK_I32: i32 = NOT_BOXED_MASK as i32;
+const _: () = assert!(NOT_BOXED_MASK == NOT_BOXED_MASK_I32 as i64);
+/// [`PRIMARY_MASK`] as the `imm32` of [`CodeBuffer::test_ri`].
+const PRIMARY_MASK_I32: i32 = PRIMARY_MASK as i32;
+const _: () = assert!(PRIMARY_MASK == PRIMARY_MASK_I32 as i64);
+/// [`POINTER_MASK`] as the `imm32` of [`CodeBuffer::and_ri`].
+const POINTER_MASK_I32: i32 = POINTER_MASK as i32;
+const _: () = assert!(POINTER_MASK == POINTER_MASK_I32 as i64);
+/// [`SUB_BITS_POINTER_MASK`] as the `imm32` of [`CodeBuffer::and_ri`].
+const SUB_BITS_POINTER_MASK_I32: i32 = SUB_BITS_POINTER_MASK as i32;
+const _: () = assert!(SUB_BITS_POINTER_MASK == SUB_BITS_POINTER_MASK_I32 as i64);
+/// [`SUB_BITS_HEADER`] as the `imm32` of [`CodeBuffer::cmp_ri`].
+const SUB_BITS_HEADER_I32: i32 = SUB_BITS_HEADER as i32;
+const _: () = assert!(SUB_BITS_HEADER == SUB_BITS_HEADER_I32 as i64);
+
 /// The byte offset of an `ErlSubBits`'s `base_flags` word (word 1) — the payload pointer
 /// plus its low flag bits (`erts/emulator/beam/erl_bits.h:60-82`).
 ///
@@ -132,7 +162,7 @@ const SUB_BITS_BASE_DISP: i32 = (SUB_BITS_BASE_WORD * core::mem::size_of::<beam_
 /// The divisor of a whole-byte window end: `end % 8 == 0` is C's append **position** gate for
 /// `unit == 8` (`append_unit_allows`, `erl_bits.c:1778-1784`), and the aligned route's byte
 /// cursor needs it (`beam_term::bitstring::bit_count_to_bytes`'s rounding denominator).
-const BITS_PER_BYTE: i64 = 8;
+const BITS_PER_BYTE: i32 = 8;
 
 /// Emit the aligned append door for the accumulator at `source`, appending `tail_bits` bits.
 ///
@@ -169,21 +199,20 @@ pub(super) fn emit_append_cursor(
 
     // (2) `beam_term::refc::is_refc_binary`'s first clause — `is_boxed_term(t)`, i.e. the
     // `is_boxed` bit trick and then "not a bare header word" (which `is_boxed` alone admits,
-    // and which would otherwise be dereferenced as a pointer).
-    buffer.mov_ri(Reg::Rcx, NOT_BOXED_MASK)?;
-    buffer.test_rr(Reg::Rax, Reg::Rcx)?;
+    // and which would otherwise be dereferenced as a pointer). Both are register-immediate
+    // tests, so each mask costs one instruction and no `movabs`.
+    buffer.test_ri(Reg::Rax, NOT_BOXED_MASK_I32)?;
     buffer.jcc(Cond::Ne, fallback)?;
-    buffer.mov_ri(Reg::Rcx, PRIMARY_MASK)?;
-    buffer.test_rr(Reg::Rax, Reg::Rcx)?;
+    buffer.test_ri(Reg::Rax, PRIMARY_MASK_I32)?;
     buffer.jcc(Cond::E, fallback)?;
-    // `boxed_val(t)` — the accumulator's header word address, kept in `r8`.
-    buffer.mov_ri(Reg::R8, POINTER_MASK)?;
-    buffer.and_rr(Reg::R8, Reg::Rax)?;
+    // `boxed_val(t)` — the accumulator's header word address, untagged **in place**. The term
+    // word is dead here (see the module docs: every later read of the accumulator re-loads it),
+    // so no second register is spent on the pointer.
+    buffer.and_ri(Reg::Rax, POINTER_MASK_I32)?;
     // Its header must say `ErlSubBits`: a `BinRef`, a tuple, an `ErlHeapBits` — every other
     // boxed term — is not a refc binary.
-    buffer.mov_rm(Reg::Rcx, Reg::R8, HEADER_DISP)?;
-    buffer.mov_ri(Reg::Rdx, SUB_BITS_HEADER)?;
-    buffer.cmp_rr(Reg::Rcx, Reg::Rdx)?;
+    buffer.mov_rm(Reg::Rcx, Reg::Rax, HEADER_DISP)?;
+    buffer.cmp_ri(Reg::Rcx, SUB_BITS_HEADER_I32)?;
     buffer.jcc(Cond::Ne, fallback)?;
 
     // (3) `orig` (word 4) is deliberately **not** tested, and the sequence is therefore one
@@ -213,23 +242,21 @@ pub(super) fn emit_append_cursor(
 
     // (4) `start` (word 2) must be `0`: C asserts it for both append forms
     // (`erl_bits.c:1943-1948`), because an in-place append writes at absolute payload offsets.
-    buffer.mov_rm(Reg::Rcx, Reg::R8, SUB_BITS_START_DISP)?;
+    buffer.mov_rm(Reg::Rcx, Reg::Rax, SUB_BITS_START_DISP)?;
     buffer.test_rr(Reg::Rcx, Reg::Rcx)?;
     buffer.jcc(Cond::Ne, fallback)?;
 
     // (5) The payload base (word 1 without its flag bits) — non-null, and the helper's second
     // argument. It is the key the machine's writable-payload registry is asked about.
-    buffer.mov_rm(Reg::Rsi, Reg::R8, SUB_BITS_BASE_DISP)?;
-    buffer.mov_ri(Reg::Rcx, SUB_BITS_POINTER_MASK)?;
-    buffer.and_rr(Reg::Rsi, Reg::Rcx)?;
+    buffer.mov_rm(Reg::Rsi, Reg::Rax, SUB_BITS_BASE_DISP)?;
+    buffer.and_ri(Reg::Rsi, SUB_BITS_POINTER_MASK_I32)?;
     buffer.test_rr(Reg::Rsi, Reg::Rsi)?;
     buffer.jcc(Cond::E, fallback)?;
 
     // (6) The window end (word 3) — the helper's third argument — which must be on a byte
     // boundary for this route's cursor (`start == 0`, so the word is the window's bit size).
-    buffer.mov_rm(Reg::Rdx, Reg::R8, SUB_BITS_END_DISP)?;
-    buffer.mov_ri(Reg::Rcx, BITS_PER_BYTE - 1)?;
-    buffer.test_rr(Reg::Rdx, Reg::Rcx)?;
+    buffer.mov_rm(Reg::Rdx, Reg::Rax, SUB_BITS_END_DISP)?;
+    buffer.test_ri(Reg::Rdx, BITS_PER_BYTE - 1)?;
     buffer.jcc(Cond::Ne, fallback)?;
 
     // (7) The one remaining call: the machine's capacity lookup and the room rule. The
