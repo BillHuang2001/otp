@@ -955,14 +955,34 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
 ///
 /// `rax` (the cursor) is never clobbered: `rdx` carries the extracted byte and `rcx` a `Y`
 /// value, and the displacement is `cursor + offset_bits / 8`.
+///
+/// A **run** of consecutive one-byte fields (`bits == 8`) that all read the same [`Loc`] shares
+/// one load and one `sar 4`: they all extract the same byte, so one extraction serves every store
+/// and the run costs `2 + n` instructions instead of `3n`. A wider field is never grouped — its
+/// descending `sar 8` chain restarts per field — so it keeps the per-field sequence below.
 fn emit_aligned_fields(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     prepared: &[PreparedField<'_>],
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
-    for field in prepared {
-        match field {
+    let mut at = 0usize;
+    while at < prepared.len() {
+        let run = one_byte_run(prepared, at);
+        if run > 1 {
+            if let PreparedField::Bits { value, .. } = &prepared[at] {
+                read_field_value(buffer, allocation, value, highest_touched)?;
+                buffer.sar_ri(Reg::Rdx, 4)?;
+                for field in &prepared[at..at + run] {
+                    if let PreparedField::Bits { offset_bits, .. } = field {
+                        buffer.mov_mr8(Reg::Rax, (*offset_bits / 8) as i32, Reg::Rdx)?;
+                    }
+                }
+            }
+            at += run;
+            continue;
+        }
+        match &prepared[at] {
             PreparedField::Bits {
                 value,
                 bits,
@@ -975,13 +995,7 @@ fn emit_aligned_fields(
                 // One load per field, into `Rdx`, and the bytes are then peeled off it in
                 // place — never one load per byte (a wider field used to pay `nbytes` loads of
                 // the same word and `nbytes` full-width shifts).
-                match *value {
-                    Loc::X(_) => value.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
-                    Loc::Y(k) => {
-                        emit_y_slot_value(buffer, Reg::Rcx, k)?;
-                        buffer.mov_rr(Reg::Rdx, Reg::Rcx)?;
-                    }
-                }
+                read_field_value(buffer, allocation, value, highest_touched)?;
                 // Byte `i` (MSB first) of the big-endian field is word bits
                 // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift is
                 // ARITHMETIC precisely because the caller wants
@@ -1026,8 +1040,60 @@ fn emit_aligned_fields(
                 }
             }
         }
+        at += 1;
     }
     Ok(())
+}
+
+/// How many consecutive [`PreparedField::Bits`] fields starting at `start` are one-byte fields
+/// reading the **same** location — the run [`emit_aligned_fields`] shares one extraction across.
+///
+/// A run of one is the "no grouping" answer, so a caller can treat `> 1` as the grouped case.
+fn one_byte_run(prepared: &[PreparedField<'_>], start: usize) -> usize {
+    let PreparedField::Bits {
+        value,
+        bits: 8,
+        ..
+    } = &prepared[start]
+    else {
+        return 1;
+    };
+    let mut run = 1usize;
+    while let Some(PreparedField::Bits {
+        value: next,
+        bits: 8,
+        ..
+    }) = prepared.get(start + run)
+    {
+        if next != value {
+            break;
+        }
+        run += 1;
+    }
+    run
+}
+
+/// Load a field value into `rdx`: an x-register through [`Loc::load_x`] (a **cached** value out of
+/// its callee-saved machine register, an uncached one out of `machine.x`), a `Y` slot through its
+/// re-derived address in `rcx`.
+///
+/// The `Y` form re-derives the slot address rather than reusing a hoisted one: nothing between the
+/// up-front window guard and here pushes a frame (the append door only reads machine state), so the
+/// published window still holds the slot and a second guard must not be emitted.
+fn read_field_value(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    value: &Loc,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    match *value {
+        Loc::X(_) => value.load_x(buffer, allocation, Reg::Rdx, highest_touched),
+        Loc::Y(k) => {
+            emit_y_slot_value(buffer, Reg::Rcx, k)?;
+            buffer.mov_rr(Reg::Rdx, Reg::Rcx)?;
+            Ok(())
+        }
+    }
 }
 
 /// The **general** (bit-granular) route's field-write phase.
