@@ -359,6 +359,17 @@ fn assert_down(payload: Eterm, head: Option<Eterm>, kind: Atom, reason: Eterm) -
     }
 }
 
+/// The **head** element (element 0) of a live DOWN payload — the monitor's tag, or the default
+/// `'DOWN'` atom.
+///
+/// [`assert_down`] returns the *target* (element 3), so a caller that wants to compare the head
+/// must read it here rather than reusing that return value.
+fn head_of(payload: Eterm) -> Eterm {
+    // SAFETY: `payload` is the live 5-tuple a DOWN builder produced on the recipient's heap (or in
+    // its message fragment); element 0 is in bounds.
+    unsafe { tuple_element(payload, 0) }
+}
+
 /// Asserts the target element of a DOWN is the pid/port immediate `expected`.
 fn assert_immediate_target(target: Eterm, expected: Eterm) {
     assert_eq!(target, expected, "the DOWN target is the expected immediate");
@@ -610,7 +621,8 @@ fn a_heap_resident_tag_reaches_the_notification_in_every_shape() {
         .expect("a heap-resident tag of any shape is accepted");
     f.table.terminate(target, boom).expect("the target dies");
     let payload = f.sole_payload(watcher);
-    let head = assert_down(payload, None, process, boom);
+    assert_immediate_target(assert_down(payload, None, process, boom), target.to_eterm());
+    let head = head_of(payload);
     // The delivered head is a *copy*, structurally `=:=` the original (compared against a term
     // rebuilt on a fresh arena, so nothing here reads the watcher's heap twice).
     let mut arena = Heap::new(64).expect("the expectation arena allocates");
@@ -632,9 +644,13 @@ fn a_heap_resident_tag_reaches_the_notification_in_every_shape() {
         .monitor_with_tag(watcher, target, MonitorKind::Process, Some(tag))
         .expect("a heap tuple tag is accepted");
     f.table.terminate(target, boom).expect("the target dies");
-    let head = assert_down(f.sole_payload(watcher), None, process, boom);
-    let expected = Heap::new(8)
-        .expect("the expectation arena allocates")
+    let payload = f.sole_payload(watcher);
+    assert_immediate_target(assert_down(payload, None, process, boom), target.to_eterm());
+    let head = head_of(payload);
+    // The expectation lives on a bound arena: the delivered head points into the payload, so the
+    // arena it is compared against must outlive the comparison.
+    let mut arena = Heap::new(8).expect("the expectation arena allocates");
+    let expected = arena
         .tuple(&[make_small(1), make_small(2), make_small(3)])
         .expect("the expected tuple fits");
     assert!(compare::eq(head, expected, &f.names), "the tuple tag is echoed");
@@ -660,11 +676,11 @@ fn a_heap_resident_tag_reaches_the_notification_in_every_shape() {
         .monitor_with_tag(watcher, target, MonitorKind::Process, Some(tag))
         .expect("a heap map tag is accepted");
     f.table.terminate(target, boom).expect("the target dies");
-    let head = assert_down(f.sole_payload(watcher), None, process, boom);
-    let expected = {
-        let mut arena = Heap::new(map_words_capacity(1) + 1).expect("the arena allocates");
-        one_pair_map(&mut arena, &f.names, make_atom(k), make_small(7))
-    };
+    let payload = f.sole_payload(watcher);
+    assert_immediate_target(assert_down(payload, None, process, boom), target.to_eterm());
+    let head = head_of(payload);
+    let mut arena = Heap::new(map_words_capacity(1) + 1).expect("the arena allocates");
+    let expected = one_pair_map(&mut arena, &f.names, make_atom(k), make_small(7));
     assert!(compare::eq(head, expected, &f.names), "the map tag is echoed");
     f.drain_one(watcher);
 
@@ -691,7 +707,9 @@ fn a_heap_resident_tag_reaches_the_notification_in_every_shape() {
         .monitor_with_tag(watcher, target, MonitorKind::Process, Some(tag))
         .expect("a big-binary tag is accepted");
     f.table.terminate(target, boom).expect("the target dies");
-    let head = assert_down(f.sole_payload(watcher), None, process, boom);
+    let payload = f.sole_payload(watcher);
+    assert_immediate_target(assert_down(payload, None, process, boom), target.to_eterm());
+    let head = head_of(payload);
     // SAFETY: `head` is the live binary the delivered DOWN carries, owned by the watcher's heap.
     let (bytes, bits) = unsafe { binary_view(head) };
     assert_eq!(bits, 8000, "the 1000-byte tag arrives with all 8000 bits");
@@ -781,7 +799,8 @@ fn a_heap_resident_tag_survives_the_watchers_own_garbage_collection() {
     // Only now does the target die: the DOWN must still carry the tag, `=:=` the original.
     f.table.terminate(target, boom).expect("the target dies");
     let payload = f.sole_payload(watcher);
-    let head = assert_down(payload, None, process, boom);
+    assert_immediate_target(assert_down(payload, None, process, boom), target.to_eterm());
+    let head = head_of(payload);
     let mut arena = Heap::new(64).expect("the expectation arena allocates");
     let expected = multi_call_tag(&mut arena, &f.names, embedded, a, k);
     assert!(
@@ -813,7 +832,7 @@ fn a_born_down_noproc_down_carries_a_heap_resident_tag() {
         _ = erlang:monitor(process, nobody_here, [{tag, T}]),
         M = receive X -> X after 2000 -> timeout end,
         io:format("~p/~p/~p~n",
-                  [element(1, M) =:= T, element(3, M) =:= {nobody_here, node()},
+                  [element(1, M) =:= T, element(4, M) =:= {nobody_here, node()},
                    element(5, M)])
     "#;
     if !expect_oracle(named_expr, "true/true/noproc") {
@@ -846,18 +865,12 @@ fn a_born_down_noproc_down_carries_a_heap_resident_tag() {
         .table
         .monitor_with_tag(watcher, dead, MonitorKind::Process, Some(tag))
         .expect("a non-live target is not an error");
-    let expected = {
-        let mut arena = Heap::new(64).expect("the expectation arena allocates");
-        multi_call_tag(&mut arena, &f.names, embedded, a, k)
-    };
+    let mut arena = Heap::new(64).expect("the expectation arena allocates");
+    let expected = multi_call_tag(&mut arena, &f.names, embedded, a, k);
     let payload = f.sole_payload(watcher);
-    let head = assert_down(payload, None, process, noproc);
+    assert_immediate_target(assert_down(payload, None, process, noproc), dead.to_eterm());
+    let head = head_of(payload);
     assert!(compare::eq(head, expected, &f.names), "the born-down tag is the tag");
-    assert_immediate_target(
-        // SAFETY: the live DOWN tuple; element 3 is in bounds.
-        unsafe { tuple_element(payload, 3) },
-        dead.to_eterm(),
-    );
     // The monitor was never recorded (nothing to watch), so the tag's slot was released with the
     // DOWN it produced.
     assert!(f
@@ -879,16 +892,15 @@ fn a_born_down_noproc_down_carries_a_heap_resident_tag() {
     let expected_target = f.tuple_in(watcher, &[make_atom(nobody), make_atom(node)]);
     let payload = f.sole_payload(watcher);
     let delivered = assert_down(payload, None, process, noproc);
-    let expected_tag = Heap::new(8)
-        .expect("the expectation arena allocates")
+    let mut arena = Heap::new(8).expect("the expectation arena allocates");
+    let expected_tag = arena
         .tuple(&[make_small(5), make_small(6)])
         .expect("the expected tuple fits");
     assert!(
         compare::eq(delivered, expected_target, &f.names),
         "the DOWN target is the `{{Name, Node}}` pair"
     );
-    // SAFETY: the live DOWN tuple; element 0 is in bounds.
-    let head = unsafe { tuple_element(payload, 0) };
+    let head = head_of(payload);
     assert!(
         compare::eq(head, expected_tag, &f.names),
         "the named born-down DOWN carries the heap-resident tag"
@@ -971,8 +983,7 @@ fn an_exempt_watcher_gets_a_tagged_down_through_a_message_fragment() {
     );
 
     // The tag rides the fragment, `=:=` the original, and inside the fragment rather than the heap.
-    // SAFETY: the live DOWN tuple the fragment holds; elements 0/2/3/4 are in bounds.
-    let head = unsafe { tuple_element(payload, 0) };
+    let head = head_of(payload);
     assert!(
         fragment.contains(head),
         "the tag lives inside the fragment, never on the watcher's heap"
@@ -981,8 +992,8 @@ fn an_exempt_watcher_gets_a_tagged_down_through_a_message_fragment() {
         !f.on_young_heap(watcher, head),
         "not one word of the tag was materialised on the heap"
     );
-    let expected_tag = Heap::new(8)
-        .expect("the expectation arena allocates")
+    let mut arena = Heap::new(8).expect("the expectation arena allocates");
+    let expected_tag = arena
         .tuple(&[make_small(1), make_small(2), make_small(3)])
         .expect("the expected tuple fits");
     assert!(
@@ -1010,8 +1021,7 @@ fn an_exempt_watcher_gets_a_tagged_down_through_a_message_fragment() {
         .expect("the watcher's own garbage collection runs");
     let after = f.sole_payload(watcher);
     assert_eq!(after, payload, "the fragment-resident DOWN did not move");
-    // SAFETY: the same live 5-tuple, still inside the fragment.
-    let head_after = unsafe { tuple_element(after, 0) };
+    let head_after = head_of(after);
     assert!(
         compare::eq(head_after, expected_tag, &f.names),
         "the watcher's garbage collection does not disturb a fragment-resident tag"
@@ -1089,17 +1099,15 @@ fn materialising_a_tag_grows_the_nursery_without_collecting() {
     // tag's route may only **grow** the nursery (address-preserving) and re-copy — never collect.
     let mut f = Fixture::new();
     let process = f.atom("process");
-    let reason = {
-        // A boxed reason that the receiver's five free words can take.
-        let mut arena = Heap::new(8).expect("the reason arena allocates");
-        arena
-            .tuple(&[make_small(11), make_small(12)])
-            .expect("the reason tuple fits")
-    };
     let watcher = f
         .table
         .spawn(HeapPolicy::default())
         .expect("a watcher process");
+    // The reason is a boxed tuple small enough for the receiver's five free words — built on the
+    // **dying target's** own heap, exactly where a real death's reason lives when the signal copies
+    // it, so the fixture's reason can never dangle under the copy.
+    let target = f.table.spawn_default().expect("a target process");
+    let reason = f.tuple_in(target, &[make_small(11), make_small(12)]);
     // A tag far larger than the reason, so the nursery takes the reason and refuses the tag.
     let tag_elems: Vec<Eterm> = (0..39).map(|i| make_small(i as i64)).collect();
     let tag = f.tuple_in(watcher, &tag_elems);
@@ -1119,7 +1127,6 @@ fn materialising_a_tag_grows_the_nursery_without_collecting() {
         .collector()
         .minor_gcs();
 
-    let target = f.table.spawn_default().expect("a target process");
     f.table
         .monitor_with_tag(watcher, target, MonitorKind::Process, Some(tag))
         .expect("the tag is accepted");
@@ -1147,15 +1154,33 @@ fn materialising_a_tag_grows_the_nursery_without_collecting() {
         "no collection may run between the reason copy and the tag copy"
     );
 
-    // Both halves of the DOWN are correct, `=:=` the inputs — the reason did not dangle.
+    // Both halves of the DOWN are correct, `=:=` the inputs — the reason did not dangle. The
+    // delivered reason is a *copy* of the dying target's boxed tuple, so it is compared
+    // structurally against a rebuilt expectation (word equality would only work for an immediate).
     let payload = f.sole_payload(watcher);
-    let head = assert_down(payload, None, process, reason);
-    let expected_tag = {
-        let mut arena = Heap::new(48).expect("the expectation arena allocates");
-        arena
-            .tuple(&tag_elems)
-            .expect("the expected tag tuple fits")
-    };
+    let mut reason_arena = Heap::new(8).expect("the reason expectation arena allocates");
+    let expected_reason = reason_arena
+        .tuple(&[make_small(11), make_small(12)])
+        .expect("the expected reason tuple fits");
+    // SAFETY: the live DOWN tuple; the five element slots are in bounds.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5, "a DOWN message is a 5-tuple");
+        assert!(
+            is_reference(tuple_element(payload, 1)),
+            "element 1 is a reference"
+        );
+        assert_eq!(tuple_element(payload, 2), make_atom(process));
+        assert_eq!(tuple_element(payload, 3), target.to_eterm());
+        assert!(
+            compare::eq(tuple_element(payload, 4), expected_reason, &f.names),
+            "the delivered reason is the dying target's own tuple, copied `=:=` without dangling"
+        );
+    }
+    let head = head_of(payload);
+    let mut arena = Heap::new(48).expect("the expectation arena allocates");
+    let expected_tag = arena
+        .tuple(&tag_elems)
+        .expect("the expected tag tuple fits");
     assert!(compare::eq(head, expected_tag, &f.names), "the tag is the tag");
     assert!(
         f.on_young_heap(watcher, head),
@@ -1253,8 +1278,8 @@ fn a_tagged_named_monitor_reports_the_name_node_target() {
         .expect("a heap-resident tag on a named monitor is accepted");
     f.table.terminate(target, normal).expect("the target is live");
     let expected_target = f.tuple_in(watcher, &[make_atom(other), make_atom(node)]);
-    let expected_tag = Heap::new(8)
-        .expect("the expectation arena allocates")
+    let mut arena = Heap::new(8).expect("the expectation arena allocates");
+    let expected_tag = arena
         .tuple(&[make_small(31), make_small(32)])
         .expect("the expected tuple fits");
     let payload = f.sole_payload(watcher);
@@ -1263,9 +1288,8 @@ fn a_tagged_named_monitor_reports_the_name_node_target() {
         compare::eq(delivered, expected_target, &f.names),
         "the DOWN target is the `{{Name, Node}}` pair"
     );
-    // SAFETY: the live DOWN tuple; element 0 is in bounds.
     assert!(
-        compare::eq(unsafe { tuple_element(payload, 0) }, expected_tag, &f.names),
+        compare::eq(head_of(payload), expected_tag, &f.names),
         "the named DOWN's head is the heap-resident tag"
     );
 }
@@ -1411,8 +1435,8 @@ fn a_tagged_port_monitor_delivers_the_tagged_port_down_and_the_untagged_one_is_u
     f.table
         .port_closed(&mut ports, port, normal)
         .expect("the port is live");
-    let expected_tag = Heap::new(8)
-        .expect("the expectation arena allocates")
+    let mut arena = Heap::new(8).expect("the expectation arena allocates");
+    let expected_tag = arena
         .tuple(&[make_small(41), make_small(42)])
         .expect("the expected tuple fits");
     let payload = f.sole_payload(watcher);
@@ -1420,9 +1444,8 @@ fn a_tagged_port_monitor_delivers_the_tagged_port_down_and_the_untagged_one_is_u
         assert_down(payload, None, port_atom, normal),
         port.to_eterm(),
     );
-    // SAFETY: the live DOWN tuple; element 0 is in bounds.
     assert!(
-        compare::eq(unsafe { tuple_element(payload, 0) }, expected_tag, &f.names),
+        compare::eq(head_of(payload), expected_tag, &f.names),
         "the port DOWN's head is the heap-resident tag"
     );
     assert!(
