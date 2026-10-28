@@ -23,7 +23,7 @@ The `m<session>-` prefix names the measurement session the files belong to; the 
 - `m21-load-record.md` + `m21-xrun-load.log` — the per-pass `/proc/loadavg` before/after record, the command shape, the two spike-affected rounds, the single withheld figure (`r7/rust churn`) and the memory rows.
 - `m21-budgetprobe-all.json` / `.txt` — one supplementary `--runtime all --quick` pass, run **only** so the both-sides-in-one-report budget ratio rows can be judged and so `bench compare` has a report carrying both sides; it is runtime-major and ordering-biased, so it is **not** a timing source.
 - `m21-compare-cross-runtime.txt` — `bench compare m21-budgetprobe-all.json` (the driver's own cross-runtime diff of that supplementary pass).
-- Its workload set is deliberately narrow: `slice` and the six other `Runtimes::Both` workloads are **not** in m21, so a footprint or per-call figure for them comes from `m22` (start-up, `slice`, memory, the four GC-workstream per-unit rows) or from `m20`/m19 (everything else).
+- Its workload set is deliberately narrow: `slice` and the six other `Runtimes::Both` workloads are **not** in m21, so a footprint or per-call figure for them comes from `m22` (start-up, `slice`, memory, the four GC-workstream per-unit rows) or from `m19` (everything else).
 
 ### `m15-` — the superseded full-suite session (2026-10-17, `/proc/loadavg` ≈2–5)
 - `m15-bench-xrun.json` — **the full cross-runtime report**: `run --full --runtime all`, the six `Runtimes::Both` workloads × both runtimes (12/12 rows `ok`). The source of every headline number in `../RESULTS.md` §2/§3.
@@ -55,6 +55,7 @@ Each session's `m*-load-record.md` / `m*-tool-targets-notes.md` pins the host co
 - **Never compare a Rust tier column with the `sys` column without saying which is which.** The `-interp`/`-quick` pair exists precisely to keep the two Rust tiers separable from the system-ERTS column.
 - **A per-round ratio is only comparable with a record taken against the same oracle.** `m22`'s and `m21`'s `sys` side are both OTP **29.1.2 / erts-17.1.1** (the same store path), so those two records are mutually diffable row for row; m17–m20 named 29.1.1 / erts-17.1, so quote a cross-record ratio only after checking which `erl` each side names (`m22-xrun-ratios.txt` §G, `m21-xrun-ratios.txt` §G).
 - **A `--runtime all` report is a supplementary artefact, never a timing source** (`BOTTLENECKS.md` §1.1 bans the runtime-major ordering as a headline): `m21-budgetprobe-all.*` exists only to judge the both-sides budget rows and to give `bench compare` one report holding both sides, because two single-side reports share no `(workload, runtime)` key and the two-file mode then reports every row `only-in-a`/`only-in-b`.
+- **No `m20-*` artifact exists here**, so a provenance statement naming "m17–m20" (or "m20's record") means m17–m19 plus the artifact-less `m20` that the `erts_rust`-level docs name — every artifact-backed record in this directory is `m19-*`, `m21-*` or `m22-*`.
 
 ## See Also
 - `../RESULTS.md` → the m15 summary tables, exact commands, the paired-estimator record (§3.4) and the still-open items.

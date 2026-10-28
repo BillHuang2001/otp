@@ -13,7 +13,7 @@ Sides: `sys` = the system ERTS on `PATH` — **Erlang/OTP 29.1.2 / erts-17.1.1**
 `rust` = `erts_rust/target/release/beam_rt` at its default baseline-JIT tier (`version=30`), i.e. the binary this tree's
 HEAD builds. **Oracle caveat, carried deliberately:** the tree pins OTP **30.0-rc0 / erts-17.1**, while the sandbox oracle is
 OTP **29.1.2 / erts-17.1.1** — and m21 already named that same 29.1.2 oracle (its archived `runtimes[].program` is the same
-store path), so m21 <-> m22 is oracle-matched; the 29.1.1 / erts-17.1 oracle belongs to m20/m19 and older records only.
+store path), so m21 <-> m22 is oracle-matched; the 29.1.1 / erts-17.1 oracle belongs to m19 and older records only (the artifact-less m20 named in `BOTTLENECKS.md` §0 has no reports here).
 
 ## Command shape (one matched round = two single-side passes, alternating order)
 ```sh
