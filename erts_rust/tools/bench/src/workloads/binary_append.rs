@@ -158,8 +158,12 @@ const OUT_BYTES_PER_CALL: i64 = 4 * 2 * INPUT_ARG;
 /// 5 000, 10 000}, 3–4 interleaved rounds pinned with `taskset -c 3`, one process at a time, with
 /// the `N = 0` pass's CPU time subtracted ⇒ ≈200–211 µs/call (median ≈204 µs/call; the user-only
 /// slope is ≈170 µs/call). The ladder is at `/proc/loadavg` ∈ 110–160, and CPU time is used
-/// because that is contention-insensitive where a wall-clock marginal is not. 204 µs is the
-/// value at [`CASE`]'s `n_rust`, so the pinned loop work is the conservative one.
+/// because that is contention-insensitive where a wall-clock marginal is not.
+/// It is deliberately the **conservative** figure of the two the pin has: the driver's own
+/// quiet-window *paired marginal* (`bench run --quick --runtime rust --workloads binary_append`
+/// against the merged release binaries, `taskset -c 3`, 3 paired rounds, 1-min load 5.5–6.4)
+/// reads ≈157.5 µs/call, so the ≥0.5 s loop-work assertion at [`CASE`]'s `n_rust` is checked
+/// against the dearer number.
 #[cfg_attr(not(test), allow(dead_code))]
 const MEASURED_PER_CALL_NS_RUST: f64 = 204_000.0;
 
@@ -169,11 +173,11 @@ const MEASURED_PER_CALL_NS_RUST: f64 = 204_000.0;
 /// timed loop must do enough work that its marginal cost stands clear of that runtime's own
 /// run-to-run boot/startup jitter** (the Rust side's boot jitter is ≈±0.1 s around a ≈0.7–1.5 s
 /// boot). The Rust-side floor is therefore **≥0.5 s of loop work**; at the measured
-/// [`MEASURED_PER_CALL_NS_RUST`] (≈204 µs/call) `n_rust = 4_000` calls is ≈0.82 s of work
-/// (≈0.64 s at a quieter host's ≈160 µs/call), i.e. ≥0.5 s with a 1.28–1.63× margin, and far
-/// inside `beam_rt`'s non-overridable 60 s `run`-action deadline. The oracle's much smaller
-/// startup jitter (tens of ms) needs a correspondingly smaller marginal: `n_sys = 50_000`
-/// calls at ≈110 µs/call is ≈5.5 s.
+/// [`MEASURED_PER_CALL_NS_RUST`] (≈204 µs/call) `n_rust = 4_000` calls is ≈0.82 s of work, and
+/// ≈630 ms (1.26× the floor) at the quiet-window driver marginal of ≈157.5 µs/call, i.e. ≥0.5 s
+/// with a 1.26–1.63× margin, and far inside `beam_rt`'s non-overridable 60 s `run`-action
+/// deadline. The oracle's much smaller startup jitter (tens of ms) needs a correspondingly
+/// smaller marginal: `n_sys = 50_000` calls at ≈110 µs/call is ≈5.5 s.
 ///
 /// **Maintenance rule:** when a case's measured per-call cost changes materially, re-derive
 /// `n_rust` so the loop work stays ≥0.5 s and re-pin it in

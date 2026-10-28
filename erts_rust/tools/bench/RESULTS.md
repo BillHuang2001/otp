@@ -448,7 +448,9 @@ Archive `out/` copies into `results/` with **only** the mechanical normalisation
 - **`foreign`'s and `binary_append`'s `case_<name>_ns_per_call` remain `N`-dependent on rust** (a
   common-mode per-op heap retention), so those per-call figures are comparable **only across runs at the
   same `N`**; the counts are the ones in §3.3. `binary_append`'s `n_rust` is now **4 000**, re-derived from
-  the merged runtime's measured ≈204 µs/call so the loop does ≈0.82 s of work and clears the ≥0.5 s rule —
+  the merged runtime's measured ≈204 µs/call (deliberately the conservative figure: the driver's own
+  quiet-window paired marginal reads ≈157.5 µs/call, i.e. ≈630 ms of loop work, 1.26× the floor) so the
+  loop does ≈0.82 s of work and clears the ≥0.5 s rule —
   the row no longer sits at the runtime's deadline cap, though `beam_rt`'s `RUN_DEADLINE = 60 s`
   (`crates/beam_rt/src/runtime/scheduler.rs:90`) remains **non-overridable** and the maintenance rule still
   applies: re-derive `n_rust` from the measured cost before changing anything there.
