@@ -92,6 +92,18 @@ pub const SEED_ATOMS: &[&str] = &[
     "EXIT",
     "file",
     "line",
+    // The cooked stacktrace's `{error_info, Map}` location extension:
+    // the extension's own key, the `module` key of a format-module map, the
+    // `cause` key an ext-info variant carries, and the three format modules OTP's
+    // `erl_stdlib_errors`/`erl_erts_errors`/`erl_kernel_errors` classification
+    // names. A raise that publishes a map names these itself, but a fixture whose
+    // source never mentions them cannot render one without the seed.
+    "error_info",
+    "module",
+    "cause",
+    "erl_erts_errors",
+    "erl_stdlib_errors",
+    "erl_kernel_errors",
 ];
 
 /// Loads a `.beam` image into the IR, interning its atoms (and its decoded

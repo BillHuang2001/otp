@@ -29,7 +29,7 @@
 //!
 //! * **Coverage** — every file [`Machine::with_roots`] hands over is walked (the used
 //!   X-register prefix, the whole Erlang stack, the used FR prefix) plus the machine's
-//!   five *loose* heap terms, which `with_roots` parks at the stack tail.
+//!   seven *loose* heap terms, which `with_roots` parks at the stack tail.
 //! * **Selection** — only `LIST`/`BOXED` words are reported; small integers, atoms and
 //!   `NIL` are skipped, because relocating an immediate is meaningless.
 //! * **Agreement** — the word set the walk reports equals the pointer-bearing subset of
@@ -82,11 +82,11 @@ fn raws(terms: impl IntoIterator<Item = Eterm>) -> Vec<usize> {
 /// * `x(0)` a boxed tuple, `x(1)` a small integer, `x(2)` a cons cell;
 /// * a 3-Y-slot frame holding `y(0)` a boxed tuple, `y(1)` `NIL`, `y(2)` an atom;
 /// * `fr(0)` a boxed tuple;
-/// * the two failed-clause latch slots, the pending exception's reason and the two
-///   supplied-trace **term** latches all armed (a boxed/cons term each way), which is
-///   the state `with_roots` parks at the stack tail.
+/// * the two failed-clause latch slots, the pending exception's reason, the two
+///   supplied-trace **term** latches and the two `error_info` latches all armed (a
+///   boxed/cons term each way), which is the state `with_roots` parks at the stack tail.
 ///
-/// Returns the machine and the nine pointer-bearing words it roots, in the order
+/// Returns the machine and the eleven pointer-bearing words it roots, in the order
 /// [`Machine::for_each_root`] documents (`x` prefix, stack, `fr` prefix, loose terms —
 /// [`Machine::loose_heap_terms`] order).
 fn roots_fixture() -> (Machine, Vec<Eterm>) {
@@ -100,6 +100,8 @@ fn roots_fixture() -> (Machine, Vec<Eterm>) {
     let reason = terms::make_list(&mut ctx, &[make_small(7)]).expect("a cons cell");
     let pending_trace = terms::make_list(&mut ctx, &[make_small(8)]).expect("a cons cell");
     let live_trace = terms::make_tuple(&mut ctx, &[make_small(9)]).expect("a boxed tuple");
+    let live_error_info = terms::make_list(&mut ctx, &[make_small(10)]).expect("a cons cell");
+    let pending_error_info = terms::make_tuple(&mut ctx, &[make_small(11)]).expect("a boxed tuple");
 
     let mut fixture = Fixture::new("m");
     let an_atom = make_atom(fixture.atom("an_atom"));
@@ -118,6 +120,8 @@ fn roots_fixture() -> (Machine, Vec<Eterm>) {
     machine.pending_exception = Some((ExceptionClass::Error, reason));
     machine.pending_supplied_term = Some(pending_trace);
     machine.raise_supplied_term = Some(live_trace);
+    machine.raise_error_info = Some(live_error_info);
+    machine.pending_error_info = Some(pending_error_info);
 
     (
         machine,
@@ -131,6 +135,8 @@ fn roots_fixture() -> (Machine, Vec<Eterm>) {
             reason,
             pending_trace,
             live_trace,
+            live_error_info,
+            pending_error_info,
         ],
     )
 }
@@ -142,12 +148,12 @@ fn for_each_root_enumerates_registers_stack_frames_and_the_loose_terms() {
     machine.for_each_root(|term| seen.push(term));
     assert_eq!(
         seen, expected,
-        "every rooted file and all five loose terms, in the documented order"
+        "every rooted file and all seven loose terms, in the documented order"
     );
     assert_eq!(
         seen.len(),
-        9,
-        "two x registers, one Y slot, one FR slot, five loose"
+        11,
+        "two x registers, one Y slot, one FR slot, seven loose"
     );
 }
 
@@ -341,6 +347,8 @@ fn loose_slot(machine: &Machine, slot: usize) -> Option<Eterm> {
         2 => machine.pending_exception.map(|(_class, reason)| reason),
         3 => machine.pending_supplied_term,
         4 => machine.raise_supplied_term,
+        5 => machine.raise_error_info,
+        6 => machine.pending_error_info,
         _ => unreachable!("the machine has exactly {} loose fields", Machine::LOOSE_HEAP_TERMS),
     }
 }
@@ -353,6 +361,8 @@ fn arm_loose_slot(machine: &mut Machine, slot: usize, term: Eterm) {
         2 => machine.pending_exception = Some((ExceptionClass::Error, term)),
         3 => machine.pending_supplied_term = Some(term),
         4 => machine.raise_supplied_term = Some(term),
+        5 => machine.raise_error_info = Some(term),
+        6 => machine.pending_error_info = Some(term),
         _ => unreachable!("the machine has exactly {} loose fields", Machine::LOOSE_HEAP_TERMS),
     }
 }
@@ -401,14 +411,14 @@ fn park_and_move(machine: &mut Machine, held: Eterm, moved: Eterm) -> usize {
 /// **The soundness pin for [`Machine::with_roots`]'s fast-path predicate.**
 ///
 /// `with_roots` parks the machine's loose heap terms — and re-seats each field from the slot
-/// the host wrote back through — **iff** at least one of the five is armed. A predicate that
+/// the host wrote back through — **iff** at least one of them is armed. A predicate that
 /// reads the wrong field, or that forgets one, silently takes the cheap branch while a heap
 /// term is held outside the frozen [`RootSet`]: the visitor's relocation never reaches it and
 /// the field keeps the pre-hand-off word, i.e. a **dangling pointer** after a real
 /// collection. Nothing about that is visible without a visitor that actually moves things,
 /// which is what this test is.
 ///
-/// Each of the five fields is armed **on its own** (every other loose field stays unarmed),
+/// Each loose field is armed **on its own** (every other loose field stays unarmed),
 /// so an enum-erated predicate that is right for "all armed" and wrong for "exactly one armed"
 /// fails here. The parked word must appear exactly once, the field must hold the *moved* word
 /// afterwards, the stack length must be restored, and both root-enumeration doors must report
@@ -490,7 +500,7 @@ fn with_roots_parks_and_relocates_each_loose_field_armed_on_its_own() {
 /// handed stack is exactly the Erlang stack.
 ///
 /// This is the shape the no-parking fast path must keep (its cheap branch is taken *iff* all
-/// five fields are unarmed), and it is what makes the fast path byte-identical to the
+/// loose fields are unarmed), and it is what makes the fast path byte-identical to the
 /// pre-parking behavior.
 #[test]
 fn with_roots_parks_nothing_when_no_loose_field_is_armed() {
@@ -511,7 +521,7 @@ fn with_roots_parks_nothing_when_no_loose_field_is_armed() {
 /// The all-armed twin of the per-slot pin: every loose field armed at once must be parked and
 /// re-seated, in one hand-off, and none may be dropped or cross-seated.
 #[test]
-fn with_roots_relocates_all_five_loose_fields_in_one_hand_off() {
+fn with_roots_relocates_all_loose_fields_in_one_hand_off() {
     let mut ctx = MinimalContext::new();
     let mut held = Vec::new();
     let mut moved = Vec::new();
@@ -558,8 +568,8 @@ fn with_roots_relocates_all_five_loose_fields_in_one_hand_off() {
 ///
 /// [`Machine::for_each_root_mut`] must hand over exactly the root words
 /// [`Machine::for_each_root`] reports. The two deliver them in different *shapes* and in
-/// different *orders*: the census yields single pointer-bearing words and reports the five
-/// loose terms **last**, from their fields, while the writable door yields three contiguous
+/// different *orders*: the census yields single pointer-bearing words and reports the loose
+/// terms **last**, from their fields, while the writable door yields three contiguous
 /// slices (`x` prefix, whole stack, `fr` prefix, immediates included) and the loose terms
 /// arrive **inside the stack slice** because `with_roots` parks them at the stack tail
 /// before handing the stack over. So the comparison is over the sorted **multiset** — a
@@ -596,8 +606,8 @@ fn for_each_root_mut_enumerates_the_same_roots_as_for_each_root() {
 
     assert_eq!(
         writable.len(),
-        9,
-        "the fixture roots nine pointer-bearing words"
+        expected.len(),
+        "the fixture roots one pointer-bearing word per rooted slot"
     );
     assert_eq!(
         raws(writable.clone()),
@@ -622,7 +632,7 @@ fn for_each_root_mut_enumerates_the_same_roots_as_for_each_root() {
         "y(1) is `NIL` and still part of the handed stack"
     );
 
-    // The five loose terms arrive through the **stack** slice (they were parked there),
+    // The loose terms arrive through the **stack** slice (they were parked there),
     // never as their own slice and never in the register files.
     for expected_loose in &expected[4..] {
         assert!(
@@ -643,8 +653,10 @@ fn for_each_root_mut_enumerates_the_same_roots_as_for_each_root() {
 /// slots are roots.
 #[test]
 fn for_each_root_mut_relocates_the_very_slots_for_each_root_reports() {
-    /// The number of pointer-bearing words `roots_fixture` arms (asserted below).
-    const FIXTURE_ROOTS: usize = 9;
+    /// The number of pointer-bearing words `roots_fixture` arms: two X registers, one Y
+    /// slot, one FR slot, and one per loose heap-term field. Derived rather than typed, so
+    /// arming another latch cannot silently desynchronise the two sides.
+    const FIXTURE_ROOTS: usize = 4 + Machine::LOOSE_HEAP_TERMS;
 
     // The relocation targets are built **before** the fixture, in a `MinimalContext` that
     // stays alive for the whole test. Ordering matters: `roots_fixture` builds its terms in a
@@ -828,7 +840,7 @@ fn for_each_root_mut_writes_are_observed_by_for_each_root() {
 /// must cover exactly the X prefix plus the stack (with the armed loose words parked in it),
 /// and none of their byte ranges may overlap the `args_scratch` buffer. A failure in the
 /// middle of the hand-off must still truncate the parked loose words off the stack and
-/// re-seat all five fields; only the visitor's own error travels on.
+/// re-seat every loose field; only the visitor's own error travels on.
 #[test]
 fn for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error() {
     let (mut machine, _) = roots_fixture();
@@ -899,8 +911,8 @@ fn for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error() {
     machine.for_each_root(|term| census.push(term));
     assert_eq!(
         census.len(),
-        9,
-        "the census agrees: `args_scratch` contributes no root beyond the fixture's nine"
+        4 + Machine::LOOSE_HEAP_TERMS,
+        "the census agrees: `args_scratch` contributes no root beyond the fixture's own"
     );
     assert_eq!(
         machine.stack_mut().len(),

@@ -30,10 +30,11 @@
 //! instruction is idempotent) or must report a typed error instead.
 use beam_common::{BeamError, ExceptionClass, Result, StackTrace};
 use beam_loader::{ImportRef, Label, Module, Operand, NO_FAIL};
-use beam_term::{make_atom, Eterm, NIL};
+use beam_term::{is_list, is_nil, make_atom, Eterm, NIL};
 
 use crate::context::{BifOutcome, ExecutionContext};
 use crate::error;
+use crate::families::exceptions::bif_frame;
 use crate::machine::{namespace_atom, Machine};
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
@@ -148,7 +149,26 @@ impl Machine {
             // No fail label ⇒ a *raise*: land in a live catch frame (C falls
             // through to `find_func_info`/`handle_error`) or propagate the typed
             // error.
-            Err(e) if fail == NO_FAIL => self.raise_bif_error(module, e, ctx),
+            //
+            // The BIF that failed **is** the innermost cooked-stacktrace frame (C's
+            // `save_stacktrace`, `beam_common.c:877-1063`): [`bif_frame::bif_head_item`]
+            // synthesizes `{Module, Function, ArgList, [{error_info, #{module =>
+            // FormatModule}}]}` from this instruction's own import and its own real
+            // argument operands, and declines (`None` — today's behaviour) for the three
+            // raising BIFs, for a raise that cannot land, and for anything it cannot
+            // name. A guard failure (`fail != NO_FAIL`, the arm below) arms nothing.
+            Err(e) if fail == NO_FAIL => {
+                let head = bif_frame::bif_head_item(
+                    self,
+                    ctx,
+                    module,
+                    module_name,
+                    function_name,
+                    args,
+                    &e,
+                )?;
+                self.raise_bif_error_with_head(module, e, head, ctx)
+            }
             // Guard failure: jump to the fail label.
             Err(_) => {
                 let (func, pc) = resolve(labels, fail)?;
@@ -510,6 +530,30 @@ impl Machine {
             BeamError::Raise(raise) if !raise.stacktrace.is_empty() => Some(raise.stacktrace.clone()),
             _ => None,
         };
+        // The two slots an `erlang:error/2,3` raise **arrives carrying**: the argument
+        // list the innermost cooked item's `A` slot reports (`Raise::saved_args`) and
+        // the `{error_info, Map}` extension that item's location grows
+        // (`Raise::error_info`). Extracted here, once, so both the term-reason and the
+        // atom-reason landing below arm the same latches from the same words.
+        //
+        // C's ground truth: `handle_error` digs `Args` (and, for `EXC_ERROR_3`, the
+        // `error_info` term) out of `c_p->fvalue`'s 2/3-tuple
+        // (`../../erts/emulator/beam/beam_common.c:470-495`) and `save_stacktrace`'s
+        // `non_bif_stacktrace:` arm hands both to the **innermost** frame
+        // (`:1005-1032`) — the caller of `error/1,2,3`, never the BIF itself.
+        let (saved_args, error_info) = match &error {
+            BeamError::Raise(raise) => (
+                raise
+                    .saved_args()
+                    .and_then(|live| live.downcast_ref::<Eterm>())
+                    .copied(),
+                raise
+                    .error_info()
+                    .and_then(|live| live.downcast_ref::<Eterm>())
+                    .copied(),
+            ),
+            _ => (None, None),
+        };
         // A raise whose reason is a compound term lands (or propagates) with the
         // term, mirroring C's `handle_error` → `next_catch` for every reason shape.
         if let BeamError::Raise(raise) = &error {
@@ -528,6 +572,8 @@ impl Machine {
                     trace,
                     has_head,
                     supplied_trace,
+                    saved_args,
+                    error_info,
                 );
             }
         }
@@ -562,13 +608,28 @@ impl Machine {
         if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
             self.set_class_atom(class, make_atom(class_atom));
         }
-        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
+        self.throw_with_trace_headed(
+            class,
+            make_atom(atom),
+            trace,
+            has_head,
+            supplied_trace,
+            saved_args,
+            error_info,
+        )
     }
 
     /// [`Machine::throw_with_trace`] that first arms the one-shot latches the raise
     /// arrived with, so the raise being landed is marked as carrying a synthesized
-    /// callee head item (when `has_head`, which lives in `trace`) and/or the explicit
-    /// symbolic frames it arrived with (when `supplied_trace` is `Some`).
+    /// callee head item (when `has_head`, which lives in `trace`), the explicit
+    /// symbolic frames it arrived with (when `supplied_trace` is `Some`) and/or the
+    /// `erlang:error/2,3` argument list and `{error_info, Map}` extension that
+    /// **caller** frame reports (`saved_args`/`error_info`).
+    ///
+    /// Every latch is armed **immediately before** the `throw_with_trace` that lands
+    /// the raise and with no allocation in between, so the words stay inside the
+    /// frozen root set; a raise that never reaches that call (the no-catch-frame
+    /// `Err` path above) leaves every latch clear.
     #[inline]
     fn throw_with_trace_headed(
         &mut self,
@@ -577,6 +638,8 @@ impl Machine {
         trace: Eterm,
         has_head: bool,
         supplied_trace: Option<StackTrace>,
+        saved_args: Option<Eterm>,
+        error_info: Option<Eterm>,
     ) -> Result<Step> {
         if has_head {
             self.pending_callee_head = true;
@@ -587,6 +650,32 @@ impl Machine {
         // trace stays the `raise_snapshot`-derived one.
         if supplied_trace.is_some() {
             self.pending_supplied_trace = supplied_trace;
+        }
+        // The `erlang:error/2,3` slots go to the **innermost cooked item only**, and a
+        // synthesized head item IS that item — it names the failing BIF and carries its
+        // own arguments and location, exactly as C's innermost `fi` does
+        // (`../../erts/emulator/beam/beam_common.c:1283-1291`: only `fi` gets the
+        // args/`error_info` tail, every outer frame is built with `am_true` and `NIL`).
+        // Arming them for a raise that already carries a head item would therefore
+        // attach them to the **caller's** frame, which the oracle never does — so the
+        // gate is `!has_head`, and the two latches stay clear.
+        if !has_head {
+            // C's `erts_build_mfa_item` puts the argument list in the `A` slot **only**
+            // when it is a list or `[]` (`../../erts/emulator/beam/utils.c:3449-3457`);
+            // a non-list second argument falls back to the declared arity.
+            if let Some(args) = saved_args {
+                if is_list(args) || is_nil(args) {
+                    self.pending_function_clause_args = Some(args);
+                }
+            }
+            // The extension is a **map** by construction (`error/3` drops an
+            // `{error_info, _}` pair whose payload is not one); a non-map payload is
+            // never rendered as an extension, so it arms nothing.
+            if let Some(map) = error_info {
+                if crate::predicates::is_map(map) {
+                    self.pending_error_info = Some(map);
+                }
+            }
         }
         self.throw_with_trace(class, reason, trace)
     }

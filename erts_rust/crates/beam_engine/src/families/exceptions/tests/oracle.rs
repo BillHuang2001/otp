@@ -351,17 +351,23 @@ pub(super) fn render_flat(term: Eterm, module: &Module) -> String {
     format!("{{{}}}", rendered.join(","))
 }
 
-/// Render a cooked item's `Location` field: the empty list, or the
-/// `[{file,"Name"},{line,N}]` shape `build_stacktrace` builds.
+/// Render a cooked item's `Location` field: the empty list, the
+/// `[{file,"Name"},{line,N}]` shape `build_stacktrace` builds, or that shape with
+/// the `{error_info, Map}` extension appended (C's `erts_build_mfa_item`,
+/// `../../erts/emulator/beam/utils.c:3430-3457`, conses the exception's extra info
+/// onto the location tail — so it is the **third** element, never a map on its own).
 ///
 /// Special-cased (never [`render_flat`]) because the file name is a **char list**
 /// the oracle prints as a string.
-pub(super) fn render_location(term: Eterm) -> String {
+pub(super) fn render_location(term: Eterm, module: &Module) -> String {
     if is_nil(term) {
         return "[]".to_string();
     }
     let pairs = crate::terms::list_elements(term).expect("a location is a list");
-    assert_eq!(pairs.len(), 2, "a location is `[{{file,_}},{{line,_}}]`, got {pairs:?}");
+    assert!(
+        pairs.len() == 2 || pairs.len() == 3,
+        "a location is `[{{file,_}},{{line,_}}]` with at most one trailing extension, got {pairs:?}"
+    );
     let name: String = crate::terms::list_elements(
         crate::terms::tuple_element(pairs[0], 1).expect("the file pair's value"),
     )
@@ -370,9 +376,39 @@ pub(super) fn render_location(term: Eterm) -> String {
     .map(|code| char::from_u32(signed_value(*code) as u32).expect("a scalar value"))
     .collect();
     let line = crate::terms::tuple_element(pairs[1], 1).expect("the line pair's value");
-    format!("[{{file,\"{name}\"}},{{line,{}}}]", signed_value(line))
+    let mut rendered = format!("[{{file,\"{name}\"}},{{line,{}}}", signed_value(line));
+    if let Some(extension) = pairs.get(2) {
+        rendered.push(',');
+        rendered.push_str(&render_error_info_extension(*extension, module));
+    }
+    rendered.push(']');
+    rendered
 }
 
+/// Render the `{error_info, Map}` location extension the way the oracle's `~p`
+/// prints it, with a small **flat** map rendered as `#{K => V,...}` in the map's
+/// stored (key) order — the order a flatmap keeps and the order `~p` prints.
+///
+/// Only the shapes these fixtures build are covered: an atom/list/small-integer
+/// value. A HAMT (more than `MAP_SMALL_MAP_LIMIT` keys) renders in storage order,
+/// which is *not* the oracle's `~p` order, so no oracle-comparison row uses one.
+pub(super) fn render_error_info_extension(term: Eterm, module: &Module) -> String {
+    let arity = crate::terms::tuple_arity(term).expect("the extension is a 2-tuple");
+    assert_eq!(arity, 2, "a location extension is a 2-tuple, got arity {arity}");
+    let key = crate::terms::tuple_element(term, 0).expect("the extension's key");
+    assert_eq!(
+        render_atom(key, module),
+        "error_info",
+        "the only location extension these fixtures produce is `error_info`"
+    );
+    let value = crate::terms::tuple_element(term, 1).expect("the extension's value");
+    let entries = crate::terms::map_entries(value).expect("the extension's value is a map");
+    let rendered: Vec<String> = entries
+        .iter()
+        .map(|(k, v)| format!("{} => {}", render_flat(*k, module), render_flat(*v, module)))
+        .collect();
+    format!("{{error_info,#{{#{}}}}}", rendered.join(","))
+}
 /// Render one cooked stacktrace item the way the oracle probe prints its four
 /// fields.
 pub(super) fn render_item(item: Eterm, module: &Module) -> String {
@@ -384,6 +420,7 @@ pub(super) fn render_item(item: Eterm, module: &Module) -> String {
     let third = crate::terms::tuple_element(item, 2).expect("the item's third field");
     let location = render_location(
         crate::terms::tuple_element(item, 3).expect("the item's location"),
+        module,
     );
     format!("{name}|{function}|{}|{location}", render_flat(third, module))
 }

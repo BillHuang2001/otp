@@ -142,6 +142,7 @@ The design rationale and binding invariants of the runtime glue — the mature-G
 * ETS owner tracking and owner-death reclamation are live on both install routes — G *ETS ownership*.
 * The `ets` table-alias boundary is a witness `Cell<bool>`, not an address check — G *ETS ownership*.
 * `process_info/1,2` answers ~28 items, `port_info(Port, monitors)` stays `[]`, non-byte-aligned `-eval` results cannot be printed — G *`process_info/1,2`* / *Printing*.
+* A `run` argument token above `MAX_SMALL` (`2^59 - 1`) is materialized with `make_small` and **no range check** (`src/runtime.rs::materialize`, reached from `src/cli.rs::parse_arg_term`): a debug build aborts on the `debug_assert`, a release build truncates to a wrong small int — the one class the runtime forbids — G *CLI `run` argument tokens*.
 * Single-threaded scheduler; a BIF-and-call-only loop ends no slice on the native tier (fairness) — G *Scheduler / runner*.
 * `process_info(P, garbage_collection)`'s `minor_gcs` is `minor_since_major`, not a total — G *`process_info/1,2`*.
 * An allocate-and-abandon loop is collector-bound, never arena-bound — G *Scheduler / runner*.
