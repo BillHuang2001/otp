@@ -271,7 +271,7 @@ pub(super) struct ProcessEngine {
     /// so a stale `true` can never re-sync against registers an earlier window published.
     pub(super) parked_published: bool,
     /// The execution tier this process is running on, chosen at its **first** entry and
-    /// remembered for the rest of its life.
+    /// remembered across every later slice.
     ///
     /// It is selected there by
     /// [`select_entry_tier`](super::tier::select_entry_tier) (or forced by a
@@ -280,7 +280,15 @@ pub(super) struct ProcessEngine {
     /// **this** tier through
     /// [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier),
     /// so a native-tier process is not silently demoted to the interpreter after its first
-    /// slice. A process that has not run yet holds the conservative
+    /// slice.
+    ///
+    /// The one write after the first entry is an **upgrade**: under the default mode
+    /// ([`JitMode::Auto`](super::tier::JitMode)) a process that entered during the runtime's
+    /// boot phase is raised from [`Tier::Interpreter`] to [`Tier::BaselineJit`] at its first
+    /// slice boundary after that phase ends. The rule is one-way (never downgraded) and applies
+    /// only to the default mode — a pinned mode keeps its tier verbatim — so a process ends up
+    /// on exactly the tier it would have had if it had entered after boot (see
+    /// `super::tier`'s *The boot phase*). A process that has not run yet holds the conservative
     /// [`Tier::Interpreter`] (its first entry overwrites it), which is also the always-correct
     /// value if a tier were ever read before that entry.
     pub(super) tier: Tier,

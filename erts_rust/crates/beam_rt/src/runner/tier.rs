@@ -123,12 +123,81 @@
 //! hot loops to the reference tier for their whole life. The verified characterisation (with
 //! figures) is in `PERF.md`.
 //!
-//! # Why the default is the native tier
+//! # The boot phase
+//!
+//! Only the **default** tier mode is scoped by a phase; every `BEAM_RT_TIER` override stays
+//! authoritative and phase-independent. [`JitMode::Interpreter`] pins the reference tier,
+//! [`JitMode::Baseline`] pins the native baseline tier for the **whole** process — which
+//! reproduces the pre-phase selection exactly, and is therefore the A/B control — and
+//! [`JitMode::Cranelift`] pins the hot tier, each in both phases. [`JitMode::Auto`] (an unset
+//! or `auto` `BEAM_RT_TIER`) selects [`Tier::Interpreter`] while the runtime is in its
+//! **boot phase** ([`Runtime::in_boot_phase`](crate::runtime::Runtime::in_boot_phase) — the
+//! boot-script window) and [`Tier::BaselineJit`] in steady state.
+//!
+//! The phase is what keeps the two measured costs apart. Compiling a module during the boot
+//! buys nothing: the boot script's `{kernelProcess,…}` directives start processes that run a
+//! short burst and settle, so the baseline tier's per-module compile time and code memory are
+//! paid for a handful of instructions (measured: +8.43 MiB peak RSS and +10.5 ms boot with no
+//! boot-side benefit, while the interpreter is 6–8× slower on steady-state `list_walk`). The
+//! tier must therefore **switch after boot** rather than be pinned globally to either side.
+//!
+//! The switch is an **upgrade at the slice boundary**, not a sticky first-entry choice. A
+//! process whose first entry happened during the boot phase is remembered as
+//! [`Tier::Interpreter`] (that is what [`select_entry_tier`] answered), and the runner
+//! re-examines it at every slice boundary a resumed machine presents: on [`JitMode::Auto`],
+//! an [`Tier::Interpreter`]-tier engine whose runtime has left the boot phase is upgraded to
+//! [`Tier::BaselineJit`] and the new tier is written back to
+//! [`ProcessEngine::tier`](super::entry::ProcessEngine). The rule is **one-way** (never
+//! downgraded) and applies **only** to [`JitMode::Auto`]: under a pinned mode the remembered
+//! tier is kept verbatim. The net effect is that such a process gets exactly the tier it
+//! would have had if it had entered after boot — so no new class of process is exposed to the
+//! documented native-tier fairness residual (a natively linked tail loop with no allocation
+//! never pre-empts) — while the boot itself never compiles anything.
+//!
+//! ## Why upgrading a machine the interpreter entered is sound
+//!
+//! It is sound because the engine's native resume is written for it.
+//! `beam_engine`'s `jit::baseline::run_native_resume_outcome` (`jit/baseline/mod.rs:569`) does
+//! **not** reset the machine: it zeroes the reduction counter, re-binds the run's entry module
+//! through `enter_run` (idempotent on a resume), takes the artifact's label map where it has
+//! one and the machine's otherwise, and hands off to the tier's `drive` loop. The run's
+//! registers, its Erlang stack and every live call frame are untouched, which is exactly the
+//! state the interpreter left at the suspension.
+//!
+//! The two things a resume could otherwise get wrong are handled by the engine, not assumed
+//! away:
+//!
+//! * **An address the compiled artifact has no block for** executes exactly **one** interpreter
+//!   step ([`Machine::step_instruction`](beam_engine::Machine)) — the interpreter's own
+//!   semantics, the same per-instruction deopt every un-lowered instruction already takes — and
+//!   the driver continues from wherever that step left the machine.
+//! * **Nothing is compiled eagerly.** The artifact is **lazy**
+//!   (`jit/cache/mod.rs:281-302` `CompiledModule::lazy` + `native_entry_cached`), so a module
+//!   is compiled only when execution actually reaches it natively; a resume that never returns
+//!   to a given function never compiles it.
+//! * **A parked machine's module context** is recovered from `Machine::current_context` on the
+//!   resume (`switch_into`), so a process that suspended inside a *callee* module resumes in
+//!   that module's blocks rather than the entry module's.
+//!
+//! [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier)'s own
+//! contract is already written that way — "a slice that suspended on a native tier (or on the
+//! interpreter) resumes on the same tier the caller names" — so it makes no assumption that
+//! the resume tier equals the tier the process's first entry selected. And because there is
+//! exactly **one** tier per slice, a one-way upgrade cannot produce a *mismatch* between two
+//! tiers inside one run: the parked arm either keeps the remembered tier or raises it, and the
+//! slice then runs wholly on the answer.
+//!
+//! Diagnostic residual: the `+JPperf` symbol map is snapshotted only on a first entry, so an
+//! upgraded process's code ranges are not added to it. The map is diagnostic-only (nothing
+//! executes from it), and the process still computes exactly the value the interpreter-forced
+//! run does.
+//!
+//! # Why the default is the native tier in steady state
 //!
 //! The tier costs nothing observable (it is interpreter-identical, including every `RunOutcome`
 //! suspension address and every typed error), so the **default selects the baseline tier for
-//! every process entry**; measured workload figures live in `erts_rust/tools/bench/RESULTS.md`
-//! and are re-measured there rather than transcribed here.
+//! every process entry once the boot phase is over**; measured workload figures live in
+//! `erts_rust/tools/bench/RESULTS.md` and are re-measured there rather than transcribed here.
 //!
 //! The optional Cranelift hot tier is deliberately **not** the default: it is off in the shipped
 //! build (an extra codegen dependency the standalone runtime does not need to run anything), and
@@ -152,31 +221,46 @@ use crate::runtime::Runtime;
 /// on the process (see [`ProcessEngine::tier`](super::entry::ProcessEngine)): every later
 /// resume — a pre-emption or a `receive` park — re-enters on that same tier through
 /// [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier).
+///
+/// Only the default [`JitMode::Auto`] is **phase-scoped** (interpreter while the boot script
+/// runs, the native baseline tier afterwards — see *The boot phase* in the module docs); every
+/// other value pins its tier for the whole process, in both phases.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum JitMode {
-    /// The native baseline tier for **every** process entry. **The default.**
+    /// The **default**: the interpreter while the runtime is in its boot phase, the native
+    /// baseline tier in steady state, for every process entry.
     ///
-    /// This is both the unset-`BEAM_RT_TIER` default and the `BEAM_RT_TIER=auto` value. It is
-    /// the same selection [`JitMode::Baseline`] forces: the engine's driver handles the
+    /// This is both the unset-`BEAM_RT_TIER` default and the `BEAM_RT_TIER=auto` value.
+    /// Steady state selects what [`JitMode::Baseline`] forces: the engine's driver handles the
     /// module-context switch, so there is no module that has to be inspected (or refused)
     /// first — see the module docs for the soundness argument.
+    ///
+    /// The phase scopes *when* code is compiled, never *which* tier a process ends up on: a
+    /// process whose first entry happened during the boot phase is **upgraded** to the native
+    /// baseline tier at its first slice boundary after the phase ends (one-way, never
+    /// downgraded), so it gets exactly the tier it would have had if it had entered after boot.
     #[default]
     Auto,
     /// The interpreter unconditionally (the reference tier, and the kill switch).
     ///
     /// The `BEAM_RT_TIER=interpreter` value: the tier the differential gate and the pre-JIT
     /// measurements are taken against, and the one to pin when a divergence is being chased.
+    /// It pins the reference tier in **both** phases and is never upgraded.
     Interpreter,
     /// The native baseline tier for **every** process entry, requested explicitly.
     ///
     /// The `BEAM_RT_TIER=baseline` value, or its [`Tier::name`] spelling `baseline-jit`. It
-    /// selects exactly what [`JitMode::Auto`] selects today, so it is a measurement/debugging
-    /// alias of the default rather than a different policy; the two are kept distinct because
-    /// the environment surface names both and `interpreter` must remain the only value that
-    /// turns the tier off.
+    /// pins the baseline tier in **both** phases, so it is exactly what [`JitMode::Auto`]
+    /// selects in steady state *and* what `Auto` produced before the boot phase existed —
+    /// which is what makes it the A/B control for measuring the phase policy. The two are kept
+    /// distinct because the environment surface names both and `interpreter` must remain the
+    /// only value that turns the tier off.
     Baseline,
     /// The optional Cranelift hot tier — `BEAM_RT_TIER=cranelift` (or, spelled as
     /// [`Tier::name`] spells it, `jit-cranelift`).
+    ///
+    /// Pins that tier in **both** phases, like every other non-default mode: the boot phase
+    /// scopes only [`JitMode::Auto`].
     ///
     /// Reachable **only** with the runtime's `cranelift` Cargo feature, which is what compiles
     /// `beam_engine`'s `jit-cranelift` backend in (see the module docs, *The Cranelift tier is
@@ -342,12 +426,25 @@ pub(crate) fn unbuilt_tier_request() -> Option<BeamError> {
 }
 /// The execution tier for a process's first entry.
 ///
-/// `runtime`, `state` and `entry` are not consulted: the baseline tier is sound for any module
-/// (see the module docs), so the mode alone decides. The parameters are kept because this is the
+/// A pinned mode decides on its own: [`JitMode::Interpreter`] → [`Tier::Interpreter`],
+/// [`JitMode::Baseline`] → [`Tier::BaselineJit`], [`JitMode::Cranelift`] →
+/// [`Tier::Cranelift`]. Only the **default**, [`JitMode::Auto`], is scoped by the runtime's
+/// **boot phase**: [`Tier::Interpreter`] while
+/// [`Runtime::in_boot_phase`](crate::runtime::Runtime::in_boot_phase) — the boot-script
+/// window, whose code gets no benefit from being compiled but pays the compile's boot time
+/// and peak memory — and [`Tier::BaselineJit`] in steady state. Every `BEAM_RT_TIER` override
+/// therefore stays authoritative and phase-independent: `interpreter` pins the reference tier,
+/// `baseline` pins the native baseline tier — which also reproduces the pre-phase selection
+/// exactly, and is why it is the A/B control — and `cranelift` pins the hot tier, in **both**
+/// phases (see *The boot phase*).
+///
+/// `state` and `entry` are not consulted: both tiers are sound for any module (see the module
+/// docs), so the mode and the phase decide. The parameters are kept because this is the
 /// runner's single tier-decision seam — a future policy (a per-module measurement) would read
 /// them here, and the caller ([`RuntimeRunner`](super::RuntimeRunner)) resolves the tier
 /// **before** it builds the [`RuntimeContext`](crate::context::RuntimeContext) that borrows the
-/// runtime.
+/// runtime. The runtime *is* read (the phase), so the caller must resolve the tier before that
+/// borrow, which is what it does.
 ///
 /// The tier is chosen from the [`ProcessEntry`] alone, i.e. **before** a fun entry's local
 /// launch target has been resolved (that resolution needs the context, and happens on the same
@@ -361,16 +458,20 @@ pub(crate) fn unbuilt_tier_request() -> Option<BeamError> {
 /// second copy of the gate here to disagree with the engine.
 ///
 /// Called **once** per process, at its first entry; the caller remembers the answer on the
-/// engine, so no later slice selects a tier again (see [`JitMode`]).
+/// engine, so no later slice selects a tier again from this seam — a later slice honours the
+/// remembered tier, upgrading it at most once on an [`JitMode::Auto`] process (see
+/// [`JitMode`] and *The boot phase*).
 pub(super) fn select_entry_tier(
-    _runtime: &Runtime,
+    runtime: &Runtime,
     _state: &mut RunnerState,
     _entry: &ProcessEntry,
     mode: JitMode,
 ) -> Tier {
     match mode {
         JitMode::Interpreter => Tier::Interpreter,
-        JitMode::Auto | JitMode::Baseline => Tier::BaselineJit,
+        JitMode::Baseline => Tier::BaselineJit,
         JitMode::Cranelift => Tier::Cranelift,
+        JitMode::Auto if runtime.in_boot_phase() => Tier::Interpreter,
+        JitMode::Auto => Tier::BaselineJit,
     }
 }

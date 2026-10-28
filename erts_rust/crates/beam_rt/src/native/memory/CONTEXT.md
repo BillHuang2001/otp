@@ -42,7 +42,7 @@ The pin is `tests.rs::the_links_item_unions_a_local_link_with_an_inbound_distrib
 ### `garbage_collection` and `max_heap_size`
 `garbage_collection` is the 5-item proplist `[{max_heap_size,Map},{min_bin_vheap_size,N},{min_heap_size,N},{fullsweep_after,N},{minor_gcs,N}]` in `beam_gc::GARBAGE_COLLECTION_KEYS` order (a **map** for `max_heap_size`, unlike `system_info`'s bare integer).
 `max_heap_size`'s value source is `Process::max_heap_size()` when the pid's setting was set explicitly (`Runtime::max_heap_was_set`), else the **birth default** `Runtime::birth_max_heap_setting(&policy)` — the `+hmax` bound (`HeapPolicy::max_heap_words`) with the `+hmax*` flag word — so an explicit `#{size => 0}` stays distinguishable from a never-set one.
-Boot/system processes get `max_heap_words = 0` (`Runtime::system_spawn_policy`, selected by `Runtime::default_spawn_policy` inside the `Runtime::booting` window), so `+hmax` bounds user code and cannot cap the boot.
+Boot/system processes get `max_heap_words = 0` (`Runtime::system_spawn_policy`, selected by `Runtime::default_spawn_policy` inside the `Runtime::in_boot_phase` window), so `+hmax` bounds user code and cannot cap the boot.
 `minor_gcs` is `Collector::minor_since_major`, **not** a collection total (a fullsweep resets it to `0`); the monotone totals are `Runtime::gc_stats().collections` and `beam_gc::AnyCollector::stats()`.
 
 ### Execution-position items and `catchlevel`

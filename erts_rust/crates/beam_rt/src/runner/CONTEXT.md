@@ -6,7 +6,7 @@ It builds a [`RuntimeContext`](crate::context::RuntimeContext) that runs **as th
 A first entry runs `run_export_outcome_with_tier`; a re-entry — a reduction pre-emption, a `receive` park, a BIF suspend — runs `resume_outcome_with_tier` on the process's **remembered** tier.
 The return value is stabilized (`Runtime::stabilize_term_with`) onto the runtime's `-eval` store (`Runtime::eval_heap` + its off-heap payload table) and recorded in `RunnerState::results`; a raise's live reason is stabilized (`Runtime::stabilize_error_live_reason`) into `RunnerState::exits`, with the original `BeamError` in `RunnerState::errors`.
 A run to `return` exits `normal` — `x(0)` is the function's return value, not the exit reason — and a failure exits with the raise's own reason term, so nothing is swallowed and nothing is invented.
-This node also owns the **execution-tier decision** (taken once per process, carried for its life), the **park root hand-off**, the **slice-boundary collection door**, the **slice-boundary off-heap refc-binary prune**, and the process's own pre-sleep signal work.
+This node also owns the **execution-tier decision** (taken at a process's first entry, carried across its slices, upgraded at most once and never downgraded), the **park root hand-off**, the **slice-boundary collection door**, the **slice-boundary off-heap refc-binary prune**, and the process's own pre-sleep signal work.
 Per-suite routing: [`tests/CONTEXT.md`](tests/CONTEXT.md). Every measured figure and its caveats: [`MEASURED.md`](MEASURED.md).
 
 ## API Surface (crate-internal, `pub(crate)`)
@@ -24,21 +24,21 @@ Per-suite routing: [`tests/CONTEXT.md`](tests/CONTEXT.md). Every measured figure
   `errors`' live reason word is reachable for **liveness only** (`for_each_error_live_reason`): `BeamError` exposes no mutable accessor, so a *moving* pass must refuse a region a recorded reason names instead of rewriting it.
 * [`run`] — `RuntimeRunner`: the slice itself — tier selection, tier-aware first entry/resume, the three park arms, the boundary door, the off-heap prune, the parked-receive deadline rearm, the outcome stabilization. Detail in the sections below.
 * [`budget`] — `BudgetProbe` (`charge` = the **refusing** primitive, `spend` = **pricing and never refusing**) and `BudgetContext`, the slice's outermost `ExecutionContext`: it owns `wants_reduce`/`reduce` (one charge per interpreted reduction) and forwards every seam it does not implement.
-* [`tier`] — `JitMode`, the pure `mode_from_value`, the memoized `env_default` (plus the `#[cfg(test)]` per-thread `force`/`clear` override), `select_entry_tier`, and the CLI-facing startup check `tier_unavailable`/`unbuilt_tier_request`.
+* [`tier`] — `JitMode`, the pure `mode_from_value`, the memoized `env_default` (plus the `#[cfg(test)]` per-thread `force`/`clear` override), `select_entry_tier` (mode + the default's boot phase), the module docs' *The boot phase* (rule, override precedence, the upgrade soundness proof), and the CLI-facing startup check `tier_unavailable`/`unbuilt_tier_request`.
 * [`reason`] — `normal`, `killed`, `exit_reason` only; the finite-`receive` deadline recovery lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no delay decoding is duplicated here.
 * [`perf`] — `record_baseline_code`, the `+JPperf` code map (contract A.8; fills only an enabled perf map).
 * `#[cfg(test)]` accounting in [`run`] — `run_slice_counters()` (slices/yields/waits/suspends; `note_slice_suspended` records a suspend as *also* a yield, which is what makes "the instruction was not applied and will be re-executed" structurally observable), `park_publish_counters()` (published/skipped) and `boundary_door_counters()` (checks/unpublished/collections/request_collected), each a per-thread `Cell` with a reader and a reset.
   Every one of them is a deterministic structural observation, never a timing, and a non-test build carries none of the increments.
 
-## The execution tier (one decision per process)
+## The execution tier (one decision per process, plus the boot phase's one upgrade)
 ### `BEAM_RT_TIER` — `mode_from_value` is the single definition of the value semantics
 | value | mode | meaning |
 |---|---|---|
-| unset | `Auto` (**the `#[default]`**) | the native baseline tier for **every** process entry |
-| `auto` | `Auto` | the default, named explicitly |
-| `baseline`, `baseline-jit` | `Baseline` | the same selection, forced explicitly (a measurement/debugging alias; `baseline-jit` is `Tier::BaselineJit::name()`) |
-| `cranelift`, `jit-cranelift` | `Cranelift` | the optional hot tier; sane only in a build with the `cranelift` Cargo feature (below); `jit-cranelift` is `Tier::Cranelift::name()` |
-| `interpreter`, **anything else** | `Interpreter` | the always-correct reference tier and the **only kill switch**; an unknown value resolves here rather than being an error |
+| unset | `Auto` (**the `#[default]`**) | the interpreter during the runtime's **boot phase**, the native baseline tier in steady state (see *The boot phase*) |
+| `auto` | `Auto` | the default, named explicitly — the same phase-scoped selection |
+| `baseline`, `baseline-jit` | `Baseline` | the native baseline tier for **every** process entry, in **both** phases: what `Auto` selects in steady state and what it selected before the phase existed, hence the A/B control for the phase policy (`baseline-jit` is `Tier::BaselineJit::name()`) |
+| `cranelift`, `jit-cranelift` | `Cranelift` | the optional hot tier, pinned in both phases like every other non-default mode; sane only in a build with the `cranelift` Cargo feature (below); `jit-cranelift` is `Tier::Cranelift::name()` |
+| `interpreter`, **anything else** | `Interpreter` | the always-correct reference tier and the **only kill switch**, pinned in both phases and never upgraded; an unknown value resolves here rather than being an error |
 
 `env_default()` reads the variable once (a `OnceLock`), so a long-running process pays one `getenv`; `mode_from_value` itself is pure (no environment read), which is how a test pins the semantics without `set_var` (edition 2024 makes it `unsafe`).
 Beside the runtime's own spellings, `mode_from_value` accepts **every `Tier::name()` the engine roster defines** for the two always-available tiers, resolved through `Tier::from_name` (the engine's table, never a second copy here), so a value copied out of a tier report selects the tier it names — `baseline-jit` unaccepted was a measurement hazard, because the fallback is the always-available interpreter (a session would believe it measured the default native tier while it measured the reference one).
@@ -46,20 +46,33 @@ A name the roster does not define stays unaccepted: `hot` names no tier, and `ji
 
 ### When the machine exists (the first slice does not build one)
 The `Machine` is built **eagerly at engine registration**: the one engine constructor `RunnerState::spawn_with_stability` (`entry.rs:504-535`) inserts `ProcessEngine { machine: Machine::new(), .. }` (`entry.rs:511-514`), so a process owns its machine from spawn — its pid enters `RunnerState::engines` before `Runtime::spawn_process_with_policy` enqueues it — and no engine ever shares or recycles its machine.
-The first slice only selects the **tier** into that existing machine (`select_entry_tier`, `run.rs:979-983`); the slice path has no machine construction site, and the nested-run recycling pool is `../context/machine_pool.rs`, not this node.
+The first slice only selects the **tier** into that existing machine (`select_entry_tier`, `run.rs:1013`); the slice path has no machine construction site, and the nested-run recycling pool is `../context/machine_pool.rs`, not this node.
 A process the runtime creates **without an engine** — the `Runtime::new` service stand-ins and the `-eval` action process, spawned straight into the process table — has no `ProcessEngine` and therefore no `Machine`.
 The engine is the machine's only holder after the slice re-inserts it, so `RunnerState::prune_dead` (`entry.rs:947-968`) dropping a dead pid's engine is what releases that machine.
 
 ### How and when the tier is chosen
 ```text
-tier = match engine.parked { Some(_) => engine.tier,            // a resume re-uses the remembered tier
-                             None    => { let t = select_entry_tier(.., state.jit_mode());
-                                          engine.tier = t; t } }
+mode = state.jit_mode();                                        // read once per slice
+tier = match engine.parked {
+    Some(_) => { if mode == Auto && engine.tier == Interpreter    // the boot phase's one upgrade
+                 && !runtime.in_boot_phase() { engine.tier = BaselineJit; }
+                 engine.tier }                                    // otherwise the remembered tier
+    None    => { let t = select_entry_tier(runtime, .., mode); engine.tier = t; t } }
 ```
-The choice is made **once**, at a process's first entry, before the `RuntimeContext` borrow (the context takes `Runtime` mutably), and written to `ProcessEngine::tier`; every later slice takes the `Some(_)` arm, so a process keeps its tier for its whole life and is never silently demoted.
+The choice is made at a process's first entry, before the `RuntimeContext` borrow (the context takes `Runtime` mutably), and written to `ProcessEngine::tier`; every later slice takes the `Some(_)` arm, so a process keeps its tier across its slices and is never silently demoted.
+The parked arm's single exception is the **one-way upgrade** `Auto` performs once the boot phase has ended (see *The boot phase*): it applies to a parked machine of **either** suspension kind (a reduction pre-emption and a `receive`/BIF park both set `engine.parked`), never downgrades, and never touches a pinned mode.
 It is passed to both first-entry sites (the export entry's own label, and the resolved local-fun entry) and to the resume through `Machine::resume_outcome_with_tier`, whose `Tier::Interpreter` arm delegates to the plain `Machine::resume_outcome` (an interpreter-tier process is byte-for-byte unchanged).
 The remembered tier is observable only at a **slice boundary**; a process that runs to completion inside its first slice never re-enters.
-`select_entry_tier` is the single tier-decision seam and the **mode alone** decides: the baseline tier is sound for any module, so neither the entry's module nor its code is inspected (the parameters are kept for a future per-module policy).
+`select_entry_tier` is the single tier-decision seam for a first entry, and a pinned mode decides on its own; only the default `Auto` also reads the runtime's **boot phase**.
+Beyond the mode and the phase, nothing is inspected: the baseline tier is sound for any module, so neither the entry's module nor its code is (the `state`/`entry` parameters are kept for a future per-module policy).
+### The boot phase (`Runtime::in_boot_phase`, the boot-script window)
+`Runtime`'s `booting` flag — the same window `default_spawn_policy` reads to hand the boot's system servers the unbounded heap policy — is the runtime's boot **phase**, read here through `Runtime::in_boot_phase` and written only through `Runtime::set_boot_phase` (the two boot drives bracket the script with it, so a directive that raises leaves it too).
+`Auto` selects `Tier::Interpreter` while the phase is on and `Tier::BaselineJit` once it is off: compiling a module during the boot buys nothing (the `{kernelProcess,…}` directives run a short burst and settle) and was measured at +8.43 MiB peak RSS / +10.5 ms boot, while the interpreter is 6–8× slower on steady-state `list_walk`.
+The phase therefore scopes **when** code is compiled, never **which** tier a process ends up on: a process whose first entry happened during the phase is upgraded at its first post-boot slice boundary, i.e. it gets exactly the tier it would have had if it had entered after boot, so no new class of process is exposed to the native-tier fairness residual below.
+Upgrading a machine the interpreter entered is sound because `beam_engine`'s `run_native_resume_outcome` is a no-reset resume (registers, Erlang stack and every live call frame survive; the entry module is re-bound through `enter_run`, the label map comes from the artifact or the machine) and because its artifact is **lazy** (`CompiledModule::lazy` + `native_entry_cached`): an address it holds no block for advances by exactly one `Machine::step_instruction`, and nothing is compiled until it is natively reachable. `Machine::resume_outcome_with_tier`'s own contract already reads that way, and there is exactly one tier per slice, so a one-way upgrade cannot cause a tier mismatch.
+Every `BEAM_RT_TIER` override is phase-independent — `interpreter` pins the reference tier, `baseline` pins the native tier for the whole process (the A/B control), `cranelift` pins the hot tier — so the phase can never turn a request into a different tier.
+Residual: the `+JPperf` symbol map is snapshotted only on a first entry (`record_baseline_code`, `run.rs:971`/`:1363`), so an upgraded process's code ranges are not added to it; the map is diagnostic-only.
+Pinned by `tests.rs::{the_boot_phase_selects_the_interpreter_for_the_default_mode, an_upgraded_process_computes_the_interpreter_value_on_the_baseline_tier, an_upgraded_process_runs_its_first_post_boot_slice_on_the_baseline_tier, a_receive_parked_boot_process_is_upgraded_on_its_resume, a_pinned_interpreter_mode_does_not_upgrade_after_the_boot_phase}`.
 The mode resolves from `state.jit_mode` if a test set it, else from `env_default()`.
 
 ### Why the native baseline tier is sound for any module
@@ -182,7 +195,8 @@ Pinned end to end by `tests/signal_self_delivery.rs` over `tests/fixtures/sigsel
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors, no crate-local error enum, no panic-as-control-flow.
 * The tier is resolved **before** the `RuntimeContext` borrow — the selection happens in the slice's prologue, before the context takes `Runtime` mutably.
 * A test forces a tier by setting `state.jit_mode = Some(..)` (or the `#[cfg(test)]` per-thread `force`/`clear`) — never `std::env::set_var`, which edition 2024 makes `unsafe`. `BEAM_RT_TIER` is the CLI-facing equivalent, and its semantics are pinned through the pure `mode_from_value`, not through the environment.
-* `JitMode::Baseline` is an alias of the default selection; only `JitMode::Interpreter` turns the native tier off, and `JitMode::Cranelift` is the third selection — whether it can be *served* is the `cranelift` Cargo feature, read by the CLI-side startup check, never a mode and never an arm inside the selection.
+* `JitMode::Baseline` pins the native baseline tier in **both** phases (it is what `Auto` selects in steady state, and what `Auto` selected before the phase existed); only `JitMode::Interpreter` turns the native tier off, and `JitMode::Cranelift` is the third selection — whether it can be *served* is the `cranelift` Cargo feature, read by the CLI-side startup check, never a mode and never an arm inside the selection. Only `Auto` reads the boot phase.
+* A test drives the phase through `Runtime::set_boot_phase` (the single writer) and must leave it off; a process-wide forced mode (`tier::force`/`clear`) is cleared the same way.
 * Files target ~1000 lines; `run.rs` (1 585 lines of production) and `tests.rs` (a 216 KB suite) are the pre-existing overages, catalogued in `../CONTEXT.md`'s *File-size overages*.
 
 ## Known Issues / Gaps
@@ -206,10 +220,10 @@ Pinned end to end by `tests/signal_self_delivery.rs` over `tests/fixtures/sigsel
 * `entry.rs` → `ProcessEntry`, `ProcessEngine`, `RunnerState` (`prune_dead`, the read seams, the spawn seams, the value root gather, the four mutable root doors, `for_each_engine_census`, `for_each_error_live_reason`), `EngineParkCensus`, `UnrunnableProcess`, `registered_name`.
 * `run.rs` → `RuntimeRunner`: the tier selection and the tier-aware resume, the three park arms through `park_window` → `park_machine` → `publish_parked_roots`/`resume_from_process_roots`, the boundary door (`collect_at_reds_boundary`), the off-heap prune (`reclaim_off_heap_binaries`), `take_max_heap_kill`, the outcome stabilization, `refuse_engine_less`, and the `#[cfg(test)]` counters (`RunSliceCounters`, `ParkPublishCounters`, `BoundaryDoorCounters`).
 * `budget.rs` → `BudgetProbe` (`charge`/`spend`/`used`/`is_exhausted`) and `BudgetContext`: its own `wants_reduce`/`reduce`, its forwards of `resolve_external_call`/`resolve_local_fun`/`resolve_local_call` (the engine consults the wrapper from its `call_ext*`, `call_fun`/`call_fun2` and `Call`/`CallOnly`/`CallLast` arms and the native tier's `jit_local_call` probe), the in-machine door pair `wants_bif_in_machine`/`call_bif_in_machine` (to the inner `RuntimeContext`'s `position.rs`), the three `arm_gc` doors and `send_message_with_off_heap`.
-* `tier.rs` → `JitMode`, `mode_from_value`, `env_default` (+ the test-only `force`/`clear`), `tier_unavailable`, `unbuilt_tier_request`, `select_entry_tier`.
+* `tier.rs` → `JitMode`, `mode_from_value`, `env_default` (+ the test-only `force`/`clear`), `tier_unavailable`, `unbuilt_tier_request`, `select_entry_tier` (the default mode is scoped by `Runtime::in_boot_phase`, see *The boot phase*).
 * `reason.rs` → `normal`, `killed`, `exit_reason`.
 * `perf.rs` → `record_baseline_code` (the `+JPperf` code map).
-* `tests.rs` → the colocated unit suites (outcome bookkeeping, the budget primitives, seam forwarding, the tier rows, tier persistence across both suspension kinds, the non-allocating-loop pair, the park hand-off and exemption rows, the growth counters, the census/door agreement).
+* `tests.rs` → the colocated unit suites (outcome bookkeeping, the budget primitives, seam forwarding, the tier rows, the boot-phase rule and its one-way upgrade across both suspension kinds, tier persistence, the non-allocating-loop pair, the park hand-off and exemption rows, the growth counters, the census/door agreement).
 * `tests/` → the three structural suites: `boundary_cost.rs` (the boundary door's cost and rationing on hot shapes), `reds_door.rs` (the door itself on a shape that reaches no admission point), `slice_charging.rs` (the native tier's slice charge, the refusing seam, the residual tuple) — per-file detail in [`tests/CONTEXT.md`](tests/CONTEXT.md).
 * `MEASURED.md` → **sibling doc, not code**: the measured workload record behind the sections above (delivery path, sleep accounting, growth loops, boundary-door rationing, slice charge, `foreign` per-call table, off-heap envelope and end-to-end).
 * `../context/gc/CONTEXT.md`, `../context/CONTEXT.md` → the collection valves, the root hand-off mechanism and the prune's gates (sibling context node). `../../CONTEXT.md` → the crate-level contract (CLI, exit codes, gaps). `../../PERF.md`, `../../PERF_HISTORY.md`, `../../TRACE_AND_PERF.md`, `../../../../tools/bench/RESULTS.md` → the crate- and workspace-level measurement records.
