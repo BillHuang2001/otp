@@ -1521,10 +1521,16 @@ pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
 /// itself (`route::Aligned`'s inline proof in [`super::emit::bitstr_inline`]'s
 /// `create_door`): `raw::writable_append_target`'s
 /// registry clause — the payload base is the key — its `checked_mul(8)` byte-to-bit
-/// conversion, the `unit == 8` append-position gate and the `end + tail <= capacity` room
-/// rule. Every one of them answers exactly what that seam function answers for the same
-/// machine state, which is what keeps an inline-proof mistake a **refusal** (one
-/// interpreter step) and never a wrong result.
+/// conversion and the `end + tail <= capacity` room rule. Every one of them answers exactly
+/// what that seam function answers for the same machine state, which is what keeps an
+/// inline-proof mistake a **refusal** (one interpreter step) and never a wrong result.
+///
+/// **Precondition: `end_bits % 8 == 0`.** C's append-position gate for a whole-byte build
+/// (`append_unit_allows`, `erl_bits.c:1778-1784`) is *the door's* `test rdx, 7 / jne
+/// fallback` guard, emitted before this call, so it is not re-checked here — this helper is
+/// reached from [`emit_append_cursor`](super::emit::bitstr_inline::create_door) only. A
+/// caller with an unaligned window end must take the general door
+/// ([`jit_open_append_bin_any`]) instead.
 ///
 /// `0` is a safe decline signal: a real payload base is a live allocation address and can
 /// never be null, and the cursor is `base` plus a non-negative byte offset.
@@ -1552,6 +1558,13 @@ pub(crate) extern "C" fn jit_append_cursor(
 /// The decision body of [`jit_append_cursor`], split out so a test can pin it against
 /// `seam::open_append` (the seam's byte-aligned door, `#[cfg(test)]` and kept as that door's
 /// reference answer) without a `JitRuntime`.
+///
+/// **Precondition: `end_bits % 8 == 0`.** C's whole-byte append-position gate
+/// (`append_unit_allows(end_bits, 8)`, `erl_bits.c:1778-1784`) is *the aligned door's* run-time
+/// guard — `emit_append_cursor` emits `test rdx, 7 / jne fallback` before the call — so this
+/// function does not re-check it: the byte cursor `base + end_bits / 8` is only meaningful at a
+/// byte-aligned window end, and the door is this helper's only caller. An unaligned window end is
+/// the general door's ([`jit_open_append_bin_any`]) business, not this one's.
 pub(crate) fn append_cursor(
     machine: &Machine,
     base: usize,
@@ -1567,11 +1580,6 @@ pub(crate) fn append_cursor(
     else {
         return 0;
     };
-    // C's append-position gate for a whole-byte build (`append_unit_allows(end_bits, 8)`,
-    // `erl_bits.c:1778-1784`), kept here so this door agrees with the seam's on every input.
-    if end_bits % 8 != 0 {
-        return 0;
-    }
     let Some(new_end) = end_bits.checked_add(tail_bits) else {
         return 0;
     };

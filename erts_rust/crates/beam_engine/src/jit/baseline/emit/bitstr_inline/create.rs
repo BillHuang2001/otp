@@ -147,7 +147,8 @@
 //! bit-granular door takes the accumulator as an x-register or `Y`-slot
 //! index, and `jit_write_bit_field` takes the field value the same way plus one flags word
 //! ([`WRITE_ACC_IN_Y`] / [`WRITE_VALUE_IN_Y`]) naming which machine file holds each. The
-//! block's spill before every helper call makes `machine.x` authoritative, and a `Y` slot is
+//! bit-granular route's door spills the block's cached x-registers before its helper call, so
+//! `machine.x` is authoritative when that route's helpers run, and a `Y` slot is
 //! reached through `Machine::y`, so an index is all such a helper needs.
 //! The aligned route's call is the exception the block can afford: it passes the payload base
 //! and the window end it has just loaded from the accumulator's own block, in the ABI's own
@@ -237,9 +238,10 @@
 //! takes. The general door [`jit_open_append_bin_any`] / [`jit_open_append_bin_any_y`] is
 //! handed the plan's `unit` for exactly this test; the aligned route
 //! ([`create_door::emit_append_cursor`]) refuses unless `end_bits % 8 == 0` — the `unit == 8`
-//! form of the same gate, because a byte cursor needs a byte-aligned window end — and
-//! [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor) re-checks it so the
-//! machine-private half agrees with the seam on every input.
+//! form of the same gate, because a byte cursor needs a byte-aligned window end — and that
+//! emitted guard is the whole check: [`jit_append_cursor`](crate::jit::baseline::runtime::jit_append_cursor)
+//! does not re-test it, keeping only the writable-registry clause and the overflow-safe
+//! `checked_mul(8)`/`checked_add` room rule.
 //!
 //! The `fail` arm is deliberately **not** part of this shape: `bs_create_bin`'s
 //! `NO_FAIL`-vs-label discrimination stays in the family, and every refusal above (and
@@ -276,7 +278,7 @@ use create_binary::emit_binary_all;
 use create_field::{
     emit_bit_field_store, FieldScratch, MAX_INLINE_FIELD_BITS, PRODUCTION_FIELD_SCRATCH,
 };
-use create_door::emit_append_cursor;
+use create_door::{emit_append_cursor, POINTER_MASK_I32};
 
 // The gold-standard oracle for `emit_bit_field_store`: the sequence is executed for every
 // width, window offset and window end over a byte-pre-filled payload and compared with the
@@ -322,6 +324,11 @@ const MAX_TAIL_BYTES: usize = 256;
 
 /// [`MAX_TAIL_BYTES`] in bits, the form the plan's `tail_bits` is compared against.
 const MAX_TAIL_BITS: u32 = MAX_TAIL_BYTES as u32 * 8;
+
+/// The commit's advance is a register-immediate `add` ([`CodeBuffer::add_ri`], a
+/// sign-extended `imm32`), so the compile-time tail must fit one. A cap that grew past
+/// `i32::MAX` would fail the build here rather than silently truncate the window advance.
+const _: () = assert!(MAX_TAIL_BITS <= i32::MAX as u32);
 
 /// The scratch the `Y` accumulator's up-front guard computes its slot address in, and the
 /// scratch its window bound goes to.
@@ -858,8 +865,6 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
                 allocation,
                 source,
                 shape.tail_bits,
-                func,
-                pc,
                 fallback,
                 highest_touched,
             )?,
@@ -889,7 +894,10 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         match route {
             // Unreachable: a bare build returned above (see the arm above).
             Route::Fresh => return Ok(false),
-            Route::Aligned => emit_aligned_fields(buffer, &prepared, highest_touched)?,
+            Route::Aligned => {
+                emit_aligned_fields(buffer, allocation, &prepared, highest_touched)?
+            }
+
             Route::BitGranular => {
                 emit_bit_fields(
                     buffer,
@@ -908,36 +916,45 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         // build's result, and **the only mutation** the sequence performs beyond the payload
         // bytes. (The `binary all` route's commit is inside its helper: its advance is the
         // source's run-time width, not a compile-time constant.)
+        //
+        // One load of the accumulator serves this phase **and** phase (6)'s destination
+        // store: the term goes to `rdx` (kept for the store), the untagged boxed pointer is
+        // masked **in place** out of `rax` (`and rax, -8`, an imm32 form rather than a
+        // `movabs`+`and` pair), and the commit is the one write through it. The old shape
+        // reloaded the accumulator for the destination store and materialised the mask in a
+        // register, i.e. one load and two instructions of pure overhead per append.
         match source {
-            Loc::X(x) => {
-                buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-                touch(highest_touched, x);
-            }
-            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
+            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rax, highest_touched)?,
+            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rax, k)?,
         }
-        buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
-        buffer.and_rr(Reg::Rdx, Reg::Rax)?;
-        buffer.mov_rm(Reg::Rcx, Reg::Rdx, SUB_BITS_END_DISP)?;
-        buffer.mov_ri(Reg::Rax, i64::from(shape.tail_bits))?;
-        buffer.add_rr(Reg::Rcx, Reg::Rax)?;
-        buffer.mov_mr(Reg::Rdx, SUB_BITS_END_DISP, Reg::Rcx)?;
+        buffer.mov_rr(Reg::Rdx, Reg::Rax)?;
+        buffer.and_ri(Reg::Rax, POINTER_MASK_I32)?;
+        buffer.mov_rm(Reg::Rcx, Reg::Rax, SUB_BITS_END_DISP)?;
+        // `tail_bits` is bounded by [`MAX_TAIL_BITS`] (the assertion beside it keeps the
+        // `u32 as i32` narrowing provable), so the advance is a register-immediate `add`.
+        buffer.add_ri(Reg::Rcx, shape.tail_bits as i32)?;
+        buffer.mov_mr(Reg::Rax, SUB_BITS_END_DISP, Reg::Rcx)?;
     }
 
     // (6) The accumulator term into the destination — the very word the instruction was
     // given, because the seam proved the build takes the in-place route (`grow`, republish
     // and promotion to the copy-rebuild form all decline). Nothing after this may fail.
+    //
+    // The term is `rdx` on the append routes (phase (5) kept it across the commit) and on
+    // the `binary all` route it is read here, because that helper owns its own commit.
     if let Loc::Y(k) = shape.dst {
         // The window guard already ran and nothing between it and here moved the frame (the
         // helper only reads machine state), so the slot address is re-derived without a
-        // second guard.
+        // second guard. It is derived into `Y_ADDR_SCRATCH`, which the three-instruction
+        // re-derivation writes alone, so `rdx` (the term) and `rax` (the door's answer /
+        // the boxed pointer) survive it.
         emit_y_slot_address(buffer, Y_ADDR_SCRATCH, k)?;
     }
-    match source {
-        Loc::X(x) => {
-            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-            touch(highest_touched, x);
+    if shape.binary_all.is_some() {
+        match source {
+            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
+            Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
         }
-        Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
     }
     shape
         .dst
@@ -949,20 +966,42 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
 /// The **aligned** route's field-write phase: the byte stores at the write cursor the append
 /// door returned in `rax`.
 ///
-/// Every value is re-read after the helper: an x-register from `machine.x` (`rbx` is
-/// callee-saved, and the spill before the call made that array authoritative for a cached
-/// register too), a `Y` slot through its re-derived address — once per field into `rcx`,
-/// since its four-instruction re-derivation should not be paid per byte.
+/// Every value is re-read after the helper: an x-register through [`Loc::load_x`], which reads
+/// a **cached** value out of its callee-saved machine register and an uncached one out of
+/// `machine.x` — the door's helper only reads machine state, so neither representation can be
+/// stale — and a `Y` slot through its re-derived address, once per field into `rcx`, since its
+/// four-instruction re-derivation should not be paid per byte.
 ///
 /// `rax` (the cursor) is never clobbered: `rdx` carries the extracted byte and `rcx` a `Y`
 /// value, and the displacement is `cursor + offset_bits / 8`.
+///
+/// A **run** of consecutive one-byte fields (`bits == 8`) that all read the same [`Loc`] shares
+/// one load and one `sar 4`: they all extract the same byte, so one extraction serves every store
+/// and the run costs `2 + n` instructions instead of `3n`. A wider field is never grouped — its
+/// descending `sar 8` chain restarts per field — so it keeps the per-field sequence below.
 fn emit_aligned_fields(
     buffer: &mut CodeBuffer,
+    allocation: &Allocation,
     prepared: &[PreparedField<'_>],
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
-    for field in prepared {
-        match field {
+    let mut at = 0usize;
+    while at < prepared.len() {
+        let run = one_byte_run(prepared, at);
+        if run > 1 {
+            if let PreparedField::Bits { value, .. } = &prepared[at] {
+                read_field_value(buffer, allocation, value, highest_touched)?;
+                buffer.sar_ri(Reg::Rdx, 4)?;
+                for field in &prepared[at..at + run] {
+                    if let PreparedField::Bits { offset_bits, .. } = field {
+                        buffer.mov_mr8(Reg::Rax, (*offset_bits / 8) as i32, Reg::Rdx)?;
+                    }
+                }
+            }
+            at += run;
+            continue;
+        }
+        match &prepared[at] {
             PreparedField::Bits {
                 value,
                 bits,
@@ -975,16 +1014,7 @@ fn emit_aligned_fields(
                 // One load per field, into `Rdx`, and the bytes are then peeled off it in
                 // place — never one load per byte (a wider field used to pay `nbytes` loads of
                 // the same word and `nbytes` full-width shifts).
-                match *value {
-                    Loc::X(x) => {
-                        buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-                        touch(highest_touched, x);
-                    }
-                    Loc::Y(k) => {
-                        emit_y_slot_value(buffer, Reg::Rcx, k)?;
-                        buffer.mov_rr(Reg::Rdx, Reg::Rcx)?;
-                    }
-                }
+                read_field_value(buffer, allocation, value, highest_touched)?;
                 // Byte `i` (MSB first) of the big-endian field is word bits
                 // `4 + 8 * (nbytes - 1 - i)` .. +8 (see the module docs), and the shift is
                 // ARITHMETIC precisely because the caller wants
@@ -1029,8 +1059,60 @@ fn emit_aligned_fields(
                 }
             }
         }
+        at += 1;
     }
     Ok(())
+}
+
+/// How many consecutive [`PreparedField::Bits`] fields starting at `start` are one-byte fields
+/// reading the **same** location — the run [`emit_aligned_fields`] shares one extraction across.
+///
+/// A run of one is the "no grouping" answer, so a caller can treat `> 1` as the grouped case.
+fn one_byte_run(prepared: &[PreparedField<'_>], start: usize) -> usize {
+    let PreparedField::Bits {
+        value,
+        bits: 8,
+        ..
+    } = &prepared[start]
+    else {
+        return 1;
+    };
+    let mut run = 1usize;
+    while let Some(PreparedField::Bits {
+        value: next,
+        bits: 8,
+        ..
+    }) = prepared.get(start + run)
+    {
+        if next != value {
+            break;
+        }
+        run += 1;
+    }
+    run
+}
+
+/// Load a field value into `rdx`: an x-register through [`Loc::load_x`] (a **cached** value out of
+/// its callee-saved machine register, an uncached one out of `machine.x`), a `Y` slot through its
+/// re-derived address in `rcx`.
+///
+/// The `Y` form re-derives the slot address rather than reusing a hoisted one: nothing between the
+/// up-front window guard and here pushes a frame (the append door only reads machine state), so the
+/// published window still holds the slot and a second guard must not be emitted.
+fn read_field_value(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    value: &Loc,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    match *value {
+        Loc::X(_) => value.load_x(buffer, allocation, Reg::Rdx, highest_touched),
+        Loc::Y(k) => {
+            emit_y_slot_value(buffer, Reg::Rcx, k)?;
+            buffer.mov_rr(Reg::Rdx, Reg::Rcx)?;
+            Ok(())
+        }
+    }
 }
 
 /// The **general** (bit-granular) route's field-write phase.
@@ -1124,9 +1206,10 @@ fn emit_bit_fields(
 /// the `is_small` refusal is this arm's up-front per-field guard (see
 /// [`super::create_field`]).
 ///
-/// Every value is re-read from the machine after the helper: a cached x-register was
-/// spilled before the call, so `machine.x` (via `rbx`) is authoritative, and a `Y` slot is
-/// reached through its own re-derived address behind the up-front guard.
+/// Every value is re-read from the machine after the helper: this route's door
+/// ([`emit_positioned_helper_call`]) spills the block's cached x-registers before its call, so
+/// `machine.x` (via `rbx`) is authoritative, and a `Y` slot is reached through its own
+/// re-derived address behind the up-front guard.
 fn emit_bit_fields_inline(
     buffer: &mut CodeBuffer,
     source: Loc,

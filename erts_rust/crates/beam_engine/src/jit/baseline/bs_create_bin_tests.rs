@@ -33,14 +33,20 @@
 //!   <the append door>                                    ; Aligned: inline shape proof + jit_append_cursor (X or Y)
 //!                                                        ; BitGranular: jit_open_append_bin_any[_y](slot, tail, unit)
 //!   test rax, rax ; je fallback                          ; the LAST guard, still before every write
-//!   <the field byte stores at the cursor in rax>         ; a Y field value is re-read (unguarded) per field
-//!   <the accumulator re-read (unguarded), the end commit>; THE ONLY MUTATION, last
-//!   <the accumulator re-read (unguarded) into Dst>       ; a Y Dst's address is re-derived too
+//!   <the field byte stores at the cursor in rax>         ; one load + `sar 4` per Field::Bits (a run of
+//!                                                        ; same-Loc one-byte fields shares one load), a Y value
+//!                                                        ; re-read (unguarded) per field
+//!   <one accumulator load, the pointer mask in place, end += tail_bits, one store> ; THE ONLY MUTATION, last
+//!   <the same kept accumulator word into Dst>            ; a Y Dst's address is re-derived too
 //!   jmp fast_done
 //! fallback:
 //!   <one interpreter step>                               ; re-reads an untouched accumulator
 //! fast_done:
 //! ```
+//!
+//! The aligned route's door neither spills nor publishes a position: `jit_append_cursor` cannot
+//! pre-empt, park, raise or collect, and the `fallback` arm parks through `jit_step_one`'s own
+//! arguments, so the position a reader sees there is the block entry — a valid resume point.
 //!
 //! A `fallback` is a **deopt**: `jit_step_one` re-executes the entire instruction in the
 //! interpreter with the same operands and re-reads the machine's live state. So any word the
@@ -5006,6 +5012,114 @@ fn a_bare_build_packs_its_eight_bit_field_in_block_and_answers_the_family_value(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The append door's machine-private half, pinned against the seam it is the remainder of
+// ---------------------------------------------------------------------------
+/// **`runtime::append_cursor` answers exactly what `seam::open_append` decides**, for the one
+/// accumulator form a real build produces, over the four cases that clause matrix has: a
+/// registered payload, an unregistered address, room that fits and room that does not.
+///
+/// The helper is the remainder of `seam::open_append` once the emitted proof has established
+/// the term shape itself (`create_door.rs`), so the two must agree on every clause that does
+/// **not** depend on the term: the writable-payload registry lookup (`base` is the key), its
+/// byte-to-bit `checked_mul(8)` conversion and the `end + tail <= capacity` room rule. The
+/// test therefore drives both against the same machine state and asserts they answer the same
+/// thing, then reads the helper's own answer as the byte cursor `base + end_bits / 8`.
+///
+/// **Byte alignment is the DOOR's guard, not this helper's.** `emit_append_cursor` emits
+/// `test rdx, 7 / jne fallback` before the call (`append_unit_allows(end_bits, 8)`,
+/// `erl_bits.c:1778-1784`), so the helper is only ever reached at a byte-aligned window end and
+/// deliberately does not re-check it: an unaligned end is the general door's
+/// (`jit_open_append_bin_any`) business. Every row below is at an aligned end, which is the
+/// only input the helper's contract admits.
+///
+/// What this row still proves: the registry and room clauses agree clause-for-clause with the
+/// seam, the answer is the byte cursor and not the base, and a refusal is the `0` sentinel —
+/// never a fabricated cursor.
+#[test]
+fn append_cursor_answers_exactly_what_the_seams_open_append_decides() {
+    use crate::families::bitstrings::create::seam;
+    use super::runtime::append_cursor;
+
+    let module = accumulator_module("append_cursor_pin", &[], |module| {
+        int_seg(module, Operand::X(1), 8)
+    });
+    let name = atom(&module, "f");
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let hint = crate::terms::make_integer(&mut ctx, 16).expect("the capacity hint builds");
+    let value = crate::terms::make_integer(&mut ctx, 0x41).expect("the field value builds");
+    // The interpreter runs the family's own build, so the accumulator below is the shape a real
+    // `private_append` produces: a writable `ErlSubBits` over a payload this machine owns,
+    // whose window end is the field's 8 bits.
+    let outcome = machine.run_export_outcome_with_tier(
+        &module,
+        name,
+        2,
+        &[hint, value],
+        &mut ctx,
+        Tier::Interpreter,
+    );
+    let accumulator = returned("append_cursor", "interpreter", &outcome);
+
+    // (1) The registry-match, room-fits case: both answer `Some`, and the helper's value is the
+    // byte cursor `base + end_bits / 8` — not the base, which is what a missing division or a
+    // missing registry lookup would look like.
+    let (base, end_bits) = seam::open_append(&machine, accumulator, 0)
+        .expect("a freshly built accumulator is a writable payload of this machine with room");
+    assert_eq!(
+        end_bits, 8,
+        "the accumulator's window end is the one appended field's 8 bits"
+    );
+    assert_eq!(
+        append_cursor(&machine, base, end_bits, 0),
+        (base + end_bits / 8) as i64,
+        "the door answers the byte cursor, not the payload base"
+    );
+
+    // (2) The room clause, at its exact boundary: a tail that exactly fills the payload is
+    // accepted by both, one bit more is refused by both.
+    let capacity_bits = machine
+        .writable_capacity(base as *const u8)
+        .expect("the accumulator's payload is registered writable")
+        * 8;
+    let exact_tail = capacity_bits - end_bits;
+    assert_eq!(
+        seam::open_append(&machine, accumulator, exact_tail as u32),
+        Some((base, end_bits)),
+        "a tail that exactly fills the payload is room enough"
+    );
+    assert_eq!(
+        append_cursor(&machine, base, end_bits, exact_tail),
+        (base + end_bits / 8) as i64,
+        "the exact-fit tail answers the cursor"
+    );
+    let one_bit_too_much = exact_tail + 1;
+    assert_eq!(
+        seam::open_append(&machine, accumulator, one_bit_too_much as u32),
+        None,
+        "one bit past the capacity is refused by the seam"
+    );
+    assert_eq!(
+        append_cursor(&machine, base, end_bits, one_bit_too_much),
+        0,
+        "…and refused by the helper, as the `0` sentinel — never a cursor"
+    );
+
+    // (3) The registry-miss case: an address this machine never registered answers `None` / `0`
+    // even though it is a perfectly plausible address, so the room rule is never reached.
+    let unregistered = base + 4096;
+    assert_eq!(
+        machine.writable_capacity(unregistered as *const u8),
+        None,
+        "the probe address is not a payload of this machine"
+    );
+    assert_eq!(
+        append_cursor(&machine, unregistered, end_bits, 0),
+        0,
+        "an unregistered base is the `0` sentinel"
+    );
+}
 // ---------------------------------------------------------------------------
 // The bare route's value sweep — a child module, because this file carries the append route
 // ---------------------------------------------------------------------------
