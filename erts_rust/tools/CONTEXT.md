@@ -13,9 +13,11 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 ### `differential`
 - `differential run <case-id> [--json] [--out <dir>]` — run one built-in conformance case both ways; print the comparison.
 - `differential compare <expr> [--pa <dir>] [--json] [--out <dir>]` — ad-hoc: evaluate an Erlang expression under both runtimes and compare.
-- `differential suite [--strict] [--json] [--out <dir>]` — run the built-in conformance corpus.
+- `differential suite [--strict] [--allowlist <f>] [--drift-allowlist <f>] [--gaps <p>] [--json] [--out <dir>]` — run the built-in conformance corpus.
+- `differential merge --from <dir> [--allowlist <f>] [--drift-allowlist <f>] [--out-file <p>]` — fold per-case `run --out-file` reports into one suite report without re-running (the documented gate-equivalent route for a full sweep).
 - `differential list [--by-contract] [--json] [--out <dir>]` — list corpus case ids + the compatibility contract each covers (`--by-contract` adds a per-contract case-count rollup).
-- Exit codes: `0` all executed cases agreed (skips/unsupported reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to a failure exit.
+- Exit codes: `0` every executed case agreed (a recorded capability gap or a recorded host-oracle drift is reported, not fatal); `1` ≥1 **mismatch** (our runtime diverging from the committed golden — never allowlisted); `2` usage/env error; with a ratchet, `1` also covers an unauthorized or stale entry in either allowlist. `--strict` escalates an unratcheted `unsupported`/`skipped`/`oracle_drift` to a failure exit.
+- `gate.sh` adds `--report <file>` (judge an existing report, no build/sweep) and maps to `0/1/2/3` where `3` = a ratchet must be updated.
 
 ### `bench`
 - `bench list [--json]` — list workloads + their prerequisite-probe status.
