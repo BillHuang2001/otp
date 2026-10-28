@@ -77,8 +77,13 @@ allocation pins can derive their budget instead of hard-coding a slack.
   block), so the array's `8 · INDEX_SHARDS` bytes move bytes rather than allocation *count*;
   measured at **9 allocations** for a fork-then-intern at 300 atoms and **10** at 3 000
   (`../../../tests/intern_alloc.rs`, case (f), which pins the bound as flat — budget 11).
-- `get`/`len`/`insert` — one shard hash plus one map probe; `len` is O(1) (`split_last` of the
-  chunk list).
+- `get`/`len`/`insert` — **one** `hash_of` per call, serving both the shard mask and the in-shard
+  probe slot, plus one probe. (A `HashMap<Arc<str>, Atom>` could not reuse it: `RandomState`'s
+  SipHash is per-process seeded state, re-derived for every lookup, and it compares keys through an
+  `Arc<str>` deref. This was the single hottest symbol on `copy_bound/etf_roundtrip`.) `len` is
+  O(1) (`split_last` of the chunk list). The probe table grows at a 3/4 load factor (exact test
+  `4·len >= 3·cap`), doubling the power-of-two slot count and re-placing entries from their
+  **stored** hashes — never by re-hashing a string.
 - **The shard array is the second term of the trade.** A non-empty table's `shards` block is
   `8 · INDEX_SHARDS` B (8 KB at 1024), and it is *retained* by every table whose array has diverged
   from its parent — i.e. by every loaded module's `fork` on its first intern — as well as
