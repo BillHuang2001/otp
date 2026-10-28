@@ -26,9 +26,9 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   - `BeamError` variants: `BadArg`, `BadArith`, `BadArity`, `BadMatch`, `SystemLimit`,
     `Alloc(AllocFailure)`, `TermNotFound`, `Io(std::io::Error)`, `Raise(Raise)`.
   - `Raise { class, reason, stacktrace, live_reason, saved_args, error_info }` (all fields public).
-    `live_reason:
-    Option<LiveReason>` is the **opaque live-reason slot**: `ExitReason::Structured` is a unit variant,
-    so a structured reason's live *term* travels out-of-band here instead of in the reason. Builders
+    `live_reason: Option<LiveReason>` is the **opaque live-reason slot**: `ExitReason::Structured` is a
+    unit variant, so a structured reason's live *term* travels out-of-band here instead of in the
+    reason. Builders
     `new`/`error`/`exit`/`throw`/`with_stacktrace`/`with_live_reason`/`with_saved_args`/`with_error_info`,
     accessors `live_reason()`/`saved_args()`/`error_info()`.
     The other two slots are the `erlang:error/2,3` raise shapes the engine renders into the
