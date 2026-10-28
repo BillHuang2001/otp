@@ -1086,7 +1086,10 @@ fn a_bs_match_over_an_off_heap_refc_window_takes_no_interpreter_step() {
          elements): the `bs_match` shape has to be lowered natively",
         family_calls,
         2 * LONG_APPEND_N
+    );
+}
 
+// ---------------------------------------------------------------------------
 // 10. A refc-window subject — the binary-comprehension inner loop
 // ---------------------------------------------------------------------------
 /// Build an off-heap (**refc**) bitstring term over `payload_bytes` with the window
