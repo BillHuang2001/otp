@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beam_common::{BeamError, ExceptionClass, ExitReason};
+use beam_common::{
+    AtomName, BeamError, ExceptionClass, ExitReason, Raise, SourceLocation, StackFrame, StackTrace,
+};
 use beam_engine::context::RootSet;
 use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
 use beam_engine::machine::WaitDeadline;
@@ -42,7 +44,7 @@ use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm, NIL
 use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
-use super::reason::{exit_reason, normal};
+use super::reason::{exit_reason, normal, signalled_or_bare, signalled_reason};
 use super::run::{
     boundary_door_counters, park_publish_counters, park_window, publish_parked_roots,
     reset_boundary_door_counters, reset_park_publish_counters, reset_run_slice_counters,
@@ -196,6 +198,149 @@ fn a_reasonless_error_falls_back_to_its_diagnostic_text() {
     let mut rt = runtime();
     let reason = exit_reason(&mut rt, &BeamError::TermNotFound);
     assert_eq!(rt.atom_name_of(reason), Some(BeamError::TermNotFound.to_string().as_str()));
+}
+
+/// One located stacktrace frame (`died.erl:18`), i.e. what a compiled function's uncaught
+/// exception carries.
+fn located_frame(module: &'static str, function: &'static str, arity: u8) -> StackTrace {
+    let mut stacktrace = StackTrace::new();
+    let mut frame = StackFrame::new(module, function, arity);
+    frame.location = Some(SourceLocation {
+        file: AtomName::new("died.erl"),
+        line: 18,
+    });
+    stacktrace.push(frame);
+    stacktrace
+}
+
+/// An `error` raise carrying one located frame.
+fn raise_with_frame(class: ExceptionClass, reason: ExitReason) -> BeamError {
+    BeamError::Raise(
+        Raise::new(class, reason).with_stacktrace(located_frame("died", "boom", 0)),
+    )
+}
+
+/// `term` as the `~p` printer renders it (the report renders with the same control, so this is
+/// the text a reader of either channel sees).
+fn rendered(rt: &mut Runtime, term: Eterm) -> String {
+    rt.format_term(term, None)
+        .expect("the signalled reason is printable")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+#[test]
+fn an_error_raise_signals_its_reason_and_stacktrace() {
+    // The oracle's `{'EXIT', Pid, R}` for an uncaught `erlang:error(boom)` is the exit value
+    // `{Reason, Stacktrace}` — not the bare reason the raw raise carries.
+    let mut rt = runtime();
+    let error = raise_with_frame(ExceptionClass::Error, ExitReason::atom("boom"));
+    let signalled = signalled_reason(&mut rt, &error).expect("the exit value builds");
+    assert_eq!(
+        rendered(&mut rt, signalled),
+        "{boom,[{died,boom,0,[{file,\"died.erl\"},{line,18}]}]}"
+    );
+}
+
+#[test]
+fn an_uncaught_throw_signals_a_nocatch_error() {
+    // A throw that reaches the top of the stack is *promoted* to `{nocatch, Value}` before it
+    // is signalled (the C's `beam_common.c:508-516`).
+    let mut rt = runtime();
+    // The heap is hoisted out of the build: the live reason term points into it, and
+    // `exit_reason` reads that word straight (the producer stabilized it upstream on the real
+    // route — here the test is the producer).
+    let mut heap = beam_alloc::Heap::new(8).expect("a scratch heap");
+    let ball = rt.intern("ball");
+    let value = heap.tuple(&[ball, make_small(1)]).expect("the thrown tuple");
+    let error = BeamError::Raise(
+        Raise::new(ExceptionClass::Throw, ExitReason::Structured)
+            .with_stacktrace(located_frame("died", "thr", 0))
+            .with_live_reason(beam_common::LiveReason::new(value)),
+    );
+    let signalled = signalled_reason(&mut rt, &error).expect("the exit value builds");
+    assert_eq!(
+        rendered(&mut rt, signalled),
+        "{{nocatch,{ball,1}},[{died,thr,0,[{file,\"died.erl\"},{line,18}]}]}"
+    );
+}
+
+#[test]
+fn an_exit_class_signals_its_bare_reason() {
+    // `exit(bye)` / `exit(normal)` / `exit(shutdown)` / `exit(kill)` signal the reason itself:
+    // no exit value, no stacktrace — exactly what the oracle delivers.
+    let mut rt = runtime();
+    for name in ["bye", "normal", "shutdown", "kill"] {
+        let error = BeamError::Raise(Raise::new(
+            ExceptionClass::Exit,
+            ExitReason::atom(name),
+        ));
+        let signalled = signalled_reason(&mut rt, &error).expect("never fails for an exit");
+        assert_eq!(signalled, rt.intern(name), "exit({name}) signals the bare atom");
+        assert_eq!(rendered(&mut rt, signalled), name);
+    }
+    // A *structured* exit reason stays bare too — it is never wrapped in a pair.
+    let mut heap = beam_alloc::Heap::new(8).expect("a scratch heap");
+    let reason = rt.intern("reason");
+    let value = heap.tuple(&[reason, make_small(2)]).expect("the exit reason");
+    let error = BeamError::Raise(
+        Raise::new(ExceptionClass::Exit, ExitReason::Structured)
+            .with_live_reason(beam_common::LiveReason::new(value)),
+    );
+    let signalled = signalled_reason(&mut rt, &error).expect("never fails for an exit");
+    assert_eq!(rendered(&mut rt, signalled), "{reason,2}");
+}
+
+#[test]
+fn a_non_raise_error_signals_its_bare_diagnostic_text() {
+    // No `Raise` ⇒ no exception class and no stacktrace, so there is no exit value to build:
+    // the bare interned `Display` text is signalled (the documented asymmetry).
+    let mut rt = runtime();
+    let signalled = signalled_reason(&mut rt, &BeamError::TermNotFound)
+        .expect("the bare fallback never fails");
+    assert_eq!(
+        rt.atom_name_of(signalled),
+        Some(BeamError::TermNotFound.to_string().as_str())
+    );
+}
+
+#[test]
+fn an_unbuildable_exit_value_falls_back_to_the_bare_reason() {
+    // The fallback rule: a build/stabilize failure degrades to the bare reason (a death is
+    // never lost) and is traced rather than fabricated into a shape.
+    let mut rt = runtime();
+    let bare = rt.intern("boom");
+    assert_eq!(signalled_or_bare(bare, Err(BeamError::SystemLimit)), bare);
+    // A built value passes through untouched.
+    assert_eq!(signalled_or_bare(bare, Ok(bare)), bare);
+}
+
+#[test]
+fn the_report_and_the_signalled_reason_describe_one_death() {
+    // The real contract: the `=ERROR REPORT====` block and the `{'EXIT', Pid, R}` a linked peer
+    // receives are two renderings of ONE exit value, so their `~p` text must agree exactly.
+    for (class, reason) in [
+        (ExceptionClass::Error, ExitReason::atom("boom")),
+        (ExceptionClass::Throw, ExitReason::atom("oops")),
+    ] {
+        let mut rt = runtime();
+        let error = raise_with_frame(class, reason);
+        let bare = exit_reason(&mut rt, &error);
+        let signalled = signalled_reason(&mut rt, &error).expect("the exit value builds");
+        let text = crate::report::crash_report(&mut rt, ProcessId::new(2, 1), &error, bare)
+            .expect("the report builds")
+            .expect("an error/throw-class termination reports");
+        let value = text
+            .split_once("with exit value:\n")
+            .expect("the report names its exit value")
+            .1;
+        assert_eq!(
+            value.trim_end_matches('\n'),
+            rendered(&mut rt, signalled),
+            "the report and the signal must describe the same exit value ({})",
+            class.as_str()
+        );
+    }
 }
 
 #[test]
