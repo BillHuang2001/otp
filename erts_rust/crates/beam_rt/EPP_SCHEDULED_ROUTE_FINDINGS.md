@@ -86,7 +86,7 @@ and `runner::tests::a_receive_park_publishes_so_a_signal_collects_the_receivers_
 **The durable invariant behind the E0 shape.** A registered BIF's container result is never left on the recyclable pooled BIF heap while running Erlang code can store it in a heap object.
 On a process route the copy-out moves such a result onto the process's own **scanned young heap**, where the engine's ordinary root set already publishes it (it lands in `x(0)` on return) and a later collection relocates it like any other heap object.
 The pool rewind that follows stays gated on `safe_to_rewind`: only a call the six escaping `DispatchHooks` seams and reentrancy cannot have run on, with an `Ok` result, is rewound to its own start offset.
-A graph that holds a reference is neither moved nor rewound — a reference's identity is its address.
+A graph that holds a reference is neither moved nor rewound — the monitor/alias provenance and the canonical timer words are keyed by the reference's term word.
 The table-less `-eval` route keeps the older gated move: it has no collector, so the copy lands on the pointer-stable runtime store (`Runtime::eval_heap` + `Runtime::eval_off_heap`) instead of an object a collection would relocate.
 The invariant is [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)'s and [`src/context/calls.rs`](src/context/calls.rs) implements it.
 

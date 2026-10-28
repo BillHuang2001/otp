@@ -316,8 +316,9 @@ object — a second full traversal on top of the copy that follows it. It now wa
 an inline 64-word worklist plus a lazily allocated spill, **no visited set** (a well-formed term graph
 is acyclic) and a `1 << 20` visit budget whose exhaustion answers `true` — the *decline*, never a wrong
 move. Every semantic guard, the `for_each_child_slot` child enumeration and the guarantee (**a
-reference-containing container is never moved**, because a reference's identity is its address and
-`Runtime::references`/`Timers` are keyed by the term) are unchanged.
+reference-containing container is never moved**, because `Runtime::references` keys a reference's
+monitor/alias provenance on its term word and `Timers`/`TimerWakes` hold canonical reference words)
+are unchanged.
 
 ### The deterministic counter (the evidence, not a wall time)
 

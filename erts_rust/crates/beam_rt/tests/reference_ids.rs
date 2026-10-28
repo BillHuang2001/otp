@@ -31,12 +31,13 @@
 //!   (the `{alias, Mode}` monitor form included);
 //! * `beam_abi`'s NIF-resource mint (`enif_make_resource`).
 //!
-//! So two producers can never issue the same id, and a reference's identity is its **term**. A
-//! `send` destination is nevertheless classified by **provenance** (the term-keyed runtime
-//! registry, `src/context/alias.rs`), never by the id alone, because provenance is what says
-//! whether a reference may be a live alias — the guard the unit suite's
-//! `resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias` pins directly
-//! (with a deliberately fabricated colliding block, since minting one is now impossible).
+//! So two producers can never issue the same id, and a reference's identity is the **id** word it
+//! encodes — a *copy* of a reference is the same reference. A `send` destination is nevertheless
+//! classified by **provenance** (the term-keyed runtime registry, `src/context/alias.rs`), never by
+//! the id alone, because provenance is what says whether a reference may be a live alias — the
+//! guard the unit suite's `resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias`
+//! pins directly (with a deliberately fabricated colliding block, since minting one is now
+//! impossible).
 //! This suite pins the *observable* answers of every public mint route against every consumer
 //! path, with the live oracle as ground truth.
 //!
@@ -72,12 +73,17 @@
 //!   keeps a bare reference from being *delivered* to an alias owner);
 //! * `erlang:monitor(process, self(), [{alias, _}])` registers an alias here where the C clears it for
 //!   a self-monitor (documented at `tests/alias.rs`);
-//! * `erlang:unalias/1` and `erlang:cancel_timer/1` on a **decoded copy** of a reference
-//!   (`binary_to_term(term_to_binary(R))`) miss the term-keyed registries, so they answer `false` /
-//!   `badarg` where the C reads the ref thing's payload and answers `true` / the remaining time. This
-//!   is the "identity is the term, not the id" seam — a decoded copy was never minted here, so its
-//!   *provenance* is unknown even though its id is a real draw — and closing it is owned by
-//!   `../beam_process/`, *not* by `beam_rt`.
+//! * `erlang:unalias/1` on a **decoded copy** of an alias reference
+//!   (`binary_to_term(term_to_binary(R))`) answers `false` where the C reads the ref thing's payload
+//!   and answers `true`: the monitor/alias provenance registry (`Runtime::references`,
+//!   `src/runtime.rs`) is keyed by the reference **term's** word, so the copy is not found even
+//!   though the id it encodes is the reference's whole identity.
+//!
+//! A **timer** reference is the registry that does recognise a copy: `erlang:cancel_timer/1,2` and
+//! `erlang:read_timer/1,2` name the timer by the reference's **id** (`Timers::refs_by_id` beside the
+//! word-keyed `refs`), so a decoded copy of a timer reference cancels the timer on both runtimes —
+//! the `cancel_timer_copy` fixture below, and `tests/timer_ref_identity.rs` for the ETS round trip
+//! `inet_gethost_native` depends on.
 //!
 //! A reference **without** a decoded copy (the live mint) is one of the agreeing cases, and a decoded
 //! copy of a **live alias** is a working `send` destination on both runtimes (the "unknown
@@ -235,7 +241,7 @@ unalias_copy() ->
     C = binary_to_term(term_to_binary(A)),
     try erlang:unalias(C) catch Cl:E -> {Cl, E} end.
 
-%% --- DIVERGENCE: cancel_timer/1 of a decoded copy ----------------------
+%% --- a decoded COPY of a timer reference cancels the same timer --------
 cancel_timer_copy() ->
     T = erlang:send_after(100000, self(), x),
     C = binary_to_term(term_to_binary(T)),
@@ -252,7 +258,7 @@ const FIXTURES: [(&str, &str); 1] = [("refids", REFIDS_SRC)];
 /// Every case the two runtimes must print identically: the label, the fixture entry point and the
 /// exact line both runtimes print for it. Two producers' mint routes appear in most entries, so a
 /// regression in any of them is caught.
-const AGREEMENTS: [(&str, &str, &str); 9] = [
+const AGREEMENTS: [(&str, &str, &str); 10] = [
     (
         "make_ref/0 through is_reference, =:=, binary_to_term, demonitor and unalias",
         "make_ref_consumers",
@@ -277,6 +283,11 @@ const AGREEMENTS: [(&str, &str, &str); 9] = [
         "send_after/3 and start_timer/3 references through is_reference and cancel_timer",
         "timer_consumers",
         "{true,true,false,true,true,true}",
+    ),
+    (
+        "cancel_timer/1 through a decoded COPY of a send_after/3 reference",
+        "cancel_timer_copy",
+        "true",
     ),
     (
         "the term_to_binary/binary_to_term round trip for every mint route",
@@ -306,7 +317,7 @@ const AGREEMENTS: [(&str, &str, &str); 9] = [
 
 /// Each entry: the label, the fixture entry point, this runtime's current answer and the live
 /// oracle's answer for the same workload.
-const DIVERGENCES: [(&str, &str, &str, &str); 6] = [
+const DIVERGENCES: [(&str, &str, &str, &str); 5] = [
     (
         "a send to a bare make_ref/0: typed badarg here, a silent drop there",
         "send_bare_ref",
@@ -335,12 +346,6 @@ const DIVERGENCES: [(&str, &str, &str, &str); 6] = [
         "unalias/1 of a decoded copy: the term-keyed registry misses it here",
         "unalias_copy",
         "false",
-        "true",
-    ),
-    (
-        "cancel_timer/1 of a decoded copy: the term-keyed registry misses it here",
-        "cancel_timer_copy",
-        "{error,badarg}",
         "true",
     ),
 ];
