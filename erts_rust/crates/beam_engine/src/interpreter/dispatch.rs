@@ -35,7 +35,7 @@ use beam_term::{
 use crate::context::{BifOutcome, ExecutionContext};
 use crate::error;
 use crate::families;
-use crate::families::exceptions::callee;
+use crate::families::exceptions::{bif_frame, callee};
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
 use crate::machine::{namespace_atom, Continuation, Machine, RunOutcome, Verdict};
 use crate::operand::{read_operand, write_operand};
@@ -1008,7 +1008,18 @@ impl Machine {
             // byte-identical to the one it replaces — without it, a send to a dead
             // pid would turn from a silent drop into a raise.
             Err(BeamError::TermNotFound) => Ok(Some(ApplyTarget::Called(message))),
-            Err(e) => Ok(Some(ApplyTarget::Raised(self.raise_bif_error(module, e, ctx)?))),
+            // A failing send is a BIF failure of `erlang:send/2`, so the oracle's
+            // innermost cooked item is `{erlang,send,[To,Msg],[{error_info,#{module =>
+            // erl_erts_errors}}]}` — the **canonical** name, never the `'!'/2` alias the
+            // import may have been written with (measured: `erlang:'!'(1,hi)` cooks
+            // `{erlang,send,[1,hi],…}`), with the destination and message in `x(0)`/`x(1)`.
+            Err(e) => {
+                let head =
+                    bif_frame::bif_head_item_regs(self, ctx, module, "erlang", "send", 2)?;
+                Ok(Some(ApplyTarget::Raised(
+                    self.raise_bif_error_with_head(module, e, head, ctx)?,
+                )))
+            }
         }
     }
     /// The **single shared body** of the three `call_ext*` arms.
@@ -1093,8 +1104,39 @@ impl Machine {
                             // instruction's own `arity` operands hold its arguments, so
                             // the item is synthesized here (a no-op for any other error
                             // shape, or when the raise cannot land).
-                            let head =
-                                callee::import_callee_head_item(self, ctx, module, target, arity, &e)?;
+                            //
+                            // Every **other** host failure on this route is a real BIF
+                            // error, and the oracle's innermost item is then the BIF
+                            // itself with its real argument list and its `error_info`
+                            // extension (C's `save_stacktrace`, `beam_common.c:877-1063`
+                            // — see [`crate::families::exceptions::bif_frame`]). The
+                            // `undef` item takes precedence: it names a callee that does
+                            // not exist, whose `Location` is the empty list, and C never
+                            // reaches the BIF arm for it.
+                            let head = match callee::import_callee_head_item(
+                                self, ctx, module, target, arity, &e,
+                            )? {
+                                Some(item) => Some(item),
+                                None => match labels.import_target(module, target) {
+                                    // `bif_mfa->arity` — the **import table's** declared
+                                    // arity, which is not the instruction's own for the
+                                    // `call_ext 3 erlang:apply/3` split.
+                                    Ok((bif_module, bif_function, bif_arity)) => {
+                                        bif_frame::bif_head_item_regs(
+                                            self,
+                                            ctx,
+                                            module,
+                                            bif_module,
+                                            bif_function,
+                                            bif_arity,
+                                        )?
+                                    }
+                                    // The import reference is unreadable: there is no
+                                    // callee identity to name, and the BIF's own error
+                                    // must never be replaced by a marshalling one.
+                                    Err(_) => None,
+                                },
+                            };
                             return self
                                 .raise_bif_error_with_head(module, e, head, ctx)
                                 .map_err(Box::new);
@@ -1441,7 +1483,29 @@ impl Machine {
             // on the *call instruction* — re-executing it re-asks the host, which
             // re-issues the BIF with the same registers.
             Ok(BifOutcome::Suspend) => return Ok(Some(Step::Suspend { func, pc })),
-            Err(e) => return self.raise_bif_error(module, e, ctx).map_err(Box::new).map(Some),
+            Err(e) => {
+                // This seam **is** a BIF dispatch (`call_bif_named`), so its failure
+                // cooks the same innermost item a `call_ext` BIF failure does: the
+                // callee named with its real argument registers and the
+                // `{error_info, #{module => FormatModule}}` extension (the running
+                // module owns the callee, so its own atom table names it).
+                //
+                // Residual: OTP reaches a module's own `*_nif` stub through the
+                // **NIF** epilogue, which hands `handle_error` the *calling* MFA
+                // (`../../erts/emulator/beam/emu/bif_instrs.tab:633`,
+                // `handle_error(c_p, cp, reg, c_p->current)`), so an oracle trace for a
+                // failing NIF stub names the caller rather than the stub. No
+                // differential case reaches a failing `zlib`/`prim_tty` stub, and the
+                // engine's seam has no NIF epilogue to consult, so the item follows
+                // the BIF route — a documented shape difference, never a wrong term.
+                let head =
+                    bif_frame::bif_head_item_regs(self, ctx, module, module_name, function_name, arity)
+                        .map_err(Box::new)?;
+                return self
+                    .raise_bif_error_with_head(module, e, head, ctx)
+                    .map_err(Box::new)
+                    .map(Some);
+            }
         };
         self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
             .map(Some)

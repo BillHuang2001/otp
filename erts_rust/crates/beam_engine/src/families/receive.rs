@@ -81,6 +81,7 @@ use beam_term::{is_small, signed_value};
 
 use crate::context::ExecutionContext;
 use crate::error;
+use crate::families::exceptions::bif_frame;
 use crate::interpreter;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
@@ -117,7 +118,17 @@ pub(crate) fn exec(
                     machine.set_x(0, message)?;
                     Ok(Some(Step::Next))
                 }
-                Err(e) => machine.raise_bif_error(module, e, ctx).map(Some),
+                // A failing send is a BIF failure of `erlang:send/2` (C's `send()`
+                // macro reaches `handle_error` with the export's `info.mfa`), so the
+                // oracle's innermost cooked item names the BIF with the destination
+                // and the message — `catch (1 ! hi)` cooks
+                // `{erlang,send,[1,hi],[{error_info,#{module => erl_erts_errors}}]}`.
+                // The registers are untouched by the failed delivery, so the item is
+                // built from `x(0)`/`x(1)` like any other `call_ext` BIF failure.
+                Err(e) => {
+                    let head = bif_frame::bif_head_item_regs(machine, ctx, module, "erlang", "send", 2)?;
+                    machine.raise_bif_error_with_head(module, e, head, ctx).map(Some)
+                }
             }
         }
 

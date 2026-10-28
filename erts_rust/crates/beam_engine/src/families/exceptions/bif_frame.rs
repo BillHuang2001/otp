@@ -53,12 +53,32 @@
 //! The engine's raise snapshot is `(context, func, pc)` metadata, so its cooked
 //! items can only ever carry an **arity** in the `A` slot (see [`super::stacktrace`])
 //! — the BIF frame with its real argument list and its `error_info` location is
-//! exactly the one item the snapshot cannot produce, so the BIF dispatch site
+//! exactly the one item the snapshot cannot produce, so the failing site
 //! synthesizes it and publishes it as the raise's own **raw-trace word**, the same
 //! protocol [`super::callee`] uses for an `undef`:
 //! [`Machine::raise_bif_error_with_head`] arms the one-shot `pending_callee_head`
 //! latch immediately before the `throw_with_trace` that lands it, and
 //! `build_stacktrace` conses the item in front of the snapshot's frames.
+//!
+//! # The two entry points (one carve)
+//!
+//! A BIF failure reaches this module through **two register shapes**, which is why
+//! there are two entry points over one shared [`carve`]:
+//!
+//! * [`bif_head_item`] — the `bif`/`gc_bif` instruction, whose arguments are its own
+//!   [`Operand`]s;
+//! * [`bif_head_item_regs`] — every `call_ext`-shaped site (`call_ext*`, the
+//!   `apply`/`apply_target` route, `send` and the local-callee seam), whose
+//!   arguments are the registers `x(0..arity)` and whose **arity is the import
+//!   table's declared one**, not necessarily the instruction's own (the
+//!   `call_ext 3 erlang:apply/3` split): C's
+//!   `make_arglist(c_p, reg, bif_mfa->arity)`
+//!   (`../../erts/emulator/beam/beam_common.c:1062`), where `bif_mfa` is the
+//!   export's `info.mfa`, never the call site's operand.
+//!
+//! Both go through the **same** [`carve`], so the layout, the sizing and the
+//! reserve → read → write ordering are defined once and the two shapes cannot
+//! drift.
 //!
 //! **Never a fabricated frame.** The item is built only at a real BIF failure,
 //! from that instruction's own `(module, function)` import and its own **real**
@@ -89,7 +109,7 @@
 //!   the payload today — the only producer is `erlang:error/3`, which the
 //!   [`is_non_bif_raise`] gate excludes from this path entirely.
 
-use beam_loader::{Module, Operand};
+use beam_loader::{Atom, Module, Operand};
 use beam_term::{make_atom, Eterm, NIL};
 
 use beam_common::Result;
@@ -187,6 +207,105 @@ fn extension_atoms(
     ))
 }
 
+/// Where an entry point's **argument list** comes from.
+///
+/// The two shapes C itself distinguishes: a `bif`/`gc_bif` instruction's own
+/// operands, and the registers of every `call_ext`-shaped site. [`carve`] is the
+/// only consumer, so both shapes provably produce the same item layout.
+#[derive(Clone, Copy)]
+enum Args<'a> {
+    /// The `bif`/`gc_bif` instruction's own argument operands.
+    Operands(&'a [Operand]),
+    /// The registers `x(0..arity)`, where `arity` is the **BIF's declared** arity
+    /// (C's `bif_mfa->arity`, `../../erts/emulator/beam/beam_common.c:1062`).
+    Registers(u32),
+}
+
+impl Args<'_> {
+    /// How many arguments the item's `ArgList` holds — the count [`carve`] sizes the
+    /// reservation from, and the arity [`is_non_bif_raise`] is asked about.
+    fn len(self) -> usize {
+        match self {
+            Args::Operands(operands) => operands.len(),
+            Args::Registers(arity) => arity as usize,
+        }
+    }
+
+    /// Read argument `index` **after** the reservation. Both arms go through
+    /// [`crate::operand::read_operand`], so an unreadable argument answers the same
+    /// typed error either way and nothing is read twice.
+    fn read(
+        self,
+        machine: &Machine,
+        ctx: &mut dyn ExecutionContext,
+        index: usize,
+    ) -> Result<Eterm> {
+        match self {
+            Args::Operands(operands) => read_operand(machine, ctx, &operands[index]),
+            Args::Registers(_) => read_operand(machine, ctx, &Operand::X(index as u32)),
+        }
+    }
+}
+
+/// The **one** carve of a `{Module, Function, ArgList, Location}` item, shared by
+/// both entry points.
+///
+/// `item_atoms` is the `(module, function)` pair, already resolved to atom indices
+/// (an atom is an immediate, so holding the two words across the reservation is
+/// safe); `extension` names the `{error_info, #{module => FormatModule}}` location
+/// (see [`extension_atoms`]) or `None` for the empty-list location.
+///
+/// The whole graph is **one** rooted reservation, sized from metadata only —
+/// `2 * argc` words for the argument list (one cons cell per argument), `5` for the
+/// item tuple, and [`EXTENSION_WORDS`] more when the location carries the
+/// extension. Children are written before parents, in that order, and every
+/// argument is read **after** the reservation (the frozen reserve → read → write
+/// discipline: a moving collector may run under it).
+///
+/// An argument that cannot be read is **not** a runtime value (it comes from the
+/// instruction or from the BIF's declared arity), so the honest answer is
+/// `Ok(None)` — synthesize nothing and keep the raise as it was — never a
+/// fabricated `[]` in that slot.
+fn carve(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    module: &Module,
+    item_atoms: (Atom, Atom),
+    extension: Option<(Atom, Atom, Atom)>,
+    args: Args<'_>,
+) -> Result<Option<Eterm>> {
+    let argc = args.len();
+    let total = 2 * argc + ITEM_WORDS + extension.map_or(0, |_| EXTENSION_WORDS);
+    let mut sink = terms::reserve_slack(machine, ctx, total)?;
+    // Children before parents, in the order `total` counts.
+    let location = match extension {
+        Some((error_info, key, value)) => {
+            let map = sink.map(
+                &[(make_atom(key), make_atom(value))],
+                &module.atom_table,
+            )?;
+            let pair = sink.tuple(&[make_atom(error_info), map])?;
+            sink.list(&[pair])?
+        }
+        None => NIL,
+    };
+    // Post-collection read: the BIF's real arguments, in order.
+    let mut values = Vec::with_capacity(argc);
+    for index in 0..argc {
+        match args.read(machine, ctx, index) {
+            Ok(value) => values.push(value),
+            Err(_) => return Ok(None),
+        }
+    }
+    let arg_list = sink.list(&values)?;
+    Ok(Some(sink.tuple(&[
+        make_atom(item_atoms.0),
+        make_atom(item_atoms.1),
+        arg_list,
+        location,
+    ])?))
+}
+
 /// The synthesized innermost cooked-stacktrace item of a raise coming out of the BIF
 /// `bif_module:bif_function/arity`:
 ///
@@ -197,11 +316,11 @@ fn extension_atoms(
 /// with the empty-list `Location` when [`format_module`] does not name a format
 /// module for `bif_module`.
 ///
-/// `args` are the **instruction's own** argument operands (the very list the
-/// dispatch marshalled for the BIF), so the item names the callee with its real
-/// arguments exactly as C's `make_arglist(c_p, reg, bif_mfa->arity)` does. They are
-/// read **after** the one rooted reservation, honoring the frozen
-/// reserve → read → write ordering (a moving collector may run under it).
+/// This is the **`bif`/`gc_bif` instruction** shape: `args` are the instruction's own
+/// argument operands (the very list the dispatch marshalled for the BIF), so the
+/// item names the callee with its real arguments exactly as C's
+/// `make_arglist(c_p, reg, bif_mfa->arity)` does. For the `call_ext`-shaped sites see
+/// [`bif_head_item_regs`].
 ///
 /// Returns `None` — today's behaviour, an unmodified raise — when any of:
 ///
@@ -220,6 +339,54 @@ pub(crate) fn bif_head_item(
     bif_function: &str,
     args: &[Operand],
 ) -> Result<Option<Eterm>> {
+    build(
+        machine,
+        ctx,
+        module,
+        bif_module,
+        bif_function,
+        Args::Operands(args),
+    )
+}
+
+/// [`bif_head_item`] for the **register-shaped** sites — every `call_ext`-shaped
+/// route (`call_ext*`, the `apply`/`apply_target` seam, `send`, the local-callee
+/// seam).
+///
+/// `arity` is the **BIF's declared arity** (the import table's, or the local callee's
+/// own), never the instruction's operand: those two differ for the
+/// `call_ext 3 erlang:apply/3` split, and C's `make_arglist(c_p, reg, bif_mfa->arity)`
+/// uses the export's (`../../erts/emulator/beam/beam_common.c:1062`). The arguments
+/// are the registers `x(0..arity)`, read after the reservation, and an arity beyond
+/// the register file is a decline (`Ok(None)`), exactly like an unreadable operand.
+pub(crate) fn bif_head_item_regs(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    module: &Module,
+    bif_module: &str,
+    bif_function: &str,
+    arity: u32,
+) -> Result<Option<Eterm>> {
+    build(
+        machine,
+        ctx,
+        module,
+        bif_module,
+        bif_function,
+        Args::Registers(arity),
+    )
+}
+
+/// The shared gate + atom resolution of the two entry points (see
+/// [`bif_head_item`] for the declines, which are identical for both shapes).
+fn build(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    module: &Module,
+    bif_module: &str,
+    bif_function: &str,
+    args: Args<'_>,
+) -> Result<Option<Eterm>> {
     if is_non_bif_raise(bif_module, bif_function, args.len() as u32)
         || machine.catch_frame_depth() == 0
     {
@@ -234,42 +401,14 @@ pub(crate) fn bif_head_item(
     // Resolved before the reservation: the three atom words are `Copy` indices and
     // can never be relocated. An extension the module cannot name is simply absent.
     let extension = extension_atoms(ctx, module, bif_module);
-    // The whole graph in ONE rooted reservation, sized from metadata only:
-    // `2 * arity` words for the argument list (one cons cell per argument), `5` for
-    // the item tuple, and `EXTENSION_WORDS` more when the location carries the
-    // `{error_info, Map}` extension (the map, the pair and its cons cell).
-    let total = 2 * args.len() + ITEM_WORDS + extension.map_or(0, |_| EXTENSION_WORDS);
-    let mut sink = terms::reserve_slack(machine, ctx, total)?;
-    // Children before parents, in the order `total` counts.
-    let location = match extension {
-        Some((error_info, key, value)) => {
-            let map = sink.map(
-                &[(make_atom(key), make_atom(value))],
-                &module.atom_table,
-            )?;
-            let pair = sink.tuple(&[make_atom(error_info), map])?;
-            sink.list(&[pair])?
-        }
-        None => NIL,
-    };
-    // Post-collection read: the BIF's real arguments, in order. An unreadable
-    // operand is not a runtime value (`args` comes from the instruction), so the
-    // honest answer is to synthesize nothing and keep the raise as it was — never to
-    // replace the BIF's own error with a marshalling one.
-    let mut values = Vec::with_capacity(args.len());
-    for operand in args {
-        match read_operand(machine, ctx, operand) {
-            Ok(value) => values.push(value),
-            Err(_) => return Ok(None),
-        }
-    }
-    let arg_list = sink.list(&values)?;
-    Ok(Some(sink.tuple(&[
-        make_atom(module_atom),
-        make_atom(function_atom),
-        arg_list,
-        location,
-    ])?))
+    carve(
+        machine,
+        ctx,
+        module,
+        (module_atom, function_atom),
+        extension,
+        args,
+    )
 }
 
 #[cfg(test)]

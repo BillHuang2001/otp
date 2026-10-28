@@ -125,7 +125,7 @@ use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm, NIL};
 
 use crate::context::{BifOutcome, ExecutionContext, FunOutcome, RootSet};
 use crate::error;
-use crate::families::exceptions::callee;
+use crate::families::exceptions::{bif_frame, callee};
 use crate::machine::{namespace_atom, Continuation, Machine};
 use crate::operand::{
     operand_slack_words, read_operand, read_operand_slack, read_operands_slack, write_operand,
@@ -645,6 +645,19 @@ fn call_fun(
 /// prints are deliberately not fabricated.
 ///
 /// Every other error keeps the catch-aware funnel unchanged.
+///
+/// **No BIF head item is armed here, deliberately.** This funnel carries a
+/// *closure application* failure, not a BIF failure: the applied value is a fun, and
+/// the site has no BIF `(module, function, arity)` identity to name — a fun's
+/// identity is `{Fun, Args}` (`lambda_head_item`) or a *code* frame with a real
+/// `[{file,_},{line,_}]` location, never a `{Module, Function, ArgList, […]}` item. A
+/// fun that wraps a BIF (`(fun erlang:hd/1)(1)`) is dispatched by the host's own
+/// closure seam (`RuntimeContext::apply_non_local_fun` → `call_bif`), so the BIF
+/// identity exists only on the far side of a seam this module cannot see through, and
+/// synthesizing one from the fun term would equally "name" `lists:max/1` — an Erlang
+/// frame whose oracle item carries a file/line location, which no BIF head item may
+/// imitate. The `apply`/`apply_target` route, which *does* know the BIF MFA, arms the
+/// head (see [`apply_target`]).
 fn fun_apply_error(
     machine: &mut Machine,
     module: &Module,
@@ -867,7 +880,25 @@ pub(crate) fn apply_target(
             let function_term = machine
                 .x(arity + 1)
                 .ok_or_else(|| error::bad_register(arity + 1))?;
-            let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;
+            // The `undef` head takes precedence: it names a callee that does not exist
+            // (`Location` `[]`), and the failing dispatch never happened. Only when the
+            // target **did** resolve to a BIF and that BIF failed does the oracle cook
+            // the BIF head item — the BIF's own declared arity and its real arguments,
+            // which are the registers `x(0..arity)` this site marshalled (measured:
+            // `apply(erlang,hd,[1])` cooks `{erlang,hd,[1],[{error_info,#{module =>
+            // erl_erts_errors}}]}`, while `apply(erlang,error,[foo])` keeps the caller
+            // frame — the [`bif_frame::is_non_bif_raise`] gate).
+            let head = match callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)? {
+                Some(item) => Some(item),
+                None => bif_frame::bif_head_item_regs(
+                    machine,
+                    ctx,
+                    module,
+                    &module_name,
+                    &function_name,
+                    arity,
+                )?,
+            };
             Ok(ApplyTarget::Raised(
                 machine.raise_bif_error_with_head(module, e, head, ctx)?,
             ))
