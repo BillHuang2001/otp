@@ -317,7 +317,8 @@ fn the_item_is_declined_without_a_live_catch_frame() {
 #[test]
 fn the_item_is_declined_for_the_raising_bifs() {
     // `erlang:error/1,2,3`, `erlang:exit/1` and `erlang:throw/1`: the caller's own
-    // frame is the innermost one (SLICE B1's rows), so no BIF item may be prepended.
+    // frame is the innermost one (`error/2,3`'s args and `error_info` ride it), so no
+    // BIF item may be prepended.
     let module = fixture();
     let mut machine = machine_with_a_catch_frame();
     let mut ctx = MinimalContext::new();

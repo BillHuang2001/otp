@@ -92,7 +92,7 @@ pub const SEED_ATOMS: &[&str] = &[
     "EXIT",
     "file",
     "line",
-    // The cooked stacktrace's `{error_info, Map}` location extension (SLICE B1):
+    // The cooked stacktrace's `{error_info, Map}` location extension:
     // the extension's own key, the `module` key of a format-module map, the
     // `cause` key an ext-info variant carries, and the three format modules OTP's
     // `erl_stdlib_errors`/`erl_erts_errors`/`erl_kernel_errors` classification

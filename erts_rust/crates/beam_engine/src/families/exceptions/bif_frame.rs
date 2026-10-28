@@ -100,14 +100,14 @@
 //!   engine emits `#{module => FormatModule}` only. `ets:lookup/2`,
 //!   `erlang:register/2`, `erlang:process_flag/2,3`, `erlang:start_timer/3,4` and
 //!   the bit-syntax BIFs carry a `cause` in the oracle.
-//! * A raise that **publishes its own ext info** ([`beam_common::Raise::error_info`])
-//!   is likewise rendered `#{module => FormatModule}` rather than verbatim: the
-//!   payload is an unrooted `Eterm` inside the `BeamError`, and carrying it across
-//!   the reservation is the dangling-pointer hazard the rooting law forbids. The
-//!   verbatim form needs a machine latch for the payload (SLICE B1's
-//!   `pending_error_info`/`raise_error_info`), and no BIF raise in the tree sets
-//!   the payload today — the only producer is `erlang:error/3`, which the
-//!   [`is_non_bif_raise`] gate excludes from this path entirely.
+//! * A BIF that **published its own ext info** would still render
+//!   `#{module => FormatModule}` here: this carve builds the item from the BIF's
+//!   own dispatch site and never reads a `Raise` payload, so it has no C
+//!   `#{cause => Fvalue, module => …}` arm. No BIF in the tree publishes one —
+//!   the only producer is `erlang:error/3`, which the [`is_non_bif_raise`] gate
+//!   excludes from this path entirely; the *caller-frame* path renders a
+//!   `Raise::error_info` payload verbatim instead (`stacktrace.rs`'s
+//!   `raise_error_info` latch).
 
 use beam_loader::{Atom, Module, Operand};
 use beam_term::{make_atom, Eterm, NIL};
@@ -170,7 +170,7 @@ pub(crate) fn format_module(bif_module: &str) -> Option<&'static str> {
 /// The three exceptions are the BIFs that *are* the raise: `erlang:error/1,2,3`
 /// (the reason the program chose), `erlang:exit/1` and `erlang:throw/1`. Their
 /// frame identity and argument list are the ones the caller's own frame renders
-/// (SLICE B1's `saved_args` shape), so prepending a `{erlang,error,[…]}` item would
+/// (the `saved_args` shape), so prepending a `{erlang,error,[…]}` item would
 /// be a frame the oracle never shows.
 ///
 /// Every other `erlang` BIF — `hd/1`, `binary_to_atom/1`, `map_get/2`, … — **does**
