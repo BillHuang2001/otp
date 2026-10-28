@@ -526,7 +526,7 @@ pub(crate) fn emit_block(
             // crate `CONTEXT.md`), and the interpreter's own arm is `push_frame` then
             // `Step::Next`.
             Instr::Allocate { stack_need, .. } => {
-                emit_allocate(buffer, allocation, done, func, pc, stack_need.words())?
+                emit_allocate(buffer, allocation, done, pc, stack_need.words())?
             }
             // `allocate_heap Ns Nh Live` admits heap FIRST, then pushes the frame (the
             // interpreter's order — a failed admission must leave no frame behind).
@@ -553,7 +553,8 @@ pub(crate) fn emit_block(
             // `trim N Remaining` shrinks the current frame to `N` Y slots; a frame-size
             // mismatch (no live frame, or `N` past the frame) stays the interpreter's own
             // typed error.
-            Instr::Trim { n, .. } => emit_trim(buffer, allocation, done, func, pc, *n)?,            Instr::Jump { target } => match labels.resolve(*target) {
+            Instr::Trim { n, .. } => emit_trim(buffer, allocation, done, func, pc, *n)?,
+            Instr::Jump { target } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
                     // A compiled successor is entered **directly** (the linker tears
                     // this block's frame down and jumps to its entry); anything else

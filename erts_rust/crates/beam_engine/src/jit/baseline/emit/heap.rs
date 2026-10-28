@@ -36,11 +36,12 @@
 //! # The two shapes
 //!
 //! All four instructions are **non-terminating**: the interpreter's arm returns
-//! `Step::Next`, so the emitted code compares the helper's word with
-//! `encode_target(func, pc + 1)` and continues in-block on a match, or branches to the
-//! block epilogue with the word in `rax` (always the [`ERROR`] word of a failed
-//! admission / a failed trim) on anything else. The four differ only in whether the
-//! helper can touch `machine.x`:
+//! `Step::Next`, so the helper answers [`CONTINUE`] (`i64::MAX`) and the emitted code
+//! proves it with a reject-only `test rax, rax` / `js` pair over the
+//! `{CONTINUE non-negative, ERROR negative}` space, continuing in-block when the sign
+//! bit is clear and branching to the block epilogue with the word in `rax` (always the
+//! [`ERROR`] word of a failed admission / a failed trim) on anything else. The four
+//! differ only in whether the helper can touch `machine.x`:
 //!
 //! * **`allocate`** ([`emit_allocate`]) and **`trim`** ([`emit_trim`]) touch **no**
 //!   x-register: `push_frame` grows `machine.stack` and pushes a `Frame`, and `trim`
@@ -75,10 +76,13 @@ use beam_common::Result;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::runtime::{
-    encode_target, jit_allocate, jit_allocate_heap, jit_test_heap, jit_trim, AllocateHeapHelper,
+    jit_allocate, jit_allocate_heap, jit_test_heap, jit_trim, AllocateHeapHelper, AllocateHelper,
     FrameSizeHelper, HeapNeedHelper,
 };
-use super::{emit_continue_check, emit_continue_check_helper_refresh, emit_helper_call, Allocation};
+use super::{
+    emit_continue_check_helper_refresh, emit_continue_check_reject_only,
+    emit_helper_call, Allocation,
+};
 
 /// Lower `allocate StackNeed Live` — push a stack frame, then continue in-block at
 /// `pc + 1`.
@@ -90,8 +94,9 @@ use super::{emit_continue_check, emit_continue_check_helper_refresh, emit_helper
 /// so the helper re-publishes the window on its success path and emitted code never
 /// performs the push.
 ///
-/// The helper answers either `encode_target(func, pc + 1)` (the interpreter's
-/// `Step::Next`) or `ERROR`, and [`emit_frame_change_continue`] folds both. Like
+/// The helper answers either [`CONTINUE`] (the interpreter's `Step::Next`) or
+/// `ERROR`, and [`emit_frame_change_continue`] proves which with a reject-only
+/// `test rax, rax` / `js` over `{CONTINUE non-negative, ERROR negative}`. Like
 /// [`super::emit_deallocate`] there is no register refill (the push touches no
 /// x-register) and, the window being already the live frame's, no emitted refresh call.
 ///
@@ -100,18 +105,18 @@ pub(super) fn emit_allocate(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     done: CodeLabel,
-    func: u32,
     pc: u32,
     stack_need: u32,
 ) -> Result<()> {
-    let helper: FrameSizeHelper = jit_allocate;
+    let helper: AllocateHelper = jit_allocate;
     emit_helper_call(
         buffer,
         allocation,
         helper as *const (),
-        &[i64::from(func), i64::from(pc), i64::from(stack_need)],
-    pc)?;
-    emit_frame_change_continue(buffer, done, func, pc)
+        &[i64::from(stack_need)],
+        pc,
+    )?;
+    emit_frame_change_continue(buffer, done)
 }
 /// Lower `allocate_heap StackNeed HeapNeed Live` — admit the heap need, then push the
 /// frame, then continue in-block at `pc + 1`.
@@ -147,7 +152,7 @@ pub(super) fn emit_allocate_heap(
     // The push inside the helper is a frame change, so the helper re-publishes the Y
     // window itself (see `jit_allocate_heap`): the continue arm keeps its register refill
     // but emits no separate refresh call.
-    emit_continue_check_helper_refresh(buffer, done, allocation, func, pc)
+    emit_continue_check_helper_refresh(buffer, done, allocation, pc)
 }
 
 /// Lower `test_heap HeapNeed Live` — admit the heap need, then continue in-block at
@@ -178,7 +183,7 @@ pub(super) fn emit_test_heap(
             i64::from(live),
         ],
     pc)?;
-    emit_continue_check(buffer, done, allocation, func, pc)
+    emit_continue_check_reject_only(buffer, done, allocation, pc)
 }
 
 /// Lower `trim N Remaining` — shrink the current frame, then continue in-block at
@@ -204,7 +209,7 @@ pub(super) fn emit_trim(
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(n)],
     pc)?;
-    emit_frame_change_continue(buffer, done, func, pc)
+    emit_frame_change_continue(buffer, done)
 }
 
 /// The continue arm of a **frame-changing** helper that touches no x-register: continue
@@ -217,16 +222,12 @@ pub(super) fn emit_trim(
 /// (`jit_allocate`'s `push_frame`, `jit_trim`'s frame shift), on its success path, so the
 /// continue arm emits no refresh call: the window is already the live frame's when the next
 /// instruction of the block addresses a `Y` slot.
-fn emit_frame_change_continue(
-    buffer: &mut CodeBuffer,
-    done: CodeLabel,
-    func: u32,
-    pc: u32,
-) -> Result<()> {
-    // `rax` holds the helper's word; only "the next instruction" continues here.
-    buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
-    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
-    buffer.jcc(Cond::Ne, done)?;
+fn emit_frame_change_continue(buffer: &mut CodeBuffer, done: CodeLabel) -> Result<()> {
+    // `rax` holds the helper's word: `CONTINUE` is non-negative and the only other answer
+    // is the negative `ERROR`, so a sign test is the whole decision — no target word is
+    // materialised (the helper no longer answers one).
+    buffer.test_rr(Reg::Rax, Reg::Rax)?;
+    buffer.jcc(Cond::S, done)?;
     Ok(())
 }
 
@@ -285,6 +286,35 @@ mod tests {
         code.windows(needle.len()).any(|window| window == needle)
     }
 
+    /// The fixed head of a frame-change helper's continue arm: the `test rax, rax`
+    /// sign test followed by the `js` opcode bytes (the rel32 differs per site, so
+    /// only the two opcode bytes are taken).
+    fn sign_test_head() -> Vec<u8> {
+        let mut head = encoded(|buffer| buffer.test_rr(Reg::Rax, Reg::Rax).unwrap());
+        let jcc = encoded(|buffer| {
+            let done = buffer.label();
+            buffer.jcc(Cond::S, done).unwrap();
+        });
+        head.extend_from_slice(&jcc[..2]);
+        head
+    }
+
+    /// Whether `code` contains the frame-change continue arm's head: two
+    /// instructions (`test rax, rax` + `js`) whose trailing rel32 is site-specific.
+    /// A materialised target word would put a `movabs` where the `test` is, so this
+    /// rejects the old `movabs`+`cmp`+`jcc` shape as well as pinning the new one.
+    fn contains_sign_test(code: &[u8]) -> bool {
+        contains(code, &sign_test_head())
+    }
+
+    /// Whether `code` **ends** with that head, which is the shape of the two
+    /// frame-only arms (`allocate`, `trim`): they carry no register-cache refill, so
+    /// the sign test is the last thing they emit.
+    fn ends_with_sign_test(code: &[u8]) -> bool {
+        let head = sign_test_head();
+        code.len() >= 9 && code[code.len() - 9..code.len() - 4] == head[..]
+    }
+
     /// A cache holding x0 in `r12`, marked written so the spill and the refill both
     /// emit real instructions.
     fn cached_allocation() -> Allocation {
@@ -301,7 +331,7 @@ mod tests {
             (
                 "allocate",
                 jit_allocate as *const (),
-                lowered(|buffer, done| emit_allocate(buffer, &allocation, done, 4, 7, 2)),
+                lowered(|buffer, done| emit_allocate(buffer, &allocation, done, 7, 2)),
             ),
             (
                 "allocate_heap",
@@ -334,11 +364,20 @@ mod tests {
                 .position(|window| window == needle)
                 .unwrap_or_else(|| panic!("{label}: the helper must be called"));
             assert!(call >= spill.len(), "{label}: the call follows the spill");
-            // …and the emitted code continues only on "the next instruction".
-            let next = encoded(|buffer| buffer.mov_ri(Reg::R11, encode_target(4, 8)).unwrap());
+            // …and the arm's continue check is the two-instruction reject-only sign
+            // test: the helpers answer `CONTINUE` (non-negative) or `ERROR`
+            // (negative), so no target word is materialised at all. The two
+            // refilling arms continue with a cache fill after it, so the sign test is
+            // only at the tail of the two frame-only arms.
             assert!(
-                contains(&code, &next),
-                "{label}: the continue arm compares against `encode_target(func, pc + 1)`"
+                contains_sign_test(&code),
+                "{label}: the continue arm must be a reject-only `test rax, rax` + `js`"
+            );
+            let refilling = label == "allocate_heap" || label == "test_heap";
+            assert_eq!(
+                ends_with_sign_test(&code),
+                !refilling,
+                "{label}: only the frame-only arms end on the sign test"
             );
         }
     }
@@ -375,7 +414,7 @@ mod tests {
         for (label, code) in [
             (
                 "allocate",
-                lowered(|buffer, done| emit_allocate(buffer, &allocation, done, 4, 7, 2)),
+                lowered(|buffer, done| emit_allocate(buffer, &allocation, done, 7, 2)),
             ),
             (
                 "trim",
@@ -403,7 +442,7 @@ mod tests {
         for (label, code) in [
             (
                 "allocate",
-                lowered(|buffer, done| emit_allocate(buffer, &accessing, done, 0, 7, 2)),
+                lowered(|buffer, done| emit_allocate(buffer, &accessing, done, 7, 2)),
             ),
             (
                 "trim",
@@ -422,13 +461,10 @@ mod tests {
         // The frame change is still followed by the continue check — that is what lets the
         // block carry on in-block after it (and, for `allocate_heap`, still reload the
         // x-registers a collecting host rewrote).
-        let allocate = lowered(|buffer, done| emit_allocate(buffer, &accessing, done, 0, 7, 2));
-        let next = encoded(|buffer| buffer.mov_ri(Reg::R11, encode_target(0, 8)).unwrap());
+        let allocate = lowered(|buffer, done| emit_allocate(buffer, &accessing, done, 7, 2));
         assert!(
-            allocate
-                .windows(next.len())
-                .any(|window| window == next.as_slice()),
-            "the continue arm still compares against the next instruction"
+            ends_with_sign_test(&allocate),
+            "the continue arm still admits a continuing helper word"
         );
         // `test_heap` changes no frame, so its window is still the one the block published
         // and it keeps the gated emitted refresh.
@@ -489,7 +525,7 @@ mod tests {
     fn the_allocate_arm_pushes_the_frame_with_a_helper_call_only() {
         use super::super::super::runtime::{RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP};
         let code = lowered(|buffer, done| {
-            emit_allocate(buffer, &Allocation::default(), done, 4, 7, 2)
+            emit_allocate(buffer, &Allocation::default(), done, 7, 2)
         });
         // The push itself: exactly the `jit_allocate` helper call.
         assert!(

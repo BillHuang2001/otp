@@ -105,6 +105,23 @@ pub const fn decode_target(word: i64) -> Option<(u32, u32)> {
     Some(((word >> 32) as u32, (word & 0xFFFF_FFFF) as u32))
 }
 
+/// The **non-terminating helper success answer**: what a helper whose interpreter arm
+/// returns `Step::Next` answers when the block may continue in-block.
+///
+/// A helper that continues in-block used to answer
+/// `encode_target(func, pc + 1)` — the emitter's two compile-time immediates, re-packed
+/// per execution and compared against a third emitted `movabs`. The continuation's
+/// *address* is not what the emitted arm needs: it only has to know whether to continue,
+/// so the answer is a fixed **non-negative** word and the arm tests its sign
+/// (`test rax, rax` / `js done`), which is also the strict form of the `ERROR`-only
+/// failing space every one of these helpers has ([`ERROR`] is `-2`).
+///
+/// The value is `i64::MAX`, outside every decodable target (`func < 2^31`), so even a
+/// hypothetical driver decode of it is a typed out-of-range error rather than a jump to
+/// an unrelated block. That word never reaches the driver: the emitted arm continues
+/// in-block on it and exits the block only on a negative word.
+pub const CONTINUE: i64 = i64::MAX;
+
 /// The sign bit of a [`Step::Wait`] block-return word: the marker a suspending
 /// `receive` sets on its encoded resume address (see [`encode_wait`]).
 ///
@@ -617,10 +634,18 @@ pub(crate) type FrameExitHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32
 /// `(func, pc)`); a bare `return` pops nothing, so it carries no frame size.
 pub(crate) type ReturnHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32) -> i64;
 
-/// The `jit_allocate`/`jit_trim` helpers' native signature (the block ABI plus the
-/// instruction's own `(func, pc)` and the single frame-size word the instruction
-/// carries — the `allocate` frame's Y-slot count, or the `trim`'s pop count).
+/// The `jit_trim` helper's native signature (the block ABI plus the instruction's own
+/// `(func, pc)` and the frame-pop count). The `(func, pc)` pair is what
+/// [`report_frame_error`] publishes on an over-trim, so it stays an argument.
 pub(crate) type FrameSizeHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32) -> i64;
+
+/// The `jit_allocate` helper's native signature: the block ABI plus the frame's Y-slot
+/// count and nothing else.
+///
+/// It carries no `(func, pc)`: the helper cannot fail, cannot park and cannot raise (the
+/// push is infallible and reaches no host door), so it has no error to report at an
+/// address — and the emitted arm only tests the sign of its [`CONTINUE`] answer.
+pub(crate) type AllocateHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32) -> i64;
 
 /// The `jit_test_heap` helper's native signature (the block ABI plus the instruction's
 /// own `(func, pc)`, the heap-word need and the live x-register count).
@@ -2640,7 +2665,9 @@ pub(crate) extern "C" fn jit_deallocate_return(
 ///
 /// This is the *non-terminating* member of the family: the interpreter's arm returns
 /// `Step::Next`, so the block continues in-block at `pc + 1`; the push itself cannot
-/// fail (see [`Machine::push_frame_window`]), so this helper has **no** failure arm.
+/// fail (see [`Machine::push_frame_window`]), so this helper has **no** failure arm and
+/// answers the fixed non-negative [`CONTINUE`] word (the emitted arm tests its sign, so
+/// neither a target nor the frame size is materialised per execution).
 /// `push_frame` touches no x-register, so the block refills nothing — but it **is** a
 /// frame change, so the Y window is re-published here when a later instruction of the
 /// block still accesses a Y slot.
@@ -2659,12 +2686,7 @@ pub(crate) extern "C" fn jit_deallocate_return(
 /// instruction-granular helper (`jit_step_one`/`jit_family`/`jit_test`/...), and a
 /// failing frame helper leaves through [`report_frame_error`], which stores `(func, pc)`
 /// itself. So the store was dead work on every path that has a reader.
-pub(crate) extern "C" fn jit_allocate(
-    rt: *mut JitRuntime<'_>,
-    func: u32,
-    pc: u32,
-    stack_need: u32,
-) -> i64 {
+pub(crate) extern "C" fn jit_allocate(rt: *mut JitRuntime<'_>, stack_need: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
     // holds points at an object the driver owns and keeps alive for the whole loop.
@@ -2679,7 +2701,7 @@ pub(crate) extern "C" fn jit_allocate(
     // computed rather than re-deriving them.
     let (y_base, y_count) = machine.push_frame_window(stack_need);
     runtime.publish_y_window(y_base, y_count);
-    encode_target(func, pc + 1)
+    CONTINUE
 }
 
 /// The **`allocate_heap`** helper: admit the heap need, **then** push the frame — the
@@ -2733,7 +2755,7 @@ pub(crate) extern "C" fn jit_allocate_heap(
             let machine = unsafe { &mut *runtime.machine };
             let (y_base, y_count) = machine.push_frame_window(stack_need);
             runtime.publish_y_window(y_base, y_count);
-            encode_target(func, pc + 1)
+            CONTINUE
         }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
@@ -2769,7 +2791,7 @@ pub(crate) extern "C" fn jit_test_heap(
         machine.ensure_heap(heap_need, live, ctx)
     };
     match admitted {
-        Ok(()) => encode_target(func, pc + 1),
+        Ok(()) => CONTINUE,
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -2808,7 +2830,7 @@ pub(crate) extern "C" fn jit_trim(
         // `jit_refresh_y` call.
         Ok(()) => {
             runtime.refresh_y_base();
-            encode_target(func, pc + 1)
+            CONTINUE
         }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
