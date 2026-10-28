@@ -141,13 +141,6 @@ const ATOM_TAG: i64 = TAG_IMMED2_ATOM as i64;
 /// exactly `beam_term::is_not_nil_list` (the C bit trick; the literal-pointer bit is
 /// handled by the mask, as in the C).
 const LIST_MASK: i64 = (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST) as i64;
-/// [`LIST_MASK`] as the `imm32` of [`CodeBuffer::test_ri`].
-///
-/// `test r64, imm32` sign-extends its immediate, so the mask must survive the
-/// `i64` -> `i32` narrowing unchanged; `test` sets ZF from `word & mask` without
-/// writing the operand, which is bit-for-bit the flags the `and`-of-a-copy set.
-const LIST_MASK_I32: i32 = LIST_MASK as i32;
-const _: () = assert!(LIST_MASK == LIST_MASK_I32 as i64);
 /// The raw word of `NIL`.
 const TEST_NIL: i64 = NIL.raw() as i64;
 
@@ -720,17 +713,18 @@ pub(super) fn try_inline_test(
             buffer.jcc(Cond::E, after)?;
         }
         TestPred::IsNonemptyList => {
-            // `is_not_list(A)` is `(A & LIST_MASK) != 0`, and `test` sets exactly the ZF
-            // an `and` would — so the predicate is one instruction, with no constant
-            // materialised and no copy of the operand consumed.
-            buffer.test_ri(TEST_A, LIST_MASK_I32)?;
+            buffer.mov_ri(FAST_C, LIST_MASK)?;
+            buffer.mov_rr(TEST_T, TEST_A)?;
+            buffer.and_rr(TEST_T, FAST_C)?;
             buffer.jcc(Cond::E, after)?;
         }
         TestPred::IsList => {
             buffer.mov_ri(TEST_T, TEST_NIL)?;
             buffer.cmp_rr(TEST_A, TEST_T)?;
             buffer.jcc(Cond::E, after)?;
-            buffer.test_ri(TEST_A, LIST_MASK_I32)?;
+            buffer.mov_ri(FAST_C, LIST_MASK)?;
+            buffer.mov_rr(TEST_T, TEST_A)?;
+            buffer.and_rr(TEST_T, FAST_C)?;
             buffer.jcc(Cond::E, after)?;
         }
         TestPred::IsBoolean { truthy, falsy } => {
