@@ -21,7 +21,7 @@ Ground truth = the legacy C `../../../erts/emulator/beam/external.c` (`erts_enco
 
 ## Status
 **Implemented.** Every module below carries real bodies: the wire layer (`tag`, `reader`, `writer`,
-`atom_cache`, `off_heap`, `compress`, `ref_wire`, `error`), the two state machines (`encode/`,
+`scratch`, `atom_cache`, `off_heap`, `compress`, `ref_wire`, `error`), the two state machines (`encode/`,
 `decode/`) and the `term/` materialization layer.
 Test shape: in-module unit suites + **34 integration binaries** + a doc-test; the per-binary
 inventory is [`tests/CONTEXT.md`](./tests/CONTEXT.md)'s — re-run the gate command for the live count.
@@ -54,8 +54,10 @@ Re-exported at the crate root and via `beam_codec::prelude::*`.
   (`new`, `with_capacity`, **`from_vec`**, `u8`/`u16be`/`u32be`/`u64be`, `bytes`, `len`, `is_empty`,
   `as_slice`, `into_vec`, `clear`, `capacity`/`reserve`) plus two crate-internal backward writes: the
   bounds-checked `patch_u32be(pos, value) -> Result<()>` (patching the `NEW_FUN_EXT` size field) and
-  `mask_last_byte(mask)` (clearing a bit-string tail's unused low bits in place). Both are safe
-  Rust.
+  `mask_last_byte(mask)` (clearing a bit-string tail's unused low bits in place), plus the four
+  `pub(crate)` coalescing writers the encoder's hot paths use — `head_u8`/`head_u16`/`head_u32`
+  (tag + fixed-width field in one reservation) and `head_bytes` (tag + payload, no length field —
+  the caller writes the length where the format has one). Both are safe Rust.
 - `scratch.rs` — `EncodeScratch`, the caller-owned reusable output buffer (`new`/`with_capacity`,
   `writer() -> Writer`, `recycle(Writer)`, `clear`, `is_empty`, `capacity`), fed to
   `Encoder::with_writer`/`Encoder::new_body_with` and taken back with `Encoder::take_writer`; it
@@ -243,7 +245,7 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
   property/fuzz (`property_roundtrip`/`property_oracle` + `property_support/`, splitmix64 seed
   `0x5EED_F00D_1234_5678`), hardening (`decode_hostile`, `decode_depth`), identity/`[safe]` seams
   (`local_node`, `local_identity_roundtrip`, `export_gate`, `export_arity_oracle`), deterministic
-  attribution (`alloc_count` + `attrib_support/`: **1** allocation per encode, **26** fresh / **3**
+  attribution (`alloc_count` + `attrib_support/`: **1** allocation per encode, **24** fresh / **1**
   warm per decode, image 101 bytes — counts, never timings), per-tag suites (`tag_coverage`'s 41-row
   coverage + 66-row exact-`BeamError` tables, `tag_space_audit`'s exhaustive 256-row disposition
   sweep + no-panic `[131,byte]` sweep, and the roundtrip/scalar/legacy/record/map/`COMPRESSED`
