@@ -90,14 +90,14 @@
 //! |---|---|---|---|
 //! | `flat` (a 64-element int list)             | 64  | 6 / 96    | **1 / 64**   |
 //! | `mixed` (ints + a 128 B binary + a sublist) | 133 | 6 / 420   | **1 / 133**  |
-//! | `deep` (200 nested one-element lists)       | 1   | 9 / 2056  | **7 / 1025** |
+//! | `deep` (200 nested one-element lists)       | 1   | 9 / 2056  | **13 / 2049** |
 //! | `empty` (`[]`)                              | 0   | 1 / 8     | **0 / 0**    |
 //!
 //! `deep` still pays the *spill* (its 200 levels exceed the 128 inline frames: the
 //! spill `Vec` grows 4 → 128 `Eterm`s, 1024 bytes over 6 events, once — the same stack
-//! serves both passes). `erlang:iolist_to_binary/1` is measured alongside as the
-//! **unchanged** sibling walk in `src/binary.rs` (6/96, 5/292, 9/2056, 1/8), so a
-//! regression there would be visible here.
+//! serves both passes). `erlang:iolist_to_binary/1` is measured alongside and must be
+//! **identical**, because both BIFs now run the crate's one walk (`src/iolist.rs`):
+//! the row pins that identity, so a second flattener cannot reappear on either path.
 //!
 //! `std`-only: no new dependencies. The `beam_bifs` lib is `#![deny(unsafe_code)]`,
 //! but this file is its own crate root (the `#[global_allocator]` needs
@@ -567,7 +567,7 @@ fn the_local_option_still_costs_a_second_image_buffer_in_beam_codec() {
 
 /// How many nested one-element lists the `deep` workload wraps around its single
 /// byte. Chosen to exceed `INLINE_WALK_FRAMES` (the fixed-size walk stack in
-/// `src/binconv.rs`) several times over, so the spilling fallback is exercised.
+/// `src/iolist.rs`) several times over, so the spilling fallback is exercised.
 const DEEP_NESTING: usize = 200;
 
 /// The payload of a `term_to_binary` image of a **binary** term — the inverse of
@@ -724,7 +724,7 @@ fn the_iolist_encode_allocates_one_byte_buffer() {
     // |---|---|---|
     // | `flat`  (64 B)   | 6 / 96    | **1 / 64**  |
     // | `mixed` (133 B)  | 6 / 420   | **1 / 133** |
-    // | `deep`  (1 B)    | 9 / 2056  | **7 / 1025** |
+    // | `deep`  (1 B)    | 9 / 2056  | **13 / 2049** |
     // | `empty` (0 B)    | 1 / 8     | **0 / 0**   |
     //
     // `flat`/`mixed` are the ideal: one `Vec::with_capacity(total)`, exactly the
@@ -743,13 +743,13 @@ fn the_iolist_encode_allocates_one_byte_buffer() {
             case.list_to_binary.allocations,
             match name {
                 // The byte buffer, plus the spill's growth for the deep nest.
-                "deep" => 7,
+                "deep" => 13,
                 "empty" => 0,
                 _ => 1,
             },
             "{name}: list_to_binary/1 must allocate {} times ({} bytes measured)",
             match name {
-                "deep" => 7,
+                "deep" => 13,
                 "empty" => 0,
                 _ => 1,
             },
@@ -759,8 +759,9 @@ fn the_iolist_encode_allocates_one_byte_buffer() {
     // The buffer is the exact byte count: no doubling, no spare capacity.
     for (name, case) in cases {
         if name == "deep" {
-            // The 1-byte buffer plus the spill's 1024 bytes.
-            assert_eq!(case.list_to_binary.bytes, 1 + 1024, "the deep nest's measured bytes");
+            // The 1-byte buffer plus **two** spills (one per pass: the measuring walk
+            // and the filling walk each own their `WalkStack`), 1024 bytes each.
+            assert_eq!(case.list_to_binary.bytes, 1 + 2 * 1024, "the deep nest's measured bytes");
         } else {
             assert_eq!(
                 case.list_to_binary.bytes, case.byte_len,
@@ -771,26 +772,20 @@ fn the_iolist_encode_allocates_one_byte_buffer() {
     // A *deep* iolist still builds its bytes correctly (checked in `iolist_case`), so
     // the spilling fallback is not merely cheap but correct.
 
-    // ---- `iolist_to_binary/1` is the *sibling* walk, unchanged here ----------
+    // ---- `iolist_to_binary/1` is the *same* walk, and must cost the same -----
     //
-    // Its yard (`src/binary.rs::collect_byte_unit` + `BitBuf`) is a separate
-    // implementation, so this change does not touch it: measured identically before
-    // and after (6/96, 5/292, 9/2056, 1/8 for `flat`, `mixed`, `deep`, `empty`). The
-    // figures are pinned so that walk cannot silently *regress*, and the `mixed` row's
-    // 292 bytes show it already copies each binary element only once (through
-    // `beam_codec::term::bitstring_bytes`, a borrowed view). Adopting the same
-    // one-buffer shape there is a recorded follow-up, not part of this change.
+    // Both BIFs now flatten through `crate::iolist` (`bytes` with `TopLevel::List`
+    // for the list form), so their measured cost must be **identical** per workload
+    // — the invariant this pin states, rather than a second table of constants.
+    // Before the consolidation `iolist_to_binary/1` ran its own work-stack +
+    // growth-capacity `BitBuf` walk (6/96, 5/292, 9/2056, 1/8 for `flat`, `mixed`,
+    // `deep`, `empty`); a reappearing second flattener shows up here immediately.
     for (name, case) in cases {
-        let (allocations, bytes) = match name {
-            "flat" => (6, 96),
-            "mixed" => (5, 292),
-            "deep" => (9, 2056),
-            _ => (1, 8),
-        };
         assert_eq!(
             (case.iolist_to_binary.allocations, case.iolist_to_binary.bytes),
-            (allocations, bytes),
-            "{name}: iolist_to_binary/1's measured cost (unchanged by this change)"
+            (case.list_to_binary.allocations, case.list_to_binary.bytes),
+            "{name}: iolist_to_binary/1 must cost exactly what list_to_binary/1 does \
+             (one walk, one byte buffer)"
         );
     }
 }

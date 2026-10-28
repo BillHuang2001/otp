@@ -238,10 +238,25 @@ tests) + `binary/growth.rs` (capacity growth, counters, the relocation protocol)
   (`len <= capacity <= reserved <= max_capacity`), `len` the logical length. Growth mutators (all
   `&mut self`, all requiring `refcount() == 1`, C's writable-binary precondition): `ensure_capacity`
   (absolute), `reserve(extra)` (= `ensure_capacity(len + extra)`), `append(bytes)`, `set_len`
-  (zero-fills what it newly exposes), `compact` (drop spare capacity to `round_up_unit(len)`).
+  (zero-fills what it newly exposes), `set_len_unwritten` (publishes a range the caller has *already*
+  written, with **no** zero fill — see below), `compact` (drop spare capacity to `round_up_unit(len)`).
   Growth schedule = C's `GROW_PROC_BIN_SIZE` in integer math: double up to
-  `GROW_DOUBLING_LIMIT_BYTES` (16 MiB), then +20 %; `with_capacity` reserves
-  `round_up_unit(max(capacity, DEFAULT_RESERVATION_FACTOR × capacity))`.
+  `GROW_DOUBLING_LIMIT_BYTES` (16 MiB), then +20 %.
+- **The reservation is geometric for all capacities** (`reservation_for`): `round_up_unit(max(capacity,
+  capacity × DEFAULT_RESERVATION_FACTOR))` (factor 4), capped by `MAX_PAYLOAD_BYTES`. A small payload
+  therefore starts with slack it may never use — a 256 B capacity reserves 1 KiB — and that slack is
+  deliberate (see `## Design Decisions`). Amortisation is untouched: a payload whose capacity is
+  exhausted applies the `GROW_PROC_BIN_SIZE` schedule to the *reservation*, so an append loop stays
+  logarithmic in moves (the 256 B → 64 KiB ladder still costs `moves <= 8`, `bytes_copied <= 2n`).
+- **`set_len_unwritten(len)` is the high-water publish** (`src/binary/growth.rs`): it sets the header
+  length under the *caller's* invariant that it has already written every byte of `[old_len, len)` —
+  `set_len` zero-fills that range first, which for a writable accumulator is pure waste because the
+  appender overwrites it immediately. Refusals are identical to `set_len`'s (a shared payload, or
+  `len > capacity`, is a typed error) and the range is never read by this crate, so a caller that
+  breaks the invariant reads uninitialised payload bytes — the one documented `// SAFETY:`-style
+  obligation of the method. Unit-pinned by
+  `tests/refc_binary_growth.rs::set_len_unwritten_publishes_written_bytes_without_zero_filling`
+  (a byte the caller pre-filled beyond `len` survives; `set_len` would have zeroed it).
 - **`GrowOutcome { InPlace { capacity }, Moved(Relocation) }`** (exported at the crate root and in the
   prelude as **`PayloadGrowOutcome`** / **`PayloadRelocation`**, because `reserved_heap::GrowOutcome`
   owns the bare name): `InPlace` guarantees `data_ptr()` is unchanged, so every on-heap `BinRef.val`,
@@ -259,6 +274,9 @@ tests) + `binary/growth.rs` (capacity growth, counters, the relocation protocol)
   Private `#[repr(C)] BinaryHeader { refc, len, capacity, reserved }` = 4 words = 32 bytes sits
   immediately before the payload (`data_ptr` = first payload byte; `data_ptr - HEADER_SIZE` recovers
   the base; `HEADER_SIZE % UNIT_SIZE == 0` keeps `data_ptr` `MIN_ALIGN`-aligned). `Send` but not `Sync`.
+- **A `RefcBinary` payload is one ordinary allocator block of `HEADER_SIZE (32) + reserved` bytes**, so on the registry default config it routes by that total: `<= 1024` → slab class, `1024 < total < sbct (512 KiB)` → a block of the pooled 1 MiB variable-size MBC carrier (shared, first-fit, coalescing), `>= sbct` → a dedicated SBC mapping (`src/allocator/core.rs:314-328`; bands at `src/allocator/core.rs:321-327`).
+- **Growth never calls `realloc_impl`/`realloc_typed`**: `relocate` does `alloc_typed` → `copy_nonoverlapping` → `dealloc_typed` (`src/binary/growth.rs:393-426`), so the probe-only block (`realloc_calls` in `stats.rs`) stays 0 on this path and each move costs one `state.lock()` take + a linear `take_mbc_fit` pool scan per side (`src/allocator/core.rs:320,493`; `src/allocator/state.rs:124-135`).
+- **Per-append is free of this crate**: the writable-accumulator sink writes straight through `data_ptr()` and consults `ensure_capacity` only on a capacity shortfall, so an append loop touches `beam_alloc` once per *growth*, never per append (`src/binary/growth.rs:246-253` early-returns without even a counter bump).
 
 ### `mseg` — the mmap-backed segment allocator (`erl_mseg.c`)
 Facade + submodules `mseg/{mapping,header,config,state,allocator}.rs`.
@@ -358,6 +376,11 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `mapped_bytes` stay flat while `cache_hits` (= `AllocStats::mseg.reused`) climbs. The address can
   only change on cache eviction (FIFO when full), or when `take_cached` picks a different smallest
   fitting cached segment (a bad fit is tail-trimmed, keeping the base).
+### Where a `bs_init_writable` accumulator payload lands (the `foreign`-kernel shape)
+- `bs_init_writable` asks for `RefcBinary::with_capacity(capacity)` with `capacity` = the compiler's hint: **256 bytes** when the comprehension's output size is not statically known (`lib/compiler/src/beam_ssa_bc_size.erl:36` "the default size of 256 bytes", the literal at `:579`; the C reads `x(0)` as bytes, `../../erts/emulator/beam/erl_bits.c:2023-2035`). The `beam_engine/src/bench/` docs' "256 bits = 32 bytes" is wrong by 8×.
+- A 256 B capacity reserves `round_up_unit(256 × 4) = 1024` B, so the request is `HEADER_SIZE(32) + 1024 = 1056` B at `MIN_ALIGN` 16 — **32 B above the default ladder top** (`large_threshold` 1024), hence `alloc_mid`: a block of the pooled 1 MiB variable-size MBC carrier (the good-fit scan `state.rs::take_mbc_fit`, **oldest-first**, plus a boundary-tag split, and a coalesce on free). That is the intended landing; reserving the 256 B exactly so the 288 B block would land on class 256 was measured to cost more, not less (see `## Design Decisions`).
+- The request count is **one per output binary, not per append**: the append loop writes into the reservation (`beam_engine`'s `raw::InPlace`), so a 30 B result out of a 256 B capacity makes 0 grows and 0 moves; `compact()`/high-water trimming is never called for an accumulator. A *growing* accumulator (`binary_append`'s 32 KiB output) starts from a 1 KiB reservation and enters the geometric zone directly.
+
 ### When a free actually unmaps (pointer-invalidation map)
 `Heap::drop` (heap.rs:242) never unmaps anything itself — it only calls `AllocRef::dealloc` →
 `CarrierAllocator::dealloc_impl` (allocator/core.rs:484), whose routing decides everything below.
@@ -580,6 +603,11 @@ as the current *shape* of the footprint, and see `../beam_rt/CONTEXT.md` for the
   `refcount() == 1` (C's `ASSERT(erts_refc_read(…refc, 1) == 1)`), so a reallocation can never pull the
   block out from under another handle; and the replacement block is obtained *before* the old one is
   freed, so a failed grow leaves the payload and every pointer into it fully valid.
+- **The payload reservation is geometric for all capacities.** `with_capacity(capacity)` reserves
+  `round_up_unit(capacity × DEFAULT_RESERVATION_FACTOR)` (4×, capped by `MAX_PAYLOAD_BYTES`), small
+  capacities included. Reserving a small capacity *exactly* so its block lands on the top size class
+  was measured to cost ~+20 % instructions per output binary on the four `foreign` kernels, so the
+  slack stays.
 - **`len` lives in the header, not the handle.** A clone and its original must never disagree about the
   payload length, and growth has to be visible to whichever handle reads next; caching it per handle
   would make `as_bytes` and `Drop` drift apart. `Drop` therefore frees with `HEADER_SIZE +
@@ -607,9 +635,12 @@ as the current *shape* of the footprint, and see `../beam_rt/CONTEXT.md` for the
 - A **leak/steady-state** test drives alloc/free cycles and asserts the carrier/free-block counters
   return to baseline (no leak on the tested paths).
 - Gate (GREEN required, current): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  -p beam_alloc --no-fail-fast` → **244 lib + 18 (`tests/allocator.rs`) + 13 (`tests/heap.rs`) + 4
-  (`tests/hot_path.rs`) + 12 (`tests/refc_binary_growth.rs`) + 12 (`tests/reserved_heap.rs`) = 303
-  tests, 0 failures**;
+  -p beam_alloc --no-fail-fast` → **245 lib + 18 (`tests/allocator.rs`) + 13 (`tests/heap.rs`) + 4
+  (`tests/hot_path.rs`) + 14 (`tests/refc_binary_growth.rs`) + 12 (`tests/reserved_heap.rs`) = 306
+  tests, 0 failures**; the growth-policy cases are `reservation_is_geometric_for_all_capacities` (lib)
+  plus `a_small_reservation_still_grows_amortised_linearly` and
+  `set_len_unwritten_publishes_written_bytes_without_zero_filling`
+  (`tests/refc_binary_growth.rs`);
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets` is
   warning-free; and `... clippy -p beam_alloc --all-targets` reports nothing for this crate.
 - Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
@@ -677,7 +708,7 @@ as the current *shape* of the footprint, and see `../beam_rt/CONTEXT.md` for the
 - `src/binary.rs` → `RefcBinary`: off-heap refcounted large binaries (attributed to the `BINARY` type);
   the control header (refcount/length/capacity/reservation), constructors, read accessors, `Clone`/`Drop`
 - `src/binary/growth.rs` → `GrowOutcome`/`Relocation`/`GrowthCounters`, `payload_capacity`, and the
-  growth mutators (`ensure_capacity`/`reserve`/`append`/`set_len`/`compact`, the private `relocate`,
+  growth mutators (`ensure_capacity`/`reserve`/`append`/`set_len`/`set_len_unwritten`/`compact`, the private `relocate`,
   `payload_layout` — the one layout every allocation and every free shares)
 - `src/block.rs` → block layout constants + `BlockHdr`/`BlockFlags` (implementation module)
 - `src/carrier.rs` → `Carrier` (mseg-backed block, subdivision into equal class blocks) + the
@@ -723,16 +754,18 @@ as the current *shape* of the footprint, and see `../beam_rt/CONTEXT.md` for the
 - `../beam_gc/`, `../beam_message/`, `../beam_ets/`, `../beam_process/` → primary dependents.
 
 ## Handoffs (owned by other nodes — NOT adopted here)
-- **A writable payload cannot report how many bytes were actually written.** `beam_engine`'s
-  `bs_init_writable` accumulator builds its payload with `RefcBinary::with_capacity`
-  (`Machine::alloc_refc_binary_with_capacity`) and widens it through `RefcBinary::ensure_capacity`
-  (`Machine::grow_writable_payload`, acting on `PayloadGrowOutcome::InPlace`/`Moved`), so the append
-  loop is amortised, not quadratic; what stays unmodelled is the high-water figure — that node records
-  that the payload's `as_bytes()` reports the whole reservation rather than the bytes written.
-  Closing it needs a `set_len_written`/high-water accessor on `RefcBinary` here (the header-carried
-  `len` is the constraint); the consumer is `../beam_engine/src/families/bitstrings/`
-  (`create/mod.rs`, `CONTEXT.md`), which names exactly this API as the one that closes its last
-  bitstring gap.
+- **The high-water publish EXISTS here but is not adopted by its caller.** `RefcBinary::set_len_unwritten(len)`
+  (this crate, `src/binary/growth.rs`) is the accessor the writable-accumulator path needed: it sets the
+  header length without `set_len`'s zero fill of `[old_len, len)`, under the caller's invariant that it
+  already wrote those bytes. **Inert on purpose** — `beam_engine` is outside this node's scope and is
+  untouched, so no runtime path calls it yet. The intended caller is exactly two sites:
+  `Machine::alloc_refc_binary_with_capacity` (`../beam_engine/src/machine/mod.rs:1675-1677`, which today
+  spends `set_len(real_capacity)` zero-filling the whole reservation up front) and the growth path
+  `../beam_engine/src/binary/…` → `crates/beam_alloc/src/binary/growth.rs:261-265,329-335`
+  (`ensure_capacity`'s and `set_len`'s zero fill after a move), plus the accumulator sink
+  `../beam_engine/src/families/bitstrings/` (`create/mod.rs`, whose `CONTEXT.md` names this API as the
+  one that closes its last bitstring gap). Adopting it there removes the ≈256 B/call (small kernels) and
+  ≈65 280 B/call (`binary_append`'s growth ladder) of `_int_memset`-style zero fill, not any allocation.
 - **`beam_rt` `system_info` wiring (partially adopted):** `beam_rt`'s `info.rs`/`info/memory.rs`
   already answer `system_info(alloc_util_allocators)` and `system_info({allocator,A})` from
   `registry::alloc_util_allocators()` + `AllocatorInfo::from_stats(...)` — the `{allocator,A}` rows

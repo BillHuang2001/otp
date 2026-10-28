@@ -245,7 +245,6 @@ Retained after the load, per `Module` (`../beam_loader/src/ir.rs:283`), with the
 **Massif's peak snapshot attributes **18.3 MiB to the `codeserver.rs:825,927` lowering chain** — the loader's per-function-body `Vec<Instr>` allocation, one exact allocation per body, so no growth transient sits beside it.** `read_image`'s `std::fs::read` buffer is dropped (`src/codeserver.rs:821`), so the `.beam` image is never retained; at the snapshot the whole-file bytes and `Chunks`' raw+decoded copies are live beside the `Module` being built.
 **Post-boot retention by the code server is therefore at most ≈ 11.3 MiB, of which at most ≈ 10.5 MiB is the IR (the pre-fusion census bound; fusion only lowers it).** The dead share is small but free: `locals` 44.6 KiB + raw `meta` 2.2 KiB + the three decoded tables ≈ 214 KiB live (≈ 0.3–0.4 MiB of heap) with no consumer.
 `get_module_info(M, attributes|compile)` does **not** read the decoded tables — it re-decodes the raw bytes through a fresh 8 192-word scratch `Heap` per call (`src/context/module_info.rs:257-261`).
->>>>>>> 233fd520f38638515b592c9fbb6a182137718b06
 
 ## Test Strategy
 The crate's test strategy — the colocated unit suites, the seam/GC/owner-death suites, the one-per-contract integration suites, the per-call harnesses, the gate commands, the gate-equivalent full-corpus sweep and the test-hygiene rules — is **[`TEST_STRATEGY.md`](TEST_STRATEGY.md)**; per-suite routing and the distribution (A.5) evidence are **[`tests/CONTEXT.md`](tests/CONTEXT.md)**.

@@ -44,8 +44,12 @@
 //! **arithmetic** key order (`beam_term::compare::cmp_arith`, the order ERTS
 //! `ordered_set` uses), along with `first`/`last`/`next`/`prev`.
 
+use crate::champ_interior::ChampInterior;
+use crate::hash_interior::HashInterior;
+use crate::key::key_of;
 use crate::kind::{OrderedInterior, SetInterior, TableKind, TableOptions};
-use crate::table::{Table, TableId};
+use crate::ordered_interior::{OrderedSetInterior, SortedOrderedInterior};
+use crate::table::{Interior, Table, TableId};
 use beam_common::BeamError;
 use beam_term::heap::Heap;
 use beam_term::prelude::*;
@@ -695,4 +699,100 @@ fn interiors_agree_on_membership_and_iteration_content() {
     ck.sort_by(|a, b| cmp(*a, *b, &atoms));
     hk.sort_by(|a, b| cmp(*a, *b, &atoms));
     assert_eq!(ck, hk);
+}
+/// The **hash-once** upsert entry points agree with the re-hashing ones, for every
+/// interior family.
+///
+/// `Table::insert_stored` hashes an inserted key once and threads the value through
+/// `Interior::insert_hashed` / `Interior::lookup_one_hashed` (the hash-twice path
+/// cost a second `term_hash` per `ets:insert` plus a throwaway `vec![object]` for the
+/// replace probe). `beam_term::hashing::term_hash` stays the ONE hash
+/// implementation — the value is only carried — so this is the guarantee that the
+/// carried value really is the key's hash and that the one-object probe answers the
+/// object `lookup` does.
+///
+/// Two interiors of the same family are driven through the shared operation script:
+/// one through `insert`/`lookup` (which re-hash), the other through
+/// `insert_hashed`/`lookup_one_hashed` with an explicit `term_hash(key, atoms)`.
+/// Every insert/delete answer, `size()` and the whole content are compared step by
+/// step.
+#[test]
+fn hash_threaded_upsert_agrees_with_the_rehashing_path() {
+    fn render_bool(result: Result<bool, BeamError>) -> String {
+        match result {
+            Ok(answered) => format!("ok:{answered}"),
+            Err(err) => format!("err:{err:?}"),
+        }
+    }
+    fn render_unit(result: Result<(), BeamError>) -> String {
+        match result {
+            Ok(()) => "ok".to_string(),
+            Err(err) => format!("err:{err:?}"),
+        }
+    }
+    let atoms = AtomTable::new();
+    let families: [(&str, fn() -> Box<dyn Interior>); 4] = [
+        ("champ", || Box::new(ChampInterior::new())),
+        (
+            "chained",
+            || Box::new(HashInterior::with_keypos(TableKind::Set, 1)),
+        ),
+        ("bplus_tree", || Box::new(OrderedSetInterior::new())),
+        ("sorted", || Box::new(SortedOrderedInterior::new())),
+    ];
+    for (name, build) in families {
+        let mut direct = build();
+        let mut threaded = build();
+        let mut heap = Heap::new(1 << 16);
+        let mut inserts = 0usize;
+        for op in script(300) {
+            match op {
+                Op::Insert(key, value) => {
+                    let object = obj(&mut heap, key, value);
+                    let table_key = key_of(object, 1).expect("the object is a valid tuple");
+                    let hash = term_hash(table_key, &atoms);
+                    let rehashed = render_bool(direct.insert(table_key, object, &atoms));
+                    let threaded_answer =
+                        render_bool(threaded.insert_hashed(table_key, object, &atoms, hash));
+                    assert_eq!(
+                        rehashed, threaded_answer,
+                        "{name}: insert and insert_hashed disagree at {key}/{value}"
+                    );
+                    inserts += 1;
+                }
+                Op::Delete(key) => {
+                    let term = make_small(key);
+                    let rehashed = render_unit(direct.delete(term, &atoms));
+                    let threaded_answer = render_unit(threaded.delete(term, &atoms));
+                    assert_eq!(rehashed, threaded_answer, "{name}: delete at {key}");
+                }
+                Op::Lookup(key) => {
+                    let term = make_small(key);
+                    let hash = term_hash(term, &atoms);
+                    let probe = render_opt(direct.lookup_one_hashed(term, &atoms, hash));
+                    let first = render_opt(direct.lookup(term, &atoms).into_iter().next());
+                    let threaded_probe =
+                        render_opt(threaded.lookup_one_hashed(term, &atoms, hash));
+                    assert_eq!(
+                        probe, first,
+                        "{name}: the probe must answer lookup's first object at {key}"
+                    );
+                    assert_eq!(probe, threaded_probe, "{name}: the interiors disagree at {key}");
+                }
+                _ => {}
+            }
+            assert_eq!(
+                direct.size(),
+                threaded.size(),
+                "{name}: the two interiors hold different sizes"
+            );
+            assert_eq!(
+                render_set(&direct.iter_objects().collect::<Vec<_>>()),
+                render_set(&threaded.iter_objects().collect::<Vec<_>>()),
+                "{name}: the two interiors diverge in content"
+            );
+        }
+        assert!(inserts > 0, "{name}: the script drove an insert");
+        assert!(direct.size() > 0, "{name}: the script must store something");
+    }
 }

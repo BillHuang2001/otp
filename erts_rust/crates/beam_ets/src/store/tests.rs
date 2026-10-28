@@ -1548,4 +1548,87 @@
         assert_eq!(store.words(), 0);
         assert_eq!(store.blocks(), blocks, "reclamation never unmaps a block");
         assert!(store.memory() > 0, "the freed words' storage is still held");
+    }    // --- the run-list bookkeeping (the `ets:insert` hot path) -------------------
+    /// A small nested object with several separate runs (a 3-tuple of 3-tuples:
+    /// one run per tuple), so a copy's run list has more than one entry.
+    fn multi_run_source(heap: &mut Heap) -> Eterm {
+        let inner: Vec<Eterm> = (0..3)
+            .map(|j| {
+                heap.tuple(&[make_small(j), make_small(j + 10), make_small(j + 20)])
+                    .expect("heap room for the inner tuple")
+            })
+            .collect();
+        heap.tuple(&inner).expect("heap room for the outer tuple")
+    }
+    /// The copy path **recycles** the run list a freed object hands back.
+    ///
+    /// Every `copy` needs a `Vec<AllocSlice>` of the runs it allocated and every
+    /// `free` drains one, so allocating a fresh list per op regrew it from capacity 0
+    /// every time (6 reallocations per `ets:insert` on the copy-bound workload). The
+    /// drained list is now pooled and the next copy takes it — this pins the hand-off
+    /// by assertion on the *allocation*, not on a timing figure: the second copy's run
+    /// list is the same buffer the first copy's free pooled (the pooled buffer is
+    /// still alive in the pool while the copy runs, so an address match cannot be a
+    /// coincidental reuse of freed memory).
+    #[test]
+    fn a_freed_run_list_is_recycled_by_the_next_copy() {
+        let mut heap = Heap::new(256);
+        let source = multi_run_source(&mut heap);
+        let mut store = test_store();
+        let first = store.copy(source).expect("the object is copyable");
+        let capacity = {
+            let runs = store.tracked.get(&first).expect("the object owns runs");
+            assert_eq!(runs.len(), 4, "one run per tuple, the source is 3-in-1");
+            runs.capacity()
+        };
+        assert!(capacity >= 4, "the run list has real capacity");
+        assert_eq!(store.spare_runs.len(), 0, "nothing is pooled yet");
+        assert_eq!(store.free(first), 16, "4 tuples: 4 + 3 x 4 words");
+        assert_eq!(store.spare_runs.len(), 1, "the drained run list is pooled");
+        assert!(
+            store.spare_runs[0].is_empty(),
+            "a pooled list is cleared, never handed out dirty"
+        );
+        assert_eq!(
+            store.spare_runs[0].capacity(),
+            capacity,
+            "the pooled list keeps its capacity (that is the whole point)"
+        );
+        let pooled = store.spare_runs[0].as_ptr();
+        let second = store.copy(source).expect("the object is copyable again");
+        let reused = store.tracked.get(&second).expect("the recopy owns runs");
+        assert_eq!(
+            reused.as_ptr(),
+            pooled,
+            "the next copy records its runs in the pooled buffer instead of allocating"
+        );
+        assert_eq!(store.words(), 16, "recycling does not change the accounting");
+    }
+    /// The run-list pool is **bounded**: a burst of frees keeps at most
+    /// [`SPARE_RUN_BUFFERS`] buffers, so a mass deletion cannot pin an unbounded
+    /// number of them, and the ones past the cap are simply dropped.
+    #[test]
+    fn the_spare_run_list_pool_is_bounded() {
+        let mut heap = Heap::new(1024);
+        let sources: Vec<Eterm> = (0..SPARE_RUN_BUFFERS + 3)
+            .map(|_| multi_run_source(&mut heap))
+            .collect();
+        let mut store = test_store();
+        let copies: Vec<Eterm> = sources
+            .iter()
+            .map(|&source| store.copy(source).expect("the object is copyable"))
+            .collect();
+        for copy in copies {
+            assert!(store.free(copy) > 0);
+        }
+        assert_eq!(
+            store.spare_runs.len(),
+            SPARE_RUN_BUFFERS,
+            "the pool stops at {SPARE_RUN_BUFFERS} buffers"
+        );
+        assert_eq!(store.words(), 0, "every run was reclaimed regardless");
+        // The pool still works after the cap was hit (a burst never wedges it).
+        let again = store.copy(sources[0]).expect("the object is copyable");
+        assert!(!store.tracked.get(&again).expect("runs").is_empty());
+        assert!(store.free(again) > 0);
     }

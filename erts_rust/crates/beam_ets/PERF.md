@@ -462,3 +462,101 @@ improving: `8` and `16` are clearly worse on both axes, and `48`/`64` trade a de
 merge.
 This is a choice, not a contract — `Interior` promises no fanout — and the knob is the pair of
 consts in `src/ordered_interior/node.rs` (`MIN_OCCUPANCY` is derived, `ORDER / 2`).
+
+## 4. The `ets:*` copy path's *bookkeeping* cost — instructions per op, before → after
+
+`copy_bound/ets_copy` was ~**27 000 instructions/op** on rust against the oracle's ~5 390 (wall
+ratio 6.7–9.8×). The term model is not the problem: the op performs exactly **two
+materialisations** (71 words / 27 objects in, 71 / 27 out). The excess was *bookkeeping* — the
+`TermStore`'s per-object run accounting, a SipHash lookup per copied object, a linear size-bucket
+scan per released run and a second key hash per `ets:insert`. §4 records what each fix bought.
+
+### Method (deterministic, not wall time)
+
+Instructions are what the fix moves, so instructions are what is reported. The workload is the
+bench's own embedded `etf/ets_copy` module (`tools/bench/src/workloads/copy_bound.rs`
+`module_source()`, staged verbatim: 5-key map payload of 71 words / 27 objects, `ets:insert(Tab,
+{k, T})` then `ets:lookup(Tab, k)` on one `set` table with one key), run as
+
+```text
+erlc -o <scratch> bench_copy_bound.erl
+perf stat -e cpu_core/instructions/u -x, taskset -c 3 \
+    erts_rust/target/release/beam_rt -pa <scratch> run <scratch>/bench_copy_bound.beam \
+    bench_copy_bound:ets_copy/1 <N>
+```
+
+at `N = 100 000` and `N = 0`, three alternating pairs:
+`instr/op = (instr(N) − instr(0)) / N`. The subtraction cancels the whole ~1.44 G-instruction boot
+(preloaded modules + JIT), which is why the figure is stable to **±0.15 %** across repeats on a
+host whose 1-minute load moved between `5.98` and `6.38` during the runs — the same measurement on
+the same binary reproduced `20 801 / 20 808 / 20 990` across sessions. (The oracle side is not
+measured this way here; the 5 390 figure is the one the profiling pass recorded, and it is quoted
+for scale only.)
+
+The wall-clock companion is the bench's own paired marginal (§6.7 of `tools/bench/RESULTS.md` for
+the recording conventions): at `/proc/loadavg` **6.15** `case_ets_copy_ns_per_op` reads
+**1 057.4 ns** (paired median 264.341 ms over `N = 250 000`, noise ±4.672 ms, min 254.824 / max
+267.492); the pre-change record on this host (load ≈ 15) read **1 515.6 ns**, i.e. **0.70×** — the
+same direction and roughly the same size as the instruction ratio (**0.758×**), with the load
+difference the reason the two ratios do not coincide exactly.
+
+### The four levers, per lever
+
+| # | locus | change | instr/op |
+|---|---|---|---|
+| — | — | baseline (all four open) | **27 440** |
+| 2 | `src/store/mod.rs` `release`/`take_free_run` | the free runs were a `Vec<(usize, Vec<AllocSlice>)>` **scanned linearly** on every release *and* every reuse (28 releases per op, each scanning the distinct-size list); now `free_runs[n]` is the bucket of `n`-word runs — the bucket is derived, not searched (an overflow list keeps runs > `FREE_RUN_BUCKETS = 32` words) | **−4 586** |
+| 1 | `src/store/mod.rs` `copy`/`free`/`tracked` | the run list a `copy` filled was allocated from capacity 0 and dropped by `free` on every op (6 reallocations/op); the drained list is now pooled (`spare_runs`, capped at `SPARE_RUN_BUFFERS = 4`) and taken at the *start* of the next copy, and `tracked`'s SipHash (548 instr/op) is replaced by `RootHasher`, a finalising multiply over the store's own object roots | **−1 864** |
+| 3 | `src/table/mod.rs` `insert_stored`, `src/table/interior.rs`, `champ_interior.rs`, `hash_interior/mod.rs` | the key was hashed twice per upsert (replace probe + insert) and the probe built a throwaway `vec![object]`; `insert_hashed`/`lookup_one_hashed` thread **one** `term_hash` through both halves and answer an `Option` | **−182** |
+| — | — | after levers 1–3 | **20 801** |
+| 4 | `crates/beam_bifs/src/ets.rs` `selection_objects` | `vec![selection]` per single-object `ets:insert/2` — **landed in `beam_bifs`**: `selection_objects` now returns a two-variant `Selection` (`Single(Eterm)` → `core::slice::from_ref`, `List(Vec<Eterm>)`), both call sites consume it as a slice, so a single-object `ets:insert/2` makes **0 allocations** for its selection (`crates/beam_bifs/tests/ets_insert_alloc.rs`) | not isolated here (this table's split predates it) |
+
+The lever-2 and lever-1 splits were isolated by rebuilding with each change reverted in turn
+(lever 2 restored: **25 394** instr/op; lever 3 measured on top of 1+2: 20 990 → 20 808). Lever 4
+was the one lever outside this node's write scope, and it has since landed in `beam_bifs`: the
+single-object `ets:insert/2` selection is now a `Selection::Single` borrowed through
+`core::slice::from_ref` instead of a `vec![selection]`, i.e. **zero allocations** for the selection
+(pinned by `crates/beam_bifs/tests/ets_insert_alloc.rs`). Its per-op instruction effect is not
+isolated in the table above, whose split was taken before the change and whose baseline differs from
+the current tree.
+
+Lever 3 is small *because the key is an immediate*: `term_hash` of an atom or small int is a few
+instructions, so one of three hashes per op was never the expensive one — the profiling pass's
+"`beam_term` hashing 5.8 %" is dominated by the payload map's five key hashes, which no ETS-side
+change touches.
+
+### What was deliberately NOT changed
+
+- **`beam_term::size` / the copy-boundary pricing walk** — 0.04 % of the op post hint-gate, and the
+  path-set drop that would have made it cheaper is unsound.
+- **Observable semantics.** Which object wins on a duplicate key, key equality/ordering, `size`,
+  `lookup`/`select`/`tab2list`/`first`/`next` and `ets:info/2` (including `lock_count` and the
+  bucket-chain histogram) are untouched: the run buckets are an *accounting* index over the same
+  runs (`TermStore::words`/`blocks`/`memory` bookkeeping is identical — every word is still counted
+  once, and a reused run is still exact-fit), and the hash is only *carried*.
+### One arena run per copy — tried, measured, **reverted**
+The remaining per-op reservation count was attacked directly: `TermStore::copy` used to reserve one
+run **per node** (`alloc_words(n)` as the recursion reaches each node — 28 reservations and 28
+reclamation records for this payload's 27 nodes / 71 words). The experiment replaced that with **one
+contiguous run per copy**: a sizing pass (`copy_words`, mirroring the writer node for node) measures
+the graph, one `alloc_words(total)` reserves it, and a write pass (`write_term`) fills it behind a
+single monotone cursor, so `free` becomes one reclamation.
+Measured exactly as above (same module, `N = 100 000` pairs against `N = 0`), on the same host
+session, `/proc/loadavg` `56.59 50.79 75.04` (before) and `25.87 29.96 54.62` (after):
+| case | per-object reservations | one run per copy | ratio |
+|---|---|---|---|
+| `ets_copy` | **20 753** / 20 752 instr/op | **20 371** / 20 371 / 20 245 (`N = 200 000`) | **0.982×** |
+| `etf_roundtrip` (control) | 22 555 / 22 558 | 22 597 / 22 616 | 1.002× (flat) |
+So the shape change is real but only **−1.8 %**, i.e. **−382 instructions/op** — under the ≥3 %
+margin this was gated on — and it is *stable* (two `N` points, three pairs, ±0.1 instr/op), so the
+figure is a measurement, not noise. The reason is arithmetic: the 28 reservations and 28 releases
+cost roughly what the extra sizing traversal costs (`copy_words` re-classifies all 27 nodes and
+re-reads their headers, which is most of what an allocation avoided), and the write pass then pays a
+bounds check per node (`CopySink::take`) to stay sound inside the one run.
+The shape was reverted, and the per-object reservation stays, because the change also **coarsens
+reuse**: an exact-fit free run is now a whole object, so a table churning objects of *differing*
+sizes reuses far fewer freed runs than the per-node scheme (whose buckets are the handful of small
+node sizes every object shares) and therefore maps more blocks. That is a real memory downside on the
+heterogeneous shapes a real table sees — `ets:info(T, memory)` is unaffected (`Table::memory` sums
+live words, not block capacity), but the arena's high-water is not. Paying that for <2 % of the op
+was not a trade worth making; the next lever on this path is not the reservation count.

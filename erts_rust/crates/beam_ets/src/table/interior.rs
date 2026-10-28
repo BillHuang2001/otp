@@ -68,6 +68,30 @@ pub(crate) trait Interior: Send + Sync {
     /// `false`.
     fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool>;
 
+    /// [`insert`](Interior::insert) with the key's `beam_term::hashing::term_hash`
+    /// supplied by the caller.
+    ///
+    /// `Table::insert_stored` has to *both* probe for the object it is about to
+    /// replace **and** insert, and both steps need the same key hash — so the table
+    /// hashes once and threads the value through here instead of paying a second
+    /// `term_hash` per `ets:insert`. `beam_term` stays the ONE hash implementation:
+    /// the value is only carried, never derived here.
+    ///
+    /// The caller guarantees `hash == term_hash(key, atoms)`. The default ignores
+    /// it and re-hashes (correct, just not free); every interior whose index is
+    /// keyed by a hash overrides this with the same body as
+    /// [`insert`](Interior::insert).
+    fn insert_hashed(
+        &mut self,
+        key: Eterm,
+        object: Eterm,
+        atoms: &AtomTable,
+        hash: u64,
+    ) -> Result<bool> {
+        let _ = hash;
+        self.insert(key, object, atoms)
+    }
+
     /// Insert `object` under `key` only if `key` is absent; returns whether the
     /// object was inserted.
     fn insert_new(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool>;
@@ -80,6 +104,22 @@ pub(crate) trait Interior: Send + Sync {
 
     /// All objects stored under `key` (0 or 1 for `set`/`ordered_set`).
     fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm>;
+
+    /// The **one** object stored under `key`, for a single-object kind
+    /// (`set`/`ordered_set`, which hold at most one object per key), with the key's
+    /// `term_hash` supplied by the caller — the allocation-free probe
+    /// [`insert_stored`](super::Table) needs to find the object an upsert replaces.
+    ///
+    /// The [`lookup`](Interior::lookup) it replaces built a throwaway
+    /// `vec![object]` (one malloc/free per `ets:insert`) just to hand back at most
+    /// one element, and re-hashed the key. The caller guarantees
+    /// `hash == term_hash(key, atoms)`; the default ignores the value and takes the
+    /// first element of [`lookup`](Interior::lookup), which is that same object for
+    /// a single-object kind.
+    fn lookup_one_hashed(&self, key: Eterm, atoms: &AtomTable, hash: u64) -> Option<Eterm> {
+        let _ = hash;
+        self.lookup(key, atoms).into_iter().next()
+    }
 
     /// Whether any object is stored under `key`.
     fn member(&self, key: Eterm, atoms: &AtomTable) -> bool;

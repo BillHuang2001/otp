@@ -613,16 +613,20 @@ impl Table {
     /// [`store_object`]: Table::store_object
     fn insert_stored(&mut self, stored: Eterm, atoms: &AtomTable) -> Result<()> {
         let stored_key = key_of(stored, self.opts.keypos())?;
+        // One key hash serves both halves of the upsert: the replace probe and the
+        // insert itself. `beam_term::hashing::term_hash` stays the crate's only hash
+        // implementation — the value is threaded through, never recomputed here.
+        let hash = term_hash(stored_key, atoms);
         // A single-object kind (`set`/`ordered_set`) *replaces* the object stored
         // under an existing key. Look the replaced root up **before** the insert so
         // its storage can be reclaimed afterwards (the multi kinds only ever add,
         // so there is nothing to reclaim).
         let replaced = if self.opts.kind().is_multi() {
-            Vec::new()
+            None
         } else {
-            self.interior.lookup(stored_key, atoms)
+            self.interior.lookup_one_hashed(stored_key, atoms, hash)
         };
-        let retained = self.interior.insert(stored_key, stored, atoms)?;
+        let retained = self.interior.insert_hashed(stored_key, stored, atoms, hash)?;
         if !retained {
             // The interior rejected the copy as a duplicate no-op (a `bag` holding
             // an identical object): no entry references it, so reclaim it instead of
@@ -630,7 +634,7 @@ impl Table {
             // it is released even while the table is fixed — no traversal can hold it.
             self.store.free(stored);
         }
-        for old in replaced {
+        if let Some(old) = replaced {
             // The replaced object *was* in the table (and its stored key term may be
             // the very term a fixed traversal is holding), so its storage is deferred
             // while the table is fixed.

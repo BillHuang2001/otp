@@ -111,6 +111,12 @@ fn bif_host() -> BifHook {
             };
             byte_size_of(*source)
         }
+        ("erlang", "bit_size", 1) => {
+            let [source] = args else {
+                return Err(beam_common::BeamError::BadArg);
+            };
+            bit_size_of(*source)
+        }
         ("erlang", "length", 1) => {
             let [source] = args else {
                 return Err(beam_common::BeamError::BadArg);
@@ -136,6 +142,21 @@ fn byte_size_of(term: Eterm) -> Result<Eterm> {
     Ok(make_small(bits.div_ceil(8) as i64))
 }
 
+/// `erlang:bit_size/1` for the interpreter tier: the bit-length word itself
+/// (`bits::bit_size` = `beam_term::bitstring_size`), `badarg` for anything that is not a
+/// bitstring — the same ground truth the native helper's `bit_size_value` reproduces for
+/// every bitstring layout (on-heap bits, a refc binary, a sub-binary window, a bit offset).
+fn bit_size_of(term: Eterm) -> Result<Eterm> {
+    // SAFETY: `is_bitstring` dereferences a boxed header only when the word is a boxed
+    // term, so a non-boxed word (an immediate, `NIL`) is a plain word compare.
+    if !unsafe { is_bitstring(term) } {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    // SAFETY: `is_bitstring` just established `term` is a live bitstring whose backing
+    // thing is valid for its size words.
+    let bits = unsafe { bitstring_size(term) };
+    Ok(make_small(bits as i64))
+}
 /// `erlang:length/1` for the interpreter tier: the number of cons cells of a **proper**
 /// list (`[]` is `0`), `badarg` for a non-list or an improper tail — the same walk the
 /// native helper's `list_length` performs.
@@ -1281,6 +1302,120 @@ fn byte_size_is_lowered_to_the_bit_size_rounded_up() {
     }
 }
 
+/// `bit_size(Literal(0))` where literal `0` is the bitstring `bytes`/`bits` — the
+/// fast-path shape of [`bit_size_is_lowered_to_the_bit_length`].
+fn bit_size_literal_case(name: &str, bytes: &[u8], bits: usize) -> (Module, Atom) {
+    let (mut module, export) = bif_module(
+        name,
+        "bit_size",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Literal(0),
+                dst: Operand::X(0),
+            },
+            bif_call(1, vec![Operand::X(0)], Operand::X(0)),
+            Instr::Return,
+        ],
+    );
+    set_literals(&mut module, &[bit_binary(bytes, bits)]);
+    (module, export)
+}
+/// **`bit_size/1` returns the bit length verbatim** — the value asserted concretely on both
+/// tiers: the empty binary, a byte-aligned one, and the two non-byte-aligned cases that
+/// `byte_size/1` would round up (`<<1:1>>` is `1`, `<<1:17>>` is `17`).
+///
+/// This is the guard BIF of `emqx_base62:decode/1`'s `decode_char/2`/`decode/2` clauses, so
+/// the shapes are the ones a real corpus hands it: an on-heap bitstring of any bit length.
+/// The refc-binary / sub-binary-window / bit-offset widths are pinned on the helper itself
+/// (`super::super::bif_helper`'s unit tests), where the terms can be built directly.
+#[test]
+fn bit_size_is_lowered_to_the_bit_length() {
+    // (label, module, expected)
+    let cases: [(&str, (Module, Atom), i64); 4] = [
+        (
+            "bit_size(<<>>)",
+            bit_size_literal_case("bif_bit_size_empty", &[], 0),
+            0,
+        ),
+        (
+            "bit_size(<<1,2,3>>)",
+            bit_size_literal_case("bif_bit_size_aligned", &[1, 2, 3], 24),
+            24,
+        ),
+        (
+            "bit_size(<<1:1>>)",
+            bit_size_literal_case("bif_bit_size_one_bit", &[0x80], 1),
+            1,
+        ),
+        (
+            "bit_size(<<1:17>>)",
+            bit_size_literal_case("bif_bit_size_seventeen", &[0x80, 0, 0], 17),
+            17,
+        ),
+    ];
+    for (label, (module, name), expected) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            let expected = make_small(expected);
+            assert_value(&format!("{label} (interpreter tier)"), expected, interpreter);
+            assert_value(&format!("{label} (baseline tier)"), expected, baseline);
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
+/// `bit_size(Value)` where the prologue `move` puts `value` into `x(0)` — the shape a
+/// declined operand (a non-bitstring) is fed through.
+fn bit_size_value_case(name: &str, value: Operand) -> (Module, Atom) {
+    bif_module(
+        name,
+        "bit_size",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: value,
+                dst: Operand::X(0),
+            },
+            bif_call(1, vec![Operand::X(0)], Operand::X(0)),
+            Instr::Return,
+        ],
+    )
+}
+/// **`bit_size/1` of a non-bitstring is the interpreter's own `badarg`** on both tiers —
+/// the helper declines the shape rather than returning a length (a wrong term, since every
+/// non-bitstring is a `badarg` on the oracle).
+#[test]
+fn bit_size_of_a_non_bitstring_raises_the_interpreters_badarg() {
+    let (mut atom_module, atom_name) =
+        bit_size_value_case("bif_bit_size_atom", Operand::Nil);
+    let atom = Operand::Atom(atom_module.atom_table.intern("nope"));
+    atom_module.functions[0].code[2] = Instr::Move {
+        src: atom,
+        dst: Operand::X(0),
+    };
+    let cases = [
+        (
+            "bit_size(42)",
+            bit_size_value_case("bif_bit_size_int", Operand::Integer(42)),
+        ),
+        ("bit_size(an_atom)", (atom_module, atom_name)),
+    ];
+    for (label, (module, name)) in cases {
+        with_both_tiers_bif_host(&module, name, |interpreter, baseline| {
+            for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                assert!(
+                    matches!(outcome, Err(beam_common::BeamError::BadArg)),
+                    "{label} ({tier}): a declined shape must raise the interpreter's \
+                     `badarg`; saw {outcome:?}"
+                );
+            }
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
+    }
+}
 /// **`length/1` counts a proper list's cells** — `[]` is `0` and `[1,2,3]` is `3`, on both
 /// tiers (the `[]` case is a constant operand, the list case a register holding cons cells).
 #[test]
@@ -1694,6 +1829,10 @@ fn the_lowered_value_bif_fast_paths_record_no_static_deopt() {
         (
             "byte_size/1",
             byte_size_literal_case("bif_byte_size_pin", &[0x80], 1),
+        ),
+        (
+            "bit_size/1",
+            bit_size_literal_case("bif_bit_size_pin", &[0x80], 1),
         ),
         (
             "length/1",

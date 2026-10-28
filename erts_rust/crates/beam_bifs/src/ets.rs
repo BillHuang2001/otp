@@ -973,17 +973,41 @@ fn tab2list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 // --------------------------------------------------------------- insertion
 
+/// The object(s) of an `ets:insert/2` / `ets:insert_new/2` selection.
+///
+/// The single-object form is the common one and must not allocate, so it is held
+/// inline and handed to the table as a one-element slice
+/// (`core::slice::from_ref`); only a list selection needs a `Vec`. Both BIFs read
+/// the selection through [`Selection::as_slice`], so there is one spelling of the
+/// rule.
+enum Selection {
+    /// One object term, whose shape the table validates.
+    Single(Eterm),
+    /// The objects of a proper list selection (possibly empty).
+    List(Vec<Eterm>),
+}
+
+impl Selection {
+    /// Every selected object, in selection order.
+    fn as_slice(&self) -> &[Eterm] {
+        match self {
+            Selection::Single(object) => core::slice::from_ref(object),
+            Selection::List(objects) => objects,
+        }
+    }
+}
+
 /// The objects an `ets:insert/2` / `ets:insert_new/2` selection names.
 ///
 /// A proper list *is* a list of objects — and `[]` (`NIL`) is the empty list, not
 /// an object (the verified `erl` behaviour: `ets:insert(T, [])` is `true`); an
 /// improper list is `badarg`; anything else is a single object, whose shape is
 /// then validated by the table.
-fn selection_objects(selection: Eterm) -> Result<Vec<Eterm>> {
+fn selection_objects(selection: Eterm) -> Result<Selection> {
     if is_list(selection) || is_nil(selection) {
-        proper_list(selection).ok_or_else(badarg)
+        Ok(Selection::List(proper_list(selection).ok_or_else(badarg)?))
     } else {
-        Ok(vec![selection])
+        Ok(Selection::Single(selection))
     }
 }
 
@@ -995,7 +1019,7 @@ fn insert_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let mut failure = None;
-    for object in objects {
+    for &object in objects.as_slice() {
         if let Err(err) = table.insert(object, ctx.atoms()) {
             failure = Some(err);
             break;
@@ -1021,7 +1045,7 @@ fn insert_new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let objects = selection_objects(args[1])?;
 
     let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
-    let outcome = insert_new_into(&mut table, &objects, ctx.atoms());
+    let outcome = insert_new_into(&mut table, objects.as_slice(), ctx.atoms());
     restore_table(ctx, handle, table)?;
     match outcome {
         Ok(inserted) => ctx.boolean(inserted),

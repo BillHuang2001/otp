@@ -214,6 +214,97 @@ fn a_generous_reservation_grows_entirely_in_place() {
     assert!(run.payload.capacity() >= run.payload.len());
 }
 
+/// **Test 2b (a small-capacity payload still grows amortised).** The reservation policy does
+/// not change the growth *shape*: the C's `GROW_PROC_BIN_SIZE` schedule is applied to the
+/// reservation, so an append loop that outgrows a small payload still doubles (moves
+/// logarithmic, bytes copied O(n)).
+#[test]
+fn a_small_reservation_still_grows_amortised_linearly() {
+    let alloc = test_allocator("reservation-growth");
+    let run = append_loop(
+        RefcBinary::with_capacity_and_allocator(alloc, 256).expect("reserve"),
+        8 * 1024,
+        64,
+    );
+    assert_eq!(run.payload.len(), 8 * 1024);
+    assert_eq!(run.payload.as_bytes(), &run.expected[..], "the bytes are exact");
+    assert!(
+        run.counters.moves <= 8,
+        "doubling from the small reservation keeps the move count logarithmic: {:?}",
+        run.counters
+    );
+    assert!(
+        run.counters.bytes_copied <= 2 * run.payload.len(),
+        "the moves copy O(n) bytes, not O(n^2): {:?}",
+        run.counters
+    );
+    assert!(
+        run.payload.reserved_bytes() <= run.payload.max_capacity(),
+        "the grown reservation respects the cap"
+    );
+}
+
+/// **Test 2c (the written high-water publish).** [`RefcBinary::set_len_unwritten`] publishes
+/// bytes a writer has already written *through the payload pointer* without touching them,
+/// where [`RefcBinary::set_len`] zero-fills the range it exposes. The two are the same call
+/// except for that fill, so they are asserted side by side on otherwise identical payloads.
+#[test]
+fn set_len_unwritten_publishes_written_bytes_without_zero_filling() {
+    let alloc = test_allocator("written-high-water");
+    // A payload with room to grow, so the exposed range is one the reservation covers.
+    let mut payload = RefcBinary::with_limits(alloc.clone(), 64, 64, 1024).expect("reserve");
+    assert_eq!(payload.len(), 0);
+
+    // An appender writes 4 bytes through the raw pointer (the sink's shape), then publishes.
+    let written = [0xDE, 0xAD, 0xBE, 0xEF];
+    // SAFETY: the payload reserves 64 writable bytes from `data_ptr`, so writing the first
+    // four of them is in bounds and inside the single allocation this handle owns.
+    unsafe { core::ptr::copy_nonoverlapping(written.as_ptr(), payload.data_ptr(), 4) };
+    // Pre-fill the *rest* of the range we are about to expose with a non-zero pattern, so a
+    // zero fill would be visible: this stands in for the bytes the appender is about to write.
+    const TAIL: u8 = 0xA5;
+    // SAFETY: bytes `[4, 8)` are inside the 64-byte writable reservation.
+    unsafe { core::ptr::write_bytes(payload.data_ptr().add(4), TAIL, 4) };
+    payload.set_len_unwritten(8).expect("publish the written high water");
+    assert_eq!(payload.len(), 8, "the high water is the published length");
+    assert_eq!(
+        payload.as_bytes(),
+        &[written[0], written[1], written[2], written[3], TAIL, TAIL, TAIL, TAIL],
+        "`set_len_unwritten` publishes the bytes as written — nothing is zero-filled"
+    );
+
+    // Shrinking is free and leaves the bytes alone (same rule as `set_len`).
+    payload.set_len_unwritten(4).expect("shrink");
+    assert_eq!(payload.as_bytes(), &written[..]);
+
+    // The contrast: `set_len` over the same range zero-fills what it newly exposes.
+    payload.set_len(8).expect("zero-filling publish");
+    assert_eq!(
+        payload.as_bytes(),
+        &[written[0], written[1], written[2], written[3], 0, 0, 0, 0],
+        "`set_len` still zero-fills the exposed range"
+    );
+
+    // Refusals: past the capacity, and on a shared payload. Both leave the length alone.
+    let err = payload.set_len_unwritten(65).expect_err("past the capacity is refused");
+    assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    assert_eq!(payload.len(), 8, "a refused publish changes nothing");
+    let clone = payload.clone();
+    let err = payload
+        .set_len_unwritten(16)
+        .expect_err("a shared payload cannot be re-lengthened");
+    assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    assert_eq!(payload.len(), 8);
+    drop(clone);
+
+    // And the whole reservation-sized publish a grown accumulator performs: the length goes to
+    // the capacity with no write at all, which is exactly what `beam_engine`'s
+    // `cover_writable_capacity` needs after a grow (the sink writes before any read).
+    payload.set_len_unwritten(payload.capacity()).expect("publish the capacity");
+    assert_eq!(payload.len(), payload.capacity());
+    assert_eq!(payload.len(), 64);
+}
+
 /// **Test 3 (the relocation protocol).** A move must report where the payload went *and*
 /// preserve its bytes exactly, so a host can republish the term from the relocation alone.
 #[test]

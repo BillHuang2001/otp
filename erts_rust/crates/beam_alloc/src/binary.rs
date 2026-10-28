@@ -720,6 +720,23 @@ mod tests {
         assert_eq!(alloc.stats().live_blocks, 0, "a failed allocation leaks nothing");
     }
 
+    /// The reservation is **geometric for every capacity** — `capacity *
+    /// DEFAULT_RESERVATION_FACTOR`, rounded up to the unit and clamped to what one block can
+    /// hold (small capacities keep the slack too; see `beam_alloc/CONTEXT.md`
+    /// § Design Decisions).
+    #[test]
+    fn reservation_is_geometric_for_all_capacities() {
+        for &capacity in &[0usize, 1, 16, 17, 64, 200, 256, 512, 992, 1024, 4096, 65_536] {
+            assert_eq!(
+                reservation_for(capacity),
+                round_up_unit(capacity * DEFAULT_RESERVATION_FACTOR),
+                "capacity {capacity}: the geometric slack"
+            );
+        }
+        // Clamped to what one block can hold — a hostile capacity saturates, never wraps.
+        assert_eq!(reservation_for(usize::MAX / 2), MAX_PAYLOAD_BYTES);
+        assert_eq!(reservation_for(MAX_PAYLOAD_BYTES), MAX_PAYLOAD_BYTES);
+    }
     #[test]
     fn new_uses_the_registry_binary_allocator() {
         let binary = RefcBinary::new(&[1, 2, 3, 4]).expect("allocate");

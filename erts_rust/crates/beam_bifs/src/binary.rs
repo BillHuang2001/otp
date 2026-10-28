@@ -131,17 +131,31 @@
 //!   entry lives for the process's lifetime (a bounded, monotonic leak). The
 //!   registry is process-global because [`BifContext`] exposes no seam for it —
 //!   see the module's `compiled_patterns` section.
-//! * **`referenced_byte_size/1` is not registered** (it needs the off-heap
-//!   `BinRef` of a sub-binary, which Milestone-1 does not build; every result is
-//!   a fresh on-heap binary).
+//! * **`referenced_byte_size/1` reports the binary's own size** (`src/term_conv.rs`):
+//!   it needs the off-heap `BinRef` of a sub-binary, which Milestone-1 does not
+//!   build; every result here is a fresh on-heap binary.
 //! * **`decode_unsigned`/`encode_unsigned` span the full integer range.**
 //!   `decode_unsigned` accepts any width and promotes a value past the 60-bit
 //!   small range to a bignum (the oracle's behaviour); `encode_unsigned` accepts a
 //!   bignum and emits its minimal byte image. Only a magnitude beyond the bignum
 //!   limb bound is `system_limit`.
 //! * **Sub-binaries are copied, not referenced.** `erts_binary_part` returns a
-//!   `SUB_BITS` sharing the source; Milestone-1 has no off-heap `BinRef`, so
-//!   every result is a fresh on-heap binary (`crate::bits::make_binary`).
+//!   `SUB_BITS` sharing the source (`beam_term::bitstring::write_sub_bits` is the
+//!   layout writer for that window), but a `BinRef` window's payload is refcounted
+//!   and owned by the *source process's* off-heap store while this crate only ever
+//!   builds on the caller's destination heap — and the runtime's result copy-out
+//!   (`beam_rt`'s `move_result_into_process_heap` → `beam_message`'s
+//!   `copy_refc_binary`) resolves a `BinRef` only through the *source* off-heap
+//!   table, which the copy-out passes empty. A window minted here would therefore
+//!   be flattened on the way back to the process — byte-faithful, but with none of
+//!   the sharing the oracle gets. So the part is copied out of the parent into one
+//!   on-heap block: the same bytes, no dangling payload, and
+//!   `binary:referenced_byte_size/1` of the result reports its own size (the
+//!   divergence recorded at [`crate::term_conv::referenced_byte_size_1`]).
+//!   Of the **cost** the oracle's aliasing avoids, only the copy of the *selected*
+//!   range remains: `part/2,3`, `bin_to_list/2,3` and `erlang:binary_part/2,3`
+//!   read the source through the borrowing [`crate::bits::with_bytes`] and copy a
+//!   buffer proportional to the result, never to the parent.
 //! * **`binary:copy/2` cannot outgrow the fixed-size test heap**: a result larger
 //!   than the destination heap can hold reports `system_limit` rather than
 //!   allocating without bound (the same convention `convert::make_tuple` uses).
@@ -163,6 +177,7 @@ use crate::arith;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, system_limit};
+use crate::iolist;
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -180,48 +195,15 @@ fn as_uint(term: Eterm) -> Option<u64> {
     }
 }
 
-/// `term_to_Sint`: an integer of either sign (a float is not one).
-fn as_sint(term: Eterm) -> Option<i64> {
-    if access::is_small(term) {
-        Some(signed_value(term))
-    } else {
-        None
-    }
-}
 
 /// Whether `term` is the atom `name`.
 fn is_atom_named(ctx: &BifContext<'_>, term: Eterm, name: &str) -> bool {
     access::is_atom(term) && ctx.atoms().name(atom_val(term)) == Some(name)
 }
 
-/// Validates the `[Start, Start + Len)` byte range against a buffer of `size`
-/// bytes, exactly like `erts_binary_part`
-/// (`erts/emulator/beam/erl_bif_binary.c:2137`): a negative `Len` is the
-/// reverse-part form (`Len` bytes *ending* at `Start`), and a range that is
-/// negative or reaches past the end is `badarg`.
-fn checked_range(size: usize, epos: Eterm, elen: Eterm) -> Result<(usize, usize)> {
-    let mut start = as_uint(epos).ok_or_else(badarg)?;
-    let mut len = as_sint(elen).ok_or_else(badarg)?;
-    if len < 0 {
-        // `-(i64::MIN)` overflows: `checked_neg` reports that as `badarg`.
-        let back = u64::try_from(len.checked_neg().ok_or_else(badarg)?).map_err(|_| badarg())?;
-        if back > start {
-            return Err(badarg());
-        }
-        len = -len;
-        start -= back;
-    }
-    let len = u64::try_from(len).map_err(|_| badarg())?;
-    let end = start.checked_add(len).ok_or_else(badarg)?;
-    if end > size as u64 {
-        return Err(badarg());
-    }
-    Ok((start as usize, len as usize))
-}
-
-/// The validated byte slice of `bytes` (see [`checked_range`]).
+/// The validated byte slice of `bytes` (see [`iolist::part_range`]).
 fn checked_slice<'a>(bytes: &'a [u8], epos: Eterm, elen: Eterm) -> Result<&'a [u8]> {
-    let (start, len) = checked_range(bytes.len(), epos, elen)?;
+    let (start, len) = iolist::part_range(bytes.len(), epos, elen)?;
     Ok(&bytes[start..start + len])
 }
 
@@ -238,12 +220,12 @@ fn parse_scope(ctx: &BifContext<'_>, term: Eterm, size: usize) -> Result<(usize,
     if !access::is_tuple(range) || access::tuple_size(range) != 2 {
         return Err(badarg());
     }
-    let (start, len) = checked_range(
+    let (start, len) = iolist::part_range(
         size,
         access::tuple_element(range, 0),
         access::tuple_element(range, 1),
     )?;
-    // `checked_range` validated `Start + Len <= size`, so this is the `end`.
+    // `part_range` validated `Start + Len <= size`, so this is the `end`.
     Ok((start, start + len))
 }
 
@@ -635,10 +617,17 @@ fn find_all(subject: &[u8], alternatives: &[Vec<u8>], start: usize, end: usize) 
 // ---------------------------------------------------------------------------
 
 /// `at(Binary, Pos)` — the byte at the 0-based `Pos`.
+///
+/// The payload is read through the borrowing [`bits::with_bytes`], so a single-byte
+/// read costs **no** allocation and copies nothing: the position is validated against
+/// the term's own (already known) byte size and the one byte is fetched in place. The
+/// old route (`bits::bytes(..)` = `binary_bytes`) copied the *whole* payload out of the
+/// term to return one byte.
 fn at(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let bytes = bits::bytes(args[0])?;
     let index = usize::try_from(as_uint(args[1]).ok_or_else(badarg)?).map_err(|_| badarg())?;
-    let byte = *bytes.get(index).ok_or_else(badarg)?;
+    // `None` covers both a non-binary subject and an index past its end — the C's
+    // `badarg` for each.
+    let byte = bits::with_bytes(args[0], |bytes| bytes.get(index).copied().ok_or_else(badarg))?;
     ctx.int(i64::from(byte))
 }
 
@@ -656,11 +645,31 @@ fn part_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     part_slice(ctx, args[0], args[1], args[2])
 }
 
-/// The shared body of `part/2,3`: copy the validated sub-binary to the heap.
+/// The shared body of `part/2,3`: the validated sub-binary, copied to the heap.
+///
+/// The range rule is [`iolist::part_range`] (the crate's one spelling of
+/// `erts_binary_part`'s), and the payload is read through the borrowing
+/// [`bits::with_bytes`], so only the **selected** bytes are copied out of the term —
+/// a `{0,1}` part of a 64 KiB binary copies one byte, not the subject.
+///
+/// C makes the result a **sub-binary** sharing the source (`SUB_BITS` over the
+/// source's `BinRef`), so the oracle's `binary:referenced_byte_size/1` of a part
+/// reports the *parent* binary's size. This runtime keeps every binary it builds on
+/// the heap ([`crate::bits`]'s documented placement policy), so the value is copied
+/// and that size reports the part's own byte count — the divergence
+/// [`crate::term_conv::referenced_byte_size_1`] records. Aliasing is not reachable
+/// from this crate: a `BinRef` window's payload is refcounted and owned by the
+/// process's off-heap store, and this crate builds only on the caller's destination
+/// heap.
 fn part_slice(ctx: &mut BifContext<'_>, subject: Eterm, epos: Eterm, elen: Eterm) -> Result<Eterm> {
-    let bytes = bits::bytes(subject)?;
-    let slice = checked_slice(&bytes, epos, elen)?;
-    bits::make_binary(ctx.heap(), slice)
+    if !bits::is_binary(subject) {
+        return Err(badarg());
+    }
+    // The borrow ends before the heap write: the selected bytes are copied out of the
+    // term into a buffer proportional to the *result*, so no slice derived from the
+    // term's storage is live while the destination heap is written.
+    let slice = bits::with_bytes(subject, |bytes| Ok(checked_slice(bytes, epos, elen)?.to_vec()))?;
+    bits::make_binary(ctx.heap(), &slice)
 }
 
 /// `copy(Binary)`.
@@ -700,7 +709,7 @@ fn do_copy(ctx: &mut BifContext<'_>, subject: Eterm, count: u64) -> Result<Eterm
 fn list_to_bin_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // `list_to_bitstring` requires a list at the top level: a bare binary is
     // `badarg` (`list_to_bin(<<1,2>>)` ⇒ `badarg`).
-    let bytes = collect_byte_unit(args[0])?;
+    let bytes = iolist::bytes(args[0], iolist::TopLevel::List)?;
     bits::make_binary(ctx.heap(), &bytes)
 }
 
@@ -709,24 +718,17 @@ fn list_to_bin_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // `list_to_bitstring/1`) and `erlang:split_binary/2`
 // ---------------------------------------------------------------------------
 
-/// The unit of an iolist walk (`erl_iolist.c`'s `Unit`).
-///
-/// * `Byte` (`Unit = 8`) — `erlang:iolist_to_binary/1` and
-///   `erlang:iolist_size/1`: every bitstring leaf must be **byte aligned** and the
-///   result is a binary.
-/// * `Bit` (`Unit = 1`) — `erlang:list_to_bitstring/1`: a leaf may be a bitstring
-///   of *any* bit size and the pieces are concatenated bit by bit.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Unit {
-    Byte,
-    Bit,
-}
-
-/// A growable MSB-first bit buffer.
+/// A growable MSB-first bit buffer, for `erlang:list_to_bitstring/1`'s `Unit = 1`
+/// iolist (`erl_iolist.c`'s bit unit): a leaf may be a bitstring of *any* bit size and
+/// the pieces are concatenated bit by bit.
 ///
 /// The packed form is exactly what [`crate::bits::make_bitstring`] consumes: bit
 /// `i` is bit `7 - (i % 8)` of `bytes[i / 8]`, the bits after `len` in the final
 /// byte stay zero, and `bytes.len() == len.div_ceil(8)`.
+///
+/// A byte-unit iolist does **not** use this buffer: it is flattened by the crate's one
+/// iolist walk ([`crate::iolist`]), which reserves one buffer of exactly the iolist's
+/// byte count instead of growing bit by bit.
 struct BitBuf {
     bytes: Vec<u8>,
     len: usize,
@@ -780,18 +782,23 @@ impl BitBuf {
     }
 }
 
-/// Flattens an iolist into `buf`, rejecting an invalid element with `badarg`.
+/// Collects the pieces of a [`Unit::Bit`] iolist into `buf`, rejecting an invalid
+/// element with `badarg`.
 ///
-/// The walk mirrors `erl_iolist.c`'s `generic_iolist_size`/`generic_iolist_copy`:
-/// a list element is a byte (`0..=255`), a bitstring, or a nested list; a cons
-/// **tail** may also be `[]`, a cons, or a bitstring (`[1|<<2>>]` is a valid
-/// iolist), and anything else is `badarg`. Under [`Unit::Byte`] a bitstring leaf
-/// whose bit size is not a whole number of bytes is `badarg`
-/// (`iolist_to_binary([<<1:3>>])`); under [`Unit::Bit`] any bit size is accepted.
+/// The acceptance rules mirror `erl_iolist.c`'s
+/// `generic_iolist_size`/`generic_iolist_copy` for the bit unit: a list element is a
+/// byte (`0..=255`), a bitstring of **any** bit size, or a nested list; a cons
+/// **tail** may also be `[]`, a cons, or a bitstring (`[1|<<2>>]` is a valid iolist),
+/// and anything else is `badarg`.
+///
+/// This is the bit-assembling sibling of the crate's one byte walk
+/// ([`crate::iolist`]) — the two cannot be the same function, because this one
+/// concatenates *bits* (a leaf may contribute a partial byte) while that one requires
+/// every leaf to be a whole number of bytes and so can reserve an exact byte buffer.
 ///
 /// The walk uses an explicit work stack, so a deeply nested list cannot overflow
 /// the Rust stack.
-fn collect_iolist_units(root: Eterm, unit: Unit, buf: &mut BitBuf) -> Result<()> {
+fn collect_bitstring_pieces(root: Eterm, buf: &mut BitBuf) -> Result<()> {
     let mut stack = vec![root];
     while let Some(term) = stack.pop() {
         if access::is_nil(term) {
@@ -806,9 +813,6 @@ fn collect_iolist_units(root: Eterm, unit: Unit, buf: &mut BitBuf) -> Result<()>
             continue;
         }
         if bits::is_bitstring(term) {
-            if unit == Unit::Byte && bits::bit_size(term)? % 8 != 0 {
-                return Err(badarg());
-            }
             let (bytes, offset, size_bits) = codec_term::bitstring_bytes(term)?;
             buf.push_bitstring(bytes, offset, size_bits);
             continue;
@@ -828,27 +832,18 @@ fn collect_iolist_units(root: Eterm, unit: Unit, buf: &mut BitBuf) -> Result<()>
     Ok(())
 }
 
-/// Flattens a [`Unit::Byte`] iolist whose top level must be a list or `[]` — the
-/// shared body of `binary:list_to_bin/1` and `erlang:iolist_to_binary/1`.
-///
-/// Every element of a `Byte`-unit iolist is a whole number of bytes, so the packed
-/// buffer's bytes are the result's bytes verbatim.
-fn collect_byte_unit(root: Eterm) -> Result<Vec<u8>> {
-    if !access::is_nil(root) && !access::is_list(root) {
-        return Err(badarg());
-    }
-    let mut buf = BitBuf::new();
-    collect_iolist_units(root, Unit::Byte, &mut buf)?;
-    Ok(buf.bytes)
-}
-
 /// Flattens an **iodata** argument into the bytes it denotes, without building a term.
 ///
 /// The accepted set is exactly `erlang:iolist_to_iovec/1`'s, whose `check_io_list` is
 /// the same one `iolist_to_binary/1` runs (`erl_iolist.c`): a byte-aligned bitstring,
 /// or a (possibly improper, bitstring-tailed) list of bytes, byte-aligned bitstrings
 /// and nested lists; anything else is `badarg`. The top level may be either shape —
-/// unlike [`collect_byte_unit`], which serves the list-only `list_to_bin/1`.
+/// unlike `erlang:list_to_binary/1`'s rule, which is list-only.
+///
+/// The traversal is the crate's one iolist walk ([`crate::iolist::bytes`] with
+/// [`TopLevel::ListOrBinary`](crate::iolist::TopLevel)), so this path and
+/// `iolist_to_binary/1` accept exactly the same terms, in one exact-capacity buffer
+/// and with no per-element temporary.
 ///
 /// This is the byte view the `zlib:*` BIFs hand to the zlib codec
 /// (`crate::zlib`): their NIFs take their input through `erlang:iolist_to_iovec/1`,
@@ -857,19 +852,15 @@ pub(crate) fn iodata_bytes(root: Eterm) -> Result<Vec<u8>> {
     // The top level must be a list, `[]` or a (byte-aligned) bitstring — exactly
     // `iolist_to_iovec_1`'s first two clauses, so a bare integer is `badarg`
     // (`zlib:compress(42)` ⇒ `badarg`).
-    if !access::is_nil(root) && !access::is_list(root) && !bits::is_bitstring(root) {
-        return Err(badarg());
-    }
-    let mut buf = BitBuf::new();
-    collect_iolist_units(root, Unit::Byte, &mut buf)?;
-    Ok(buf.bytes)
+    iolist::bytes(root, iolist::TopLevel::ListOrBinary)
 }
 
 /// `iolist_to_binary(IoListOrBinary)` (`erl_iolist.c:916`).
 ///
 /// Unlike `erlang:list_to_binary/1`, a **bare** byte-aligned binary is a valid
 /// argument (`iolist_to_binary(<<1,2,3>>)` ⇒ `<<1,2,3>>`); a bare *non-byte-aligned*
-/// bitstring is `badarg`.
+/// bitstring is `badarg`. A bare byte-aligned binary is returned **as itself** — the
+/// C's `is_binary` fast path, so no copy is made at all.
 fn iolist_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let root = args[0];
     if bits::is_bitstring(root) {
@@ -878,7 +869,9 @@ fn iolist_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm>
         }
         return Ok(root);
     }
-    let bytes = collect_byte_unit(root)?;
+    // The list form goes through the crate's one iolist walk: one buffer, reserved to
+    // the iolist's exact byte count (see [`crate::iolist::bytes`]).
+    let bytes = iolist::bytes(root, iolist::TopLevel::List)?;
     bits::make_binary(ctx.heap(), &bytes)
 }
 
@@ -898,7 +891,11 @@ fn iolist_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         }
         size_bits as u64 / 8
     } else {
-        collect_byte_unit(root)?.len() as u64
+        // Measured by walking the iolist, **not** by flattening it: the C's
+        // `erts_iolist_size` and [`crate::iolist::byte_len`] both validate every element
+        // and count, and nothing is allocated for an iolist nested within
+        // `INLINE_WALK_FRAMES` levels.
+        iolist::byte_len(root, iolist::TopLevel::List)? as u64
     };
     byte_count_term(ctx, size)
 }
@@ -909,6 +906,11 @@ fn iolist_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// limbs little-endian), never by a local bignum construction.
 fn byte_count_term(ctx: &mut BifContext<'_>, size: u64) -> Result<Eterm> {
     match i64::try_from(size) {
+        // The common case is a size inside the 60-bit small range: build the immediate
+        // directly (`try_make_small`, no allocation) instead of paying
+        // `int_from_i64`'s [`Big`](crate::arith) wrapper, which would allocate for
+        // every `iolist_size/1`/`byte_size/1` answer.
+        Ok(small) if (beam_term::MIN_SMALL..=beam_term::MAX_SMALL).contains(&small) => ctx.int(small),
         Ok(small) => arith::int_from_i64(ctx, small),
         // A byte count above `i64::MAX`: one little-endian magnitude limb.
         Err(_) => arith::int_from_mag(ctx, false, &[size]),
@@ -928,7 +930,7 @@ fn list_to_bitstring_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm
         return Err(badarg());
     }
     let mut buf = BitBuf::new();
-    collect_iolist_units(root, Unit::Bit, &mut buf)?;
+    collect_bitstring_pieces(root, &mut buf)?;
     bits::make_bitstring(ctx.heap(), &buf.bytes, buf.len)
 }
 
@@ -965,12 +967,13 @@ fn split_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// Builds the list `[B0, B1, …]` of the bytes in `bytes`.
+///
+/// The builder is [`crate::iolist::byte_list`] — the crate's **one** byte-list
+/// builder, shared with `binary_to_list/1,3`, `os_bif`'s filename rendering and
+/// [`BifContext::charlist`] — so the four former copies of the same
+/// "one small integer per byte" rule cannot disagree.
 fn bytes_to_list(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Result<Eterm> {
-    let mut elems = Vec::with_capacity(bytes.len());
-    for &byte in bytes {
-        elems.push(ctx.int(i64::from(byte))?);
-    }
-    ctx.list(&elems)
+    iolist::byte_list(ctx, bytes)
 }
 
 /// `bin_to_list(Binary)`.
@@ -1000,15 +1003,21 @@ fn bin_to_list_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// The shared body of `bin_to_list/2,3` (`binary.erl` delegates to
 /// `binary_to_list/1,3`, whose range rules are `erts_binary_part`'s).
+///
+/// The range rule is [`iolist::part_range`] (the crate's one spelling of it) and the
+/// payload is read through the borrowing [`bits::with_bytes`], so only the **selected**
+/// bytes are copied out of the term before the list is built.
 fn bin_to_list_slice(
     ctx: &mut BifContext<'_>,
     subject: Eterm,
     epos: Eterm,
     elen: Eterm,
 ) -> Result<Eterm> {
-    let bytes = bits::bytes(subject)?;
-    let slice = checked_slice(&bytes, epos, elen)?;
-    bytes_to_list(ctx, slice)
+    if !bits::is_binary(subject) {
+        return Err(badarg());
+    }
+    let slice = bits::with_bytes(subject, |bytes| Ok(checked_slice(bytes, epos, elen)?.to_vec()))?;
+    bytes_to_list(ctx, &slice)
 }
 
 /// `decode_unsigned(Binary)`.

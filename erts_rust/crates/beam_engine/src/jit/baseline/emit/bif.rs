@@ -38,9 +38,10 @@
 //! * `tuple_size/1` reuses the same `is_tuple` header guard and derives the arity from the
 //!   header word the guard leaves behind (see [`try_inline_tuple_size`]).
 //!
-//! **(b) `byte_size/1` and `length/1`, evaluated natively by the Rust helper.** Neither
-//! value is a plain word read — `byte_size/1` rounds the bit size up to whole bytes and
-//! `length/1` walks a *proper* list — so both are computed by [`jit_bif_value`], whose Rust
+//! **(b) `byte_size/1`, `bit_size/1` and `length/1`, evaluated natively by the Rust helper.**
+//! None of the three is a plain word read — `byte_size/1` rounds the bit size up to whole
+//! bytes, `bit_size/1` returns that bit length verbatim, and `length/1` walks a *proper*
+//! list — so all three are computed by [`jit_bif_value`], whose Rust
 //! body reproduces the `beam_bifs` ground truth word for word. This route is claimed from
 //! **either** `Instr::Bif` or `Instr::GcBif`, because the installed corpus emits both as the
 //! collecting `{gc_bif,…}` (`Instr::GcBif`); the instruction's own `fail` label and raise
@@ -49,12 +50,12 @@
 //!
 //! Every rejection — an operand outside the addressable set, an index that is not a
 //! compile-time small int, or any *run-time* guard failure (a non-cons source, a non-tuple
-//! source, an out-of-range index, a non-bitstring `byte_size/1`, a non-list/improper
+//! source, an out-of-range index, a non-bitstring `byte_size/1`/`bit_size/1`, a non-list/improper
 //! `length/1`, or a shape the helper's pure read cannot address) — branches to the same
 //! [`emit_step_and_continue`] the instruction would have taken before, i.e. exactly one
 //! interpreter step. The interpreter's `Bif`/`GcBif` arm then calls the real BIF through the
 //! host, so every error (`badarg` for `hd(5)`/`hd([])`/`element(0, T)`/`element(9, {a})`/
-//! `tuple_size([1])`/`byte_size(0)`/`length({a})`) is the interpreter's own: the fast path
+//! `tuple_size([1])`/`byte_size(0)`/`bit_size(0)`/`length({a})`) is the interpreter's own: the fast path
 //! can only ever *produce the same value* or *decline*, never a different result. Route (a)
 //! allocates nothing and touches no heap word; route (b) reads its operand through the
 //! engine's own `read_operand` and writes its result through `write_operand`, and the emitted
@@ -108,11 +109,11 @@ enum Target<'a> {
     },
     /// `tuple_size/1` over the tuple in this operand.
     TupleSize(&'a Operand),
-    /// `byte_size/1` or `length/1` — evaluated by the native helper
+    /// `byte_size/1`, `bit_size/1` or `length/1` — evaluated by the native helper
     /// [`jit_bif_value`] (`super::super::bif_helper`), whose Rust body is the `beam_bifs`
-    /// ground truth itself (`bit_size` rounded up for `byte_size/1`; the proper-list walk
-    /// for `length/1`). The operand is re-read from the module by the helper, so the
-    /// target carries no operand of its own.
+    /// ground truth itself (`bit_size` rounded up for `byte_size/1`, the same bit size for
+    /// `bit_size/1`; the proper-list walk for `length/1`). The operand is re-read from the
+    /// module by the helper, so the target carries no operand of its own.
     Value,
 }
 
@@ -214,7 +215,7 @@ fn value_registers(dst: &Operand) -> (Vec<u32>, Vec<u32>) {
     }
 }
 
-/// Classify `instr` as one of the five lowered BIFs — the three pure accessors reused from
+/// Classify `instr` as one of the six lowered BIFs — the three pure accessors reused from
 /// the aggregate read guards, or the two helper-evaluated value accessors — with the
 /// destination operand every one of them writes.
 ///
@@ -255,11 +256,12 @@ fn classify<'a>(module: &Module, instr: &'a Instr) -> Option<(Target<'a>, &'a Op
             dst,
         )),
         ("tuple_size", [source]) if !collecting => Some((Target::TupleSize(source), dst)),
-        // The helper-evaluated value accessors: `byte_size/1` and `length/1`, accepted
-        // only for a shape their Rust body can serve end to end (`value_shape`), from
-        // either variant — neither has a heap effect, so the helper's value is exact and
-        // any shape it cannot prove still declines to the interpreter's own step.
-        ("byte_size" | "length", [source]) if value_shape(source, dst) => {
+        // The helper-evaluated value accessors: `byte_size/1`, `bit_size/1` and
+        // `length/1`, accepted only for a shape their Rust body can serve end to end
+        // (`value_shape`), from either variant — none has a heap effect, so the helper's
+        // value is exact and any shape it cannot prove still declines to the
+        // interpreter's own step.
+        ("byte_size" | "bit_size" | "length", [source]) if value_shape(source, dst) => {
             Some((Target::Value, dst))
         }
         _ => None,
@@ -298,7 +300,7 @@ fn shape(module: &Module, instr: &Instr) -> Option<Inlined> {
 }
 
 /// The `(touches, writes)` x-register sets of the `Bif`'s native lowering, or `None` when
-/// the instruction is not one of the five lowered BIFs in an inlinable shape.
+/// the instruction is not one of the six lowered BIFs in an inlinable shape.
 ///
 /// Purely syntactic, so [`super::regalloc::allocate_registers`] caches exactly the
 /// registers the emitter reads and — load-bearing — **writes** ([`Inlined::writes`]: a
@@ -309,7 +311,7 @@ pub(super) fn bif_shape(module: &Module, instr: &Instr) -> Option<(Vec<u32>, Vec
     Some((shape.registers(), shape.writes()))
 }
 /// The x-registers the `Bif`'s native lowering **reads through the block register cache**,
-/// or `None` when the instruction is not one of the five lowered BIFs in an inlinable
+/// or `None` when the instruction is not one of the six lowered BIFs in an inlinable
 /// shape. The read-set twin of [`bif_shape`] (see [`Inlined::reads`]).
 pub(super) fn bif_reads(module: &Module, instr: &Instr) -> Option<Vec<u32>> {
     shape(module, instr).map(|shape| shape.reads())
@@ -328,7 +330,7 @@ pub(super) fn bif_uses_y(module: &Module, instr: &Instr) -> bool {
 ///
 /// Returns `true` when the whole guarded sequence was emitted, leaving the BIF's value in
 /// `dst` and letting the block continue with the next instruction. Returns `false`
-/// **without having emitted a byte** when `instr` is not one of the five lowered BIFs or
+/// **without having emitted a byte** when `instr` is not one of the six lowered BIFs or
 /// its operands are not an inlinable shape ([`shape`]), so the caller emits exactly today's
 /// `jit_step_one` step.
 #[allow(clippy::too_many_arguments)]
@@ -387,14 +389,16 @@ pub(super) fn try_inline_bif(
             pc,
             highest_touched,
         ),
-        // `byte_size/1`/`length/1` are served by the native helper `jit_bif_value`, whose
+        // `byte_size/1`/`bit_size/1`/`length/1` are served by the native helper
+        // `jit_bif_value`, whose
         // Rust body reproduces `beam_bifs`'s own value (or declines to the interpreter's
         // step, which raises its exact `badarg`/`system_limit`).
         Target::Value => try_inline_bif_value(buffer, allocation, done, func, pc),
     }
 }
 
-/// Emit the native helper call for `erlang:byte_size/1` / `erlang:length/1`, always
+/// Emit the native helper call for `erlang:byte_size/1` / `erlang:bit_size/1` /
+/// `erlang:length/1`, always
 /// continuing in block on the helper's "advanced by one" word.
 ///
 /// [`jit_bif_value`] has [`StepHelper`]'s exact signature, so the sequence is the shared

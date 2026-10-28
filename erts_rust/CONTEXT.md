@@ -188,7 +188,25 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   version-aware scan, wall 67.7 s); `emqx` skips honestly (`skipped(emqx-requires-otp-28)` — the
   checkout pins OTP 28, the host is OTP 29.1.1). Load is recorded before/after every run: **the host
   is shared**, so read the ratios and the deterministic `case_*_ops/calls/elements` counters, never
-  the absolute wall times.
+  the absolute wall times. The four `foreign/*` rows are **engine-tier**: per call they cross **0**
+  BIFs (`to_lower`, `capitalize_token`), **4** (`iolist_to_binary/1`, `encode`) and **16**
+  (`bit_size/1`, `decode`), so ~90–100 % of each residual is the baseline tier's per-instruction
+  machinery and `beam_bifs`/`beam_term`/`beam_alloc` cannot close it — the live per-frame split is
+  `crates/beam_engine/src/jit/baseline/measure/CONTEXT.md` §*The create arm's helpers*, not
+  `BOTTLENECKS.md` §B3 (whose `dispatch` 12.6 %, `push_bit` 6.5 % and `alloc_impl` 17.31 % shares
+  predate the create-arm landing and no longer reproduce).
+  Attribution of the worst row (`binary_append`, callgrind + `perf cpu_core/instructions/u`): the
+  residual is **one non-inlined opcode** — the comprehension loop's `bs_match` `integer` command
+  takes the family path at ~647 instructions/iteration (~72 % of the ~897 total), while the same
+  loop's `bs_create_bin` IS JIT-inlined (~200/iteration, one `jit_append_cursor` call per append) and
+  the equivalent `{skip,8}` match form inlines whole (223–254/iteration). The in-scope crates are
+  noise here — `beam_alloc` growth + `set_len` zero-fill ≈1.0 % of per-call instructions
+  (8 `ensure_capacity` = 2 in-place grows + 6 allocate/copy/free relocations of a 256 B→64 KiB
+  ladder, 64 512 B copied + 65 280 B zero-filled per call), `beam_bifs`/`beam_term`/`beam_ets` ≈0.1 %
+  — so no in-scope lever exists for this workload; the fix belongs to the baseline-JIT `bs_match`
+  shape (`crates/beam_engine/src/jit/baseline/emit/bitstr_inline/bs_match.rs`). Coverage caveat: no
+  `tools/differential` case reaches `bs_init_writable`/`private_append` at all, so no case pins the
+  bytes of a grown writable accumulator yet.
 - **Contract A.9 (build/bootstrapping) — boot COMPLETES; no self-hosted build yet.** `beam_rt`
   loads the 22 preloaded modules on startup, and its boot-script executor drives the real
   `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 directives) **through the final

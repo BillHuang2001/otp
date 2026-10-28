@@ -116,7 +116,14 @@ impl HashInterior {
     /// [`capacity::INITIAL_BUCKETS`], doubles past the load factor and never
     /// shrinks below the starting count), so the modulo is well defined.
     fn bucket_index(&self, key: Eterm, atoms: &AtomTable) -> usize {
-        (term_hash(key, atoms) as usize) % self.buckets.len()
+        self.bucket_index_hashed(term_hash(key, atoms))
+    }
+
+    /// [`bucket_index`](HashInterior::bucket_index) for a key whose
+    /// `beam_term::hashing::term_hash` the caller already has (see
+    /// [`Interior::insert_hashed`]).
+    fn bucket_index_hashed(&self, hash: u64) -> usize {
+        (hash as usize) % self.buckets.len()
     }
 
     /// The number of hash slots this index exposes (`ets:slot/2`'s
@@ -329,7 +336,21 @@ impl HashInterior {
 
 impl Interior for HashInterior {
     fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool> {
-        let bi = self.bucket_index(key, atoms);
+        let hash = term_hash(key, atoms);
+        self.insert_hashed(key, object, atoms, hash)
+    }
+
+    /// The hash-once half of [`insert`](Interior::insert) — see
+    /// [`Interior::insert_hashed`]: `Table::insert_stored` already hashed this key to
+    /// find the object it replaces, so the bucket is derived from that value.
+    fn insert_hashed(
+        &mut self,
+        key: Eterm,
+        object: Eterm,
+        atoms: &AtomTable,
+        hash: u64,
+    ) -> Result<bool> {
+        let bi = self.bucket_index_hashed(hash);
         // Whether the interior now owns `object`. `set`/`duplicate_bag` always
         // retain; only a `bag` can reject an *identical* object as a no-op, in which
         // case the caller reclaims the rejected copy (see the trait doc).
@@ -446,11 +467,21 @@ impl Interior for HashInterior {
         Ok(())
     }
 
-    fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm> {        let bi = self.bucket_index(key, atoms);
+    fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm> {
+        let bi = self.bucket_index(key, atoms);
         match Self::entry_pos(&self.buckets[bi], key, atoms) {
             Some(pos) => self.buckets[bi][pos].objs.clone(),
             None => Vec::new(),
         }
+    }
+
+    /// The allocation-free upsert probe (see [`Interior::lookup_one_hashed`]).
+    /// `set`/`ordered_set` keep at most one object per key, so the first stored
+    /// object *is* the object the insert will replace.
+    fn lookup_one_hashed(&self, key: Eterm, atoms: &AtomTable, hash: u64) -> Option<Eterm> {
+        let bi = self.bucket_index_hashed(hash);
+        Self::entry_pos(&self.buckets[bi], key, atoms)
+            .and_then(|pos| self.buckets[bi][pos].objs.first().copied())
     }
 
     fn member(&self, key: Eterm, atoms: &AtomTable) -> bool {

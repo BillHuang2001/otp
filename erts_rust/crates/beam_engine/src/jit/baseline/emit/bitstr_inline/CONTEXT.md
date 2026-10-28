@@ -20,8 +20,7 @@ The tier's width/flag rule has **one** definition here (`integer.rs::field_width
   The ten label-carrying ones answer `Option<(Shape, (u32, u32))>` — the resolved fail target is part of the accepted shape — and the two start-match ones answer `Option<(StartMatchShape, MatchFail)>`; the two position shapes take no label at all.
 - The **label-free** constructors `<Shape>::of(...)`/`of_get(...)` (`TestTail2Shape::of`, `SkipBits2Shape::of`, `StartMatchShape::of`, `GetInteger2Shape::of`, `BsMatchShape::of`, `MatchStringShape::of`, `Utf32Shape::of`/`of_get`, `Utf16Shape::of`/`of_get`, `Utf8Shape::of`/`of_get`, `CreateBinShape::of`), which is what `emit/arith.rs::uses_y` reads: the block's Y gate must derive the same answer as the emitter without needing the label map.
 - The rule and the decoders `pub(crate)`: `field_width_supported(nbits)`, `field_is_unsupported(flags)`, and — `#[cfg(test)]` — `field_is_little(flags)`, `bs_match_group_len`, `bs_match_static_size`, `bs_match_integer_flags`, `MatchFail`, all shared with `emit/test/refusal_census.rs`.
-- The shared machinery in `mod.rs`: `emit_ctx_guard` (the `is_boxed` + `HEADER_SUB_BITS` match-context guard, leaving the block base in `MOVE_SCRATCH`), `emit_fallback_and_done` (the `fast_done` jump + the `fallback` interpreter step + the `fast_done` binding), `emit_bit_extract` (a big-endian field out of `(base, bit_pos, num_bytes)`) and `emit_subject_view` (the readable `(base, bit_pos, num_bytes)` window of the **two** subject forms it classifies — an on-heap `ErlHeapBits`, whose `num_bytes` is the block's word-padded data extent, and a **refc window**, an `ErlSubBits` whose own `orig` is a `BinRef`, whose `num_bytes` is the strict `ceil((rem + end - start) / 8)` — with every other form jumping to `fallback`; the sequence is 343 B, ~184 B of it the refc arm, emitted once per shape that classifies a subject).
-- The frozen layout constants the emitters read (`SUB_BITS_START_DISP`/`_END_DISP`/`_ORIG_DISP`, `HEADER_DISP`, `HEAP_BITS_SIZE_DISP`/`_DATA_DISP`, `SUB_BITS_HEADER`, `BIN_REF_HEADER`, `BITSTRING_TAG_MASK_WORD`, `HEAP_BITS_SUBTAG_WORD`, `LITERAL_PTR_BIT`, `NOT_BOXED_MASK`, `POINTER_MASK`, `IMMED1_MASK`, `SMALL_TAG`) and the five field-flag bits (`BSF_ALIGNED` 1, `BSF_LITTLE` 2, `BSF_SIGNED` 4, `BSF_EXACT` 8, `BSF_NATIVE` 16).
+- The shared machinery in `mod.rs`: `emit_ctx_guard` (the `is_boxed` + `HEADER_SUB_BITS` match-context guard, leaving the block base in `MOVE_SCRATCH`), `emit_fallback_and_done` (the `fast_done` jump + the `fallback` interpreter step + the `fast_done` binding), `emit_bit_extract` (a big-endian field out of `(base, bit_pos, num_bytes)`) and `emit_subject_view` (the readable `(base, bit_pos, num_bytes)` window of the **two** subject forms it classifies — an on-heap `ErlHeapBits`, whose `num_bytes` is the block's word-padded data extent, and a **refc window**, an `ErlSubBits` whose own `orig` is a `BinRef`, whose `num_bytes` is the strict `ceil((rem + end - start) / 8)` — with every other form jumping to `fallback`; the sequence is 343 B, ~184 B of it the refc arm, emitted once per shape that classifies a subject).- The frozen layout constants the emitters read (`SUB_BITS_START_DISP`/`_END_DISP`/`_ORIG_DISP`, `HEADER_DISP`, `HEAP_BITS_SIZE_DISP`/`_DATA_DISP`, `SUB_BITS_HEADER`, `BIN_REF_HEADER`, `BITSTRING_TAG_MASK_WORD`, `HEAP_BITS_SUBTAG_WORD`, `LITERAL_PTR_BIT`, `NOT_BOXED_MASK`, `POINTER_MASK`, `IMMED1_MASK`, `SMALL_TAG`) and the five field-flag bits (`BSF_ALIGNED` 1, `BSF_LITTLE` 2, `BSF_SIGNED` 4, `BSF_EXACT` 8, `BSF_NATIVE` 16).
 - The `#[cfg(test)]` per-shape instrument: `SHAPE_COUNT` = 17, the indices `SHAPE_GET_POSITION`/`SHAPE_SET_POSITION`/`SHAPE_TEST_TAIL2`/`SHAPE_SKIP_BITS2`/`SHAPE_START_MATCH3`/`SHAPE_START_MATCH4`/`SHAPE_GET_INTEGER2`/`SHAPE_BS_MATCH`/`SHAPE_CREATE_BIN`/`SHAPE_BS_MATCH_STRING`/`SHAPE_SKIP_UTF32`/`SHAPE_GET_UTF32`/`SHAPE_SKIP_UTF16`/`SHAPE_GET_UTF16`/`SHAPE_SKIP_UTF8`/`SHAPE_GET_UTF8`/`SHAPE_CREATE_FRESH`, and `inlined(shape) -> u64`, a **compile-time** count of how often a shape's sequence was emitted (the fifteen match-context shapes call no helper at all, so a run-time helper counter cannot see them; the two construction shapes' helper calls depend on which route the plan picked — append, bit-granular, `binary all` or the bare build — so the emission is the one instrument that covers them all).
 - The two construction-shape caps, `create.rs`-private: `MAX_FIELDS = 16` fields and `MAX_TAIL_BYTES = 256` tail bytes, which bound the block's size and the `emit/compile.rs` `CREATE_BIN_PATH_BYTES` budget.
 ## The construction shape (`bs_create_bin { dst, segments }`) — `create.rs::try_inline_bs_create_bin`
@@ -195,7 +194,31 @@ The source gate is **any byte-aligned bitstring window** — an on-heap `ErlHeap
   `jit_make_heap_binary` call — the admission point the rooted reserve needs — and the
   destination store). Anything the fresh plan declines (a `binary`/`string`/`float`/`utf*`
   segment, a `Dynamic`/`All` width, a `little`/`signed`/`native` flag, a zero-width field, a
-  total past one word) stays on `jit_bitstr`.
-- **`BitGranular` + `ConstBytes`** in one plan: refused by the predicate (`CreateBinShape::of`
+  total past one word) stays on `jit_bitstr`.- **`BitGranular` + `ConstBytes`** in one plan: refused by the predicate (`CreateBinShape::of`
   -> `None`), because the aligned half would commit a window end before the bit fields have
   passed their own room check.
+## The shared subject view (`mod.rs::emit_subject_view`) — the two readable forms
+The field-extracting shapes (`bs_match`'s `integer` command, `bs_get_integer2`, `bs_match_string`, the three UTF
+skip/get pairs) read their subject through one classification, which answers
+`(base, bit_pos, num_bytes)` and jumps to `fallback` for everything else.
+The forms it reads are exactly `raw::heap_bits`' two — the family's own reader, branch for branch:
+- **an on-heap `ErlHeapBits`**: `base` = the data region (word 2), `bit_pos = pos` (the form's own offset is `0`),
+  `num_bytes` = the block's **word-padded** data extent `((size + 63) >> 6) << 3`. The padding is spendable because
+  `emit_bit_extract` reads a second byte only for a field whose bits reach past the first, so a padding byte can never
+  contribute a bit of the result; the narrow `ceil(size / 8)` bound was a real performance bug (a `<<_:2, F:6>>` match
+  over a 1-byte subject needs no second byte at all).
+- **a refc window** — an `ErlSubBits` whose own `orig` (word 4) is a boxed `BinRef`, i.e. exactly
+  `beam_term::refc::is_refc_binary` — which is what a match over a binary **above `ERL_ONHEAP_BINARY_LIMIT`** (64) bytes
+  gets, and therefore the subject of every compiled binary comprehension. `base = (base_flags & !ERL_SUB_BITS_FLAG_MASK)`
+  plus `(start + pos) / 8` payload bytes, `bit_pos = (start + pos) & 7`, `num_bytes = ceil(end / 8) - (start + pos) / 8`.
+  That is `raw::subject_bytes`' `ceil((off + size) / 8)` figure — the payload's own length is no field of the
+  `ErlSubBits`, so this arm bounds every read by the **window's** bytes and can spend no padding.
+  The guards are `start + pos <= end` and, before it, the `orig`-is-a-`BinRef` test; the second is what keeps a
+  **non-refc** `ErlSubBits` (a match context used as a subject, a sub-bitstring over a heap block) on the family.
+Every other form falls through to one interpreter step: a non-boxed word, a literal-area term (the words are read-only;
+the family reads them the same way), a bare `BinRef`, a non-refc `ErlSubBits`, and every non-bitstring.
+The arm mutates nothing, so it is deopt-idempotent by construction; `jit_step_one` re-executes the instruction and
+re-reads the same words.
+Pinned by `../../bs_match_deopt_tests.rs`'s three refc rows (16 KiB whole window, a 4-bit-offset window, and a non-refc
+`ErlSubBits` that must still decline, each with a **zero run-time `BsMatch` deopt** count on the accepted forms — the
+value alone also passes for an arm that deopts every time).

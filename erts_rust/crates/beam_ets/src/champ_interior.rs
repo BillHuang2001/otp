@@ -471,6 +471,20 @@ impl Default for ChampInterior {
 impl Interior for ChampInterior {
     fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool> {
         let hash = term_hash(key, atoms);
+        self.insert_hashed(key, object, atoms, hash)
+    }
+
+    /// The hash-once half of [`insert`](Interior::insert) — see
+    /// [`Interior::insert_hashed`]. `Table::insert_stored` already hashed this key to
+    /// find the object it replaces, so the insert reuses that value instead of
+    /// hashing the same key a second time per `ets:insert`.
+    fn insert_hashed(
+        &mut self,
+        key: Eterm,
+        object: Eterm,
+        atoms: &AtomTable,
+        hash: u64,
+    ) -> Result<bool> {
         match node_insert(&mut self.root, hash, 0, key, object, atoms) {
             Upsert::Inserted => self.len += 1,
             Upsert::Replaced => {}
@@ -521,6 +535,13 @@ impl Interior for ChampInterior {
             Some(object) => vec![object],
             None => Vec::new(),
         }
+    }
+
+    /// The allocation-free upsert probe (see [`Interior::lookup_one_hashed`]): the
+    /// trie lookup straight to an `Option`, with the caller's hash and no
+    /// `vec![object]`.
+    fn lookup_one_hashed(&self, key: Eterm, atoms: &AtomTable, hash: u64) -> Option<Eterm> {
+        node_lookup(&self.root, hash, 0, key, atoms)
     }
 
     fn member(&self, key: Eterm, atoms: &AtomTable) -> bool {
