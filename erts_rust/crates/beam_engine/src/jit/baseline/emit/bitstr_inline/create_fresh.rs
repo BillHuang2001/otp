@@ -35,7 +35,7 @@
 //!   spill                                     ; machine.x authoritative before any call
 //!   per field, in instruction order:
 //!     <guarded load of the value into rdx>    ; a Y value's frame-window guard is its load
-//!     mov rax, rdx ; and rax, IMMED1_MASK ; cmp rax, SMALL_TAG ; jne fallback
+//!     mov rax, rdx ; mov rcx, SMALL_TAG ; and rax, rcx ; cmp rax, rcx ; jne fallback
 //!     sar rdx, 4                              ; untag (arithmetic: negatives sign-extend)
 //!     [shl rdx, 64-bits ; shr rdx, 64-bits]   ; mask to the field width (skipped at 64 bits)
 //!     first: mov pack, rdx                    ; a COPY — a 64-bit first field must not shift
@@ -122,7 +122,7 @@ use super::super::{
     emit_refresh_y, fill, spill, Allocation, FillSite, SpillSite, RUNTIME_SLOT_DISP,
 };
 use super::create::emit_y_slot_address;
-use super::{emit_fallback_and_done, CreateBinShape, IMMED1_MASK, SMALL_TAG};
+use super::{emit_fallback_and_done, CreateBinShape, SMALL_TAG};
 
 #[cfg(test)]
 use super::{record_inlined, SHAPE_CREATE_FRESH};
@@ -196,9 +196,12 @@ pub(super) fn emit_fresh_build(
         )?;
         // The tag test destroys its input, so the raw word is copied out first.
         buffer.mov_rr(Reg::Rax, Reg::Rdx)?;
-        buffer.mov_ri(Reg::Rcx, IMMED1_MASK)?;
-        buffer.and_rr(Reg::Rax, Reg::Rcx)?;
+        // One tag word per field serves both the mask and the compare: `IMMED1_MASK ==
+        // SMALL_TAG` (asserted beside the constants), so `(v & mask) == tag` is
+        // `(v & SMALL_TAG) == SMALL_TAG`. It is (re)materialised *after* the load because a
+        // `Y` field value's load clobbers the end scratch register.
         buffer.mov_ri(Reg::Rcx, SMALL_TAG)?;
+        buffer.and_rr(Reg::Rax, Reg::Rcx)?;
         buffer.cmp_rr(Reg::Rax, Reg::Rcx)?;
         buffer.jcc(Cond::Ne, fallback)?;
         // Untag: `make_small(v) == v * 16 + 15`, so an arithmetic shift is the exact value —
