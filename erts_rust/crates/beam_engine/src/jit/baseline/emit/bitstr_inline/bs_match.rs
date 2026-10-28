@@ -356,6 +356,14 @@ fn emit_bs_match_ensure_at_least(
 }
 
 /// Emit one statically-decoded `bs_match` command.
+///
+/// `proven` carries a **lower bound on the remaining window** that an earlier command of this
+/// same list has already established on every path reaching this one, so the bound-only
+/// commands (`ensure_at_least` with a non-zero `size` — its test compares `remaining >= size`
+/// before any residue test — and an `integer`'s own check) can skip
+/// [`emit_bs_match_remaining`] and their compare entirely when the bound already covers what
+/// they need. The value is `None` whenever it is unknown, and every command that moves the
+/// running position (`skip`, `integer`) resets it — a check is never elided across one.
 fn emit_bs_match_command(
     buffer: &mut CodeBuffer,
     command: &BsMatchCmd,
@@ -363,17 +371,32 @@ fn emit_bs_match_command(
     fallback: CodeLabel,
     allocation: &Allocation,
     highest_touched: &mut Option<u32>,
+    proven: &mut Option<usize>,
 ) -> Result<()> {
     match command {
         BsMatchCmd::EnsureAtLeast { size, unit } => {
-            emit_bs_match_ensure_at_least(buffer, *size, *unit, fail_arm)
+            if *size == 0 {
+                // `remaining % unit == 0` (or the family's no-op) establishes no bound — a
+                // modulo only ever proves a multiple, never a lower bound.
+                return emit_bs_match_ensure_at_least(buffer, *size, *unit, fail_arm);
+            }
+            if proven.is_some_and(|bound| bound >= *size) {
+                // An earlier command already proved `remaining >= size` at this same position.
+                return Ok(());
+            }
+            emit_bs_match_ensure_at_least(buffer, *size, *unit, fail_arm)?;
+            *proven = Some(proven.map_or(*size, |bound| bound.max(*size)));
+            Ok(())
         }
         BsMatchCmd::EnsureExactly { stride } => {
             // `end.saturating_sub(pos) != stride` — the remaining window, exact equality.
             emit_bs_match_remaining(buffer)?;
             buffer.mov_ri(Reg::Rax, *stride as i64)?;
             buffer.cmp_rr(Reg::Rcx, Reg::Rax)?;
-            buffer.jcc(Cond::Ne, fail_arm)
+            buffer.jcc(Cond::Ne, fail_arm)?;
+            // Past this point `remaining == stride`, which is a bound as well as an equality.
+            *proven = Some(*stride);
+            Ok(())
         }
         BsMatchCmd::Skip { stride } => {
             // `commands::skip_cmd`: a checked advance, then the running position moves.
@@ -383,14 +406,20 @@ fn emit_bs_match_command(
             buffer.mov_rm(Reg::Rax, MOVE_SCRATCH, SUB_BITS_END_DISP)?;
             buffer.cmp_rr(Reg::Rcx, Reg::Rax)?;
             buffer.jcc(Cond::A, fail_arm)?;
-            buffer.mov_rr(Reg::Rsi, Reg::Rcx)
+            buffer.mov_rr(Reg::Rsi, Reg::Rcx)?;
+            // The position moved, so no earlier bound still applies.
+            *proven = None;
+            Ok(())
         }
         BsMatchCmd::Integer { nbits, dst } => {
-            // `nbits > remaining` -> the FAIL label.
-            emit_bs_match_remaining(buffer)?;
-            buffer.mov_ri(Reg::Rax, *nbits as i64)?;
-            buffer.cmp_rr(Reg::Rcx, Reg::Rax)?;
-            buffer.jcc(Cond::B, fail_arm)?;
+            // `nbits > remaining` -> the FAIL label, unless an earlier command already proved
+            // the window is at least this wide at the position this command reads.
+            if !proven.is_some_and(|bound| bound >= *nbits) {
+                emit_bs_match_remaining(buffer)?;
+                buffer.mov_ri(Reg::Rax, *nbits as i64)?;
+                buffer.cmp_rr(Reg::Rcx, Reg::Rax)?;
+                buffer.jcc(Cond::B, fail_arm)?;
+            }
             // The subject's readable window, then the shared guarded extraction.
             let (base, bit_pos, num_bytes) =
                 emit_subject_view(buffer, MOVE_SCRATCH, Reg::Rsi, fallback)?;
@@ -403,6 +432,8 @@ fn emit_bs_match_command(
             buffer.shl_ri(Reg::R8, 4)?;
             buffer.mov_ri(Reg::Rcx, SMALL_TAG)?;
             buffer.or_rr(Reg::R8, Reg::Rcx)?;
+            // The position moved, so no earlier bound still applies.
+            *proven = None;
             dst.store_at(buffer, Y_ADDR_SCRATCH, Reg::R8, allocation, highest_touched)
         }
     }
@@ -481,6 +512,9 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_match(
     }
     emit_ctx_guard(buffer, shape.ctx, allocation, fallback, highest_touched)?;
     buffer.mov_rm(Reg::Rsi, MOVE_SCRATCH, SUB_BITS_START_DISP)?;
+    // A lower bound on the remaining window that the commands emitted so far have already
+    // established on every path that reaches the next one; see [`emit_bs_match_command`].
+    let mut proven: Option<usize> = None;
     for command in &shape.commands {
         emit_bs_match_command(
             buffer,
@@ -489,6 +523,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_match(
             fallback,
             allocation,
             highest_touched,
+            &mut proven,
         )?;
     }
     buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)?;
@@ -512,3 +547,130 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_match(
     Ok(true)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Emit `commands` into a throwaway buffer with `proven` pre-seeded, and answer its
+    /// byte length. Nothing is sealed or executed: this suite pins the **emitted shape**,
+    /// which is a closed-form function of the command list and the seeded bound.
+    fn emit_len(commands: &[BsMatchCmd], proven: Option<usize>) -> usize {
+        let mut buffer = CodeBuffer::new().expect("a code buffer");
+        let fail_arm = buffer.label();
+        let fallback = buffer.label();
+        let allocation = Allocation::default();
+        let mut highest_touched: Option<u32> = None;
+        let mut proven = proven;
+        for command in commands {
+            emit_bs_match_command(
+                &mut buffer,
+                command,
+                fail_arm,
+                fallback,
+                &allocation,
+                &mut highest_touched,
+                &mut proven,
+            )
+            .expect("the command must emit");
+        }
+        buffer.len()
+    }
+    /// The full `integer` emission, i.e. the one that re-derives `remaining` and compares.
+    fn integer_unproven() -> usize {
+        emit_len(&[BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) }], None)
+    }
+    /// The same `integer` emission with a bound that already covers it.
+    fn integer_proven() -> usize {
+        emit_len(&[BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) }], Some(8))
+    }
+    /// A bound an earlier command established on **every** path reaching the next one is
+    /// what lets it skip `remaining`'s derivation and its compare: the `ensure_at_least`
+    /// row costs exactly its own emission plus the *elided* `integer`, never the full one.
+    #[test]
+    fn a_bound_from_an_earlier_command_elides_the_next_check() {
+        let ensure = emit_len(&[BsMatchCmd::EnsureAtLeast { size: 8, unit: 1 }], None);
+        let pair = emit_len(
+            &[
+                BsMatchCmd::EnsureAtLeast { size: 8, unit: 1 },
+                BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) },
+            ],
+            None,
+        );
+        assert_eq!(pair, ensure + integer_proven());
+        assert!(
+            integer_unproven() > integer_proven(),
+            "the elided form must be strictly smaller than the full one"
+        );
+        assert!(pair < ensure + integer_unproven());
+    }
+    /// `ensure_exactly` establishes an equality, which is a bound too.
+    #[test]
+    fn an_equality_bound_elides_the_next_check() {
+        let exactly = emit_len(&[BsMatchCmd::EnsureExactly { stride: 8 }], None);
+        let pair = emit_len(
+            &[
+                BsMatchCmd::EnsureExactly { stride: 8 },
+                BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) },
+            ],
+            None,
+        );
+        assert_eq!(pair, exactly + integer_proven());
+    }
+    /// A bound **smaller** than what the next command needs proves nothing about it.
+    #[test]
+    fn a_smaller_bound_does_not_elide_the_next_check() {
+        let ensure = emit_len(&[BsMatchCmd::EnsureAtLeast { size: 4, unit: 1 }], None);
+        let pair = emit_len(
+            &[
+                BsMatchCmd::EnsureAtLeast { size: 4, unit: 1 },
+                BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) },
+            ],
+            None,
+        );
+        assert_eq!(pair, ensure + integer_unproven());
+    }
+    /// `ensure_at_least 0 Unit` only tests `remaining % Unit`, which establishes no lower
+    /// bound at all — it must not arm the next command's elision.
+    #[test]
+    fn a_modulo_only_test_establishes_no_bound() {
+        let ensure = emit_len(&[BsMatchCmd::EnsureAtLeast { size: 0, unit: 2 }], None);
+        let pair = emit_len(
+            &[
+                BsMatchCmd::EnsureAtLeast { size: 0, unit: 2 },
+                BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) },
+            ],
+            None,
+        );
+        assert_eq!(pair, ensure + integer_unproven());
+    }
+    /// A `Unit != 1` command with a non-zero `Size` compares `remaining >= Size` **first**
+    /// and only then the `(remaining - Size) % Unit` residue, so its lower bound is real.
+    #[test]
+    fn a_unit_mismatch_test_still_establishes_its_lower_bound() {
+        let ensure = emit_len(&[BsMatchCmd::EnsureAtLeast { size: 8, unit: 2 }], None);
+        let pair = emit_len(
+            &[
+                BsMatchCmd::EnsureAtLeast { size: 8, unit: 2 },
+                BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) },
+            ],
+            None,
+        );
+        assert_eq!(pair, ensure + integer_proven());
+    }
+    /// A `skip` moves the running position, so a bound established before it says nothing
+    /// about the window the next command reads: the check is **re-armed**.
+    #[test]
+    fn a_position_moving_command_re_arms_the_check() {
+        let ensure = emit_len(&[BsMatchCmd::EnsureAtLeast { size: 8, unit: 1 }], None);
+        let skip = emit_len(&[BsMatchCmd::Skip { stride: 8 }], None);
+        let triple = emit_len(
+            &[
+                BsMatchCmd::EnsureAtLeast { size: 8, unit: 1 },
+                BsMatchCmd::Skip { stride: 8 },
+                BsMatchCmd::Integer { nbits: 8, dst: Loc::X(1) },
+            ],
+            None,
+        );
+        assert_eq!(triple, ensure + skip + integer_unproven());
+    }
+}
