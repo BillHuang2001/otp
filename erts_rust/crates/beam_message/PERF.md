@@ -420,6 +420,21 @@ literal is shared), so the change removes almost nothing there while adding one 
 and a ~0.8 % shift over a 31.7 k-instruction row is the same order as the code-placement confound §7.2 documents (the
 two binaries differ by ~15 KB). Nothing in this node can make a 3-word copy cheaper; the row's cost is
 `beam_rt`'s (see §10).
+**The other two `copy_bound` rows also carry a payload copy, and they move the same way.** Neither is this crate's
+own workload, and both are reported here because a change to the copier must not regress them — they read:
+| case | before, per round | after, per round | median delta |
+|---|---|---|---|
+| `copy_bound`/`etf_roundtrip` (N 100 000 -> 600 000) | 23 047.3 / 23 042.8 / 23 024.6 | 21 110.2 / 21 084.7 / 21 101.8 | **-8.42 %** |
+| `copy_bound`/`ets_copy` (N 100 000 -> 900 000) | 20 940.2 / 21 145.3 / 20 928.0 | 19 204.7 / 19 189.7 / 19 194.9 | **-8.33 %** |
+The mechanism is the same one and it is not layout: an **ETS insert copies the term onto the table's heap through this
+crate's `copy_struct`** (the send path and ETS share the copier — `beam_rt/src/context/gc/resources.rs` documents a
+resource term surviving "the send path's `copy_struct`, an ETS insert"), and `binary_to_term` materialises its result
+through the same copy, so both rows perform a 70-word payload copy per op against a base only a third as large as
+`send_recv`'s. Two controls rule out a whole-binary placement effect: a payload-construction-only loop reads
+**803.8 -> 804.6 instr/op (+0.10 %)** and a **1-word**-payload two-process round trip reads **31 002.4 -> 31 056.3
+(+0.17 %)**, while a null A/B (the baseline binary on both sides) reads **-0.02 %**. So the harness is sound, the
+untouched paths are untouched, and the saving scales with the payload graph the copy walks — 0 words, 3 words, 70
+words.
 **Paired wall clock**, 15 alternating rounds per case (`before,after`, then the order reversed),
 `/proc/loadavg` **23.1 -> 30.4**:
 | case | before ns/op | after ns/op | delta | per-round duration spread |
