@@ -1291,6 +1291,34 @@ mod tests {
         String::from_utf8(output.stdout).expect("the probe renders as UTF-8")
     }
 
+    /// `application:get_key(App, vsn)` under the live system `erl`, as a plain string.
+    ///
+    /// The single-property sibling of [`oracle_lines`], with the same shape (the same
+    /// `-noshell -eval …` argv, null stdin, an `.output()` probe whose **failure is a test
+    /// failure**, never a skip) because a version read out of an installation's `.app` file
+    /// is only ever comparable to *that* installation's own value.
+    fn oracle_vsn(oracle: &std::path::Path, app: &str) -> String {
+        use std::process::{Command, Stdio};
+
+        let eval = format!(
+            "io:format(\"~s~n\", [element(2, application:get_key({app}, vsn))]), halt(0)."
+        );
+        let output = Command::new(oracle)
+            .args(["-noshell", "-eval", &eval])
+            .stdin(Stdio::null())
+            .output()
+            .expect("the oracle runs");
+        assert!(
+            output.status.success(),
+            "the oracle probe for application:get_key({app}, vsn) failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("the probe renders as UTF-8")
+            .trim_end()
+            .to_string()
+    }
+
     /// Whether `vsn` is a well-formed OTP version string: non-empty, 2–3 dot-separated
     /// all-digit components (`8.1`, `11.0.4`).
     ///
@@ -1468,14 +1496,44 @@ mod tests {
         let kernel = atom(&mut runtime, "kernel");
         let stdlib = atom(&mut runtime, "stdlib");
 
-        // `{ok, Value}` for a declared string property.
-        for (key, expected) in [("vsn", "11.0.4"), ("description", DESCRIPTION)] {
+        // `{ok, Value}` for a declared string property. The description string is the same
+        // in every OTP, so it stays pinned exactly; the version is read out of the
+        // installation's own `kernel.app` on the code path (host OTP 29.1.2 answers
+        // `11.0.4` where this tree's `lib/kernel/vsn.mk` says `11.0`), so it is never a
+        // literal here — it is asserted below by shape and against the live oracle.
+        for (key, expected) in [("description", DESCRIPTION)] {
             let key_atom = atom(&mut runtime, key);
             let answer = call(&mut runtime, "application", "get_key", &[kernel, key_atom])
                 .expect("get_key/2");
             let (tag, value) = pair(answer);
             assert_eq!(runtime.atom_name_of(tag), Some("ok"));
             assert_eq!(string_of(value), expected, "get_key(kernel, {key})");
+        }
+
+        // `vsn` answers the app file's own version, never a fabricated one: a well-formed
+        // OTP version string, and — when a system `erl` is resolvable — exactly the value
+        // that installation's own `application:get_key(kernel, vsn)` answers. A missing
+        // oracle skips `vsn`'s cross-check **loudly** and lets the rest of this test run.
+        let vsn_key = atom(&mut runtime, "vsn");
+        let answer =
+            call(&mut runtime, "application", "get_key", &[kernel, vsn_key]).expect("get_key/2");
+        let (tag, value) = pair(answer);
+        assert_eq!(runtime.atom_name_of(tag), Some("ok"));
+        let vsn = string_of(value);
+        assert!(
+            well_formed_vsn(&vsn),
+            "get_key(kernel, vsn) = {vsn:?} must be a well-formed OTP version string"
+        );
+        match crate::native::test_support::resolve_oracle() {
+            Some(oracle) => assert_eq!(
+                vsn,
+                oracle_vsn(&oracle, "kernel"),
+                "the runtime's kernel vsn must be the oracle installation's own"
+            ),
+            None => crate::native::test_support::skip_oracle_loudly(
+                "application:get_key(kernel, vsn) cross-check",
+                "the version comparison",
+            ),
         }
 
         // A declared list-of-atoms property: stdlib's `{applications, [kernel]}`.
