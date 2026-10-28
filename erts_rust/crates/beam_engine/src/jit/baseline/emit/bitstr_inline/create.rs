@@ -147,7 +147,8 @@
 //! bit-granular door takes the accumulator as an x-register or `Y`-slot
 //! index, and `jit_write_bit_field` takes the field value the same way plus one flags word
 //! ([`WRITE_ACC_IN_Y`] / [`WRITE_VALUE_IN_Y`]) naming which machine file holds each. The
-//! block's spill before every helper call makes `machine.x` authoritative, and a `Y` slot is
+//! bit-granular route's door spills the block's cached x-registers before its helper call, so
+//! `machine.x` is authoritative when that route's helpers run, and a `Y` slot is
 //! reached through `Machine::y`, so an index is all such a helper needs.
 //! The aligned route's call is the exception the block can afford: it passes the payload base
 //! and the window end it has just loaded from the accumulator's own block, in the ABI's own
@@ -889,7 +890,10 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         match route {
             // Unreachable: a bare build returned above (see the arm above).
             Route::Fresh => return Ok(false),
-            Route::Aligned => emit_aligned_fields(buffer, &prepared, highest_touched)?,
+            Route::Aligned => {
+                emit_aligned_fields(buffer, allocation, &prepared, highest_touched)?
+            }
+
             Route::BitGranular => {
                 emit_bit_fields(
                     buffer,
@@ -909,10 +913,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         // bytes. (The `binary all` route's commit is inside its helper: its advance is the
         // source's run-time width, not a compile-time constant.)
         match source {
-            Loc::X(x) => {
-                buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-                touch(highest_touched, x);
-            }
+            Loc::X(_) => source.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
             Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
         }
         buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
@@ -933,10 +934,7 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
         emit_y_slot_address(buffer, Y_ADDR_SCRATCH, k)?;
     }
     match source {
-        Loc::X(x) => {
-            buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-            touch(highest_touched, x);
-        }
+        Loc::X(_) => source.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
         Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rdx, k)?,
     }
     shape
@@ -949,15 +947,17 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
 /// The **aligned** route's field-write phase: the byte stores at the write cursor the append
 /// door returned in `rax`.
 ///
-/// Every value is re-read after the helper: an x-register from `machine.x` (`rbx` is
-/// callee-saved, and the spill before the call made that array authoritative for a cached
-/// register too), a `Y` slot through its re-derived address — once per field into `rcx`,
-/// since its four-instruction re-derivation should not be paid per byte.
+/// Every value is re-read after the helper: an x-register through [`Loc::load_x`], which reads
+/// a **cached** value out of its callee-saved machine register and an uncached one out of
+/// `machine.x` — the door's helper only reads machine state, so neither representation can be
+/// stale — and a `Y` slot through its re-derived address, once per field into `rcx`, since its
+/// four-instruction re-derivation should not be paid per byte.
 ///
 /// `rax` (the cursor) is never clobbered: `rdx` carries the extracted byte and `rcx` a `Y`
 /// value, and the displacement is `cursor + offset_bits / 8`.
 fn emit_aligned_fields(
     buffer: &mut CodeBuffer,
+    allocation: &Allocation,
     prepared: &[PreparedField<'_>],
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
@@ -976,10 +976,7 @@ fn emit_aligned_fields(
                 // place — never one load per byte (a wider field used to pay `nbytes` loads of
                 // the same word and `nbytes` full-width shifts).
                 match *value {
-                    Loc::X(x) => {
-                        buffer.mov_rm(Reg::Rdx, Reg::Rbx, x_offset(x))?;
-                        touch(highest_touched, x);
-                    }
+                    Loc::X(_) => value.load_x(buffer, allocation, Reg::Rdx, highest_touched)?,
                     Loc::Y(k) => {
                         emit_y_slot_value(buffer, Reg::Rcx, k)?;
                         buffer.mov_rr(Reg::Rdx, Reg::Rcx)?;
@@ -1124,9 +1121,10 @@ fn emit_bit_fields(
 /// the `is_small` refusal is this arm's up-front per-field guard (see
 /// [`super::create_field`]).
 ///
-/// Every value is re-read from the machine after the helper: a cached x-register was
-/// spilled before the call, so `machine.x` (via `rbx`) is authoritative, and a `Y` slot is
-/// reached through its own re-derived address behind the up-front guard.
+/// Every value is re-read from the machine after the helper: this route's door
+/// ([`emit_positioned_helper_call`]) spills the block's cached x-registers before its call, so
+/// `machine.x` (via `rbx`) is authoritative, and a `Y` slot is reached through its own
+/// re-derived address behind the up-front guard.
 fn emit_bit_fields_inline(
     buffer: &mut CodeBuffer,
     source: Loc,

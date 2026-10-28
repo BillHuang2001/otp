@@ -354,6 +354,33 @@ impl Loc {
         highest_touched: &mut Option<u32>,
     ) -> Result<()> {
         match self {
+            Loc::X(_) => self.load_x(buffer, allocation, dst, highest_touched),
+            Loc::Y(k) => emit_guarded_y_load(buffer, dst, end, k, fallback),
+        }
+    }
+
+    /// Read an **x-register** into `dst`, honouring the block's register cache: a cached
+    /// register reads its machine register, an uncached one its `machine.x` slot.
+    ///
+    /// The cache-aware read a lowering uses **after** a helper call. A cached x-register
+    /// lives in a **callee-saved** machine register that always holds the authoritative
+    /// value (an x-register is either always cached or never, and every write stores into
+    /// the cache register, so the two representations cannot disagree), and an uncached
+    /// one is only readable from `machine.x`. A read that must not spill therefore uses
+    /// this door; a read that is allowed to spill keeps [`Loc::load`].
+    ///
+    /// Unlike [`Loc::load`] there is **no** frame-window guard (an x-register has no `Y`
+    /// window) and no `Y` handling: a `Y` slot must go through the guarded
+    /// [`Loc::load`]/[`Loc::guard_load`] pair, so asking for one here is an internal
+    /// mis-call reported as a typed error rather than a silently wrong load.
+    pub(super) fn load_x(
+        self,
+        buffer: &mut CodeBuffer,
+        allocation: &Allocation,
+        dst: Reg,
+        highest_touched: &mut Option<u32>,
+    ) -> Result<()> {
+        match self {
             Loc::X(x) => match allocation.slot(x) {
                 Some(reg) => buffer.mov_rr(dst, reg),
                 None => {
@@ -362,7 +389,9 @@ impl Loc {
                     Ok(())
                 }
             },
-            Loc::Y(k) => emit_guarded_y_load(buffer, dst, end, k, fallback),
+            Loc::Y(_) => Err(crate::error::unsupported(
+                "jit: load_x on a Y slot (use the guarded load)",
+            )),
         }
     }
 

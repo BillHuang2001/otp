@@ -107,9 +107,9 @@ use super::super::{
     HEADER_DISP, NOT_BOXED_MASK, POINTER_MASK, SUB_BITS_END_DISP, SUB_BITS_HEADER,
     SUB_BITS_START_DISP,
 };
-use super::super::super::operands::{x_offset, Loc};
+use super::super::super::operands::Loc;
 use super::super::super::prologue;
-use super::super::super::{spill, touch, Allocation, SpillSite, RUNTIME_SLOT_DISP};
+use super::super::super::{Allocation, RUNTIME_SLOT_DISP};
 
 /// `_TAG_PRIMARY_MASK` — the two-bit primary tag (`beam_term::tag`).
 ///
@@ -181,19 +181,17 @@ pub(super) fn emit_append_cursor(
     fallback: CodeLabel,
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
-    // The cached x-registers go to `machine.x` first: the accumulator load below reads the
-    // block's authoritative view of the term from there, and every post-call re-read of a
-    // field value (the write phase) relies on that store having happened.
-    spill(buffer, allocation, SpillSite::Helper, pc)?;
-
     // (1) The accumulator term. A `Y` slot needs no second frame-window guard: the shape's
     // phase (1b) already proved the slot inside the published window, and nothing between
-    // there and here (a spill, a compare chain) can move the frame.
+    // there and here (a compare chain) can move the frame.
+    //
+    // An x-register accumulator is read through [`Loc::load_x`], so a cached one comes out of
+    // its **callee-saved** machine register rather than requiring a pre-call spill of
+    // `machine.x`. Nothing between this load and the helper call writes that register, and
+    // the helper (`jit_append_cursor`) only reads machine state — it cannot allocate, collect,
+    // park, raise or pre-empt — so no representation of the term can go stale.
     match source {
-        Loc::X(x) => {
-            buffer.mov_rm(Reg::Rax, Reg::Rbx, x_offset(x))?;
-            touch(highest_touched, x);
-        }
+        Loc::X(_) => source.load_x(buffer, allocation, Reg::Rax, highest_touched)?,
         Loc::Y(k) => emit_y_slot_value(buffer, Reg::Rax, k)?,
     }
 
