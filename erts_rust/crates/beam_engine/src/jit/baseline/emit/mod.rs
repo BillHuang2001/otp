@@ -138,6 +138,11 @@ mod liveness;
 mod r#move;
 mod operands;
 mod prologue;
+/// The emitted length of one `emit_publish_y` sequence, measured by the emitter itself —
+/// the derivation a post-publish-alternate pin asserts the offset against instead of a
+/// byte count copied from the encoder's arithmetic.
+#[cfg(test)]
+pub(crate) use prologue::publish_y_len;
 mod regalloc;
 mod regs;
 mod select;

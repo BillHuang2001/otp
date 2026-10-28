@@ -62,18 +62,25 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     // the hot path of every cross-block jump — a `fib`-style loop re-enters the driver
     // once per iteration — so SipHash on a `(u32, u32)` key is a measurable share of the
     // run. Two indexed `Vec` loads replace it.
+    //
+    // Each function's vector is `2 * code.len()` slots: `[0, n)` is the folded
+    // block/sub-block entry table and `[n, 2n)` the **post-publish** alternate entries
+    // ([`super::prologue::emit_block_prologue`]'s answer for a publishing block), so a
+    // continuation-resolution probe reads one vector. See
+    // [`super::super::runtime::EntryTables`].
     let mut entries: Vec<Vec<*const u8>> = module
         .functions
         .iter()
-        .map(|function| vec![std::ptr::null(); function.code.len()])
+        .map(|function| vec![std::ptr::null(); function.code.len() * 2])
         .collect();
     // The eager twin of the lazy layout's `CompiledFunction::sub_entries`: the native
     // entry of the continuation sub-block starting at `[func][pc]`, filled by
-    // [`emit_shared_sub_blocks`] after every IR block (see that function).
+    // [`emit_shared_sub_blocks`] after every IR block (see that function). Doubled like
+    // `entries`, with the second half holding each sub-block's post-publish alternate.
     let mut sub_entries: Vec<Vec<*const u8>> = module
         .functions
         .iter()
-        .map(|function| vec![std::ptr::null(); function.code.len()])
+        .map(|function| vec![std::ptr::null(); function.code.len() * 2])
         .collect();
 
     // Reserve one entry label per non-empty compiled block **before** emitting any
@@ -98,13 +105,18 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 
     let mut summary = Summary::default();
     for func_index in 0..module.functions.len() {
+        let code_len = module.functions[func_index].code.len();
+        let slots = &mut entries[func_index];
+        let (block_entries, rest) = slots.split_at_mut(code_len);
+        let (post_publish, _) = rest.split_at_mut(code_len);
         let func_summary = emit_function(
             &mut buffer,
             module,
             &labels,
             &block_labels,
             func_index as u32,
-            &mut entries[func_index],
+            block_entries,
+            post_publish,
         )?;
         summary.merge(&func_summary);
     }
@@ -116,6 +128,12 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     // remaining instruction of the block. See [`emit_shared_sub_blocks`].
     for func_index in 0..module.functions.len() {
         let function = &module.functions[func_index];
+        let code_len = function.code.len();
+        let slots = &mut sub_entries[func_index];
+        // The same two halves every per-function entry vector carries: `[0, n)` the
+        // sub-block entries, `[n, 2n)` their post-publish alternates.
+        let (sub_block_entries, rest) = slots.split_at_mut(code_len);
+        let (post_publish, _) = rest.split_at_mut(code_len);
         emit_shared_sub_blocks(
             &mut buffer,
             module,
@@ -124,9 +142,14 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
             func_index as u32,
             &function.code,
             &function.blocks,
-            &mut sub_entries[func_index],
+            sub_block_entries,
+            post_publish,
         )?;
     }
+    // One null-fill rule over both halves at once (see [`merge_sub_entries`]): the
+    // vectors are aligned, so a block start's alternate wins over a continuation
+    // sub-block's alternate at the same `pc` exactly as a block start wins over a
+    // sub-block there.
     for func_index in 0..module.functions.len() {
         merge_sub_entries(&mut entries[func_index], &sub_entries[func_index]);
     }
@@ -180,7 +203,12 @@ pub(crate) fn compile_function(
             + sub_blocks_capacity_estimate(&function.code, &function.blocks)
             + DEFAULT_CAPACITY,
     )?;
-    let mut entries: Vec<*const u8> = vec![std::ptr::null(); function.code.len()];
+    // Each entry vector is `2 * code.len()` slots, exactly like the eager layout's
+    // `entries[func]`/`sub_entries[func]` rows: `[0, n)` the entries themselves and
+    // `[n, 2n)` the **post-publish** alternates (see
+    // [`super::super::runtime::EntryTables`]).
+    let code_len = function.code.len();
+    let mut entries: Vec<*const u8> = vec![std::ptr::null(); code_len * 2];
     let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
     for block in &function.blocks {
         let start = block.start;
@@ -190,19 +218,36 @@ pub(crate) fn compile_function(
         }
         block_labels.insert((func, start as u32), buffer.label());
     }
-    let mut summary = emit_function(&mut buffer, module, labels, &block_labels, func, &mut entries)?;
-    let mut sub_entries: Vec<*const u8> = vec![std::ptr::null(); function.code.len()];
-    emit_sub_blocks(
-        &mut buffer,
-        module,
-        labels,
-        &block_labels,
-        func,
-        &function.code,
-        &function.blocks,
-        &mut summary,
-        &mut sub_entries,
-    )?;
+    let mut summary = {
+        let (block_entries, rest) = entries.split_at_mut(code_len);
+        let (post_publish, _) = rest.split_at_mut(code_len);
+        emit_function(
+            &mut buffer,
+            module,
+            labels,
+            &block_labels,
+            func,
+            block_entries,
+            post_publish,
+        )?
+    };
+    let mut sub_entries: Vec<*const u8> = vec![std::ptr::null(); code_len * 2];
+    {
+        let (sub_block_entries, rest) = sub_entries.split_at_mut(code_len);
+        let (post_publish, _) = rest.split_at_mut(code_len);
+        emit_sub_blocks(
+            &mut buffer,
+            module,
+            labels,
+            &block_labels,
+            func,
+            &function.code,
+            &function.blocks,
+            &mut summary,
+            sub_block_entries,
+            post_publish,
+        )?;
+    }
     buffer.seal()?;
     merge_sub_entries(&mut entries, &sub_entries);
     Ok(CompiledFunction {
@@ -222,6 +267,12 @@ pub(crate) fn compile_function(
 /// [`super::runtime::EntryTables::entry`] then needs one bounds check, one load and one
 /// null test instead of up to two of each, and never touches the second table's cache
 /// line. Precedence is unchanged (a block start still wins), so no address moves.
+///
+/// The **one** rule, applied over both halves of the vectors unchanged: `[0, n)` folds
+/// the entries and `[n, 2n)` the post-publish alternates. The two halves are aligned, so
+/// "a block start wins over a continuation sub-block at the same `pc`" holds for the
+/// alternate table too, and a `pc` that is a block start is never a sub-block start
+/// ([`emit_sub_blocks`] skips an address `block_labels` already serves).
 fn merge_sub_entries(entries: &mut [*const u8], sub_entries: &[*const u8]) {
     for (slot, sub) in entries.iter_mut().zip(sub_entries) {
         if slot.is_null() {
@@ -306,6 +357,12 @@ fn sub_blocks_capacity_estimate(code: &[Instr], blocks: &[Block]) -> usize {
 /// Lower a native **sub-block** for every continuation address a frame-preserving call
 /// in `code` stores, filling `sub_entries`.
 ///
+/// `post_publish` is the second half of the same per-function entry vector and receives
+/// each sub-block's **post-publish alternate** exactly as [`emit_function`] does for an
+/// IR block: a continuation sub-block that accesses a `Y` slot opens with the same
+/// publish, so a `deallocate_return` landing in it need not republish the window it has
+/// just derived.
+///
 /// A continuation address `p = pc + 1` of a [`stores_continuation`] call is where the
 /// driver resumes once the callee returns. The loader cuts a function into blocks only at
 /// [`Instr::Label`]s, so `p` usually lies **inside** a block and the driver would
@@ -340,6 +397,7 @@ fn emit_sub_blocks(
     blocks: &[Block],
     summary: &mut Summary,
     sub_entries: &mut [*const u8],
+    post_publish: &mut [*const u8],
 ) -> Result<()> {
     for (pc, instr) in code.iter().enumerate() {
         if !stores_continuation(instr) {
@@ -369,7 +427,7 @@ fn emit_sub_blocks(
             }
         }
         let offset = buffer.len();
-        emit_block(
+        let alternate = emit_block(
             buffer,
             module,
             labels,
@@ -387,12 +445,22 @@ fn emit_sub_blocks(
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
         sub_entries[start] = entry;
+        if let Some(alternate) = alternate {
+            // SAFETY: `alternate` is the offset [`super::prologue::emit_block_prologue`]
+            // reported *inside* the sub-block that was just fully emitted, so
+            // `code_ptr().add(alternate)` names emitted code of the same sealed mapping
+            // (`entry`'s argument applies unchanged).
+            post_publish[start] = unsafe { buffer.code_ptr().add(alternate) };
+        }
     }
     Ok(())
 }
 
 /// Lower the eager layout's **continuation sub-blocks** into `buffer`, filling
 /// `sub_entries` — the eager twin of [`emit_sub_blocks`].
+///
+/// `post_publish` is the second half of the same per-function vector and carries each
+/// sub-block's post-publish alternate, exactly as in the lazy pass.
 ///
 /// The eager layout lowers every function into one shared mapping up front and its driver
 /// entry probes the block table only through `entries` (see
@@ -443,6 +511,7 @@ fn emit_shared_sub_blocks(
     code: &[Instr],
     blocks: &[Block],
     sub_entries: &mut [*const u8],
+    post_publish: &mut [*const u8],
 ) -> Result<()> {
     for (pc, instr) in code.iter().enumerate() {
         if !stores_continuation(instr) {
@@ -472,7 +541,7 @@ fn emit_shared_sub_blocks(
         let allocation = allocate_registers_with_labels(module, labels, code, start, end);
         let mut discard: Option<u32> = None;
         let offset = buffer.len();
-        emit_block(
+        let alternate = emit_block(
             buffer,
             module,
             labels,
@@ -490,6 +559,13 @@ fn emit_shared_sub_blocks(
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
         sub_entries[start] = entry;
+        if let Some(alternate) = alternate {
+            // SAFETY: `alternate` is the offset [`super::prologue::emit_block_prologue`]
+            // reported *inside* the sub-block that was just fully emitted, so
+            // `code_ptr().add(alternate)` names emitted code of the same sealed mapping
+            // (`entry`'s argument applies unchanged).
+            post_publish[start] = unsafe { buffer.code_ptr().add(alternate) };
+        }
     }
     Ok(())
 }
@@ -497,6 +573,14 @@ fn emit_shared_sub_blocks(
 /// Lower every non-empty block of function `func` into `buffer`, binding the
 /// pre-reserved entry label of each and filling `entries[start]` with its native
 /// entry point.
+///
+/// `post_publish[start]` receives the block's **second entry point** when it has one —
+/// [`emit_block`]'s answer, the offset just past the block's Y-window publish
+/// ([`super::prologue::emit_block_prologue`]) — and stays null for a block whose prologue
+/// publishes nothing (only the normal entry serves, and
+/// [`super::super::runtime::EntryTables::post_publish_entry`] falls back to it). The two
+/// slices are the two halves of the caller's per-function entry vector, so a transfer
+/// probe reads them from the same base.
 ///
 /// Returns the function's register/block [`Summary`]. `block_labels` is the block map
 /// a taken branch is resolved against: the **whole-module** map for [`compile_module`]
@@ -511,6 +595,7 @@ fn emit_function(
     block_labels: &BTreeMap<(u32, u32), CodeLabel>,
     func: u32,
     entries: &mut [*const u8],
+    post_publish: &mut [*const u8],
 ) -> Result<Summary> {
     let function = &module.functions[func as usize];
     let code = &function.code;
@@ -536,7 +621,7 @@ fn emit_function(
         // exists: it was reserved for exactly these non-empty blocks.
         buffer.bind(block_labels[&(func, start as u32)])?;
         let offset = buffer.len();
-        emit_block(
+        let alternate = emit_block(
             buffer,
             module,
             labels,
@@ -554,6 +639,14 @@ fn emit_function(
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
         entries[start] = entry;
+        if let Some(alternate) = alternate {
+            // SAFETY: `alternate` is the offset
+            // [`super::prologue::emit_block_prologue`] reported *inside* the block that
+            // was just fully emitted — the byte just past its Y-window publish — so
+            // `code_ptr().add(alternate)` names emitted code of the same sealed mapping
+            // and `entry`'s argument applies unchanged.
+            post_publish[start] = unsafe { buffer.code_ptr().add(alternate) };
+        }
         summary.block_count += 1;
     }
     summary.cached_registers.sort_unstable();

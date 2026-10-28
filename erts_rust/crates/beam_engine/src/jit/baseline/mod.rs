@@ -250,6 +250,9 @@ mod bs_create_bin_tests;
 #[path = "bitstr_shapes_deopt_tests.rs"]
 mod bitstr_shapes_deopt_tests;
 #[cfg(test)]
+#[path = "post_publish_entry_tests.rs"]
+mod post_publish_entry_tests;
+#[cfg(test)]
 #[path = "foreign_kernel_tests.rs"]
 mod foreign_kernel_tests;
 

@@ -114,6 +114,14 @@ struct EagerLayout {
     /// that address compiled no block. A flat index (not a `HashMap`) because the
     /// driver probes it on every cross-block jump.
     ///
+    /// Each row is **two halves of `code.len()` slots**: `[0, n)` the folded entry table
+    /// (block start, else continuation sub-block — see
+    /// [`merge_sub_entries`](super::emit::merge_sub_entries)) and `[n, 2n)` the
+    /// **post-publish** alternates, the block's second entry point just past its Y-window
+    /// publish ([`super::runtime::EntryTables`]). The two halves keep
+    /// [`super::runtime::EntryTables`] at 16 bytes, so the driver's per-iteration
+    /// publication costs nothing extra.
+    ///
     /// A null **sentinel** rather than `Option<*const u8>`: `Option<*const u8>` is 16
     /// bytes on this toolchain (a raw pointer carries no null niche), so the sentinel
     /// halves every table and drops the tag load from the hot probe.
@@ -164,6 +172,12 @@ pub(crate) struct CompiledFunction {
     pub(crate) buffer: CodeBuffer,
     /// The native entry point of the block starting at `pc`, or null (indexed by
     /// `pc`, so the driver's block probe stays two `Vec` loads).
+    ///
+    /// **Two halves of `code.len()` slots**, exactly like the eager layout's rows:
+    /// `[0, n)` the folded entry table (block start, else continuation sub-block — see
+    /// [`merge_sub_entries`](super::emit::merge_sub_entries)) and `[n, 2n)` the
+    /// **post-publish** alternates ([`super::runtime::EntryTables`]), so one vector answers
+    /// both probes.
     pub(crate) entries: Vec<*const u8>,
     /// The native entry point of the **continuation sub-block** starting at `pc`, or
     /// null (indexed by `pc`).
@@ -675,7 +689,12 @@ impl CompiledModule {
             Layout::Eager(eager) => {
                 let mut blocks: Vec<(usize, u32, u32)> = Vec::new();
                 for (func, row) in eager.entries.iter().enumerate() {
-                    for (pc, entry) in row.iter().enumerate() {
+                    // The vector's first half is the folded entry table; its second half
+                    // holds the post-publish alternates, which describe the same blocks (at
+                    // an address strictly inside one), so iterating it would fabricate
+                    // regions for code that is not a block start.
+                    let code_len = row.len() / 2;
+                    for (pc, entry) in row[..code_len].iter().enumerate() {
                         if !entry.is_null() {
                             blocks.push((*entry as usize, func as u32, pc as u32));
                         }
@@ -697,7 +716,10 @@ impl CompiledModule {
                 for (func, slot) in lazy.functions.borrow().iter().enumerate() {
                     let Some(function) = slot else { continue };
                     let mut blocks: Vec<(usize, u32, u32)> = Vec::new();
-                    for (pc, entry) in function.entries.iter().enumerate() {
+                    // First half only: the second holds the post-publish alternates, which
+                    // describe the same blocks (see the eager arm above).
+                    let code_len = function.entries.len() / 2;
+                    for (pc, entry) in function.entries[..code_len].iter().enumerate() {
                         if !entry.is_null() {
                             blocks.push((*entry as usize, func as u32, pc as u32));
                         }

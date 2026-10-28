@@ -1,26 +1,32 @@
 # `emit/prologue` — the compiled-block prologue and the spill/fill discipline
 
 ## Intent
-What every emitted range opens with (`prologue.rs::emit_block_prologue`: the variable-length frame, the `rt` slot, the position store / Y-window publish, the live-in cache load) and the spill/fill traffic every later site follows.
+What every emitted range opens with (`prologue.rs::emit_block_prologue`: the optional Y-window publish, the variable-length frame, the `rt` slot, the unconditional position store, the live-in cache load) and the spill/fill traffic every later site follows.
 The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its measured models) is owned by `../regs/CONTEXT.md`; this node owns the emission sites.
 `rsp` stays 16-byte aligned at every helper call (`frame_slot_len(k)` = `8` when `k = 1 + slots.len()` is even, `16` when odd), and the teardown (`../CONTEXT.md`'s `emit_frame_teardown`) derives the matching `lea rsp,[rsp+frame_slot_len(k)]` from the same `native_frame_regs`.
 
 ## Spill/fill discipline
-- Prologue (`prologue.rs::emit_block_prologue`, emitted first by `block.rs::emit_block`): push the
-  block's own frame register set
+- Prologue (`prologue.rs::emit_block_prologue`, emitted first by `block.rs::emit_block`): a block that
+  publishes its Y window (`Allocation::prologue_publishes_y` over `y_last`/`y_first`/
+  `frame_republish_first`) publishes it **first, before the frame pushes** — `push rdi` (saves `rt` and
+  supplies the 16-byte `rsp` alignment a C-ABI call needs at a block entry, where `rsp ≡ 8 (mod 16)`),
+  three `movabs` (`func`, `pc`, `jit_publish_y`), `call r11`, `pop rdi` (restores `rt`) — 35 B in six
+  instructions for the whole publish.
+  The prologue then pushes the block's own frame register set
   (`native_frame_regs` — `rbx` plus the machine registers the block holds as cache slots),
-  reserve the `frame_slot_len(k)`-byte `rt` slot (`8` when `k = 1 + slots.len()` is even,
-  `16` when odd, so `rsp` stays 16-byte aligned at every helper call), `rbx = rt->x_regs`,
-  then store the block-entry position **inline** (`emit_position_store`:
+  reserves the `frame_slot_len(k)`-byte `rt` slot (`8` when `k = 1 + slots.len()` is even,
+  `16` when odd, so `rsp` stays 16-byte aligned at every helper call), sets `rbx = rt->x_regs`, stores the
+  block-entry position **inline** (`emit_position_store`:
   `mov r10,[rdi+RUNTIME_CURRENT_CODE_DISP]`; `mov r11, movabs pack_current_code(func, block_start_pc)`;
-  `mov [r10], r11` — 24 B, three instructions, no helper call, emitted before the cached loads,
-  which is why nothing a block keeps live can sit in caller-saved scratch here) — or, when the block
-  accesses a `Y` slot **and** its first `Y` access is not preceded by an in-block frame-changing helper
-  (`Allocation::prologue_publishes_y` over `y_last`/`y_first`/`frame_republish_first`),
-  `jit_publish_y(rt, func, pc)`, which does that same position store **and** re-publishes the current
-  frame's Y window in one call — then load each cached register in
+  `mov [r10], r11` — 24 B, three instructions, no helper call, emitted **unconditionally**, publishing
+  block or not, before the cached loads, which is why nothing a block keeps live can sit in caller-saved
+  scratch here), then loads each cached register in
   `Allocation::entry_fill` from `machine.x` (the block's **live-in** slots: a cached register the block
   writes before it reads is not loaded at entry, because that writing instruction sets it).
+  `emit_block_prologue` answers, beside the emitted code, the buffer offset **immediately past the
+  publish's `pop rdi`** — the block's **post-publish alternate entry** — and `None` for a block that
+  publishes nothing; `block.rs::emit_block` threads it out and `compile.rs` stores it in the entry
+  vector's second half (`../../CONTEXT.md`'s *What is keyed by what*).
   The window must be re-derivable from Rust state at every enterable address: a block is entered only at
   its own start (a fresh block entry, or a resume parked on a block entry, which re-executes the
   prefix), an in-block `allocate`/`allocate_heap`/`trim` re-publishes it from
@@ -28,6 +34,22 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   block's first `Y` access is not preceded by such a helper — so a block whose every `Y` access follows
   one pays no prologue publish, while an allocation with no analysis tables publishes (§ the only
   failure direction is a redundant publish).
+  **The alternate entry is the second member of that address set.** `emit_resume_or_exit` reaches it only
+  **after** `emit_frame_teardown`, so `rsp ≡ 8 (mod 16)` and `rdi == rt` — byte-for-byte the state the
+  normal entry has right after its own `pop rdi`; both paths converge at one address, the block's own
+  pushes run exactly once on either path, and `done`'s teardown stays balanced.
+  `jit_deallocate_return` re-publishes the CALLER's window itself (from `frames.last()`, now the caller
+  frame, and a freshly taken `machine.stack.as_mut_ptr()`) straight after a successful
+  `pop_frame_take_continuation`, so entering the alternate repeats no publish; the position the skipped
+  publish would have stored is exactly the word `commit_in_block_entry` already stores
+  (`pack_current_code(func, pc)` ≡ `encode_target(func, pc)`).
+  Nothing else asks for it: `jit_return`, `jit_deallocate`, `jit_allocate` and a linked `call`'s in-block
+  callee entry keep the folded entry and the prologues of non-publishing blocks have no alternate at all.
+  Deopt safety follows from the prologue being straight-line setup with **no** deopt edge, from
+  `Instr::DeallocateReturn` always transferring control and never being re-executed by `jit_step_one`, and
+  from the publish deriving only from post-`pop` machine state and being idempotent — a refused `reduce`
+  charge parks the machine at the target, where the next entry re-publishes, and a publish that already
+  ran is harmless on `Halt`/`ENTER`/declined/refused-charge outcomes.
   `emit_position_store` is the **one** encoder of an instruction position (`pub(super)`, so
   `../family.rs`'s bitstring arm emits the same 24 B for each `Bs*` instruction before its helper call —
   `jit_bitstr` no longer stores the position itself; see `../CONTEXT.md`).

@@ -78,7 +78,9 @@ store a return address into the wrong function's frame and only show up as a cor
   register-file bound) and performs the skipped driver iteration in the driver's own order (position
   store, reductions bump, `ctx.reduce(1)?`), re-publishing the target's `EntryTables` for a
   cross-function transfer. Every decline leaves `resume_entry` null and the helper's word equal
-  to the pre-existing `encode_target(func, pc)`, so the driver serves it exactly as before.
+  to the pre-existing `encode_target(func, pc)`, so the driver serves it exactly as before. This route
+  asks for the folded entry only (`prefer_post_publish = false`); the post-publish alternate is
+  `jit_deallocate_return`'s alone.
 Pinned by `call_tests.rs`'s five transfer tests (see `../CONTEXT.md`).
 
 ### The tail forms (`CallLast`/`CallOnly`): the same compile-time-baked probe
@@ -119,7 +121,8 @@ The per-kind authoritative table is the census in `../../census/CONTEXT.md` (`..
 ## Measured
 
 ### The prologue Y-window publish is suppressed behind an in-block frame helper
-`emit/prologue.rs` emits `jit_publish_y` for a block that accesses a `Y` slot **unless** its first `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s `y_first` vs `frame_republish_first`, read by `Allocation::prologue_publishes_y`) — such a helper re-publishes the window itself on the arm that continues the block in-block, and a block is entered only at its own start, so a resume re-enters at the block entry and re-executes the prefix. The suppressed blocks emit the plain position store instead.
+`emit/prologue.rs` emits `jit_publish_y` for a block that accesses a `Y` slot **unless** its first `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s `y_first` vs `frame_republish_first`, read by `Allocation::prologue_publishes_y`) — such a helper re-publishes the window itself on the arm that continues the block in-block, and a block is entered only at its own start, so a resume re-enters at the block entry and re-executes the prefix.
+The position store is **not** part of what a publish buys: every block prologue emits it unconditionally, and a publishing block's publish runs ahead of the frame pushes as the 35 B `push rdi` / three `movabs` / `call r11` / `pop rdi` sequence.
 The suppression measured **−2.33 %** on `list_walk` and **−0.40 %** on `foreign_cowboy_bstr` retired instructions.
 The figures, the round-by-round ratios and the corpus-wide `y_blocks` / `y_prologue_publishes` split are `../measure/CONTEXT.md`'s; the rule itself is `../prologue/CONTEXT.md`'s.
 
@@ -134,10 +137,11 @@ rest of the block one interpreter-step-per-instruction. **Both** layouts lower o
 address, through the same `emit_block` an IR block uses (identical shape rules, guards and deopts):
 
 - **Lazy** — `compile_function` lowers the IR blocks with `emit_function`, then the sub-blocks with
-  `emit_sub_blocks`, recording each native entry in `CompiledFunction::sub_entries[p]`.
+  `emit_sub_blocks` into `CompiledFunction`'s sub-block vector, and folds them into the block-start table
+  with `merge_sub_entries`.
 - **Eager** — `compile_module` lowers every IR block, then calls `emit_shared_sub_blocks` **after every**
   IR block (so the block regions stay contiguous at the front of the shared mapping) and **before**
-  `seal`, recording each entry in `EagerLayout::sub_entries`.
+  `seal`, writing `EagerLayout::sub_entries[func]` and folding it into `entries[func]` the same way.
 
 For each `p` that lies strictly inside an IR block (`b.start < p < b.end`, `p < code.len()`) and is not
 already a compiled block start, the pass lowers `[p, sub_block_end(code, b, p))`, where `sub_block_end`
@@ -154,9 +158,14 @@ continue that the shared `done` epilogue turns into an `encode_target(func, p_{i
 already at a block start, or at/past the end of the function, needs no sub-block.
 
 Sub-blocks are emitted after all IR blocks, so the block-entry table and the `code_map` regions keep
-describing IR blocks only; they reserve no entry label (nothing branches to a continuation address), they
-start with a full block prologue, and they are not counted as blocks. `entries` is probed **first** and
-`sub_entries` second, so a real block start always wins. **Each pass allocates for the range it emits** —
+describing IR blocks only (`code_map` walks `entries[..n]`); they reserve no entry label (nothing branches
+to a continuation address), they start with a full block prologue, and they are not counted as blocks.
+Each function's entry vector is `2 * code.len()` slots in two aligned halves: `[0,n)` is the entry that
+address serves — an IR block start, else the continuation sub-block at that pc — and `[n,2n)` the
+post-publish alternates (null meaning "the normal entry serves"). `merge_sub_entries` applies one
+null-fill rule over both halves (a block start wins over a continuation sub-block at the same pc), so a
+real block start still always wins. The artifact probe still consults `entries` first and the raw
+`sub_entries` second, which the fold has made redundant at a continuation pc. **Each pass allocates for the range it emits** —
 `emit_sub_blocks` folds its sub-block touches into the per-function `Summary` as a superset while
 `emit_shared_sub_blocks` derives the same `allocate_registers_with_labels(module, labels, code, start, end)`
 and discards its touches, so the eager whole-module `Summary` stays exactly the IR blocks'. A sub-block is a fresh native

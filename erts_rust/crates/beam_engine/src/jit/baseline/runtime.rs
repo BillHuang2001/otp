@@ -331,14 +331,30 @@ pub(crate) struct JitRuntime<'a> {
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
 /// **return** can resolve its own continuation without leaving the block.
 ///
-/// The two tables are the artifact's own per-function entry vectors
-/// ([`CompiledFunction::entries`]/[`CompiledFunction::sub_entries`] for the lazy layout,
-/// the `[func]` slices of `EagerLayout::entries`/`sub_entries` for the eager one), read
-/// through raw pointers: a compiled function's entry vectors are built once, before its
-/// buffer is sealed, and are never mutated afterwards, and the artifact that owns them
-/// outlives every run (the driver holds the artifact, and the lazy layout's `RefCell` slot
-/// keeps its own `Rc`), so the pointers stay valid for as long as the driver can consult
-/// them.
+/// The tables are the artifact's own per-function entry vectors
+/// ([`CompiledFunction::entries`] for the lazy layout, the `[func]` slice of
+/// `EagerLayout::entries` for the eager one), read through raw pointers: a compiled
+/// function's entry vectors are built once, before its buffer is sealed, and are never
+/// mutated afterwards, and the artifact that owns them outlives every run (the driver
+/// holds the artifact, and the lazy layout's `RefCell` slot keeps its own `Rc`), so the
+/// pointers stay valid for as long as the driver can consult them.
+///
+/// # The two halves
+///
+/// One vector carries **two** tables of `entries_len` slots each, so that a continuation
+/// resolution reads one base with one bound:
+///
+/// * `[0, n)` — the **folded entry table**: `entries[pc]` is the block's native entry, or
+///   the continuation sub-block's entry where the block start left a null
+///   (`emit::compile::merge_sub_entries`), which is what [`EntryTables::entry`] answers;
+/// * `[n, 2n)` — the **post-publish alternates**: the block's second entry point, just
+///   past its Y-window publish, which [`EntryTables::post_publish_entry`] answers for a
+///   caller that has already republished the window itself (a `deallocate_return`'s
+///   continuation).
+///
+/// A null slot is the "this address compiled no such entry" **sentinel** rather than
+/// `Option<*const u8>` (16 bytes on this toolchain — a raw pointer carries no null
+/// niche), so the table is half the width and a probe pays no tag load.
 ///
 /// [`CompiledFunction::entries`]: super::code::CompiledFunction
 #[derive(Clone, Copy)]
@@ -346,14 +362,17 @@ pub(crate) struct EntryTables {
     /// The function these tables belong to — a continuation in **another** function is a
     /// different mapping, which only the driver may switch to.
     pub(crate) func: u32,
-    /// `entries[pc]`: the block's native entry, or null for an address this function
-    /// compiled no block start for.
+    /// The base of the function's entry vector: `entries[pc]` is the block's native entry
+    /// (or its continuation sub-block's) and `entries[entries_len + pc]` its post-publish
+    /// alternate.
     ///
     /// A null **sentinel** rather than `Option<*const u8>` (16 bytes on this toolchain —
     /// a raw pointer carries no null niche), so the table is half the width and the probe
     /// pays no tag load.
     pub(crate) entries: *const *const u8,
-    /// The number of slots in `entries` (the function's code length).
+    /// The number of slots in **each half** of `entries` (the function's code length), so
+    /// [`EntryTables::entry`]'s bound is the same one the pre-split table had and
+    /// [`EntryTables::post_publish_entry`] reuses it as its offset.
     pub(crate) entries_len: usize,
 }
 
@@ -378,15 +397,22 @@ impl EntryTables {
     ///
     /// [`CompiledModule::entry_tables`]: super::code::CompiledModule::entry_tables
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
-    /// `entries` must be the function's **already folded** table: the compiler fills each
-    /// block start's slot and, wherever it left a null, the continuation sub-block's entry
-    /// (`emit::compile::merge_sub_entries`). One slot therefore answers both shapes a
-    /// transfer can name, and a null slot means that address compiled no entry at all.
+    /// `entries` must be the function's **doubled** entry vector: its first half is the
+    /// **already folded** entry table — the compiler fills each block start's slot and,
+    /// wherever it left a null, the continuation sub-block's entry
+    /// (`emit::compile::merge_sub_entries`) — and its second half the post-publish
+    /// alternates, folded by the same rule. One slot therefore answers both shapes a
+    /// transfer can name, a null slot means that address compiled no entry at all, and
+    /// `entries_len` is the **code length**, i.e. the length of one half.
     pub(crate) fn of(func: u32, entries: &[*const u8]) -> EntryTables {
+        debug_assert!(
+            entries.len() % 2 == 0,
+            "a per-function entry vector is two halves of equal length (entries + alternates)"
+        );
         EntryTables {
             func,
             entries: entries.as_ptr(),
-            entries_len: entries.len(),
+            entries_len: entries.len() / 2,
         }
     }
     /// The native entry for `(func, pc)` in these tables — a real block start first, then a
@@ -403,10 +429,50 @@ impl EntryTables {
         if pc >= self.entries_len {
             return None;
         }
-        // SAFETY: `entries` points at the `entries_len`-slot folded entry vector of the
+        // SAFETY: `entries` points at the `2 * entries_len`-slot folded entry vector of the
         // compiled function this table was published for (see the struct docs), and `pc`
-        // is in bounds of it. A slot is null when that address compiled no entry.
+        // is in bounds of its first half. A slot is null when that address compiled no
+        // entry.
         let entry = unsafe { *self.entries.add(pc) };
+        if entry.is_null() {
+            None
+        } else {
+            Some(entry)
+        }
+    }
+
+    /// The **post-publish alternate** entry for `(func, pc)`, or `None` when that address
+    /// compiled none.
+    ///
+    /// The block's second entry point: the address just past its [`jit_publish_y`] call,
+    /// where `rdi` again holds `rt` and `rsp` is again `≡ 8 (mod 16)` — byte for byte the
+    /// state the normal entry has right after its own publish. Entering there **skips only
+    /// the publish**, so every push the prologue emits still runs exactly once and the
+    /// shared `done` epilogue's teardown stays balanced.
+    ///
+    /// Only a caller that has just published the target frame's window itself may use it —
+    /// [`jit_deallocate_return`], which pops the frame and then `refresh_y_base`s the
+    /// caller's window before committing the transfer. Every other transfer takes
+    /// [`EntryTables::entry`]; a null slot here therefore only costs a redundant publish,
+    /// and the caller falls back to the folded entry.
+    ///
+    /// The guards and the null sentinel are [`EntryTables::entry`]'s, with the second
+    /// half's base offset by `entries_len` (so both halves share one bound check).
+    pub(crate) fn post_publish_entry(&self, func: u32, pc: u32) -> Option<*const u8> {
+        if func != self.func {
+            return None;
+        }
+        let pc = pc as usize;
+        if pc >= self.entries_len {
+            return None;
+        }
+        // SAFETY: `entries` points at the `2 * entries_len`-slot folded entry vector of the
+        // compiled function this table was published for (see the struct docs), and
+        // `entries_len + pc` is in bounds of its second half for the `pc` bound-checked
+        // above. A slot is null when that address compiled no alternate entry.
+        let entry = unsafe { *self.entries.add(self.entries_len + pc) };
+        #[cfg(test)]
+        super::counters::record_post_publish_probe(!entry.is_null());
         if entry.is_null() {
             None
         } else {
@@ -2144,11 +2210,19 @@ fn report_frame_error(
 /// publishes its **target** (via [`commit_in_block_entry`]) and a decline is republished by
 /// the driver's own loop-head decode. The one shape no other store covers is a `Halt`, which
 /// ends the run, and [`halt_word`] publishes it there.
+///
+/// `prefer_post_publish` asks the transfer to enter the target block at its **post-publish
+/// alternate** entry ([`EntryTables::post_publish_entry`]) when it compiled one, instead of
+/// its normal entry. Only [`jit_deallocate_return`] passes `true`, and only because it has
+/// just republished the target frame's Y window itself ([`JitRuntime::refresh_y_base`]): the
+/// alternate skips the target's own publish, which would derive the identical window.
+/// Everywhere else the flag is `false` and the resolution is byte-for-byte what it was.
 fn return_word(
     runtime: &mut JitRuntime<'_>,
     continuation: Continuation,
     func: u32,
     pc: u32,
+    prefer_post_publish: bool,
 ) -> i64 {
     // Cleared on **every** call, so the emitted arm can never observe a stale entry from an
     // earlier return (the two arms read exactly the value their own helper wrote).
@@ -2171,7 +2245,7 @@ fn return_word(
             // (see [`enter_in_block`]): both are "continue the driver's loop at `(func, pc)`
             // without going back to the driver", so they must never diverge. The clear above
             // is this path's, so it takes the twin that does not repeat it.
-            enter_in_block_cleared(runtime, func, pc)
+            enter_in_block_cleared(runtime, func, pc, prefer_post_publish)
         }
     }
 }
@@ -2233,7 +2307,7 @@ fn halt_word(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
 #[inline]
 pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     runtime.resume_entry = std::ptr::null();
-    enter_in_block_cleared(runtime, func, pc)
+    enter_in_block_cleared(runtime, func, pc, false)
 }
 /// [`enter_in_block`] for a caller that has **already** cleared
 /// [`JitRuntime::resume_entry`] in its own first instructions — the `return` half
@@ -2243,23 +2317,41 @@ pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -
 /// The clear is one store and sits on the per-transfer path, so the two callers that
 /// need it (`return_word` above, a linked `call` in [`super::call`]) share this body with
 /// the clear hoisted to the one that does not already have it.
+///
+/// `prefer_post_publish` is [`return_word`]'s: when set, a same-function target the
+/// published tables describe by an **alternate** entry is entered there, so the publish the
+/// caller has just made ([`JitRuntime::refresh_y_base`]) is not repeated by the target's own
+/// prologue. A null alternate — or the flag being clear, which is every other caller — keeps
+/// the folded entry byte-for-byte.
 #[inline]
-fn enter_in_block_cleared(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+fn enter_in_block_cleared(
+    runtime: &mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    prefer_post_publish: bool,
+) -> i64 {
     let word = encode_target(func, pc);
     match runtime.tables.entry(func, pc) {
         // The same-function shape: the published tables already describe this function, so
         // there is nothing to re-publish and no artifact to ask.
-        Some(entry) => match commit_in_block_entry(runtime, word) {
-            Ok(()) => {
-                runtime.resume_entry = entry;
-                word
+        Some(entry) => {
+            let entry = if prefer_post_publish {
+                runtime.tables.post_publish_entry(func, pc).unwrap_or(entry)
+            } else {
+                entry
+            };
+            match commit_in_block_entry(runtime, word) {
+                Ok(()) => {
+                    runtime.resume_entry = entry;
+                    word
+                }
+                Err(err) => {
+                    runtime.error = Some(err);
+                    ERROR
+                }
             }
-            Err(err) => {
-                runtime.error = Some(err);
-                ERROR
-            }
-        },
-        None => cross_function_enter(runtime, func, pc, word),
+        }
+        None => cross_function_enter(runtime, func, pc, word, prefer_post_publish),
     }
 }
 
@@ -2325,8 +2417,14 @@ fn commit_in_block_entry(
 /// arm tail-jumps to.
 #[cold]
 #[inline(never)]
-fn cross_function_enter(runtime: &mut JitRuntime<'_>, func: u32, pc: u32, word: i64) -> i64 {
-    let Some((entry, tables)) = cross_function_entry(runtime, func, pc) else {
+fn cross_function_enter(
+    runtime: &mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    word: i64,
+    prefer_post_publish: bool,
+) -> i64 {
+    let Some((entry, tables)) = cross_function_entry(runtime, func, pc, prefer_post_publish) else {
         return word;
     };
     match commit_in_block_entry(runtime, word) {
@@ -2371,6 +2469,7 @@ fn cross_function_entry(
     runtime: &JitRuntime<'_>,
     func: u32,
     pc: u32,
+    prefer_post_publish: bool,
 ) -> Option<(*const u8, Option<EntryTables>)> {
     let compiled = runtime.compiled;
     if compiled.is_null() {
@@ -2400,6 +2499,15 @@ fn cross_function_entry(
             return None;
         }
     }
+    // The alternate entry the target's own tables carry (`tables` is that function's), so a
+    // `deallocate_return` that has already republished the window lands past the publish
+    // instead of repeating it. `entry` stays the answer whenever no alternate compiled, and
+    // for every caller that did not ask (`prefer_post_publish == false`).
+    let entry = if prefer_post_publish {
+        tables.post_publish_entry(func, pc).unwrap_or(entry)
+    } else {
+        entry
+    };
     // The artifact's x write extent may have just grown: `native_entry_tables` compiles the
     // target function on first sight, and the extent the driver declared at this block's entry
     // predates that. Re-declare it before the jump (see `note_native_write_extent`).
@@ -2509,7 +2617,9 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         machine.take_continuation()
     };
     match continuation {
-        Ok(continuation) => return_word(runtime, continuation, func, pc),
+        // `false`: a bare `return` pops nothing, so the frame — and the Y window its block's
+        // prologue published — is unchanged, and the target may need its own publish.
+        Ok(continuation) => return_word(runtime, continuation, func, pc, false),
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -2536,6 +2646,26 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
 /// Like [`jit_return`] it always transfers control, so the caller leaves the block
 /// with the helper's word in `rax` — or tail-jumps to the same-function block entry
 /// [`return_word`] resolved.
+///
+/// # The pop's own publish, and the post-publish entry
+///
+/// The pop is a frame change: `machine.stack` was truncated and the top frame is now the
+/// **caller's**, so the window the returning block's prologue published is stale. This
+/// helper therefore calls [`JitRuntime::refresh_y_base`] — the same derive-from-`Machine`
+/// body [`jit_publish_y`] runs — on the success arm, **before** [`return_word`] commits the
+/// transfer, and then asks the transfer to enter the target at its post-publish alternate
+/// ([`EntryTables::post_publish_entry`]) when it compiled one. That is the whole point of the
+/// hoisted prologue publish: a `deallocate_return` into a Y-accessing continuation sub-block
+/// pays **one** helper call instead of two.
+///
+/// Publishing here is strictly fresher than the returning block's window and is harmless on
+/// every other outcome: a `Halt` ends the run (no block reads a window afterwards), an `ENTER`
+/// hands the driver a module-context switch under the same frames (the window is a property of
+/// the frame, not the context), a declined transfer is re-entered by the driver through the
+/// target's own prologue (which publishes again), and a refused pre-emption charge parks the
+/// machine at the target with a window the next entry re-derives. The publish is idempotent —
+/// it derives from post-pop `Machine` state alone — so a re-entry can never observe a stale
+/// one.
 pub(crate) extern "C" fn jit_deallocate_return(
     rt: *mut JitRuntime<'_>,
     func: u32,
@@ -2553,7 +2683,12 @@ pub(crate) extern "C" fn jit_deallocate_return(
         machine.pop_frame_take_continuation(deallocate)
     };
     match outcome {
-        Ok(continuation) => return_word(runtime, continuation, func, pc),
+        Ok(continuation) => {
+            // The caller's frame is the machine's top frame now, and the continuation runs in
+            // it: publish its window before the transfer commits (see the docs above).
+            runtime.refresh_y_base();
+            return_word(runtime, continuation, func, pc, true)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
