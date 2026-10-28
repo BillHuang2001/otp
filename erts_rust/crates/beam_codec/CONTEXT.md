@@ -215,7 +215,7 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
   the oracle boundary, since map key order and the `FLOAT_EXT`→`NEW_FLOAT_EXT` rewrite are not
   byte-canonical.
 - **Codec cost is pinned deterministically, not by wall clock.** `tests/alloc_count.rs` asserts the exact allocation counts for the bench payload; `examples/etf_attrib.rs` prints timings for a human only.
-  The codec is ≈ 28 % of the `etf_roundtrip` op; `ETF_COST.md` decomposes the rest.
+  `ETF_COST.md`'s pre-optimization split (encode 390 / decode 798 / compare 258 ns) is superseded by the per-op budget in §Known Issues; its compare figure in particular does not reproduce at HEAD.
   The warm decode's **3** allocations are exactly its three container `Vec`s — the tuple's `elems` (`src/decode/mod.rs:709`), the map's `pairs` (`:758`) and `write_map`'s `pairs.to_vec()` sort buffer (`../beam_term/src/map.rs:389`) — so a stack buffer for a small container plus an in-place sort would take a warm decode to 0.
 - **Encode classifies by a linear predicate chain, not by tag.** `Encoder::encode` probes `is_small`/`is_atom`/`is_nil`/`is_list`/`fun_kind_term`/`is_record`/`big_parts`/`float_value`/`tuple_arity`/`flatmap_parts`/`map_pairs_storage_order`/`external_*_parts`/`bitstring_bytes` in order (`src/encode/mod.rs:505-596`), so a binary element pays ~15 failed probes where C's `switch (tag_val_def(obj))` (`../../../erts/emulator/beam/external.c:3533`) pays one.
   A tag-first dispatch is additive: `beam_term::tag::primary_tag` (`../beam_term/src/tag.rs:264`) plus `boxed::header_subtag` (`../beam_term/src/boxed.rs:115`) and `BoxedTag::from_raw` (`../beam_term/src/tag.rs:235`) already exist, so no term-layout knowledge moves into this crate.
