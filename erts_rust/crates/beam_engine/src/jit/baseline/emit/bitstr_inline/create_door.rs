@@ -108,7 +108,6 @@ use super::super::{
     SUB_BITS_START_DISP,
 };
 use super::super::super::operands::Loc;
-use super::super::super::prologue;
 use super::super::super::{Allocation, RUNTIME_SLOT_DISP};
 
 /// `_TAG_PRIMARY_MASK` — the two-bit primary tag (`beam_term::tag`).
@@ -173,14 +172,15 @@ const BITS_PER_BYTE: i32 = 8;
 /// to `fallback` with nothing written. The `test rax, rax ; je fallback` pair is this
 /// function's own last two instructions, so the caller must not emit a second one.
 ///
+/// Takes no `(func, pc)`: the door publishes **no** position (see the module docs), so it has
+/// nothing to name and the block prologue's own publication stands.
+///
 /// See the module docs for the proof sequence, the register contract and the frozen layouts.
 pub(super) fn emit_append_cursor(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     source: Loc,
     tail_bits: u32,
-    func: u32,
-    pc: u32,
     fallback: CodeLabel,
     highest_touched: &mut Option<u32>,
 ) -> Result<()> {
@@ -260,12 +260,16 @@ pub(super) fn emit_append_cursor(
     buffer.test_ri(Reg::Rdx, BITS_PER_BYTE - 1)?;
     buffer.jcc(Cond::Ne, fallback)?;
 
-    // (7) The one remaining call: the machine's capacity lookup and the room rule. The
-    // position is published **before** it runs, exactly as `emit_positioned_helper_call`
-    // does, and the arguments are already in their ABI registers (`rdi` = `rt`, `rsi` = base,
-    // `rdx` = end, `rcx` = tail width), so no caller-saved register carries anything across.
+    // (7) The one remaining call: the machine's capacity lookup and the room rule. No
+    // position store precedes it, and none is needed (see the module docs): the block
+    // prologue already published this block's entry — a valid resume point whose
+    // re-execution re-runs the block prefix — and `jit_append_cursor` cannot raise, park,
+    // pre-empt, allocate or collect, so nothing between it and the next publishing point
+    // (the `fallback` arm's `jit_step_one`, a block exit, a native transfer) can observe
+    // `Machine::current_code` naming this instruction. The arguments are already in their
+    // ABI registers (`rdi` = `rt`, `rsi` = base, `rdx` = end, `rcx` = tail width), so no
+    // caller-saved register carries anything across and nothing is kept live.
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-    prologue::emit_position_store(buffer, func, pc)?;
     buffer.mov_ri(Reg::Rcx, i64::from(tail_bits))?;
     buffer.mov_ri(Reg::R11, jit_append_cursor as *const () as i64)?;
     buffer.call_r(Reg::R11)?;

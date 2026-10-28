@@ -864,8 +864,6 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_create_bin(
                 allocation,
                 source,
                 shape.tail_bits,
-                func,
-                pc,
                 fallback,
                 highest_touched,
             )?,
