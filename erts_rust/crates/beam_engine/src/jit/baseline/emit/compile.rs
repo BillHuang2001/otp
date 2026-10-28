@@ -62,18 +62,25 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     // the hot path of every cross-block jump — a `fib`-style loop re-enters the driver
     // once per iteration — so SipHash on a `(u32, u32)` key is a measurable share of the
     // run. Two indexed `Vec` loads replace it.
+    //
+    // Each function's vector is `2 * code.len()` slots: `[0, n)` is the folded
+    // block/sub-block entry table and `[n, 2n)` the **post-publish** alternate entries
+    // ([`super::prologue::emit_block_prologue`]'s answer for a publishing block), so a
+    // continuation-resolution probe reads one vector. See
+    // [`super::super::runtime::EntryTables`].
     let mut entries: Vec<Vec<*const u8>> = module
         .functions
         .iter()
-        .map(|function| vec![std::ptr::null(); function.code.len()])
+        .map(|function| vec![std::ptr::null(); function.code.len() * 2])
         .collect();
     // The eager twin of the lazy layout's `CompiledFunction::sub_entries`: the native
     // entry of the continuation sub-block starting at `[func][pc]`, filled by
-    // [`emit_shared_sub_blocks`] after every IR block (see that function).
+    // [`emit_shared_sub_blocks`] after every IR block (see that function). Doubled like
+    // `entries`, with the second half holding each sub-block's post-publish alternate.
     let mut sub_entries: Vec<Vec<*const u8>> = module
         .functions
         .iter()
-        .map(|function| vec![std::ptr::null(); function.code.len()])
+        .map(|function| vec![std::ptr::null(); function.code.len() * 2])
         .collect();
 
     // Reserve one entry label per non-empty compiled block **before** emitting any
@@ -98,13 +105,18 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 
     let mut summary = Summary::default();
     for func_index in 0..module.functions.len() {
+        let code_len = module.functions[func_index].code.len();
+        let slots = &mut entries[func_index];
+        let (block_entries, rest) = slots.split_at_mut(code_len);
+        let (post_publish, _) = rest.split_at_mut(code_len);
         let func_summary = emit_function(
             &mut buffer,
             module,
             &labels,
             &block_labels,
             func_index as u32,
-            &mut entries[func_index],
+            block_entries,
+            post_publish,
         )?;
         summary.merge(&func_summary);
     }

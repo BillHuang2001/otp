@@ -146,6 +146,12 @@ fn try_inline_init_yregs(
 /// `highest_touched` accumulates the highest x-register index the emitted code
 /// touches natively (a cached load/store, or a direct `machine.x` access); the
 /// driver refuses native entry to a machine whose register file does not cover it.
+///
+/// The answer is the block's **post-publish entry offset** when it has one — a
+/// publishing prologue's second entry point, just past the Y-window publish, which
+/// `jit_deallocate_return` answers so a returning `deallocate_return` does not pay a
+/// second publish for the continuation sub-block it lands in. `None` means the block
+/// publishes nothing and only its normal entry serves.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_block(
     buffer: &mut CodeBuffer,
@@ -158,11 +164,12 @@ pub(crate) fn emit_block(
     end: usize,
     allocation: &Allocation,
     highest_touched: &mut Option<u32>,
-) -> Result<()> {
+) -> Result<Option<usize>> {
     // --- prologue -----------------------------------------------------------
     #[cfg(test)]
     let block_start_bytes = buffer.len();
-    emit_block_prologue(buffer, allocation, highest_touched, func, start)?;
+    let post_publish_entry =
+        emit_block_prologue(buffer, allocation, highest_touched, func, start)?;
 
     let done: CodeLabel = buffer.label();
     // The direct block-to-block linker: a taken branch to a compiled successor's
@@ -1414,7 +1421,7 @@ pub(crate) fn emit_block(
         allocation,
         (buffer.len() - block_start_bytes) as u64,
     );
-    Ok(())
+    Ok(post_publish_entry)
 }
 
 /// [`emit_step_and_continue`] plus the **static-census** deopt attribution: the whole
