@@ -57,6 +57,10 @@ This is the frozen public-API shape dependents design against; keep it stable.
 - `beam_codec` → `Encoder`/`Decoder` (ETF), tag constants, `VERSION_MAGIC = 131`, compression.
 - `beam_loader` → the **typed block-structured IR** (`Module`, `Function`, `Block`, ops with
   safepoints/failure/branch/catch/line info) that `beam_engine` consumes — see `../CONTEXT.md` §4.
+  A loaded image also owns its **label/import index**: `Module::label_map() -> Arc<LabelMap>` over one
+  `SharedLabelMap(OnceLock<Arc<LabelMap>>)` slot on the image (`src/labels.rs`), so every machine and every JIT
+  artifact running that image shares one map — build it once per image, never per machine; `Machine::label_map`
+  is the engine's only wrapper of that door.
 - `beam_engine` → the execution loop + an **`ExecutionContext` trait** (BIF dispatch, term alloc,
   process/stack state, trap/signal handling) plus a **`Mailbox` trait** — the receive/message seam
   (`send_message`/`receive_next`/`receive_skip`/`receive_remove`/`receive_reset`/`receive_marker_*`,
