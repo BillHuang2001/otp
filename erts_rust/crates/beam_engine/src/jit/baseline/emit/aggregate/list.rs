@@ -54,12 +54,13 @@ use super::super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATC
 //   of `machine.x`, and a `Y` slot is addressed through the guarded frame window —
 //   both refused kinds deopt, so the interpreter step reports the faithful error;
 // * the guard is `is_list` itself, the C bit trick
-//   `(word & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0`: the emitted `and`
-//   leaves `0` for a cons cell (primary tag `LIST`) and the mask itself for
-//   everything else — `NIL`, a small int, an atom, a boxed term (`[]`, `1`,
-//   `foo`, a tuple, …) — so the comparison against the mask is exactly
-//   "not a cons cell" and branches to the helper, whose interpreter step raises
-//   the exact `{badmatch, Source}`;
+//   `(word & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0`: the mask's bit is
+//   clear for a cons cell (primary tag `LIST`) and set for everything else —
+//   `NIL`, a small int, an atom, a boxed term (`[]`, `1`, `foo`, a tuple, …) —
+//   so a `test` of that one bit (`beam_term::list::is_not_list`, which `test`
+//   evaluates without consuming the word) is exactly "not a cons cell" and
+//   branches to the helper, whose interpreter step raises the exact
+//   `{badmatch, Source}`;
 // * on success the cell's address is `list_val(word)` (`word & !TAG_PTR_MASK`),
 //   the CAR is the word at offset 0 and the CDR the word at the cons cell's
 //   second word (`beam_term::{CAR_OFFSET, CDR_OFFSET}`).
@@ -79,8 +80,21 @@ use super::super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATC
 /// `is_not_list` bit trick (`beam_term::list::is_not_list`), which is `0x2`.
 const NOT_LIST_MASK: i64 = (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST) as i64;
 
+/// [`NOT_LIST_MASK`] as the `imm32` of [`CodeBuffer::test_ri`].
+///
+/// `test r64, imm32` sign-extends its immediate, so the constant must survive the
+/// `i64` -> `i32` narrowing unchanged — asserted at compile time, exactly as the
+/// bitstring construction door does for its own masks.
+const NOT_LIST_MASK_I32: i32 = NOT_LIST_MASK as i32;
+const _: () = assert!(NOT_LIST_MASK == NOT_LIST_MASK_I32 as i64);
+
 /// `!TAG_PTR_MASK` as an `i64` — the mask `list_val` clears the pointer tag with.
 pub(crate) const POINTER_MASK: i64 = !(TAG_PTR_MASK as i64);
+
+/// [`POINTER_MASK`] as the `imm32` of [`CodeBuffer::and_ri`] (`-8`, which the
+/// encoder's sign-extending `81 /4 id` form widens back to `!0x7`).
+const POINTER_MASK_I32: i32 = POINTER_MASK as i32;
+const _: () = assert!(POINTER_MASK == POINTER_MASK_I32 as i64);
 
 /// The byte offset of the CAR (head) word inside a cons cell.
 const CAR_DISP: i32 = (size_of::<Eterm>() * CAR_OFFSET) as i32;
@@ -261,13 +275,10 @@ pub(crate) fn try_inline_get_tl(
 /// ```text
 ///   mov  r11, <source>      ; the source word: a cached register, `[rbx + x*8]`,
 ///                           ;   or a guarded Y read (r10 = the window bound)
-///   mov  r10, NOT_LIST_MASK ; the `is_not_list` bit
-///   and  r11, r10
-///   cmp  r11, r10           ; the masked word is 0 (a cons cell) or the mask itself
-///   je   fallback           ; not a cons cell: the helper raises `{badmatch,Source}`
-///   mov  r11, <source>      ; reload (the mask consumed the word)
-///   mov  r10, POINTER_MASK
-///   and  r11, r10           ; r11 = the cons cell's address, `list_val(word)`
+///   test r11, NOT_LIST_MASK ; the `is_not_list` bit: `(word & 0x2) != 0` — `test`
+///                           ;   leaves r11 intact, so the word is not reloaded
+///   jne  fallback           ; not a cons cell: the helper raises `{badmatch,Source}`
+///   and  r11, POINTER_MASK  ; r11 = the cons cell's address, `list_val(word)`
 ///   <guard phase>           ; each Y destination's window guard, leaving its slot
 ///                           ;   address in r9 / r8 — BEFORE any store, so a
 ///                           ;   rejection leaves no destination half-written
@@ -305,21 +316,19 @@ fn emit_list_read(
 
     // The guard: `is_not_list(source)` — a non-cons source (`[]`, a small int, an
     // atom, a tuple) branches to the helper, which raises `{badmatch, Source}`.
+    //
+    // Five instructions: `test` sets ZF from `word & NOT_LIST_MASK` without writing
+    // its operand (the same bits the `and`/`cmp` pair compared), and the untag then
+    // reuses the loaded word via `and_ri` — so neither the reload of the source nor
+    // either ten-byte `movabs` constant is needed.
     shape
         .source
         .load(buffer, allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, fallback, highest_touched)?;
-    buffer.mov_ri(MOVE_SCRATCH_2, NOT_LIST_MASK)?;
-    buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
-    buffer.cmp_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
-    buffer.jcc(Cond::E, fallback)?;
+    buffer.test_ri(MOVE_SCRATCH, NOT_LIST_MASK_I32)?;
+    buffer.jcc(Cond::Ne, fallback)?;
 
-    // The cell's address: reload the source word (the mask above consumed it) and
-    // clear the pointer tag — `list_val(word)`.
-    shape
-        .source
-        .load(buffer, allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, fallback, highest_touched)?;
-    buffer.mov_ri(MOVE_SCRATCH_2, POINTER_MASK)?;
-    buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
+    // The cell's address: clear the pointer tag — `list_val(word)`.
+    buffer.and_ri(MOVE_SCRATCH, POINTER_MASK_I32)?;
 
     // The **guard phase**: every `Y` destination's frame-window guard, leaving the slot
     // address in its own scratch. All of them run before the first store, so a rejection
