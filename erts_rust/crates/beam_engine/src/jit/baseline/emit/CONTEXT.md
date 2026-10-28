@@ -8,7 +8,9 @@ constants, `touch`, the spill/fill traffic, the helper-sequencing layer every ar
 `emit_helper_call`/`emit_step_and_continue`/`emit_continue_check`/`emit_refresh_y` — plus the
 re-exports); `block.rs` owns the compiled-block shape (the `emit_block` lowering dispatch, its
 helper-sequence arms and its epilogue/deopt wrapper) and `prologue.rs` the block prologue it emits
-first (`emit_block_prologue` and its position-store helpers); `regs.rs` owns the register cache
+first (`emit_block_prologue`: the optional Y-window publish, the frame pushes, the `rt` slot, the
+unconditional position store, and the post-publish alternate entry offset it answers); `regs.rs`
+owns the register cache
 (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`); `compile.rs` owns the compilation entry points
 — `compile_module` (the **eager** whole-module layout: one shared `CodeBuffer`, a whole-module block
 map) and `compile_function`/`emit_function` (the **lazy** layout's per-function unit: its own
@@ -94,14 +96,20 @@ The only tables that outlive a compile are `compile.rs`'s entry tables and the `
   entry-point-relative (`block_start` + the two per-pc tables + `entry_fill`).
 - **Keyed by `(func, pc)`, two different structures with the same key** (`compile.rs`):
   `block_labels: BTreeMap<(u32, u32), CodeLabel>` (`:86` eager / `:179` lazy — a **label** per block
-  start, so a forward branch is an ordinary `rel32` fixup) and the driver-facing entry tables
+  start, so a forward branch is an ordinary `rel32` fixup) and the driver-facing entry vectors
   `entries`/`sub_entries` (`Vec<Vec<*const u8>>` for the eager layout's `[func][pc]`, `Vec<*const u8>`
-  for a lazy function's `[pc]`, each slot null when that address compiled no block — **flat
+  for a lazy function's `[pc]`, each slot null when that address compiled no entry — **flat
   indexing**, chosen over a `HashMap` because the driver probes it on every cross-block jump).
+  **Every per-function entry vector is `2 * code.len()` slots, in two aligned halves**: `[0, n)` the
+  entry that address serves (`entries` the block starts, `sub_entries` the continuation sub-blocks) and
+  `[n, 2n)` the **post-publish alternates** a prologue emitted at `Some(offset)` fills (`emit_function`
+  / `emit_sub_blocks` / `emit_shared_sub_blocks` each write their own half), a null alternate slot
+  meaning "the normal entry serves".
   The **last** step of each layout, after `emit_sub_blocks`/`emit_shared_sub_blocks` and before
-  `buffer.seal()`, folds the two into one: `merge_sub_entries` null-fills each block-start table with
-  the continuation sub-block entry at the same pc (a pc is at most one of the two, and a block start
-  still wins), so the published table answers both shapes with one lookup. Addresses do not move —
+  `buffer.seal()`, folds the two vectors into one: `merge_sub_entries` null-fills each slot with the
+  continuation sub-block entry at the same pc (a pc is at most one of the two, and a block start
+  still wins), **applied over both halves unchanged** — so `[n, 2n)` inherits the same precedence for
+  the alternates. The published table then answers both shapes with one lookup. Addresses do not move —
   the fold runs after every label is bound and only rewrites slot contents.
   `Linker` (`link.rs:229`) holds only `&BTreeMap<(u32, u32), CodeLabel>`; it owns no fixup table — the
   `rel32` patching is the `CodeBuffer`'s own label machinery.
@@ -117,7 +125,7 @@ The only tables that outlive a compile are `compile.rs`'s entry tables and the `
 This file is the *contract*: the core model, the literal-area guard, the constraints, the constraints' register/budget rules, the routing table and the known issues.
 The rest is one level down, each child owning one mechanism:
 - `shapes/CONTEXT.md` → the lowering dispatch table, every restricted shape, the three deopt levels and the heap / frame-admission family.
-- `prologue/CONTEXT.md` → the compiled-block prologue, the position store / Y publish, and the spill/fill discipline (`ExitSpill`'s single-store rule is `link/`'s).
+- `prologue/CONTEXT.md` → the compiled-block prologue, the Y-window publish and the post-publish alternate entry it defines, and the spill/fill discipline (`ExitSpill`'s single-store rule is `link/`'s).
 - `regalloc/CONTEXT.md` → the register picker and the Y/refresh/dirty-set gate derivation.
 - `link/CONTEXT.md` → the exits, the `CALL_STORED` in-block transfer, the tail forms' baked probe, and the continuation sub-blocks.
 - `regs/CONTEXT.md` → the register cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite`) and its store/fill models; the only owner of that contract.
@@ -193,13 +201,18 @@ by construction).
   sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`), plus
   the `#[path]` submodule `spill_tests` (`spill_tests.rs`; see `## Test Strategy`).
 - `block.rs` -> the per-instruction lowering dispatch and the compiled-block shape it emits:
-  `emit_block` (the `match instr` dispatch), `try_inline_init_yregs`, `emit_deopt`,
+  `emit_block` (the `match instr` dispatch, answering the prologue's alternate-entry offset through to
+  the caller), `try_inline_init_yregs`, `emit_deopt`,
   `emit_local_call_probe`, `emit_ext_call`, `emit_receive`; the block prologue it emits first is
   `prologue.rs`.
-- `prologue.rs` -> the compiled-block prologue: `emit_block_prologue` (the frame-register pushes, the
-  `rt`-slot reservation, the `machine.x` base load, the position store / Y-window publish and the
-  live-in cache load) plus the `pub(super)` `emit_position_store`/private `emit_publish_y`/
-  `emit_prologue_helper` it uses (`emit_position_store`'s second user is `family.rs`'s bitstring arm).
+- `prologue.rs` -> the compiled-block prologue: `emit_block_prologue` (the optional Y-window publish
+  **first**, then the frame-register pushes, the `rt`-slot reservation, the `machine.x` base load, the
+  unconditional position store and the live-in cache load), answering `Result<Option<usize>>` — the
+  buffer offset **immediately past the publish's `pop rdi`** for a publishing block (the block's
+  **post-publish alternate entry**), `None` otherwise — plus the `pub(super)` `emit_position_store` and
+  the private `emit_publish_y` it uses (`emit_position_store`'s second user is `family.rs`'s bitstring
+  arm) and the `#[cfg(test)] publish_y_len()` that measures the emitted publish without a hardcoded
+  constant.
 - `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`spill_sets`/`y_last`/
   `y_first`/`frame_republish_first`/`block_start`/`fill_sets`/`entry_fill`,
   `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/`entry_loads`/`refresh_y_after`/
@@ -278,7 +291,12 @@ by construction).
   `mov rdi,[rsp+RUNTIME_SLOT_DISP]` / `mov r11,[rdi+RUNTIME_RESUME_DISP]` / `test r11,r11` /
   `je done` — and, when one is published, the block tears its own frame down and `jmp r11` **tails**
   into it, so a return chain does not grow the native stack; otherwise the word leaves for the driver),
-  plus its unit tests (the frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
+  which emits the same bytes whichever entry it reaches: a `deallocate_return` arrives at the block's
+  **post-publish alternate** through `r11` **after** its own frame teardown, i.e. with
+  `rsp ≡ 8 (mod 16)` and `rdi == rt`, exactly the normal entry's post-`pop rdi` state — the choice is
+  the helper's (`jit_deallocate_return` re-publishes the caller window and asks for the alternate
+  entry), never the emitted arm's; plus its unit tests (the frame-discipline bytes and the
+  emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
   frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers, `allocate`
   included: one `jit_allocate` call plus the continue arm, no emitted frame push) and the private
@@ -384,4 +402,6 @@ driver-side (re)publication before any emitted code can use a store:
 
 - **Every capacity guard precedes every write.** A growth moves the allocation, so an emitted arm would have to re-read the store after its guards and could never name freed memory; today the whole push is the `jit_allocate` helper call, which lets the `Vec` grow and re-derives the window itself.
 - **The commit order is `fill`, then `len`.** The Y words are written into spare capacity before the stack length is bumped, so a collection (or the census walk) never sees a length covering a word the push has not written.
-- **The Y-window publication must be re-derivable at every enterable address.** The window follows from `Machine` state alone (`push_frame_window`'s `(y_base, y_count)` on a push, `refresh_y_base` on a `trim`/pop), so a block entry or a resumed slice can always re-derive it: the in-block `allocate`/`allocate_heap`/`trim` helper re-publishes it on the arm that continues the block, a block entry re-executes the block prefix, and the prologue publishes whenever the block's first Y access is not preceded by such a helper. `../frame_push_tests.rs` pins the behavioural half (each frame pushed exactly once across a sliced and resumed run) and `heap.rs`'s `the_allocate_arm_pushes_the_frame_with_a_helper_call_only` the structural half.
+- **The Y-window publication must be re-derivable at every enterable address.** The window follows from `Machine` state alone (`push_frame_window`'s `(y_base, y_count)` on a push, `refresh_y_base` on a `trim`/pop), so a block entry or a resumed slice can always re-derive it: the in-block `allocate`/`allocate_heap`/`trim` helper re-publishes it on the arm that continues the block, a block entry re-executes the block prefix, and the prologue publishes whenever the block's first Y access is not preceded by such a helper.
+  The **post-publish alternate** is inside that set and owes it nothing: `jit_deallocate_return` re-publishes the caller's window from `frames.last()` and a freshly taken `stack` pointer straight after its `pop_frame_take_continuation`, *before* it asks for the alternate and before the transfer commits, so entering there repeats no publish.
+  `../frame_push_tests.rs` pins the behavioural half (each frame pushed exactly once across a sliced and resumed run) and `heap.rs`'s `the_allocate_arm_pushes_the_frame_with_a_helper_call_only` the structural half.
