@@ -214,6 +214,19 @@ pub(crate) struct Counters {
     pub(crate) publish_y: u64,
     /// `jit_refresh_y` calls (the gated in-block Y-window re-publish).
     pub(crate) refresh_y: u64,
+    /// [`EntryTables::post_publish_entry`] probes — a transfer that asked for a block's
+    /// **post-publish alternate** entry because it had just republished the target frame's
+    /// Y window itself. Only [`jit_deallocate_return`] sets the preference, so this counts
+    /// the `deallocate_return` transfers that reached a same-function continuation.
+    ///
+    /// [`EntryTables::post_publish_entry`]: super::runtime::EntryTables::post_publish_entry
+    /// [`jit_deallocate_return`]: super::runtime::jit_deallocate_return
+    pub(crate) post_publish_requests: u64,
+    /// Of those probes, the ones that **found** an alternate entry, i.e. the transfers that
+    /// entered past the target's own `jit_publish_y` instead of repeating it. A probe with
+    /// no alternate falls back to the folded entry and merely republishes an identical
+    /// window, so `post_publish_requests - post_publish_entries` is that (harmless) residual.
+    pub(crate) post_publish_entries: u64,
     /// Emitted **guarded Y-slot reads** ([`super::emit::emit_guarded_y_load`]): one
     /// frame-window guard plus one load, per inlined `Y` source.
     pub(crate) y_loads: u64,
@@ -480,6 +493,18 @@ pub(crate) fn record_publish_y() {
 /// A `jit_refresh_y` call (the gated in-block Y-window refresh).
 pub(crate) fn record_refresh_y() {
     with(|c| c.refresh_y += 1);
+}
+/// One [`EntryTables::post_publish_entry`] probe, recording whether it found an alternate
+/// entry: `taken` is that answer.
+///
+/// [`EntryTables::post_publish_entry`]: super::runtime::EntryTables::post_publish_entry
+pub(crate) fn record_post_publish_probe(taken: bool) {
+    with(|c| {
+        c.post_publish_requests += 1;
+        if taken {
+            c.post_publish_entries += 1;
+        }
+    });
 }
 
 /// One emitted guarded Y-slot access: `load` distinguishes a read

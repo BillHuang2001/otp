@@ -131,6 +131,18 @@ pub(super) fn emit_block_prologue(
     Ok(alternate_entry)
 }
 
+/// The emitted length of one [`emit_publish_y`] sequence, measured by emitting it into a
+/// throwaway buffer.
+///
+/// A pin on a block's post-publish alternate entry must assert the **relation**
+/// `alternate = normal entry + the publish sequence's length`, never a byte count copied
+/// from the encoder's arithmetic, so the length is derived here, from the emitter itself.
+#[cfg(test)]
+pub(crate) fn publish_y_len() -> Result<usize> {
+    let mut buffer = CodeBuffer::new()?;
+    emit_publish_y(&mut buffer, 0, 0)?;
+    Ok(buffer.len())
+}
 /// Emit an **inline position store**: write `(func, pc)` — two compile-time constants —
 /// into `machine.current_code`.
 ///

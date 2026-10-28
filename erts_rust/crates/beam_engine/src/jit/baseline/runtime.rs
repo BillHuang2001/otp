@@ -471,6 +471,8 @@ impl EntryTables {
         // `entries_len + pc` is in bounds of its second half for the `pc` bound-checked
         // above. A slot is null when that address compiled no alternate entry.
         let entry = unsafe { *self.entries.add(self.entries_len + pc) };
+        #[cfg(test)]
+        super::counters::record_post_publish_probe(!entry.is_null());
         if entry.is_null() {
             None
         } else {
