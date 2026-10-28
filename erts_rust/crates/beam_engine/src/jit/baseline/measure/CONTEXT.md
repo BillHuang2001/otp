@@ -103,7 +103,7 @@ Those counters are deterministic, so they are the pair to quote for any entry/ca
 `driver_interp_steps_per_call` **0.00**, `in_block_calls_per_call` **21.00**,
 `in_block_call_declines_per_call` **0.00**, `block_entry_lookups` **200** (hits 200, misses 0),
 `deopt_count` **empty** (`Allocate` included: the frame push is a natively-called helper, never a
-deopt), plus `instr_per_call`-normalised `rooted_calls_per_call` **1 000.00** and
+deopt), plus `rooted_calls_per_call` **1 000.00** and
 `bif_calls_per_call` **0.00** (the small-int `+`/`-` are inlined by this tier).
 They read **identically** at `e6ba57dff9` and at `6be815d640`; only the `ns` rows differ between the
 two runs (2 % apart at 1-min load 27–64, i.e. below this host's resolution — not evidence).
