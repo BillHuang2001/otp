@@ -264,7 +264,7 @@ A source-only fixture is compiled at test time by the system `erlc`/`cc` into a 
 
 ## Application-level call chains (current state)
 `compile_file.rs` drives the real `compiler` application in process and `eunit_capture.rs` drives the real `eunit` application (`eunit:test/1` on a compiled fixture, whose captured output rides the group-leader protocol); no test drives `syntax_tools`, `xref`, `dialyzer` or `edoc`.
-The deepest chains are `proc_lib_start.rs` (`proc_lib:start[_link]/4` → `proc_lib:sync_start/2`), `multimodule.rs` (real stdlib loaded on demand), `io_scan.rs` (the `{get_until,…}` request driving the real `erl_scan`/`erl_parse`) and `boot.rs` (all 22 boot directives, `{apply,{c,erlangrc,[]}}` included).
+The deepest chains are `proc_lib_start.rs` (`proc_lib:start[_link]/4` → `proc_lib:sync_start/2`), `multimodule.rs` (real stdlib loaded on demand), `io_scan.rs` (the `{get_until,…}` request driving the real `erl_scan`/`erl_parse`), `boot.rs` (all 22 boot directives, `{apply,{c,erlangrc,[]}}` included) and `cowboy_serve.rs` (a pristine Cowboy stack serving a real HTTP/1.1 request — the only chain whose code is entirely outside this repository).
 A real stdlib module does not complete a compile on the scheduled `run` route (`ordsets.erl` does, an order of magnitude slower than the `-eval` route; `calendar.erl`/`lists.erl` spend the whole window inside one `Runtime::scheduler_pass`, which the between-pass `RUN_DEADLINE` never sees) — the scheduled route's limit there is its own throughput.
 
 ## Distribution (A.5) evidence
