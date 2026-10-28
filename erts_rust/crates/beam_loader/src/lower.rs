@@ -46,6 +46,7 @@ use crate::decoded::DecodedTerm;
 use crate::decode::RawInstr;
 use crate::error::bad_file;
 use crate::ir::{Export, FunDescriptor, Import, Module, RecordDefinition, RecordField};
+use crate::labels::SharedLabelMap;
 use crate::literal::LiteralArea;
 use crate::operand::{Label, Operand};
 
@@ -250,6 +251,7 @@ pub fn build_module(
         meta: chunks.meta.clone(),
         meta_table: Arc::new(meta_table),
         checksum,
+        label_map: SharedLabelMap::empty(),
     })
 }
 

@@ -68,6 +68,7 @@ pub mod decode;
 pub mod error;
 pub mod instr;
 pub mod ir;
+pub mod labels;
 pub mod literal;
 pub mod load;
 pub mod lower;
@@ -77,6 +78,10 @@ pub mod operand;
 pub use crate::attributes::{AttributeTable, SharedAttributeTable};
 pub use crate::decoded::{DecodedTerm, SharedDecodedTerm};
 pub use crate::ir::*;
+pub use crate::labels::{
+    build_label_map, import_target, label_map_builds, reset_label_map_builds, LabelMap,
+    SharedLabelMap,
+};
 pub use crate::literal::{LiteralArea, SharedLiteralArea};
 pub use crate::load::{load, load_file};
 pub use crate::opcode::*;
@@ -85,7 +90,9 @@ pub use crate::operand::*;
 /// The conventional glob-import surface for downstream crates.
 ///
 /// `use beam_loader::prelude::*;` brings the frozen IR (`ir::*`, including
-/// [`FunDescriptor`](crate::ir::FunDescriptor)), the decoded literal area
+/// [`FunDescriptor`](crate::ir::FunDescriptor)), the per-image label/import index
+/// ([`LabelMap`](crate::labels::LabelMap),
+/// [`SharedLabelMap`](crate::labels::SharedLabelMap)), the decoded literal area
 /// ([`literal::*`](crate::literal)), the decoded term-chunk holders
 /// ([`AttributeTable`](crate::attributes::AttributeTable),
 /// [`DecodedTerm`](crate::decoded::DecodedTerm)), the operand and register
@@ -95,6 +102,10 @@ pub mod prelude {
     pub use crate::attributes::{AttributeTable, SharedAttributeTable};
     pub use crate::decoded::{DecodedTerm, SharedDecodedTerm};
     pub use crate::ir::*;
+    pub use crate::labels::{
+        build_label_map, import_target, label_map_builds, reset_label_map_builds, LabelMap,
+        SharedLabelMap,
+    };
     pub use crate::literal::{LiteralArea, SharedLiteralArea};
     pub use crate::load::{load, load_file};
     pub use crate::opcode::*;

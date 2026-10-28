@@ -21,12 +21,13 @@
 //! Loader-specific error constructors over [`beam_common::BeamError`].
 //!
 //! The crate uses **only** `beam_common::{Result, BeamError}` — there is no
-//! crate-local error enum (`../CONTEXT.md` §3). These small helpers name the two
-//! failure shapes a `.beam` reader produces so the parsing code reads clearly:
-//! a structurally invalid image ([`bad_file`]) and a truncated one
-//! ([`truncated`]). Both map to [`BeamError::BadArg`], the BEAM `badarg` error
-//! atom, exactly as `beam_file.c` rejects malformed input.
-use beam_common::BeamError;
+//! crate-local error enum (`../CONTEXT.md` §3). These small helpers name the three
+//! failure shapes a `.beam` reader (or the label/import index it exposes) produces so
+//! the code reads clearly: a structurally invalid image ([`bad_file`]), a truncated
+//! one ([`truncated`]), and a construct this milestone does not model
+//! ([`unsupported`]). The first two map to [`BeamError::BadArg`], the BEAM `badarg`
+//! error atom, exactly as `beam_file.c` rejects malformed input.
+use beam_common::{BeamError, ExitReason, Raise};
 
 /// A `.beam` image (or a structure within it) is structurally invalid.
 ///
@@ -43,3 +44,15 @@ pub fn bad_file(_msg: &str) -> BeamError {
 pub fn truncated(_what: &'static str) -> BeamError {
     BeamError::BadArg
 }
+
+/// A construct this milestone does not model — the typed `error:unsupported_opcode`.
+///
+/// The import-table errors ([`crate::labels::import_target`]) and an execution
+/// engine's opcode-gap sentinel are one definition: the raised reason is the atom
+/// `unsupported_opcode: <what>`, carrying the offending name for diagnostics.
+pub fn unsupported(what: &str) -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom(format!(
+        "unsupported_opcode: {what}"
+    ))))
+}
+

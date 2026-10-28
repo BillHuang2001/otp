@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use crate::attributes::{AttributeTable, SharedAttributeTable};
 use crate::decoded::{DecodedTerm, SharedDecodedTerm};
+use crate::labels::{LabelMap, SharedLabelMap};
 use crate::literal::LiteralArea;
 use crate::operand::Label;
 
@@ -366,6 +367,20 @@ pub struct Module {
     /// carries, and is what a `code:module_md5`-style introspection query would serve.
     /// Reachable through [`Module::checksum`]. `[0u8; 16]` for a [`Module::default`].
     pub checksum: [u8; 16],
+    /// The image's label/import index, built lazily and shared by every consumer.
+    ///
+    /// It is derived **only** from this image's immutable content — `Function::labels`
+    /// and [`Module::imports`] resolved through the image's own atom table — so every
+    /// consumer of the image (every `Machine`) can share the one map instead of
+    /// re-deriving it. It is therefore *not* part of the image's content identity and
+    /// is never serialized, hashed or compared. Reachable through
+    /// [`Module::label_map`].
+    ///
+    /// `pub` only because the frozen construction idiom `Module { .., ..Module::default() }`
+    /// (used by `beam_rt`'s evaluator) needs every field visible; it is an
+    /// implementation slot, not image content — read it through [`Module::label_map`]
+    /// and never write it.
+    pub label_map: SharedLabelMap,
 }
 
 impl Default for Module {
@@ -393,6 +408,7 @@ impl Default for Module {
             meta: None,
             meta_table: Arc::new(DecodedTerm::default()),
             checksum: [0u8; 16],
+            label_map: SharedLabelMap::empty(),
         }
     }
 }
@@ -442,6 +458,21 @@ impl Module {
     /// [`crate::load_file`] always carries the computed digest.
     pub fn checksum(&self) -> [u8; 16] {
         self.checksum
+    }
+
+    /// The image's label/import index — **the single door** to it.
+    ///
+    /// The map is a pure function of this image's immutable content (`Function::labels`
+    /// plus [`Module::imports`] resolved through this image's atom table), so it is
+    /// built once in the image's lifetime and every later call answers a clone of the
+    /// same allocation: every consumer of the image shares one map instead of
+    /// re-deriving it.
+    ///
+    /// The returned [`Arc`] is what lets a caller hold the map across `&mut` calls into
+    /// an execution machine. A caller must not mutate a `Module` after taking its map
+    /// — the slot is not revalidated; module images are immutable by contract.
+    pub fn label_map(&self) -> Arc<LabelMap> {
+        self.label_map.get(self)
     }
 
     /// The lambda descriptor at `index` (a `make_fun3`/`call_fun2` fun-table index).
