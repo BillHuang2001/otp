@@ -6,6 +6,81 @@ of *decisions and structural changes*, complementing `git log` (which holds ever
 
 Format: one entry per major change — date, area, what changed and why. Newest first.
 ---
+## 2026-10-28 — Real-world project compatibility (jsone, bbmustache), reference hashing, an io device protocol and crash reports, the refc-window bitstring subject, nursery carriage, and a COW atom store
+Scope: the milestone that took the runtime from "runs constructed fixtures" to **running two real
+Erlang projects' own eunit suites byte-identically** (`jsone` 90/90, `bbmustache` 79/79) and then
+made the measured hot paths cheaper. The headline **architectural/algorithmic** changes are:
+(a) a reference is now a hashable term, so `dict`/`gb_trees`/`ets` — and therefore `eunit`'s own
+server — work over refs; (b) `io` is a **device protocol** (`{io_request,From,ReplyAs,…}` /
+`{io_reply,…}` with group-leader routing and a file device) rather than a sink, and a crashing
+process produces a real crash report; (c) the baseline JIT classifies an off-heap **refc-binary
+window** as a bitstring subject and emits a **fresh** (accumulator-less) `bs_create_bin` route, so
+binary comprehensions and `<<C>>` builders run as native code instead of one interpreter deopt per
+element; (d) the collector **carries a one-shot growth request** into the next minor collapse,
+replacing a grow→collect→shrink→grow cycle (1 210 → 608 collections on an in-process compile);
+(e) the atom table is a **chunked copy-on-write store** (a `fork` allocates nothing) and the loader
+fuses while lowering (one exact allocation per function body); (f) `-eval` application nesting is
+**bounded and trampolined** onto the BEAM stack instead of overflowing the driver thread.
+- **Area:** `erts_rust/crates/beam_term/src/hashing/{make_hash,make_hash2}.rs` — **the term model**
+- **Change:** `RefIdentityUnavailable` is gone: a reference hashes from its identity word the way the
+  C's `erl_term_hashing.c` does, so `phash/2`, `dict`, `gb_trees` and `ets` accept refs. This was the
+  root cause of `eunit:test/1` dying with `{error,server_down}` (the eunit server keys its job table by
+  `make_ref/0`); the capability gap had been *uncatchable* on the runner path because the raise's reason
+  atom was not interned, which is fixed too.
+- **Area:** `erts_rust/crates/beam_rt/src/{report.rs,io_route.rs,native/io*,context/io_route.rs}` — **the
+  runtime's observable surface (A.7/A.8)**
+- **Change:** every io request now traverses the OTP device protocol — a group leader, a
+  `{io_request,From,ReplyAs,Request}`/`{io_reply,ReplyAs,Reply}` pair, and a file device — where output
+  used to be written directly and ignored; and a process that exits abnormally emits an error report
+  through a new crash reporter. Both are prerequisites for any supervised application, and both were
+  invisible to the differential corpus until a real suite asked for them.
+- **Area:** `erts_rust/crates/beam_engine/src/jit/baseline/emit/bitstr_inline/**` — **the execution engine**
+- **Change:** `emit_subject_view` gains the **refc-window** subject form (an `ErlSubBits` whose `orig`
+  is a `BinRef`: `base = base_flags & !flags + start/8`, `bit_pos = pos + start%8`), and
+  `CreateBinShape::of` gains the **fresh** route (`Route::Fresh` / `SHAPE_CREATE_FRESH`: a bare
+  `bs_create_bin` packs its guarded fields and makes one positioned `jit_make_heap_binary` call). The
+  refc form is the subject of every binary comprehension over a binary past the 64-byte on-heap limit:
+  `step_one_per_call` on all four `foreign/*` kernels is now **0.00** (it was one deopt per element), and
+  `binary_append` fell from ~8–11× the oracle to **1.86×**. The same batch replaces
+  `enter_in_block`'s table lookups with a null-sentinel `*const u8` entry table, folds continuation
+  entries, drops the return path's dead position store, and adds an additive defaulted
+  `ExecutionContext::reduce_hook()` seam.
+- **Area:** `erts_rust/crates/beam_gc/src/{nursery,collector,immix_collector}.rs` — **the GC (Stage 4)**
+- **Change:** a BIF copy-out cannot collect (no published root set), so it grew the nursery; the next
+  collection then collapsed the nursery to the **live-set** target, and the following copy-out grew it
+  again. A `pending_growth_need` (a `max`, never a sum) is now carried from the growth door into the next
+  minor collapse, bounded by a carriage rule — a capacity *redistribution* between young and mature, not
+  a footprint trick. Measured 1 210 → 608 collections, 1 135 465 → 962 449 words copied, with the
+  compiled artifact byte-identical.
+- **Area:** `erts_rust/crates/beam_term/src/atom/store.rs`, `beam_loader/src/lower/{group,fuse}.rs`,
+  `beam_rt/src/codeserver.rs` — **boot footprint**
+- **Change:** the atom index became a chunked, sharded **copy-on-write** store behind two `Arc`s, so a
+  per-module `AtomTable::fork` allocates nothing (it deep-copied a 26 MiB index at peak) and the
+  codeserver re-forks from the merged store at load end; the loader fused **while** lowering instead of
+  building a pre-fusion body beside the fused one. Together they took a bare boot from 1.516× to
+  **0.99–1.00×** the oracle's `VmHWM`, and the compute/slice rows to 0.74×/1.00×.
+- **Area:** `erts_rust/crates/beam_rt/src/eval/nesting.rs` — **the `-eval` route (A.6)**
+- **Change:** a deeply recursive named fun applied through the tree-walker overflowed the 64 MiB driver
+  thread (SIGABRT). Nested applications are now walked up to a 512-level budget and then compiled onto
+  the BEAM stack; past 16 nested compiled closures the route raises a typed `unsupported`. `F(50000)`
+  and `F(100000)` answer `done` where they aborted.
+- **Area:** `erts_rust/crates/beam_bifs` (iolist walk, `binary:part/3`, `ets:insert/2` selection),
+  `erts_rust/crates/beam_ets` (bucket-indexed free runs, hash-once insert) — **data-path algorithms**
+- **Change:** four iolist flatteners and four byte-list builders collapsed into one walk with a 128-frame
+  inline stack; `ets_copy` dropped 26.1% of its instructions (per-object arena reservations, a linear
+  bucket scan and a per-op SipHash insert are gone) and now runs at 5.2× the oracle (was 9.8×).
+- **Area:** `erts_rust/tools/differential` — **the compatibility gate**
+- **Change:** a new **`oracle_drift`** verdict with its own allowlist/ratchet: a case whose *our* side
+  reproduces the committed golden while the host oracle does not is a host-release difference, not a
+  divergence, and `mismatch` stays reserved for a real divergence. The corpus is 3 469 cases across all
+  nine contracts, `agree=3 465 mismatch=0 unsupported=1 oracle_drift=3`.
+- **Measured position after this batch** (paired, pinned, shared-host caveats stated in
+  `erts_rust/BOTTLENECKS.md`): startup p50 1.21×, `slice` ≈1.00×, compute **0.88×** (rust faster),
+  `binary_append` 1.86×, `ets_copy` 5.2×, `list_walk` 5.5×, `foreign` 6.0/6.4/12.1/11.3×, boot peak
+  RSS **0.99×**, compute peak RSS **0.74×**. External targets: `jsone` 1.22× and `bbmustache` 1.07×
+  wall on their own suites; `cowboy`/`khepri`/`plb` remain oracle-only or partially runnable.
+
+---
 ## 2026-10-22 — The C-ABI aliasing contract, the bitstring inline set, the off-heap prune valve, and one shared MD5 core
 Scope: the batch that turned four measured hazards into structural rules. The headline
 **architectural/algorithmic** changes are (a) both foreign C-ABI environments (`DriverEnv`,

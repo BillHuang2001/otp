@@ -85,7 +85,16 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --all-targets --manifest-path erts_rust/Cargo.toml
       - name: Test workspace
-        run: cargo test --workspace --no-fail-fast --manifest-path erts_rust/Cargo.toml
+        ## The four tests skipped here drive the *whole* corpus through a serial
+        ## `differential suite` (hours each); their coverage is the Differential
+        ## compatibility gate step below, which runs the same corpus once. Everything
+        ## else in the workspace runs.
+        run: |
+          cargo test --workspace --no-fail-fast --manifest-path erts_rust/Cargo.toml -- \
+            --skip the_suite_reports_module_agreement_and_expression_capability_gaps \
+            --skip the_ratchet_tolerates_only_the_recorded_gaps_end_to_end \
+            --skip a_mismatch_is_never_masked_by_an_allowlist_end_to_end \
+            --skip a_rust_runtime_signalling_unsupported_is_honest_not_a_mismatch
       - name: Clippy (non-blocking)
         ## `!cancelled()` (not `always()`): still produce a clippy report when an
         ## earlier step failed, but do not start new work after a cancellation.
@@ -106,7 +115,12 @@ jobs:
             exit 0
           fi
           rc=0
-          erts_rust/tools/differential/gate.sh || rc=$?
+          ## CI pins an oracle whose erts version matches the tree's goldens, so no case
+          ## may be an oracle drift here: judge with an EMPTY drift allowlist (strict),
+          ## which also keeps the committed erts-17.1.1 drift entries from going stale.
+          drift_allowlist="$(mktemp)"
+          : > "$drift_allowlist"
+          erts_rust/tools/differential/gate.sh --drift-allowlist "$drift_allowlist" || rc=$?
           case "$rc" in
             0)
               echo "::notice::differential gate passed — every executed case agreed (exit 0)"

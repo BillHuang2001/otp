@@ -6,7 +6,7 @@ description: The per-group inventory of the differential conformance corpus (`er
 Each group is a module `src/corpus/<group>.rs` exposing `group() -> Vec<Case>`, concatenated by
 `corpus::mod::build_corpus()`. A case id is `<prefix>/<name>`, where the prefix is a *subdivision*
 and NOT the file name (one file may emit several prefixes). Counts below are for the current corpus
-(3322 cases total, one allowlisted gap, `wire/new_fun_ext_encode`); re-derive them with
+(3 469 cases total, one allowlisted gap, `wire/new_fun_ext_encode`, three recorded oracle drifts); re-derive them with
 `erts_rust/target/release/differential list 2>/dev/null | grep -c '^<prefix>/'` rather than trusting
 this file, which drifts on every corpus round.
 ## A.1 — language semantics
@@ -22,6 +22,10 @@ this file, which drifts on every corpus round.
 - `ordered_walk.rs` — the `ets` `ordered_set` walk across the `ORDER`=32 node split
   (`ets:first/1`+`next/2`, `ets:last/1`+`prev/2` over >2×ORDER keys interleaved with insert/delete),
   the absent-key range-bound anchor and the terminal `'$end_of_table'`.
+- `bitbin.rs` (6 cases) — the **opcode** half of the binary surface: a writable accumulator
+  (`bs_init_writable` + private append; pinned by byte count **and** md5), growth past the payload's
+  reservation, a `bs_match` over a **refc** subject at a non-zero non-byte-aligned offset (integer and
+  binary fields), its byte-aligned control, and one large-payload `ets` copy round trip.
 ## A.2 — `.beam`/ETF images
 - `etf.rs` (84 cases) — `term_to_binary` bytes + `binary_to_term` round trips incl. local pid/ref
   identity; the `[local]` `LOCAL_EXT` image with the per-VM 4-byte node hash masked
