@@ -90,7 +90,7 @@
 use std::cell::Cell;
 
 use beam_loader::{BsGetArgs, HeapNeed, Instr, Label, Module, Operand, Reg, NO_FAIL};
-use beam_term::{Atom, Eterm};
+use beam_term::{make_atom, Atom, Eterm};
 
 use super::bitstr::bitstr_calls;
 use super::bitstr_inline_tests::{
@@ -386,6 +386,8 @@ enum ArgKind {
     Bytes(&'static [u8]),
     /// A float.
     Float(f64),
+    /// An atom term (an immediate), named by the module's own atom table.
+    Atom(Atom),
 }
 
 impl ArgKind {
@@ -396,6 +398,7 @@ impl ArgKind {
                 crate::terms::make_heap_binary(ctx, bytes).expect("the argument builds")
             }
             ArgKind::Float(value) => crate::terms::make_float(ctx, value).expect("the argument builds"),
+            ArgKind::Atom(atom) => make_atom(atom),
         }
     }
 }
@@ -4868,3 +4871,13 @@ fn a_bare_build_packs_its_eight_bit_field_in_block_and_answers_the_family_value(
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// The bare route's value sweep — a child module, because this file carries the append route
+// ---------------------------------------------------------------------------
+/// The value half of [`bitstr_inline::Route::Fresh`] (the bare `bs_create_bin` lowering):
+/// the `1..=64` width sweep, the multi-field packing, the `Y`-slot destination and the two
+/// refusals. Split out of this file, whose own subject is the append route's shape and
+/// mutation order.
+#[path = "bs_create_bin_fresh_tests.rs"]
+mod fresh;
