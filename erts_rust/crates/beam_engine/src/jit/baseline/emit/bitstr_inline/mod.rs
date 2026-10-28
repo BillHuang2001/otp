@@ -105,6 +105,7 @@ use super::operands::Loc;
 
 mod bs_match;
 mod create;
+mod create_fresh;
 mod integer;
 mod match_string;
 mod position;

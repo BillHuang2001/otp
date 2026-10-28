@@ -80,7 +80,7 @@ use super::Loc;
 /// emitter writes as `movabs` immediates, because no run-time word can cross the block ABI.
 pub(super) fn emit_binary_all(
     buffer: &mut CodeBuffer,
-    shape: &super::CreateBinShape,
+    source: Loc,
     src: Loc,
     allocation: &Allocation,
     fallback: CodeLabel,
@@ -91,7 +91,7 @@ pub(super) fn emit_binary_all(
         Loc::X(x) => i64::from(x),
         Loc::Y(k) => i64::from(k),
     };
-    let flags = if shape.source.is_y() {
+    let flags = if source.is_y() {
         WRITE_ACC_IN_Y
     } else {
         0
@@ -101,7 +101,7 @@ pub(super) fn emit_binary_all(
         buffer,
         allocation,
         helper as *const (),
-        &[i64::from(shape.source_slot()), src_slot, flags],
+        &[i64::from(super::CreateBinShape::slot_of(source)), src_slot, flags],
         func,
         pc,
     )?;
