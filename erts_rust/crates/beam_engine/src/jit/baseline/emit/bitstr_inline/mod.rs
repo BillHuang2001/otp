@@ -33,9 +33,12 @@
 //! predicate — returning `Ok(false)` with **zero bytes emitted** — so `emit_block`'s
 //! existing `_ if bitstrings::claimed(instr) => emit_bitstr(...)` arm keeps handling it
 //! exactly as before. A shape whose operands are addressable but whose *run-time* value
-//! is not a match context branches to a local `fallback` label that runs exactly one
-//! interpreter step ([`emit_step_and_continue`]), so the interpreter's own typed error
-//! (`bs_get_position: operand is not a match context`, …) is what the process sees.
+//! is not a match context branches to a local `fallback` label that runs exactly one step of
+//! the owning body, so the interpreter's own typed error
+//! (`bs_get_position: operand is not a match context`, …) is what the process sees. That step
+//! is [`emit_step_and_continue`] (one interpreter dispatch) everywhere except the
+//! start-match arm, whose two fresh-subject guards are served by `emit_bitstr` (the
+//! *family* helper `jit_bitstr`) because that is the body which must `make_ctx`.
 //!
 //! # Frozen layouts read here
 //!
@@ -102,6 +105,7 @@ use super::operands::Loc;
 
 mod bs_match;
 mod create;
+mod create_fresh;
 mod integer;
 mod match_string;
 mod position;
@@ -261,7 +265,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 16;
+pub(crate) const SHAPE_COUNT: usize = 17;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -310,6 +314,11 @@ pub(crate) const SHAPE_SKIP_UTF8: usize = 14;
 /// The `bs_get_utf8` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_UTF8: usize = 15;
+/// The **bare** (accumulator-less) `bs_create_bin` shape index in the test-build instrument
+/// — the [`Route::Fresh`] route, emitted by `create_fresh` and distinct from
+/// [`SHAPE_CREATE_BIN`]'s private-append accumulator shape.
+#[cfg(test)]
+pub(crate) const SHAPE_CREATE_FRESH: usize = 16;
 #[cfg(test)]
 thread_local! {
     /// How often each shape's native lowering was **emitted** (a compile-time count, so it
@@ -323,12 +332,12 @@ thread_local! {
 /// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
 /// entries. The two kinds of shape here need that count for different reasons.
 ///
-/// For the **fifteen helper-free** shapes — every shape in the roster except
-/// [`SHAPE_CREATE_BIN`], i.e. the eleven match-context shapes (the seven
-/// position/tail/start-match/integer extractors, the static `bs_match`, `bs_match_string` and
-/// `bs_skip_utf32`/`bs_get_utf32`) plus the variable-width `bs_skip_utf16`/`bs_get_utf16` and
-/// `bs_skip_utf8`/`bs_get_utf8` pairs — the emission is the only observable there can be:
-/// such a shape calls no helper at all, so
+/// For the **fifteen helper-free** shapes — every shape in the roster except the two
+/// construction shapes ([`SHAPE_CREATE_BIN`] and [`SHAPE_CREATE_FRESH`]), i.e. the eleven
+/// match-context shapes (the seven position/tail/start-match/integer extractors, the static
+/// `bs_match`, `bs_match_string` and `bs_skip_utf32`/`bs_get_utf32`) plus the
+/// variable-width `bs_skip_utf16`/`bs_get_utf16` and `bs_skip_utf8`/`bs_get_utf8` pairs —
+/// the emission is the only observable there can be: such a shape calls no helper at all, so
 /// [`super::super::bitstr::bitstr_calls`] never moves for it and "the inline arm ran" *is*
 /// the decision to emit.
 ///
@@ -339,6 +348,10 @@ thread_local! {
 /// arm ran for **either** route, and it is also the proof that a plan
 /// `CreateBinShape::of` **refused** emitted zero bytes (the refusal happens before the
 /// first byte, so the counter cannot move).
+///
+/// [`SHAPE_CREATE_FRESH`] is the same argument for the bare build: it calls exactly one
+/// helper (`jit_make_heap_binary`), and whether that arm emitted at all — rather than the
+/// instruction staying on the family — is the emission decision.
 ///
 /// Either way, pair it with a zero [`super::super::bitstr_inline_tests::static_deopts`]
 /// count for the same variant to prove the whole instruction stayed native.
@@ -351,6 +364,18 @@ pub(crate) fn inlined(shape: usize) -> u64 {
 fn record_inlined(shape: usize) {
     INLINED.with(|counts| counts[shape].set(counts[shape].get() + 1));
 }
+/// The one family-helper call a `Bs*`-arm block makes **by construction**: a
+/// `bs_start_match3`/`bs_start_match4` on a subject that is not yet a match context cannot be
+/// inlined — the family must `make_ctx`, which allocates — so the start-match arm's run-time
+/// guard hands that instruction to `jit_bitstr`, one step of the *family* body the interpreter's
+/// own step would reach (never a whole interpreter dispatch).
+///
+/// Every row suite whose fixture starts with `bs_start_match3` therefore sees **exactly** this
+/// many `bitstr_calls()` on a successful path, on top of whatever the row's own shape does. The
+/// suites assert against this constant instead of a bare `1`, so the number stays tied to the
+/// reason it is there — and so a later shape that really does fall back is still visible.
+#[cfg(test)]
+pub(crate) const FRESH_START_MATCH_HELPER_CALLS: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // The shared match-context guard
