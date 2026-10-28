@@ -22,7 +22,7 @@
 //! `erlang:bit_size/1` and `erlang:length/1` evaluated natively instead of deopting to one
 //! interpreter step.
 //!
-//! The installed corpus emits both as the collecting `{gc_bif,…}` (`Instr::GcBif`), a
+//! The installed corpus emits all three as the collecting `{gc_bif,…}` (`Instr::GcBif`), a
 //! pure term accessor with no heap effect (the tier accepts the non-collecting
 //! `Instr::Bif` form too), so leaving them to `jit_step_one` costs a helper
 //! round-trip **plus** a full interpreter dispatch and `Step` decode per call. Unlike
@@ -77,8 +77,8 @@ use super::encode_target;
 use super::jit_step_one;
 use super::runtime::JitRuntime;
 
-/// Evaluate the `erlang:byte_size/1` or `erlang:length/1` at `(func, pc)` natively, or
-/// run the interpreter's own step for it.
+/// Evaluate `erlang:byte_size/1`, `erlang:bit_size/1` or `erlang:length/1` at `(func, pc)`
+/// natively, or run the interpreter's own step for it.
 ///
 /// The helper has the [`StepHelper`](super::runtime::StepHelper) signature, so the
 /// `erlang:byte_size/1` / `erlang:length/1` arm of `super::emit::bif` drives it through
@@ -96,7 +96,7 @@ use super::runtime::JitRuntime;
 ///   propagating raise) — leaves the block for the driver with that word in `rax`,
 ///   exactly as a deopt's.
 ///
-/// Nothing is ever invented: an instruction that does not name one of the two lowered
+/// Nothing is ever invented: an instruction that does not name one of the three lowered
 /// BIFs, or a shape whose value the helper cannot compute, is handed to
 /// [`jit_step_one`] — the interpreter's step, which produces *its* exact value or typed
 /// error.

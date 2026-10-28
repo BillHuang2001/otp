@@ -99,6 +99,7 @@ mod bits;
 mod bits_decode;
 mod bits_match;
 pub(crate) mod compile;
+mod nesting;
 mod parse;
 pub(crate) mod reclaim;
 pub(crate) mod scratch;
@@ -1415,8 +1416,80 @@ impl Evaluator<'_, '_> {
         }
     }
 
-    /// Applies one of this evaluator's closures.
+    /// Applies one of this evaluator's closures, within the walker's application-nesting budget
+    /// ([`nesting`]).
+    ///
+    /// A closure application is a chain of native Rust calls, so a deep recursion would exhaust
+    /// the driver thread's stack (a process **abort**, never a result). [`nesting::Slot::enter`]
+    /// answers which route runs the body: the tree walker while the nesting is within
+    /// [`nesting::WALK_APPLY_LIMIT`], the **compiled** route past it (so the recursion lives on
+    /// the BEAM process stack), and the typed `unsupported` gap once no further compiled
+    /// application may nest.
     fn apply_closure(
+        &mut self,
+        body: &Rc<FunBody>,
+        function: Eterm,
+        args: &[Eterm],
+    ) -> EResult<Eterm> {
+        let (slot, route) = nesting::Slot::enter();
+        // An arity its own clauses do not declare is the walker's `BadArity` (the oracle's
+        // `badarity`), and it cannot recurse — so it keeps that reason instead of being reported
+        // as a capability gap the compile route would answer with.
+        let arity_matches = terms::fun_arity(function)
+            .ok()
+            .and_then(|arity| usize::try_from(arity).ok())
+            == Some(args.len());
+        let result = match route {
+            nesting::Route::Walk => self.walk_closure(body, function, args),
+            nesting::Route::Compiled if arity_matches => self.apply_compiled_closure(function, args),
+            nesting::Route::Compiled => self.walk_closure(body, function, args),
+            nesting::Route::Exhausted => Err(Flow::Fatal(nesting::exhausted())),
+        };
+        // The guard covers the whole application, so the counters follow the Rust stack on every
+        // exit path (a value and a raise alike).
+        drop(slot);
+        result
+    }
+
+    /// Runs one of this evaluator's closures as **compiled code** — the route that keeps a deep
+    /// recursion off the Rust stack.
+    ///
+    /// [`compile::entry_for`] compiles the closure's recorded source text into a synthetic
+    /// `beam_rt_eval_fun_<index>` module and loads it with `code:load_binary/3`; applying that
+    /// module's entry below then runs the body — and every recursive call inside it — as a real
+    /// engine machine on the BEAM process stack.
+    ///
+    /// The compile is attempted only where the context owns the process table
+    /// ([`RuntimeContext::owns_process_table`]): `compile:file/2` drives the compiler's own
+    /// file/io round trips, which pump the scheduler — exactly what a context *inside* a
+    /// scheduler slice may not do (the same rule `native::process::spawn_in_pass` follows). Every
+    /// other failure declines into the
+    /// typed refusal ([`nesting::compile_declined`]), never into a wrong value.
+    fn apply_compiled_closure(&mut self, function: Eterm, args: &[Eterm]) -> EResult<Eterm> {
+        if !self.ctx.owns_process_table() {
+            return Err(Flow::Fatal(nesting::compile_declined(
+                "the application runs inside a scheduler slice, which may not compile",
+            )));
+        }
+        let Some(compiled) = compile::entry_for(self.ctx, function, args) else {
+            return Err(Flow::Fatal(nesting::compile_declined(
+                "the closure has no compilable source text",
+            )));
+        };
+        // `entry_for` already checked the closure's arity against `args`; this is the cross-check
+        // that the generated `run/<captures + arity>` is the shape the argument list has, so the
+        // module is never entered at an entry of another arity.
+        let call_args = compiled.arguments(args);
+        if call_args.len() as u32 != compiled.arity {
+            return Err(Flow::Fatal(nesting::compile_declined(
+                "the compiled entry's arity does not match the application",
+            )));
+        }
+        self.call(&compiled.module, compile::ENTRY_FUNCTION, &call_args)
+    }
+
+    /// Applies one of this evaluator's closures by walking its clauses (the tree-walker route).
+    fn walk_closure(
         &mut self,
         body: &Rc<FunBody>,
         function: Eterm,
@@ -3351,6 +3424,90 @@ mod tests {
         );
         assert_eq!(ints("lists:map(fun erlang:abs/1, [-1,2])"), vec![1, 2]);
         assert_eq!(ints("lists:map(fun length/1, [[1],[2,3]])"), vec![1, 2]);
+    }
+
+    /// A fun recursion inside the walker's nesting bound is walked, not compiled: nothing about
+    /// ordinary `-eval` code changes route ([`nesting::WALK_APPLY_LIMIT`]).
+    #[test]
+    fn a_fun_recursion_inside_the_bound_runs_in_the_walker() {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let value = eval(&mut ctx, "F = fun G(0) -> done; G(N) -> G(N - 1) end, F(100).")
+            .expect("a 100-deep recursion is far inside the walker's bound");
+        assert_eq!(ctx.runtime.atoms().name(atom_val(value)), Some("done"));
+        assert!(
+            ctx.runtime.eval_compiled.is_empty(),
+            "a recursion inside the bound must not compile the closure"
+        );
+    }
+
+    /// Past the bound the closure is compiled, so the recursion runs on the BEAM process stack
+    /// (the engine grows it on the heap) and the answer is the oracle's `done`.
+    ///
+    /// The oracle's own answer for every expression here is pinned in the test's comments
+    /// (`erl -noshell -eval '…, halt().'`).
+    #[test]
+    fn a_deep_named_fun_recursion_is_served_by_the_compiled_route() {
+        const DEPTH: usize = 10_000;
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        // oracle: `done`
+        let expression = format!("F = fun G(0) -> done; G(N) -> G(N - 1) end, F({DEPTH}).");
+        let value = eval(&mut ctx, &expression).expect("a deep named-fun recursion answers");
+        assert_eq!(ctx.runtime.atoms().name(atom_val(value)), Some("done"));
+        let compiled: Vec<&str> = ctx
+            .runtime
+            .eval_compiled
+            .values()
+            .filter_map(|entry| entry.as_ref().map(|compiled| compiled.module.as_str()))
+            .collect();
+        assert_eq!(
+            compiled.len(),
+            1,
+            "exactly the recursive closure is compiled, not its call site: {compiled:?}"
+        );
+        assert!(
+            compiled[0].starts_with("beam_rt_eval_fun_"),
+            "the recursion was served by {} rather than a compiled `-eval` closure",
+            compiled[0]
+        );
+    }
+
+    /// The compiled route carries the oracle's values for the two other recursion shapes a
+    /// `-eval` expression uses — a **non-tail** build (`[N | G(N-1)]`, a `DEPTH`-frame BEAM
+    /// stack) and an accumulator clause pair (oracle: `10000` for both).
+    #[test]
+    fn the_compiled_route_answers_the_oracles_value_for_non_tail_and_accumulator_recursions() {
+        int(
+            "F = fun G(0) -> []; G(N) -> [N | G(N - 1)] end, length(F(10000))",
+            10_000,
+        );
+        int(
+            "F = fun G(0, Acc) -> Acc; G(N, Acc) -> G(N - 1, [N | Acc]) end, \
+             length(F(10000, []))",
+            10_000,
+        );
+    }
+
+    /// A recursion that must **alternate** compiled code and the walker — a fun value applied to
+    /// itself, so every level is compiled-module → `apply_fun` → walker — can never become pure
+    /// BEAM recursion. It ends in the typed `unsupported` capability gap (the CLI's exit 3),
+    /// never in a stack overflow. The oracle answers `done` here; the refusal is the honest bound
+    /// (see [`nesting`]).
+    #[test]
+    fn a_recursion_that_alternates_compiled_and_walked_answers_a_typed_gap() {
+        let error = run(
+            "F = fun(G, 0) -> done; (G, N) -> G(G, N - 1) end, F(F, 10000)",
+        )
+        .expect_err("the recursion alternates the compiled route and the walker");
+        let reason = error::unsupported_reason(&error)
+            .unwrap_or_else(|| panic!("{error} is not the typed capability gap"));
+        assert!(
+            reason.contains("compiled closures"),
+            "the refusal does not name the exhausted budget: {reason}"
+        );
     }
 
     #[test]

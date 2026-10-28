@@ -1591,7 +1591,8 @@ fn the_base62_decode_append_arm_lowers_the_six_bit_build_and_declines_the_runtim
         (lowered, declined),
         (5, 1),
         "decode/2: the two 6-bit appends and the three `<<DecodeChar>>` bare builds are lowered, \
-         and the runtime-width append stays where it was"    );
+         and the runtime-width append stays where it was"
+    );
     assert_eq!(
         lowered, lowered_instances,
         "the builds `CreateBinShape::of` accepts and the instances the emitter actually lowered \

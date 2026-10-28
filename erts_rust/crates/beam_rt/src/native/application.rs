@@ -46,7 +46,7 @@
 //! term** text of the shipping OTP files: `%%` comment lines followed by
 //! `{application, Name, [{description, "..."}, {vsn, "..."}, {modules, [...]}, …]}.` —
 //! unquoted and quoted atoms, double-quoted strings, integers, lists and tuples, and
-//! nothing else (verified against OTP 29/erts-17.1's `kernel-11.0.4` and `stdlib-8.1`).
+//! nothing else (verified against the shipping OTP `kernel` and `stdlib` resources).
 //! [`parse_resource`] implements exactly that subset and reports anything outside it as a
 //! typed error naming the offending construct — never a silently mis-read value.
 //!
@@ -92,9 +92,9 @@ use crate::error;
 /// oracle never reports `erts` as a *loaded* application — it **is** the emulator, not an
 /// application — so it must not be invented here; `code:lib_dir(erts)` still resolves it
 /// through the code server, which is a different question. `kernel` and `stdlib` are the
-/// two the oracle reports (`erl -noshell -eval 'application:loaded_applications().'` ⇒
-/// `[{kernel,"ERTS  CXC 138 10","11.0.4"},{stdlib,"ERTS  CXC 138 10","8.1"}]`, verified
-/// against OTP 29/erts-17.1).
+/// two the oracle reports (`erl -noshell -eval 'application:loaded_applications().'`), and
+/// each triple's `vsn` is the **installation's** own — read out of the `.app` file on the
+/// code path, so it is never pinned here.
 const LOADED_APPLICATIONS: &[&str] = &["kernel", "stdlib"];
 
 /// The proplist keys `application:get_all_key/1` reports for a **loaded** application, in
@@ -361,21 +361,21 @@ impl RuntimeContext<'_> {
     ///
     /// An application whose resource file (or whose `description`/`vsn` property) cannot
     /// be resolved is **omitted** — the triple would otherwise have to be fabricated.
-    /// Oracle-verified (OTP 29/erts-17.1):
-    /// `[{kernel,"ERTS  CXC 138 10","11.0.4"},{stdlib,"ERTS  CXC 138 10","8.1"}]`.
+    /// The shape and the order are pinned; each `vsn` is the **installation's** own (read
+    /// out of the `.app` file on the code path), which is why the tests compare it with the
+    /// live oracle instead of a literal.
     pub(super) fn application_loaded_applications(&mut self) -> Result<Eterm> {
         self.application_triples(false)
     }
 
     /// `application:which_applications/0`: the same triples in **reverse** order.
     ///
-    /// Oracle-verified (OTP 29/erts-17.1):
-    /// `[{stdlib,"ERTS  CXC 138 10","8.1"},{kernel,"ERTS  CXC 138 10","11.0.4"}]` — the
-    /// same pair `loaded_applications/0` reports, reversed. The oracle derives the two
-    /// lists from different internal sources (the loaded set of the application master
-    /// versus the running set of the application controller), so their orders differ; only
-    /// membership is meaningful and no contract pins the order, but agreeing with the
-    /// oracle costs one `reverse` and is worth it.
+    /// The oracle reports the same pair `loaded_applications/0` reports, reversed. The
+    /// oracle derives the two lists from different internal sources (the loaded set of the
+    /// application master versus the running set of the application controller), so their
+    /// orders differ; only membership is meaningful and no contract pins the order, but
+    /// agreeing with the oracle costs one `reverse` and is worth it. As with
+    /// `loaded_applications/0`, each `vsn` is the installation's own — never a literal.
     pub(super) fn application_which_applications(&mut self) -> Result<Eterm> {
         self.application_triples(true)
     }
@@ -965,8 +965,8 @@ mod tests {
     use crate::native::test_support::{atom, call, runtime, string_of, system_runtime};
     use beam_term::make_small;
 
-    /// The `description` every shipping OTP application resource declares (verified
-    /// against OTP 29/erts-17.1's `kernel-11.0.4` and `stdlib-8.1`).
+    /// The `description` every shipping OTP application resource declares (the app file's
+    /// own string, which is what the runtime reports and the oracle reports too).
     const DESCRIPTION: &str = "ERTS  CXC 138 10";
 
     /// The 2-tuple `terms::tuple_element` pair, or a test failure naming the answer.
@@ -1255,27 +1255,119 @@ mod tests {
             .collect()
     }
 
+    /// The `name|description|vsn` rendering of a triple list — one line per entry, the very
+    /// shape [`oracle_lines`] prints, so the two lists compare as text.
+    fn rendered(triples: &[(String, String, String)]) -> String {
+        triples
+            .iter()
+            .map(|(app, description, vsn)| format!("{app}|{description}|{vsn}\n"))
+            .collect()
+    }
+
+    /// `application:<function>()` under the live system `erl`, rendered by [`rendered`]'s
+    /// rule (one `name|description|vsn` line per entry).
+    ///
+    /// The caller resolves the oracle through
+    /// [`resolve_oracle`](crate::native::test_support::resolve_oracle) and skips **loudly**
+    /// when there is none, so a version is never compared against a pinned literal. A probe
+    /// that *can* run but fails is a test failure, not a skip.
+    fn oracle_lines(oracle: &std::path::Path, function: &str) -> String {
+        use std::process::{Command, Stdio};
+
+        let eval = format!(
+            "lists:foreach(fun({{A,D,V}}) -> io:format(\"~s|~s|~s~n\",[atom_to_list(A),D,V]) end, \
+             application:{function}()), halt(0)."
+        );
+        let output = Command::new(oracle)
+            .args(["-noshell", "-eval", &eval])
+            .stdin(Stdio::null())
+            .output()
+            .expect("the oracle runs");
+        assert!(
+            output.status.success(),
+            "the oracle probe for application:{function}() failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("the probe renders as UTF-8")
+    }
+
+    /// `application:get_key(App, vsn)` under the live system `erl`, as a plain string.
+    ///
+    /// The single-property sibling of [`oracle_lines`], with the same shape (the same
+    /// `-noshell -eval …` argv, null stdin, an `.output()` probe whose **failure is a test
+    /// failure**, never a skip) because a version read out of an installation's `.app` file
+    /// is only ever comparable to *that* installation's own value.
+    fn oracle_vsn(oracle: &std::path::Path, app: &str) -> String {
+        use std::process::{Command, Stdio};
+
+        let eval = format!(
+            "io:format(\"~s~n\", [element(2, application:get_key({app}, vsn))]), halt(0)."
+        );
+        let output = Command::new(oracle)
+            .args(["-noshell", "-eval", &eval])
+            .stdin(Stdio::null())
+            .output()
+            .expect("the oracle runs");
+        assert!(
+            output.status.success(),
+            "the oracle probe for application:get_key({app}, vsn) failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("the probe renders as UTF-8")
+            .trim_end()
+            .to_string()
+    }
+
+    /// Whether `vsn` is a well-formed OTP version string: non-empty, 2–3 dot-separated
+    /// all-digit components (`8.1`, `11.0.4`).
+    ///
+    /// The **shape** is what is asserted here, never a value — the value is the
+    /// installation's own (see [`loaded_applications_pins_kernel_then_stdlib`]), so this is
+    /// the rule that still fails on a fabricated or garbled version when no oracle is
+    /// installed to compare against.
+    fn well_formed_vsn(vsn: &str) -> bool {
+        let components: Vec<&str> = vsn.split('.').collect();
+        (2..=3).contains(&components.len())
+            && components.iter().all(|component| {
+                !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    }
+
     #[test]
     fn loaded_applications_pins_kernel_then_stdlib() {
         let Some(mut runtime) = system_runtime() else {
             return;
         };
-        // Oracle-verified (OTP 29/erts-17.1):
-        // `[{kernel,"ERTS  CXC 138 10","11.0.4"},{stdlib,"ERTS  CXC 138 10","8.1"}]`.
+        // The pinned half is structural: the application set and order, each entry's own
+        // description, and the 3-tuple shape ([`triples`] asserts it). The `vsn` is the
+        // **installation's** own — read out of the `.app` file on the code path — so it is
+        // not pinned: an OTP 29.1.2 installation answers `stdlib 8.1.1` where this tree's
+        // `lib/stdlib/vsn.mk` says `8.1`, and each is correct for its own installation.
+        // Two rules stand in for the literal: the version's shape here, and the live
+        // oracle's own list below.
+        let loaded = triples(&mut runtime, "loaded_applications");
+        let names: Vec<&str> = loaded.iter().map(|(app, _, _)| app.as_str()).collect();
+        assert_eq!(names, ["kernel", "stdlib"], "loaded order: {loaded:?}");
+        for (app, description, vsn) in &loaded {
+            assert_eq!(description, DESCRIPTION, "{app}'s own description");
+            assert!(
+                well_formed_vsn(vsn),
+                "{app}'s vsn {vsn:?} must be a well-formed OTP version string"
+            );
+        }
+
+        let Some(oracle) = crate::native::test_support::resolve_oracle() else {
+            crate::native::test_support::skip_oracle_loudly(
+                "application:loaded_applications/0 cross-check",
+                "the `[{Application, Description, Vsn}]` comparison",
+            );
+            return;
+        };
         assert_eq!(
-            triples(&mut runtime, "loaded_applications"),
-            vec![
-                (
-                    "kernel".to_string(),
-                    DESCRIPTION.to_string(),
-                    "11.0.4".to_string()
-                ),
-                (
-                    "stdlib".to_string(),
-                    DESCRIPTION.to_string(),
-                    "8.1".to_string()
-                ),
-            ]
+            rendered(&loaded),
+            oracle_lines(&oracle, "loaded_applications"),
+            "the runtime's list must equal the oracle's, entry for entry"
         );
     }
 
@@ -1284,25 +1376,60 @@ mod tests {
         let Some(mut runtime) = system_runtime() else {
             return;
         };
-        // Oracle-verified: `which_applications/0` reports the same pair **reversed**.
         let loaded = triples(&mut runtime, "loaded_applications");
         let which = triples(&mut runtime, "which_applications");
-        assert_eq!(which, loaded.into_iter().rev().collect::<Vec<_>>());
+
+        // The relation `which == reverse(loaded)` holds whatever the installation's versions
+        // are, and it is the whole point of this test.
+        assert_eq!(which, loaded.iter().rev().cloned().collect::<Vec<_>>());
         assert_eq!(
-            which,
-            vec![
-                (
-                    "stdlib".to_string(),
-                    DESCRIPTION.to_string(),
-                    "8.1".to_string()
-                ),
-                (
-                    "kernel".to_string(),
-                    DESCRIPTION.to_string(),
-                    "11.0.4".to_string()
-                ),
-            ]
+            loaded
+                .iter()
+                .map(|(app, _, _)| app.as_str())
+                .collect::<Vec<_>>(),
+            ["kernel", "stdlib"],
+            "loaded order: {loaded:?}"
         );
+        for (app, description, vsn) in &which {
+            assert_eq!(description, DESCRIPTION, "{app}'s own description");
+            assert!(
+                well_formed_vsn(vsn),
+                "{app}'s vsn {vsn:?} must be a well-formed OTP version string"
+            );
+        }
+
+        // And the reversed list is the oracle's own `which_applications/0`, versions
+        // included — so the order relation above is checked against a real system too.
+        let Some(oracle) = crate::native::test_support::resolve_oracle() else {
+            crate::native::test_support::skip_oracle_loudly(
+                "application:which_applications/0 cross-check",
+                "the reversed `[{Application, Description, Vsn}]` comparison",
+            );
+            return;
+        };
+        assert_eq!(
+            rendered(&which),
+            oracle_lines(&oracle, "which_applications"),
+            "the runtime's reversed list must equal the oracle's, entry for entry"
+        );
+    }
+
+    #[test]
+    fn the_vsn_shape_rule_admits_only_otp_version_strings() {
+        // The rule that replaces the pinned literal on a host with **no** oracle installed:
+        // a version is the installation's own, so only its shape can be asserted — and this
+        // is that shape, checked from both sides so it is not a rubber stamp.
+        for good in ["8.1", "11.0.4", "17.1", "1.2.3"] {
+            assert!(well_formed_vsn(good), "{good:?} is a well-formed version");
+        }
+        for bad in [
+            "", "8", "8.", ".1", "8..1", "8.a", "v8.1", "8.1 ", "8.1.1.1",
+        ] {
+            assert!(
+                !well_formed_vsn(bad),
+                "{bad:?} is not a well-formed version"
+            );
+        }
     }
 
     #[test]
@@ -1369,14 +1496,44 @@ mod tests {
         let kernel = atom(&mut runtime, "kernel");
         let stdlib = atom(&mut runtime, "stdlib");
 
-        // `{ok, Value}` for a declared string property.
-        for (key, expected) in [("vsn", "11.0.4"), ("description", DESCRIPTION)] {
+        // `{ok, Value}` for a declared string property. The description string is the same
+        // in every OTP, so it stays pinned exactly; the version is read out of the
+        // installation's own `kernel.app` on the code path (host OTP 29.1.2 answers
+        // `11.0.4` where this tree's `lib/kernel/vsn.mk` says `11.0`), so it is never a
+        // literal here — it is asserted below by shape and against the live oracle.
+        for (key, expected) in [("description", DESCRIPTION)] {
             let key_atom = atom(&mut runtime, key);
             let answer = call(&mut runtime, "application", "get_key", &[kernel, key_atom])
                 .expect("get_key/2");
             let (tag, value) = pair(answer);
             assert_eq!(runtime.atom_name_of(tag), Some("ok"));
             assert_eq!(string_of(value), expected, "get_key(kernel, {key})");
+        }
+
+        // `vsn` answers the app file's own version, never a fabricated one: a well-formed
+        // OTP version string, and — when a system `erl` is resolvable — exactly the value
+        // that installation's own `application:get_key(kernel, vsn)` answers. A missing
+        // oracle skips `vsn`'s cross-check **loudly** and lets the rest of this test run.
+        let vsn_key = atom(&mut runtime, "vsn");
+        let answer =
+            call(&mut runtime, "application", "get_key", &[kernel, vsn_key]).expect("get_key/2");
+        let (tag, value) = pair(answer);
+        assert_eq!(runtime.atom_name_of(tag), Some("ok"));
+        let vsn = string_of(value);
+        assert!(
+            well_formed_vsn(&vsn),
+            "get_key(kernel, vsn) = {vsn:?} must be a well-formed OTP version string"
+        );
+        match crate::native::test_support::resolve_oracle() {
+            Some(oracle) => assert_eq!(
+                vsn,
+                oracle_vsn(&oracle, "kernel"),
+                "the runtime's kernel vsn must be the oracle installation's own"
+            ),
+            None => crate::native::test_support::skip_oracle_loudly(
+                "application:get_key(kernel, vsn) cross-check",
+                "the version comparison",
+            ),
         }
 
         // A declared list-of-atoms property: stdlib's `{applications, [kernel]}`.

@@ -41,23 +41,40 @@
 //!
 //! Every case below is compared with the system Erlang oracle by **trimmed stdout equality plus
 //! the exit code**, with the rendering pinned as a golden too, so a regression fails even where
-//! the toolchain is absent. The probes read only keys whose value is the same in both runtimes
-//! (the erts `version` string, `{wordsize, internal}`, and a *predicate* over `otp_release`)
-//! — never `otp_release`'s digits themselves, which are this tree's release and not the
-//! oracle's. A missing toolchain is a **loud skip**, never a silent pass.
+//! the toolchain is absent. The probes read only keys whose value is comparable across hosts
+//! (`{wordsize, internal}`, a *predicate* over `otp_release`, and the erts `version` string) —
+//! never `otp_release`'s digits themselves, which are this tree's release and not the oracle's.
+//!
+//! **This runtime pins the tree's frozen erts version; the oracle may be a different erts
+//! *patch*.** `beam_common::ERTS_VERSION` is a compile-time constant, so this runtime answers it
+//! on every host, while `erlang:system_info(version)` under the system oracle answers whatever
+//! erts the installed OTP carries (e.g. `"17.1.1"` on an erts-17.1.1 host). The golden assertion
+//! therefore stays unconditional — the frozen value is the correct answer — and the oracle
+//! comparison tolerates **exactly one** difference: the oracle's own version literal, measured
+//! per run by [`assert_agrees_with_the_oracle`]. Any other divergence, including a different
+//! version *number* on this side, still fails.
+//!
+//! A missing toolchain is a **loud skip**, never a silent pass.
 #[allow(dead_code)]
 mod support;
+use std::path::Path;
 use std::process::Command;
 /// A `version` string retained across the fetch of `allocated_areas`.
 ///
 /// `allocated_areas` is the widest value the surface answers, so it overwrites every word the
-/// version string occupied. Golden and oracle: `A="17.1"` (both runtimes are erts `17.1`).
+/// version string occupied. Golden: `A="17.1"` — the tree's frozen erts version
+/// (`beam_common::ERTS_VERSION`), which this runtime answers on **every** host. The oracle
+/// answers *its own* erts version, which may be a different **patch** (`A="17.1.1"` on an
+/// erts-17.1.1 host); only that literal is accommodated in the oracle comparison.
 const VERSION_ACROSS_ALLOCATED_AREAS: &str = "A = erlang:system_info(version), \
      _ = erlang:system_info(allocated_areas), io:format(\"A=~p~n\", [A]).";
 /// The `epp:predef_macros/2` shape: a retained value, a wide key, then an **immediate** key.
 ///
 /// Before the fix this printed the atom the third call answered (`A="BEAM"`) — a
 /// well-formed, wrong value, which is worse than a crash because nothing reports it.
+///
+/// Golden `A="17.1"` for the same reason as above: the frozen erts version is the answer here,
+/// and the oracle's own patch literal is the one tolerated difference.
 const VERSION_ACROSS_WIDE_AND_IMMEDIATE: &str = "A = erlang:system_info(version), \
      _ = erlang:system_info(allocated_areas), _ = erlang:system_info(machine), \
      io:format(\"A=~p~n\", [A]).";
@@ -90,6 +107,53 @@ fn beam_eval(expr: &str) -> (String, i32) {
     )
 }
 
+/// The oracle's own erts `version` string, as `erlang:system_info(version)` renders it there.
+///
+/// Measured per run rather than assumed: the system oracle is whatever OTP the host carries, so
+/// its erts **patch** may differ from the tree's frozen [`beam_common::ERTS_VERSION`] (a host
+/// whose `erts-17.1.1` answers `"17.1.1"` where this tree pins `"17.1"`). `None` when the probe
+/// cannot answer — the caller then compares plainly instead of tolerating anything.
+fn oracle_erts_version(oracle: &Path) -> Option<String> {
+    let version = support::oracle_eval(
+        oracle,
+        None,
+        "io:format(\"~s~n\", [erlang:system_info(version)]).",
+    )?;
+    if version.is_empty() {
+        eprintln!("warning: the oracle answered an empty `system_info(version)`");
+        return None;
+    }
+    Some(version)
+}
+
+/// What this runtime's `stdout` must look like once the oracle's own erts patch is accounted for.
+///
+/// The runtime answers the tree's **frozen** erts version (`beam_common::ERTS_VERSION`) on every
+/// host, while the oracle answers its own — possibly a different *patch*. The single tolerated
+/// difference is that literal: when the oracle's version differs from the frozen one, the frozen
+/// version literal in `stdout` is substituted with the oracle's own, and everything else must
+/// still match byte for byte. When the versions are equal this is `stdout` unchanged, and when
+/// the oracle's version cannot be measured it is `stdout` unchanged too (a loud warning, never
+/// silence) — a genuinely different value fails either way, because only the version literal is
+/// rewritten.
+fn expected_under_the_oracle(stdout: &str, oracle: &Path) -> String {
+    match oracle_erts_version(oracle) {
+        Some(version) if version != beam_common::ERTS_VERSION => {
+            let frozen = format!("\"{}\"", beam_common::ERTS_VERSION);
+            let observed = format!("\"{version}\"");
+            stdout.replace(&frozen, &observed)
+        }
+        Some(_) => stdout.to_string(),
+        None => {
+            eprintln!(
+                "warning: the oracle's `system_info(version)` could not be measured; comparing \
+                 plainly, so an erts patch difference on this host will show up as a failure"
+            );
+            stdout.to_string()
+        }
+    }
+}
+
 /// Asserts this runtime prints `golden` for `expr` (exit 0) and that the oracle agrees.
 fn assert_agrees_with_the_oracle(banner: &str, expr: &str, golden: &str) {
     let (stdout, exit) = beam_eval(expr);
@@ -108,8 +172,11 @@ fn assert_agrees_with_the_oracle(banner: &str, expr: &str, golden: &str) {
     };
     match support::oracle_eval(&oracle, None, expr) {
         Some(expected) => assert_eq!(
-            stdout, expected,
-            "the retained value must be byte-identical to the system oracle's"
+            expected_under_the_oracle(&stdout, &oracle),
+            expected,
+            "the retained value must be byte-identical to the system oracle's, apart from the \
+             oracle's own erts version literal (this runtime pins the tree's frozen \
+             `beam_common::ERTS_VERSION`; the oracle may be a different erts patch)"
         ),
         None => eprintln!("warning: the oracle could not answer `{expr}`"),
     }

@@ -156,15 +156,15 @@
 //! two levels up; none is a magic number.
 
 use beam_common::Result;
-use beam_term::{ERL_SUB_BITS_FLAG_MASK, SUB_BITS_BASE_WORD, TAG_PRIMARY_HEADER, TAG_PRIMARY_MASK};
+use beam_term::{ERL_SUB_BITS_FLAG_MASK, TAG_PRIMARY_HEADER, TAG_PRIMARY_MASK};
 
 use crate::jit::baseline::runtime::jit_append_cursor;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::emit_y_slot_value;
 use super::super::{
-    HEADER_DISP, NOT_BOXED_MASK, POINTER_MASK, SUB_BITS_END_DISP, SUB_BITS_HEADER,
-    SUB_BITS_START_DISP,
+    HEADER_DISP, NOT_BOXED_MASK, POINTER_MASK, SUB_BITS_BASE_DISP, SUB_BITS_END_DISP,
+    SUB_BITS_HEADER, SUB_BITS_START_DISP,
 };
 use super::super::super::operands::Loc;
 use super::super::super::{Allocation, RUNTIME_SLOT_DISP};
@@ -212,14 +212,6 @@ const _: () = assert!(SUB_BITS_POINTER_MASK == SUB_BITS_POINTER_MASK_I32 as i64)
 /// [`SUB_BITS_HEADER`] as the `imm32` of [`CodeBuffer::cmp_ri`].
 const SUB_BITS_HEADER_I32: i32 = SUB_BITS_HEADER as i32;
 const _: () = assert!(SUB_BITS_HEADER == SUB_BITS_HEADER_I32 as i64);
-
-/// The byte offset of an `ErlSubBits`'s `base_flags` word (word 1) — the payload pointer
-/// plus its low flag bits (`erts/emulator/beam/erl_bits.h:60-82`).
-///
-/// Declared here rather than imported because the layout module two levels up carries the
-/// `start`/`end`/`orig` displacements but not this one; it is the same
-/// `beam_term::SUB_BITS_BASE_WORD` product those are (`[`SUB_BITS_START_DISP`]` is word 2).
-const SUB_BITS_BASE_DISP: i32 = (SUB_BITS_BASE_WORD * core::mem::size_of::<beam_term::Eterm>()) as i32;
 
 /// The divisor of a whole-byte window end: `end % 8 == 0` is C's append **position** gate for
 /// `unit == 8` (`append_unit_allows`, `erl_bits.c:1778-1784`), and the aligned route's byte
