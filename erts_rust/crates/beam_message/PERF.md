@@ -407,19 +407,29 @@ estimator — the N-op pass minus the 0-op pass on the same boot, so per-op star
 | case | before instr/op | after instr/op | delta |
 |---|---|---|---|
 | `copy_bound`/`send_recv` | 70 400 | 66 800 | **-5.2 %** |
-| `copy_bound`/`send_recv_plain` | 31 560 | 31 780 | +0.7 % (noise) |
+| `copy_bound`/`send_recv_plain` | 31 560 | 31 780 | +0.7 % — see the interleaved set below |
 | control: a two-process round trip with a **1-word** payload (no payload copy at all, `erlc`-compiled fixture, same driving recipe) | 30 716 | 30 843 | +0.4 % (load drift — no regression) |
+Re-run **interleaved** (3 alternating rounds, `before`/`after` order reversed on even rounds, load 170 -> 126) so that no
+round of one side sits next to a round of the other:
+| case | before, per round | after, per round | median delta |
+|---|---|---|---|
+| `send_recv` (N 200 000 -> 1 000 000) | 70 873.0 / 70 410.6 / 70 472.7 | 66 747.0 / 66 918.3 / 66 750.9 | **-5.28 %** (no overlap) |
+| `send_recv_plain` (N 50 000 -> 350 000) | 31 805.2 / 31 745.1 / 31 672.9 | 31 923.5 / 31 988.1 / 32 036.7 | **+0.77 %** (~240 instr/op) |
+The small, *consistent* `send_recv_plain` increase is published rather than dropped: its payload copies are 3 words (the
+literal is shared), so the change removes almost nothing there while adding one thread-local worklist access per copy,
+and a ~0.8 % shift over a 31.7 k-instruction row is the same order as the code-placement confound §7.2 documents (the
+two binaries differ by ~15 KB). Nothing in this node can make a 3-word copy cheaper; the row's cost is
+`beam_rt`'s (see §10).
 **Paired wall clock**, 15 alternating rounds per case (`before,after`, then the order reversed),
 `/proc/loadavg` **23.1 -> 30.4**:
 | case | before ns/op | after ns/op | delta | per-round duration spread |
 |---|---|---|---|---|
 | `copy_bound`/`send_recv` | 6 288.9 | 5 833.3 | **-7.2 %** | 5.1-7.9 ms |
 | `copy_bound`/`send_recv_plain` | 3 350.0 | 3 913.3 | +16.8 %, **not a result** | 0.58-1.77 ms (3x) |
-`send_recv` agrees in direction and rough size across both instruments; `send_recv_plain` separates from neither the
-instructions nor (at this load) the wall clock, and §7.2/§7.3 record it as the least claim-worthy row. The
-instructions figure does establish that the change is not a regression on it: that row's payload copies are 3 words
-(the literal is shared), so the work the change removes — a per-call worklist allocation, and one bounds test per cons
-cell — is small there by construction.
+`send_recv` agrees in direction and size across both instruments. `send_recv_plain` does not separate from the host's
+wall clock at this load (its 300 000-op pass runs 0.6-1.8 s round to round) and its instruction count moves the wrong
+way by ~0.8 %; §7.2/§7.3 already record it as the least claim-worthy row, and §10 says why this crate cannot be its
+lever.
 The row-level attribution behind the ceiling: the per-op payload copy is **957 of `send_recv`'s 70 400 instructions**
 and the whole `beam_message::copy` subtree is ~10.7 % **inclusive** (it contains the enqueue and the off-heap drain).
 Removing the copy *entirely* would therefore move the row ~1-3 %, not 25 % — see §10 for where the rest is and which
@@ -514,6 +524,13 @@ erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_mes
 erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message \
     --test send_perf -- --nocapture
 
+# the messages row A/B (S7.4): two release `beam_rt` binaries, marginal retired instructions per op
+erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt -p bench
+taskset -c 3 perf stat -e cpu_core/instructions/u,cpu_core/cycles/u -- \
+    "$BEAM_RT_BIN" -pa <fixture-dir> run <fixture-dir>/bench_copy_bound.beam bench_copy_bound:send_recv/1 200000
+taskset -c 3 perf stat -e cpu_core/instructions/u,cpu_core/cycles/u -- \
+    "$BEAM_RT_BIN" -pa <fixture-dir> run <fixture-dir>/bench_copy_bound.beam bench_copy_bound:send_recv/1 0
+#   -> (N-op pass - 0-op pass) / N is the per-op marginal; alternate the two binaries round by round
 # the release regime (the one to quote for a per-send shape):
 erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_message --release --tests
 taskset -c 3 erts_rust/target/release/deps/send_perf-* --nocapture
