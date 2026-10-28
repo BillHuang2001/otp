@@ -103,6 +103,7 @@ impl PutListShape {
     /// The helper reads every operand out of `machine.x`/`machine.y` and writes `dst`
     /// there too, so the arm never touches a cache register (see
     /// [`super::regalloc::cacheable_touches`]).
+    #[allow(dead_code)]
     pub(super) const fn registers(self) -> [u32; 0] {
         []
     }
@@ -222,6 +223,7 @@ pub(super) fn emit_put_list(
 /// with a zero static-deopt count for `PutList` over the same compile-free emission to
 /// prove the whole instruction stayed native.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn lowered() -> u64 {
     PUT_LIST_ARM.with(Cell::get).0
 }
@@ -231,6 +233,7 @@ pub(crate) fn lowered() -> u64 {
 /// A refusal emits zero bytes, so the counter is the proof that a refused shape reached the
 /// family arm rather than this one — the counterpart of [`lowered`].
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn declined() -> u64 {
     PUT_LIST_ARM.with(Cell::get).1
 }
@@ -238,6 +241,7 @@ pub(crate) fn declined() -> u64 {
 /// Reset both counters (a test that compiles more than one module asserts per-compile
 /// deltas rather than a running total).
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_counters() {
     PUT_LIST_ARM.with(|counts| counts.set((0, 0)));
 }
