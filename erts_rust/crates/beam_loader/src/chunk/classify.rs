@@ -129,13 +129,13 @@ pub const CHUNK_KINDS: &[ChunkKind] = &[
         id: ChunkId::ATTR,
         name: "Attr",
         class: ChunkClass::ParsedExposed,
-        reason: "module attributes -> Module::attributes (raw) + Module::attributes_term (decoded)",
+        reason: "module attributes -> Module::attributes (raw; the term is decoded on demand)",
     },
     ChunkKind {
         id: ChunkId::CINF,
         name: "CInf",
         class: ChunkClass::ParsedExposed,
-        reason: "compiler information term -> Module::compile_info (raw) + Module::compile_info_term (decoded)",
+        reason: "compiler information term -> Module::compile_info (raw; the term is decoded on demand)",
     },
     ChunkKind {
         id: ChunkId::LINE,
@@ -147,7 +147,7 @@ pub const CHUNK_KINDS: &[ChunkKind] = &[
         id: ChunkId::LOCT,
         name: "LocT",
         class: ChunkClass::ParsedExposed,
-        reason: "JIT-only local-function table (ExpT layout) -> Module::locals",
+        reason: "JIT-only local-function table (ExpT layout), parsed and validated (atom indices range-checked); not retained on the IR",
     },
     ChunkKind {
         id: ChunkId::OBSOLETE_ATOM,
@@ -165,7 +165,7 @@ pub const CHUNK_KINDS: &[ChunkKind] = &[
         id: ChunkId::META,
         name: "Meta",
         class: ChunkClass::ParsedExposed,
-        reason: "compiler feature metadata term (part of the module checksum) -> Module::meta (raw) + Module::meta_term (decoded)",
+        reason: "compiler feature metadata term (part of the module checksum) -> Module::meta (raw)",
     },
     ChunkKind {
         id: ChunkId::DBGB,

@@ -141,8 +141,25 @@ impl TaggedNumber<'_> {
 /// [`TaggedNumber::bytes`]. A sub-length whose tag is not `u`, or one at/above the
 /// C's `ERTS_SINT32_MAX - 9` bound (`beam_file.c:201`), yields
 /// `BeamError::BadArg`. Never panics.
+#[inline]
 pub(crate) fn read_tagged<'a>(r: &mut beam_codec::Reader<'a>) -> Result<TaggedNumber<'a>> {
     let b = r.u8()?;
+    read_tagged_from(r, b)
+}
+
+/// [`read_tagged`] with the tag/length byte already consumed — its inlinable head.
+///
+/// The two encodings whose value fits one machine word are here (the in-nibble form and
+/// the one-byte tail), so a caller that decodes operands in a loop — [`decode_operand`],
+/// which reads the byte itself and passes it in — gets them inline and pays a call only
+/// for the explicit-count form, which is out of line as [`read_tagged_explicit`].
+/// Behaviour is byte-identical to [`read_tagged`]: it *is* that function with the byte
+/// read hoisted out (`read_tagged(r)` = read one byte, then call this).
+#[inline]
+pub(crate) fn read_tagged_from<'a>(
+    r: &mut beam_codec::Reader<'a>,
+    b: u8,
+) -> Result<TaggedNumber<'a>> {
     let tag = b & 0x07;
     if (b & 0x08) == 0 {
         return Ok(TaggedNumber {
@@ -160,6 +177,20 @@ pub(crate) fn read_tagged<'a>(r: &mut beam_codec::Reader<'a>) -> Result<TaggedNu
             bytes: &[],
         });
     }
+    read_tagged_explicit(r, b)
+}
+
+/// The explicit-count tail of [`read_tagged`]: `(b >> 5) + 2` big-endian magnitude bytes,
+/// with a `u`-tagged sub-length (`count = S + 9`) when `(b >> 5) == 7`.
+///
+/// Kept out of line (`#[inline(never)]`) and cold (`#[cold]`): it is the only part of the
+/// primitive that is both rare in a real code stream and recursive (the sub-length is
+/// itself a tagged number), so inlining it into every operand decode would grow the hot
+/// loop for a path almost no instruction takes.
+#[cold]
+#[inline(never)]
+fn read_tagged_explicit<'a>(r: &mut beam_codec::Reader<'a>, b: u8) -> Result<TaggedNumber<'a>> {
+    let tag = b & 0x07;
     let count = if (b >> 5) < 7 {
         usize::from(b >> 5) + 2
     } else {
@@ -338,10 +369,27 @@ pub fn decode_stream(
             // `LoadAssert((i + 1) == arity)` (`beam_file.c:2352`): a `z,1` argument list is
             // always the instruction's *last* operand (the compiler emits the variadic
             // operand last, and the C expands it into the trailing argument slots).
-            if index + 1 < arity && matches!(operand, Operand::List(_)) {
+            //
+            // `index + 1 < arity` is tested first on purpose: on the final operand — and so
+            // on every 0- and 1-operand instruction, ≈35 % of a real stream — the
+            // discriminant test is never reached at all.
+            if index + 1 < arity && matches!(&operand, Operand::List(_)) {
                 return Err(bad_file("argument list is not the last operand"));
             }
-            check_label(&operand, version.label_count)?;
+            // The `f` bound against the chunk's `label_count` (the C's
+            // `raw_arg.word_value < code->label_count`, `beam_file.c:2324-2331`) is applied
+            // here, on the decoded operand: `f,0` is the `NO_FAIL` sentinel and is kept
+            // verbatim. A `z,1` argument list's elements *are* the instruction's trailing
+            // operands, so the rare list shape descends through `check_label_listed`.
+            match &operand {
+                Operand::Label(label) => {
+                    if label.0 != 0 && label.0 >= version.label_count {
+                        return Err(label_index_out_of_range());
+                    }
+                }
+                Operand::List(items) => check_label_listed(items, version.label_count)?,
+                _ => {}
+            }
             operands.push(operand);
         }
         instrs.push(RawInstr {
@@ -373,26 +421,39 @@ pub fn decode_stream(
 /// A short read, an out-of-range atom index, an over-wide non-`i` operand or an
 /// unknown/obsolete `z` sub-tag (notably sub-tag 0, the obsolete float form) yields
 /// [`beam_common::BeamError::BadArg`]. Never panics.
+///
+/// `#[inline(always)]` rather than a plain `#[inline]` hint, on measurement: the release
+/// cost model declines the hint (the body carries the eight-tag match plus the atom
+/// lookup), and that refusal is expensive. Over the committed `tests/load_cost.rs`
+/// workload — 200 real OTP modules, 13 loads each, `taskset -c 4 perf stat -e
+/// cpu_atom/instructions/u`, three runs, spread <0.01 % — the whole load path retires
+/// **18.000 G** instructions with `#[inline]` and **17.152 G** with `#[inline(always)]`
+/// (19.836 G before this change). There is exactly one hot call site — this function is
+/// called once per operand from [`decode_stream`]'s operand loop — so inlining its ~120
+/// instructions once buys the removal of a call and of the `Result<Operand>` round trip
+/// through the stack *per operand* (`Result` is indirect here: its widest variant makes it
+/// an sret).
+#[inline(always)]
 pub fn decode_operand(
     r: &mut beam_codec::Reader<'_>,
     atoms: &[Atom],
     types: &TypeTable,
 ) -> Result<Operand> {
-    // One tag/length byte plus its magnitude, decoded by the shared primitive.
-    let tagged = read_tagged(r)?;
-    let tag = tagged.tag;
+    // One tag/length byte plus its magnitude, decoded by the shared primitive. The byte is
+    // read here rather than inside `read_tagged` so the primitive's two word-sized arms
+    // (the in-nibble and one-byte-tail encodings, i.e. every real operand) inline straight
+    // into this match; only the explicit-count form calls out (`read_tagged_explicit`).
+    let b = r.u8()?;
+    let tagged = read_tagged_from(r, b)?;
     if !tagged.bytes.is_empty() {
         // The value did not fit a machine word: only `i` is allowed to be wider than
         // a word (it becomes a bignum literal); any other tag is the C's valueless
         // `TAG_o`, which fails the load (`beam_file.c:228-233`).
-        if tag != TAG_I {
-            return Err(bad_file("operand is wider than a machine word"));
-        }
-        return big_integer_operand(tagged.bytes);
+        return wide_operand(tagged);
     }
     let magnitude = tagged.word as u64;
 
-    match tag {
+    match tagged.tag {
         // `u` — untagged integer. The file's encoding is unsigned; the value is
         // carried as the IR's `i64` (the compiler only emits tagged integers that
         // fit, and `i` is the tag for a negative value). A `u` value above
@@ -407,11 +468,10 @@ pub fn decode_operand(
             if magnitude == 0 {
                 return Ok(Operand::Nil);
             }
-            let atom = atoms
-                .get(magnitude as usize)
-                .copied()
-                .ok_or_else(|| bad_file("atom index out of range"))?;
-            Ok(Operand::Atom(atom))
+            match atoms.get(magnitude as usize) {
+                Some(&atom) => Ok(Operand::Atom(atom)),
+                None => Err(cold_bad_file("atom index out of range")),
+            }
         }
         // `x` — X register.
         //
@@ -419,14 +479,14 @@ pub fn decode_operand(
         // above the runtime's register file cannot exist, so it is a malformed image.
         3 => {
             if magnitude >= MAX_REG {
-                return Err(bad_file("x register index out of range"));
+                return Err(cold_bad_file("x register index out of range"));
             }
             Ok(Operand::X(magnitude as u32))
         }
         // `y` — Y register (stack slot). Same bound as `x` (`beam_file.c:2335-2338`).
         4 => {
             if magnitude >= MAX_REG {
-                return Err(bad_file("y register index out of range"));
+                return Err(cold_bad_file("y register index out of range"));
             }
             Ok(Operand::Y(magnitude as u32))
         }
@@ -439,11 +499,40 @@ pub fn decode_operand(
         // bound, but the IR field is 32-bit, so a wider value would silently truncate into
         // a *different* character; reject it instead.
         6 => Ok(Operand::Character(narrow_u32(magnitude)?)),
-        // `z` — extended form; the magnitude is the sub-tag.
+        // `z` — extended form; the magnitude is the sub-tag. Its whole payload decoder is
+        // out of line and cold (see [`decode_extended`]): `z` operands are a small share of
+        // a stream and one of its sub-tags recurses into this function.
         7 => decode_extended(r, magnitude, atoms, types),
         // Tags 8–14 exist only inside the loader and must never appear in a file.
-        _ => Err(bad_file("unrecognized operand tag")),
+        _ => Err(cold_bad_file("unrecognized operand tag")),
     }
+}
+
+/// The over-wide operand path of [`decode_operand`], kept out of line.
+///
+/// A value that did not fit a machine word: only `i` may be wider than a word (it becomes
+/// a bignum literal, [`Operand::BigInteger`]); any other tag is the C's valueless `TAG_o`
+/// and fails the load (`beam_file.c:228-233`).
+#[cold]
+#[inline(never)]
+fn wide_operand(tagged: TaggedNumber<'_>) -> Result<Operand> {
+    if tagged.tag != TAG_I {
+        return Err(bad_file("operand is wider than a machine word"));
+    }
+    big_integer_operand(tagged.bytes)
+}
+
+/// The loader's `badarg`, constructed on the cold side of a hot branch.
+///
+/// [`bad_file`] *is* a constant ([`beam_common::BeamError::BadArg`]), so routing a failure
+/// through a `#[cold] #[inline(never)]` constructor is not about the error value: it is the
+/// branch hint. LLVM moves a block that calls a cold function out of the hot path, which
+/// keeps the operand decoder's straight-line match dense. Every failure arm of
+/// [`decode_operand`] and [`decode_stream`]'s label bound goes through here.
+#[cold]
+#[inline(never)]
+fn cold_bad_file(message: &'static str) -> beam_common::BeamError {
+    bad_file(message)
 }
 
 /// Builds the IR operand for an `i`-tagged integer that does not fit a machine word
@@ -520,6 +609,13 @@ fn sign_extend(magnitude: u64, byte_count: usize) -> i64 {
 ///
 /// Sub-tag `0` (the pre-R16B float form) and any unassigned sub-tag are rejected:
 /// only 1–5 are ever emitted.
+///
+/// Out of line and cold by construction: `z` operands are a small share of a real code
+/// stream, the sub-tag match is wide, and sub-tags 1 and 5 recurse back into
+/// [`decode_operand`] — so inlining it into the operand decoder would only thicken the hot
+/// loop.
+#[cold]
+#[inline(never)]
 fn decode_extended(
     r: &mut beam_codec::Reader<'_>,
     sub_tag: u64,
@@ -674,6 +770,7 @@ fn allocation_entry(kind: u64, number: u64) -> Result<AllocKind> {
 /// valid one (a wrong result rather than a typed error). The value is a size the IR cannot
 /// represent, so the loader reports [`beam_common::BeamError::SystemLimit`] — the same
 /// class it uses for its other representational bounds.
+#[inline]
 fn narrow_u32(value: u64) -> Result<u32> {
     u32::try_from(value).map_err(|_| beam_common::BeamError::SystemLimit)
 }
@@ -682,25 +779,35 @@ fn narrow_u32(value: u64) -> Result<u32> {
 ///
 /// The C asserts `raw_arg.word_value < code->label_count` for every non-zero `f` operand
 /// (`beam_file.c:2324-2331`); `f,0` is the `NO_FAIL` sentinel and is kept verbatim. A label
-/// operand may also appear inside a `z,1` argument list (`Operand::List`), so the walk
+/// operand may also appear inside a `z,1` argument list ([`Operand::List`]), so the walk
 /// descends into it — the C applies the same check to those slots, because a list's
 /// elements *are* the instruction's trailing operands.
-fn check_label(operand: &Operand, label_count: u32) -> Result<()> {
-    match operand {
-        Operand::Label(label) => {
-            if label.0 != 0 && label.0 >= label_count {
-                return Err(bad_file("label index out of range"));
+///
+/// [`decode_stream`] applies the plain [`Operand::Label`] bound inline (it is the shape
+/// essentially every instruction carries) and only a list operand — a rare, and recursive,
+/// shape — reaches this out-of-line walk.
+#[cold]
+#[inline(never)]
+fn check_label_listed(items: &[Operand], label_count: u32) -> Result<()> {
+    for item in items.iter() {
+        match item {
+            Operand::Label(label) => {
+                if label.0 != 0 && label.0 >= label_count {
+                    return Err(label_index_out_of_range());
+                }
             }
-            Ok(())
+            Operand::List(nested) => check_label_listed(nested, label_count)?,
+            _ => {}
         }
-        Operand::List(items) => {
-            for item in items.iter() {
-                check_label(item, label_count)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
+    Ok(())
+}
+
+/// The out-of-range `f` operand failure: a cold path, like [`cold_bad_file`].
+#[cold]
+#[inline(never)]
+fn label_index_out_of_range() -> beam_common::BeamError {
+    bad_file("label index out of range")
 }#[cfg(test)]
 mod tests {
     use super::*;

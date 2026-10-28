@@ -84,17 +84,16 @@ pub struct Chunks<'a> {
     pub attributes: Option<Vec<u8>>,
     /// The raw `CInf` chunk bytes, if present.
     ///
-    /// `CInf` is `term_to_binary(CompileInfo)` (`beam_asm.erl:236,309`); the decoded term
-    /// is materialized by [`crate::lower::build_module`] into
-    /// [`crate::ir::Module::compile_info_term`].
+    /// `CInf` is `term_to_binary(CompileInfo)` (`beam_asm.erl:236,309`); the bytes are
+    /// carried onto [`crate::ir::Module::compile_info`] and decoded on demand by a
+    /// consumer that needs the term.
     pub compile_info: Option<Vec<u8>>,
     /// The raw `Meta` chunk bytes, if present.
     ///
     /// `Meta` is the compiler's feature/CPU metadata, an external term written by
     /// `compile.erl` (`?META_CHUNK_NAME`) and passed through `beam_asm.erl:216-224`. It is
-    /// also part of the module checksum (`beam_file.c:1811-1815`), so it is captured raw;
-    /// the decoded term is materialized by [`crate::lower::build_module`] into
-    /// [`crate::ir::Module::meta_term`].
+    /// part of the module checksum (`beam_file.c:1811-1815`), so it is captured raw and
+    /// carried onto [`crate::ir::Module::meta`] — never decoded at load.
     pub meta: Option<Vec<u8>>,
     /// The `Code` header as the IR's [`CodeVersion`].
     pub code_version: CodeVersion,
@@ -355,8 +354,8 @@ mod tests {
         assert_eq!(chunks.literals, Vec::<Vec<u8>>::new());
         assert!(chunks.attributes.is_some());
         assert!(chunks.compile_info.is_some());
-        // The fixture carries a 45-byte `Meta` chunk, captured raw (and decoded into a
-        // term one layer up — `Module::meta_term`).
+        // The fixture carries a 45-byte `Meta` chunk, captured raw (it stays raw on the
+        // IR — `Module::meta` — and is never decoded at load).
         assert_eq!(chunks.meta.as_deref().map(<[u8]>::len), Some(45));
     }
 

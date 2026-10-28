@@ -125,16 +125,73 @@ struct BodyShape {
     blocks: usize,
 }
 
-/// The one structural pass over a raw body: the two counts [`BodyShape`] holds.
+/// [`BodyShape`] as a fold over the raw stream, advanced by [`group`]'s cut-finding walk
+/// (pass 1) as it visits each instruction once.
 ///
 /// [`lower_instr`] maps `Opcode::deallocate` to [`Instr::Deallocate`], `Opcode::r#return`
 /// to [`Instr::Return`], `Opcode::label` to [`Instr::Label`] and every other opcode to
 /// exactly one instruction, so a lowered body is element-for-element its raw body: the
-/// adjacent `deallocate`/`return` pairs sit at the same positions (and can never
-/// overlap, since `deallocate` cannot also be the `return` half of a pair) and the
-/// labels are the raw labels. `windows(2)` visits every instruction — as the first
-/// element of its pair, and the last one as the second element of the final pair — so
-/// one traversal answers both questions.
+/// adjacent `deallocate`/`return` pairs sit at the same positions (and can never overlap,
+/// since `deallocate` cannot also be the `return` half of a pair) and the labels are the
+/// raw labels. A body's raw length is its index range (`end - start`), so only the pair
+/// count has to be discovered as the stream goes by, and a `label` is one block.
+///
+/// That is why the fold is three arm hooks ([`label`](Self::label),
+/// [`deallocate`](Self::deallocate), [`ret`](Self::ret)) instead of a `push(opcode)` for
+/// every instruction: a `label`/`deallocate`/`return` is a few percent of a body, so every
+/// other instruction now costs the walk nothing at all, where the second pass this
+/// replaces (`body_shape`, one cache line per instruction) paid a loop iteration for each
+/// of them. `Copy`, so the walk can snapshot the state at a `label` and use it as the
+/// shape of a body ending there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ShapeAcc {
+    /// The fused pairs folded so far: each collapses two raw instructions into one.
+    pairs: usize,
+    /// The `label` instructions folded so far: one block each.
+    blocks: usize,
+    /// The index of the `deallocate` folded last. A pair is the adjacent `deallocate` /
+    /// `return`, so a `return` at `idx` fuses exactly when this is `idx - 1` — which is
+    /// also why no arm has to clear it.
+    deallocate: Option<usize>,
+}
+
+impl ShapeAcc {
+    /// Folds a `label` definition.
+    fn label(&mut self) {
+        self.blocks += 1;
+    }
+
+    /// Folds a `deallocate`: the only instruction that can start a fused pair.
+    fn deallocate(&mut self, idx: usize) {
+        self.deallocate = Some(idx);
+    }
+
+    /// Folds a `return`: it takes back a `deallocate` immediately before it.
+    fn ret(&mut self, idx: usize) {
+        if idx > 0 && self.deallocate == Some(idx - 1) {
+            self.pairs += 1;
+        }
+    }
+
+    /// The [`BodyShape`] of a body starting where this fold started and `len` raw
+    /// instructions long.
+    fn shape(&self, len: usize) -> BodyShape {
+        BodyShape {
+            instructions: len - self.pairs,
+            blocks: self.blocks,
+        }
+    }
+}
+
+/// The whole-body reference definition of [`BodyShape`], in one `windows(2)` pass.
+///
+/// [`ShapeAcc`] is the same fold expressed incrementally, and is what [`group`] uses (its
+/// walk visits every instruction anyway). This function is the definition the fold is
+/// checked against: the `debug_assert_eq!` that closes a cut re-derives that cut's prefix
+/// with it, and `tests::grouped_bodies_are_sized_exactly_like_the_whole_body_pass` runs
+/// whole bodies through [`group_functions_checked`] and compares the result with it, so
+/// the two cannot drift. Both callers are test-build-only in effect — a `debug_assert_eq!`
+/// folds away when debug assertions are off — so a release build runs only the fold.
 fn body_shape(body: &[RawInstr]) -> BodyShape {
     let mut shape = BodyShape {
         instructions: body.len(),
@@ -171,19 +228,36 @@ fn group(instrs: &[RawInstr], check: &mut Option<Check<'_, '_>>) -> Result<Vec<F
         arity: u32,
     }
 
-    // Pass 1: locate the cuts on the raw stream. Only the instructions whose IR
-    // shape the grouping itself needs are lowered — the `label` that names a
-    // function and the `func_info` that defines one.
+    // Pass 1: locate the cuts on the raw stream, folding each body's two counts as the
+    // walk passes over it. Only the instructions whose IR shape the grouping itself
+    // needs are lowered — the `label` that names a function and the `func_info` that
+    // defines one.
     let mut cuts: Vec<Cut> = Vec::new();
-    let mut last_label: Option<(Label, usize)> = None;
+    // `shapes[i]` is the [`BodyShape`] of the body `cuts[i]` introduces; a body's shape
+    // is settled when the next cut closes it (or, for the last body, at the end of the
+    // stream), so this lags `cuts` by one inside the loop.
+    let mut shapes: Vec<BodyShape> = Vec::new();
+    // The last `label` seen: its label, its index, and the fold state of the body that is
+    // open at it — i.e. exactly the shape of a body ending at that label, which is what a
+    // following `func_info` makes it.
+    let mut last_label: Option<(Label, usize, ShapeAcc)> = None;
+    // The fold of the body currently open, and the index its body starts at.
+    let mut open = ShapeAcc::default();
+    let mut body_start = 0usize;
     for (idx, raw) in instrs.iter().enumerate() {
         match raw.opcode {
             Opcode::label => {
                 // The only opcode that lowers to `Instr::Label`.
                 if let Instr::Label(label) = lower_instr(raw)? {
-                    last_label = Some((label, idx));
+                    // The snapshot is taken BEFORE the label is folded: if a `func_info`
+                    // follows, this label opens the next function, so the open body ends
+                    // just before it.
+                    last_label = Some((label, idx, open));
                 }
+                open.label();
             }
+            Opcode::deallocate => open.deallocate(idx),
+            Opcode::r#return => open.ret(idx),
             Opcode::func_info => {
                 // The only opcode that lowers to `Instr::FuncInfo`.
                 let (module, function, arity) = match lower_instr(raw)? {
@@ -194,8 +268,8 @@ fn group(instrs: &[RawInstr], check: &mut Option<Check<'_, '_>>) -> Result<Vec<F
                     } => (module, function, arity),
                     _ => return Err(bad_file("func_info does not lower to func_info")),
                 };
-                let (func_label, func_label_idx) =
-                    last_label.ok_or_else(|| bad_file("func_info without a preceding label"))?;
+                let (func_label, func_label_idx, closed) = last_label
+                    .ok_or_else(|| bad_file("func_info without a preceding label"))?;
                 // Only line markers may sit between the function label and the
                 // `func_info` that defines the function (`beam_file.c:2502-2589`).
                 for between in &instrs[func_label_idx + 1..idx] {
@@ -211,6 +285,34 @@ fn group(instrs: &[RawInstr], check: &mut Option<Check<'_, '_>>) -> Result<Vec<F
                     Some(Err(err)) => return Err(err),
                     _ => return Err(bad_file("func_info is not followed by an entry label")),
                 };
+                // The label closes the body the previous cut opened: `closed` is the fold
+                // of everything from that cut's `func_label_idx` up to here, and the body's
+                // raw length is its index range. Nothing precedes the FIRST cut's label but
+                // the stream prefix, which belongs to no body.
+                if !cuts.is_empty() {
+                    shapes.push(closed.shape(func_label_idx - body_start));
+                }
+                // This cut's body starts at `func_label_idx`. Its prefix — the function
+                // label, its `line` markers and this `func_info` — is exactly one label and
+                // contains no fusable pair (a pair would need a `deallocate` immediately
+                // before a `return`, and only `line` markers may follow the label), and the
+                // `func_info` it ends with is no `deallocate` either, so the fresh fold
+                // carries one block, no pair and no pending `deallocate`. Debug builds
+                // re-derive that from the whole-body reference.
+                debug_assert_eq!(
+                    body_shape(&instrs[func_label_idx..=idx]),
+                    BodyShape {
+                        instructions: idx + 1 - func_label_idx,
+                        blocks: 1,
+                    },
+                    "the prefix of a cut holds exactly its function label, and no pair"
+                );
+                open = ShapeAcc {
+                    pairs: 0,
+                    blocks: 1,
+                    deallocate: None,
+                };
+                body_start = func_label_idx;
                 cuts.push(Cut {
                     func_label,
                     func_label_idx,
@@ -228,6 +330,10 @@ fn group(instrs: &[RawInstr], check: &mut Option<Check<'_, '_>>) -> Result<Vec<F
         return Err(bad_file("module has no func_info"));
     }
 
+    // The last body runs to the end of the stream; the walk's fold state is its shape.
+    shapes.push(open.shape(instrs.len() - body_start));
+    debug_assert_eq!(shapes.len(), cuts.len());
+
     // Everything before the first function's label belongs to no function. It is
     // lowered only so a malformed prefix is still rejected.
     for raw in &instrs[..cuts[0].func_label_idx] {
@@ -242,10 +348,11 @@ fn group(instrs: &[RawInstr], check: &mut Option<Check<'_, '_>>) -> Result<Vec<F
             .get(i + 1)
             .map_or(instrs.len(), |next| next.func_label_idx);
         let body = &instrs[cut.func_label_idx..end];
-        // The body's two counts, from one pass: [`emit_fused`] applies the peephole rule
-        // as it lowers, so it emits `body.len() - pairs(body)` instructions, and it opens
-        // one block per label. Both allocations are therefore exact and never grow.
-        let shape = body_shape(body);
+        // The body's two counts, folded by pass 1 above ([`ShapeAcc`]): [`emit_fused`]
+        // applies the peephole rule as it lowers, so it emits `body.len() - pairs(body)`
+        // instructions, and it opens one block per label. Both allocations are therefore
+        // exact and never grow.
+        let shape = shapes[i];
         let mut code: Vec<Instr> = Vec::with_capacity(shape.instructions);
         let mut blocks: Vec<Block> = Vec::with_capacity(shape.blocks);
         let mut labels: BTreeMap<Label, usize> = BTreeMap::new();
@@ -301,7 +408,7 @@ fn group(instrs: &[RawInstr], check: &mut Option<Check<'_, '_>>) -> Result<Vec<F
 /// When `check` is `Some` (the checked route) each instruction is validated as it is
 /// emitted and a label definition is folded into `blocks`/`labels` at the same moment,
 /// which is what removes the second and third walks; `blocks` must then have room for
-/// exactly `body_shape(body).blocks` entries.
+/// exactly [`BodyShape::blocks`] entries, as pass 1's fold of `body` counted them.
 fn emit_fused(
     body: &[RawInstr],
     out: &mut Vec<Instr>,
@@ -866,6 +973,146 @@ mod tests {
                 blocks: 1
             }
         );
+    }
+
+    #[test]
+    fn grouped_bodies_are_sized_exactly_like_the_whole_body_pass() {
+        // The walk no longer re-reads a body to size its two vectors: pass 1 folds
+        // `ShapeAcc` as it visits each instruction once, so this is that fold's proof
+        // against the whole-body reference, through the REAL grouping (`lower_instr`,
+        // the fuse rule and the block construction included). Exhaustive over all
+        // 4^8 = 65 536 mixes of `deallocate`/`return`/`label`/`move` in two consecutive
+        // bodies — back-to-back pairs, a pair split by a label, a dangling `deallocate`,
+        // a trailing label — where the second body additionally follows the cut's
+        // `label`/`line`/`func_info`, which the previous body's fold had already seen.
+        const LEN: usize = 4;
+        let (module, function) = atoms();
+        // Labels 1..=4 introduce the two functions; a pattern's labels take their own id
+        // per position, so every definition in a stream is unique.
+        let context = ctx(256, 2, 4, 0);
+        let mut pairs = 0usize;
+        let mut labels = 0usize;
+        for pattern in 0..4u32.pow(2 * LEN as u32) {
+            let body = |first_label: u32, shift: u32| -> Vec<RawInstr> {
+                (0..LEN)
+                    .map(|i| {
+                        let shift = shift + 2 * i as u32;
+                        match (pattern >> shift) & 0b11 {
+                            0 => deallocate(1),
+                            1 => ret(),
+                            2 => label(first_label + i as u32),
+                            _ => raw(Opcode::r#move, vec![Operand::X(0), Operand::X(1)]),
+                        }
+                    })
+                    .collect()
+            };
+            let mut instrs = vec![label(1), func_info(module, function, 0), label(2)];
+            instrs.extend(body(100, 0));
+            // The cut, then the second body.
+            instrs.push(label(3));
+            instrs.push(raw(Opcode::line, vec![Operand::Integer(1)]));
+            instrs.push(func_info(module, function, 1));
+            instrs.push(label(4));
+            instrs.extend(body(200, 2 * LEN as u32));
+
+            let split = 3 + LEN;
+            let functions = group_functions_checked(&instrs, &context).unwrap();
+            assert_eq!(functions.len(), 2, "pattern {pattern:08b}");
+            for (i, raw) in [&instrs[..split], &instrs[split..]].iter().enumerate() {
+                let shape = body_shape(raw);
+                assert_eq!(
+                    functions[i].code.len(),
+                    shape.instructions,
+                    "body {i} of pattern {pattern:08b}"
+                );
+                assert_eq!(
+                    functions[i].blocks.len(),
+                    shape.blocks,
+                    "body {i} of pattern {pattern:08b}"
+                );
+                // The allocations the fold sized are exactly filled, in every profile.
+                assert_eq!(functions[i].code.len(), functions[i].code.capacity());
+                assert_eq!(functions[i].blocks.len(), functions[i].blocks.capacity());
+                pairs += raw.len() - shape.instructions;
+                labels += shape.blocks;
+            }
+        }
+        // The sweep really did cover both counts, so neither is vacuously exact.
+        assert!(pairs > 0, "the sweep must see fused pairs");
+        assert!(labels > 0, "the sweep must see labels");
+    }
+
+    #[test]
+    fn the_walk_sizes_a_body_ending_in_a_trailing_label_and_skips_the_prefix() {
+        // Two shapes the folded counts have to get right, both of which a per-body
+        // allocation turns into slack (and therefore a failed `debug_assert`) if the walk
+        // is off by one: the stream prefix belongs to NO body, and a body may end in a
+        // label of its own — a trailing label the reference counts only through
+        // `body.last()`. The cut's `label`/`line`/`func_info` are the instructions the
+        // walk folds into the closing body first and must re-attribute to the new one.
+        let (module, function) = atoms();
+        let prefix = raw(Opcode::r#move, vec![Operand::X(0), Operand::X(1)]);
+        let instrs = vec![
+            // The stream prefix: lowered, but part of no function.
+            prefix,
+            ret(),
+            // Body 0: label, func_info, label, fused pair, trailing label.
+            label(1),
+            func_info(module, function, 1),
+            label(2),
+            deallocate(1),
+            ret(),
+            label(3),
+            // The cut.
+            label(4),
+            raw(Opcode::line, vec![Operand::Integer(7)]),
+            func_info(module, function, 2),
+            // Body 1: label, fused pair, trailing label.
+            label(5),
+            deallocate(2),
+            ret(),
+            label(6),
+        ];
+        let context = ctx(7, 2, 8, 0);
+        let functions = group_functions_checked(&instrs, &context).unwrap();
+        assert_eq!(functions.len(), 2);
+        assert_eq!(
+            functions[0].code,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::FuncInfo {
+                    module,
+                    function,
+                    arity: 1
+                },
+                Instr::Label(Label(2)),
+                Instr::DeallocateReturn(1),
+                Instr::Label(Label(3)),
+            ]
+        );
+        assert_eq!(
+            functions[1].code,
+            vec![
+                Instr::Label(Label(4)),
+                Instr::Line(7),
+                Instr::FuncInfo {
+                    module,
+                    function,
+                    arity: 2
+                },
+                Instr::Label(Label(5)),
+                Instr::DeallocateReturn(2),
+                Instr::Label(Label(6)),
+            ]
+        );
+        // One block per label, as folded: three in each body.
+        assert_eq!(functions[0].blocks.len(), 3);
+        assert_eq!(functions[1].blocks.len(), 3);
+        // …and, in every profile, the allocations the fold sized are exactly filled.
+        for function in &functions {
+            assert_eq!(function.code.len(), function.code.capacity());
+            assert_eq!(function.blocks.len(), function.blocks.capacity());
+        }
     }
 
     #[test]
