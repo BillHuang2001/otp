@@ -167,10 +167,46 @@
 //! for an accumulator with one whole-binary tail (`<<Acc/binary, B/binary>>`), and it is the
 //! shape [`AppendPlan::binary_all`] carries: the lowering copies the source whole rather than
 //! writing a field at a static offset.
+//!
+//! # A bare build: the fresh classifier
+//!
+//! A `bs_create_bin` with **no accumulator** — a build that constructs its whole result in one
+//! go, such as the per-character `<<DecodeChar>>` in `emqx_base62:decode/2` — has no in-place
+//! append to plan and no payload to write into: its result is a fresh term whose bits are the
+//! concatenation of its fields. [`fresh_plan`] is that shape's static classifier and
+//! [`make_fresh_binary`] its one materialization rule, so a lowering neither re-derives the
+//! field list nor owns a second heap-bits layout writer.
+//!
+//! ## The accepted shape
+//!
+//! The same `[Type, Index, Unit, Flags, Value, Size]` groups, resolved by
+//! [`prepare`](super::prepared::prepare) — note a bare build's **first** group is its first
+//! *field*, not an accumulator, so the classifier walks every group with no skip — where every
+//! segment is a statically sized **unsigned big-endian** `integer` of `1..=64` bits over an x-
+//! or y-register, and the summed width is `1..=64` bits. Everything else is `None`, exactly as
+//! for [`append_plan`]: a `binary`/`string`/`float`/`utf*`/`append` segment, a `Dynamic`/`All`
+//! width, a literal-area value operand, a `little`/`signed`/`native` flag (a lowering that
+//! wrote a `-native`/`little`/`signed` field big-endian unsigned would produce a **wrong**
+//! value, so it declines rather than approximates; `unsigned`/`big` are the default flag atoms
+//! and decode to `0`, so they are accepted), a field of zero width, and a total past one
+//! machine word.
+//!
+//! ## The invariant a lowering relies on
+//!
+//! For such a field the family's write is `value & mask(nbits)` of a **small integer** (C's
+//! `erts_bs_put_integer_be`, `erl_bits.c:952`), so masking is exact for a negative value too —
+//! its low `nbits` bits *are* its two's complement — and no compile-time range or type check
+//! is needed. Only "is a small integer" must be tested at run time; a value that is not one
+//! (a bignum, a float, an atom) is the family's own masked wide-int write or its bare
+//! `badarg`, so a lowering must hand such an operand back to the family instead of packing it.
+//! The concatenation itself is [`FreshPlan::total_bits`] wide, first field most significant.
 
+use beam_common::Result;
 use beam_loader::{Module, Operand, Reg};
 use beam_term::Eterm;
 
+use crate::context::ExecutionContext;
+use crate::error;
 use crate::families::bitstrings::{decode_flags, raw, BSF_LITTLE, BSF_NATIVE, BSF_SIGNED};
 use crate::machine::Machine;
 
@@ -344,6 +380,146 @@ pub(crate) fn append_plan(module: &Module, segments: &[Operand]) -> Option<Appen
         fields,
         binary_all: None,
     })
+}
+
+/// One compile-time field of a bare (`accumulator-less`) `bs_create_bin` build.
+// The consumer outside the tests is the baseline tier's bare-build arm (`src/jit`), which is
+// wired beside this seam; the `not(test)` gate keeps the crate's `#[cfg(test)]` census of the
+// seam honest in the meantime.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FreshPlan {
+    /// The fields in instruction order, each a run-time value written MSB-first. Always
+    /// [`Field::Bits`] — a bare build has no accumulator for a [`Field::ConstBytes`] to be
+    /// ordered against, so a `string` segment is declined outright.
+    pub(crate) fields: Vec<Field>,
+    /// The summed width: exactly the built bitstring's own bit size, `1..=64`.
+    pub(crate) total_bits: u32,
+}
+
+/// The compile-time half of a **bare** `bs_create_bin` build: recognise a segment list with
+/// no accumulator whose fields can be packed into one machine word, and resolve them — or
+/// `None` when the shape is not one a lowering may pack.
+///
+/// A bare build's **first** group is its first field (there is no accumulator group to skip,
+/// unlike [`append_plan`]'s [`segment_groups`]), so every group is walked. Each segment must
+/// be a statically sized **unsigned big-endian** `integer` of `1..=64` bits over an x- or
+/// y-register ([`locatable_operand`]); the summed width must be `1..=64` bits, which is the
+/// one machine word a packed lowering carries. See the module docs for the accepted shape and
+/// the masking invariant a lowering relies on.
+///
+/// Pure over the module image and the instruction's operands: it reads, allocates nothing and
+/// mutates nothing, and `None` is never an error — it means "this instruction is not that
+/// shape", so the tier keeps the family's own route.
+#[cfg_attr(not(test), allow(dead_code))] // see `FreshPlan`
+pub(crate) fn fresh_plan(module: &Module, segments: &[Operand]) -> Option<FreshPlan> {
+    // `prepare` declines a truncated (or stray) operand list too; an empty list is declined
+    // here because a build with no fields has nothing to pack.
+    if segments.is_empty() || segments.len() % SEGMENT_OPERANDS != 0 {
+        return None;
+    }
+    let program = prepare(module, segments)?;
+    let mut fields = Vec::with_capacity(program.segments.len());
+    let mut total_bits: u32 = 0;
+    // `prepare` walks the same fixed-width groups in the same order, so the raw operands line
+    // up with the prepared segments one for one. They are needed for the flags: the
+    // direct-store form (`ByteInt`) keeps only the endianness, so a `signed` whole-byte field
+    // is indistinguishable from an unsigned one there — and a field a lowering writes
+    // MSB-first as an unsigned value must never be signed (or `little`/`native`).
+    for (segment, group) in program
+        .segments
+        .iter()
+        .zip(segments.chunks_exact(SEGMENT_OPERANDS))
+    {
+        let flags = decode_flags(module, &group[3]).ok()?;
+        if flags & (BSF_LITTLE | BSF_SIGNED | BSF_NATIVE) != 0 {
+            return None;
+        }
+        let (value, bits) = match segment {
+            // A 1/2/4/8-byte field: `prepare` settled the width and the store shape.
+            PreparedSeg::ByteInt {
+                value,
+                bytes,
+                little: false,
+            } => (value, u32::from(*bytes) * 8),
+            // Any other static width (whole-byte or bit-granular).
+            PreparedSeg::Integer {
+                value,
+                width: Width::Imm(nbits),
+                ..
+            } => (value, u32::try_from(*nbits).ok()?),
+            // An `append`, `binary`, `string`, `float`, `utf*`, a `Dynamic`/`All` width: not
+            // this shape.
+            _ => return None,
+        };
+        if !(1..=64).contains(&bits) {
+            return None;
+        }
+        fields.push(Field::Bits {
+            value: locatable_operand(value)?,
+            bits,
+        });
+        total_bits = total_bits.checked_add(bits)?;
+    }
+    // One machine word is the whole budget, and a zero-field build is nothing to pack.
+    if !(1..=64).contains(&total_bits) {
+        return None;
+    }
+    Some(FreshPlan { fields, total_bits })
+}
+
+/// Materialise a **fresh** bare-build result: the low `nbits` bits of `packed`, as the
+/// family's own on-heap bitstring.
+///
+/// This is the one materialization rule for a fresh build (the bare twin of
+/// [`write_bit_field`]'s "one definition" role), so no second heap-bits layout writer exists:
+/// it lays `packed` out as a bit sequence in a stack `[u8; 8]` — **left-aligned**, so a field
+/// of `nbits % 8 != 0` leaves the low bits of the final byte zero — and hands the bytes to
+/// [`raw::make_bits`], which zeroes the padding and masks the unused trailing bits of that
+/// final byte. Nothing here re-derives [`beam_term::bitstring`]'s layout.
+///
+/// # Caller contract
+///
+/// * `packed` is the concatenation of a [`FreshPlan`]'s [`Field::Bits`] values, **the first
+///   field in the most significant position**, with each value already the field's masked low
+///   `bits` (for a negative small integer that is its two's complement, exactly what the
+///   family writes). The concatenation is a *bit* sequence, not a byte sequence: a 1-bit field
+///   of `1` is the single top bit of the result (`0x80` in the first byte), never `0x01`.
+/// * `nbits` is the plan's [`FreshPlan::total_bits`], `1..=64`. A value outside that band is
+///   the caller's own bug, not a reachable runtime case, and is answered with a typed
+///   [`error::unsupported`].
+/// * The call **allocates on the process heap**, so every live term may move: the caller must
+///   re-read every register, stack slot and raw pointer it still holds afterwards. It goes
+///   through the rooted reserve ([`raw::make_bits`]'s `alloc_rooted`), so the machine's own
+///   root set is relocated correctly.
+/// * It is **re-execution idempotent** for the same `(packed, nbits)`: it writes no machine
+///   state, so a parked instruction may be re-executed from the top and produces an equal
+///   term (a fresh block, the same bits).
+#[cfg_attr(not(test), allow(dead_code))] // see `FreshPlan`
+pub(crate) fn make_fresh_binary(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    packed: u64,
+    nbits: usize,
+) -> Result<Eterm> {
+    if nbits == 0 || nbits > 64 {
+        return Err(error::unsupported(
+            "bs_create_bin: fresh build width outside 1..=64 bits",
+        ));
+    }
+    let nbytes = nbits.div_ceil(8);
+    let mut buf = [0u8; 8];
+    // The fields' concatenation is a **bit sequence** — first field most significant — so the
+    // last byte carries its bits at the top and the low bits past `nbits` stay zero. Writing
+    // the whole word left-aligned and taking its top `nbytes` bytes is exactly that split:
+    // result bit `p` is bit `nbits - 1 - p` of `packed`. (Right-aligning the bytes instead
+    // would read a 1-bit field `1` as `0x01`, i.e. answer `<<0:1>>`.) `raw::make_bits` masks
+    // the unused trailing bits of the final byte, so no extra masking is needed here.
+    let left = packed << (64 - nbits);
+    for (index, byte) in buf.iter_mut().take(nbytes).enumerate() {
+        *byte = (left >> (56 - 8 * index)) as u8;
+    }
+    raw::make_bits(machine, ctx, &buf[..nbytes], nbits)
 }
 
 /// The **byte-aligned** run-time door: the payload base address and the window end (in
