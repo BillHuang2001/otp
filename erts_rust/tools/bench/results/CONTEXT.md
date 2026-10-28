@@ -8,7 +8,7 @@ The `m<session>-` prefix names the measurement session the files belong to; the 
 
 ## API Surface (what each file is)
 
-### `m23-` — the current session: the startup round's four-side A/B + the sweep at that state (2026-10-29, `/proc/loadavg` 66.0–74.1 boot A/B, 66.0–67.7 `slice`)
+### `m23-` — the current session: the startup round's four-side A/B + the sweep at that state (2026-10-29, `/proc/loadavg` 68.4–74.1 boot A/B, 66.0–67.7 `slice`)
 - A **binary A/B**, not a cross-runtime matched round: four sides sampled **inside every round** (side order reshuffled by a seeded RNG) — `old` = the pre-round `beam_rt` build, `new` = HEAD (the phase-scoped tier rule), `newpin` = the **same HEAD binary with `BEAM_RT_TIER=baseline`**, `sys` = the oracle `erl` (OTP **29.1.2 / erts-17.1.1**): `m23-boot-wall.json` (21 rounds) and `m23-slice-wall.json` (15 rounds). Each sample carries wall (`perf_counter` around `fork`/`wait4`), **CPU (`ru_utime + ru_stime`, the load-robust column)** and peak RSS (`ru_maxrss`); `/proc/loadavg` is logged before and after every round and every sample is pinned `taskset -c 3`.
 - `m23-boot-ab.json` / `m23-slice-ab.json` — the same instruments' **contended** counterparts (1-min load 454–490): archived as evidence only, never as a timing source.
 - `m23-bench-{old,new}-r{1,2,3}.json` — the driver's own rust-only non-regression rounds (`run --quick --runtime rust --workloads slice,list_walk,copy_bound,baseline`, alternating side order; 6 passes, 24/24 rows `ok`, no withheld marginal), the source of the round's peak-RSS and deterministic-counter rows.

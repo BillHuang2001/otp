@@ -561,7 +561,7 @@ medians** — never an absolute.
 `taskset -c 3`. Four sides: `old` = the **pre-round `beam_rt` build**, `new` = **HEAD** (the phase-scoped
 tier rule), `newpin` = the **same HEAD binary run with `BEAM_RT_TIER=baseline`**, `sys` = the system oracle
 `erl` (**OTP 29.1.2 / erts-17.1.1** — m21/m22's oracle, not m19's 29.1.1). 1-min `/proc/loadavg`: the boot
-A/B is **21 rounds at 66.0–74.1**, the `slice` run **15 rounds at 66.0–67.7**, recorded before and after
+A/B is **21 rounds at 68.4–74.1**, the `slice` run **15 rounds at 66.0–67.7**, recorded before and after
 every round, with the side order reshuffled per round.
 Two instruments: (1) the four-side spawn A/B — wall from `perf_counter` around `fork`/`wait4`, **CPU =
 `ru_utime + ru_stime`** (the load-robust column), peak RSS from `ru_maxrss`; (2) the driver's own
@@ -574,13 +574,13 @@ steady-state slope.
 - **wall at 1-min load > 20.** Three archived pairs are the round's *contended* counterparts, kept only as
   evidence and never as a timing source: `m23-boot-ab.json` and `m23-slice-ab.json` (load 454–490) and the
   first A/B, `m23-tier-{old,new}-r{1..5}.json` (`m23-tier-loads.txt`, load 73–161). Every boot/`slice` cell
-  below comes from the load-66–74 window.
+  below comes from that quiet window (68.4–74.1 for the boot rounds, 66.0–67.7 for `slice`).
 - **the `ns_per_*` / per-call rows.** `case_*_ns_per_*` is `N`-dependent on the rust side and the host is
   shared (§3.3 applies unchanged); the `peak_memory_bytes` rows below are boot-dominated except `slice`
   (N=1). Read the paired ratios and the deterministic `case_*` counters.
 - **any absolute wall time as a constant.**
 
-### Boot — 21 interleaved rounds, 1-min load 66–74 (`m23-boot-wall.json`)
+### Boot — 21 interleaved rounds, 1-min load 68.4–74.1 (`m23-boot-wall.json`)
 
 | side | wall p50 (ms) | wall p95 (ms) | CPU p50 `utime+stime` (ms) | peak RSS p50 (MiB) |
 |---|---|---|---|---|
