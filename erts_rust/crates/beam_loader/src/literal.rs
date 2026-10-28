@@ -112,10 +112,8 @@ impl LiteralArea {
     /// The decoded arena is literal-tagged before it is published: the initialized
     /// words and each boxed/list root are ORed with `TAG_LITERAL_PTR` via
     /// [`beam_term::literal::tag_literal_area`] (the safe form of the C
-    /// `erts_set_literal_tag`). Tagging happens **only** here — the shared
-    /// `decode_terms`/`decode_terms_at_capacity` helpers are also used by
-    /// [`crate::attributes::AttributeTable`], whose terms are ordinary heap terms
-    /// and must not carry the literal bit.
+    /// `erts_set_literal_tag`). Tagging happens **only** here, on the payloads the
+    /// `LitT` chunk carries.
     pub fn decode(raw: &[Vec<u8>], atoms: &mut AtomTable) -> Result<LiteralArea> {
         if raw.is_empty() {
             return Ok(LiteralArea::empty());
@@ -194,9 +192,8 @@ fn estimate_capacity(count: usize, total_bytes: usize) -> usize {
 
 /// Decodes `raw` into a fresh arena sized from the payloads' total length.
 ///
-/// Returns the arena and the decoded terms; shared with
-/// [`crate::attributes::AttributeTable`] so the arena-sizing and heap-growth retry
-/// live in one place.
+/// Returns the arena and the decoded terms; the arena-sizing and heap-growth retry live
+/// in one place for every caller ([`LiteralArea::decode`]).
 pub(crate) fn decode_terms(raw: &[Vec<u8>], atoms: &mut AtomTable) -> Result<(Heap, Vec<Eterm>)> {
     let total_bytes: usize = raw.iter().map(Vec::len).sum();
     decode_terms_at_capacity(raw, atoms, estimate_capacity(raw.len(), total_bytes))

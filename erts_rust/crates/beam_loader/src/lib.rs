@@ -59,11 +59,9 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod attributes;
 pub mod checksum;
 pub mod chunk;
 pub mod container;
-pub mod decoded;
 pub mod decode;
 pub mod error;
 pub mod instr;
@@ -76,8 +74,6 @@ pub mod opcode;
 pub mod operand;
 pub mod raw;
 
-pub use crate::attributes::{AttributeTable, SharedAttributeTable};
-pub use crate::decoded::{DecodedTerm, SharedDecodedTerm};
 pub use crate::ir::*;
 pub use crate::labels::{
     build_label_map, import_target, label_map_builds, reset_label_map_builds, LabelMap,
@@ -95,14 +91,10 @@ pub use crate::raw::{RawOperands, INLINE_OPERANDS};
 /// [`FunDescriptor`](crate::ir::FunDescriptor)), the per-image label/import index
 /// ([`LabelMap`](crate::labels::LabelMap),
 /// [`SharedLabelMap`](crate::labels::SharedLabelMap)), the decoded literal area
-/// ([`literal::*`](crate::literal)), the decoded term-chunk holders
-/// ([`AttributeTable`](crate::attributes::AttributeTable),
-/// [`DecodedTerm`](crate::decoded::DecodedTerm)), the operand and register
+/// ([`literal::*`](crate::literal)), the operand and register
 /// identifiers (`operand::*`), the opcode roster (`opcode::*`) and the two entry
 /// points ([`load`], [`load_file`]) into scope. Mirrors the crate-root re-exports.
 pub mod prelude {
-    pub use crate::attributes::{AttributeTable, SharedAttributeTable};
-    pub use crate::decoded::{DecodedTerm, SharedDecodedTerm};
     pub use crate::ir::*;
     pub use crate::labels::{
         build_label_map, import_target, label_map_builds, reset_label_map_builds, LabelMap,

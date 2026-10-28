@@ -35,8 +35,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::attributes::{AttributeTable, SharedAttributeTable};
-use crate::decoded::{DecodedTerm, SharedDecodedTerm};
 use crate::labels::{LabelMap, SharedLabelMap};
 use crate::literal::LiteralArea;
 use crate::operand::Label;
@@ -290,14 +288,6 @@ pub struct Module {
     pub atom_table: beam_term::AtomTable,
     /// The `ExpT` exports.
     pub exports: Vec<Export>,
-    /// The `LocT` local-function table (one entry per non-exported local function).
-    ///
-    /// Byte-for-byte the `ExpT` layout, so the label is the local function's **entry**
-    /// label. The C keeps this table only for `erts_jit_asm_dump` (`beam_file.c:1684`)
-    /// and it is irrelevant to interpretation; it is exposed here as an *additive*
-    /// field so a loaded module still records that the chunk was recognized rather
-    /// than silently skipped.
-    pub locals: Vec<Export>,
     /// The `ImpT` imports (the single source of BIF identity).
     pub imports: Vec<Import>,
     /// The module's functions.
@@ -318,47 +308,29 @@ pub struct Module {
     pub strings: Vec<u8>,
     /// The raw `Attr` chunk bytes, if present.
     ///
-    /// Kept alongside [`Module::attribute_table`] (the decoded term) — the raw bytes
-    /// are what feeds the module checksum, the decoded term what
-    /// `module_info(attributes)` serves.
+    /// `Attr` is `term_to_binary(set_vsn_attribute(Attr, MD5))`
+    /// (`lib/compiler/src/beam_asm.erl:307-310`), the value `Module:module_info(attributes)`
+    /// serves. It is kept **raw**: the C decodes it only when `module_info` asks
+    /// (`erts/emulator/beam/erl_bif_info.c:5873-5894`, `attributes_for_module` →
+    /// `erts_decode_ext`), and the runtime's module-info bridge does the same on demand.
     pub attributes: Option<Vec<u8>>,
-    /// The decoded `Attr` chunk: the module's attributes as an Erlang term.
-    ///
-    /// Shared behind an [`Arc`] (the table owns a heap), so a `Module` clone stays
-    /// cheap. Reachable through [`Module::attributes_term`] /
-    /// [`Module::attribute_by_name`].
-    pub attribute_table: SharedAttributeTable,
     /// The raw `CInf` chunk bytes, if present.
-    ///
-    /// Kept alongside [`Module::compile_info_table`] (the decoded term) — the raw bytes
-    /// are what a byte-level consumer (and the module checksum) sees, the decoded term
-    /// what `module_info(compile)` serves.
-    pub compile_info: Option<Vec<u8>>,
-    /// The decoded `CInf` chunk: the compiler information as an Erlang term.
     ///
     /// `CInf` is `term_to_binary([{version,?COMPILER_VSN}|Compile])`
     /// (`lib/compiler/src/beam_asm.erl:236,309`), the value the oracle's
-    /// `Module:module_info(compile)` returns (the C decodes it on demand:
-    /// `erts/emulator/beam/erl_bif_info.c:5896-5918`, `compilation_info_for_module` →
+    /// `Module:module_info(compile)` returns. It is kept **raw** for the same reason as
+    /// [`Module::attributes`]: the C decodes it on demand
+    /// (`erts/emulator/beam/erl_bif_info.c:5896-5918`, `compilation_info_for_module` →
     /// `erts_decode_ext`).
-    ///
-    /// Shared behind an [`Arc`] (the holder owns a heap), so a `Module` clone stays
-    /// cheap. Reachable through [`Module::compile_info_term`].
-    pub compile_info_table: SharedDecodedTerm,
+    pub compile_info: Option<Vec<u8>>,
     /// The raw `Meta` chunk bytes, if present (part of the module checksum).
-    pub meta: Option<Vec<u8>>,
-    /// The decoded `Meta` chunk: the compiler's feature metadata as an Erlang term.
     ///
     /// `Meta` is `term_to_binary(MetaData, [deterministic])` written by
     /// `lib/compiler/src/compile.erl:2274-2295` (the `?META_CHUNK_NAME` extra chunk)
     /// and passed through `beam_asm.erl:216-224`; it is a property list, e.g.
     /// `[{enabled_features,[maybe_expr]}]`. The C only feeds the raw bytes to the module
-    /// checksum (`erts/emulator/beam/beam_file.c:1811-1815`); the decoded term is exposed
-    /// here for the tooling/introspection layer.
-    ///
-    /// Shared behind an [`Arc`] (the holder owns a heap), so a `Module` clone stays
-    /// cheap. Reachable through [`Module::meta_term`].
-    pub meta_table: SharedDecodedTerm,
+    /// checksum (`erts/emulator/beam/beam_file.c:1811-1815`); they stay raw here too.
+    pub meta: Option<Vec<u8>>,
     /// The module **checksum**: the 16-byte MD5 over a fixed subset of the container.
     ///
     /// Computed at load time by [`crate::checksum::module_md5`] exactly as the C loader
@@ -391,7 +363,6 @@ impl Default for Module {
             atoms: Vec::new(),
             atom_table: beam_term::AtomTable::new(),
             exports: Vec::new(),
-            locals: Vec::new(),
             imports: Vec::new(),
             functions: Vec::new(),
             funs: Vec::new(),
@@ -402,11 +373,8 @@ impl Default for Module {
             literals: Arc::new(LiteralArea::default()),
             strings: Vec::new(),
             attributes: None,
-            attribute_table: Arc::new(AttributeTable::default()),
             compile_info: None,
-            compile_info_table: Arc::new(DecodedTerm::default()),
             meta: None,
-            meta_table: Arc::new(DecodedTerm::default()),
             checksum: [0u8; 16],
             label_map: SharedLabelMap::empty(),
         }
@@ -508,67 +476,5 @@ impl Module {
     pub fn record_by_name(&self, name: &str) -> Option<&RecordDefinition> {
         let atom = self.atom_table.lookup(name)?;
         self.record(atom)
-    }
-
-    /// The module's attributes as a decoded Erlang term (the `Attr` chunk), or `None`
-    /// when the chunk is absent/empty.
-    ///
-    /// This is exactly what the oracle's `Module:module_info(attributes)` returns: a
-    /// `[{Key, Value}]` property list. The terms point into the module's own atom table
-    /// and attribute heap, so they stay valid for as long as this module.
-    pub fn attributes_term(&self) -> Option<Eterm> {
-        self.attribute_table.term()
-    }
-
-    /// The value of the attribute named `name` (e.g. `"vsn"`), or `None` when the
-    /// module declares no such attribute.
-    ///
-    /// The name is resolved through this module's atom table first (like
-    /// [`Module::record_by_name`]), so the lookup works with the module-local atoms the
-    /// decoded attribute list carries.
-    pub fn attribute_by_name(&self, name: &str) -> Option<Eterm> {
-        let atom = self.atom_table.lookup(name)?;
-        self.attribute_table.lookup(beam_term::make_atom(atom))
-    }
-
-    /// The module's compiler information as a decoded Erlang term (the `CInf` chunk),
-    /// or `None` when the chunk is absent/empty.
-    ///
-    /// This is exactly what the oracle's `Module:module_info(compile)` returns: a
-    /// `[{version, Vsn}, {options, Opts}, {source, File}]` property list. The term points
-    /// into the module's own atom table and compile-info heap, so it stays valid for as
-    /// long as this module.
-    pub fn compile_info_term(&self) -> Option<Eterm> {
-        self.compile_info_table.term()
-    }
-
-    /// The value of the first `{Key, Value}` pair in the decoded `CInf` property list
-    /// whose key is the atom named `name` (e.g. `"source"`), or `None` when the chunk is
-    /// absent/empty or carries no such pair.
-    ///
-    /// The name is resolved through this module's atom table first (like
-    /// [`Module::attribute_by_name`]), so the lookup works with the module-local atoms
-    /// the decoded term carries.
-    pub fn compile_info_by_name(&self, name: &str) -> Option<Eterm> {
-        let atom = self.atom_table.lookup(name)?;
-        self.compile_info_table.lookup(beam_term::make_atom(atom))
-    }
-
-    /// The module's compiler feature metadata as a decoded Erlang term (the `Meta`
-    /// chunk), or `None` when the chunk is absent/empty.
-    ///
-    /// A property list, e.g. `[{enabled_features,[maybe_expr]}]`. The term points into
-    /// the module's own atom table and metadata heap, so it stays valid for as long as
-    /// this module.
-    pub fn meta_term(&self) -> Option<Eterm> {
-        self.meta_table.term()
-    }
-
-    /// The value of the first `{Key, Value}` pair in the decoded `Meta` property list
-    /// whose key is the atom named `name` (e.g. `"enabled_features"`), or `None` when the
-    /// chunk is absent/empty or carries no such pair.
-    pub fn meta_by_name(&self, name: &str) -> Option<Eterm> {
-        let atom = self.atom_table.lookup(name)?;
-        self.meta_table.lookup(beam_term::make_atom(atom))
     }
 }

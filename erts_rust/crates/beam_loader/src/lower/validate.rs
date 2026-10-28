@@ -340,16 +340,72 @@ fn validate_line_ref(location: LineRef, line: &LineTable) -> Result<()> {
     Ok(())
 }
 
-/// Whether `label` is a label a `FunT` descriptor may name.
+/// The module-wide set of labels some [`Function`] defines: the membership question
+/// [`crate::lower::build_module`] asks once per `FunT` entry.
 ///
-/// Warms the caller about the one rule the C states outside `asm_load.c`
-/// (`beam_file.c:429`'s `LoadAssert(label > 0 && label < label_count)`); the
-/// definition-side checks live in [`DefinedLabels::define`].
-pub(crate) fn is_defined_label(functions: &[Function], label: Label) -> bool {
-    label.0 != 0
-        && functions
-            .iter()
-            .any(|function| function.labels.contains_key(&label))
+/// It is built once from the grouped functions, so the `FunT` loop pays one O(1) probe
+/// per lambda instead of a scan of every function's label map (`funs × functions`
+/// `BTreeMap` lookups for a module with many lambdas).
+///
+/// The shape and the size guard are [`DefinedLabels`]': an indexed `Vec<bool>` over the
+/// declared label space when `label_count` fits [`MAX_INDEXED_LABELS`], and a
+/// [`BTreeSet`] fallback for a space too large to index or for a module with no `Code`
+/// header (whose label space is unbounded) — so a crafted header cannot force a large
+/// allocation here either.
+pub(crate) struct DefinedLabelSet {
+    /// The module's declared label space, when it is small enough to index directly.
+    bits: Option<Vec<bool>>,
+    /// The fallback for a label space too large to index, and for a module with no
+    /// `Code` header (whose definitions are unbounded).
+    fallback: BTreeSet<u32>,
+}
+
+impl DefinedLabelSet {
+    /// Collects every label defined by some function of `functions`.
+    ///
+    /// The definitions themselves were validated while the bodies were emitted
+    /// ([`DefinedLabels::define`]), so this only records them.
+    pub(crate) fn of(functions: &[Function], label_count: u32) -> Self {
+        let mut set = Self {
+            bits: (label_count != 0 && label_count <= MAX_INDEXED_LABELS)
+                .then(|| vec![false; label_count as usize]),
+            fallback: BTreeSet::new(),
+        };
+        for function in functions {
+            for label in function.labels.keys() {
+                set.insert(label.0);
+            }
+        }
+        set
+    }
+
+    /// Records a defined label (no rule is applied — see [`Self::of`]).
+    fn insert(&mut self, label: u32) {
+        match &mut self.bits {
+            Some(bits) if (label as usize) < bits.len() => bits[label as usize] = true,
+            // The fallback, and the defensive arm for a label outside an indexed space.
+            _ => {
+                self.fallback.insert(label);
+            }
+        }
+    }
+
+    /// Whether `label` is a label a `FunT` descriptor may name.
+    ///
+    /// The one rule the C states outside `asm_load.c` is
+    /// `beam_file.c:429`'s `LoadAssert(label > 0 && label < label_count)`: label 0 is
+    /// the "no label" sentinel, never a lambda body, so it always answers `false`.
+    pub(crate) fn contains(&self, label: Label) -> bool {
+        if label.0 == 0 {
+            return false;
+        }
+        if let Some(bits) = &self.bits {
+            if let Some(defined) = bits.get(label.0 as usize) {
+                return *defined;
+            }
+        }
+        self.fallback.contains(&label.0)
+    }
 }
 
 #[cfg(test)]
@@ -622,9 +678,26 @@ mod tests {
     fn a_fun_label_of_zero_is_not_a_defined_label() {
         let mut functions = vec![function(Vec::new())];
         functions[0].labels.insert(Label(2), 0);
-        assert!(!is_defined_label(&functions, Label(0)));
-        assert!(is_defined_label(&functions, Label(2)));
-        assert!(!is_defined_label(&functions, Label(3)));
+        let defined = DefinedLabelSet::of(&functions, 4);
+        assert!(!defined.contains(Label(0)));
+        assert!(defined.contains(Label(2)));
+        assert!(!defined.contains(Label(3)));
+    }
+
+    #[test]
+    fn a_label_space_too_large_to_index_still_answers_membership() {
+        // The fallback path: a 4-Gi-bit declared space must not allocate a bitset, and
+        // must answer exactly like the indexed table.
+        let mut functions = vec![function(Vec::new())];
+        functions[0].labels.insert(Label(2), 0);
+        let defined = DefinedLabelSet::of(&functions, u32::MAX);
+        assert!(
+            defined.bits.is_none(),
+            "the fallback must not allocate a bitset"
+        );
+        assert!(!defined.contains(Label(0)));
+        assert!(defined.contains(Label(2)));
+        assert!(!defined.contains(Label(3)));
     }
 
     // -----------------------------------------------------------------------

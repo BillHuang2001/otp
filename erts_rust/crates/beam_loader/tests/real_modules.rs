@@ -205,10 +205,9 @@ fn loads_every_installed_otp_beam() {
 /// for the `deallocate`/`return` fusion lands on the post-fusion length.
 fn slack_tables(module: &Module) -> Vec<String> {
     let mut found = Vec::new();
-    let tables: [(&str, usize, usize); 6] = [
+    let tables: [(&str, usize, usize); 5] = [
         ("atoms", module.atoms.len(), module.atoms.capacity()),
         ("exports", module.exports.len(), module.exports.capacity()),
-        ("locals", module.locals.len(), module.locals.capacity()),
         ("imports", module.imports.len(), module.imports.capacity()),
         ("funs", module.funs.len(), module.funs.capacity()),
         (

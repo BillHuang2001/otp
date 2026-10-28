@@ -45,7 +45,6 @@ use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 use crate::chunk::record::{RawRecord, RawRecordDefault};
 use crate::chunk::Chunks;
 use crate::decode::RawInstr;
-use crate::decoded::DecodedTerm;
 use crate::error::bad_file;
 use crate::ir::{Export, FunDescriptor, Import, Module, RecordDefinition, RecordField};
 use crate::labels::SharedLabelMap;
@@ -99,17 +98,13 @@ pub fn build_module(
         });
     }
 
-    // `LocT` (the JIT-only local-function table) shares the `ExpT` layout, so it is
-    // mapped exactly like the exports — the label is the local function's entry label.
-    // The interpreter never consults it; it is carried so the recognized chunk is
-    // visible on the IR rather than silently dropped.
-    let mut locals = Vec::with_capacity(chunks.locals.len());
+    // `LocT` (the JIT-only local-function table) shares the `ExpT` layout, so its wire
+    // atom indices are range-checked exactly like an `ExpT` entry's. The table itself is
+    // *not* materialized onto the IR: the interpreter never consults it (the C keeps it
+    // only for `erts_jit_asm_dump`, `beam_file.c:1684`), so a well-formed chunk is
+    // validated here and dropped instead of being retained for the module's lifetime.
     for raw in &chunks.locals {
-        locals.push(Export {
-            function: atom_at(&atoms, raw.function)?,
-            arity: raw.arity,
-            label: Label(raw.label),
-        });
+        atom_at(&atoms, raw.function)?;
     }
 
     let mut imports = Vec::with_capacity(chunks.imports.len());
@@ -182,6 +177,9 @@ pub fn build_module(
     // refuses a second entry for it (`jit/asm_load.c:150-165`, "lambda already defined
     // for label %i").
     let mut fun_labels: BTreeSet<u32> = BTreeSet::new();
+    // The module's defined labels, collected once: a per-entry scan of every function's
+    // label map would cost `funs × functions` probes for a module with many lambdas.
+    let defined_labels = validate::DefinedLabelSet::of(&functions, chunks.code_version.label_count);
     for raw in &chunks.funs {
         let label = Label(raw.label);
         // `beam_file.c:429`'s `LoadAssert(label > 0 && label < label_count)`: label 0 is
@@ -189,7 +187,7 @@ pub fn build_module(
         if raw.label == 0 {
             return Err(bad_file("fun descriptor label is zero"));
         }
-        if !validate::is_defined_label(&functions, label) {
+        if !defined_labels.contains(label) {
             return Err(bad_file(
                 "fun descriptor label is not a label in the module",
             ));
@@ -232,22 +230,13 @@ pub fn build_module(
     // area they point into exists.
     let records = resolve_records(pending_records, &literals)?;
 
-    // The `Attr` chunk is a module attribute property list encoded as an external term
-    // (`beam_asm.erl:307-310`); decode it into a real term through the module's own
-    // atom table (so its keys share the module's atom identity) — the value
-    // `module_info(attributes)` serves. A malformed payload is a typed error.
-    let attribute_table =
-        crate::attributes::AttributeTable::decode(chunks.attributes.as_deref(), &mut atom_table)?;
-
-    // The `CInf` chunk is `term_to_binary([{version,?COMPILER_VSN}|Compile])`
-    // (`beam_asm.erl:236,309`) — the value `module_info(compile)` serves — and the `Meta`
-    // chunk is `compile.erl`'s `term_to_binary(MetaData, [deterministic])` feature
-    // metadata (`compile.erl:2274-2295`). Both are plain `binary_to_term` payloads
-    // (`beam_lib.erl:1071-1077` for `CInf`; `beam_file.c:1811-1815` only checksums
-    // `Meta`), decoded eagerly through the same holder as `Attr`; a malformed payload is
-    // a typed error.
-    let compile_info_table = DecodedTerm::decode(chunks.compile_info.as_deref(), &mut atom_table)?;
-    let meta_table = DecodedTerm::decode(chunks.meta.as_deref(), &mut atom_table)?;
+    // The `Attr`/`CInf`/`Meta` payloads are single external terms, but they are *not*
+    // decoded here: nothing in this crate reads the decoded terms, and the runtime's
+    // `get_module_info/1,2` bridge decodes the retained raw bytes on demand
+    // (`beam_rt::context::module_info`) — the same lazy shape as the C, which only
+    // feeds `Meta` to the module checksum (`beam_file.c:1811-1815`) and decodes `Attr`/
+    // `CInf` when `module_info` asks (`erl_bif_info.c:5873-5918`). The raw bytes stay on
+    // the IR (`Module::attributes`/`compile_info`/`meta`).
 
     // The module checksum: the MD5 over the fixed chunk subset (`beam_file.c:1751-1830`,
     // `beam_lib:md5/1`). Computed here so every caller of `build_module` — the public
@@ -259,7 +248,6 @@ pub fn build_module(
         atoms,
         atom_table,
         exports,
-        locals,
         imports,
         functions,
         funs,
@@ -270,11 +258,8 @@ pub fn build_module(
         literals,
         strings: chunks.strings.clone(),
         attributes: chunks.attributes.clone(),
-        attribute_table: Arc::new(attribute_table),
         compile_info: chunks.compile_info.clone(),
-        compile_info_table: Arc::new(compile_info_table),
         meta: chunks.meta.clone(),
-        meta_table: Arc::new(meta_table),
         checksum,
         label_map: SharedLabelMap::empty(),
     })
@@ -1886,22 +1871,10 @@ mod tests {
     }
 
     #[test]
-    fn a_module_without_a_locals_table_has_no_locals() {
-        // `minimal_chunks` carries no `LocT` entries, so the lowered module's
-        // local-function table is empty (it is an additive field, never `None`).
-        let module = build_module(
-            &minimal_chunks(Vec::new(), Vec::new()),
-            &minimal_stream(),
-            beam_term::AtomTable::new(),
-        )
-        .unwrap();
-        assert!(module.locals.is_empty());
-    }
-
-    #[test]
-    fn a_locals_entry_is_lowered_like_an_export() {
+    fn a_locals_entry_is_validated_like_an_export() {
         // A `LocT` entry maps its wire atom index through the atom table exactly like
-        // an `ExpT` entry; the label is the local function's entry label.
+        // an `ExpT` entry. The table itself is not retained on the IR (the interpreter
+        // never consults it), so acceptance is the observable outcome.
         let chunks = Chunks {
             locals: vec![RawExport {
                 function: 2, // atom "f"
@@ -1910,11 +1883,7 @@ mod tests {
             }],
             ..minimal_chunks(Vec::new(), Vec::new())
         };
-        let module = build_module(&chunks, &minimal_stream(), beam_term::AtomTable::new()).unwrap();
-        assert_eq!(module.locals.len(), 1);
-        let local = &module.locals[0];
-        assert_eq!(module.atom_name(local.function), Some("f"));
-        assert_eq!((local.arity, local.label), (3, Label(2)));
+        build_module(&chunks, &minimal_stream(), beam_term::AtomTable::new()).unwrap();
     }
 
     #[test]

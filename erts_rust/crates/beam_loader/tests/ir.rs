@@ -121,22 +121,16 @@ fn preserves_the_wire_atom_table() {
 }
 
 #[test]
-fn preserves_the_local_function_table() {
+fn a_local_function_is_not_an_export() {
     let module = load_fixture();
 
-    // `LocT` is byte-for-byte an `ExpT` layout: the module's single non-exported
-    // local `fib/3` at entry label 6 (the exported `fib/1` is separate, label 4).
-    assert_eq!(
-        module.locals,
-        vec![Export {
-            function: atom(&module, "fib"),
-            arity: 3,
-            label: Label(6),
-        }]
-    );
-    // The local is *not* an export: `fib/3` is absent from `ExpT`.
+    // `LocT` is byte-for-byte an `ExpT` layout; it is validated at load but not retained
+    // on the IR (the interpreter never consults it). What the IR must keep is the
+    // distinction: the module's single non-exported local `fib/3` (entry label 6) is
+    // absent from `ExpT`, while the exported `fib/1` (label 4) is present.
     assert_eq!(module.export(atom(&module, "fib"), 3), None);
     assert_eq!(module.export(atom(&module, "fib"), 1), Some(Label(4)));
+    assert_eq!(module.fun(0), None);
 }
 
 #[test]
