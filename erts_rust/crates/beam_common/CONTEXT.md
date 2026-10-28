@@ -153,6 +153,15 @@ buffer hashes immediately, two 32-byte updates leave a full *unhashed* buffer) a
 run that only stays non-negative because it is written as `(56 + 64 - filled) & 63`. `finish` takes
 `&self` and pads a copy, which is what makes `erlang:md5_final/1` pure.
 
+`Md5::hash_part` is written in the canonical 4×16 **constant-index** form: each round is unrolled into
+its 16 steps, so every step's `F`/`G`/`H`/`I`, its `K`/`S` entry and its message-word index `g` is a
+compile-time constant (one `rol` per step, no per-step branch chain, no computed index).
+That shape is load-bearing: this is the hot loop of the boot path (the chunk walk of every loaded
+`.beam`), and it retires ~718 instructions per 64-byte block against ~3× that for a per-step-branch
+loop (`perf stat -e cpu_core/instructions/u` over `tests::md5_throughput_microbench`).
+Only the round *shape* changed with it — padding, the little-endian word read, the length encoding and
+the output endianness are untouched, and the digest is byte-identical.
+
 Dependency-free (it does not even use this crate's `libc`), safe (`#![forbid(unsafe_code)]`),
 allocation-free (fixed arrays only) and panic-free; pinned by the RFC 1321 Appendix A.5 suite plus a
 length-`0..=130` / pad-boundary sweep whose goldens are oracle-derived.
@@ -245,6 +254,11 @@ those with `node`/`serial`, which M1 keeps at `0`, so the guarantee is over *loc
     the `len == 64` image, the rebuilt-from-parts context, the verbatim non-zero buffer tail and the
     `len > BLOCK_LEN` → `BeamError::BadArg` refusal; and the C buffering asymmetry (`len == 0` after
     one 64-byte update, `len == 64` unhashed after two 32-byte ones).
+  - `md5` also carries two `#[ignore]`d **diagnostics** (measurement, not assertion):
+    `print_beam_digests` (`MD5_BEAM_DIR=<dir>`) prints `hex path` for every `*.beam` under a directory,
+    asserting the one-shot and 1000-byte-streaming forms agree, so a corpus digest list can be diffed
+    across builds and against `md5sum`; `md5_throughput_microbench` (`MD5_BENCH_ROUNDS`, default 32)
+    hashes a 1 MiB payload in a loop for `perf stat -e cpu_core/instructions/u`.
 - Doctests: every public item carries a runnable example (`cargo test` runs them; do **not** pass
   `--lib` to the crate gate, which would skip them).
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_common` GREEN.

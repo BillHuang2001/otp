@@ -54,6 +54,10 @@
 //! `unwrap`), **safe Rust** (the crate root carries `#![forbid(unsafe_code)]`) and dependency-free
 //! (this crate's only dependency remains `libc`, which this module does not even need).
 //!
+//! The file sits at the ~1000-line target because roughly half of it is the `tests` module (the
+//! RFC 1321 vectors, the oracle-derived pad-boundary table and the two measurement diagnostics); the
+//! implementation itself is ~500 lines and has no second responsibility to split off.
+//!
 //! # Examples
 //!
 //! ```
@@ -368,6 +372,11 @@ impl Md5 {
 
     /// `hash_part` (`../../erts/emulator/beam/erl_md5.c:156`): folds one 64-byte block into the
     /// state — the 64 RFC 1321 rounds, `wrapping_add` throughout.
+    ///
+    /// Written in the canonical 4×16 **constant-index** form: each of the four rounds is unrolled
+    /// into its 16 steps, so every step's round function, `K`/`S` entry and message-word index `g` is
+    /// a compile-time constant. Nothing is left to be selected per step, which is what lets the
+    /// backend emit one `rol` per round instead of a branch chain plus a computed load.
     fn hash_part(&mut self, block: &[u8; BLOCK_LEN]) {
         let words = block_words(block);
 
@@ -376,29 +385,112 @@ impl Md5 {
         let mut c = self.c;
         let mut d = self.d;
 
-        for (i, (k, shift)) in KS.iter().zip(SHIFTS.iter()).enumerate() {
-            let (f, g) = if i <= 15 {
-                (d ^ (b & (c ^ d)), i)
-            } else if i <= 31 {
-                (c ^ (d & (b ^ c)), (5 * i + 1) & 0xF)
-            } else if i <= 47 {
-                (b ^ c ^ d, (3 * i + 5) & 0xF)
-            } else {
-                (c ^ (b | !d), (7 * i) & 0xF)
-            };
-            // `g` is masked to `0..=15` in every arm above (and equals `i <= 15` in the first), so
-            // this index cannot go out of bounds.
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(*k)
-                .wrapping_add(words[g])
-                .rotate_left(*shift);
-
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f);
+        // One MD5 step: `a = b + rotl(a + F(b,c,d) + K + W, S)`, with the four role words rotating.
+        macro_rules! step {
+            ($f:expr, $wi:expr, $ki:expr, $si:expr) => {{
+                let t = a
+                    .wrapping_add($f)
+                    .wrapping_add(KS[$ki])
+                    .wrapping_add(words[$wi]);
+                a = d;
+                d = c;
+                c = b;
+                b = b.wrapping_add(t.rotate_left(SHIFTS[$si]));
+            }};
         }
+        // RFC 1321 §3.4's four auxiliary functions, each in its `z ^ (…)`/`y ^ (…)` form.
+        macro_rules! ff {
+            ($x:expr, $y:expr, $z:expr) => {
+                $z ^ ($x & ($y ^ $z))
+            };
+        }
+        macro_rules! gg {
+            ($x:expr, $y:expr, $z:expr) => {
+                $y ^ ($z & ($x ^ $y))
+            };
+        }
+        macro_rules! hh {
+            ($x:expr, $y:expr, $z:expr) => {
+                $x ^ $y ^ $z
+            };
+        }
+        macro_rules! ii {
+            ($x:expr, $y:expr, $z:expr) => {
+                $y ^ ($x | !$z)
+            };
+        }
+
+        // Round 1 — `F(b,c,d)`, message words 0..15 in order.
+        step!(ff!(b, c, d), 0, 0, 0);
+        step!(ff!(b, c, d), 1, 1, 1);
+        step!(ff!(b, c, d), 2, 2, 2);
+        step!(ff!(b, c, d), 3, 3, 3);
+        step!(ff!(b, c, d), 4, 4, 4);
+        step!(ff!(b, c, d), 5, 5, 5);
+        step!(ff!(b, c, d), 6, 6, 6);
+        step!(ff!(b, c, d), 7, 7, 7);
+        step!(ff!(b, c, d), 8, 8, 8);
+        step!(ff!(b, c, d), 9, 9, 9);
+        step!(ff!(b, c, d), 10, 10, 10);
+        step!(ff!(b, c, d), 11, 11, 11);
+        step!(ff!(b, c, d), 12, 12, 12);
+        step!(ff!(b, c, d), 13, 13, 13);
+        step!(ff!(b, c, d), 14, 14, 14);
+        step!(ff!(b, c, d), 15, 15, 15);
+
+        // Round 2 — `G(b,c,d)`, `g = (5i + 1) mod 16`.
+        step!(gg!(b, c, d), 1, 16, 16);
+        step!(gg!(b, c, d), 6, 17, 17);
+        step!(gg!(b, c, d), 11, 18, 18);
+        step!(gg!(b, c, d), 0, 19, 19);
+        step!(gg!(b, c, d), 5, 20, 20);
+        step!(gg!(b, c, d), 10, 21, 21);
+        step!(gg!(b, c, d), 15, 22, 22);
+        step!(gg!(b, c, d), 4, 23, 23);
+        step!(gg!(b, c, d), 9, 24, 24);
+        step!(gg!(b, c, d), 14, 25, 25);
+        step!(gg!(b, c, d), 3, 26, 26);
+        step!(gg!(b, c, d), 8, 27, 27);
+        step!(gg!(b, c, d), 13, 28, 28);
+        step!(gg!(b, c, d), 2, 29, 29);
+        step!(gg!(b, c, d), 7, 30, 30);
+        step!(gg!(b, c, d), 12, 31, 31);
+
+        // Round 3 — `H(b,c,d)`, `g = (3i + 5) mod 16`.
+        step!(hh!(b, c, d), 5, 32, 32);
+        step!(hh!(b, c, d), 8, 33, 33);
+        step!(hh!(b, c, d), 11, 34, 34);
+        step!(hh!(b, c, d), 14, 35, 35);
+        step!(hh!(b, c, d), 1, 36, 36);
+        step!(hh!(b, c, d), 4, 37, 37);
+        step!(hh!(b, c, d), 7, 38, 38);
+        step!(hh!(b, c, d), 10, 39, 39);
+        step!(hh!(b, c, d), 13, 40, 40);
+        step!(hh!(b, c, d), 0, 41, 41);
+        step!(hh!(b, c, d), 3, 42, 42);
+        step!(hh!(b, c, d), 6, 43, 43);
+        step!(hh!(b, c, d), 9, 44, 44);
+        step!(hh!(b, c, d), 12, 45, 45);
+        step!(hh!(b, c, d), 15, 46, 46);
+        step!(hh!(b, c, d), 2, 47, 47);
+
+        // Round 4 — `I(b,c,d)`, `g = (7i) mod 16`.
+        step!(ii!(b, c, d), 0, 48, 48);
+        step!(ii!(b, c, d), 7, 49, 49);
+        step!(ii!(b, c, d), 14, 50, 50);
+        step!(ii!(b, c, d), 5, 51, 51);
+        step!(ii!(b, c, d), 12, 52, 52);
+        step!(ii!(b, c, d), 3, 53, 53);
+        step!(ii!(b, c, d), 10, 54, 54);
+        step!(ii!(b, c, d), 1, 55, 55);
+        step!(ii!(b, c, d), 8, 56, 56);
+        step!(ii!(b, c, d), 15, 57, 57);
+        step!(ii!(b, c, d), 6, 58, 58);
+        step!(ii!(b, c, d), 13, 59, 59);
+        step!(ii!(b, c, d), 4, 60, 60);
+        step!(ii!(b, c, d), 11, 61, 61);
+        step!(ii!(b, c, d), 2, 62, 62);
+        step!(ii!(b, c, d), 9, 63, 63);
 
         self.a = self.a.wrapping_add(a);
         self.b = self.b.wrapping_add(b);
@@ -826,5 +918,93 @@ mod tests {
         assert_eq!(BLOCK_LEN, 64);
         assert_eq!(DIGEST_LEN, 16);
         assert_eq!(digest(b"").len(), DIGEST_LEN);
+    }
+
+    /// Collects every `*.beam` below `dir` into `out` (depth-first, no ordering guarantee).
+    fn collect_beams(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_beams(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "beam") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// **Digest-equivalence printer** over a corpus of real `.beam` files — `#[ignore]`d and
+    /// env-gated, because it is a diagnostic, not a behavioural test.
+    ///
+    /// It prints one `hex path` line per file, so a pre-change and a post-change build can be diffed
+    /// line for line, and the same lines can be cross-checked against `md5sum` (which hashes the very
+    /// same bytes). Each file is hashed both one-shot and in 1000-byte streaming pieces, which also
+    /// pins that a chunked feed — the loader's shape — agrees with `digest`.
+    ///
+    /// ```text
+    /// MD5_BEAM_DIR=../../../bootstrap/lib \
+    ///     cargo test -p beam_common --lib -- --ignored --nocapture print_beam_digests
+    /// ```
+    #[test]
+    #[ignore = "diagnostic: prints the digest of every .beam under $MD5_BEAM_DIR"]
+    fn print_beam_digests() {
+        let Ok(root) = std::env::var("MD5_BEAM_DIR") else {
+            eprintln!("MD5_BEAM_DIR is not set — nothing to print");
+            return;
+        };
+        let mut files = Vec::new();
+        collect_beams(std::path::Path::new(&root), &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "no *.beam under {root}");
+
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            let one_shot = digest(&bytes);
+            let mut streamed = Md5::new();
+            for chunk in bytes.chunks(1000) {
+                streamed.update(chunk);
+            }
+            assert_eq!(
+                streamed.finish(),
+                one_shot,
+                "streaming vs one-shot for {}",
+                path.display()
+            );
+            println!("{} {}", hex(&one_shot), path.display());
+        }
+        eprintln!("{} .beam files", files.len());
+    }
+
+    /// **MD5 throughput loop** for retire-instruction measurement — `#[ignore]`d, no dev-dependency.
+    ///
+    /// Hashes a 1 MiB payload `MD5_BENCH_ROUNDS` times (default 32), so the compression function
+    /// dominates the retired-instruction count. Wrap the test binary, not `cargo`:
+    ///
+    /// ```text
+    /// perf stat -e cpu_core/instructions/u -r 5 \
+    ///     erts_rust/target/release/deps/beam_common-<hash> --ignored --exact \
+    ///     tests::md5_throughput_microbench
+    /// ```
+    #[test]
+    #[ignore = "diagnostic: MD5 throughput loop for perf stat"]
+    fn md5_throughput_microbench() {
+        let rounds: usize = std::env::var("MD5_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32);
+        let data = patterned(1 << 20);
+        let first = digest(&data);
+        let mut acc = 0u8;
+        for _ in 0..rounds {
+            acc ^= digest(&data)[0];
+        }
+        assert_eq!(digest(&data), first, "the digest is deterministic");
+        assert_eq!(
+            acc,
+            if rounds % 2 == 1 { first[0] } else { 0 },
+            "every round hashed the same payload"
+        );
     }
 }
