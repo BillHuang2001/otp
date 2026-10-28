@@ -99,6 +99,62 @@ impl Writer {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// Appends the two-byte header `[tag, value]` with **one** capacity check.
+    ///
+    /// The coalesced form of [`Writer::u8`] twice: a tag byte plus one payload byte
+    /// (`SMALL_INTEGER_EXT`, `SMALL_TUPLE_EXT`, `ATOM_CACHE_REF_EXT`, the size-and-
+    /// length pair of `SMALL_BIG_EXT`, …) is emitted as a single two-byte append, so
+    /// the sink is reserved/checked once instead of once per byte. The bytes written
+    /// are exactly `u8(tag); u8(value)`.
+    #[inline]
+    pub(crate) fn head_u8(&mut self, tag: u8, value: u8) {
+        self.buf.extend_from_slice(&[tag, value]);
+    }
+
+    /// Appends the three-byte header `[tag, hi, lo]` (big-endian `value`) with
+    /// **one** capacity check.
+    ///
+    /// The coalesced form of [`Writer::u8`] + [`Writer::u16be`]: a tag byte plus a
+    /// 16-bit length/count field (`ATOM_UTF8_EXT`, the `STRING_EXT`/`NEWER_REFERENCE_EXT`
+    /// element count, …). The bytes written are exactly `u8(tag); u16be(value)`.
+    #[inline]
+    pub(crate) fn head_u16(&mut self, tag: u8, value: u16) {
+        let [hi, lo] = value.to_be_bytes();
+        self.buf.extend_from_slice(&[tag, hi, lo]);
+    }
+
+    /// Appends the five-byte header `[tag, b3, b2, b1, b0]` (big-endian `value`)
+    /// with **one** capacity check.
+    ///
+    /// The coalesced form of [`Writer::u8`] + [`Writer::u32be`]: a tag byte plus a
+    /// 32-bit length/count field (`BINARY_EXT`/`BIT_BINARY_EXT`'s byte count,
+    /// `MAP_EXT`'s pair count, `LARGE_TUPLE_EXT`'s arity, `LIST_EXT`'s element count,
+    /// …). The bytes written are exactly `u8(tag); u32be(value)`.
+    #[inline]
+    pub(crate) fn head_u32(&mut self, tag: u8, value: u32) {
+        let [b3, b2, b1, b0] = value.to_be_bytes();
+        self.buf.extend_from_slice(&[tag, b3, b2, b1, b0]);
+    }
+
+    /// Appends a one-byte `tag` followed by `bytes` verbatim, reserving the whole
+    /// `1 + bytes.len()` run **once**.
+    ///
+    /// There is deliberately **no length field** between the two: a wire form that
+    /// carries one (`SMALL_ATOM_UTF8_EXT`'s name length, `BINARY_EXT`'s byte count)
+    /// writes the tag and its length through [`Writer::head_u8`] /
+    /// [`Writer::head_u16`] / [`Writer::head_u32`] and then the payload through
+    /// [`Writer::bytes`]. This call is for a tag whose payload *is* everything that
+    /// follows — `NEW_FLOAT_EXT`'s eight IEEE bytes, the 31-byte `FLOAT_EXT` field,
+    /// `ATOM_UTF8_EXT`'s already-length-prefixed remainder — and, as a plain
+    /// one-byte-prefix-plus-run coalescer, for a layout whose first byte merely
+    /// prefixes a block (`NEW_FUN_EXT`'s `[arity][uniq]`).
+    #[inline]
+    pub(crate) fn head_bytes(&mut self, tag: u8, bytes: &[u8]) {
+        self.buf.reserve(bytes.len() + 1);
+        self.buf.push(tag);
+        self.buf.extend_from_slice(bytes);
+    }
+
     /// The number of bytes written.
     pub fn len(&self) -> usize {
         self.buf.len()
@@ -204,6 +260,7 @@ mod tests {
     use beam_common::BeamError;
 
     use super::*;
+    use crate::tag::{ATOM_UTF8_EXT, MAP_EXT, NEW_FLOAT_EXT, NIL_EXT, SMALL_INTEGER_EXT};
 
     #[test]
     fn new_is_empty() {
@@ -275,6 +332,126 @@ mod tests {
         writer.bytes(&[4]);
         assert_eq!(writer.as_slice(), &[1, 2, 3, 4]);
         assert_eq!(writer.len(), 4);
+    }
+
+    #[test]
+    fn head_u8_appends_a_tag_and_one_payload_byte_and_reserves_once() {
+        // The bytes are exactly `u8(tag); u8(value)`, appended at the end.
+        let mut writer = Writer::new();
+        writer.bytes(&[0xAA]);
+        writer.head_u8(SMALL_INTEGER_EXT, 0x07);
+        assert_eq!(writer.as_slice(), &[0xAA, 97, 0x07]);
+        assert_eq!(writer.len(), 3);
+
+        // `SMALL_INTEGER_EXT` 255 must not collide with the negative-arm tag: both
+        // ends of the byte range are written verbatim.
+        let mut edges = Writer::new();
+        edges.head_u8(0, 0);
+        edges.head_u8(0xFF, 0xFF);
+        assert_eq!(edges.as_slice(), &[0, 0, 0xFF, 0xFF]);
+
+        // Capacity: the pair fits in a two-byte reservation, so a writer with exactly
+        // two spare bytes does **not** reallocate …
+        let mut fitted = Writer::with_capacity(2);
+        let cap = fitted.capacity();
+        fitted.head_u8(1, 2);
+        assert_eq!(fitted.capacity(), cap);
+        assert_eq!(fitted.as_slice(), &[1, 2]);
+        // … while one spare byte is not enough and the sink grows (never truncating).
+        let mut grown = Writer::with_capacity(1);
+        let before = grown.capacity();
+        grown.head_u8(0xAA, 0xBB);
+        assert!(grown.capacity() > before);
+        assert_eq!(grown.as_slice(), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn head_u16_appends_a_tag_and_a_big_endian_u16_and_reserves_once() {
+        let mut writer = Writer::new();
+        writer.bytes(&[0xAA]);
+        writer.head_u16(ATOM_UTF8_EXT, 0x1234);
+        assert_eq!(writer.as_slice(), &[0xAA, 118, 0x12, 0x34]);
+        assert_eq!(writer.len(), 4);
+
+        // Both extremes stay network-order.
+        let mut edges = Writer::new();
+        edges.head_u16(1, 0);
+        edges.head_u16(2, u16::MAX);
+        assert_eq!(edges.as_slice(), &[1, 0, 0, 2, 0xFF, 0xFF]);
+
+        // Capacity: three bytes fit a three-byte reservation, not a two-byte one.
+        let mut fitted = Writer::with_capacity(3);
+        let cap = fitted.capacity();
+        fitted.head_u16(9, 0xBEEF);
+        assert_eq!(fitted.capacity(), cap);
+        assert_eq!(fitted.as_slice(), &[9, 0xBE, 0xEF]);
+        let mut grown = Writer::with_capacity(2);
+        let before = grown.capacity();
+        grown.head_u16(9, 0xBEEF);
+        assert!(grown.capacity() > before);
+        assert_eq!(grown.as_slice(), &[9, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn head_u32_appends_a_tag_and_a_big_endian_u32_and_reserves_once() {
+        let mut writer = Writer::new();
+        writer.bytes(&[0xAA]);
+        writer.head_u32(MAP_EXT, 0xDEAD_BEEF);
+        assert_eq!(writer.as_slice(), &[0xAA, 116, 0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(writer.len(), 6);
+
+        // Both extremes stay network-order.
+        let mut edges = Writer::new();
+        edges.head_u32(1, 0);
+        edges.head_u32(2, u32::MAX);
+        assert_eq!(
+            edges.as_slice(),
+            &[1, 0, 0, 0, 0, 2, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+
+        // Capacity: five bytes fit a five-byte reservation, not a four-byte one.
+        let mut fitted = Writer::with_capacity(5);
+        let cap = fitted.capacity();
+        fitted.head_u32(116, 32);
+        assert_eq!(fitted.capacity(), cap);
+        assert_eq!(fitted.as_slice(), &[116, 0, 0, 0, 32]);
+        let mut grown = Writer::with_capacity(4);
+        let before = grown.capacity();
+        grown.head_u32(116, 32);
+        assert!(grown.capacity() > before);
+        assert_eq!(grown.as_slice(), &[116, 0, 0, 0, 32]);
+    }
+
+    #[test]
+    fn head_bytes_appends_a_tag_then_the_payload_verbatim_with_one_reservation() {
+        // No length field is inserted: the payload follows the tag byte directly.
+        let mut writer = Writer::new();
+        writer.bytes(&[0xAA]);
+        writer.head_bytes(NEW_FLOAT_EXT, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            writer.as_slice(),
+            &[0xAA, 70, 1, 2, 3, 4, 5, 6, 7, 8],
+            "the payload must not be length-prefixed"
+        );
+        assert_eq!(writer.len(), 10);
+
+        // An empty payload writes the tag alone (a bare `SMALL_INTEGER_EXT`-style
+        // header is the caller's business, but the call must not panic or grow).
+        let mut bare = Writer::new();
+        bare.head_bytes(NIL_EXT, &[]);
+        assert_eq!(bare.as_slice(), &[106]);
+
+        // Capacity: `1 + len` bytes fit a `1 + len` reservation, not a `len` one.
+        let mut fitted = Writer::with_capacity(4);
+        let cap = fitted.capacity();
+        fitted.head_bytes(119, b"abc");
+        assert_eq!(fitted.capacity(), cap);
+        assert_eq!(fitted.as_slice(), &[119, b'a', b'b', b'c']);
+        let mut grown = Writer::with_capacity(3);
+        let before = grown.capacity();
+        grown.head_bytes(119, b"abc");
+        assert!(grown.capacity() > before);
+        assert_eq!(grown.as_slice(), &[119, b'a', b'b', b'c']);
     }
 
     #[test]

@@ -686,15 +686,14 @@ impl<'a> Encoder<'a> {
     /// signed 32-bit ⇒ `INTEGER_EXT`, otherwise a bignum.
     fn encode_small(&mut self, value: i64) -> Result<()> {
         if (0..=255).contains(&value) {
-            self.buf.u8(SMALL_INTEGER_EXT);
-            self.buf.u8(value as u8);
+            self.buf.head_u8(SMALL_INTEGER_EXT, value as u8);
             return Ok(());
         }
         if let Ok(int) = i32::try_from(value) {
-            self.buf.u8(INTEGER_EXT);
             // `(int as u32).to_be_bytes()` is exactly `int.to_be_bytes()` (two's
-            // complement big-endian), the `INTEGER_EXT` payload.
-            self.buf.u32be(int as u32);
+            // complement big-endian), the `INTEGER_EXT` payload — emitted together
+            // with the tag in one reservation.
+            self.buf.head_u32(INTEGER_EXT, int as u32);
             return Ok(());
         }
         // The magnitude becomes a one-`ErtsDigit` bignum block; the sign is carried
@@ -741,11 +740,12 @@ impl<'a> Encoder<'a> {
     /// [`float`] module).
     fn encode_float(&mut self, value: f64) -> Result<()> {
         if self.uses_new_floats() {
-            self.buf.u8(NEW_FLOAT_EXT);
-            self.buf.u64be(value.to_bits());
+            // The tag and its fixed eight IEEE-754 bytes in one reservation.
+            self.buf.head_bytes(NEW_FLOAT_EXT, &value.to_bits().to_be_bytes());
         } else {
-            self.buf.u8(FLOAT_EXT);
-            self.buf.bytes(&float::format_float_ext(value)?);
+            // The tag and the fixed 31-byte text field in one reservation.
+            self.buf
+                .head_bytes(FLOAT_EXT, &float::format_float_ext(value)?);
         }
         Ok(())
     }
@@ -766,8 +766,7 @@ impl<'a> Encoder<'a> {
             None => None,
         };
         if let Some(index) = cached {
-            self.buf.u8(ATOM_CACHE_REF_EXT);
-            self.buf.u8(index);
+            self.buf.head_u8(ATOM_CACHE_REF_EXT, index);
             return Ok(());
         }
 
@@ -794,13 +793,11 @@ impl<'a> Encoder<'a> {
     fn write_atom_utf8(&mut self, name: &str) {
         let bytes = name.as_bytes();
         if bytes.len() <= 255 {
-            self.buf.u8(SMALL_ATOM_UTF8_EXT);
-            self.buf.u8(bytes.len() as u8);
+            self.buf.head_u8(SMALL_ATOM_UTF8_EXT, bytes.len() as u8);
         } else {
             // At most 255 characters × 4 UTF-8 bytes ≤ 1020, so the 16-bit
             // length always fits.
-            self.buf.u8(ATOM_UTF8_EXT);
-            self.buf.u16be(bytes.len() as u16);
+            self.buf.head_u16(ATOM_UTF8_EXT, bytes.len() as u16);
         }
         self.buf.bytes(bytes);
     }
@@ -816,11 +813,9 @@ impl<'a> Encoder<'a> {
     fn write_atom_latin1_small_tags(&mut self, name: &str) -> Result<()> {
         let bytes = latin1_bytes(name).ok_or_else(|| error::unsupported(Tag::SmallAtom))?;
         if bytes.len() <= 255 {
-            self.buf.u8(SMALL_ATOM_EXT);
-            self.buf.u8(bytes.len() as u8);
+            self.buf.head_u8(SMALL_ATOM_EXT, bytes.len() as u8);
         } else {
-            self.buf.u8(ATOM_EXT);
-            self.buf.u16be(bytes.len() as u16);
+            self.buf.head_u16(ATOM_EXT, bytes.len() as u16);
         }
         self.buf.bytes(&bytes);
         Ok(())
@@ -834,10 +829,9 @@ impl<'a> Encoder<'a> {
     fn write_atom_latin1_wide_only(&mut self, name: &str) {
         match latin1_bytes(name) {
             Some(bytes) => {
-                self.buf.u8(ATOM_EXT);
                 // The name is ≤ 255 chars and Latin-1 is one byte per char, so the
                 // 16-bit length always fits.
-                self.buf.u16be(bytes.len() as u16);
+                self.buf.head_u16(ATOM_EXT, bytes.len() as u16);
                 self.buf.bytes(&bytes);
             }
             None => self.write_atom_utf8(name),
@@ -859,8 +853,7 @@ impl<'a> Encoder<'a> {
     fn encode_list(&mut self, term: Eterm) -> Result<()> {
         // Where the representation byte goes: the rewind point of the fallback.
         let start = self.buf.len();
-        self.buf.u8(STRING_EXT);
-        self.buf.u16be(0); // patched with the byte count on success
+        self.buf.head_u16(STRING_EXT, 0); // the count is patched on success
         let count_pos = start + 1;
 
         let mut count: u32 = 0;
@@ -890,9 +883,9 @@ impl<'a> Encoder<'a> {
 
         // Not a 16-bit `STRING_EXT`: drop the optimistic bytes and emit `LIST_EXT`.
         self.buf.truncate(start)?;
-        self.buf.u8(LIST_EXT);
-        let count_pos = self.buf.len();
-        self.buf.u32be(0); // patched with the cons-cell count at the end
+        // The element count sits at `start + 1` and is patched at the end.
+        let count_pos = start + 1;
+        self.buf.head_u32(LIST_EXT, 0);
         let mut count: u32 = 0;
         let mut cursor = term;
         loop {
@@ -913,14 +906,12 @@ impl<'a> Encoder<'a> {
     /// Encodes a tuple: `SMALL_TUPLE_EXT` up to arity 255, else `LARGE_TUPLE_EXT`.
     fn encode_tuple(&mut self, term: Eterm, arity: usize) -> Result<()> {
         if arity <= 255 {
-            self.buf.u8(SMALL_TUPLE_EXT);
-            self.buf.u8(arity as u8);
+            self.buf.head_u8(SMALL_TUPLE_EXT, arity as u8);
         } else {
             if arity > u32::MAX as usize {
                 return Err(error::system_limit());
             }
-            self.buf.u8(LARGE_TUPLE_EXT);
-            self.buf.u32be(arity as u32);
+            self.buf.head_u32(LARGE_TUPLE_EXT, arity as u32);
         }
         for index in 0..arity {
             let element = tuple_element(term, index)?;
@@ -997,8 +988,7 @@ impl<'a> Encoder<'a> {
         if n > MAX_ARITYVAL {
             return Err(error::system_limit());
         }
-        self.buf.u8(MAP_EXT);
-        self.buf.u32be(n as u32);
+        self.buf.head_u32(MAP_EXT, n as u32);
         Ok(())
     }
 
@@ -1121,11 +1111,9 @@ impl<'a> Encoder<'a> {
         let tail = size_bits % 8;
         let len_field = u32::try_from(n_bytes).map_err(|_| error::system_limit())?;
         if tail == 0 {
-            self.buf.u8(BINARY_EXT);
-            self.buf.u32be(len_field);
+            self.buf.head_u32(BINARY_EXT, len_field);
         } else {
-            self.buf.u8(BIT_BINARY_EXT);
-            self.buf.u32be(len_field);
+            self.buf.head_u32(BIT_BINARY_EXT, len_field);
             // `bits` is the number of significant bits in the last byte (`1..=8`).
             self.buf.u8(tail as u8);
         }
