@@ -373,14 +373,46 @@ impl fmt::Debug for LiveReason {
     }
 }
 
-/// A complete BEAM exception: class, reason, stacktrace and — for a structured
-/// reason — the live reason term.
+/// A complete BEAM exception: class, reason, stacktrace and the three opaque
+/// live-term slots a structured reason and the `erlang:error/2,3` raise shapes
+/// need.
 ///
 /// Equality and `Debug` cover only the observable parts ([`class`](Raise::class),
 /// [`reason`](Raise::reason), [`stacktrace`](Raise::stacktrace)): the
-/// [`live_reason`](Raise::live_reason) payload is out-of-band metadata that
+/// [`live_reason`](Raise::live_reason), [`saved_args`](Raise::saved_args) and
+/// [`error_info`](Raise::error_info) payloads are out-of-band metadata that
 /// [`ExitReason`] cannot compare, so a raise carrying a live term compares equal to
 /// the same raise without it.
+///
+/// # Why `saved_args` and `error_info` exist
+///
+/// ERTS renders the *innermost* stacktrace item of a raise from state that is not
+/// part of the class/reason pair, so a faithful stacktrace needs it carried
+/// alongside the raise until the stacktrace is built (measured on `erl` 29 /
+/// erts-17.1, compiled module):
+///
+/// - a BIF frame carries the BIF's real argument list —
+///   `try hd(1) catch C:R:S -> S end` ⇒
+///   `{erlang,hd,[1],[{error_info,#{module => erl_erts_errors}}]}`;
+/// - a plain Erlang frame carries its own arguments —
+///   `try lists:max([]) catch C:R:S -> S end` ⇒
+///   `{lists,max,[[]],[{file,"lists.erl"},{line,638}]}`;
+/// - `erlang:error/1` keeps the caller frame, arity, no args —
+///   `try erlang:error(foo) catch C:R:S -> S end` ⇒
+///   `{p,e,0,[{file,"p.erl"},{line,7}]}`;
+/// - `erlang:error/2,3`'s argument **list replaces** the caller frame's `A` slot —
+///   `try erlang:error(foo,[1,2]) catch C:R:S -> S end` ⇒
+///   `{p,f,[1,2],[{file,"p.erl"},{line,8}]}` (the C's `EXC_ERROR_2` saved args),
+///   which is what [`saved_args`](Raise::saved_args) carries;
+/// - a `{error_info, Map}` in `erlang:error/3`'s options is **appended to** the
+///   innermost frame's `Location` —
+///   `try erlang:error({badmap,zz},[1,2],[{error_info,#{module=>erl_stdlib_errors}}])
+///   catch C:R:S -> S end` ⇒
+///   `{p,g,[1,2],[{file,"p.erl"},{line,9},{error_info,#{module => erl_stdlib_errors}}]}`,
+///   which is what [`error_info`](Raise::error_info) carries.
+///
+/// The execution engine renders both into that innermost item; `beam_common` only
+/// transports them.
 #[derive(Clone)]
 pub struct Raise {
     /// The class of the exception.
@@ -391,17 +423,27 @@ pub struct Raise {
     pub stacktrace: StackTrace,
     /// The live reason term, when the reason is structured (see [`LiveReason`]).
     pub live_reason: Option<LiveReason>,
+    /// The live **argument list** term an `erlang:error/2,3` raise was given (see
+    /// [`LiveReason`]): payload convention is the raising crate's live term as an
+    /// `Eterm` word, recovered with `downcast_ref::<Eterm>()` exactly like
+    /// [`Raise::live_reason`].
+    pub saved_args: Option<LiveReason>,
+    /// The live **`error_info` map** an `erlang:error/3` raise scanned out of its
+    /// options list (payload convention as above: the map term as an `Eterm`).
+    pub error_info: Option<LiveReason>,
 }
 
 impl Raise {
     /// Creates a raise of `class` with `reason`, an empty stacktrace and no live
-    /// reason.
+    /// reason, saved args or error info.
     pub fn new(class: ExceptionClass, reason: ExitReason) -> Self {
         Self {
             class,
             reason,
             stacktrace: StackTrace::new(),
             live_reason: None,
+            saved_args: None,
+            error_info: None,
         }
     }
 
@@ -436,11 +478,32 @@ impl Raise {
     pub fn live_reason(&self) -> Option<&LiveReason> {
         self.live_reason.as_ref()
     }
+    /// Attaches the `erlang:error/2,3` argument list term, returning the updated
+    /// raise (builder style).
+    pub fn with_saved_args(mut self, saved_args: LiveReason) -> Self {
+        self.saved_args = Some(saved_args);
+        self
+    }
+    /// Attaches the scanned `error_info` map term, returning the updated raise
+    /// (builder style).
+    pub fn with_error_info(mut self, error_info: LiveReason) -> Self {
+        self.error_info = Some(error_info);
+        self
+    }
+    /// The `erlang:error/2,3` argument list term, when the raise carries one.
+    pub fn saved_args(&self) -> Option<&LiveReason> {
+        self.saved_args.as_ref()
+    }
+    /// The scanned `error_info` map term, when the raise carries one.
+    pub fn error_info(&self) -> Option<&LiveReason> {
+        self.error_info.as_ref()
+    }
 }
 
 impl fmt::Debug for Raise {
-    /// Prints the observable parts and the placeholder `<live reason>` for the
-    /// opaque slot; the payload is never dereferenced or printed.
+    /// Prints the observable parts and the placeholders `<live reason>`,
+    /// `<saved args>` and `<error info>` for the opaque slots; the payloads are
+    /// never dereferenced or printed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Raise")
             .field("class", &self.class)
@@ -450,13 +513,22 @@ impl fmt::Debug for Raise {
                 "live_reason",
                 &self.live_reason.as_ref().map(|_| "<live reason>"),
             )
+            .field(
+                "saved_args",
+                &self.saved_args.as_ref().map(|_| "<saved args>"),
+            )
+            .field(
+                "error_info",
+                &self.error_info.as_ref().map(|_| "<error info>"),
+            )
             .finish()
     }
 }
 
 impl PartialEq for Raise {
-    /// Compares only the observable parts; the opaque [`live_reason`](Raise::live_reason)
-    /// payload is ignored.
+    /// Compares only the observable parts; the opaque
+    /// [`live_reason`](Raise::live_reason), [`saved_args`](Raise::saved_args) and
+    /// [`error_info`](Raise::error_info) payloads are ignored.
     fn eq(&self, other: &Self) -> bool {
         self.class == other.class
             && self.reason == other.reason
@@ -933,5 +1005,94 @@ mod tests {
         assert!(error.is_raise());
         assert_eq!(error.as_atom(), None);
         assert_eq!(error.to_string(), "error <structured reason>");
+    }
+    #[test]
+    fn saved_args_and_error_info_default_to_none_on_every_constructor() {
+        let cases = [
+            Raise::new(ExceptionClass::Error, ExitReason::Structured),
+            Raise::error(ExitReason::Structured),
+            Raise::exit(ExitReason::Structured),
+            Raise::throw(ExitReason::Structured),
+        ];
+        for raise in cases {
+            assert!(raise.saved_args().is_none());
+            assert!(raise.error_info().is_none());
+        }
+    }
+    #[test]
+    fn raise_equality_ignores_saved_args_and_error_info() {
+        let plain = Raise::error(ExitReason::Structured).with_stacktrace(sample_stacktrace());
+        let with_slots = Raise::error(ExitReason::Structured)
+            .with_stacktrace(sample_stacktrace())
+            .with_saved_args(LiveReason::new(1u64))
+            .with_error_info(LiveReason::new(2u64));
+        assert_eq!(plain, with_slots);
+        assert_eq!(with_slots, plain);
+        assert_eq!(with_slots, with_slots.clone());
+        // A different payload still compares equal: only the slots differ.
+        let other_slots = Raise::error(ExitReason::Structured)
+            .with_stacktrace(sample_stacktrace())
+            .with_saved_args(LiveReason::new(9u64));
+        assert_eq!(with_slots, other_slots);
+        // The observable parts still distinguish a slot-carrying raise.
+        assert_ne!(
+            with_slots,
+            with_slots.clone().with_stacktrace(StackTrace::new())
+        );
+        assert_ne!(with_slots, Raise::throw(ExitReason::Structured));
+    }
+    #[test]
+    fn saved_args_and_error_info_survive_clone_and_downcast() {
+        let raise = Raise::error(ExitReason::Structured)
+            .with_saved_args(LiveReason::new(7u64))
+            .with_error_info(LiveReason::new::<&'static str>("erl_erts_errors"));
+        let clone = raise.clone();
+        for carried in [&raise, &clone] {
+            assert_eq!(
+                carried
+                    .saved_args()
+                    .and_then(|slot| slot.downcast_ref::<u64>()),
+                Some(&7)
+            );
+            assert!(carried
+                .saved_args()
+                .and_then(|slot| slot.downcast_ref::<&'static str>())
+                .is_none());
+            assert_eq!(
+                carried
+                    .error_info()
+                    .and_then(|slot| slot.downcast_ref::<&'static str>()),
+                Some(&"erl_erts_errors")
+            );
+            assert!(carried
+                .error_info()
+                .and_then(|slot| slot.downcast_ref::<u64>())
+                .is_none());
+        }
+        // Cloning shares the payloads rather than copying them.
+        assert_eq!(
+            raise
+                .saved_args()
+                .and_then(|slot| slot.as_any().downcast_ref::<u64>()),
+            clone
+                .saved_args()
+                .and_then(|slot| slot.as_any().downcast_ref::<u64>())
+        );
+    }
+    #[test]
+    fn raise_debug_hides_saved_args_and_error_info_payloads() {
+        let plain = format!("{:?}", Raise::error(ExitReason::Structured));
+        assert!(!plain.contains("<saved args>"));
+        assert!(!plain.contains("<error info>"));
+        let raise = Raise::error(ExitReason::Structured)
+            .with_saved_args(LiveReason::new(String::from("secret-args")))
+            .with_error_info(LiveReason::new(String::from("secret-info")));
+        let debug = format!("{raise:?}");
+        assert!(debug.contains("<saved args>"));
+        assert!(debug.contains("<error info>"));
+        assert!(!debug.contains("secret-args"));
+        assert!(!debug.contains("secret-info"));
+        // Display is unchanged by the metadata.
+        assert_eq!(raise.to_string(), "error <structured reason>");
     }
 }
