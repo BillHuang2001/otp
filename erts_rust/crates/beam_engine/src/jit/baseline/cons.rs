@@ -50,7 +50,13 @@
 //! [`jit_put_list`]: self::jit_put_list
 #![allow(unsafe_code)]
 
-use beam_loader::Instr;
+use beam_loader::{Instr, Operand};
+
+use crate::context::{ExecutionContext, RootSet};
+use crate::machine::Machine;
+use crate::operand::{operand_slack_words, read_operand_slack, write_operand};
+use crate::terms;
+use crate::Step;
 
 use super::jit_step_one;
 use super::runtime::{fold_err, fold_ok_step, JitRuntime};
@@ -98,9 +104,6 @@ pub(crate) extern "C" fn jit_put_list(rt: *mut JitRuntime<'_>, func: u32, pc: u3
         // SAFETY: `runtime.entry_module` points at the run's entry module, which the
         // driver holds alive for the whole loop.
         let entry_module = unsafe { &*runtime.entry_module };
-        // SAFETY: `runtime.labels` points at the driver's `labels` local, which outlives
-        // the loop.
-        let labels = unsafe { &*runtime.labels };
         // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed as
         // a raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
@@ -120,17 +123,17 @@ pub(crate) extern "C" fn jit_put_list(rt: *mut JitRuntime<'_>, func: u32, pc: u3
 
         // Only a `put_list` reaches this helper (the emitter's arm claims exactly that
         // variant). Anything else is the interpreter's, rather than guessed at here.
-        match instr {
-            Instr::PutList { .. } => {}
+        let (head, tail, dst) = match instr {
+            Instr::PutList { head, tail, dst } => (head, tail, dst),
             _ => return jit_step_one(rt, func, pc),
-        }
+        };
 
-        // The owning family's own body: the operand reads, the rooted allocation, the
-        // destination write and every error landing are the family's, unchanged. (It is
-        // reached through the shared dispatcher because `families::lists` is private to
-        // `families`; the dispatcher's variant match is the only extra work, and it is
-        // the same call the interpreter's `other` arm makes.)
-        match crate::families::dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) {
+        // The construction itself, the family's own body inlined: the rooted
+        // reserve -> read -> write discipline, with the two operand reads *inside* the
+        // reservation's closure so a collecting host's relocation is observed rather
+        // than read around. The shape proof already refused every slack-carrying
+        // operand, so the `extra` figure is 0 on every shape that reaches here.
+        match construct(machine, ctx, head, tail, dst) {
             Ok(step) => Ok(step),
             // The uniform raise funnel, exactly as `Machine::drive` runs it: the blocks
             // this helper is called from never pass through `step_instruction`, so this
@@ -144,4 +147,35 @@ pub(crate) extern "C" fn jit_put_list(rt: *mut JitRuntime<'_>, func: u32, pc: u3
         Ok(step) => fold_ok_step(runtime, step, func, pc),
         Err(err) => fold_err(runtime, err),
     }
+}
+
+/// The construction body, the owning family's own `put_list` with the dispatcher's
+/// variant match removed.
+///
+/// The order is the frozen **reserve -> read -> write** discipline: the cons block is
+/// reserved first (through [`terms::make_cons_rooted`], hence one rooted
+/// `alloc_words_rooted` carrying the whole [`RootSet`]), the two operands are read
+/// **inside** the reservation's closure (so a collecting host's relocation is observed
+/// rather than read around), and only then is the destination written.
+///
+/// Every accepted shape carries no slack (`operand_slack_words` is 0 for a small int,
+/// an atom, `[]`, and an x-register or in-window `Y` slot), so `extra` is 0 on every
+/// path the emitter's `put_list_shape` admits; the sum is kept because this body must
+/// stay identical to the family's if the shape proof later widens.
+fn construct(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    head: &Operand,
+    tail: &Operand,
+    dst: &Operand,
+) -> beam_common::Result<Step> {
+    let extra = operand_slack_words(head) + operand_slack_words(tail);
+    let cons = terms::make_cons_rooted(machine, ctx, RootSet::ALL_LIVE, extra, |m, s| {
+        Ok((
+            read_operand_slack(m, head, s)?,
+            read_operand_slack(m, tail, s)?,
+        ))
+    })?;
+    write_operand(machine, dst, cons)?;
+    Ok(Step::Next)
 }
