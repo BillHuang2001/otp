@@ -820,9 +820,11 @@ impl RuntimeContext<'_> {
         // that scheduled the timer may have been collected. Copy it onto the pointer-stable
         // arena now (see `Runtime::try_stabilize_escaped`, which reports a term the copier
         // genuinely cannot copy as the honest `system_limit` instead of storing it). `from`
-        // needs no copy (a pid term is a heap-free immediate), and `reference` must **not** be
-        // copied: it is the caller's own handle (returned below) *and* the `Timers::refs`
-        // lookup key, so a copy would break `erlang:cancel_timer/1`.
+        // needs no copy (a pid term is a heap-free immediate), and `reference` is not copied
+        // either: it is the caller's own handle (returned below) *and* the word `Timers`
+        // records, so the timer's own wake record is keyed by exactly what `cancel_timer/1`
+        // is later handed (a copy would still resolve, by identity, but the canonical word is
+        // what the heap and its wake mirror are keyed by).
         let message = self.runtime.try_stabilize_escaped(message)?;
         let from = self.pid().to_eterm();
         self.runtime
@@ -842,6 +844,11 @@ impl RuntimeContext<'_> {
     ///   (a `#Ref<>` this runtime minted for something else — `make_ref/0`, a monitor —
     ///   answers `false` too);
     /// * anything that is not a reference at all → `badarg`.
+    ///
+    /// The reference is recognised by its **identity**, so a *copy* of a timer reference — an
+    /// `ets` round trip, a message — cancels the same timer. A copied `make_ref/0`/monitor
+    /// reference still answers `badarg` where the C answers `false` (see
+    /// [`Self::is_runtime_reference`]).
     pub(super) fn cancel_timer_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         // A timer reference, or a reference this runtime minted for something else
@@ -864,11 +871,14 @@ impl RuntimeContext<'_> {
     ///
     /// This is the argument test `erlang:cancel_timer/1` and `erts_internal:group_leader/3`
     /// share. The C only checks the *shape* (`is_not_internal_ref`), because it can read the
-    /// thing's payload; reading one here would need `beam_term::boxed_val`, which is `unsafe`
-    /// (and this crate is `#![deny(unsafe_code)]`), so the runtime's term-keyed registries —
-    /// the only safe way to recognise a reference — are the test. The comparison is by raw
-    /// term word, which is exact for a reference: two distinct references are distinct terms,
-    /// and an equal term word denotes the same reference. Delegates to the ONE provenance test,
+    /// thing's payload; this crate is `#![deny(unsafe_code)]`, so the runtime's term-keyed
+    /// registries are the test. Those registries are **not** all keyed the same way, and the
+    /// difference is observable: a reference's identity is its id (ONE reference-id space,
+    /// `beam_common::next_ref_id`), not the address of its term, so a **copy** of a reference
+    /// (an `ets` round trip, a message) is the same reference. `Timers` keeps an id-keyed index
+    /// beside its word-keyed one and therefore recognises a copied **timer** reference, while
+    /// `Runtime::references` is word-keyed only, so a copied `make_ref/0`/monitor reference is
+    /// not recognised. Delegates to the ONE provenance test,
     /// [`Runtime::is_known_local_reference`].
     pub(super) fn is_runtime_reference(&self, term: Eterm) -> bool {
         self.runtime.is_known_local_reference(term)

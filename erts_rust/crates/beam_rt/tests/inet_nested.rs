@@ -142,8 +142,9 @@ const ORACLE_SUSPEND_WINDOW: Duration = Duration::from_secs(8);
 // The fixed ports
 // ---------------------------------------------------------------------------------------------
 //
-// `gen_tcp:connect/3` by **hostname** is `{error,nxdomain}` here (`inet_gethost` is not wired),
-// so every peer address is the `{127,0,0,1}` tuple. The listener ports are literals rather than
+// Every peer address is the `{127,0,0,1}` tuple: the peer is told where to connect *before* the
+// run starts, so no hostname is resolved at all (a *string* host does resolve here now — see
+// `tests/timer_ref_identity.rs`). The listener ports are literals rather than
 // `0`, because the peer is a separate process that must be told where to connect *before* the
 // run starts; each case owns its own port so the cases cannot collide, and the numbers are
 // chosen to be unlikely to be in use. They are deliberately **below the host's ephemeral range**

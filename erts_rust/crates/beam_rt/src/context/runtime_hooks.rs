@@ -228,7 +228,10 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// Oracle-verified (OTP 29/`erts-17.1`), and exactly what this answers:
     ///
     /// * the first argument must be a **reference this runtime minted** (a timer reference,
-    ///   a `make_ref/0` reference, a monitor reference) — anything else is `badarg`;
+    ///   a `make_ref/0` reference, a monitor reference) — anything else is `badarg`. A timer
+    ///   reference is recognised by its **identity**, so a *copy* of it (an `ets` round trip,
+    ///   a message) names the same timer: `inet_gethost_native.erl:365-368,270-275` stores its
+    ///   `start_timer/3` reference in an `ets` row and cancels the copy it reads back;
     /// * `Options` must be a list of `{async, boolean()}` / `{info, boolean()}` tuples, in
     ///   any order, **last occurrence winning**; anything else (a bare atom such as `[info]`,
     ///   a non-list, an improper list, `[{info, 1}]`, an unknown key) is `badarg`;
@@ -241,9 +244,21 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// # Errors
     ///
     /// `badarg` for a non-reference first argument or a malformed option list.
+    ///
+    /// # Divergence — a *copied* non-timer reference
+    ///
+    /// The predicate is [`Runtime::is_known_local_reference`], and the two halves of its
+    /// provenance map disagree about copies: `Timers` is keyed by identity as well as by word
+    /// (so any copy of a timer reference is accepted), while [`Runtime::references`] is
+    /// word-keyed (so a copy of a `make_ref/0` or monitor reference is not). A copied
+    /// **non-timer** reference therefore answers `badarg` here where the C — which reads the
+    /// thing's payload — answers `false`. Timer references are the case a real application
+    /// depends on (a timer ref is stored somewhere and cancelled through the copy); widening
+    /// the rest means id-keying `Runtime::references` and the alias/monitor tables behind it.
     fn cancel_timer_2(&mut self, heap: &mut Heap, args: &[Eterm]) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
-        // A timer reference, or a reference this runtime minted for something else
+        // A timer reference (a copy included — its identity is what `Timers` keys the second
+        // half of its map by), or a reference this runtime minted for something else
         // (`make_ref/0`, a monitor) — anything else is not a reference and is `badarg`, the
         // same test `erlang:cancel_timer/1` (the runtime-native floor) applies. The ONE
         // provenance test decides (`Runtime::is_known_local_reference`).
@@ -348,13 +363,13 @@ impl<'a> RuntimeHooksBridge<'a> {
         async_: bool,
     ) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
-        // A timer reference, or a reference this runtime minted for something else
+        // A timer reference (a copy included — `Timers` keys its second index by the
+        // reference's identity), or a reference this runtime minted for something else
         // (`make_ref/0`, a monitor) — anything else is not a reference and is `badarg`, the
         // same shape/provenance test `erlang:cancel_timer/1,2` applies (see
-        // [`Self::cancel_timer_2`]). The ONE provenance test decides
-        // (`Runtime::is_known_local_reference`); a reference this runtime did not mint answers
-        // `badarg` here where the C answers `false` — the same documented divergence the
-        // cancellation pair carries, and the reason it is stated once, here.
+        // [`Self::cancel_timer_2`], which states the one divergence a *copied* non-timer
+        // reference still carries). The ONE provenance test decides
+        // (`Runtime::is_known_local_reference`).
         let pending = if self.runtime.is_known_local_reference(term) {
             self.runtime.timers.remaining(term)
         } else {
