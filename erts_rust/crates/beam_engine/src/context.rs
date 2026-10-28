@@ -530,43 +530,6 @@ impl FunOutcome {
     }
 }
 
-/// What kind of callable a `module:function/arity` name denotes — the
-/// discriminator behind the synthesized BIF head item's `error_info` location
-/// extension ([`crate::families::exceptions::bif_frame`]).
-///
-/// C's rule 1 (`save_stacktrace`, `../../erts/emulator/beam/beam_common.c:877-1063`)
-/// applies only to a **`bif_mfa`**, i.e. to a BIF the `bif.tab` surface *declares*.
-/// A `beam_bifs` **stdlib fast path** — a registry key `bif.tab` does not declare,
-/// e.g. `lists:max/1` — stands in for an **Erlang source function**: the oracle's
-/// innermost frame for such a call is that source function with a
-/// `{file,_}`/`{line,_}` location, and **never** the BIF `error_info` extension (a
-/// fabricated extension makes `erl_error:format_exception/4` look up the wrong
-/// module's `format_error/1`).
-///
-/// That discriminator lives in the host — `beam_bifs`'s
-/// `bif_tab::Census::fast_paths` — which is why [`ExecutionContext::bif_kind`] is a
-/// seam rather than an engine-side table: this crate embeds no BIF table.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BifKind {
-    /// A BIF the `bif.tab` surface **declares** — C's `bif_mfa`. Its failing frame is
-    /// the BIF itself, with the closed table's
-    /// `[{error_info, #{module => FormatModule}}]` location
-    /// (`beam_common.c:937-1006`).
-    Declared,
-    /// A **stdlib fast path**: a `beam_bifs` registry key `bif.tab` does not declare,
-    /// standing in for an Erlang source function. Its item carries the real argument
-    /// list and **no** `error_info` extension.
-    StdlibFastPath,
-    /// The host cannot classify the name (no registry, or a name outside it).
-    ///
-    /// Treated **exactly** as [`BifKind::Declared`] everywhere, so every pre-seam host
-    /// — [`MinimalContext`], the test hosts, and any host that does not override
-    /// [`ExecutionContext::bif_kind`] — stays byte-identical.
-    #[default]
-    Unknown,
-}
-
 /// The **devirtualised** form of the [`ExecutionContext::reduce`] hook: a
 /// monomorphised shim over the host's own `reduce` plus the host it charges, so a
 /// caller that already holds this value pays one indirect call for a charge — no
@@ -1281,39 +1244,6 @@ pub trait ExecutionContext: ReduceHookSource {
         Ok(false)
     }
 
-    /// Classify a `module:function/arity` name as a **declared** BIF, a `beam_bifs`
-    /// **stdlib fast path**, or unknown — the discriminator behind the synthesized
-    /// BIF head item's location extension (see [`BifKind`]).
-    ///
-    /// C's rule 1 (`../../erts/emulator/beam/beam_common.c:877-1063`) applies only to
-    /// a `bif_mfa`: a frame for a BIF the `bif.tab` surface declares. A stdlib fast
-    /// path (`lists:max/1`, `lists:nth/2`, …) stands in for an Erlang **source**
-    /// function, whose oracle frame is `{M, F, Args, [{file, F}, {line, N}]}` — a
-    /// source location, never the `[{error_info, #{module => FormatModule}}]`
-    /// extension. Only the host can tell the two apart (the census lives in
-    /// `beam_bifs`), so the engine asks here instead of fabricating a classification.
-    ///
-    /// * [`BifKind::Declared`] — a declared BIF: the item keeps its extension.
-    /// * [`BifKind::StdlibFastPath`] — a fast path: the item carries the real argument
-    ///   list and an **empty** location. The oracle's true `{file,_}`/`{line,_}`
-    ///   location is an honest residual (the engine has no
-    ///   "source location of a loaded function" door); naming a fabricated
-    ///   `error_info` instead would be actively wrong.
-    /// * [`BifKind::Unknown`] — the **default**, and it is treated exactly as
-    ///   [`BifKind::Declared`], so a host that does not override this method (every
-    ///   existing one) is byte-identical to the pre-seam engine.
-    ///
-    /// A host owning a `beam_bifs` registry should answer
-    /// [`BifKind::StdlibFastPath`] for a key that `bif.tab` does not declare
-    /// (`bif_tab::Census::fast_paths` membership).
-    ///
-    /// The receiver is `&self` and the method must be **side-effect free**: it is
-    /// consulted on a raise path, after the failing BIF has already produced its error.
-    fn bif_kind(&self, module: &str, function: &str, arity: u32) -> BifKind {
-        let _ = (module, function, arity);
-        BifKind::Unknown
-    }
-
     /// Resolve a **record definition** that is not the running module's own — the
     /// host record-table seam behind `put_record`'s **create** form.
     ///
@@ -1624,15 +1554,6 @@ pub type LocalFunResolver = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Option<(Arc
 /// default). [`MinimalContext::new`] leaves it unset, so `resolve_local_call` stays the
 /// trait's `Ok(false)` default.
 pub type LocalCallResolver = Box<dyn FnMut(&str, &str, u32) -> Result<bool>>;
-
-/// A `module:function/arity` **classifier** — the pluggable body of
-/// [`ExecutionContext::bif_kind`].
-///
-/// `Fn` (not `FnMut`) and answering no `Result` because the seam is `&self` and is
-/// consulted on a raise path, where a failure answer would have nowhere to go: an
-/// unclassifiable name is [`BifKind::Unknown`], which the engine treats exactly as
-/// [`BifKind::Declared`].
-pub type BifKindResolver = Box<dyn Fn(&str, &str, u32) -> BifKind>;
 
 /// The first region's **reservation** in `Eterm` words (4 MiB).
 ///
@@ -2231,15 +2152,6 @@ pub struct MinimalContext {
     /// An optional local-call resolver (the
     /// [`ExecutionContext::resolve_local_call`] body).
     local_call_resolver: Option<LocalCallResolver>,
-    /// An optional `module:function/arity` **classifier** (the
-    /// [`ExecutionContext::bif_kind`] body).
-    ///
-    /// `None` out of the box, so the seam is the trait default
-    /// ([`BifKind::Unknown`], treated exactly as [`BifKind::Declared`]) and every
-    /// test that does not care about the classification is byte-identical. A test
-    /// that models a host owning a `beam_bifs` registry installs one through
-    /// [`set_bif_kind_resolver`](MinimalContext::set_bif_kind_resolver).
-    bif_kind_resolver: Option<BifKindResolver>,
     /// The host-supplied **record definitions** — the body of
     /// [`ExecutionContext::foreign_record_definition`], keyed by their exact
     /// `(owner, name)` atom values.
@@ -2293,7 +2205,6 @@ impl MinimalContext {
             external_resolver: None,
             local_fun_resolver: None,
             local_call_resolver: None,
-            bif_kind_resolver: None,
             foreign_records: Vec::new(),
             mailbox: None,
             shared_atoms: None,
@@ -2391,17 +2302,6 @@ impl MinimalContext {
     /// Install (or replace) the local-call resolver.
     pub fn set_local_call_resolver(&mut self, resolver: LocalCallResolver) {
         self.local_call_resolver = Some(resolver);
-    }
-
-    /// Install (or replace) the `module:function/arity` **classifier** — the
-    /// [`ExecutionContext::bif_kind`] body.
-    ///
-    /// A host owning a `beam_bifs` registry answers [`BifKind::StdlibFastPath`] for a
-    /// registry key `bif.tab` does not declare and [`BifKind::Declared`] for one it
-    /// does; without a resolver the trait default ([`BifKind::Unknown`], treated
-    /// exactly as `Declared`) keeps every existing test's shapes unchanged.
-    pub fn set_bif_kind_resolver(&mut self, resolver: BifKindResolver) {
-        self.bif_kind_resolver = Some(resolver);
     }
 
     /// A context with the given **record definitions** and the default (rejecting)
@@ -2690,16 +2590,6 @@ impl ExecutionContext for MinimalContext {
                 let _ = (module, function, arity);
                 Ok(false)
             }
-        }
-    }
-
-    /// Answer from the installed classifier, or the trait default
-    /// ([`BifKind::Unknown`], treated exactly as [`BifKind::Declared`]) when none was
-    /// installed — byte-identical to the pre-seam engine.
-    fn bif_kind(&self, module: &str, function: &str, arity: u32) -> BifKind {
-        match &self.bif_kind_resolver {
-            Some(resolver) => resolver(module, function, arity),
-            None => BifKind::Unknown,
         }
     }
 

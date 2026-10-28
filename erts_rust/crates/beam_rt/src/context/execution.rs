@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use beam_common::{BeamError, Result};
-use beam_engine::context::{BifKind, RootSet};
+use beam_engine::context::RootSet;
 use beam_engine::{BifOutcome, ExecutionContext};
 use beam_loader::{Label, Module};
 use beam_term::{Atom, AtomTable, Eterm};
@@ -95,27 +95,6 @@ impl ExecutionContext for RuntimeContext<'_> {
         }
         Ok(beam_bifs::serves_local_call(module, function, arity as usize))
     }
-    /// Classify the failing `module:function/arity` as a **declared `bif.tab` BIF** or a
-    /// `beam_bifs` **stdlib fast path** — the discriminator behind the synthesized BIF
-    /// head item's `[{error_info, #{module => FormatModule}}]` location extension.
-    ///
-    /// The classification data is `beam_bifs`'s census (`bif_tab::Census::fast_paths`,
-    /// exactly the registry keys the table does not declare), frozen once per process into
-    /// a sorted key vector ([`crate::bif_kind`]): a key **in** it is a fast path standing in
-    /// for an Erlang **source** function — the oracle's innermost frame for such a call is
-    /// that source function with a `{file,_}`/`{line,_}` location and **never** the BIF
-    /// `error_info` extension — and every other key is a declared BIF, which keeps it.
-    ///
-    /// Without an installed `bif.tab` (a build with no OTP checkout) the seam answers
-    /// [`BifKind::Unknown`], which the engine treats exactly as `Declared`, so the behaviour
-    /// is byte-identical to the pre-seam runtime. The scheduled path's `BudgetContext`
-    /// forwards here, so a spawned process and the `-eval`/`run` action classify identically.
-    ///
-    /// Side-effect free: this is consulted **after** the failing BIF has produced its error.
-    fn bif_kind(&self, module: &str, function: &str, arity: u32) -> BifKind {
-        crate::bif_kind::classify(module, function, arity)
-    }
-
     /// Resolve an interned atom id to its name from the runtime's **live** shared namespace,
     /// falling back to the running module's own load-time snapshot
     /// ([`ExecutionContext::atom_name`]).

@@ -45,6 +45,7 @@ const TABLE_ATOMS: &[&str] = &[
     "hd",
     "lists",
     "max",
+    "seq",
     "binary",
     "at",
     "os",
@@ -322,48 +323,11 @@ fn function_clause_error() -> BeamError {
 }
 
 #[test]
-fn a_fast_path_item_carries_no_extension() {
-    // Oracle: `catch lists:max([])` -> `{lists,max,[[]],[{file,"lists.erl"},{line,638}]}`.
-    // `lists:max/1` is NOT a `bif.tab` BIF: it is a `beam_bifs` stdlib fast path
-    // standing in for the `lists.erl` body, so the oracle's innermost item is that
-    // **source** function with a source location and no `error_info`. No engine-side
-    // door can name a source location, so the honest shape is the real argument list
-    // with an EMPTY location — never a fabricated `erl_stdlib_errors` classification.
-    let module = fixture();
-    let mut machine = machine_with_a_catch_frame();
-    let mut ctx = MinimalContext::new();
-    ctx.set_bif_kind_resolver(Box::new(|module, function, arity| {
-        if (module, function, arity) == ("lists", "max", 1) {
-            BifKind::StdlibFastPath
-        } else {
-            BifKind::Unknown
-        }
-    }));
-    let item = head_item(&mut machine, &mut ctx, &module, "lists", "max", &[1])
-        .expect("a live catch frame and a nameable fast path synthesize the item");
-    let expected = expected_item(
-        &mut ctx,
-        &module,
-        "lists",
-        "max",
-        &[make_small(1)],
-        None,
-    );
-    assert!(cmp(item, expected, &module.atom_table).is_eq());
-    assert_eq!(
-        tuple_element(item, 3).unwrap(),
-        NIL,
-        "a stdlib fast path's item has no `error_info` extension"
-    );
-}
-
-#[test]
-fn a_function_clause_raise_carries_no_extension_even_for_a_declared_bif() {
-    // No host override at all (the `Unknown` default, treated as `Declared`): the
-    // bare `function_clause` reason alone drops the extension, because C's only
-    // producer of that reason is `func_info`, which names its OWN frame with a source
-    // location and never goes through `save_stacktrace`'s BIF arm. This is the arm
-    // that makes `lists:max([])` cook `{lists,max,[[]],[]}` on a **pre-seam** host.
+fn a_function_clause_raise_carries_no_extension_even_for_a_tabled_module() {
+    // The bare `function_clause` reason alone drops the extension for a module the
+    // closed table DOES name, because C's only producer of that reason is `func_info`,
+    // which names its OWN frame with a source location and never attaches info. This is
+    // the arm that makes `lists:max([])` cook `{lists,max,[[]],[]}`.
     let module = fixture();
     let mut machine = machine_with_a_catch_frame();
     let mut ctx = MinimalContext::new();
@@ -394,38 +358,37 @@ fn a_function_clause_raise_carries_no_extension_even_for_a_declared_bif() {
 }
 
 #[test]
-fn the_hosts_classification_decides_the_extension() {
-    // `Declared` and the `Unknown` default keep the extension — a host that does not
-    // override `bif_kind` is byte-identical to the pre-seam engine — while
-    // `StdlibFastPath` drops it. Same failure (`badarg`), same names, three hosts.
+fn a_non_function_clause_raise_keeps_the_tabled_modules_extension() {
+    // Oracle, measured on OTP 29.1.2:
+    //   `try lists:seq(1, 2, 0) catch error:R:S -> hd(S) end`
+    //   -> `{lists,seq,[1,2,0],[{file,"lists.erl"},{line,541},
+    //                          {error_info,#{module => erl_stdlib_errors}}]}`
+    // `lists:seq/3` is a `beam_bifs` stdlib fast path (no `bif.tab` row), but its OTP body
+    // raises through `error_with_info/2` — an Erlang-level `erlang:error/3` carrying the
+    // extension — so a fast path keeps the extension exactly like a declared BIF. The only
+    // residual is the source position, which no engine-side door can name.
     let module = fixture();
-    let make = |kind: BifKind, ctx: &mut MinimalContext| {
-        ctx.set_bif_kind_resolver(Box::new(move |_, _, _| kind));
-    };
-    for (kind, extension) in [
-        (BifKind::Declared, Some("erl_erts_errors")),
-        (BifKind::Unknown, Some("erl_erts_errors")),
-        (BifKind::StdlibFastPath, None),
-    ] {
-        let mut machine = machine_with_a_catch_frame();
-        let mut ctx = MinimalContext::new();
-        make(kind, &mut ctx);
-        let item = head_item(&mut machine, &mut ctx, &module, "erlang", "hd", &[1]).unwrap();
-        let expected =
-            expected_item(&mut ctx, &module, "erlang", "hd", &[make_small(1)], extension);
-        assert!(
-            cmp(item, expected, &module.atom_table).is_eq(),
-            "{kind:?} must cook the extension {extension:?}"
-        );
-    }
-}
-
-#[test]
-fn the_default_classification_is_unknown() {
-    // The pre-seam default: no host override, so the seam answers `Unknown`, which
-    // the shape rule treats exactly as `Declared`.
-    let ctx = MinimalContext::new();
-    assert_eq!(ctx.bif_kind("erlang", "hd", 1), BifKind::Unknown);
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MinimalContext::new();
+    let item = head_item_for(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "lists",
+        "seq",
+        &[1, 2, 0],
+        &BeamError::BadArg,
+    )
+    .expect("a live catch frame and a nameable module synthesize the item");
+    let expected = expected_item(
+        &mut ctx,
+        &module,
+        "lists",
+        "seq",
+        &[make_small(1), make_small(2), make_small(0)],
+        Some("erl_stdlib_errors"),
+    );
+    assert!(cmp(item, expected, &module.atom_table).is_eq());
 }
 
 // ---------------------------------------------------------------------------

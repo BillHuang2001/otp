@@ -61,7 +61,7 @@ use beam_common::{LiveReason, Raise};
 use beam_loader::{Atom, Export, Import, ImportRef};
 use beam_term::{is_nil, Eterm, NIL};
 
-use crate::context::{BifKind, Mailbox};
+use crate::context::Mailbox;
 use crate::families::exceptions::bif_frame::tests::{atom_of, expected_item};
 use crate::jit::Tier;
 use crate::terms::{list_elements, tuple_element};
@@ -698,39 +698,29 @@ fn records_get_gets_no_extension() {
 }
 
 // ---------------------------------------------------------------------------
-// The measured table: declared BIF vs stdlib fast path
+// The measured table: a `function_clause` reason vs every other reason
 // ---------------------------------------------------------------------------
 
 #[test]
-fn lists_max_cooks_the_fast_path_item_without_an_extension() {
+fn lists_max_cooks_a_function_clause_item_without_an_extension() {
     // Measured on the oracle with a compiled module:
     //   `lmax() -> lists:max([]).` caught ->
     //   `{error, function_clause, {lists,max,[[]],[{file,"lists.erl"},{line,638}]}}`.
     //
-    // `lists:max/1` is NOT a `bif.tab` BIF: it is one of `beam_bifs`'s stdlib **fast
-    // paths**, standing in for the `lists.erl` body. The oracle's innermost item is
-    // therefore the ERLANG SOURCE function with a source location, never a BIF frame,
-    // and so never the `[{error_info, #{module => FormatModule}}]` extension — an
-    // extension here would make `erl_error:format_exception/4` look up
-    // `erl_stdlib_errors:format_error/1` for a call that was not a BIF.
+    // The extension is dropped because of the **reason**, not the module: C's only
+    // producer of a bare `function_clause` is `func_info`, which names its own frame with
+    // a source location and attaches no info. `lists` IS in the closed table, so a
+    // non-`function_clause` raise out of the same module keeps its extension (the
+    // `lists:seq/3` row below).
     //
     // No engine-side door can name a source location, so the honest shape is the real
-    // argument list with an EMPTY location. Both halves of the shape rule agree on it
-    // here (the host classifies the name as a fast path, and the reason is the bare
-    // `function_clause`); the unit suite pins each half on its own.
+    // argument list with an EMPTY location.
     let (module, run_atom) = call_ext_traced("lists", "max", 1, &[Reg::Nil]);
     let mut ctx = raising_ctx(
         ("lists", "max", 1),
         "function_clause",
         ExceptionClass::Error,
     );
-    ctx.set_bif_kind_resolver(Box::new(|module, function, arity| {
-        if (module, function, arity) == ("lists", "max", 1) {
-            BifKind::StdlibFastPath
-        } else {
-            BifKind::Unknown
-        }
-    }));
     let cooked = cooked_on_both_tiers(&module, run_atom, &mut ctx);
     assert_head_item(
         &module,
@@ -744,15 +734,45 @@ fn lists_max_cooks_the_fast_path_item_without_an_extension() {
 }
 
 #[test]
-fn a_declared_bif_keeps_its_extension_when_the_host_says_declared() {
-    // The negative of the row above: the same `call_ext` route and the same `badarg`
-    // reason, but a host that classifies `erlang:hd/1` as a **declared** `bif.tab`
-    // BIF. The item keeps the closed table's
-    // `[{error_info, #{module => erl_erts_errors}}]` extension — on both tiers, with
-    // tier agreement asserted first (`cooked_on_both_tiers`).
+fn lists_seq_keeps_the_stdlib_extension() {
+    // The row that settles the rule. Measured on the oracle (OTP 29.1.2):
+    //   `try lists:seq(1,2,0) catch C:R:S -> hd(S) end` ->
+    //   `{lists,seq,[1,2,0],[{file,"lists.erl"},{line,541},
+    //                          {error_info,#{module => erl_stdlib_errors}}]}`
+    //
+    // `lists:seq/3` is a `beam_bifs` stdlib **fast path** — there is no `bif.tab` row —
+    // but `lists.erl` raises through `error_with_info/2`, i.e. an Erlang-level
+    // `erlang:error(Reason, Args, [{error_info, #{module => erl_stdlib_errors}}])`. The
+    // extension is therefore the source body's own, not a BIF classification, and a fast
+    // path keeps it exactly like a declared BIF. Only the source position is a residual.
+    let (module, run_atom) = call_ext_traced(
+        "lists",
+        "seq",
+        3,
+        &[Reg::Int(1), Reg::Int(2), Reg::Int(0)],
+    );
+    let mut ctx = raising_ctx(("lists", "seq", 3), "badarg", ExceptionClass::Error);
+    let cooked = cooked_on_both_tiers(&module, run_atom, &mut ctx);
+    assert_head_item(
+        &module,
+        &mut ctx,
+        cooked,
+        "lists",
+        "seq",
+        &terms_of(&module, &[Reg::Int(1), Reg::Int(2), Reg::Int(0)]),
+        Some("erl_stdlib_errors"),
+    );
+}
+
+#[test]
+fn a_declared_bif_keeps_its_extension() {
+    // The declared-BIF row, side by side with the fast-path one above: the same
+    // `call_ext` route and the same `badarg` reason for `erlang:hd/1` (`ubif`, a real
+    // `bif.tab` row). The item keeps the closed table's
+    // `[{error_info, #{module => erl_erts_errors}}]` extension — on both tiers, with tier
+    // agreement asserted first (`cooked_on_both_tiers`).
     let (module, run_atom) = call_ext_traced("erlang", "hd", 1, &[Reg::Int(1)]);
     let mut ctx = badarg_ctx();
-    ctx.set_bif_kind_resolver(Box::new(|_, _, _| BifKind::Declared));
     let cooked = cooked_on_both_tiers(&module, run_atom, &mut ctx);
     assert_head_item(
         &module,

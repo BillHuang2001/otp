@@ -169,7 +169,7 @@
 use std::sync::Arc;
 
 use beam_common::Result;
-use beam_engine::context::{BifKind, RootSet};
+use beam_engine::context::RootSet;
 use beam_engine::{BifOutcome, ExecutionContext, Machine};
 use beam_loader::{Label, Module};
 use beam_term::{Atom, AtomTable, Eterm};
@@ -589,21 +589,6 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     ) -> Result<Option<beam_loader::RecordDefinition>> {
         ExecutionContext::foreign_record_definition(self.inner, owner, name)
     }
-    /// Forwarded like every other method (see
-    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
-    /// wrapper itself overrides) — and **load-bearing for the scheduled path**: the slice's
-    /// machine runs on *this* wrapper, so the engine asks the raise-path BIF classifier here.
-    /// Without the forward it would see the trait default ([`BifKind::Unknown`], treated
-    /// exactly as `Declared`) and a stdlib fast path would keep a **fabricated**
-    /// `[{error_info, #{module => FormatModule}}]` location extension on its synthesized head
-    /// item, diverging from the `-eval`/`run` action context — which overrides it — for the
-    /// same call.
-    ///
-    /// It is **not priced**: it is a table lookup on a raise path, not a call resolution.
-    fn bif_kind(&self, module: &str, function: &str, arity: u32) -> BifKind {
-        ExecutionContext::bif_kind(self.inner, module, function, arity)
-    }
-
     /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
     /// for that one admission point first.
     ///
