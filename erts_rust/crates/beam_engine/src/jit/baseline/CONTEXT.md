@@ -82,8 +82,14 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `ensure_heap` / `trim` calls in the interpreter's own order, and for the two `allocate` helpers
   `Machine::push_frame_window` — the push that also hands back the new frame's `(y_base, y_count)`, so
   the helper publishes the Y window from figures already in hand (`JitRuntime::publish_y_window`)
-  rather than re-deriving them — each answering `encode_target(func, pc + 1)` or `report_frame_error`'s
-  `ERROR`, with the `FrameSizeHelper`/`HeapNeedHelper`/`AllocateHeapHelper` fn-pointer types),
+  rather than re-deriving them — each answering the fixed non-negative `CONTINUE` (`i64::MAX`) or
+  `report_frame_error`'s `ERROR` (`-2`), so the emitted continue arm is a reject-only `test rax, rax` /
+  `js` over `{CONTINUE, ERROR}` (`emit/heap.rs::emit_frame_change_continue`, 9 B / 2 instructions)
+  instead of a `movabs` + `cmp` + `jcc` against a per-instruction target; `jit_allocate` therefore
+  takes only `stack_need` (its `func`/`pc` were the dead `movabs` setups), and `emit/deallocate`,
+  whose continue arm can still answer `CALL_STORED`/`HALT`, keeps `encode_target(func, pc + 1)` and
+  the exact compare. The `FrameSizeHelper`/`HeapNeedHelper`/`AllocateHeapHelper`/`AllocateHelper`
+  fn-pointer types name the four signatures),
   `jit_publish_y` (the block prologue's position store — `JitRuntime::current_code` — **plus**
   `JitRuntime::refresh_y_base` in one call, a Y-accessing block's prologue publish; the plain
   position store itself is **emitted inline**, `emit/prologue.rs::emit_position_store`) and
