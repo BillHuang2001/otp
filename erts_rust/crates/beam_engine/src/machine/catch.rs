@@ -202,6 +202,37 @@ impl Machine {
         self.raise_function_clause_args
     }
 
+    /// Consume the **live raise**'s `{error_info, Map}` extension
+    /// ([`Machine::raise_error_info`]).
+    ///
+    /// `Some(map)` means the exception currently in flight was raised by an
+    /// `erlang:error/3` that scanned that map out of its options list, and C's cooked
+    /// stacktrace appends `{error_info, Map}` as the **tail of the innermost item's
+    /// location** (`erts_build_mfa_item`,
+    /// `../../erts/emulator/beam/utils.c:3430-3457`, fed by `save_stacktrace`'s
+    /// `error_info = c_p->fvalue` for `EXC_ERROR_3`,
+    /// `../../erts/emulator/beam/beam_common.c:1024-1026`) — so the oracle reports
+    /// `[{file,F},{line,N},{error_info,Map}]` for that one item and the plain
+    /// two-element location for every outer frame. `None` for every other raise.
+    ///
+    /// Taking it consumes it: the map describes exactly **one** cooking.
+    pub(crate) fn take_raise_error_info(&mut self) -> Option<Eterm> {
+        self.raise_error_info.take()
+    }
+
+    /// The **read half** of [`Machine::take_raise_error_info`]: the live
+    /// `{error_info, Map}` map term, **without** consuming it.
+    ///
+    /// The cooked-trace builder needs the extension's presence to size its single
+    /// rooted reservation before taking it, and must not carry the pre-reservation
+    /// word into the carve: a collecting host may **move** the map under that
+    /// reservation, so the term is taken *after* it, through
+    /// [`Machine::take_raise_error_info`], which yields the re-seated (post-move)
+    /// word — exactly the split [`Machine::live_raise_function_clause_args`] has.
+    pub(crate) fn live_raise_error_info(&self) -> Option<Eterm> {
+        self.raise_error_info
+    }
+
     /// Consume the **live raise**'s explicitly supplied symbolic frames
     /// ([`Machine::raise_supplied_trace`]).
     ///
@@ -508,6 +539,11 @@ impl Machine {
             // live state from here on, so a raise that carries no such list clears it to
             // `None` (never a stale list from an earlier raise).
             self.raise_function_clause_args = self.pending_function_clause_args.take();
+            // The `{error_info, Map}` extension an `erlang:error/3` raise arrived
+            // carrying rides the same protocol: the raise site armed the one-shot
+            // latch, and this raise owns the live state from here on, so a raise that
+            // carries no such map clears it to `None`.
+            self.raise_error_info = self.pending_error_info.take();
             // The explicitly **supplied** symbolic frames ride the same protocol: the
             // raise site armed the one-shot latch (only when the incoming raise carried
             // a non-empty trace), and this raise — whoever raised it — owns the live
@@ -656,6 +692,15 @@ impl Machine {
             BeamError::Raise(raise)
                 if raise.stacktrace.is_empty() && !is_engine_diagnostic(&raise.reason) =>
             {
+                // The `{error_info, Map}` extension belongs to the **innermost cooked
+                // item's location tail** (C's `erts_build_mfa_item` prepends the
+                // `{file,_}`/`{line,_}` pairs to it), and this funnel's symbolic model —
+                // [`beam_common::StackTrace`], a list of `{M,F,A,Location}` frames with a
+                // two-element location — has no tail to put it in. It is therefore
+                // **consumed and declined** here rather than left armed for a later,
+                // unrelated cooking; the residual is recorded in
+                // `families/exceptions/CONTEXT.md`.
+                let _error_info = self.take_raise_error_info();
                 // A raise that arrived carrying **explicit symbolic frames** renders
                 // those (an empty supplied trace stays empty); a raise that supplied a
                 // trace **term** renders the preserved chain — the trace of the raise

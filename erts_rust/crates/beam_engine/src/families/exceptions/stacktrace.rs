@@ -103,16 +103,26 @@ use crate::terms::{ContextSink, Sink};
 ///    `run_export`/`run_label` entry, so a caller *outside* the run — the host's
 ///    own chain, the oracle's trailing `erl_eval`/`init` entries — has no frame
 ///    here and is absent from the result.
-/// 2. **The snapshot's items carry the arity, never an argument list.** C uses the
-///    exception's saved arguments where the raw trace holds them (`args` in
-///    `erts_build_mfa_item`); the snapshot keeps no such list, so the arity — C's
-///    own fallback for a frame without saved args — is always emitted. The one
-///    exception is the synthesized **callee head item** an unresolvable
-///    `call_ext*`/`apply` target publishes (`head` below, [`super::callee`]), which
-///    is consed in front of the frame list and *does* carry the callee's real
-///    argument list — exactly C's innermost item for an `undef`.
-/// 3. **No `error_info` entries.** C's innermost item extends its `Location` with
-///    the raw trace's extra info (`get_error_info_from_exc`); the engine has none.
+/// 2. **The snapshot's items carry the arity, except the innermost one, which carries
+///    the argument list the raise published.** C takes `args` out of the exception
+///    (`get_args_from_exc` → `erts_build_mfa_item`); the engine has no saved raw
+///    trace, so the two raise sites that *know* the argument list arm a latch —
+///    the `function_clause` site and an `erlang:error/2,3` raise — and that list
+///    (as a term, verbatim: a proper list, an improper one or `[]`) fills the first
+///    item's `A` slot. Every other item keeps the declared arity, C's own fallback.
+///    The synthesized **callee head item** an unresolvable `call_ext*`/`apply`
+///    target publishes (`head` below, [`super::callee`]) is consed in front of the
+///    frame list and carries the callee's real argument list — exactly C's innermost
+///    item for an `undef`.
+/// 3. **The `error_info` extension is rendered, but only from a raise that carries
+///    one.** C's innermost item extends its `Location` with `{error_info, Map}`
+///    (`get_error_info_from_exc`); the engine renders it when the raise published the
+///    map (`beam_common::Raise::error_info`, an `erlang:error/3`), including a
+///    `{error_info,Map}`-only location for a frame with no source position. It never
+///    *derives* one: the format-module classification
+///    (`erl_erts_errors`/`erl_kernel_errors`/`erl_stdlib_errors`) for a failing BIF is
+///    the BIF layer's, so a raise that publishes no map cooks to the plain
+///    two-element location.
 ///
 /// The *order* is C's: `build_stacktrace` prepends the current function last
 /// (`beam_common.c:1278-1288`), so the list runs innermost frame first.
@@ -225,18 +235,57 @@ pub(crate) fn symbolic_stacktrace(
     // the module/context cannot name consumes it all the same (there is no later
     // frame it could belong to).
     let live_clause_args = machine.live_raise_function_clause_args();
+    // The `{error_info, Map}` extension an `erlang:error/3` raise arrived carrying: it is
+    // the **innermost cooked item's** location tail only, and a synthesized head item IS
+    // that item — it carries its own location and its own arguments — so the extension is
+    // attached to a snapshot frame **only when this cooking has no head item** (C's
+    // `build_stacktrace` gives `args`/`error_info` to `fi` and builds every outer frame
+    // with `am_true`/`NIL`: `../../erts/emulator/beam/beam_common.c:1283-1291`).
+    //
+    // Its `error_info` atom is resolved through the **live** namespace first and the
+    // running module's load-time snapshot second ([`namespace_atom`]): the atom comes
+    // from the map the *raising* module built, which a module loaded earlier need never
+    // have interned (the same reason a supplied trace's names are resolved that way),
+    // while `location_shape`'s `file`/`line` keys always come from the frame module's own
+    // `Line` chunk. Only resolved when it is actually used, so a frame with no extension
+    // never errors on it.
+    let live_error_info = if head {
+        None
+    } else {
+        machine.live_raise_error_info()
+    };
+    let error_info_atom = match live_error_info {
+        Some(_) => Some(namespace_atom(ctx, entry_module, "error_info").ok_or_else(|| {
+            error::unsupported(
+                "build_stacktrace: cannot name the 'error_info' atom of the raise's error-info extension",
+            )
+        })?),
+        None => None,
+    };
     let mut args_item: Option<usize> = None;
+    let mut error_info_item: Option<usize> = None;
     let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
     for (index, ((_context, func, pc), owner)) in frames.iter().zip(plan.iter()).enumerate() {
-        let args = if index == 0 { live_clause_args } else { None };
+        // Both slots belong to the innermost item, so a head-bearing cooking leaves them
+        // to the head item (`super::callee`, or the BIF head builder) and never gives
+        // them to the caller's frame.
+        let args = if index == 0 && !head { live_clause_args } else { None };
         let owner_module: &Module = match owner {
             FrameOwner::EntryModule => entry_module,
             FrameOwner::Owned(index) => &owned[*index],
             FrameOwner::Skip => continue,
         };
-        let shape = item_shape(owner_module, *func, *pc, args)?;
+        let mut shape = item_shape(owner_module, *func, *pc, args)?;
         if shape.args.is_some() {
             args_item = Some(shapes.len());
+        }
+        // The map word is only a **sizing** witness here (it says "charge 5 more
+        // words"); the carve re-reads it from the re-seated latch below.
+        if index == 0 {
+            if let (Some(atom), Some(map)) = (error_info_atom, live_error_info) {
+                shape.error_info = Some(ErrorInfoShape { atom, map });
+                error_info_item = Some(shapes.len());
+            }
         }
         shapes.push(shape);
     }
@@ -263,6 +312,27 @@ pub(crate) fn symbolic_stacktrace(
                 _ => {
                     return Err(error::unsupported(
                         "build_stacktrace: the live function-clause argument latch vanished across its reservation",
+                    ))
+                }
+            }
+        }
+    }
+    // The `{error_info, Map}` **map** rides the same split — read half before the
+    // reservation (presence only, for sizing), consumed after it, so the word the carve
+    // writes into the location tail is the one the collector left in the re-seated latch
+    // and never a pre-move address. The map's own nodes are **shared, not copied** (C
+    // writes `c_p->fvalue` itself into the `{error_info, Map}` tuple), so the extension
+    // costs the region exactly the `5` words `ItemShape::words` charges it.
+    if live_error_info.is_some() {
+        let map = machine.take_raise_error_info();
+        if let Some(index) = error_info_item {
+            match (map, error_info_atom) {
+                (Some(map), Some(atom)) => {
+                    shapes[index].error_info = Some(ErrorInfoShape { atom, map });
+                }
+                _ => {
+                    return Err(error::unsupported(
+                        "build_stacktrace: the live error-info latch vanished across its reservation",
                     ))
                 }
             }
@@ -372,7 +442,7 @@ fn supplied_frame_shape<'a>(
         function: function_atom,
         arity: u32::from(frame.arity),
         args: None,
-        args_len: 0,
+        error_info: None,
         location,
     })
 }
@@ -466,48 +536,74 @@ struct ItemShape<'a> {
     /// The item's arity (`{M,F,A}`'s `A`) — what the `A` slot holds for every frame
     /// except the failed clause's own, which [`ItemShape::args`] replaces.
     arity: u32,
-    /// The **failed clause's argument list**, for the one frame whose function
-    /// contains the failed clause; `None` for every other frame.
+    /// The **innermost item's argument list**: the one frame whose function either
+    /// contains the failed clause or is the caller of an `erlang:error/2,3` raise;
+    /// `None` for every other frame.
     ///
-    /// C's `erts_build_mfa_item` (`../../erts/emulator/beam/utils.c:3430-3457`) puts
-    /// the saved `args` in the `A` slot when it is a list/nil, and only the
-    /// `function_clause` raise site publishes one (see
+    /// C's `erts_build_mfa_item` (`../../erts/emulator/beam/utils.c:3430-3457`) puts the
+    /// saved `args` in the `A` slot when it is a list/nil, and only the
+    /// `function_clause` raise site and an `error/2,3` raise publish one (see
     /// `Machine::take_raise_function_clause_args`) — so the oracle reports
-    /// `{Mod, Fun, [Arg, …], Location}` for the failing function while every outer
-    /// frame keeps its declared arity.
+    /// `{Mod, Fun, [Arg, …], Location}` for that function while every outer frame keeps
+    /// its declared arity.
     ///
-    /// The elements are read out **before** the one reservation (the list is a
-    /// machine-held term, exactly like `Machine::pending_exception`'s reason), and the
-    /// list is re-carved into the reservation so the whole cooked trace is one region:
-    /// [`ItemShape::words`] charges `2` words per element and [`write_item`] carves
-    /// exactly that many.
+    /// The **list term itself** is written into the tuple and its elements are **not**
+    /// re-carved: C hands the `args` term to `TUPLE4` verbatim, so a proper list, an
+    /// **improper** list (`erlang:error(foo, [1|2])` keeps its tail) and `[]` all ride
+    /// through unchanged — and [`ItemShape::words`] charges the region nothing for them.
     ///
-    /// This is the argument **list term**, never its elements: the elements are read at
-    /// carve time by [`write_item`], *inside* the reservation, where no further
-    /// allocation can strand them.
+    /// The word is a machine-held term, so it is read by [`write_item`] **after** the one
+    /// reservation, from the re-seated latch (`Machine::with_roots` parks and re-seats
+    /// it); nothing allocates between that read and the store.
     args: Option<Eterm>,
-    /// The element count of [`ItemShape::args`], captured before the rooted reservation
-    /// from the still-valid latch word — the fact [`ItemShape::words`] sizes by. A
-    /// proper list's length is invariant under a move, so the pre-reservation count is
-    /// exact for the re-seated list `write_item` follows. `0` when there is no list.
-    args_len: usize,
+    /// The `{error_info, Map}` extension of this item's `Location`, for the innermost
+    /// item of an `erlang:error/3` raise; `None` for every other item.
+    ///
+    /// C's `save_stacktrace` keeps the `EXC_ERROR_3` value as `c_p->fvalue`
+    /// (`../../erts/emulator/beam/beam_common.c:1024-1026`) and packages it as
+    /// `{error_info, Map}` in the exception's `ftrace`; `erts_build_mfa_item` starts the
+    /// item's location from that cons and prepends the `{line,_}`/`{file,_}` pairs, so
+    /// the oracle's innermost location is `[{file,F},{line,N},{error_info,Map}]` and
+    /// every outer item's stays two elements.
+    error_info: Option<ErrorInfoShape>,
     /// The `Location` element's shape, or `None` for the empty list.
     location: Option<LocationShape<'a>>,
 }
 
+/// The `{error_info, Map}` tail of a cooked item's location: the `error_info` **key
+/// atom** (resolved before the reservation) and the **map term**, which is shared with
+/// the raise rather than copied — exactly as C stores `c_p->fvalue` itself.
+#[derive(Clone, Copy)]
+struct ErrorInfoShape {
+    /// The `error_info` key atom, resolved through the live namespace first and the
+    /// running module's snapshot second (`machine::namespace_atom`).
+    atom: Atom,
+    /// The map term, re-read from the re-seated raise latch **after** the one
+    /// reservation, so a collecting host's relocation is what the carve writes.
+    map: Eterm,
+}
+
 impl ItemShape<'_> {
     /// The exact number of words this item's nodes occupy:
-    /// the 4-element tuple (`5`), the failed clause's argument list (`2` per element,
-    /// `0` when the `A` slot is the arity) plus, when there is a location, the char
-    /// list (`2 * chars`), the `{file,File}` tuple (`3`), the `{line,N}` tuple (`3`)
-    /// and the 2-element outer list (`4`) — i.e. `2 * chars + 10`. A `None` location
-    /// is [`NIL`] and occupies nothing.
+    /// the 4-element tuple (`5`) plus, when there is a location, the char list
+    /// (`2 * chars`), the `{file,File}` tuple (`3`), the `{line,N}` tuple (`3`) and the
+    /// outer list (`4` for two elements) — i.e. `2 * chars + 10`; plus the
+    /// `{error_info, Map}` extension (`5`) when one is attached, making the extended
+    /// form `2 * chars + 15`.
+    ///
+    /// The extension's derivation: the `{error_info,Map}` 2-tuple is `3` words
+    /// (`Sink::tuple` charges `elems.len() + 1`) and the outer list grows from 2 to 3
+    /// cells, `+2` — and the **map word is shared, not copied**, so the map's own nodes
+    /// are charged nothing. With **no** location the extension is the whole location: a
+    /// 1-element list (`2`) around the tuple (`3`), i.e. the same `5`.
+    ///
+    /// The argument list ([`ItemShape::args`]) is shared verbatim, so it is charged
+    /// nothing either: C writes the `args` term itself into the tuple.
     fn words(&self) -> usize {
-        5 + if self.args.is_some() { 2 * self.args_len } else { 0 }
-            + match &self.location {
-                Some(location) => 2 * location.file.chars().count() + 10,
-                None => 0,
-            }
+        5 + match &self.location {
+            Some(location) => 2 * location.file.chars().count() + 10,
+            None => 0,
+        } + if self.error_info.is_some() { 5 } else { 0 }
     }
 }
 
@@ -551,35 +647,21 @@ fn item_shape(
         .functions
         .get(func as usize)
         .ok_or_else(|| error::unsupported("build_stacktrace: function index out of range"))?;
-    let (args, args_len) = match failed_clause_args {
-        Some(list) if is_list(list) || is_nil(list) => (Some(list), list_len(list)?),
-        _ => (None, 0),
+    // C's `is_list(args) || is_nil(args)` test, and no length read: the list term is
+    // shared into the `A` slot, so an improper list needs no walking (and is never
+    // rejected — `erlang:error(foo, [1|2])` keeps its tail verbatim in the oracle too).
+    let args = match failed_clause_args {
+        Some(list) if is_list(list) || is_nil(list) => Some(list),
+        _ => None,
     };
     Ok(ItemShape {
         module: function.module,
         function: function.name,
         arity: function.arity,
         args,
-        args_len,
+        error_info: None,
         location: location_shape(module, func, pc)?,
     })
-}
-
-/// The element count of a **proper** list, without materializing its elements.
-///
-/// The failed clause's argument list is a live machine term that must not be held
-/// across a collection (see [`ItemShape::args`]), so only its length is read before
-/// the rooted reservation — the elements themselves are re-read from the re-seated
-/// list at carve time. An improper tail is [`BeamError::BadArg`], exactly as
-/// [`terms::list_elements`] reports it.
-fn list_len(list: Eterm) -> Result<usize> {
-    let mut len = 0usize;
-    let mut cursor = list;
-    while !is_nil(cursor) {
-        len += 1;
-        cursor = terms::cons_tail(cursor)?;
-    }
-    Ok(len)
 }
 
 /// The `Location` element of a stacktrace item: `[{file,Name},{line,N}]` when the
@@ -629,28 +711,38 @@ fn location_shape(module: &Module, func: u32, pc: u32) -> Result<Option<Location
 /// typed [`crate::error::unsupported`] from [`crate::terms::Slack::alloc_words`],
 /// never a wrong term.
 fn write_item(sink: &mut dyn Sink, shape: &ItemShape<'_>) -> Result<Eterm> {
-    let location = match &shape.location {
-        Some(location) => write_location(sink, location)?,
-        None => NIL,
+    let location = match (&shape.location, shape.error_info) {
+        (Some(location), error_info) => write_location(sink, location, error_info)?,
+        // A frame with no source location (C's `LINE_INVALID_LOCATION`) still reports
+        // the extension: `erts_build_mfa_item` starts `loc` from the `{error_info,Map}`
+        // cons and only *prepends* the file/line pairs, so the location is the
+        // one-element list `[{error_info,Map}]`.
+        (None, Some(error_info)) => write_error_info_only(sink, error_info)?,
+        (None, None) => NIL,
     };
-    // The `A` slot: the failed clause's argument list when this item is the one whose
-    // function contains the failed clause, else the declared arity. The carve is
-    // exactly the `2` words per element [`ItemShape::words`] charged. The list's
-    // elements are read **here**, inside the reservation: the list word was re-seated
-    // from the raise latch after the rooted allocation, so following it cannot
-    // dereference a pre-move cell, and the carve below never allocates.
+    // The `A` slot: the innermost item's argument list when the raise published one,
+    // else the declared arity. The list **term** is stored verbatim (C's
+    // `TUPLE4(.., args, loc)`), so its elements are neither read nor copied here — the
+    // word was re-seated from the raise latch after the rooted allocation, so it cannot
+    // address a pre-move cell, and nothing allocates between this store and the tuple.
     let arity = match shape.args {
-        Some(list) => {
-            let elements = terms::list_elements(list)?;
-            sink.list(&elements)?
-        }
+        Some(list) => list,
         None => make_small(shape.arity as i64),
     };
     sink.tuple(&[make_atom(shape.module), make_atom(shape.function), arity, location])
 }
 
-/// Carve `location`'s four nodes out of `sink` (see [`write_item`]).
-fn write_location(sink: &mut dyn Sink, location: &LocationShape<'_>) -> Result<Eterm> {
+/// Carve `location`'s nodes out of `sink` (see [`write_item`]), plus the
+/// `{error_info, Map}` tail when the raise attached one.
+///
+/// The carve order (char list, `{file,File}`, `{line,N}`, the optional
+/// `{error_info,Map}`, then the outer list) is exactly [`ItemShape::words`]'s, so a
+/// region sized by that method is consumed exactly.
+fn write_location(
+    sink: &mut dyn Sink,
+    location: &LocationShape<'_>,
+    error_info: Option<ErrorInfoShape>,
+) -> Result<Eterm> {
     // An Erlang file name term is a list of code points (the oracle prints
     // `{file,"m.erl"}`); the `Line` chunk carries the name as UTF-8.
     let chars: Vec<Eterm> = location
@@ -664,7 +756,29 @@ fn write_location(sink: &mut dyn Sink, location: &LocationShape<'_>) -> Result<E
         make_atom(location.line_atom),
         make_small(location.line as i64),
     ])?;
-    sink.list(&[file_pair, line_pair])
+    match error_info {
+        // C's `erts_build_mfa_item` prepends the pairs to the extension cons, so the
+        // extension is the **third** element.
+        Some(error_info) => {
+            let pair = write_error_info_pair(sink, error_info)?;
+            sink.list(&[file_pair, line_pair, pair])
+        }
+        None => sink.list(&[file_pair, line_pair]),
+    }
+}
+
+/// The location of an item whose frame has **no** source location but whose raise did
+/// carry the extension: `[{error_info, Map}]` (C starts `loc` from the extension and
+/// prepends nothing when `fi->loc == LINE_INVALID_LOCATION`).
+fn write_error_info_only(sink: &mut dyn Sink, error_info: ErrorInfoShape) -> Result<Eterm> {
+    let pair = write_error_info_pair(sink, error_info)?;
+    sink.list(&[pair])
+}
+
+/// Carve the `{error_info, Map}` 2-tuple; the **map word is written verbatim** (shared
+/// with the raise, never copied, exactly as C stores `c_p->fvalue`).
+fn write_error_info_pair(sink: &mut dyn Sink, error_info: ErrorInfoShape) -> Result<Eterm> {
+    sink.tuple(&[make_atom(error_info.atom), error_info.map])
 }
 
 /// The source location in effect at code offset `pc` of the function at index

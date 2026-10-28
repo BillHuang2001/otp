@@ -417,6 +417,44 @@ pub struct Machine {
     /// **re-seated** from that slot afterwards, so a collecting host relocates the
     /// term and this field reads the *moved* word back.
     pub(crate) raise_function_clause_args: Option<Eterm>,
+    /// A **one-shot latch**: the `{error_info, Map}` extension an incoming
+    /// `erlang:error/3` raise arrived carrying (`beam_common::Raise::error_info`).
+    ///
+    /// Armed by [`Machine::raise_error`] **immediately before** the
+    /// `throw_with_trace` that lands the raise (and only when this raise produces
+    /// no synthesized head item), and consumed by that call (see
+    /// [`Machine::raise_error_info`]) — the same two-latch protocol as
+    /// `Machine::pending_function_clause_args`.
+    ///
+    /// C's ground truth is `save_stacktrace`'s non-BIF arm:
+    /// `error_info = c_p->fvalue` for `EXC_ERROR_3`
+    /// (`../../erts/emulator/beam/beam_common.c:1024-1026`), packaged as the
+    /// `{error_info, Map}` cons that `erts_build_mfa_item` prepends **the file/line
+    /// pairs to** (`../../erts/emulator/beam/utils.c:3430-3457`) — so the extension
+    /// is the **innermost cooked item's** location tail, and every outer frame's
+    /// location stays the two-element `[{file,_},{line,_}]`.
+    ///
+    /// It is a separate latch from the live-raise state so a propelling `Err` path —
+    /// a raise with no live catch frame, which still reaches `throw_with_trace` —
+    /// cannot leave a stale map for a later, unrelated cooked trace to inherit.
+    pub(crate) pending_error_info: Option<Eterm>,
+    /// The **live raise** state behind [`Machine::pending_error_info`]: the
+    /// `{error_info, Map}` map term while the raise currently in flight arrived
+    /// carrying one.
+    ///
+    /// [`Machine::throw_with_trace`] sets it (from the one-shot latch) on **every**
+    /// fresh raise, so a raise that carries no map clears it, and the two
+    /// cooked-trace builders take it **exactly once** — the caught path
+    /// ([`crate::families::exceptions::stacktrace::symbolic_stacktrace`], which
+    /// appends it to the first item's location) and the uncaught path
+    /// ([`Machine::with_uncaught_frames`], which consumes and declines it: the
+    /// symbolic [`beam_common::StackTrace`] model carries no location tail).
+    ///
+    /// Like the failed-clause argument list it is a machine-held heap term
+    /// **outside** the frozen root set ([`crate::context::RootSet`]), so
+    /// [`Machine::with_roots`] parks it at the tail of the Erlang stack for the
+    /// duration of every root hand-off and re-seats it from that slot afterwards.
+    pub(crate) raise_error_info: Option<Eterm>,
     /// A **one-shot latch**: the symbolic [`StackTrace`] an incoming raise
     /// **arrived carrying** (e.g. `erlang:raise/3` whose third argument is a
     /// non-empty trace list).
@@ -899,6 +937,8 @@ impl Machine {
             raise_head_item: false,
             pending_function_clause_args: None,
             raise_function_clause_args: None,
+            pending_error_info: None,
+            raise_error_info: None,
             pending_supplied_trace: None,
             pending_supplied_term: None,
             raise_supplied_trace: None,
@@ -1022,9 +1062,9 @@ impl Machine {
     /// [`Machine::with_parked_loose_terms_then_seat`] (`#[inline(never)]`, so it does not
     /// enlarge the fast path's frame or its caller). The fast path is: two extent
     /// computations, two unconditional dirty-extent stores, one armed predicate over the
-    /// five loose fields, the [`RootSet`] construction and the caller's own closure — no
+    /// loose fields, the [`RootSet`] construction and the caller's own closure — no
     /// array is materialised there (the predicate is derived from
-    /// [`Machine::loose_heap_terms`], compiled to a bitwise fold over the five fields, so
+    /// [`Machine::loose_heap_terms`], compiled to a bitwise fold over the fields, so
     /// the one-list rule is kept and no stack array is touched).
     #[inline(always)]
     pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
@@ -1085,7 +1125,7 @@ impl Machine {
     /// ([`Machine::loose_heap_terms`]) armed?
     ///
     /// [`Machine::with_roots`]'s fast-path predicate, and the reason the fast path touches
-    /// no stack array: it is a reading of the same five fields, which the optimizer folds
+    /// no stack array: it is a reading of the same fields, which the optimizer folds
     /// into one bitwise test on their raw words.
     #[inline]
     fn has_loose_heap_terms(&self) -> bool {
@@ -1094,9 +1134,10 @@ impl Machine {
 
     /// How many loose heap-term slots [`Machine::with_roots`] can park.
     ///
-    /// The length of [`Machine::loose_heap_terms`]: the two failed-clause argument latches,
-    /// the pending exception's reason and the two supplied-trace term latches.
-    const LOOSE_HEAP_TERMS: usize = 5;
+    /// The length of [`Machine::loose_heap_terms`]: the two failed-clause argument
+    /// latches, the pending exception's reason, the two supplied-trace term latches and
+    /// the two `{error_info, Map}` latches.
+    const LOOSE_HEAP_TERMS: usize = 7;
 
     /// The machine's **loose heap terms**: the `Eterm`-typed fields that hold a
     /// process-heap term but are **not** part of the frozen [`RootSet`].
@@ -1117,6 +1158,8 @@ impl Machine {
             self.pending_exception.map(|(_class, reason)| reason),
             self.pending_supplied_term,
             self.raise_supplied_term,
+            self.raise_error_info,
+            self.pending_error_info,
         ]
     }
 
@@ -1178,6 +1221,12 @@ impl Machine {
         }
         if let Some(term) = terms[4] {
             self.raise_supplied_term = Some(term);
+        }
+        if let Some(term) = terms[5] {
+            self.raise_error_info = Some(term);
+        }
+        if let Some(term) = terms[6] {
+            self.pending_error_info = Some(term);
         }
     }
 
@@ -1274,9 +1323,10 @@ impl Machine {
     /// The three frozen [`RootSet`] files, in that order, each borrowed only for its own
     /// visit: the **used prefix** of the X-register file ([`Machine::used_x_extent`]), the
     /// **whole** Erlang stack (every Y slot of every live frame — there is no liveness map)
-    /// and the used prefix of the FR file ([`Machine::used_fr_extent`]). The machine's five
+    /// and the used prefix of the FR file ([`Machine::used_fr_extent`]). The machine's
     /// **loose heap terms** ([`Machine::loose_heap_terms`]: the two failed-clause argument
-    /// latches, the pending exception's reason and the two supplied-trace term latches) are
+    /// latches, the pending exception's reason, the two supplied-trace term latches and the
+    /// two `{error_info, Map}` latches) are
     /// **parked at the stack tail before the stack slice is handed over**, so the visitor
     /// relocates them *through that slice*, exactly as [`Machine::with_roots`] makes them
     /// relocatable, and each field is **re-seated from its slot after the last slice** —
@@ -1328,7 +1378,7 @@ impl Machine {
     /// The visitor's error is propagated unchanged, and the walk **stops** there (the later
     /// slices are never handed over). The three root files are left exactly as the visitor
     /// wrote them — a partially-relocated root set is the visitor's own responsibility, and
-    /// the door does not attempt to undo a move — while the stack length and the five loose
+    /// the door does not attempt to undo a move — while the stack length and every loose
     /// fields are restored around the parking in every case.
     pub fn for_each_root_mut(
         &mut self,
