@@ -42,10 +42,39 @@
 //! **exclusively** from the fourteen `pub const` tables in
 //! [`hook_sets`](crate::hook_sets) — the roster [`ROSTER`] names each `(bit, table)`
 //! pair, and every key of every table contributes its bit to that key's entry
-//! (OR-ing, so a key listed by two tables gets both bits). [`BUCKETS`] open-addressed
-//! buckets (linear probing) hold a `u64` content hash plus the full key plus the
-//! `u16` flags; the tables hold 226 raw keys (222 distinct), so the load factor is at
-//! most 0.22 and a probe sequence almost always ends at its first bucket.
+//! (OR-ing, so a key listed by two tables gets both bits).
+//!
+//! The table is **two arrays**, laid out so that the array a lookup walks stays in L1:
+//!
+//! * [`BUCKETS`] open-addressed, linearly probed probe slots (`[Bucket; 1024]`, **8
+//!   KiB**): a [`Bucket`] is `{ tag: u32, flags: u16, key: u16 }`, i.e. eight bytes and
+//!   so eight buckets per cache line, and `key == EMPTY_KEY` marks a free slot, which
+//!   also ends a probe sequence; and
+//! * `keys`, the identity array: one [`Key`] (`{ module, function, arity }`) per
+//!   distinct key — at most [`ROSTER_KEYS`] = 226 entries, and read **only** when a
+//!   bucket's [`tag`](fingerprint_tag) matches the queried fingerprint, so the common
+//!   absent-key probe never touches it.
+//!
+//! The tables hold 226 raw keys (222 distinct), so the load factor is at most 0.22 and
+//! a probe sequence almost always ends at its first bucket.
+//!
+//! # The fingerprint
+//!
+//! [`fingerprint`] is a **bounded-load** fingerprint, not a byte fold. It mixes the
+//! two names' lengths, the arity, and the leading and trailing eight-byte window of
+//! each name ([`head_word`]/[`tail_word`]: at most four `u64` loads per key, each a
+//! safe length-guarded read, zero-padded when a name is shorter than its window), then
+//! avalanches the accumulator **once** ([`avalanche`]: two xor-shifts around one
+//! multiply). That is two multiplies and four loads for a whole key, against the one
+//! dependent `imul` per name byte a byte-wise FNV-1a fold paid.
+//!
+//! The low [`BUCKETS`] bits of the result select the starting slot; the high 32 bits
+//! are the slot's stored tag.
+//!
+//! The windows are what makes the cost bounded, and the price is that two names that
+//! agree in length *and* in their leading and trailing eight bytes can share a
+//! fingerprint — a name longer than sixteen bytes differing only in its middle, say.
+//! That is only ever a collision: see below.
 //!
 //! # Correctness: identical by construction
 //!
@@ -76,13 +105,16 @@
 //! **linear scan** of the corresponding table
 //! (`the_flags_agree_with_a_linear_scan_of_every_table`).
 //!
-//! # Collisions
+//! # Collisions: the fingerprint only picks a starting slot
 //!
-//! A hash collision costs **a probe, never a wrong answer**: a lookup compares the
-//! full `(module, function, arity)` of every occupied bucket it walks, so two keys
-//! that share a bucket stay distinct and a key that is not in the table is answered
-//! `0` when the walk reaches an empty bucket. The hash only chooses where the walk
-//! starts.
+//! **Soundness never depends on the fingerprint.** A lookup compares the full
+//! `(module, function, arity)` of every slot it walks past before that slot's flags are
+//! trusted, so two keys that share a fingerprint — the same tag *and* the same starting
+//! slot — stay distinct: the second insert probes past the first, and every later
+//! lookup for either walks the shared sequence and matches on the full key. A key that
+//! is not in the table is answered `0` when the walk reaches a free slot. The
+//! fingerprint only chooses where the walk starts, and the stored tag is only a
+//! pre-filter that keeps a slot which is not ours from touching the identity array.
 //!
 //! # Why there is no cache in front of it
 //!
@@ -93,6 +125,13 @@
 //! dispatch. (The host that owns a stable key — `beam_rt`'s dispatch memo — caches
 //! this module's whole answer and that of the registry lookup together, per resolved
 //! key; the correctness of *that* cache is the host's, and it is documented there.)
+//!
+//! # The per-call path is inlined
+//!
+//! [`flags`], [`FlagTable::lookup`] and [`fingerprint`] all carry `#[inline]`, and the
+//! fourteen `needs_*` predicates in [`hook_sets`](crate::hook_sets) already do, so a
+//! host's dispatch check carries the probe in its own body: no call, no prologue and
+//! no register spills per predicate — a few loads, two multiplies and a `u16` bit test.
 
 use std::sync::OnceLock;
 
@@ -179,10 +218,11 @@ const ALL_MASK: u16 = {
 /// cannot alias an existing one and no gap is left for it to fall into.
 const _: () = assert!(ALL_MASK == (1 << ALL.len() as u16) - 1);
 
-/// The bucket count: a power of two, and `>= 512` so that the 226 raw keys of the
-/// fourteen tables (222 distinct) load it to at most 0.22 and leave most buckets
-/// empty for the linear probe. 1024 also leaves room for a table to grow without a
-/// re-tune; memory is one 48-byte bucket per slot, allocated once.
+/// The probe-slot count: a power of two, and `>= 512` so that the 226 raw keys of the
+/// fourteen tables (222 distinct) load it to at most 0.22 and leave most slots free for
+/// the linear probe. 1024 also leaves room for a table to grow without a re-tune; at
+/// [`Bucket`]'s eight bytes the whole probe array is 8 KiB, so it fits an L1 data cache
+/// on its own and leaves room for the identity array beside it.
 const BUCKETS: usize = 1024;
 
 /// A `(module, function, arity)` key as the hook tables spell it.
@@ -242,39 +282,113 @@ const _: () = {
     assert!(mask == ALL_MASK);
 };
 
-/// The 64-bit FNV-1a offset basis and prime (the same fold the host's dispatch memo
-/// uses, `beam_rt`'s `dispatch_slot`).
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// The arity salt: folded in with one multiply so that `f/1`, `f/2` and `f/3` — which
+/// share both names and lengths — cannot land on one fingerprint.
+const ARITY_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// The avalanche multiplier applied after the fold, and the final xor-shift's width.
-///
-/// The fold leaves the arity in the low bits and mixes the high bits only weakly,
-/// while the bucket index is read from the low bits; the xor-shift folds the high
-/// bits down and the multiply avalanches what is left, so the mask selects a bucket
-/// that depends on every name byte.
-const MIX: u64 = 0xa5d2_b6a8_e9c1_9f9f;
-const MIX_SHIFT: u32 = 32;
+/// The avalanche multiplier (`murmur3`'s `fmix64` constant): the one multiply that
+/// spreads the mixed accumulator's high bits into the low bits the slot mask reads.
+const AVALANCHE: u64 = 0xff51_afd7_ed55_8ccd;
 
-/// The content hash of a key: FNV-1a over `module`, a `0xFF` separator (so
-/// `("ab", "c")` cannot fold like `("a", "bc")`), `function`, then the arity — plus
-/// the final avalanche described at [`MIX`].
-///
-/// The hash is a **bucket selector only**; [`Key::matches`] verifies the full key.
-fn hash_key(module: &str, function: &str, arity: u32) -> u64 {
-    let mut hash = FNV_OFFSET;
-    for byte in module
-        .bytes()
-        .chain(core::iter::once(u8::MAX))
-        .chain(function.bytes())
-    {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
-    }
-    hash = (hash ^ u64::from(arity)).wrapping_mul(FNV_PRIME);
-    (hash ^ (hash >> MIX_SHIFT)).wrapping_mul(MIX)
+/// Up to the first eight bytes of a name as a little-endian word, zero padded — one
+/// length-guarded load, no `unsafe`.
+#[inline]
+fn head_word(bytes: &[u8]) -> u64 {
+    let mut word = [0u8; 8];
+    let n = bytes.len().min(8);
+    word[..n].copy_from_slice(&bytes[..n]);
+    u64::from_le_bytes(word)
 }
 
-/// One occupied bucket: the full key plus the seam flags it carries.
+/// Up to the last eight bytes of a name as a little-endian word, zero padded.
+///
+/// A name shorter than the window is covered by [`head_word`] alone and contributes
+/// nothing here, which is the second of the fingerprint's two length regimes.
+#[inline]
+fn tail_word(bytes: &[u8]) -> u64 {
+    match bytes.len().checked_sub(8) {
+        Some(start) => head_word(&bytes[start..]),
+        None => 0,
+    }
+}
+
+/// The final avalanche: two xor-shifts around a multiply, so every accumulator bit
+/// reaches the low bits the slot mask reads.
+#[inline]
+fn avalanche(mut mixed: u64) -> u64 {
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(AVALANCHE);
+    mixed ^= mixed >> 29;
+    mixed
+}
+
+/// The fingerprint of a key: the two names' lengths, the arity, and the leading and
+/// trailing eight-byte window of each name — at most four `u64` loads and two
+/// multiplies, however long the names are.
+///
+/// The fingerprint is a **slot selector only**; [`Key::matches`] verifies the full key
+/// before any flags are trusted, so a shared fingerprint costs a probe, never a wrong
+/// answer.
+#[inline]
+fn fingerprint(module: &str, function: &str, arity: u32) -> u64 {
+    let module = module.as_bytes();
+    let function = function.as_bytes();
+    // The lengths first: a name that is a prefix of another must not borrow its
+    // window words' meaning.
+    let mut mixed = ((module.len() as u64) << 32) | function.len() as u64;
+    mixed ^= u64::from(arity).wrapping_mul(ARITY_SALT);
+    mixed ^= head_word(module);
+    mixed ^= tail_word(module).rotate_left(43);
+    mixed ^= head_word(function).rotate_left(29);
+    mixed ^= tail_word(function).rotate_left(11);
+    avalanche(mixed)
+}
+
+/// The value of [`Bucket::key`] on a free slot.
+///
+/// `u16::MAX` is never a key index — the identity array holds at most [`ROSTER_KEYS`]
+/// entries, and the assertion below turns that bound into "every index fits a `u16`
+/// and [`EMPTY_KEY`] always means free".
+const EMPTY_KEY: u16 = u16::MAX;
+
+/// Every key index fits [`EMPTY_KEY`], so a bucket can hold the index of any key and
+/// the sentinel stays distinguishable from all of them.
+const _: () = assert!(ROSTER_KEYS < EMPTY_KEY as usize);
+
+/// One probe slot: a fingerprint tag, the seam flags, and the index of the full key.
+///
+/// Eight bytes, so a cache line holds eight slots and the whole 1024-slot probe array
+/// is 8 KiB — the layout choice that keeps a lookup's first (and, at load factor 0.22,
+/// usually only) touch inside one L1 line.
+#[derive(Clone, Copy)]
+struct Bucket {
+    /// The fingerprint's high half: a pre-filter, so a slot that is not ours costs one
+    /// `u32` compare instead of a trip to the identity array.
+    tag: u32,
+    /// The OR of every bit whose table lists the key at [`Self::key`].
+    flags: u16,
+    /// The index of the key's identity in [`FlagTable::keys`], or [`EMPTY_KEY`].
+    key: u16,
+}
+
+/// A free probe slot — the shape a table under construction leaves where it filled
+/// nothing, and the shape that ends a probe sequence.
+const FREE: Bucket = Bucket {
+    tag: 0,
+    flags: 0,
+    key: EMPTY_KEY,
+};
+
+impl Bucket {
+    /// Whether this slot is free (which ends a probe sequence).
+    #[inline]
+    fn is_free(&self) -> bool {
+        self.key == EMPTY_KEY
+    }
+}
+
+/// One distinct key's identity: the `(module, function, arity)` a lookup verifies in
+/// full before it trusts any [`Bucket::flags`].
 #[derive(Clone, Copy)]
 struct Key {
     /// The key's module name (a `&'static str` straight from the table).
@@ -283,13 +397,11 @@ struct Key {
     function: &'static str,
     /// The key's arity.
     arity: u32,
-    /// The OR of every bit whose table lists this key.
-    flags: u16,
 }
 
 impl Key {
-    /// Whether this bucket holds exactly the queried key — the full-key comparison a
-    /// lookup makes before trusting [`Self::flags`].
+    /// Whether this identity *is* the queried key — the full-key comparison that makes
+    /// a shared fingerprint (or a shared slot) harmless.
     #[inline]
     fn matches(&self, module: &str, function: &str, arity: u32) -> bool {
         // The arity first: it is the one-word test that rejects most near misses.
@@ -297,10 +409,12 @@ impl Key {
     }
 }
 
-/// The build-once open-addressed flag table ([`BUCKETS`] buckets, linear probing).
+/// The build-once open-addressed flag table ([`BUCKETS`] slots, linear probing).
 struct FlagTable {
-    /// The buckets; `None` is an empty slot and ends any probe sequence.
-    buckets: Box<[Option<Key>]>,
+    /// The probe array: `[Bucket; BUCKETS]`, [`FREE`] where no key hashes there.
+    buckets: Box<[Bucket]>,
+    /// The identity array, one entry per distinct key, indexed by [`Bucket::key`].
+    keys: Box<[Key]>,
 }
 
 impl FlagTable {
@@ -327,64 +441,108 @@ impl FlagTable {
             (_runtime_hooks, _),
         ] = ROSTER;
 
-        let mut table = FlagTable {
-            buckets: vec![None; BUCKETS].into_boxed_slice(),
-        };
-        for (bit, keys) in ROSTER {
-            for &(module, function, arity) in keys {
-                table.insert(bit, module, function, arity);
-            }
-        }
-        table
+        FlagTable::build_from(&ROSTER)
     }
 
-    /// OR `bit` into the entry for `(module, function, arity)`, creating it if absent.
-    fn insert(&mut self, bit: u16, module: &'static str, function: &'static str, arity: u32) {
-        let mut slot = bucket(hash_key(module, function, arity));
-        loop {
-            match &mut self.buckets[slot] {
-                None => {
-                    self.buckets[slot] = Some(Key {
-                        module,
-                        function,
-                        arity,
-                        flags: bit,
-                    });
-                    return;
-                }
-                Some(key) if key.matches(module, function, arity) => {
-                    key.flags |= bit;
-                    return;
-                }
-                // An unrelated key occupies this bucket: continue the probe. The
-                // array always has an empty bucket left (see `ROSTER_KEYS`).
-                Some(_) => slot = next_bucket(slot),
+    /// Build a table from an arbitrary roster — [`ROSTER`] in production, a hand-made
+    /// one in the collision tests. The one build path, so a test exercises exactly the
+    /// code a lookup runs in production.
+    fn build_from(roster: &[RosterEntry]) -> FlagTable {
+        let mut buckets = vec![FREE; BUCKETS].into_boxed_slice();
+        let mut keys = Vec::with_capacity(ROSTER_KEYS);
+        for &(bit, table) in roster {
+            for &(module, function, arity) in table {
+                insert(&mut buckets, &mut keys, bit, module, function, arity);
             }
+        }
+        FlagTable {
+            buckets,
+            keys: keys.into_boxed_slice(),
         }
     }
 
     /// The seam flags of `(module, function, arity)`, or `0` when no table lists it.
+    ///
+    /// `#[inline]` so the fourteen `needs_*` predicates carry the probe in their own
+    /// body: no call, prologue or spills per predicate. The body is a few loads, two
+    /// multiplies and (on a hit) one `u16` bit-set read.
+    #[inline]
     fn lookup(&self, module: &str, function: &str, arity: u32) -> u16 {
-        let mut slot = bucket(hash_key(module, function, arity));
+        let hash = fingerprint(module, function, arity);
+        let tag = fingerprint_tag(hash);
+        let mut slot = bucket(hash);
         loop {
-            match &self.buckets[slot] {
-                None => return 0,
-                Some(key) if key.matches(module, function, arity) => return key.flags,
-                // A hash collision (or a probe from one): costs a probe, never a
-                // wrong answer, because the next bucket's key is compared in full.
-                Some(_) => slot = next_bucket(slot),
+            let probe = self.buckets[slot];
+            if probe.is_free() {
+                return 0;
             }
+            if probe.tag == tag
+                && self.keys[usize::from(probe.key)].matches(module, function, arity)
+            {
+                return probe.flags;
+            }
+            // A shared tag or slot (or a probe from one): costs a probe, never a wrong
+            // answer, because the next slot's key is compared in full.
+            slot = next_bucket(slot);
         }
     }
 }
 
-/// The bucket a hash selects (`BUCKETS` is a power of two, so the mask suffices).
+/// OR `bit` into the entry for `(module, function, arity)` of a table under
+/// construction, appending the key's identity to `keys` when it is new.
+fn insert(
+    buckets: &mut [Bucket],
+    keys: &mut Vec<Key>,
+    bit: u16,
+    module: &'static str,
+    function: &'static str,
+    arity: u32,
+) {
+    let hash = fingerprint(module, function, arity);
+    let tag = fingerprint_tag(hash);
+    let mut slot = bucket(hash);
+    loop {
+        let probe = buckets[slot];
+        if probe.is_free() {
+            // The index fits a `u16`: `ROSTER_KEYS < EMPTY_KEY` is asserted at compile
+            // time, so no key can be appended past the sentinel's range.
+            let key = keys.len() as u16;
+            keys.push(Key {
+                module,
+                function,
+                arity,
+            });
+            buckets[slot] = Bucket {
+                tag,
+                flags: bit,
+                key,
+            };
+            return;
+        }
+        if keys[usize::from(probe.key)].matches(module, function, arity) {
+            buckets[slot].flags |= bit;
+            return;
+        }
+        // Another key occupies this slot: continue the probe. The array always has a
+        // free slot left (see `ROSTER_KEYS`).
+        slot = next_bucket(slot);
+    }
+}
+
+/// The slot a fingerprint selects (`BUCKETS` is a power of two, so the mask suffices).
 #[inline]
 fn bucket(hash: u64) -> usize {
     (hash as usize) & (BUCKETS - 1)
 }
 
-/// The next bucket in a probe sequence: linear probing with wrap-around.
+/// The tag a slot keeps of its key's fingerprint: the high half, which the slot mask
+/// does not read, so the tag and the slot select on disjoint bits.
+#[inline]
+fn fingerprint_tag(hash: u64) -> u32 {
+    (hash >> 32) as u32
+}
+
+/// The next slot in a probe sequence: linear probing with wrap-around.
 #[inline]
 fn next_bucket(slot: usize) -> usize {
     (slot + 1) & (BUCKETS - 1)
@@ -399,12 +557,14 @@ static TABLE: OnceLock<FlagTable> = OnceLock::new();
 ///
 /// This is **the single membership engine**: every `needs_*` predicate in
 /// [`hook_sets`](crate::hook_sets) is `flags(module, function, arity) & FLAG != 0`, so
-/// a host that asks all fourteen questions about one key pays one hash and one probe
-/// instead of fourteen table walks. A key no table lists answers `0`, which keeps all
-/// fourteen predicates `false` — exactly what their `binary_search`es answered.
+/// a host that asks all fourteen questions about one key pays one fingerprint and one
+/// probe instead of fourteen table walks. A key no table lists answers `0`, which keeps
+/// all fourteen predicates `false` — exactly what their `binary_search`es answered.
 #[inline]
 pub(crate) fn flags(module: &str, function: &str, arity: u32) -> u16 {
-    TABLE.get_or_init(FlagTable::build).lookup(module, function, arity)
+    TABLE
+        .get_or_init(FlagTable::build)
+        .lookup(module, function, arity)
 }
 
 #[cfg(test)]
@@ -607,6 +767,124 @@ mod tests {
         assert_ne!(
             flags("erlang", "term_to_binary", 3),
             LOCAL_FUN_IDENTITY | LOCAL_NODE
+        );
+    }
+
+    /// The fingerprint has two length regimes, and a key of *each* probes to exactly
+    /// the bits its tables justify: a name shorter than the eight-byte window
+    /// contributes its length plus a zero-padded head word and no tail word, while a
+    /// longer name contributes a real tail window.
+    #[test]
+    fn a_short_name_and_a_long_name_both_probe_correctly() {
+        // The raw words first: under eight bytes there is no tail word at all.
+        assert_eq!(head_word(b""), 0);
+        assert_eq!(tail_word(b""), 0);
+        assert_eq!(head_word(b"ets"), u64::from_le_bytes(*b"ets\0\0\0\0\0"));
+        assert_eq!(
+            tail_word(b"ets"),
+            0,
+            "a name under eight bytes contributes no tail word"
+        );
+        assert_eq!(head_word(b"abcdefgh"), u64::from_le_bytes(*b"abcdefgh"));
+        assert_eq!(tail_word(b"abcdefgh"), u64::from_le_bytes(*b"abcdefgh"));
+        assert_eq!(
+            head_word(b"erts_internal"),
+            u64::from_le_bytes(*b"erts_int")
+        );
+        assert_eq!(
+            tail_word(b"erts_internal"),
+            u64::from_le_bytes(*b"internal"),
+            "the tail window is the name's last eight bytes"
+        );
+
+        // Both regimes reach the table: the short key (3- and 5-byte names)…
+        assert_eq!(flags("ets", "foldl", 3), FUN_CALLER, "short-name regime");
+        // …and the long one (13- and 9-byte names), whose windows differ.
+        assert_eq!(
+            flags("erts_internal", "port_info", 2),
+            PORT_HOOK,
+            "long-name regime"
+        );
+        // Neither regime answers for a name that is not in any table, including one
+        // that differs only in the *last* byte of a long name (which the tail window
+        // sees) and one truncated to exactly the head window.
+        assert_eq!(flags("erts_internal", "port_infox", 2), 0);
+        assert_eq!(flags("erts_interna", "port_info", 2), 0);
+        assert_eq!(flags("ets", "folds", 3), 0);
+    }
+
+    /// Two keys that share a fingerprint — same tag, same starting slot — still answer
+    /// their own bits, and a third key sharing that fingerprint but listed by no table
+    /// still answers `0`: the walk verifies each full key, so a collision costs a probe.
+    #[test]
+    fn a_deliberate_fingerprint_collision_still_answers_correctly() {
+        // Seventeen bytes each: the same length, the same first eight bytes and the
+        // same last eight bytes, differing only in the middle — invisible to the two
+        // bounded windows, so the fingerprints coincide by construction.
+        const FIRST: Key3 = ("abcdefghMabcdefgh", "f", 2);
+        const SECOND: Key3 = ("abcdefghXabcdefgh", "f", 2);
+        const LISTED_BY_NEITHER: Key3 = ("abcdefghZabcdefgh", "f", 2);
+        const FIRST_ENTRY: RosterEntry = (MEMORY, &[FIRST]);
+        const SECOND_ENTRY: RosterEntry = (DICT, &[SECOND]);
+
+        let first = fingerprint(FIRST.0, FIRST.1, FIRST.2);
+        let second = fingerprint(SECOND.0, SECOND.1, SECOND.2);
+        assert_eq!(first, second, "the collision must be real for this test");
+        assert_eq!(bucket(first), bucket(second), "…so both start at one slot");
+        assert_eq!(fingerprint_tag(first), fingerprint_tag(second));
+
+        let table = FlagTable::build_from(&[FIRST_ENTRY, SECOND_ENTRY]);
+        assert_eq!(table.keys.len(), 2, "both keys were inserted");
+        // The second insert probed past the first rather than overwriting it.
+        let start = bucket(first);
+        assert_eq!(table.buckets[start].key, 0);
+        assert_eq!(table.buckets[next_bucket(start)].key, 1);
+
+        assert_eq!(table.lookup(FIRST.0, FIRST.1, FIRST.2), MEMORY);
+        assert_eq!(table.lookup(SECOND.0, SECOND.1, SECOND.2), DICT);
+        assert_eq!(
+            table.lookup(
+                LISTED_BY_NEITHER.0,
+                LISTED_BY_NEITHER.1,
+                LISTED_BY_NEITHER.2
+            ),
+            0,
+            "a shared fingerprint is not a match: the walk reaches a free slot"
+        );
+        assert_eq!(
+            table.lookup(FIRST.0, FIRST.1, 3),
+            0,
+            "the arity still separates"
+        );
+        // The production table lists neither name.
+        assert_eq!(flags(FIRST.0, FIRST.1, FIRST.2), 0);
+    }
+
+    /// The probe array is the L1-sized one the module doc claims — eight bytes per
+    /// slot, 8 KiB in all — and every occupied slot indexes the identity array.
+    #[test]
+    fn the_probe_array_is_eight_kilobytes_and_its_indices_are_in_range() {
+        assert_eq!(core::mem::size_of::<Bucket>(), 8);
+        assert_eq!(BUCKETS * core::mem::size_of::<Bucket>(), 8 * 1024);
+        let table = TABLE.get_or_init(FlagTable::build);
+        assert_eq!(table.buckets.len(), BUCKETS);
+        assert_eq!(table.keys.len(), table_keys().len());
+        assert!(table.keys.len() < usize::from(EMPTY_KEY));
+        let mut occupied = 0;
+        for (slot, probe) in table.buckets.iter().enumerate() {
+            if probe.is_free() {
+                continue;
+            }
+            occupied += 1;
+            assert!(
+                usize::from(probe.key) < table.keys.len(),
+                "slot {slot} indexes past the identity array"
+            );
+        }
+        assert_eq!(
+            occupied,
+            table.keys.len(),
+            "one slot per distinct key, no duplicate entries"
         );
     }
 }
