@@ -3096,6 +3096,7 @@ mod tests {
         let expected = format!("ok {{{ascending},{descending},{ascending}}}");
         assert_eq!(case.golden.stdout, Some(expected.as_str()));
         assert_eq!(case.golden.exit_code, 0);
+    }
 
     /// The hook-flag block: the gated keys whose dispatch reads one bit of the runtime's
     /// build-once flag word. Each golden is the oracle's own single line (measured twice with
