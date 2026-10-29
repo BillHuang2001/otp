@@ -1,17 +1,17 @@
 {
   "schema": "suites/1",
-  "generated_at": 1793256335,
-  "run_command": "suites run --target stdlib --suite maps_SUITE,lists_SUITE,binary_module_SUITE --timeout 120 --suite-budget 900 --jobs 1 --out /tmp/recheck-timeouts",
+  "generated_at": 1793264700,
+  "run_command": "suites run --target stdlib --suite maps_SUITE,lists_SUITE,binary_module_SUITE --timeout 120 --suite-budget 900 --jobs 1 --out results/stdlib/recheck-120",
   "host": {
-    "loadavg_before": "11.72 26.84 27.05 17/881 4",
-    "loadavg_after": "11.23 16.25 22.54 100/1258 597",
+    "loadavg_before": "58.32 50.07 29.76 141/1478 1104",
+    "loadavg_after": "43.07 71.19 52.17 28/999 1697",
     "nproc": 16,
     "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
     "oracle_version": "29/17.1.1"
   },
   "rust": {
-    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt",
-    "sha": "125ca3a9f3f7260dfc2400faff18117b67834558",
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt",
+    "sha": "71ffbbb37971d0b193e0dc74b60b6c448874349e",
     "version": "30/17.1",
     "tier": null
   },
@@ -21,8 +21,8 @@
       "kind": "ct",
       "source": {
         "repo": "otp",
-        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A615/lib/stdlib/test",
-        "sha": "125ca3a9f3f7260dfc2400faff18117b67834558",
+        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/lib/stdlib/test",
+        "sha": "9e860feef6702c61bacf6c24e31b4e5731778f11",
         "staged": "/tmp/erts-suites-stage/stdlib/src"
       },
       "build": {
@@ -44,7 +44,7 @@
         {
           "side": "rust",
           "purpose": "ct binary_module_SUITE",
-          "command": "cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 120000, 900000, \"/tmp/erts-suites-stage/stdlib/src\"), halt(0).'"
+          "command": "cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 120000, 900000, \"/tmp/erts-suites-stage/stdlib/src\"), halt(0).'"
         },
         {
           "side": "build",
@@ -54,16 +54,16 @@
       ],
       "tally": {
         "measured": 130,
-        "agree": 106,
-        "agree_fail_identical": 0,
-        "divergence": 12,
+        "agree": 113,
+        "agree_fail_identical": 1,
+        "divergence": 16,
         "oracle_only_fail": 0,
-        "rust_gap": 12,
+        "rust_gap": 0,
         "not_run": 0,
         "sys_passed": 129,
         "sys_failed": 1,
-        "rust_passed": 106,
-        "rust_failed": 11
+        "rust_passed": 113,
+        "rust_failed": 17
       },
       "rows": [
         {
@@ -162,13 +162,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -225,13 +225,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
+            "status": "fail",
             "passed": 0,
-            "failed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": "'exit <structured reason>'"
           },
-          "verdict": "rust-gap",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -246,13 +246,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
-            "passed": 0,
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -267,13 +267,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
-            "passed": 0,
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -288,13 +288,13 @@
             "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,do_interesting,1,...}}"
           },
           "rust": {
-            "status": "error",
+            "status": "fail",
             "passed": 0,
-            "failed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,do_interesting,1,...}}"
           },
-          "verdict": "divergence",
+          "verdict": "agree-fail-identical",
           "note": ""
         },
         {
@@ -309,13 +309,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
-            "passed": 0,
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -330,13 +330,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
-            "passed": 0,
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -351,13 +351,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
+            "status": "fail",
             "passed": 0,
-            "failed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": "{exception,error,unsupported_bif,{erlang,bump_reductions,[...],...}}"
           },
-          "verdict": "rust-gap",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -372,13 +372,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
-            "passed": 0,
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -393,13 +393,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
+            "status": "fail",
             "passed": 0,
-            "failed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": "timeout"
           },
-          "verdict": "rust-gap",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -414,13 +414,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
-            "passed": 0,
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -435,13 +435,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
+            "status": "fail",
             "passed": 0,
-            "failed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": "timeout"
           },
-          "verdict": "rust-gap",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -456,13 +456,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
+            "status": "fail",
             "passed": 0,
-            "failed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": "{exception,error,{badmatch,1023},{binary_module_SUITE,referenced,1,...}}"
           },
-          "verdict": "rust-gap",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -477,13 +477,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "error",
-            "passed": 0,
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
-            "detail": "case missing from the rust runtime's output"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -1527,13 +1527,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
-            "failed": 0,
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": ""
+            "detail": "timeout"
           },
-          "verdict": "agree",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -2802,8 +2802,8 @@
         "each case runs in its own `spawn_monitor` with a per-case timeout; `init_per_group`/`end_per_group`/`init_per_testcase` hooks are NOT executed",
         "cases that fail identically on both sides (missing `ct` config/data dirs, group-hook dependencies) are `agree-fail-identical`: excluded from both numerators, never counted as passes",
         "per-case timeout: 120 s · suite budget: 900 s (the runner stops launching cases when the budget expires and prints `SUITE_DEADLINE <not-run>`, so the remaining cases are reported as *not measured*, never as failures)",
-        "binary_module_SUITE: 20 cases — sys 19/1 pass/fail, rust 5/2 pass/fail",
-        "lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 78/0 pass/fail",
+        "binary_module_SUITE: 20 cases — sys 19/1 pass/fail, rust 13/7 pass/fail",
+        "lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 77/1 pass/fail",
         "maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 23/9 pass/fail"
       ]
     }
