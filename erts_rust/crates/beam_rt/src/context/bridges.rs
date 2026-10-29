@@ -186,6 +186,7 @@ impl<'a> FunBridge<'a> {
         &'b mut self,
         lent_tables: Option<&'b mut TableRegistry>,
     ) -> RuntimeContext<'b> {
+            let dispatch_memo = self.runtime.memo_pool.slot();
         RuntimeContext {
             runtime: self.runtime,
             output: self.output.clone(),
@@ -205,8 +206,9 @@ impl<'a> FunBridge<'a> {
             // A nested run never asks to be parked: the BIF that built it has already
             // returned (see `RuntimeContext::suspend_requested`).
             suspend_requested: false,
-            // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
-            dispatch_memo: super::DispatchMemo::default(),
+            // The nested context borrows a memo from the runtime's pool (recycled when it is
+            // dropped): see `super::memo_pool`.
+            dispatch_memo,
             lent_tables,
         }
     }
@@ -391,6 +393,7 @@ impl SendHook for SendBridge<'_> {
                 // be free again before the alias can be consumed through the table it was
                 // resolved against.
                 let delivered = {
+                        let dispatch_memo = self.runtime.memo_pool.slot();
                     let mut ctx = RuntimeContext {
                         runtime: self.runtime,
                         output: self.output.clone(),
@@ -408,8 +411,9 @@ impl SendHook for SendBridge<'_> {
                         // A delivery never asks to be parked (see
                         // `RuntimeContext::suspend_requested`).
                         suspend_requested: false,
-                        // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
-                        dispatch_memo: super::DispatchMemo::default(),
+                        // The nested context borrows a memo from the runtime's pool: see
+                        // `super::memo_pool`.
+                        dispatch_memo,
                         // A delivery applies no fun and reads no `TableRegistry`.
                         lent_tables: None,
                     };
@@ -434,6 +438,7 @@ impl SendHook for SendBridge<'_> {
             // drop. This is the **same** transmission the compiled `!` runs
             // (`RuntimeContext::deliver_remote`).
             remote => {
+                    let dispatch_memo = self.runtime.memo_pool.slot();
                 let mut ctx = RuntimeContext {
                     runtime: self.runtime,
                     output: self.output.clone(),
@@ -448,7 +453,7 @@ impl SendHook for SendBridge<'_> {
                     // A remote transmission never asks to be parked (see
                     // `RuntimeContext::suspend_requested`).
                     suspend_requested: false,
-                    dispatch_memo: super::DispatchMemo::default(),
+                    dispatch_memo,
                     // A remote transmission applies no fun and reads no `TableRegistry`.
                     lent_tables: None,
                 };
@@ -488,6 +493,7 @@ impl SendHook for SendBridge<'_> {
         // The port arm borrows the runtime (the wait can re-enter the scheduler), so it needs a
         // nested context of its own — the same construction [`Self::send`] performs for a
         // delivery.
+            let dispatch_memo = self.runtime.memo_pool.slot();
         let mut ctx = RuntimeContext {
             runtime: self.runtime,
             output: self.output.clone(),
@@ -503,7 +509,7 @@ impl SendHook for SendBridge<'_> {
             // `Instr::Send`/`!` instruction, which has no BIF door to consume the latch
             // (see `RuntimeContext::suspend_requested` and `crate::port::busy_wait`).
             suspend_requested: false,
-            dispatch_memo: super::DispatchMemo::default(),
+            dispatch_memo,
             // A port send applies no fun and reads no `TableRegistry`.
             lent_tables: None,
         };

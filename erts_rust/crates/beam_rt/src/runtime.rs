@@ -71,7 +71,7 @@ use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{strategy_env_default, ArgTerm, InitArgs, MaxHeapSetting, RuntimeConfig};
 use crate::context::gc_walk::{ForeignLatch, RuntimeCollectionGate};
-use crate::context::{PersistentTermStore, RuntimeContext};
+use crate::context::{MemoPool, PersistentTermStore, RuntimeContext};
 use crate::dist::links::{new_lost_peers, no_lost_peers, take_lost_peers, LostPeers};
 use crate::dist::{resolve_cookie, DistLinks, DistNode, NodeName, NONODE_NAME};
 use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
@@ -309,6 +309,16 @@ pub struct Runtime {
     /// Shared through an [`Rc`] so a `BifContext` can be dispatched against a cheap clone
     /// that does not borrow the runtime (see [`crate::context::RuntimeContext::call_registered`]).
     pub(crate) registry: Rc<BifRegistry>,
+    /// The idle dispatch-memo slots a finished
+    /// [`RuntimeContext`] hands back, for the next context of **this** runtime to fill.
+    ///
+    /// A context is built per scheduler slice, so a park-heavy loop (`receive` on every
+    /// iteration) used to rebuild the dispatch memo from empty — and pay the registry lookup,
+    /// the hook probe and an entry allocation — on every resume. The memo's own soundness
+    /// argument makes its inputs immutable **for the life of the runtime**, so the pool hangs
+    /// off the runtime (the same validity domain as the baseline tier's compiled-block cache)
+    /// and never outlives it. See the `context::memo_pool` module docs.
+    pub(crate) memo_pool: MemoPool,
     /// The code server: the one shared atom table, the module cache, the code path.
     pub(crate) code_server: CodeServer,
     /// The process table (Milestone-1: the runtime's own single process).
@@ -1587,6 +1597,7 @@ impl Runtime {
         Ok(Runtime {
             config,
             registry: Rc::new(BifRegistry::with_core_bifs()),
+            memo_pool: MemoPool::default(),
             code_server,
             processes,
             mailboxes: FastHashMap::default(),
