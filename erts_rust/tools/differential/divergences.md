@@ -548,15 +548,36 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   arity). The nearest served `ets:info/1` observation is pinned by
   `ets/info_all_item_keys_and_deterministic_counters` (the item set and its deterministic
   counters).
-- ETS query surface: `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a
-  bare single-use ref where the oracle answers its own opaque `{Ref, _, _, Ref, _, _}` handle (so
-  only the `{Matches, continuation}` split and the ref-ness are pinned).
-- ETS access control: the mode set at `ets:new/2` **is** enforced — a non-owner `ets:lookup/2` of a
-  `private` table and a non-owner `ets:insert/2` of a `private`/`protected` table raise
-  `error:badarg` in both runtimes — but the raised **reason shape** differs: the rust runtime raises
-  the bare atom `badarg`, the oracle `{badarg, Stacktrace}`. The *denied* cells are therefore
-  unpinned (the allowed half and the ungated `ets:info/1,2` surface are pinned).
-  Owner: `beam_bifs` / `beam_ets`.
+- ETS query surface — the continuation's **representation only**: a `select/3` (also `match/3` /
+  `match_object/3`) chunk's continuation is a bare **reference** here, while the oracle answers its
+  own opaque table-type-specific tuple — measured (OTP 29.1.2 / erts-17.1.1) a 6-tuple
+  `{Ref, _, _, Ref, _, _}` for a `set` and an 8-tuple for an `ordered_set`, both carrying per-VM
+  refs — so `is_reference/1` / `is_tuple/1` on that value are the diverging observables. Everything
+  else about the surface **agrees**: the `{Matches, Continuation}` split and the chunk's arity
+  (`ets/select_3_continuation`, `ets/match_3_continuation`), the result list, the
+  `'$end_of_table'` answer of an exhausted continuation (`ets/select_1_end_of_table`), the bare
+  `'$end_of_table'` **argument** (both runtimes reject it with the plain `error:badarg`), and the
+  re-read of a spent continuation (measured over a 3-object `ordered_set` at `Limit = 1`:
+  `{[1], {[2], <handle>}, [2], [3], '$end_of_table', '$end_of_table'}` on **both** sides — a
+  continuation is re-readable, not single-use). Owner: `beam_bifs` / `beam_ets` (the shape of the
+  value `select/3` hands back).
+- ETS access control: the mode set at `ets:new/2` **is** enforced and the raised **reason** agrees —
+  a non-owner `ets:lookup/2` of a `private` table and a non-owner write of a `private`/`protected`
+  table raise the plain `error:badarg` (the **bare atom**, not `{badarg, Stacktrace}`) in both
+  runtimes. Measured over twelve denied cells — non-owner `lookup`/`insert`/`delete`/
+  `delete_all_objects`/`tab2list`/`select`/`match`/`update_counter`/`lookup_element` on a `private`
+  table, plus `insert`/`delete`/`update_element` on a `protected` one — every cell answers
+  `{reason, badarg}` on **both** sides. What differs is the **stacktrace**: the innermost item's
+  `error_info` extension is `#{cause => access, module => erl_stdlib_errors}` on the oracle against
+  `#{module => erl_stdlib_errors}` here (the `bif_error_cause` seam of `CASE_DRAFTS.md` §10 —
+  `beam_bifs::error_cause` answers `Undecided` for a live table's access gate), and the trace is
+  shallower (5 frames vs 2 off the `-eval` route, whose evaluator frames are volatile anyway). So a
+  denied cell may pin its **class and reason**, never its stacktrace; the allowed half and the
+  ungated `ets:info/1,2` surface are pinned end to end by the `ets_access/*` group, which carries no
+  denied cell yet — now that the reason agrees, one may pin the bare `error:badarg` (never the
+  trace).
+  Owner: `beam_engine` (the extension's sizing/rendering) / `beam_bifs` (the decision) / `beam_rt`
+  (the missing host impl of `ExecutionContext::bif_error_cause`).
 - `erlang:module_loaded/1`: `module_loaded(lists)` is `true` vs `false`.
 - `erlang:delete_module/1` **unloads**, where the oracle only *retires* code: this runtime has no
   old-code slot, so the two runtimes agree on the first delete and part ways *after* it. Measured
@@ -604,20 +625,28 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   this size figure is unpinned — no case may read it (guarded by
   `bitbin::tests::no_case_pins_referenced_byte_size`). Owner: `beam_term` / `beam_bifs` (the
   sub-binary representation).
-- **`maps`' no-op identity is lost**: a registered BIF's result is always
-  deep-copied into the caller's heap (`move_result_into_process_heap` → `copy_result_fresh` →
-  `beam_message::copy_struct`, `crates/beam_rt/src/context/calls.rs`), so `erts_debug:same/2` of a
-  map that a no-op `maps:put/3`/`update/3`/`remove/2`/`merge/2` handed back is `false` here and
-  `true` on the oracle. Measured with `M = maps:from_list([{a,1},{b,2}])` and
-  `Q = maps:from_list([{b,2},{a,1}])`, over
-  `[same(M,maps:put(a,1,M)), same(M,maps:update(a,1,M)), same(M,maps:remove(zz,M)),
-  same(M,maps:merge(M,M)), same(M,Q), M =:= Q, same(M,maps:with([a],M)), same(M,maps:put(a,2,M))]`:
-  `ok {true,true,true,true,false,true,false,false}` on the oracle against
-  `ok {false,false,false,false,false,true,false,false}` here. The **inlined guard** BIFs are not
-  copied, so they keep the word — `{same(M,element(1,{M})), same(M,hd([M])),
-  same(M,lists:nth(1,[M])), same(M,M)}` is `{true,true,false,true}` here, unchanged under
-  `BEAM_RT_TIER=interpreter`. `crates/beam_bifs`'s no-op early returns are correct
-  (`crates/beam_bifs/tests/maps_identity.rs`), so the fix belongs to result admission, not the BIF.
+- **`maps`' no-op identity is preserved everywhere but `maps:without/2`**: the oracle's `without/2`
+  is a `lists:foldl(fun maps:remove/2, M, Ks)` (`lib/stdlib/src/maps.erl:1141-1142`), so an empty
+  key list — or a key the map does not hold — hands back the **source map's own word**. Measured
+  with `M = maps:from_list([{a,1},{b,2}])`, over
+  `[same(M,without([],M)), same(M,without([zz],M)), same(M,without([a],M)), same(M,put(a,1,M)),
+  same(M,remove(zz,M))]`: `[true,true,false,true,true]` on the oracle against
+  `[false,false,false,true,true]` here — identically off the `-eval` route and from a compiled
+  module. The cause is the `without/2` **fast path** this runtime registers: it rebuilds the whole
+  map through `build` (`crates/beam_bifs/src/maps.rs::without_2`, which has no no-op early return,
+  unlike `put_3`/`update_3`/`remove_2`), so a `without/2` case would be a plain-value `mismatch` and
+  none may be written. The rest of the family **agrees**: the registered
+  `maps:put/3`/`update/3`/`remove/2`/`merge/2` no-ops keep the argument's word through result
+  admission (the destination-containment short-circuit,
+  `crates/beam_rt/src/context/calls/dest.rs` — measured
+  `[same(M,put(a,1,M)), same(M,update(a,1,M)), same(M,remove(zz,M)), same(M,merge(M,M)), same(M,Q),
+  M =:= Q, same(M,with([a],M)), same(M,put(a,2,M))]` is `[true,true,true,true,false,true,false,false]`
+  on **both** sides, with `Q = maps:from_list([{b,2},{a,1}])`), `maps:with/2`/`map/2`/`filter/2`
+  rebuild on both sides, the inlined-guard rows are `{true,true,false,true}` on both from compiled
+  code (`{true,true,true,true}` off `-eval`), and the **compiled** map-update identity `M#{a => 1}`
+  is pinned by `maps/no_op_update_keeps_identity` and
+  `maps/no_op_update_identity_at_the_map_boundaries` (both `[AGREE]`; oracle masks `16352` and
+  `32744`). Owner: `beam_bifs` (`without_2`'s missing no-op early return).
 ## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
 - `erl_ddll`'s refusal shapes all agree and are pinned: the missing-object / missing-directory /
   non-string-name `{error,{open_error,-10}}`, the not-loaded `{error,not_loaded}`, the

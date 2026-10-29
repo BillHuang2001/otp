@@ -8,8 +8,8 @@ lands in `src/corpus/**`, and `known-gaps.txt`/`GAPS.md` are refreshed in the sa
 drafted here and deliberately **not** in `known-gaps.txt` — the allowlist records only genuinely
 unclosable gaps, and recording a closable one would defeat the ratchet. §8 and §10 are the two
 recipes open at this revision (both closable, each blocked on a named runtime seam) and §9 records
-a measured divergence, so no case can pin it; every other section is either landed or a recorded
-non-gap.
+one residual measured divergence (`maps:without/2`), so no case can pin that one shape; every other
+section is either landed or a recorded non-gap.
 
 At a glance: **§1**, **§2**, **§4b**, **§4c**, **§5a**, **§5b** and **§6** are **landed** — every
 one agrees in `beam_rt` and is pinned by the `src/corpus/**` groups (`zlib.rs`, `bifs.rs`,
@@ -17,9 +17,10 @@ one agrees in `beam_rt` and is pinned by the `src/corpus/**` groups (`zlib.rs`, 
 gaps but are not gaps at all. The only remaining zlib divergences are **§4a** (the repetitive-body
 wrapped size form) and **§4**'s large-body image-choice (the 100-byte raw-DEFLATE `zip/1` stream),
 both unpinnable and recorded in `divergences.md`, not drafts. §8 is `blocked-on-beam_rt` — the
-`system_info(snifs)` recipe is ready and lands the moment the key is served — §9 is a
-`maps` no-op-identity **divergence**, not a case: no golden can pin it while the result-admission
-path deep-copies every BIF result, and §10 is `blocked-on-beam_rt`'s host impl of
+`system_info(snifs)` recipe is ready and lands the moment the key is served — §9's compiled
+map-update identity and its registered-BIF no-ops are **landed** (result admission no longer copies
+a result that still lives on its destination), leaving `maps:without/2` as the one residual
+divergence — and §10 is `blocked-on-beam_rt`'s host impl of
 `ExecutionContext::bif_error_cause` — the `{cause,_}` error_info recipe is ready and lands the
 moment a host answers the seam.
 
@@ -488,9 +489,19 @@ Case {
 * **the work the owning crate must do** (from `crates/beam_bifs/CONTEXT.md`, read-only): `"snifs"` out of `crates/beam_rt/src/info.rs`'s `UNSUPPORTED_KEYS` into the served set, plus a builder in `crates/beam_rt/src/info/system.rs` whose value is `beam_bifs::snifs()`'s rows as `{Module, Function, Arity}` 3-tuples; the per-key rationale deleted from `crates/beam_rt/src/info/unsupported.rs` (and from its doc table); the two key-count pins retyped (`src/info.rs` `88 → 89` supported and `27 → 26` unsupported); the atom vocabulary widened to the roster's **465** distinct names (25 modules + 440 function names), or `every_supported_key_materializes…` fails on `TermNotFound`; and `tests/system_info_oracle.rs` moving `"snifs"` out of the unsupported set into the **SHAPE-ONLY** class — never `ORACLE_EQUAL`, because the value legitimately differs by release (553 vs 556).
 * repro once the key is served: `erts_rust/target/release/differential compare 'erlang:system_info(snifs)'`, and `differential run system_info/snifs_is_the_reversed_bif_tab_roster` once the case lands.
 
-## 9. `maps` no-op identity — **not a case** (a measured divergence); owner `beam_rt`
+## 9. `maps` no-op identity — **landed** for the compiled update and the registered-BIF no-ops; one residual (`maps:without/2`); owner `beam_bifs`
 
-**Status:** `blocked-on-beam_rt (a divergence, so no case can pin it)` — `crates/beam_bifs`'s `maps` no-op early returns are correct; the divergence lives in the result-admission path.
+**Status:** `landed` for the identity itself, with one unpinnable shape left.
+The **compiled** map-update identity (`M#{a => 1}` with no change returning the source map's own
+term) is pinned by the two module-run cases `maps/no_op_update_keeps_identity` and
+`maps/no_op_update_identity_at_the_map_boundaries` — both `[AGREE]`, goldens the oracle's own masks
+`16352` and `32744` — because a `.beam` gives *both* sides real map-update opcodes (`-eval` does
+not even accept the `M#{…}` update syntax).
+The **BIF-returned** no-op identity now agrees as well: result admission hands a result that still
+lives on its destination through unchanged (the destination-containment short-circuit,
+`crates/beam_rt/src/context/calls/dest.rs`), so the registered `maps:put/3`/`update/3`/`remove/2`/
+`merge/2` no-ops keep the argument's word exactly as the C runtime does.
+What is **still** a divergence — and therefore still cannot be a case — is `maps:without/2`.
 
 Measured on this host, both sides, `Probe::Value`, for
 
@@ -499,13 +510,59 @@ Measured on this host, both sides, `Probe::Value`, for
 ```
 
 * **oracle**: `ok [true,true,true,true,false,true,false,false]`
-* **`beam_rt`**: `ok [false,false,false,false,false,true,false,false]`
+* **`beam_rt`**: `ok [true,true,true,true,false,true,false,false]` — *agrees* (before the
+  destination-containment short-circuit landed this line was
+  `ok [false,false,false,false,false,true,false,false]`)
 
-Both lines are stored structure identity (`erts_debug:same/2`), not equality: the oracle's `maps` returns the *argument's own term* from a no-op, so `maps:put(M, a, 1)`, `maps:update/3`, `maps:remove/2` of an absent key and `maps:merge(M, M)` are all the same word as `M`; the same holds for `maps:with/2` on this shape. `M =:= Q` is `true` on both sides (structural equality is not the issue), and a *changing* call (`maps:put(M, a, 2)`) is a fresh term on both — which is why the divergence is invisible to every equality-based case and can only be seen through `erts_debug:same/2`.
+Both lines are stored structure identity (`erts_debug:same/2`), not equality: the oracle's `maps`
+returns the *argument's own term* from a no-op, so `maps:put(M, a, 1)`, `maps:update/3`,
+`maps:remove/2` of an absent key and `maps:merge(M, M)` are all the same word as `M`; the same
+holds for `maps:with/2` on this shape. `M =:= Q` is `true` on both sides (structural equality is not
+the issue), and a *changing* call (`maps:put(M, a, 2)`) is a fresh term on both — which is why the
+identity can only be seen through `erts_debug:same/2`.
 
-**Mechanism (the measured cause).** A registered BIF's result is always deep-copied into the caller's heap — `move_result_into_process_heap` → `copy_result_fresh` → `beam_message::copy_struct` (`crates/beam_rt/src/context/calls.rs`) — so a no-op BIF can never hand back the argument's word. Only the **inlined guard** BIFs keep it, and only from compiled code: there, measured `{erts_debug:same(M, element(1,{M})), erts_debug:same(M, hd([M])), erts_debug:same(M, lists:nth(1,[M])), erts_debug:same(M, M)}` is `{true,true,true,true}` on the oracle and `{true,true,false,true}` on `beam_rt` (`element/2` and `hd/1` compile to the `get_tuple_element`/`get_list` opcodes, while `lists:nth/2` is a registered BIF), unchanged under `BEAM_RT_TIER=interpreter` — so the tier is not the variable. On the `-eval` tree-walking route the same tuple is `{false,false,false,true}` here (the walker routes even those two through the result copy), which is the same mechanism seen on the other route.
+**Mechanism (why the `-eval` route now agrees).** A registered BIF's result used to be deep-copied
+into the caller's heap unconditionally (`move_result_into_process_heap` → `copy_result_fresh` →
+`beam_message::copy_struct`), which re-homed a word that had not moved. Each route now asks its
+destination whether the root still has to move (already on a heap this process's collector scans, or
+on the `-eval` store, or on no pooled region at all) and hands it through when it does not — see the
+`dest.rs` module doc for the soundness argument. The **inlined guard** BIFs never were copied:
+`{erts_debug:same(M, element(1,{M})), erts_debug:same(M, hd([M])), erts_debug:same(M,
+lists:nth(1,[M])), erts_debug:same(M, M)}` is `{true,true,true,true}` off the `-eval` route and
+`{true,true,false,true}` from compiled code (where `lists:nth/2` is a registered BIF and the oracle
+rebuilds too) — the same answers on both sides, unchanged under `BEAM_RT_TIER=interpreter`.
 
-**Owner and why no case can pin it.** `crates/beam_bifs`'s `maps` no-op early returns are correct and are already pinned crate-side (`crates/beam_bifs/tests/maps_identity.rs`); the fix belongs to the result-admission path in `crates/beam_rt` (a BIF whose result is its own argument must be admitted without a copy), not to the BIF. A corpus case is impossible in the meantime: the only observable is a plain `false` (a `mismatch`-class value) rather than the runtime's documented `unsupported` signal, so pinning the oracle line would turn the gate red by design.
+**The residual — `maps:without/2`.** The oracle's `without/2` is a `lists:foldl(fun maps:remove/2,
+M, Ks)` (`lib/stdlib/src/maps.erl:1141-1142`), so an empty key list or an absent key hands back the
+source map's own word; this runtime registers a `without/2` **fast path** that rebuilds the whole
+map (`crates/beam_bifs/src/maps.rs::without_2` → `build`, with no no-op early return, unlike
+`put_3`/`update_3`/`remove_2`). Measured with `M = maps:from_list([{a,1},{b,2}])` over
+
+```erlang
+[erts_debug:same(M, maps:without([], M)), erts_debug:same(M, maps:without([zz], M)), erts_debug:same(M, maps:without([a], M)), erts_debug:same(M, maps:put(a,1,M)), erts_debug:same(M, maps:remove(zz,M))]
+```
+
+* **oracle**: `ok [true,true,false,true,true]`
+* **`beam_rt`**: `ok [false,false,false,true,true]`
+
+identically off the `-eval` route and from a compiled module — so a `without/2` case would pin a
+plain-value `mismatch`, which no allowlist can cover (`ratchet::classify` ratchets only
+`Unsupported`/`Skipped`, and `suite_exit_code` returns `1` on any mismatch). **Re-verify** with the
+`Probe::Value` wrapper of "How a recipe was verified" (both commands below re-run as written):
+
+```sh
+erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt -p differential
+erts_rust/target/debug/differential run maps/no_op_update_keeps_identity          # [AGREE]
+erts_rust/target/debug/differential compare '(fun() -> M = maps:from_list([{a,1},{b,2}]), erts_debug:same(M, maps:put(a,1,M)) end)()'   # [AGREE]
+# the residual, each runtime with the same Probe::Value wrapper:
+erl -noshell -eval 'try ((fun() -> M = maps:from_list([{a,1},{b,2}]), [erts_debug:same(M, maps:without([], M)), erts_debug:same(M, maps:without([zz], M)), erts_debug:same(M, maps:without([a], M)), erts_debug:same(M, maps:put(a,1,M)), erts_debug:same(M, maps:remove(zz,M))] end)()) of V -> io:format("ok ~w~n",[V]), halt(0) catch C:R -> io:format("exception ~w ~w~n",[C,R]), halt(1) end.'
+erts_rust/target/debug/beam_rt -noshell -eval '<the same `-eval` expression>'
+```
+
+**Owner and what remains.** The fix belongs to `crates/beam_bifs/src/maps.rs::without_2` (return
+`map` unchanged when no key is removed) — not to result admission, which is now correct. The moment
+the fast path returns its argument, the two divergent rows above (`without([], M)` and
+`without([zz], M)`) agree and a `without/2` case can land in the same change.
 
 ## 10. `ets:lookup/2` of an undefined table — the `{cause,_}` error_info pair; owner `beam_engine` (`ExecutionContext::bif_error_cause`, needs a host impl in `beam_bifs`/`beam_rt`)
 
