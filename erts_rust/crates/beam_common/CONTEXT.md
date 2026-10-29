@@ -25,12 +25,13 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   - `pub type Result<T> = core::result::Result<T, BeamError>;`
   - `BeamError` variants: `BadArg`, `BadArith`, `BadArity`, `BadMatch`, `SystemLimit`,
     `Alloc(AllocFailure)`, `TermNotFound`, `Io(std::io::Error)`, `Raise(Raise)`.
-  - `Raise { class, reason, stacktrace, live_reason, saved_args, error_info }` (all fields public).
+  - `Raise { class, reason, stacktrace, live_reason, saved_args, error_info, supplied_trace }` (all fields public).
     `live_reason: Option<LiveReason>` is the **opaque live-reason slot**: `ExitReason::Structured` is a
     unit variant, so a structured reason's live *term* travels out-of-band here instead of in the
     reason. Builders
-    `new`/`error`/`exit`/`throw`/`with_stacktrace`/`with_live_reason`/`with_saved_args`/`with_error_info`,
-    accessors `live_reason()`/`saved_args()`/`error_info()`.
+    `new`/`error`/`exit`/`throw`/`with_stacktrace`/`with_live_reason`/`with_saved_args`/`with_error_info`/
+    `with_supplied_trace`,
+    accessors `live_reason()`/`saved_args()`/`error_info()`/`supplied_trace()`.
     The other two slots are the `erlang:error/2,3` raise shapes the engine renders into the
     **innermost** stacktrace item: `saved_args: Option<LiveReason>` carries the argument **list** term
     (`error/2,3`'s second argument, which *replaces* the caller frame's `A` slot — the C's
@@ -39,19 +40,24 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
     `{error_info, Map}` option, which is *appended* to that frame's `Location`
     (`try erlang:error({badmap,zz},[1,2],[{error_info,#{module=>erl_stdlib_errors}}]) …` ⇒
     `{p,g,[1,2],[{file,"p.erl"},{line,9},{error_info,#{module => erl_stdlib_errors}}]}`).
+    The fourth slot is the `erlang:raise/3` shape: `supplied_trace: Option<LiveReason>` carries the
+    third argument **verbatim** (the trace *term*), because C echoes a supplied trace unchanged
+    (`erts/emulator/beam/beam_common.c:1219-1223`) — the slot's *presence*, not its value, is the
+    discriminator, so a supplied `[]` is distinguishable from "nothing supplied".
     `Debug`+`Clone`+`PartialEq`+`Eq` are kept, but `Debug`, `PartialEq` and `Eq` are **manual**:
-    equality compares only the observable parts (`class`/`reason`/`stacktrace`) and ignores all three
-    slots, and `Debug` prints the placeholders `<live reason>`, `<saved args>` and `<error info>` — so
-    no payload is ever printed, dereferenced or compared. `Clone` stays derived (each handle is an
-    `Arc`).
+    equality compares only the observable parts (`class`/`reason`/`stacktrace`) and ignores all four
+    slots, and `Debug` prints the placeholders `<live reason>`, `<saved args>`, `<error info>` and
+    `<supplied trace>` — so no payload is ever printed, dereferenced or compared. `Clone` stays
+    derived (each handle is an `Arc`).
   - `LiveReason` — the opaque handle: `new<T: Any + Send + Sync + 'static>(T)`,
     `downcast_ref::<T>(&self) -> Option<&T>`, `as_any(&self) -> &dyn Any`; `Clone` + `Send` + `Sync`;
     `Debug` prints `<live reason>` (never the payload).
   - **Live-reason convention (for adopters):** a raising crate with a term representation stores its
     live reason term as an `Eterm` payload (`LiveReason::new(term)`) and attaches it with
-    `Raise::with_live_reason`; a consumer recovers it with `downcast_ref::<Eterm>()`. The two
-    `erlang:error/2,3` slots follow the same convention verbatim — `with_saved_args` carries the live
-    argument list term and `with_error_info` the live `error_info` map term. `beam_common`
+    `Raise::with_live_reason`; a consumer recovers it with `downcast_ref::<Eterm>()`. The three
+    term-carrying raise slots follow the same convention verbatim — `with_saved_args` carries the live
+    argument list term, `with_error_info` the live `error_info` map term and `with_supplied_trace` the
+    live supplied-trace term. `beam_common`
     names no term type — that is the adopter's payload type, not a dependency of this crate.
     Both new slots are pure out-of-band metadata: they start as `None` from
     `new`/`error`/`exit`/`throw`, are ignored by `PartialEq`/`Eq` and never dereferenced by `Debug`.
@@ -97,8 +103,8 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   raising crate maps them to live terms. A structured (tuple/list/map) reason is shown here as
   `ExitReason::Structured` (unit variant, no term), and its live term rides along out-of-band in the
   opaque `Raise::live_reason` slot — never as a `beam_term` dependency. The `Raise::saved_args`
-  (argument list term) and `Raise::error_info` (`error_info` map term) slots are opaque for the same
-  reason and add no dependency either.
+  (argument list term), `Raise::error_info` (`error_info` map term) and `Raise::supplied_trace`
+  (supplied-trace term) slots are opaque for the same reason and add no dependency either.
 - **Stability:** public enums/structs are `#[non_exhaustive]`; construct via `Default`/`new` +
   builder setters. `BeamError` implements `Display` + `std::error::Error` (source = the inner
   `io::Error`); `From<std::io::Error>` is provided.
