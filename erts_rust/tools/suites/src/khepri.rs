@@ -346,6 +346,9 @@ fn modules_rows(
         // (and re-runs) interfere. Both sides of one module still share one cwd, which is
         // what makes the comparison fair.
         let cwd = cwd.join(module);
+        if let Err(err) = target::fresh_dir(&cwd) {
+            return (module.clone(), Outcome::bare(Status::Error, err.clone()), Outcome::bare(Status::Error, err));
+        }
         let sys_outcome = match sys {
             Some(rt) => observe(rt, code_path, module, opts, &cwd),
             None => Outcome::bare(Status::NotRun, "oracle not selected"),
