@@ -64,37 +64,27 @@
 //! `beam_term::map::map_put_cow_words_required` is the writer's own read-only
 //! path descent, so the figure is the writer's, not a re-derivation here.
 //!
-//! # Known divergence found by this suite: a flat map's *compound* keys can be stored
-//! in two different orders
+//! # One atom namespace: the rebuild and the path copy agree on the stored order
 //!
-//! The two writers consult different atom namespaces when they order a flat map's
-//! **compound** keys (`erts_cmp_flatmap_keys` compares an atom element through
-//! `beam_term::compare::cmp_atoms`, which orders two *named* atoms by name and falls
-//! back to the raw atom index when either name is unknown):
+//! Both writers order a flat map's keys through the caller's **live** `AtomTable`:
+//! `beam_term::map::write_map` (reached by `maps:from_list/1` through
+//! `crate::access::make_map`) and `beam_term::map::map_put_cow` (reached by
+//! `maps:put/3` through `crate::access::map_put_cow`) are handed the same `ctx.atoms()`
+//! through `BifContext::atom_and_heap`. `erts_cmp_flatmap_keys` compares two *atom* keys
+//! by raw atom index, while a **compound** key's atom elements are compared recursively
+//! by `beam_term::compare::cmp` → `compare::cmp_atoms`, which orders two *named* atoms by
+//! **name** — the C's `erts_cmp_atoms`
+//! (`erts/emulator/beam/erl_utils.h:193-220`: an `ord0` fast path, then `sys_memcmp` on
+//! the name, then the length). A fresh or empty table would leave every name unknown
+//! there and fall back to the raw atom index, an order the C never produces.
 //!
-//! * `beam_term::map::write_map`, reached by `maps:from_list/1` through
-//!   `crate::access::make_map`, is handed a **fresh empty** `AtomTable` — the access
-//!   substitution documented in `crates/beam_bifs/src/access.rs` (taking `ctx.atoms()`
-//!   beside `ctx.heap()` would be two simultaneous borrows of `BifContext`) — so it
-//!   falls back to **index** order;
-//! * `beam_term::map::map_put_cow`, reached by `maps:put/3` through
-//!   `crate::access::map_put_cow`, is handed the **live** `ctx.atoms()` (through
-//!   `BifContext::atom_and_heap`), so two named atoms order by **name**.
-//!
-//! In an atom table whose indices are not in name order — the seeded table here puts
-//! `none` (index 4) ahead of `a` (index 5) — `maps:from_list([{{none, 3}, …}])`
-//! therefore stores `{none, 3}` **first** among the tuples while
-//! `maps:put({none, 3}, …, M)` stores it after `{a, 1}`/`{b, 2}`. The content is
-//! identical (`=:=`) either way; only the stored order differs, so for such a key a path
-//! copy is not order-equivalent to the rebuild.
-//!
-//! This file does not paper over it: the compound-key arms below use keys whose index
-//! and name order **agree** (so the equivalence really is an equivalence), and
-//! [`a_compound_key_whose_atom_element_sorts_differently_is_content_identical`] pins the
-//! content half for the diverging key. Closing it means handing the rebuild the same
-//! namespace the path-copying writer gets — `crate::access::make_map` taking an
-//! `&AtomTable` (the `ctx.atom_and_heap()` route `cow_put` already uses) — which is
-//! `beam_bifs`'s `src/access.rs`/`src/maps.rs`, not this test's, to change.
+//! The seeded table below deliberately puts `none` at index 4, ahead of `a` (5) and `b`
+//! (6), while `none` sorts **after** both by name — so a compound key's atom element is
+//! exactly where the two rules would disagree. Because both writers now share the one
+//! namespace, `maps:from_list/1` and `maps:put/3` store such a key in the same position:
+//! [`a_compound_key_whose_atom_element_sorts_differently_matches_the_rebuild`] pins the
+//! `maps:to_list/1` order and the `term_to_binary/1` (`MAP_EXT`) image of the two
+//! routes for that key.
 //!
 //! # Oracle cross-check
 //!
@@ -850,8 +840,8 @@ fn binary_and_compound_keys_survive_a_path_copy_in_the_from_list_order() {
         //
         // The inserted key's atom element is chosen so that its **index** order and its
         // **name** order agree with the two keys already stored (`b` sorts after `a`
-        // either way, and `{b,3}` after `{b,2}` by the integer); see the module docs'
-        // *Known divergence* section for the case where they disagree.
+        // either way, and `{b,3}` after `{b,2}` by the integer); the case where they
+        // disagree is the module docs' *One atom namespace* section.
         let tuple_b3 = ctx.tuple(&[b, int(3)]).expect("a 2-tuple fits");
         let grown = call(reg, ctx, "maps", "put", &[tuple_b3, int(23), m]);
         assert_eq!(size_of(reg, ctx, grown), 6, "six distinct keys");
@@ -895,20 +885,19 @@ fn binary_and_compound_keys_survive_a_path_copy_in_the_from_list_order() {
     });
 }
 
-/// The *content* half of the compound-key divergence the module docs describe: an atom
+/// The **order** half of the one-namespace rule the module docs describe: an atom
 /// element whose **index** order and **name** order disagree — `none` is seeded at
-/// index 4, ahead of `a` (5) and `b` (6), but sorts after both by name — is stored in a
-/// different position by `maps:from_list/1` than by `maps:put/3`.
+/// index 4, ahead of `a` (5) and `b` (6), but sorts after both by name — is stored in
+/// the **same** position by `maps:from_list/1` and by `maps:put/3`.
 ///
-/// Every reader but `maps:to_list/1`'s order is unaffected, so that is what this test
-/// holds fixed: the same pair set, the same values, the same `maps:get/2`/`maps:is_key/2`
-/// answers and a `remove`/`take` pair that agree with each other. The order itself is
-/// **not** asserted in either direction, because neither writer is wrong on its own —
-/// the divergence is the two writers' atom namespaces (`crate::access::make_map`'s empty
-/// table versus `crate::access::map_put_cow`'s live one), and it is reported rather than
-/// pinned here.
+/// `erts_cmp_flatmap_keys` keeps the two *atom* keys in raw-index order and orders a
+/// compound key's atom element by **name** (`compare::cmp_atoms`, the C's
+/// `erts_cmp_atoms`), so `{a,1} < {b,2} < {none,3}` — the opposite of what an empty
+/// atom table would give (`{none,3}` first). Both writers are handed the same live
+/// `ctx.atoms()`, so the rebuild and the path copy agree on the order, on the content
+/// and on the `MAP_EXT` bytes.
 #[test]
-fn a_compound_key_whose_atom_element_sorts_differently_is_content_identical() {
+fn a_compound_key_whose_atom_element_sorts_differently_matches_the_rebuild() {
     run(|reg, ctx| {
         // The fixture's premise: index order and name order really do disagree.
         let (none_atom, a_atom) = (
@@ -933,7 +922,7 @@ fn a_compound_key_whose_atom_element_sorts_differently_is_content_identical() {
         assert_eq!(size_of(reg, ctx, grown), 3, "three distinct keys");
         assert!(
             compare::eq(grown, reference, ctx.atoms()),
-            "the content must be `=:=` to the rebuild's whatever the stored order is"
+            "the path-copied map is `=:=` to the rebuild"
         );
         assert!(
             same_word(get(reg, ctx, tuple_a1, grown), int(10)),
@@ -954,6 +943,33 @@ fn a_compound_key_whose_atom_element_sorts_differently_is_content_identical() {
             );
         }
 
+        // The order: the name order `erts_cmp_atoms` implies, on **both** routes.
+        let want_keys = vec![tuple_a1, tuple_b2, tuple_n3];
+        let got_keys = keys_of(reg, ctx, grown);
+        assert_eq!(got_keys.len(), want_keys.len(), "three stored keys");
+        for (index, (got, want)) in got_keys.iter().zip(want_keys.iter()).enumerate() {
+            assert!(
+                same_word(*got, *want),
+                "maps:put/3 stores key #{index} in the compound key's name order \
+                 (`none` sorts last by name, first by index)"
+            );
+        }
+        let reference_keys = keys_of(reg, ctx, reference);
+        for (index, (got, want)) in reference_keys.iter().zip(want_keys.iter()).enumerate() {
+            assert!(
+                same_word(*got, *want),
+                "maps:from_list/1 stores key #{index} in the same order"
+            );
+        }
+
+        // ... and the encoded image, the observable a stored-order mistake cannot hide
+        // from.
+        assert_eq!(
+            image_of(reg, ctx, grown),
+            image_of(reg, ctx, reference),
+            "the two writers' MAP_EXT images agree byte for byte (order included)"
+        );
+
         // The removal arms agree with each other and with the rebuild's content.
         let shrunk = call(reg, ctx, "maps", "remove", &[tuple_n3, grown]);
         assert_eq!(size_of(reg, ctx, shrunk), 2, "remove {{none,3}}");
@@ -962,6 +978,7 @@ fn a_compound_key_whose_atom_element_sorts_differently_is_content_identical() {
             compare::eq(shrunk, m, ctx.atoms()),
             "removing the inserted key restores the original content"
         );
+        assert_matches_rebuild(reg, ctx, shrunk, &base, "compound_none_remove");
         let (value, rest) = unpack_take(call(reg, ctx, "maps", "take", &[tuple_n3, grown]));
         assert!(same_word(value, int(30)), "take hands back the value");
         assert!(
@@ -972,6 +989,7 @@ fn a_compound_key_whose_atom_element_sorts_differently_is_content_identical() {
             compare::eq(rest, shrunk, ctx.atoms()),
             "take's rest and remove agree"
         );
+        assert_matches_rebuild(reg, ctx, rest, &base, "compound_none_take");
     });
 }
 

@@ -1510,7 +1510,8 @@ fn the_stash_round_trips_every_term_kind() {
     let map = {
         let key = ctx.atom("k").expect("seeded");
         let value = ctx.atom("v").expect("seeded");
-        access::make_map(ctx.heap(), &[(key, value)]).expect("a map")
+        let (atoms, heap) = ctx.atom_and_heap();
+        access::make_map(heap, atoms, &[(key, value)]).expect("a map")
     };
     let float = ctx.make_float(1.5).expect("a float");
     let terms = vec![

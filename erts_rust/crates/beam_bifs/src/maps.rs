@@ -40,11 +40,28 @@
 //! keys and a *HAMT* hash map above that (`erl_map.h`). Both layouts are owned by
 //! `beam_term::map` (`write_map`/`map_pairs_storage_order`/`map_size`/`map_get`),
 //! which this module reaches through [`crate::access`] — so every reader and every
-//! producer below handles either representation, with no pair-count ceiling. The
-//! writer ([`build`] → [`crate::access::make_map`] → `beam_term::map::write_map`)
-//! picks the representation exactly as ERTS does (≤32 distinct keys ⇒ flat map with
-//! the keys in `erts_cmp_flatmap_keys` order, more ⇒ a HAMT keyed by `erts_map_hash`)
-//! and collapses duplicate keys **last value wins**.
+//! producer below handles either representation, with no pair-count ceiling.
+//!
+//! # Two writers, one atom namespace
+//!
+//! The four *incremental* BIFs — `put/3`, `update/3`, `remove/2`, `take/2` — path-copy:
+//! they rewrite only the trie nodes on the key's hash path and share every off-path
+//! subtree with the source map by word (`beam_term::map::{map_put_cow, map_remove_cow}`,
+//! the C's `erts_maps_put`/`erts_maps_update`/`hashmap_delete`/`erts_maps_take`; see
+//! [`cow_put`]/[`cow_remove`]).
+//!
+//! The from-scratch builders — `new/0`, `from_list/1`, `from_keys/2`, `merge/2`,
+//! `with/2`, `without/2`, `map/2`, `filter/2` — still rebuild the whole map through
+//! [`build`] → [`crate::access::make_map`] → `beam_term::map::write_map`, which picks
+//! the representation exactly as ERTS does (≤32 distinct keys ⇒ flat map with the keys
+//! in `erts_cmp_flatmap_keys` order, more ⇒ a HAMT keyed by `erts_map_hash`) and
+//! collapses duplicate keys **last value wins**.
+//!
+//! Both routes order through the caller's **one live** atom table (`ctx.atoms()`, via
+//! `BifContext::atom_and_heap`): atom keys compare by raw index in
+//! `erts_cmp_flatmap_keys`, while a **compound** key's atom elements are ordered by
+//! **name** (`compare::cmp_atoms`, the C's `erts_cmp_atoms`), so a rebuild and a path
+//! copy store the same pairs in the same order.
 //!
 //! Reading a HAMT is the interesting half: an *existing* hash map reaches these BIFs
 //! whenever `beam_codec` decodes a `MAP_EXT` blob with more than 32 distinct keys
@@ -304,11 +321,17 @@ fn map_lookup(ctx: &BifContext<'_>, map: Eterm, key: Eterm) -> Result<Option<Ete
 /// keys **last value wins** — so callers may pass duplicates freely (the oracle's
 /// `maps:from_list/1`, `merge/2`, `from_keys/2` and `put/3` all behave that way).
 ///
+/// The **live** atom table goes with the heap (`BifContext::atom_and_heap`), exactly as
+/// for the path-copying writers below: it is the namespace `write_map` orders a flat
+/// map's **compound** keys' atom elements by, so a rebuild and a path copy agree on the
+/// stored order (see [`crate::access::make_map`]).
+///
 /// # Errors
 ///
 /// Propagates the heap's allocation failure.
 fn build(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
-    access::make_map(ctx.heap(), pairs)
+    let (atoms, heap) = ctx.atom_and_heap();
+    access::make_map(heap, atoms, pairs)
 }
 
 // ---------------------------------------------------------------------------

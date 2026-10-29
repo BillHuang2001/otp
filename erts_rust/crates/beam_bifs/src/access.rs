@@ -803,22 +803,28 @@ pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
 /// and places a hash map's keys by `erts_map_hash`, collapsing duplicate keys
 /// **last value wins** in both cases.
 ///
-/// The atom table passed to `write_map` is a **fresh empty one**. The builder
-/// consults it only to name atoms in a *tie-break* (`compare::cmp_atoms`, reached
-/// from `cmp`/`eq` for keys whose hashes collide); an unknown name falls back to the
-/// raw atom index, so the result stays deterministic and — because distinct atoms
-/// have distinct indices — never merges two distinct keys. The same substitution
-/// (`beam_abi`'s driver host `map_term`) is used there for the same reason: taking
-/// `ctx.atoms()` alongside `ctx.heap()` would need two simultaneous borrows of
-/// [`BifContext`](crate::context::BifContext).
+/// `atoms` is the caller's **live** namespace — the same table [`map_put_cow`] is
+/// handed — and it decides only the ordering *tie-break* of a **compound** key's atom
+/// elements: a flat map's keys are ordered by `erts_cmp_flatmap_keys`, which compares
+/// two *atom* keys by raw atom index but recurses into `compare::cmp` for everything
+/// else, so a compound key's atom elements reach `compare::cmp_atoms`, which orders two
+/// *named* atoms by name. A fresh (or empty) table would leave every name unknown there
+/// and fall back to the raw atom index — the wrong order, because ERTS compares atoms by
+/// **name** (`erts_cmp_atoms`, `erts/emulator/beam/erl_utils.h:193-220`: an `ord0` fast
+/// path, then `sys_memcmp` on the name, then the length). Distinct atoms have distinct
+/// names *and* indices, so a rebuild never merges two distinct keys either way; only the
+/// stored order — hence the `MAP_EXT` bytes — differs.
 ///
 /// # Errors
 ///
 /// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
 /// fit the block, and the builder's own `TermError` (reconciled to
 /// [`BeamError::BadArg`]) for a malformed key.
-pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
-    let atoms = AtomTable::new();
+pub(crate) fn make_map(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    pairs: &[(Eterm, Eterm)],
+) -> Result<Eterm> {
     let words = beam_term::map::map_words_capacity(pairs.len());
     // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
     let p = unsafe { heap.alloc_words(words)? };
@@ -826,7 +832,7 @@ pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eter
     // it needs (the reservation is a documented upper bound, so trailing words may
     // stay unwritten) and returns a boxed root into the same block, which stays live
     // and unmoved for as long as `heap` does, which the caller keeps alive.
-    Ok(unsafe { beam_term::map::write_map(p, pairs, &atoms)? })
+    Ok(unsafe { beam_term::map::write_map(p, pairs, atoms)? })
 }
 
 /// The words [`map_put_cow`] must reserve for a put of `key` into `map`.
