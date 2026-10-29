@@ -114,8 +114,10 @@ probes (a fun header's distinct subtag makes the classification exact) and route
   (≤ 3) creation, else `BadArg` (`:5153-5160`).
 - **`FunKind::Local`** (the `make_fun3` closure) stores only its engine-internal descriptor
   (`[uniq: u64][index: u32]`) — no module / 16-byte `uniq` / creator pid — and encodes as
-  `NEW_FUN_EXT` **iff** a `FunIdentity` was installed (arity/index/`num_free`/env from the term;
-  module/uniq/`old_index`/`old_uniq`/creator from the identity); without one ⇒
+  `NEW_FUN_EXT` **iff** an identity is available (arity/index/`num_free`/env from the term;
+  module/uniq/`old_index`/`old_uniq`/creator from the identity): the single `FunIdentity`
+  installed by `with_fun_identity`, or — when one is installed, and then authoritatively — the
+  per-fun `FunIdentityResolver` of `with_fun_identity_resolver`. With neither ⇒
   `error::unsupported_local_fun()`, never a mis-encoded term.
 
 ### `FunIdentity` — the local-fun encode input
@@ -137,6 +139,25 @@ is the 16-byte `uniq` (C `ErlFunEntry.uniq` = `beam->checksum`, `asm_load.c:1218
 it (faithfulness pinned by `tests/local_fun_encode.rs`).
 So `unsupported_local_fun` means exactly "no host identity was installed for this term" — a **host**
 property, not a missing wire rule.
+
+### `FunIdentityResolver` — one identity **per fun**
+One encoder slot can only express local funs that all share an identity (a bare fun, one closure
+in a container, the same closure twice, a self-recursive named fun whose `env` entry is itself).
+A term holding **two different lambdas** — `[fun() -> ok end, fun(X) -> {X, X} end]`, or
+`f() -> G = fun() -> ok end, fun() -> G end` whose outer closure captures the inner one — needs
+each fun written from *its own* `ErlFunEntry` (`external.c:3966-3993`), so
+`Encoder::with_fun_identity_resolver(&mut dyn FunIdentityResolver)` is the per-fun seam: the
+encoder asks it once for every `FunKind::Local` fun it is about to write (`encode_fun` →
+`local_fun_identity`), in its own descent order.
+`Ok(Some(id))` writes that identity, `Ok(None)` keeps the typed `unsupported_local_fun` for that
+fun, `Err` propagates. An installed resolver is **authoritative** — a single `with_fun_identity`
+is not used as a fallback, because a fallback could write one fun's identity into a different fun
+(pinned by `fun.rs::an_installed_resolver_wins_over_the_single_identity_slot`).
+The wire layout is unchanged: only *which* identity feeds the same `NEW_FUN_EXT` builder moves.
+A plain `FnMut(Eterm) -> Result<Option<FunIdentity>>` is a resolver through the trait's blanket
+impl. Byte evidence: `tests/local_fun_encode.rs`'s
+`two_different_local_funs_encode_byte_exactly_like_the_oracle` compares a rebuilt two-lambda list
+image with the oracle's own `term_to_binary([F1, F2])`.
 `fun.rs:67` is the **one** construction site of `error::unsupported_local_fun`; a fun nested
 anywhere (list/tuple/map/literal) reaches the same arm.
 
@@ -229,10 +250,11 @@ The stream is `../compress.rs`'s (a `beam_deflate` delegation, zlib 1.3.2), so a
 - Oracle-dependent cases resolve `$ERTS_ORACLE` else `erl` on `$PATH` and **skip loudly**.
 
 ## Routing Table
-- `mod.rs` → `Encoder`, `FunIdentity`, `AtomEncoding`, `MinorVersion`, the `encode_term*` entry
-  points and `with_*` builders, the private `AtomFlavour` resolution, the private fun-classification
-  chain, the map emitters, `compress_if_smaller` + the integer/atom/binary emitters; ~1393 lines
-  (one state machine — the tag dispatch plus its per-tag emitters)
+- `mod.rs` → `Encoder`, `FunIdentity`, `FunIdentityResolver`, `AtomEncoding`, `MinorVersion`, the
+  `encode_term*` entry points and `with_*` builders, the private `AtomFlavour` resolution, the
+  private fun-classification chain, the map emitters, `compress_if_smaller` + the
+  integer/atom/binary emitters; ~1500 lines (one state machine — the tag dispatch plus its
+  per-tag emitters)
 - `map.rs` → the `[deterministic]` pair sort `sort_pairs_by_key` + the sorted `MAP_EXT` emitter
 - `fun.rs` → the fun encoders + `encode_new_fun_ext` (the `NEW_FUN_EXT` size patch)
 - `record.rs` → `Encoder::encode_record`

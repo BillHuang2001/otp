@@ -60,12 +60,29 @@ impl<'a> Encoder<'a> {
         match kind {
             FunKind::External => self.encode_fun_external(term),
             FunKind::Imported => self.encode_fun_imported(term),
-            // `Option<FunIdentity>` is `Copy`, so the read releases `self` before the
-            // `&mut self` call below.
-            FunKind::Local => match self.fun_identity {
+            FunKind::Local => match self.local_fun_identity(term)? {
                 Some(identity) => self.encode_fun_local(term, identity),
                 None => Err(error::unsupported_local_fun()),
             },
+        }
+    }
+
+    /// The identity to write for the local (`make_fun3`) fun `term`.
+    ///
+    /// An installed [`FunIdentityResolver`](crate::encode::FunIdentityResolver) is
+    /// authoritative and answers **per fun** (that is the seam a term with several
+    /// different lambdas needs); otherwise the single [`FunIdentity`]
+    /// [`Encoder::with_fun_identity`] installed covers every local fun, and `None` —
+    /// neither installed — keeps the typed
+    /// [`crate::error::unsupported_local_fun`] (the fields cannot be invented).
+    ///
+    /// Neither answer is ever written for a fun the host declined, so a mixed term
+    /// degrades to the typed gap, never to a wrong image.
+    fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<FunIdentity>> {
+        match self.fun_identity_resolver.as_deref_mut() {
+            // The resolver borrow ends with this call: its answer is owned.
+            Some(resolver) => resolver.resolve(term),
+            None => Ok(self.fun_identity),
         }
     }
 
@@ -202,13 +219,15 @@ mod tests {
     //! the exact wire bytes, including the C `size` rule and the local-fun rejection.
 
     use beam_term::prelude::make_small;
-    use beam_term::AtomTable;
+    use beam_term::{AtomTable, Eterm};
 
     use crate::encode::tests::new_heap;
     use crate::encode::{encode_term, encode_term_body, Encoder, FunIdentity};
     use crate::error::{is_unsupported, is_unsupported_local_fun};
-    use crate::tag::NEW_FUN_EXT;
-    use crate::term::{make_fun_external, make_fun_imported, make_fun_local, FunPid, MAX_ARG};
+    use crate::tag::{LIST_EXT, NEW_FUN_EXT, NIL_EXT};
+    use crate::term::{
+        fun_index, make_fun_external, make_fun_imported, make_fun_local, make_list, FunPid, MAX_ARG,
+    };
 
     #[test]
     fn external_fun_encodes_as_export_ext() {
@@ -425,5 +444,125 @@ mod tests {
 
         assert_eq!(without, with);
         assert_eq!(with[1], NEW_FUN_EXT);
+    }
+
+    /// The identities of the two-fun resolver tests: distinct module/`uniq`/
+    /// `old_index`/`old_uniq` per fun — what one encoder slot cannot carry.
+    fn two_identities(atoms: &mut AtomTable) -> (FunIdentity, FunIdentity) {
+        let creator = FunPid {
+            node: atoms.intern("n1"),
+            number: 1,
+            serial: 2,
+            creation: 3,
+        };
+        (
+            FunIdentity::new(atoms.intern("m1"), [0x11; 16], 4, 5, creator),
+            FunIdentity::new(atoms.intern("m2"), [0x22; 16], 6, 7, creator),
+        )
+    }
+
+    #[test]
+    fn a_resolver_gives_each_local_fun_its_own_identity() {
+        let mut atoms = AtomTable::new();
+        let (id1, id2) = two_identities(&mut atoms);
+
+        let mut heap = new_heap(256);
+        // Two *different* lambdas: arity 0 and arity 1 (one free variable), distinct
+        // descriptor indexes — the shape `[fun() -> ok end, fun(X) -> {X, X} end]`.
+        let f1 = make_fun_local(&mut heap, 0, 0xAA, 1, &[]).unwrap();
+        let f2 = make_fun_local(&mut heap, 1, 0xBB, 2, &[make_small(9)]).unwrap();
+        let list = make_list(&mut heap, &[f1, f2]);
+
+        // The resolver is asked **per fun** — it keys on the term's own descriptor
+        // index, which is the only thing telling the two apart at the codec seam.
+        let mut resolve = |fun: Eterm| {
+            Ok(if fun_index(fun)? == 1 { Some(id1) } else { Some(id2) })
+        };
+        let mut encoder = Encoder::new(&atoms).with_fun_identity_resolver(&mut resolve);
+        encoder.encode(list).unwrap();
+        let image = encoder.as_bytes().to_vec();
+
+        // The image is exactly the list framing around each fun's own single-identity
+        // image — no field of one identity leaks into the other fun.
+        let mut expected = vec![131u8, LIST_EXT];
+        expected.extend_from_slice(&2u32.to_be_bytes());
+        for (fun, identity) in [(f1, id1), (f2, id2)] {
+            let mut single = Encoder::new_body(&atoms).with_fun_identity(identity);
+            single.encode(fun).unwrap();
+            expected.extend_from_slice(single.as_bytes());
+        }
+        expected.push(NIL_EXT);
+        assert_eq!(image, expected);
+
+        // And each element decodes to the fields *its* identity supplied.
+        let mut dheap = new_heap(512);
+        let mut datoms = AtomTable::new();
+        let decoded = crate::decode_term(&image, &mut dheap, &mut datoms).unwrap();
+        let first = crate::term::cons_head(decoded).unwrap();
+        let second = crate::term::cons_head(crate::term::cons_tail(decoded).unwrap()).unwrap();
+        assert_eq!(crate::term::fun_old_index(first).unwrap(), 4);
+        assert_eq!(crate::term::fun_old_uniq(first).unwrap(), 5);
+        assert_eq!(crate::term::fun_uniq_bytes(first).unwrap(), [0x11; 16]);
+        assert_eq!(
+            datoms.name(crate::term::fun_module(first).unwrap()).unwrap(),
+            "m1"
+        );
+        assert_eq!(crate::term::fun_arity_term(first).unwrap(), 0);
+        assert_eq!(crate::term::fun_old_index(second).unwrap(), 6);
+        assert_eq!(crate::term::fun_old_uniq(second).unwrap(), 7);
+        assert_eq!(crate::term::fun_uniq_bytes(second).unwrap(), [0x22; 16]);
+        assert_eq!(
+            datoms.name(crate::term::fun_module(second).unwrap()).unwrap(),
+            "m2"
+        );
+        assert_eq!(crate::term::fun_arity_term(second).unwrap(), 1);
+        assert_eq!(crate::term::fun_env(second).unwrap(), &[make_small(9)]);
+    }
+
+    #[test]
+    fn a_resolver_that_declines_a_fun_keeps_the_typed_gap() {
+        let mut atoms = AtomTable::new();
+        let (id1, _) = two_identities(&mut atoms);
+
+        let mut heap = new_heap(256);
+        let f1 = make_fun_local(&mut heap, 0, 0xAA, 1, &[]).unwrap();
+        let f2 = make_fun_local(&mut heap, 1, 0xBB, 2, &[make_small(9)]).unwrap();
+        let list = make_list(&mut heap, &[f1, f2]);
+
+        // The first fun resolves; the second does not. A host that cannot attribute
+        // *one* fun must not make the whole image up: the typed gap, never the first
+        // fun's identity written into the second (the silently-wrong-image failure).
+        let mut resolve = |fun: Eterm| Ok(if fun_index(fun)? == 1 { Some(id1) } else { None });
+        let mut encoder = Encoder::new(&atoms).with_fun_identity_resolver(&mut resolve);
+        let err = encoder.encode(list).unwrap_err();
+        assert!(
+            is_unsupported_local_fun(&err),
+            "a declined fun must report the precise local-fun reason, got {err:?}"
+        );
+        assert!(!is_unsupported(&err));
+    }
+
+    #[test]
+    fn an_installed_resolver_wins_over_the_single_identity_slot() {
+        let mut atoms = AtomTable::new();
+        let (id1, id2) = two_identities(&mut atoms);
+        let mut heap = new_heap(64);
+        let fun = make_fun_local(&mut heap, 0, 0xAA, 1, &[]).unwrap();
+
+        // Both seams installed: the resolver is authoritative (a fallback could write
+        // one fun's identity into a different fun), so the image is `id2`'s.
+        let mut resolve = |_fun: Eterm| Ok(Some(id2));
+        let mut encoder = Encoder::new(&atoms)
+            .with_fun_identity(id1)
+            .with_fun_identity_resolver(&mut resolve);
+        encoder.encode(fun).unwrap();
+
+        let mut reference = Encoder::new(&atoms).with_fun_identity(id2);
+        reference.encode(fun).unwrap();
+        assert_eq!(encoder.as_bytes(), reference.as_bytes());
+
+        let mut single = Encoder::new(&atoms).with_fun_identity(id1);
+        single.encode(fun).unwrap();
+        assert_ne!(encoder.as_bytes(), single.as_bytes());
     }
 }

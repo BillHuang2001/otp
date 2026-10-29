@@ -68,17 +68,15 @@
 //! discipline; the entry module names every atom its landing may resolve
 //! (`badarg`/`error`/`exit`/`throw`) so a caught raise is byte-identical to C's.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::context::BifHook;
-use beam_engine::{terms, ExecutionContext, Machine, MinimalContext, RunOutcome};
+use beam_engine::{terms, ExecutionContext, FunOutcome, Machine, MinimalContext, RunOutcome};
 use beam_loader::{
-    load_file, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand,
+    load_file, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
@@ -209,6 +207,31 @@ struct TestCtx {
     callees: Vec<(String, Arc<Module>)>,
     messages: Vec<Eterm>,
     scan: usize,
+    /// The `(module, entry label)` the **closure seam**
+    /// ([`ExecutionContext::resolve_local_fun`]) answers for the fun handed to it.
+    /// `None` declines every closure, which is what makes the outcome-aware
+    /// `apply_fun_outcome` fallback run.
+    local_fun: Option<(Arc<Module>, Label)>,
+    /// How the closure-application door answers.
+    apply: ApplyAnswer,
+    /// Whether a pending [`ApplyAnswer::SuspendOnce`] has already suspended.
+    suspended: bool,
+}
+
+/// How the test host answers the closure-application door
+/// ([`ExecutionContext::apply_fun_outcome`], whose default forwards to
+/// [`ExecutionContext::apply_fun`]).
+enum ApplyAnswer {
+    /// The trait default: the typed `unsupported("apply_fun")`.
+    Unimplemented,
+    /// The application completes with this value.
+    Value(Eterm),
+    /// The application is **not** complete on the first consultation
+    /// (`FunOutcome::Suspend`, nothing applied) and answers `value` on the next —
+    /// the shape of a host whose closure body has to wait.
+    SuspendOnce(Eterm),
+    /// The application raises `badarg`.
+    FailBadArg,
 }
 
 impl TestCtx {
@@ -220,12 +243,27 @@ impl TestCtx {
             callees,
             messages: Vec::new(),
             scan: 0,
+            local_fun: None,
+            apply: ApplyAnswer::Unimplemented,
+            suspended: false,
         }
     }
 
     /// Queue `message` as if it had been sent to this mailbox.
     fn push(&mut self, message: Eterm) {
         self.messages.push(message);
+    }
+
+    /// Answer every closure with `(module, label)` — the in-machine closure seam.
+    fn with_local_fun(mut self, module: Arc<Module>, label: Label) -> TestCtx {
+        self.local_fun = Some((module, label));
+        self
+    }
+
+    /// Install the closure-application answer.
+    fn with_apply(mut self, apply: ApplyAnswer) -> TestCtx {
+        self.apply = apply;
+        self
     }
 }
 
@@ -295,6 +333,34 @@ impl ExecutionContext for TestCtx {
         self.scan = 0;
         Ok(())
     }
+
+    fn resolve_local_fun(
+        &mut self,
+        _fun: Eterm,
+        _args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        Ok(self.local_fun.clone())
+    }
+
+    fn apply_fun(&mut self, _fun: Eterm, _args: &[Eterm]) -> Result<Eterm> {
+        match self.apply {
+            ApplyAnswer::Unimplemented => Err(beam_engine::unsupported("apply_fun")),
+            ApplyAnswer::Value(value) | ApplyAnswer::SuspendOnce(value) => Ok(value),
+            ApplyAnswer::FailBadArg => Err(BeamError::BadArg),
+        }
+    }
+
+    fn apply_fun_outcome(&mut self, fun: Eterm, args: &[Eterm]) -> Result<FunOutcome> {
+        // The outcome-aware door: `SuspendOnce` reports the wait exactly once and then
+        // completes, so `resume_outcome`'s re-consultation is observable.
+        if let ApplyAnswer::SuspendOnce(_) = self.apply {
+            if !self.suspended {
+                self.suspended = true;
+                return Ok(FunOutcome::Suspend);
+            }
+        }
+        self.apply_fun(fun, args).map(FunOutcome::Return)
+    }
 }
 
 /// A BIF floor that rejects everything.
@@ -304,26 +370,6 @@ fn rejecting() -> BifHook {
     })
 }
 
-/// A recording BIF floor: logs every `(module, function, arity, args)` it is asked
-/// for and answers `erlang:apply/2` with `42`.
-type BifLog = Rc<RefCell<Vec<(String, String, u32, Vec<Eterm>)>>>;
-
-fn recording_apply2(log: BifLog) -> BifHook {
-    Box::new(move |module, function, arity, args| {
-        log.borrow_mut().push((
-            module.to_string(),
-            function.to_string(),
-            arity,
-            args.to_vec(),
-        ));
-        if module == "erlang" && function == "apply" && arity == 2 {
-            return Ok(make_small(42));
-        }
-        Err(beam_engine::unsupported(&format!(
-            "bif {module}:{function}/{arity}"
-        )))
-    })
-}
 
 /// The reason of a typed engine raise, or a panic naming what arrived instead.
 fn reason(error: BeamError) -> String {
@@ -611,54 +657,477 @@ fn a_closed_receive_through_apply_returns_without_suspending() {
 }
 
 // ---------------------------------------------------------------------------
-// (2) erlang:apply/2 is NOT special-cased — it reaches the host's own BIF
+// (2) erlang:apply/2 is the in-machine `i_apply_fun` shape
 // ---------------------------------------------------------------------------
+//
+// C compiles `erlang:apply(Fun, Args)` to dedicated instructions — `ops.tab:872-874`
+// (`i_apply_fun` / `i_apply_fun_last` / `i_apply_fun_only`) — whose body is
+// `apply_fun(c_p, x(0), x(1), reg)` (`emu/instrs.tab:314-334`): walk `Args` into
+// `reg[0..N]`, put `Fun` at `reg[N]`, and hand that register shape to `call_fun`
+// (`beam_common.c:1734-1763`). The seam reproduces exactly that, so the closure
+// runs **in this machine** (a `receive` in its body suspends *this* process), and
+// every shape error is the oracle's own payload.
+
+/// The closure body `c:inc/1` — `inc(X) -> X + 1`, with `erlang:'+'/2` behind the
+/// host BIF floor:
+///
+/// ```text
+/// c:inc/1:
+///     gc_bif +/2 x0, {integer,1} -> x0     ; fail: NO_FAIL
+///     return
+/// ```
+fn callee_inc_module() -> (Arc<Module>, Label) {
+    let mut f = Fixture::new("c");
+    let plus = f.import("erlang", "+", 2);
+    let inc = f.add_function(
+        "inc",
+        1,
+        vec![
+            Instr::Label(Label(200)),
+            Instr::GcBif {
+                arity: 2,
+                bif: plus,
+                fail: NO_FAIL,
+                live: 2,
+                args: vec![Operand::X(0), Operand::Integer(1)],
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    f.add_export("inc", 1, inc);
+    (Arc::new(f.finish()), inc)
+}
+
+/// A BIF floor answering `erlang:'+'/2` over two small integers — the arithmetic
+/// the `c:inc/1` closure body performs — and rejecting everything else.
+fn add_hook() -> BifHook {
+    Box::new(|module, function, arity, args| {
+        if module == "erlang" && function == "+" && arity == 2 {
+            let (a, b) = (args[0], args[1]);
+            if beam_term::is_small(a) && beam_term::is_small(b) {
+                return Ok(make_small(
+                    beam_term::signed_value(a) + beam_term::signed_value(b),
+                ));
+            }
+        }
+        Err(beam_engine::unsupported(&format!(
+            "bif {module}:{function}/{arity}"
+        )))
+    })
+}
+
+/// The `erlang:apply/2` caller whose call sits inside a live `try` frame; the
+/// handler returns `x(1)` — the **reason** the raise landed (`try_case` puts it
+/// there):
+///
+/// ```text
+/// m:run/2:
+///     allocate 1
+///     try y0 {handler}
+///     call_ext 2 erlang:apply/2
+///     try_end y0
+///     deallocate 1
+///     return
+///   {handler}:
+///     try_case y0
+///     move x1 -> x0                 ; the reason the raise landed
+///     deallocate 1
+///     return
+/// ```
+fn try_caller_apply2_module() -> (Module, Atom) {
+    let mut f = Fixture::new("m");
+    // Every reason atom this seam can raise is resolved from the **running**
+    // module's table (`namespace_atom`/`reason_atom`): the closure
+    // classification's `badfun`/`badarity`, the shape errors' `badarg`, and the
+    // list walk's `system_limit`.
+    for name in [
+        "badfun",
+        "badarity",
+        "system_limit",
+        "not_a_fun",
+    ] {
+        f.atom(name);
+    }
+    let target = f.import("erlang", "apply", 2);
+    let run = f.add_function(
+        "run",
+        2,
+        vec![
+            Instr::Label(Label(100)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 2,
+            },
+            Instr::Try {
+                frame: Operand::Y(0),
+                fail: Label(103),
+            },
+            Instr::CallExt { target, arity: 2 },
+            Instr::TryEnd {
+                frame: Operand::Y(0),
+            },
+            Instr::Deallocate(1),
+            Instr::Return,
+            Instr::Label(Label(103)),
+            Instr::TryCase {
+                frame: Operand::Y(0),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Deallocate(1),
+            Instr::Return,
+        ],
+    );
+    f.add_export("run", 2, run);
+    let run_atom = f.atom("run");
+    (f.finish(), run_atom)
+}
+
+/// The `call_ext` (non-tail) twin of [`caller_apply2_module`]: `m:g/2` stores a
+/// continuation before entering the closure and returns its value.
+///
+/// ```text
+/// m:g/2:
+///     allocate 0
+///     call_ext 2 erlang:apply/2
+///     deallocate 0
+///     return
+/// ```
+fn caller_apply2_call_module() -> (Module, Atom) {
+    let mut f = Fixture::new("m");
+    let target = f.import("erlang", "apply", 2);
+    let g = f.add_function(
+        "g",
+        2,
+        vec![
+            Instr::Label(Label(100)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 2,
+            },
+            Instr::CallExt { target, arity: 2 },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+    f.add_export("g", 2, g);
+    let g_atom = f.atom("g");
+    (f.finish(), g_atom)
+}
+
+/// The `call_ext_last` twin: the frame is popped on the closure's **success** path
+/// only, then the caller frame's continuation is followed.
+///
+/// ```text
+/// m:g/2:
+///     allocate 0
+///     call_ext_last 2 erlang:apply/2, 0
+/// ```
+fn caller_apply2_last_module() -> (Module, Atom) {
+    let mut f = Fixture::new("m");
+    let target = f.import("erlang", "apply", 2);
+    let g = f.add_function(
+        "g",
+        2,
+        vec![
+            Instr::Label(Label(100)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 2,
+            },
+            Instr::CallExtLast {
+                target,
+                arity: 2,
+                deallocate: 0,
+            },
+        ],
+    );
+    f.add_export("g", 2, g);
+    let g_atom = f.atom("g");
+    (f.finish(), g_atom)
+}
 
 #[test]
-fn apply2_reaches_the_host_bif_with_the_fun_and_the_argument_list() {
-    // `m:g(Fun, Args)` is literally `call_ext_only 2 erlang:apply/2`. The seam must
-    // decline it (its `fixed_apply` shape is arity 3 only) so the arm falls through
-    // to `call_import` → `call_bif("erlang", "apply", 2, [Fun, Args])`.
-    //
-    // Oracle: `erlang:apply(fun(A,B) -> A+B end, [1,2])` ⇒ `3` — i.e. `apply/2` is a
-    // *fun* applied to an argument list. Under the old arity-2 branch the seam
-    // consumed the call (reading `Fun` as the module and `Args` as the function,
-    // with `Args = []`), the BIF was never reached, and this test's log stayed empty.
-    let (module, g) = caller_apply2_module();
-    let log: BifLog = Rc::new(RefCell::new(Vec::new()));
-    let mut ctx = TestCtx::new(Vec::new(), recording_apply2(Rc::clone(&log)));
+fn apply2_of_a_local_closure_runs_its_body_in_this_machine() {
+    // Oracle: `erlang:apply(fun(X) -> X + 1 end, [1])` ⇒ `2`. The closure here is
+    // `c:inc/1` (`X + 1`), reached through the **in-machine closure seam**
+    // (`resolve_local_fun`), so the body executes on this machine's registers: the
+    // single list element lands in `x(0)` and the `+` comes back through the host
+    // BIF floor.
+    let (caller, g) = caller_apply2_module();
+    let (callee, inc) = callee_inc_module();
+    let mut ctx = TestCtx::new(Vec::new(), add_hook()).with_local_fun(callee, inc);
 
-    // The two arguments the caller passes: a real (local) closure and its list.
-    let fun = terms::make_fun(&mut ctx, 2, 4_242, 0, &[]).expect("build the fun");
-    let args = terms::make_list(&mut ctx, &[make_small(1), make_small(2)]).expect("build the list");
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_list(&mut ctx, &[make_small(41)]).expect("build the list");
 
     let mut machine = Machine::new();
     let outcome = machine
-        .run_export_outcome(&module, g, 2, &[fun, args], &mut ctx)
-        .expect("the host BIF answers");
+        .run_export_outcome(&caller, g, 2, &[fun, args], &mut ctx)
+        .expect("the in-machine closure answers");
 
     assert_eq!(
         outcome,
         RunOutcome::Returned(make_small(42)),
-        "the value is the host's own erlang:apply/2 result"
+        "the closure body ran here: 41 + 1"
     );
+}
 
-    let calls = log.borrow();
-    assert_eq!(calls.len(), 1, "exactly one BIF dispatch: {calls:?}");
-    let (module_name, function_name, arity, args) = &calls[0];
+#[test]
+fn apply2_through_call_ext_stores_the_continuation_and_returns_the_value() {
+    // The non-tail `call_ext 2` twin: the closure still runs in this machine, but
+    // the caller's frame stores the continuation (so the frame discipline differs,
+    // the answer does not).
+    let (caller, g) = caller_apply2_call_module();
+    let (callee, inc) = callee_inc_module();
+    let mut ctx = TestCtx::new(Vec::new(), add_hook()).with_local_fun(callee, inc);
+
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_list(&mut ctx, &[make_small(41)]).expect("build the list");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, g, 2, &[fun, args], &mut ctx)
+        .expect("the non-tail form answers");
+
+    assert_eq!(outcome, RunOutcome::Returned(make_small(42)));
+}
+
+#[test]
+fn apply2_through_call_ext_last_pops_the_frame_on_success() {
+    // The tail `call_ext_last 2` twin: the frame is popped only on the success
+    // path, then the caller frame's continuation (Halt) is followed.
+    let (caller, g) = caller_apply2_last_module();
+    let (callee, inc) = callee_inc_module();
+    let mut ctx = TestCtx::new(Vec::new(), add_hook()).with_local_fun(callee, inc);
+
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_list(&mut ctx, &[make_small(41)]).expect("build the list");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, g, 2, &[fun, args], &mut ctx)
+        .expect("the tail form answers");
+
+    assert_eq!(outcome, RunOutcome::Returned(make_small(42)));
+}
+
+#[test]
+fn apply2_of_a_closure_the_host_interprets_uses_the_apply_fun_door() {
+    // The closure seam declines (no in-machine code for this fun), so the
+    // **outcome-aware apply door** answers the value. The BIF floor rejects every
+    // name, which is the proof that no `erlang:apply/2` dispatch happened: the old
+    // fall-through route would have raised.
+    let (caller, g) = caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting())
+        .with_apply(ApplyAnswer::Value(make_small(42)));
+
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_list(&mut ctx, &[make_small(1)]).expect("build the list");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, g, 2, &[fun, args], &mut ctx)
+        .expect("the host closure door answers");
+
+    assert_eq!(outcome, RunOutcome::Returned(make_small(42)));
+}
+
+#[test]
+fn apply2_of_a_non_fun_is_caught_as_badfun() {
+    // Oracle: `erlang:apply(not_a_fun, [1])` ⇒ `{error,{badfun,not_a_fun}}`
+    // (C's `call_fun` `EXC_BADFUN` + `fvalue`, `beam_common.c:1604-1622`).
+    let (caller, run) = try_caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting());
+    let not_a_fun = atom_term(&caller, "not_a_fun");
+    let args = terms::make_list(&mut ctx, &[make_small(1)]).expect("build the list");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 2, &[not_a_fun, args], &mut ctx)
+        .expect("the badfun must be caught by the live try frame");
+
+    let RunOutcome::Returned(reason) = outcome else {
+        panic!("expected a caught reason, got {outcome:?}");
+    };
+    assert_eq!(terms::tuple_arity(reason).expect("a 2-tuple"), 2);
     assert_eq!(
-        (module_name.as_str(), function_name.as_str(), *arity),
-        ("erlang", "apply", 2)
+        terms::tuple_element(reason, 0).expect("element 1"),
+        atom_term(&caller, "badfun")
     );
-    assert_eq!(args.len(), 2, "apply/2 takes (Fun, Args)");
-    assert!(terms::is_fun(args[0]), "x(0) is the fun, not a module");
-    assert_eq!(terms::fun_index(args[0]).unwrap(), 0);
-    // x(1) is the *argument list* the caller passed (`[1,2]`), not the fabricated
-    // empty `Args` the old arity-2 branch used.
-    assert_eq!(terms::cons_head(args[1]).unwrap(), make_small(1));
-    let tail = terms::cons_tail(args[1]).unwrap();
-    assert_eq!(terms::cons_head(tail).unwrap(), make_small(2));
-    assert!(beam_term::is_nil(terms::cons_tail(tail).unwrap()));
+    assert_eq!(
+        terms::tuple_element(reason, 1).expect("element 2"),
+        not_a_fun,
+        "the reason names the offending term itself"
+    );
+}
+
+#[test]
+fn apply2_with_the_wrong_number_of_arguments_is_caught_as_badarity() {
+    // Oracle: `erlang:apply(fun p:id/1, [1,2])` ⇒
+    // `{error,{badarity,{fun p:id/1,[1,2]}}}` — the call's arguments as the list.
+    let (caller, run) = try_caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting());
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_list(&mut ctx, &[make_small(1), make_small(2)]).expect("build the list");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 2, &[fun, args], &mut ctx)
+        .expect("the badarity must be caught by the live try frame");
+
+    let RunOutcome::Returned(reason) = outcome else {
+        panic!("expected a caught reason, got {outcome:?}");
+    };
+    assert_eq!(terms::tuple_arity(reason).expect("a 2-tuple"), 2);
+    assert_eq!(
+        terms::tuple_element(reason, 0).expect("element 1"),
+        atom_term(&caller, "badarity")
+    );
+    let inner = terms::tuple_element(reason, 1).expect("element 2");
+    assert_eq!(terms::tuple_arity(inner).expect("{Fun, Args}"), 2);
+    assert_eq!(
+        terms::tuple_element(inner, 0).expect("the fun"),
+        fun,
+        "the reason names the applied fun"
+    );
+    let passed = terms::list_elements(terms::tuple_element(inner, 1).expect("the args"))
+        .expect("a proper list");
+    assert_eq!(passed, vec![make_small(1), make_small(2)]);
+}
+
+#[test]
+fn apply2_of_an_over_long_argument_list_is_caught_as_system_limit() {
+    // C's `i_apply_fun` bails at `MAX_REG - 1` arguments
+    // (`jit/x86/instr_fun.cpp:307-313`, the `inc` then `cmp ...; jb`), measured on
+    // the oracle as 1022 reaching the fun and 1023 raising `system_limit`.
+    let (caller, run) = try_caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting());
+    let elements: Vec<Eterm> = (0..1023).map(make_small).collect();
+    let args = terms::make_list(&mut ctx, &elements).expect("build the list");
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 2, &[fun, args], &mut ctx)
+        .expect("system_limit must be caught by the live try frame");
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(atom_term(&caller, "system_limit"))
+    );
+}
+
+#[test]
+fn apply2_accepts_one_short_of_the_register_file_bound() {
+    // 1022 arguments is the largest count that still reaches the closure, so the
+    // raise is the *classification's* `{badfun, Term}` — proof that the bound sits
+    // at `MAX_REG - 1` and not one lower.
+    let (caller, run) = try_caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting());
+    let elements: Vec<Eterm> = (0..1022).map(make_small).collect();
+    let args = terms::make_list(&mut ctx, &elements).expect("build the list");
+    let not_a_fun = atom_term(&caller, "not_a_fun");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 2, &[not_a_fun, args], &mut ctx)
+        .expect("the classification's raise must be caught");
+
+    let RunOutcome::Returned(reason) = outcome else {
+        panic!("expected a caught reason, got {outcome:?}");
+    };
+    assert_eq!(
+        terms::tuple_element(reason, 0).expect("element 1"),
+        atom_term(&caller, "badfun")
+    );
+}
+
+#[test]
+fn apply2_with_an_improper_argument_list_is_caught_as_badarg() {
+    // Oracle: `erlang:apply(fun p:id/1, [1|2])` ⇒ `{error,badarg}` (C's
+    // `apply_fun`'s `is_not_nil(tmp)` check, `beam_common.c:1746-1752`).
+    let (caller, run) = try_caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting());
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_cons(&mut ctx, make_small(1), make_small(2)).expect("build [1|2]");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 2, &[fun, args], &mut ctx)
+        .expect("the badarg must be caught by the live try frame");
+
+    assert_eq!(outcome, RunOutcome::Returned(atom_term(&caller, "badarg")));
+}
+
+#[test]
+fn apply2_with_a_non_list_argument_is_caught_as_badarg() {
+    // Oracle: `erlang:apply(fun(X) -> X end, {1})` and `(…, foo)` ⇒
+    // `{error,badarg}` — anything but a list (proper or not) never walks.
+    let (caller, run) = try_caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting());
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 2, &[fun, make_small(7)], &mut ctx)
+        .expect("the badarg must be caught by the live try frame");
+
+    assert_eq!(outcome, RunOutcome::Returned(atom_term(&caller, "badarg")));
+}
+
+#[test]
+fn apply2_whose_application_raises_lands_in_the_callers_catch_frame() {
+    // An error inside the applied closure is the C's `handle_error` →
+    // `next_catch` raise, so a live `try`/`catch` in the **caller** sees it — it
+    // must never escape the process. `ApplyAnswer::FailBadArg` is the host closure
+    // door reporting the raise.
+    let (caller, run) = try_caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting()).with_apply(ApplyAnswer::FailBadArg);
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_list(&mut ctx, &[make_small(1)]).expect("build the list");
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 2, &[fun, args], &mut ctx)
+        .expect("the application's raise is caught");
+
+    assert_eq!(outcome, RunOutcome::Returned(atom_term(&caller, "badarg")));
+}
+
+#[test]
+fn apply2_park_resumes_without_losing_the_fun_or_the_argument_list() {
+    // The closure application can need to wait: the instruction reports
+    // `Suspend` at **itself** having applied nothing, and the resume
+    // re-executes it. The register file was rewritten by the walk (the arguments
+    // are in `x(0..N)` and the fun in `x(N)`), so the two *sources* must be put
+    // back before the park or the re-walk would read the wrong shapes — C's
+    // `arg_reg` save/restore for a trapping BIF (`erts/emulator/beam/bif.h:406-423`).
+    let (caller, g) = caller_apply2_module();
+    let mut ctx = TestCtx::new(Vec::new(), rejecting())
+        .with_apply(ApplyAnswer::SuspendOnce(make_small(42)));
+    let fun = terms::make_fun(&mut ctx, 1, 4_242, 0, &[]).expect("build the fun");
+    let args = terms::make_list(&mut ctx, &[make_small(7)]).expect("build the list");
+
+    let mut machine = Machine::new();
+    let first = machine
+        .run_export_outcome(&caller, g, 2, &[fun, args], &mut ctx)
+        .expect("the suspend is reported, not folded");
+    // The park address is the `call_ext` instruction **itself** (`g/2`'s `pc` 2,
+    // i.e. the third instruction of the entry function): a suspend applies nothing,
+    // so the resume re-executes it.
+    let RunOutcome::Suspend { func, pc } = first else {
+        panic!("expected a suspend, got {first:?}");
+    };
+    assert_eq!(func, 0, "the park names the caller's own function");
+
+    let resumed = machine
+        .resume_outcome(&caller, func, pc, &mut ctx)
+        .expect("the resume completes");
+    assert_eq!(resumed, RunOutcome::Returned(make_small(42)));
 }
 // ---------------------------------------------------------------------------
 // (3) the shape errors are the catchable badarg the oracle produces

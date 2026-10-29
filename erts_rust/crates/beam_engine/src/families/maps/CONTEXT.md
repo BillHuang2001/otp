@@ -15,32 +15,61 @@ Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-
 (`i_func_info_IaaI`) + `beam_common.c:448-544` (`handle_error`, the `function_clause` reason).
 
 ## Layout
-- `mod.rs` — `exec` (dispatch), `lookup`/`position` (linear `beam_term::cmp` scans),
-  `goto`, `fail_or_raise` (`:238`), `fail_or_function_clause` (`:260`),
-  `raise_error_tuple` (`:280`).
-- `read.rs` — `get_map_elements` (`:54`), `has_map_fields` (`:82`).
-- `write.rs` — `put_map_assoc` (`:82`), `put_map_exact` (`:132`); both reserve the whole map
-  block with one rooted allocation (`make_map_rooted` + `merge_slack_words`) and re-read every
-  operand from the post-reserve machine state, so a moving collector may run in the reserve.
+- `mod.rs` — `exec` (dispatch), `lookup`/`position` (linear `beam_term::cmp` scans, `:221`/`:230`),
+  `goto` (`:237`), `fail_or_raise` (`:246`), `fail_or_function_clause` (`:268`),
+  `raise_error_tuple` (`:289`).
+- `read.rs` — `get_map_elements` (`:54`), `has_map_fields` (`:85`).
+- `write.rs` — `put_map_assoc` (`:158`), `put_map_exact` (`:221`), `unchanged_after_update` (`:127`)
+  (the no-change fast path, next section); both reserve the whole map block with one rooted allocation
+  (`make_map_rooted` + `merge_slack_words`) and re-read every operand from the post-reserve machine
+  state, so a moving collector may run in the reserve.
   The reservation's capacity is `key_count(...)` + the new pair count, where `key_count` is the
   O(1) head-node size word (`beam_term::map::map_size`, the C's `flatmap_get_size`,
   `beam_common.c:2002,2017`): the source's pair list is materialized **once** per instruction
   (`put_map_assoc` by the merge, `put_map_exact` by the `{badkey,Key}` validation plus the merge),
   never a second time for the length.
 - `tests.rs` — the unit suite (both layouts incl. the 32/33-key boundary, all failure paths, the
-  size-word/walk-count equivalence and the large-map reference-builder equivalence).
+  size-word/walk-count equivalence, the large-map reference-builder equivalence and the no-change
+  identity rows).
+
+## The no-change fast path (term identity)
+An update that changes nothing answers the **source map's own `Eterm` word**, so
+`erts_debug:same(M#{a => 1}, M)` is `true` when `M` already holds `a => 1` — on a flat map and on a
+hashmap (>32 keys) alike.
+Ground truth: `erts_gc_update_map_assoc`'s `changed_keys`/`changed_values` fast path
+(`erts/emulator/beam/beam_common.c:2094-2142`), `erts_gc_update_map_exact`'s (`:2309,2325-2326`) and
+`erts_hashmap_insert`'s same-value answer (`erl_map.c:2493,2523-2526`).
+- The decision is `write.rs::unchanged_after_update`: every pair's key must already exist (looked up
+  with `beam_term::map::map_get` under the live atom namespace, i.e. the map's own key rule, so `1`
+  and `1.0` stay distinct) **and** its value must equal the stored value by **raw `Eterm` word
+  equality**, never by `=:=` (the C compares raw words).
+- It is a pure read that allocates nothing — no reservation, no materialized operand, not even a
+  pair-list `Vec` — which is what makes writing the source word to `dst` sound under a collecting
+  host: no collection can run between the read and the store, so the word cannot have moved.
+- Residual: an operand whose read would materialize it (a non-small `Operand::Integer`/`Character`,
+  i.e. a bignum) declines the fast path up front, so such an update rebuilds the map — correct
+  contents, identity lost.
+- `put_map_exact` runs the fast path **before** its `{badkey,Key}` validation and subsumes it for its
+  own answer: a missing key is never a no-op, so it falls through to the validation.
+- Pins (`tests.rs`): `put_map_assoc_no_change_returns_the_source_word`,
+  `put_map_assoc_no_change_allocates_nothing` (the arena's `live_words` is unchanged — an invariant,
+  not a magic count), `put_map_assoc_no_change_on_a_hash_map_returns_the_source_word` (a 40-key
+  HAMT), `put_map_assoc_multi_pair_no_op_is_the_source_word` (every pair a no-op ⇒ identity) and its
+  `…_with_one_change_is_not_the_source_word` twin, plus
+  `put_map_exact_no_change_{returns_the_source_word,on_a_hash_map_returns_the_source_word}` and
+  `put_map_exact_missing_key_without_fail_raises_badkey`.
 
 ## Failure paths
 | Site | Condition | `fail != NO_FAIL` | `fail == NO_FAIL` |
 |---|---|---|---|
-| `read.rs:65,93` / `write.rs:102,155` | non-map `source` | jump | raise `{badmap,Source}` |
-| `write.rs:164` | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
-| `read.rs:73,99` | key absent | jump | raise the **bare atom** `function_clause` |
+| `read.rs:65,96` / `write.rs:177,240` | non-map `source` | jump | raise `{badmap,Source}` |
+| `write.rs:257` | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
+| `read.rs:76,102` | key absent | jump | raise the **bare atom** `function_clause` |
 
-`fail_or_raise` (`mod.rs:238`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
-(`mod.rs:280`); `fail_or_function_clause` (`mod.rs:260`) forwards the absent-key `NO_FAIL` branch to
+`fail_or_raise` (`mod.rs:246`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
+(`mod.rs:289`); `fail_or_function_clause` (`mod.rs:268`) forwards the absent-key `NO_FAIL` branch to
 the engine's single failed-clause definition `raise_function_clause_no_fail`
-(`dispatch.rs`; call site `mod.rs:267`, `what = "maps"`), which throws class `error`
+(`dispatch.rs`; call site `mod.rs:275`, `what = "maps"`), which throws class `error`
 with the bare atom `function_clause` (no tuple — the reason is not `{Tag,Value}`).
 
 ### The absent-key `NO_FAIL` reason (engine-defined)
@@ -158,9 +187,11 @@ Verified against the system `erlc` (OTP 29) disassembly:
   (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name all three, so the raise is the oracle's
   `{badkey,Key}`/`{badmap,Source}` (and the engine-defined bare `function_clause`) exactly.
 - `lookup`/`position` are O(n) scans (no hash) and `put_map_assoc` is O(n²) in the pair count
-  (`write.rs:120`); correct but unoptimised. The source **walk** count is one per instruction
-  (`tests/map_assoc_alloc.rs` pins it with a counting allocator).
-- `write.rs:188` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
+  (`write.rs:204`); correct but unoptimised. The source **walk** count is one per instruction
+  (`tests/map_assoc_alloc.rs` pins it with a counting allocator), and the no-change fast path is the
+  one route that materializes no pair list: it answers `map_get` per pair and never calls
+  `map_entries`.
+- `write.rs:280` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
   for an impossible post-reserve state.
 
 ## Notes for Agents

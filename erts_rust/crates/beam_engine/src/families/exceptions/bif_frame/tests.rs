@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use beam_common::{BeamError, ExitReason, Raise};
 use beam_loader::{Atom, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, NO_FAIL};
-use beam_term::{cmp, make_small};
+use beam_term::{cmp, make_small, AtomTable};
 
 use crate::context::MinimalContext;
 use crate::jit::Tier;
@@ -63,6 +63,10 @@ const TABLE_ATOMS: &[&str] = &[
     "badarg",
     "failed",
     "run",
+    "ets",
+    "lookup",
+    "cause",
+    "id",
 ];
 
 /// A module whose own atom table holds [`TABLE_ATOMS`] (and `m`).
@@ -732,4 +736,421 @@ fn a_guard_failure_arms_no_head_item() {
         !machine.pending_callee_head,
         "no head item may be armed by a guard failure"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the `cause` pair: C's `EXF_HAS_EXT_INFO` arm through the host seam
+// ---------------------------------------------------------------------------
+
+/// A context that answers [`ExecutionContext::bif_error_cause`] — C's
+/// `#{cause => Fvalue, module => FormatModule}` arm.
+///
+/// The trait default is `Ok(None)` (the one-pair form), so `MinimalContext` — every
+/// other row in this module — is the "no cause" host. The arena and the BIF floor are
+/// `MinimalContext`'s, forwarded, so the item's reservation is served by the same heap
+/// and a cause built on it is a real term.
+struct CauseCtx {
+    inner: MinimalContext,
+    /// The seam's answer for any `(module, function, args)`.
+    cause: Option<Eterm>,
+    /// Answer `Err` instead of a value — a host that cannot decide.
+    refuse: bool,
+    /// How often the seam was consulted: `0` proves a shape gate dropped the item
+    /// before the host was ever asked.
+    calls: usize,
+}
+
+impl CauseCtx {
+    /// A host carrying `cause` for whatever it is asked.
+    fn answering(cause: Eterm) -> CauseCtx {
+        CauseCtx {
+            inner: MinimalContext::new(),
+            cause: Some(cause),
+            refuse: false,
+            calls: 0,
+        }
+    }
+
+    /// A host that models the seam and answers "no cause" (`Ok(None)`).
+    fn silent() -> CauseCtx {
+        CauseCtx {
+            inner: MinimalContext::new(),
+            cause: None,
+            refuse: false,
+            calls: 0,
+        }
+    }
+
+    /// A host whose seam fails (`Err`) — the decline that must not replace the raise.
+    fn refusing() -> CauseCtx {
+        CauseCtx {
+            inner: MinimalContext::new(),
+            cause: None,
+            refuse: true,
+            calls: 0,
+        }
+    }
+
+    /// The same, over a BIF floor that answers `badarg` (the end-to-end rows).
+    fn with_badarg_floor(mut self) -> CauseCtx {
+        self.inner = MinimalContext::with_bif_hook(Box::new(|_, _, _, _| Err(BeamError::BadArg)));
+        self
+    }
+}
+
+impl ExecutionContext for CauseCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+
+    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
+        self.inner.atoms(module)
+    }
+
+    fn bif_error_cause(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: &[Eterm],
+    ) -> Result<Option<Eterm>> {
+        let _ = (module, function, args);
+        self.calls += 1;
+        if self.refuse {
+            return Err(BeamError::BadArg);
+        }
+        Ok(self.cause)
+    }
+}
+
+/// [`head_item`] over any host (the seam rows need a context that is not a bare
+/// `MinimalContext`).
+fn head_item_with<C: ExecutionContext>(
+    machine: &mut Machine,
+    ctx: &mut C,
+    module: &Module,
+    bif_module: &str,
+    bif_function: &str,
+    values: &[i64],
+) -> Option<Eterm> {
+    for (i, value) in values.iter().enumerate() {
+        machine.set_x(i as u32, make_small(*value)).unwrap();
+    }
+    let args: Vec<Operand> = (0..values.len()).map(|i| Operand::X(i as u32)).collect();
+    bif_head_item(
+        machine,
+        ctx,
+        module,
+        bif_module,
+        bif_function,
+        &args,
+        &BeamError::BadArg,
+    )
+    .expect("the arena never refuses a reservation")
+}
+
+/// The `error_info` map of an item's `Location` — the single `{error_info, Map}`
+/// entry, unwrapped. Panics if the location is not exactly that one-entry list, so a
+/// row that expects the empty-list location uses the item itself instead.
+fn error_info_map(module: &Module, item: Eterm) -> Eterm {
+    let location = tuple_element(item, 3).expect("the item's Location slot");
+    let entries = list_elements(location).expect("a proper Location list");
+    assert_eq!(entries.len(), 1, "exactly one `{{error_info, Map}}` entry");
+    assert_eq!(
+        tuple_element(entries[0], 0).unwrap(),
+        atom_of(module, "error_info"),
+        "the location entry's key is `error_info`"
+    );
+    tuple_element(entries[0], 1).expect("the entry's Map slot")
+}
+
+/// The map's `(key, value)` pairs in a **storage** order — the order `~p` renders and
+/// the order a flat map's atom keys are sorted into.
+fn stored_pairs(map: Eterm) -> Vec<(Eterm, Eterm)> {
+    beam_term::map::map_pairs_storage_order(map).expect("a well-formed map")
+}
+
+#[test]
+fn a_host_cause_renders_the_two_pair_extension() {
+    // Oracle, measured on OTP 29.1.2 / erts-17.1.1:
+    //   `try ets:lookup(unknown_atom_xyz, k) catch C:R:S -> hd(S) end`
+    //   -> {ets,lookup,[unknown_atom_xyz,k],
+    //         [{error_info,#{cause => id,module => erl_stdlib_errors}}]}
+    // The cause is C's `c_p->fvalue` (`../../erts/emulator/beam/beam_common.c:992-1000`),
+    // resolved through the host seam (the crate that owns the table registry decides
+    // `id` vs `type`).
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::answering(atom_of(&module, "id"));
+    let item = head_item_with(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("a live catch frame and a nameable module synthesize the item");
+    assert_eq!(ctx.calls, 1, "the seam is consulted exactly once");
+
+    let map = error_info_map(&module, item);
+    assert_eq!(
+        beam_term::map::map_size(map, &module.atom_table).unwrap(),
+        2,
+        "the two-pair form"
+    );
+    assert_eq!(
+        beam_term::map::map_get(map, atom_of(&module, "cause"), &module.atom_table).unwrap(),
+        Some(atom_of(&module, "id")),
+        "cause => the host's word"
+    );
+    assert_eq!(
+        beam_term::map::map_get(map, atom_of(&module, "module"), &module.atom_table).unwrap(),
+        Some(atom_of(&module, "erl_stdlib_errors")),
+        "module => the closed table's format module"
+    );
+    // The rest of the item is untouched: the BIF's real argument list.
+    assert_eq!(
+        list_elements(tuple_element(item, 2).unwrap()).unwrap(),
+        vec![make_small(1), make_small(2)],
+        "the two-pair form must not disturb the argument list"
+    );
+    assert_eq!(
+        tuple_element(item, 0).unwrap(),
+        atom_of(&module, "ets"),
+        "the item still names the BIF"
+    );
+}
+
+/// A module whose table interns `cause` **before** `module` — the order `atom.names`
+/// itself uses (`atom.names:178` vs `:471`) — because a flat map stores its atom keys
+/// in **atom-index** order (C's `erts_cmp_flatmap_keys`, `beam_term::map::write_map`)
+/// and that order is what `~p` renders.
+fn cause_first_fixture() -> Module {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("m");
+    module.atom_table.intern("cause");
+    for name in TABLE_ATOMS {
+        module.atom_table.intern(name);
+    }
+    module
+}
+
+#[test]
+fn the_two_pairs_are_stored_in_the_order_the_oracle_renders() {
+    // Oracle rendering (measured): `#{cause => id,module => erl_stdlib_errors}` —
+    // `cause` first. `write_map` sorts a flat map's atom keys by atom index, so on a
+    // table in `atom.names` order the stored (and therefore rendered) order is
+    // `cause, module` exactly. This is the same rule the oracle follows: its map is
+    // authored `MAP2(hp, am_cause, …, am_module, …)` and printed in storage order.
+    let module = cause_first_fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::answering(atom_of(&module, "id"));
+    let item = head_item_with(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("the item is synthesized");
+    let pairs = stored_pairs(error_info_map(&module, item));
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(
+        (pairs[0].0, pairs[1].0),
+        (atom_of(&module, "cause"), atom_of(&module, "module")),
+        "the rendered order must be the oracle's `#{{cause => …, module => …}}`"
+    );
+    assert_eq!(pairs[0].1, atom_of(&module, "id"));
+    assert_eq!(pairs[1].1, atom_of(&module, "erl_stdlib_errors"));
+}
+
+#[test]
+fn the_default_seam_keeps_the_one_pair_form() {
+    // No host override at all (the trait default `Ok(None)`): the shape every
+    // existing implementor renders — byte-identical to the pre-seam item.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MinimalContext::new();
+    let item = head_item(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("a live catch frame and a nameable module synthesize the item");
+    let expected = expected_item(
+        &mut ctx,
+        &module,
+        "ets",
+        "lookup",
+        &[make_small(1), make_small(2)],
+        Some("erl_stdlib_errors"),
+    );
+    assert!(cmp(item, expected, &module.atom_table).is_eq());
+    let pairs = stored_pairs(error_info_map(&module, item));
+    assert_eq!(
+        pairs,
+        vec![(
+            atom_of(&module, "module"),
+            atom_of(&module, "erl_stdlib_errors")
+        )],
+        "the default seam renders `#{{module => FormatModule}}` alone"
+    );
+}
+
+#[test]
+fn a_seam_answering_none_keeps_the_one_pair_form() {
+    // A host that models the seam and says "no cause to attach" must render exactly
+    // what the trait default renders.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::silent();
+    let item = head_item_with(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("the item is synthesized");
+    assert_eq!(ctx.calls, 1, "the seam was consulted");
+    let expected = expected_item(
+        &mut ctx.inner,
+        &module,
+        "ets",
+        "lookup",
+        &[make_small(1), make_small(2)],
+        Some("erl_stdlib_errors"),
+    );
+    assert!(cmp(item, expected, &module.atom_table).is_eq());
+}
+
+#[test]
+fn a_module_outside_the_table_is_never_asked_for_a_cause() {
+    // The shape rule runs first: `records:get/2` has no format module, so the item
+    // has NO extension at all (`catch records:get(1,2)` -> `{records,get,[1,2],[]}`)
+    // and the host is never consulted — a cause cannot resurrect a dropped extension.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::answering(atom_of(&module, "id"));
+    let item = head_item_with(&mut machine, &mut ctx, &module, "records", "get", &[1, 2])
+        .expect("the item is synthesized");
+    assert_eq!(ctx.calls, 0, "no extension means no cause question");
+    assert_eq!(
+        tuple_element(item, 3).unwrap(),
+        NIL,
+        "a module outside the closed table keeps the empty-list Location"
+    );
+}
+
+#[test]
+fn a_function_clause_raise_is_never_asked_for_a_cause() {
+    // The reason gate likewise precedes the seam: a bare `function_clause` drops the
+    // extension, so the host must not be asked (and must certainly not be rendered).
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::answering(atom_of(&module, "id"));
+    machine.set_x(0, make_small(1)).unwrap();
+    let item = bif_head_item(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "lists",
+        "max",
+        &[Operand::X(0)],
+        &function_clause_error(),
+    )
+    .expect("the item is synthesized")
+    .expect("a live catch frame and a nameable module");
+    assert_eq!(ctx.calls, 0, "the reason gate drops the extension first");
+    assert_eq!(tuple_element(item, 3).unwrap(), NIL);
+}
+
+#[test]
+fn a_refusing_seam_keeps_the_one_pair_form() {
+    // An `Err` from the seam declines the decoration: the item is built with the
+    // one-pair form (never a marshalling error replacing the BIF's own raise).
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::refusing();
+    let item = head_item_with(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("an `Err` from the seam must not fail the item");
+    assert_eq!(ctx.calls, 1);
+    let pairs = stored_pairs(error_info_map(&module, item));
+    assert_eq!(
+        pairs,
+        vec![(
+            atom_of(&module, "module"),
+            atom_of(&module, "erl_stdlib_errors")
+        )],
+        "a refused cause leaves the one-pair form"
+    );
+}
+
+#[test]
+fn a_boxed_cause_degrades_to_the_one_pair_form() {
+    // The word is embedded verbatim and never re-rooted, so only an immediate can be
+    // written (see `ExecutionContext::bif_error_cause`'s stability contract). A boxed
+    // answer is DROPPED — the one-pair form — never a word the carve's own reservation
+    // could relocate out from under the map.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let boxed = {
+        let mut scratch = MinimalContext::new();
+        terms::make_tuple(&mut scratch, &[make_small(1), make_small(2)]).unwrap()
+    };
+    let mut ctx = CauseCtx::answering(boxed);
+    let item = head_item_with(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("the item is synthesized");
+    assert_eq!(ctx.calls, 1);
+    let pairs = stored_pairs(error_info_map(&module, item));
+    assert_eq!(
+        pairs,
+        vec![(
+            atom_of(&module, "module"),
+            atom_of(&module, "erl_stdlib_errors")
+        )],
+        "a non-immediate cause is dropped, not stored"
+    );
+}
+
+#[test]
+fn a_host_cause_reaches_the_cooked_trace_on_both_tiers() {
+    // End to end on the compiled route: the innermost cooked item carries the two-pair
+    // extension, identically on the interpreter and the native baseline tier.
+    let (module, run_atom) = traced_bif_call("ets", "lookup", 2, NO_FAIL);
+    let mut ctx = CauseCtx::answering(atom_of(&module, "id")).with_badarg_floor();
+    let mut interpreter = Machine::new();
+    let cooked = interpreter
+        .run_export(&module, run_atom, 0, &[], &mut ctx)
+        .expect("the handler returns the cooked trace");
+    let mut jit = Machine::new();
+    let cooked_jit = jit
+        .run_with_tier(&module, run_atom, 0, &[], &mut ctx, Tier::BaselineJit)
+        .expect("the handler returns the cooked trace on the native tier too");
+    assert!(
+        cmp(cooked, cooked_jit, &module.atom_table).is_eq(),
+        "the interpreter and the baseline tier must cook the same trace"
+    );
+    let items = list_elements(cooked).unwrap();
+    assert_eq!(items.len(), 2, "the BIF head item plus the raising frame");
+    let map = error_info_map(&module, items[0]);
+    assert_eq!(
+        beam_term::map::map_get(map, atom_of(&module, "cause"), &module.atom_table).unwrap(),
+        Some(atom_of(&module, "id")),
+        "the cooked innermost item carries `cause => id`"
+    );
+    assert_eq!(
+        beam_term::map::map_get(map, atom_of(&module, "module"), &module.atom_table).unwrap(),
+        Some(atom_of(&module, "erl_stdlib_errors")),
+        "…beside `module => erl_stdlib_errors`"
+    );
+}
+
+#[test]
+fn the_shape_rule_helpers_are_reachable_from_the_crate_root() {
+    // The two halves of the shape rule are public and re-exported at the crate root
+    // (`beam_engine::{format_module, is_non_bif_raise}`), because `beam_rt`'s `-eval`
+    // route renders the same extension from the same table. Resolving them through the
+    // re-export path is what a cross-crate caller does.
+    assert_eq!(crate::format_module("ets"), Some("erl_stdlib_errors"));
+    assert_eq!(crate::format_module("records"), None);
+    assert!(crate::is_non_bif_raise("erlang", "error", 3));
+    assert!(!crate::is_non_bif_raise("erlang", "hd", 1));
 }

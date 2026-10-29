@@ -35,6 +35,22 @@ main() ->
          attempted(fun() -> byte_size(term_to_binary(#{k => Fun})) end)),
     show("erlang:external_size([fun() -> ok end])",
          attempted(fun() -> erlang:external_size([Fun]) end)),
+    %% The two shapes the record still lists as gaps: one *term* holding two
+    %% different closures, and a closure that no compiled module defines (an
+    %% `erl_eval`/`-eval` one, whose identity is `EVAL_FUN_UNIQ`).
+    F1 = fun() -> alpha end,
+    F2 = fun() -> beta end,
+    show("term_to_binary({fun() -> alpha end, fun() -> beta end})",
+         attempted(fun() -> byte_size(term_to_binary({F1, F2})) end)),
+    show("erlang:external_size({fun() -> alpha end, fun() -> beta end})",
+         attempted(fun() -> erlang:external_size({F1, F2}) end)),
+    {ok, Tokens, _} = erl_scan:string("fun() -> ok end."),
+    {ok, Exprs} = erl_parse:parse_exprs(Tokens),
+    {value, EvalFun, _} = erl_eval:exprs(Exprs, erl_eval:new_bindings()),
+    show("term_to_binary(an erl_eval closure)",
+         attempted(fun() -> byte_size(term_to_binary(EvalFun)) end)),
+    show("erlang:external_size(an erl_eval closure)",
+         attempted(fun() -> erlang:external_size(EvalFun) end)),
     show("term_to_binary(an atom)   %% control",
          attempted(fun() -> byte_size(term_to_binary(an_atom)) end)),
     ok.

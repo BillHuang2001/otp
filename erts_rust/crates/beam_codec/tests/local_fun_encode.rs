@@ -57,12 +57,14 @@ use beam_codec::term::{
     fun_uniq_bytes, tuple_arity, tuple_element, FunKind, FunPid,
 };
 use beam_codec::{
-    decode_term, encode_term, is_unsupported_local_fun, Encoder, FunIdentity, NEW_FUN_EXT,
-    VERSION_MAGIC,
+    decode_term, encode_term, is_unsupported_local_fun, Encoder, FunIdentity, LIST_EXT,
+    NEW_FUN_EXT, VERSION_MAGIC,
 };
 
 use beam_term::fun::{fun_words, write_fun_local};
-use beam_term::prelude::{atom_val, is_nil, make_small, signed_value, AtomTable, Eterm};
+use beam_term::prelude::{
+    atom_val, is_nil, make_list, make_small, signed_value, AtomTable, Eterm, NIL,
+};
 
 /// The fixture module compiled by `erlc` for the oracle test. `mk/1` captures one
 /// free variable, `mk2/2` two, `mk0/0` none — so `num_free` 1/2/0 are all covered.
@@ -289,10 +291,155 @@ fn compiled_local_fun_encodes_byte_exactly_like_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------
+// 4. TWO different local funs: the per-fun identity resolver seam.
+// ---------------------------------------------------------------------------
+
+/// The oracle program for the two-lambda case: `{term_to_binary([F1, F2]), Records}`
+/// where `Records` holds the same per-fun tuple section 3 reads
+/// (`{image, module, new_uniq, new_index, index, uniq, arity, env, pid}`), so both
+/// sides of the comparison come from one oracle run.
+const ORACLE_EVAL_TWO: &str = "Fs = [lfun:mk(7), lfun:mk0()], \
+Ps = [{term_to_binary(F), element(2, erlang:fun_info(F, module)), \
+element(2, erlang:fun_info(F, new_uniq)), element(2, erlang:fun_info(F, new_index)), \
+element(2, erlang:fun_info(F, index)), element(2, erlang:fun_info(F, uniq)), \
+element(2, erlang:fun_info(F, arity)), element(2, erlang:fun_info(F, env)), \
+element(2, erlang:fun_info(F, pid))} || F <- Fs], \
+io:format(\"~w\", [term_to_binary({term_to_binary(Fs), Ps})])";
+
+/// Materializes a proper list of `items` (`items[0]` is the head).
+fn build_list(heap: &mut Heap, items: &[Eterm]) -> Eterm {
+    let mut tail = NIL;
+    for &item in items.iter().rev() {
+        // SAFETY: `alloc_words(2)` returns two exclusively-owned, writable words — one
+        // cons cell's header-less `[CAR, CDR]` block — and both are written here.
+        let hp = unsafe { heap.alloc_words(2).expect("the test heap is large enough") };
+        unsafe {
+            *hp = item;
+            *hp.add(1) = tail;
+        }
+        tail = make_list(hp as *const Eterm);
+    }
+    tail
+}
+
+/// **The two-lambda case, byte-exact against the oracle.**
+///
+/// A term holding two *different* local funs cannot be expressed by one
+/// [`Encoder::with_fun_identity`] slot, so the image was the typed
+/// `unsupported_local_fun` (the runtime refused it rather than write the outer
+/// identity into the inner fun's fields). With a per-fun
+/// [`beam_codec::FunIdentityResolver`] each fun is written from **its own** identity
+/// and the whole list image is asserted byte-identical to the oracle's.
+#[test]
+fn two_different_local_funs_encode_byte_exactly_like_the_oracle() {
+    let Some(oracle) =
+        oracle_or_skip("two_different_local_funs_encode_byte_exactly_like_the_oracle")
+    else {
+        return;
+    };
+    let Some(dir) = compile_fixture(&oracle) else {
+        return;
+    };
+
+    let out = run_erl(&oracle, &dir, ORACLE_EVAL_TWO);
+    let images = parse_binary_list(&out);
+    assert_eq!(
+        images.len(),
+        1,
+        "the oracle should print exactly one payload image, got {}: {out:?}",
+        images.len()
+    );
+
+    let mut heap = Heap::new(8192).expect("a decode heap");
+    let mut atoms = AtomTable::new();
+    let payload = decode_term(&images[0], &mut heap, &mut atoms).expect("a valid payload");
+    assert_eq!(tuple_arity(payload).unwrap(), 2);
+
+    // (0) the oracle's own `term_to_binary([F1, F2])`.
+    let (img_bytes, img_off, img_bits) =
+        bitstring_bytes(tuple_element(payload, 0).unwrap()).unwrap();
+    assert_eq!(img_off, 0);
+    let oracle_image = &img_bytes[..img_bits / 8];
+    assert_eq!(oracle_image[0], VERSION_MAGIC);
+    assert_eq!(oracle_image[1], LIST_EXT, "the two-fun term is a LIST_EXT");
+
+    // (1) one entry per fun, in the list's own order.
+    let entries = decode_list(tuple_element(payload, 1).unwrap());
+    assert_eq!(entries.len(), 2, "one entry per fixture fun");
+
+    // Rebuild each local fun and its identity from the oracle's own fields; the module
+    // atom is already interned in `atoms`, the table the encoder names atoms from.
+    let mut lheap = Heap::new(512).expect("a local-fun heap");
+    let mut funs = Vec::new();
+    let mut identities: Vec<(u32, FunIdentity)> = Vec::new();
+    for entry in &entries {
+        let module = atom_val(tuple_element(*entry, 1).unwrap());
+        let (uniq_bytes, uniq_off, uniq_bits) =
+            bitstring_bytes(tuple_element(*entry, 2).unwrap()).unwrap();
+        assert_eq!((uniq_off, uniq_bits), (0, 128), "the MD5 is 16 bytes");
+        let mut uniq = [0u8; 16];
+        uniq.copy_from_slice(&uniq_bytes[..16]);
+        let new_index = signed_value(tuple_element(*entry, 3).unwrap()) as u32;
+        let old_index = signed_value(tuple_element(*entry, 4).unwrap()) as u32;
+        let old_uniq = signed_value(tuple_element(*entry, 5).unwrap()) as u32;
+        let arity = signed_value(tuple_element(*entry, 6).unwrap()) as usize;
+        let env = decode_list(tuple_element(*entry, 7).unwrap());
+        let (node_term, number, serial, creation) =
+            external_pid_parts(tuple_element(*entry, 8).unwrap()).unwrap();
+        let creator = FunPid {
+            node: atom_val(node_term),
+            number,
+            serial,
+            creation,
+        };
+        funs.push(build_local_fun(&mut lheap, arity, 0xDEAD_BEEF, new_index, &env));
+        identities.push((
+            new_index,
+            FunIdentity::new(module, uniq, old_index, old_uniq, creator),
+        ));
+    }
+    assert_ne!(
+        identities[0].1, identities[1].1,
+        "the two lambdas must carry different identities, or the case proves nothing"
+    );
+
+    let list = build_list(&mut lheap, &funs);
+
+    // The resolver answers **per fun**, keyed by the term's own descriptor index.
+    let mut resolve = |fun: Eterm| {
+        let index = fun_index(fun)?;
+        Ok(identities
+            .iter()
+            .find(|(candidate, _)| *candidate == index)
+            .map(|(_, identity)| *identity))
+    };
+    let mut encoder = Encoder::new(&atoms).with_fun_identity_resolver(&mut resolve);
+    encoder.encode(list).unwrap();
+    assert_eq!(
+        encoder.as_bytes(),
+        oracle_image,
+        "a two-lambda term must encode byte-identically to the oracle through the \
+         per-fun resolver (indices {:?})",
+        identities.iter().map(|(index, _)| *index).collect::<Vec<_>>()
+    );
+
+    // Each fun's own image must still be the oracle's single-fun image too — the
+    // resolver changes *which* identity feeds the fields, never their layout.
+    for ((entry, fun), (_, identity)) in entries.iter().zip(&funs).zip(&identities) {
+        let (single_bytes, single_off, single_bits) =
+            bitstring_bytes(tuple_element(*entry, 0).unwrap()).unwrap();
+        assert_eq!(single_off, 0);
+        let expected = &single_bytes[..single_bits / 8];
+        let mut single = Encoder::new(&atoms).with_fun_identity(*identity);
+        single.encode(*fun).unwrap();
+        assert_eq!(single.as_bytes(), expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Oracle resolution, fixture compilation and process plumbing
 // (mirrors tests/interop.rs / tests/map_key_order.rs)
 // ---------------------------------------------------------------------------
-
 /// Whether `p` is an existing executable file.
 fn is_executable(p: &Path) -> bool {
     #[cfg(unix)]

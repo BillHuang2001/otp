@@ -1,37 +1,34 @@
-# stdlib divergence classes D1…D11 — re-checked against the current Rust runtime
+# stdlib divergence classes D1…D12 — current verdicts
 
-Re-verification of the ten root-cause classes recorded in `../stdlib-notes.md` §D, run
-against the **current** Rust runtime at the head of this branch, plus the two rows this
-document adds: `D1c` (the suite-path abort) and `D11` (`erlang:apply/2`, the
-`queue_SUITE:oops` value disagreement). Measurement/diagnosis only: no runtime crate was
-touched.
+The per-class record behind `../stdlib-notes.md` §D and `../stdlib/summary.md`.
+Every row below was re-measured with its smallest expression against the runtime under test; nothing here is
+carried over from an earlier reading, and a claim this file could not reproduce is gone rather than annotated.
+Measurement/diagnosis only: no runtime crate was touched from this node.
 
 ## Environment and method
 
 | field | value |
 |---|---|
-| runtime under test | `erts_rust/target/release/beam_rt` built from this worktree (`cargo.sh build -p beam_rt --release`) |
-| runtime version | `erlang:system_info(version)` → `"17.1"` |
-| branch head | `a56bef586b61fcf0a9b2b67c30f13ba112a8ad7d` |
-| oracle | system `erl`/`erlc` on `$PATH`, OTP `29.1.2` / erts `17.1.1` |
-| cwd | a throwaway directory under `$TMPDIR/stdlib-diag` (`$TMPDIR/erts-suites-stage/stdlib` for the staged suite beams) |
-| host | shared; `loadavg` was ~**32** (`32.20 37.09 22.09`) during the D8 measurements |
+| runtime under test | `erts_rust/target/release/beam_rt`, built from this worktree (`cargo.sh build -p beam_rt --release`) |
+| runtime commit | `71ffbbb37971d0b193e0dc74b60b6c448874349e` (the runtime sources **are** this sha; the sweep below also ran it) |
+| runtime version | `erlang:system_info(version)` → `"17.1"`; `system_info(otp_release)` → `"30"` |
+| oracle | `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` (OTP `29.1.2` / erts `17.1.1`) |
+| sweep artifacts | `../stdlib/report.json` + `../stdlib/summary.md` (8 suites, `--timeout 10 --suite-budget 300 --jobs 4`) and `../stdlib/recheck-120/` (`maps_SUITE,lists_SUITE,binary_module_SUITE`, `--timeout 120 --jobs 1`) |
+| cwd | throwaway dirs under `$TMPDIR`; the staged suite beams are the shared `/tmp/erts-suites-stage/stdlib` (`src/`,`ebin/`,`ctl/`,`cwd/`), read-only |
+| host | **shared**; `loadavg` observed `61.39 29.93 17.96` → `58.32 50.07 29.76` for the sweep, `4.16 7.83 20.90` … `12.82 25.26 36.96` during the re-measurement below (16 logical CPUs) |
 
-Every check runs the **same** argv under both runtimes (`-noshell -pa <ebin> -eval '…, halt(0).'`).
-Where a check needs compiled code it is compiled with the **oracle's `erlc`** into `$TMPDIR`
-only, so both sides run byte-identical `.beam` files.
+Every check runs the **same** argv under both runtimes (`-noshell -pa <ebin>… -eval '…, halt(0).'`).
+Anything that needs compiled code is compiled with the **oracle's `erlc`** into `$TMPDIR`, so both sides run
+byte-identical `.beam` files; the `-eval` route is the tree-walk evaluator, the compiled route is the engine.
+Two rules are load-bearing:
 
-Two measurement rules are load-bearing here:
+- **A raise inside a probe must be caught by the probe.** An uncaught typed gap leaves through the CLI's
+  capability-gap channel (`beam_rt: unsupported: …`, exit `3`) or terminates the runtime, so pairs are
+  observed as `try … catch`/`catch` results.
+- **Ratios only.** No absolute time below is portable; D8 and the timeout table quote same-host ratios and
+  the operation counts that produced them.
 
-- **Stacktraces must be read from compiled modules.** The `-eval` tree-walk evaluator reports an
-  **empty** stacktrace for every raise on the Rust side (`catch lists:reverse(a)` →
-  `{'EXIT',{function_clause,[]}}`), so an `-eval`-based stacktrace check measures the evaluator,
-  not the runtime. D5 below is therefore measured from `stacktrace_head_probe.erl`.
-- **Ratios only.** The host is shared, so no absolute time in this document is portable; D8
-  quotes the same-host oracle/rust ratio and the operation counts that produced it.
-
-Reproduce any one-liner with `matrix.sh` (reads expressions on stdin, prints one line per
-expression with both sides):
+Reproduce any one-liner with `matrix.sh` (expressions on stdin, one line per expression with both sides):
 
 ```
 ROOT=$PWD bash erts_rust/tools/suites/results/stdlib-diagnostics/matrix.sh <<'EOF'
@@ -43,223 +40,328 @@ EOF
 
 | # | smallest expression | oracle | rust | verdict |
 |---|---|---|---|---|
-| **D1** | `lists:foreach(fun(_) -> length(lists:duplicate(200000, x)) end, [1])` | returns `ok` | catchable `error:system_limit`; uncaught → `beam_rt: system_limit`, exit 1 | **still present** (wider: the plain process now fails too) |
-| **D1b** | `spawn_monitor(fun() -> binary_module_SUITE:error_info([]) end)` (`error_info_child_probe`) | `DOWN=normal`, 1370 lines, `main result={ok,ok}` | `DOWN=normal`, 1095 lines, `main result={ok,ok}`; runtime exits 0 | **fixed** (re-measured: the child-level `{function_clause,[]}` this row used to record is gone; only the line count differs) |
-| **D1c** | `error_info_abort_probe:main({prefix, 70})` — the first **70** of `error_info/1`'s 73 entries through `ct_runner:run_case/4`'s shape | `{ok,ok}`, exit 0 | `beam_rt: system_limit` on stderr, **exit 1** (69 entries: `{ok,ok}`, exit 0) | **still present** — this is the suite-path abort; see §D1 below |
-| **D2** | `C = binary:part(<<"z",(binary:copy(<<255>>,1024))/binary>>,1,510), {byte_size(C),binary:referenced_byte_size(C)}` | `{510,2050}` | `{510,510}` | **still present** |
-| **D3** | `erlang:trace(self(),true,[running,{tracer,self()}])` | `1` | `1` | **fixed** |
-| **D3** | set-wise: `trace(…,[running,{tracer,self()}])`, `trace(…,[call])`, `trace_info(self(),flags)` | `1 1 {flags,[running,call]}` | `1 1 {flags,[running,call]}` | **fixed** |
-| **D4** | `M=#{a=>1}, {erts_debug:same(maps:merge(#{},M),M), erts_debug:same(maps:put(a,1,M),M)}` | `true true` | `true true` | **fixed** |
-| **D5** | `maps:with([a,b], (fun(X) -> X end)(a))` — from a **compiled** module | head `{maps,with,[[a,b],a]}` | head `{maps,with,[[a,b],a]}` | **fixed** (see the residual frame note) |
-| **D6** | `catch erlang:bump_reductions(134217727)` | `true` | `beam_rt: unsupported: erlang:bump_reductions/1`, exit 3 | **changed class** (was a catchable `{'EXIT',{unsupported_bif,_}}`; now the CLI-level `unsupported` signal runs past `catch`) |
-| **D7** | `erlang:system_info(snifs)` | list of **553** `{M,F,A}` | list of **556** `{M,F,A}` | **fixed** (published; the tables themselves differ) |
-| **D8** | `maps:merge_with(fun(_,V1,V2)->{V1,V2} end, M1, M2)`, 1000-key maps, 50 rounds | reference | **580× / 764×** the oracle | **still present** |
-| **D8** | `maps:intersect_with/3`, same shape | reference | **94× / 107×** | **still present** |
-| **D8** | `maps:iterator/1` + `maps:next/1` walk, 1000 entries, 50 rounds | reference | **442× / 525×** | **still present** |
-| **D8** | `maps:to_list/1` (reference: a BIF that calls no Erlang fun) | reference | **4.8× / 4.3×** | reference row — shows the gap is callback-specific |
-| **D9** | `smallest(Args) -> apply(fun(X) -> X end, Args).` called as `smallest([a])` | `a` | `error:badarg` | **still present** (and wider than recorded) |
-| **D10** | `erts_debug:set_internal_state(available_internal_state,true)`, then `…(unicode_loop_limit,10)` | `false`, then `40000` + the `Process <0.10.0> enabled access …` warning report | `false`, then `beam_rt: unsupported: bif`, exit 3 | **changed class** (was a catchable `unsupported_bif`; now the CLI-level `unsupported` signal) |
-| **D11** | `f(As) -> apply(fun(X) -> X end, As).` called as `f([a])` — from a **compiled** module (`queue_oops_probe`) | `a` | `error:badarg` | **new row, still present** — `erlang:apply/2` is served by an `apply/3`-shaped floor; this is the `queue_SUITE:oops` value disagreement. See §*queue_SUITE:oops — the value disagreement* |
-| **D11** | `apply(erlang, self)` (two atoms, compiled) | `error:badarg` | the **calling process's pid** (`apply(M, F)` runs `M:F()`) | **still present** — the *wrong-value* half of the same class |
+| **D1** | `lists:foreach(fun(_) -> length(lists:duplicate(N, x)) end, [1])` | `ok` for every `N` | catchable `error:system_limit` for `N ≥ 65537`; uncaught → `beam_rt: system_limit`, exit `1` | **still present**, threshold now `65536` elements |
+| **D1b** | `error_info_child_probe:main()` (`binary_module_SUITE:error_info([])` in the main process **and** in a `spawn_monitor` child) | `DONE`, exit `0`, 1370 lines | `DONE`, exit `0`, 1095 lines (same `{ok,ok}` main result) | **fixed** (only the printed line count differs) |
+| **D1c** | `error_info_abort_probe:main({prefix, 70})` | `{ok,ok}`, exit `0` | no abort; the parent receives the atom `'exit <structured reason>'`, exit `0` | **changed class** (the suite-level abort is gone; the raise reason is replaced by a placeholder atom) |
+| **D2** | `C = binary:part(<<"z",(binary:copy(<<255>>,1024))/binary>>,1,510), {byte_size(C), binary:referenced_byte_size(C)}` | `{510,1025}` | `{510,510}` | **still present** for every sub-binary of a **refc** parent |
+| **D3** | `T = erlang:trace(self(),true,[running,{tracer,self()}]), U = erlang:trace(self(),true,[call]), {T,U,erlang:trace_info(self(),flags)}` | `{1,1,{flags,[running,call]}}` | `{1,1,{flags,[running,call]}}` | **fixed** |
+| **D4** | `M = #{a=>1,b=>2}, erts_debug:same(maps:put(a,1,M), M)` — **compiled** | `true` | `false` | **still present** (compiled route only; `M#{a=>1}` and `maps:merge(#{},M)` keep identity, `maps:put/3` does not) |
+| **D5** | `catch maps:with([a,b], (fun(X) -> X end)(a))` — **compiled**, legacy `catch` | head `{maps,with,[[a,b],a],…}` | head `{d5_probe,legacy_catch,0,…}` (the BIF frame is missing) | **partially present** (`try`/`catch` route agrees; legacy `catch` loses the head frame) |
+| **D6** | `catch erlang:bump_reductions(134217727)` — **compiled** | `true` | `{'EXIT',{unsupported_bif,[…]}}` | **changed class** (catchable again, `error:unsupported_bif`; the CLI `unsupported` exit `3` is only the *uncaught* `-eval` shape) |
+| **D7** | `erlang:system_info(snifs)` | 553 `{M,F,A}` | 556 `{M,F,A}` | **fixed** (each list is its own static-NIF table; the count is not expected to match) |
+| **D8** | `maps_bif_loop_probe:main()` — 50 rounds × 1000-key maps | reference | `merge_with` **662×/614×**, `intersect_with` **92×/95×**, `iterator+next` **438×/480×**, `to_list` control 3.7× | **still present** |
+| **D9** | `apply_args_probe:main()` — the `apply/2` argument matrix | see §D9 | **agrees on every value**; only the arity-mismatch *reason* degrades (`{badarity,Args}` → `badarity`) | **fixed** (residual: one reason shape) |
+| **D10** | `erts_debug:set_internal_state(available_internal_state,true)`, then `…(unicode_loop_limit,10)` | `false`, then `40000` | `false`, then `40000` (same for `binary_loop_limit` → `0`, `re_loop_limit` → `64000`) | **fixed** |
+| **D11** | `R = erlang:trace_delivered(TraceePid)` after the traced child's `{'DOWN',…}` | a `reference()` | `{'EXIT',{badarg,…}}` | **still present**; the **oracle** is right (`erlang:trace_delivered/1`: `badarg` only for a *dead* pid, a terminated-but-delivered pid is legal) |
+| **D12** | `f(E) -> <<E/utf32-little>>.` called as `f(1)` — **compiled** | `<<1,0,0,0>>` | `<<0,0,0,1>>` | **new class, still present** (a `utf32` segment ignores `little`/`native` for a value that is not compile-time-known) |
+| **D12b** | `unicode_SUITE:latin1`'s `[16#FFF] = lists:flatten(Rest2)` (staged `unicode_SUITE.erl:414`) | `ok` | `{badmatch,<<0,0,…>>}` | **new, separate residual** — the `{error,Bin,Rest}` split of `unicode:characters_to_binary([…,16#FFF],latin1)`; not the utf32 class |
 
-Counts: **5 fixed** (D1b, D3, D4, D5, D7) · **6 still present** (D1, D1c, D2, D8, D9, D11) · **2 changed
-class** (D6, D10). `D1c` is the row this document adds: the suite-level abort the sweep loses 13
-cases to, which is *not* the child-level `function_clause` D1b used to record. `D11` is the row that
-turns the sweep's `queue_SUITE:oops` `{diff,…}` throw into a named runtime defect (§*queue_SUITE:oops*
-below); D9 is the same defect, and its mechanism note is corrected there.
+Counts: **5 fixed** (D1b, D3, D7, D9, D10) · **5 still present** (D1, D2, D4, D8, D11) · **1 partially present**
+(D5) · **2 changed class** (D1c, D6) · **2 new** (D12, D12b).
+`D1c`, `D9`, `D11` and `D12b` are this document's own row names; `../stdlib-notes.md` §D keeps the same
+numbering.
 
 ## Notes per class
 
-### D1 / D1b / D1c — the `system_limit` abort
+### D1 — the term-heap `system_limit`, threshold `65536` list elements
 
-The recorded fix ("need-aware per-depth BIF-region reservation") is **not observable from the
-suites' perspective**: `results/stdlib-diagnostics/bigterm_spawn_probe.erl` still aborts on its very
-first line with `beam_rt: system_limit`, exit 1, in the **plain** process.
+Measured with the raise caught by the probe, so the class is visible without a runtime exit:
 
-Reduced (`k3`/`k4` measurements, not committed — reproduce via `matrix.sh`):
+| shape (all with `N = 200000` unless stated) | oracle | rust |
+|---|---|---|
+| `length(lists:duplicate(N, x))` direct, in the main process | `ok` | `ok` |
+| the same 5× in a tail-recursive loop | `ok` | `ok` |
+| the same inside a `fun() -> … end` called directly | `ok` | `ok` |
+| the same inside a `spawn_monitor` child | `ok` | `ok` |
+| the same inside a `lists:foreach/2` fun | `ok` | **`error:system_limit`** |
+| the same inside a `lists:map/2` fun | `ok` | **`error:system_limit`** |
+| `lists:foreach` fun, `N = 65536` | `ok` | `ok` |
+| `lists:foreach` fun, `N = 65537` | `ok` | **`error:system_limit`** |
+
+So the class is *"a large allocation inside a fun invoked by a higher-order `lists` BIF"* and the threshold is
+exactly **65536** list elements (131072 words = 1 MiB of cons cells) — half of what the previous record stated
+for the compiled route. The `-eval` route is looser (ok at 65536, `beam_rt: unsupported: bif` exit `3` from
+`70000`) and is **not** catchable, i.e. the evaluator turns the same refusal into the CLI capability-gap
+channel. Uncaught on the compiled route it terminates the runtime with `beam_rt: system_limit`, exit `1`.
+It is a plain `error`, never a wrong value.
+**Owner:** `beam_rt` heap admission (`enforce_term_heap_limit` / the per-depth BIF-region reservation).
+
+### D1b — the spawned child is fine
+
+`error_info_child_probe` runs `binary_module_SUITE:error_info([])` in the main process and, separately, in a
+`spawn_monitor` child whose `{'DOWN',…}` reason is inspected. Both sides: `DONE`, exit `0`, main result
+`{ok,ok}`, child `DOWN=normal`. The only difference is the number of printed lines (rust 1095, oracle 1370) —
+these cases print more than one assertion per line, so the count is not an assertion count and no assertion
+was observed to fail. The child-level `{function_clause,[]}` this row used to name does not reproduce.
+
+### D1c — the suite-level abort is gone; the raise reason is a placeholder
+
+`error_info_abort_probe:main({prefix, N})` drives `error_info/1`'s 73-entry list through the
+`ct_runner:run_case/4` shape (`spawn_monitor` + `try`/`catch` + `exit({ct_case_result, R})`):
+
+| N | oracle | rust |
+|---|---|---|
+| 68 | `{'EXIT',{error_info_abort_probe,…}}`, exit `0` | identical, exit `0` |
+| 69 | identical | identical |
+| **70** | `{ok,ok}`, exit `0` | `MAIN_GOT 'exit <structured reason>'`, exit `0` |
+| **73** (`all`) | `{ok,ok}`, exit `0` | `MAIN_GOT 'exit <structured reason>'`, exit `0` |
+| `{one,error_info}` | `RESULT error_info {ct_case_result,{ok,ok}}` | `RESULT error_info {ct_case_result,{ok,ok}}` |
+
+The runtime no longer dies here (the whole `binary_module_SUITE` is measured now — 20/20 rows), and the case's
+own logic passes standalone. What remains is the **death-boundary reason**: the parent receives the atom
+`'exit <structured reason>'` instead of the child's `{ct_case_result,{ok,ok}}`.
+That atom is the `Display` of a structured raise reason — `crates/beam_common/src/error.rs:321`
+(`ExitReason::Structured`) — interned at `crates/beam_rt/src/runner/reason.rs` when
+`live_reason_term()` answers `None`; the payload was dropped earlier by
+`Runtime::stabilize_error_live_reason` → `degrade_live_reason` (`crates/beam_rt/src/runtime/gc.rs`), whose
+price/copy gate refuses this reason. Note the ladder of `exit/1` shapes (`d1c_probe:rows()`): all ten —
+bare atom, tuple, `{ct_case_result,…}`, `{exception,error,{badmatch,false},{m,f,1,[]}}`, a frame with
+`file`/`line`, a binary, a map, a 1M-element list, a 5000-byte binary, a nested frame list — cross the
+boundary **identically** on both sides, so the trigger is a specific term shape inside `error_info`'s reason,
+not the ct hand-off.
+**Verdict:** the abort is fixed; the residual is that the opaque placeholder atom is *observable* (an Erlang
+program can match it), i.e. a wrong value rather than a typed gap.
+**Owner:** `beam_rt` — the escape-boundary stabilization (`runtime/gc.rs`) and the
+`intern(reason.to_string())` fallback in `runner/reason.rs`, which should degrade to the bare class/reason
+instead of an invented atom. Effect on the sweep: `binary_module_SUITE:error_info` is a divergence whose detail
+is the placeholder, so the real reason stays invisible to the harness.
+
+### D2 — `binary:referenced_byte_size/1` of a sub-binary
 
 | shape | oracle | rust |
 |---|---|---|
-| `length(lists:duplicate(1 bsl 21, x))` direct | ok | ok |
-| the same 5× in a tail-recursive loop | ok | ok |
-| the same inside `fun() -> … end` called directly | ok | ok |
-| the same inside a `spawn_monitor` child | ok | ok |
-| the same inside a `lists:foreach/2` fun | ok | `error:system_limit` |
-| the same inside a `lists:map/2` fun | ok | `error:system_limit` |
-| the same via `lists:foreach` at 131072 elements | ok | ok |
-| the same via `lists:foreach` at 200000 elements | ok | `error:system_limit` |
+| `part(<<"z", (binary:copy(<<255>>,1024))/binary>>, 1, 510)` | `{510,1025}` | `{510,510}` |
+| `part(erts_debug:unaligned_bitstring(<0..255>,3), 1, 100)` | `{100,257}` | `{100,100}` |
+| `part(iolist_to_binary([copy(<<1>>,2000), copy(<<2>>,50)]),10,510)` | `{510,2050}` | `{510,510}` |
+| a sub-binary **of a sub-binary** | `{510,2050}` | `{510,510}` |
+| a literal binary, `list_to_binary/1`, `iolist_to_binary/1`, whole `binary:copy/2` | own size | own size (**agree**) |
 
-So the class is now *"a large allocation inside a fun invoked by a higher-order `lists` BIF"*, not
-*"a spawned child"*: the threshold sits between **131072** and **200000** list elements (2–3 MiB of
-cons cells), the raise is a **catchable `error:system_limit`**, and an uncaught one terminates the
-runtime with `beam_rt: system_limit` + exit 1 — exactly the recorded signature. It is a plain
-`error`, not a typed capability gap.
+So the fix that landed covers the *whole refc binary* shape only: every sub-binary whose parent is a
+**refc** binary reports its own size instead of the referenced parent size. Rows: `binary_module_SUITE:referenced`
+(`{badmatch,1023}`), `binary_module_SUITE:doctests`, `binary_module_SUITE:copy`'s referenced assertions, and
+`unicode_SUITE:ex_binaries_errors_*`'s `binary:referenced_byte_size(Chomped) =:= PBSz` checks (see D12 for the
+two unicode rows that are *not* this).
+**Owner:** `beam_bifs` `binary:referenced_byte_size/1` together with the sub-binary bookkeeping in
+`beam_term`/`beam_alloc` (the parent/live size is not carried on the sub-binary).
 
-The suite-level path moved in the opposite (better) direction: `error_info_child_probe.erl` returns
-`{ok,ok}` in the main process and lets the runtime exit **0**, and at the head measured below the
-spawned child *also* finishes (`DOWN=normal`, 1095 printed lines against the oracle's 1370). The
-`{function_clause,[]}` after 622 lines this section used to record no longer reproduces, so the
-child-level defect it described is gone; **the suite-level abort is not** — see §*D1 — the
-suite-path abort* below, which is the abort the sweep still loses 13 cases to.
+### D3 — `erlang:trace/3` (fixed)
 
-### D2 — `binary:referenced_byte_size/1`
+`{1,1,{flags,[running,call]}}` on both sides for the enable + `trace_info(flags)` readback, i.e. the flags
+round-trip through the runtime's own trace state.
 
-Unchanged: a sub-binary still reports its own size, so `unicode_SUITE`'s five
-`binary:referenced_byte_size(Chomped) =:= PBSz` assertions and `binary_module_SUITE:doctests` still
-fail for the same reason.
+### D4 — map no-op identity, compiled route only
 
-### D3 — `erlang:trace/3`
+| expression (compiled) | oracle | rust |
+|---|---|---|
+| `M = #{a=>1,b=>2}, erts_debug:same(maps:put(a,1,M), M)` | `true` | **`false`** |
+| `M = #{a=>1}, erts_debug:same(maps:put(a,1,M), M)` | `true` | `true` |
+| `M = #{a=>1,b=>2}, erts_debug:same(M#{a=>1}, M)` (update syntax) | `true` | `true` |
+| 100-key map: `erts_debug:same(maps:put(1,1,M), M)` | `true` | **`false`** |
+| 100-key map: `erts_debug:same(maps:merge(#{},M), M)` | `true` | `true` |
+| 100-key map: `erts_debug:same(M` with a *different* value `)` — control | `false` | `false` |
 
-Both the single-flag form and the set-wise form agree with the oracle, including the flags read back
-by `trace_info(self(),flags)`. The four `maps_SUITE:t_*_trapping` rows that failed on
-`{badmatch,badarg}` in `count_nr_of_yields/2` should now get past this point (their remaining
-behaviour was not re-measured here).
-
-### D4 — map identity
-
-`erts_debug:same/2` is `true` for both the no-op `maps:merge(#{},M)` and the no-op
-`maps:put(a,1,M)`, matching the oracle.
+The `-eval` route answers `true` on every row; only the compiled route diverges, and there only for
+`maps:put/3` on a map with **≥2** keys (a 1-key flatmap short-circuits). `put_map_assoc` (the `M#{K=>V}`
+instruction) keeps identity, so the residual is the `maps:put/3` path writing every map through
+`terms::make_map_rooted` with no found-key short-circuit.
+**Owner:** `beam_engine` (`families/maps`, `terms::make_map_rooted`).
 
 ### D5 — stacktrace head
 
-Fixed for the recorded claim: the trace head names the **BIF** (`{maps,with,[[a,b],a]}`,
-`{maps,keys,[a]}`, `{erlang,map_get,[a,b]}`, `{binary,part,[<<1,2>>,0,5]}`) on both sides, and the
-following frames agree too.
-
-Residual (a *different*, smaller class): where the raising call is a **tail call out of an anonymous
-fun**, the Rust trace keeps the fun's frame while the oracle has replaced it —
-`[ {maps,with,[[a,b],a]}, stacktrace_head_probe:'-main/0-fun-0-',0, stacktrace_head_probe:row/2 ]`
-vs the oracle's `[ {maps,with,[[a,b],a]}, stacktrace_head_probe:row/2, stacktrace_head_probe:main/0 ]`.
-That also shifts the `-main/0-fun-N-` numbering by one on those rows. `maps:keys/1`,
-`maps:get/2` and `binary:part/3` (BIF calls, no tail-call-from-fun) match exactly.
-
-### D6 — `erlang:bump_reductions/1`
-
-Still not served, but the **failure surface changed**: `catch erlang:bump_reductions(134217727)`
-does not catch — the runtime terminates with one `beam_rt: unsupported: erlang:bump_reductions/1`
-line and exit **3** (the CLI capability-gap channel), where the notes recorded a catchable
-`{'EXIT',{unsupported_bif,…}}`. Still a typed gap, still never a wrong answer, but a probe that
-wraps the call in `catch`/`try` cannot observe it as an Erlang exception any more. Contrast
-`erts_debug:flat_size/1` below, whose gap **is** catchable as `error:unsupported_bif`.
-
-### D7 — `erlang:system_info(snifs)`
-
-Now published: `556` elements, all 3-tuples, head `{erlang,ref_to_binary,1}`. The oracle answers
-`553` with head `{records,get_definition,2}` — the two lists are each runtime's own static-NIF
-table, so the *count* is not expected to match; the capability gap is closed.
-
-### D8 — BIF-driven Erlang loops are still ~2–3 orders of magnitude late
-
-`maps_bif_loop_probe.erl`, 1000-key maps, 50 rounds, **one** invocation per runtime, run twice with
-the order swapped (host `loadavg` ~32 both times; only the ratio is meaningful):
-
-| workload | rounds × size | ratio, run 1 | ratio, run 2 |
-|---|---|---|---|
-| `maps:merge_with/3` | 50 × 1000 keys | **580×** | **764×** |
-| `maps:intersect_with/3` | 50 × 1000 keys | **94×** | **107×** |
-| `maps:iterator/1` + `maps:next/1` | 50 × 1000 entries | **442×** | **525×** |
-| `maps:to_list/1` (no Erlang callback) | 50 × 1000 entries | 4.8× | 4.3× |
-
-Both sides computed the same work (the probe's `checksum` is `0` on both sides for every row). The
-last row is the control: a pure BIF over the same map costs ~4–5×, so essentially the whole
-residual is the per-callback-call cost of a BIF that keeps invoking an Erlang fun — i.e. the class
-is unchanged in kind and roughly in size versus the recorded ~900–1000× (the recorded figures came
-from full-size suite cases, so the two are not directly comparable; both are "orders of
-magnitude", not "slightly slower").
-
-### D9 — `apply/2` mis-reads its argument list (now with a much smaller repro)
-
-Still present, and **wider** than recorded. The trigger is not `case`-built lists: it is the
-**second argument of `apply/2` arriving in an incoming argument register**.
-
-```erlang
--module(m).
--export([smallest/1]).
-smallest(Args) -> apply(fun(X) -> X end, Args).
-```
-
-`m:smallest([a])` → oracle `a`, rust `error:badarg`.
-
-The full matrix (`apply_args_probe.erl`, every row guarded):
+From `stacktrace_head_probe.erl` (**compiled**), the frame list below the raise agrees for `maps:keys/1`,
+`maps:get/2` and `binary:part/3`.
 
 | shape | oracle | rust |
 |---|---|---|
-| `apply(F, [])`-style: fun param, literal arg list | `a` | `a` |
-| literal fun, **arg list from a parameter** | `a` | **`badarg`** |
-| both fun and arg list from parameters | `a` | **`badarg`** |
-| both from a function-clause pattern | `a` | **`badarg`** |
-| both bound by a **body** match (`{F,As} = {…}`) | `a` | `a` |
-| external fun (`fun lists:reverse/1`), arg list from a parameter | ok / `{badarity,[b,c]}` | **`badarg`** |
-| `apply/3` with all three from parameters | `[3,2,1]` | `[3,2,1]` |
-| direct call `F(Args)` | `[a]` | `[a]` |
-| `lists:foreach(fun({_,F,As}) -> apply(F,As) end, Lit)` | `a` | **`badarg`** |
-| arity mismatch (`apply(fun(X)->X end, [])` compiled) | `{badarity,[]}` | **`badarg`** |
+| `try maps:with([a,b], (fun(X) -> X end)(a)) catch C:R:S` | head `{maps,with,[[a,b],a]}` (with `{file,"maps.erl"},{line,…}`) | head identical, no `file`/`line` on that item |
+| `catch maps:with([a,b], (fun(X) -> X end)(a))` (legacy) | head `{maps,with,[[a,b],a],…}` | head `{d5_probe,legacy_catch,0,…}` — **the BIF frame is missing** |
+| `catch lists:reverse(a)` (legacy) | head `{lists,reverse,1,…}` | head `{d5_probe,legacy_catch,0,…}` |
+| tail call out of a fun (`row/2` → `fun` → `maps:with/2`) | fun frame replaced by the tail call | fun frame `'-main/0-fun-0-'` kept |
 
-So: `apply/2` is correct when the argument list is a literal or a body-bound value, and wrong
-whenever it is an **incoming argument register** — and when the arity actually mismatches the
-reason degrades from `{badarity,{Fun,Args}}` to plain `badarg`. That is exactly the
-`queue_SUITE:oops` shape (`call(Func, As) -> … apply(Func, As)`), which therefore still fails. Note
-the `-eval` evaluator happens to answer these correctly, which is why an `-eval`-only probe hides
-the bug.
+The `-eval` route now attaches **one derived raise-site item** per raise (an empty trace is no longer
+observed), but it names the raise site where OTP names the caller.
+**Consequence for the suite:** `maps_SUITE:t_from_keys/t_with_2/t_without_2/t_merge_opt` fail with
+`{badmatch,{'EXIT',…}}` because the legacy `catch`-and-match on the BIF head frame cannot succeed.
+**Owner:** `beam_engine` `families/exceptions/callee.rs` (legacy-`catch` head-frame synthesis + the
+`file`/`line` metadata on a synthesized BIF item).
 
-**Mechanism corrected (D11):** the "incoming argument register" reading above is wrong. `erlang:apply/2`
-is not *mis-read*, it is **not implemented at all** — every genuine `call_ext erlang:apply/2`
-reaches `beam_rt`'s native floor, which decodes it as the `apply/3` `(Module, Function, Args)` shape
-and calls `Module:Function()`. The rows that pass are rows the **compiler rewrote** into
-`call_fun`/`call` (the compiler does that whenever the *length* of the argument list is known at
-compile time — the fun itself need not be), so they never reach the floor; the rows that fail are
-the ones left as a real
-`erlang:apply/2`. It is therefore not "literal vs register" but "statically inlined vs actually
-called", and the arity-mismatch degradation follows from the same place (a `badarg` from the floor,
-never a `badarity` from the applied fun). Evidence and the smallest reproduction:
-§*queue_SUITE:oops — the value disagreement* below.
+### D6 — `erlang:bump_reductions/1` is a catchable typed gap
 
-### D10 — `erts_debug:set_internal_state/2`
+| shape | oracle | rust |
+|---|---|---|
+| `catch erlang:bump_reductions(134217727)` (compiled) | `true` | `{'EXIT',{unsupported_bif,[{d6_probe,caught,0,…}]}}` |
+| `try … catch C:R` (compiled) | `true` | `{error,unsupported_bif}` |
+| `-eval` uncaught | `true` | `beam_rt: unsupported: bif`, exit `3` |
 
-The oracle's own behaviour has to be reproduced carefully: a bare
-`erts_debug:set_internal_state(unicode_loop_limit,10)` answers **`undef`** (as does
-`…(available_internal_state)`); access has to be enabled first. On this oracle:
+So the reason **is** an observable Erlang exception (`error:unsupported_bif`); the CLI `unsupported` exit `3`
+appears only when the raise escapes the program on the `-eval` route. It stays a typed gap — never a wrong
+answer — and it is what `binary_module_SUITE:longest_common_trap` reports
+(`{exception,error,unsupported_bif,{erlang,bump_reductions,[…]}}`).
+**Owner:** `beam_bifs` (the `erlang:bump_reductions/1` registry entry).
 
-```
-erts_debug:set_internal_state(available_internal_state,true)  → false   (previous value)
-=WARNING REPORT==== … Process <0.10.0> enabled access to the emulator internal state.
-erts_debug:set_internal_state(unicode_loop_limit,10)          → 40000   (previous limit)
-```
+### D7 — `erlang:system_info(snifs)` (fixed)
 
-The notes' `"Process enabled access"` is that warning-report line, i.e. the *earlier* observation
-looked at the wrong half of the exchange. The Rust side answers `false` to the gate call (agreeing)
-and then `beam_rt: unsupported: bif`, exit **3**. So the capability gap stands, but the class
-changed: the raise is now the CLI-level `unsupported` signal (not a catchable `unsupported_bif`),
-and the oracle's comparable value is `40000`, not a success message.
+556 3-tuples, head `{erlang,ref_to_binary,1}`; the oracle answers 553 with head
+`{records,get_definition,2}`. Each is that runtime's own static-NIF table, so only the *availability* of the
+list is the contract, not the count.
 
-### D11 — `erlang:apply/2`
+### D8 — BIF-driven Erlang callbacks are orders of magnitude late
 
-Not implemented: every genuine `call_ext erlang:apply/2` reaches the `beam_rt` native floor, which
-decodes it as `apply/3` and calls `Module:Function()`. The full evidence (the `queue_SUITE:oops`
-op-by-op attribution, the smallest reproduction, the wrong-value shape `apply(erlang, self)`, the
-owning crate and the fix seam) is §*queue_SUITE:oops — the value disagreement* below; the probe is
-`queue_oops_probe.erl`.
+`maps_bif_loop_probe.erl`, 1000-key maps, 50 rounds, **one** invocation per runtime, two runs with the order
+swapped (`loadavg` `19.33` → `18.60`; only the ratio is meaningful):
 
-## Extra observation (not one of D1…D11): `erts_debug:flat_size/1`
+| workload | rounds × size | ratio, run 1 | ratio, run 2 |
+|---|---|---|---|
+| `maps:merge_with/3` | 50 × 1000 keys | **662×** | **614×** |
+| `maps:intersect_with/3` | 50 × 1000 keys | **92×** | **95×** |
+| `maps:iterator/1` + `maps:next/1` | 50 × 1000 entries | **438×** | **480×** |
+| `maps:to_list/1` (no Erlang callback — control) | 50 × 1000 entries | 3.7× | 3.7× |
+
+Both sides computed the same work (`checksum = 0` on both sides for every row). The control row shows a pure
+BIF over the same maps costs ~4×, so essentially the whole residual is the per-callback-call cost of a
+higher-order BIF. Same kind as recorded, roughly in the same magnitude.
+**Owner:** `beam_engine`/`beam_bifs` boundary — the callback-crossing path (`apply_fun` from inside a BIF).
+
+### D9 / D11 — `erlang:apply/2` (fixed, one reason shape left)
+
+`apply/2` is fixed: a fun applied to a proper argument list, `badarg` for a non-fun/non-list, and
+`apply(erlang, self)` is `badarg`.
+
+| shape (compiled, `apply_args_probe` / `queue_oops_probe`) | oracle | rust |
+|---|---|---|
+| `smallest([a])` with `smallest(Args) -> apply(fun(X) -> X end, Args)` | `a` | `a` |
+| `call(F, As)` = `try apply(F,As) of …` (the suite's shape), `call(fun(X)->X end,[a])` | `{value,a}` | `{value,a}` |
+| `apply(erlang, self)` (two atoms) | `error:badarg` | `error:badarg` (head frame `{queue_oops_probe,two_atoms,0,…}`; the oracle names `{erlang,apply,…}`) |
+| `apply(lists, reverse)` | `error:badarg` | `error:badarg` |
+| `mismatch(F,As) -> apply(F,As)` with `fun() -> x end`, `[a]` | `error:{badarity,{Fun,[a]}}` | **`error:badarg`** |
+| `apply(fun lists:reverse/1, [b,c])` (arity mismatch) | `error:{badarity,{fun lists:reverse/1,[b,c]}}` | **`error:badarg`** |
+| `known_length(F) -> apply(F,[a]).` / `apply(fun(X)->X end,[a])` | `a` | `a` (compiler-rewritten `call_fun`, both sides) |
+
+So every *value* agrees and the whole matrix is closed except the arity-mismatch **reason**, which degrades
+from `{badarity,Fun|Args}` to plain `badarg` (and the degraded `badarg` names the caller instead of
+`erlang:apply`).
+**Owner:** `beam_rt` native floor (`src/native.rs`, the `("erlang","apply",2)` arm) — the arity check must
+raise `badarity` with the fun/args payload instead of reusing the `badarg` path.
+**`queue_SUITE:oops`:** the row now **agrees** (both sides `pass`) in `../stdlib/report.json`; the case's
+op-1 `queue:peek({[],[]})` disagreement was entirely this defect, so the suite's model never diverged.
+
+### D10 — `erts_debug:set_internal_state/2` (fixed)
+
+The gate has to be opened first; a bare call answers `undef` on both sides. With the gate open:
+
+| call | oracle | rust |
+|---|---|---|
+| `set_internal_state(available_internal_state,true)` | `false` | `false` |
+| `set_internal_state(unicode_loop_limit,10)` | `40000` (previous limit) | `40000` |
+| `set_internal_state(binary_loop_limit,10)` | `0` | `0` |
+| `set_internal_state(re_loop_limit,10)` | `64000` | `64000` |
+
+The reported value is the **previous** value (the xchg rule), served from
+`crates/beam_bifs/src/runtime/erts_debug.rs`, and the gate-off answer is `undef` with a trace that names
+`erts_debug:set_internal_state/2` on both sides (the rust trace is one item shorter).
+Consequently `binary_module:copy` is no longer blocked by this class.
+
+### D11 — `erlang:trace_delivered/1` after the traced child is gone
+
+| expression (compiled, one process per row) | oracle | rust |
+|---|---|---|
+| `after_down`: `trace(Pid,true,[running,{tracer,self()}])`, receive `{'DOWN',…}`, then `trace_delivered(Pid)` | `#Ref<…>` | `{'EXIT',{badarg,…}}` |
+| `live`: the traced process is still alive | `#Ref<…>` | `#Ref<…>` |
+| `dead_no_monitor`: a pid that terminated without being monitored | `#Ref<…>` | `{'EXIT',{badarg,…}}` |
+
+The **oracle** is right: `erlang:trace_delivered/1`'s documented failure is `badarg` only when the argument
+"does not refer to a process (dead or alive)", and the C `trace_delivered_1` accepts any internal pid plus
+the `all` atom. The rust seam rejects a pid the process table no longer holds:
+`crates/beam_rt/src/trace.rs` `trace_delivered_1` → `if !self.process_table().contains(pid) { Err(BadArg) }`.
+**Owner:** `beam_rt` trace (the delivery bookkeeping must outlive the process, as `trace_delivered` is
+`all`-scoped to the tracer's history, not to a live tracee). This is what
+`maps_SUITE:t_from_list_check_trapping` reports (`{exception,error,badarg,{erlang,trace_delivered,…}}`).
+
+### D12 — a `utf32` bit-syntax segment ignores `little`/`native` for a runtime value
+
+| expression (compiled) | oracle | rust |
+|---|---|---|
+| `f(E) -> <<E/utf32-little>>.` called `f(1)` | `<<1,0,0,0>>` | **`<<0,0,0,1>>`** |
+| `f(E) -> <<E/utf32-native>>.` called `f(1)` (little-endian host) | `<<1,0,0,0>>` | **`<<0,0,0,1>>`** |
+| `<<1/utf32-little>>` (compile-time constant), `<<E/utf32>>`, `<<E/utf32-big>>` | `<<1,0,0,0>>` | `<<1,0,0,0>>` |
+| `<<E:32/little>>` (integer segment) | `<<1,0,0,0>>` | `<<1,0,0,0>>` |
+| `<<E/utf16-little>>`, `<<E/utf16-native>>` | `<<1,0>>` | `<<1,0>>` |
+| match: `<<C/utf32-little,Rest/binary>> = <<1:32/little>>` | `{1,<<>>}` | `{1,<<>>}` |
+| the suite helper shape: `list_to_binary([<<E/utf32-little>> || E <- Bytes])` | utf32-little bytes | **byte-swapped** |
+
+So only **construction** of a `utf32` segment with an explicit `little`/`native` flag is affected, and only
+when the value is not compile-time constant (a literal folds to the correct bytes; a `Big` segment and the
+`utf16`/integer families are correct). `BEAM_RT_TIER=interpreter` reproduces the same wrong bytes, so it is
+not a JIT-only path. Smallest reproduction: `unicode_utf32_probe:u32_little_from_var/1`.
+**Seam:** `crates/beam_engine/src/families/bitstrings/create/prepared.rs` (`(UtfKind::Utf32, Some(v)) =>
+put_utf32(v)`) and `…/create/segments.rs` (`put_utf32` → `v.to_be_bytes()`) — `put_utf32` takes **no
+`little` parameter**, unlike `put_utf16(value, little)`, so the flag is dropped on that arm.
+**Owner:** `beam_engine` (`families/bitstrings/create`).
+**Suite rows:** `unicode_SUITE:ex_binaries_errors_utf32_little/…_utf32_big`'s `freeze/…` assertion at the
+`utf32_inner_loop` step, plus `unicode_SUITE:roundtrips` — `do_roundtrips/1`'s
+`Utf32_Little = list_to_utf32_little_bsyntax(List,{utf32,little})` builds `<<E/utf32-little>>` in a
+comprehension, so the child raises `{badmatch,…}` and the parent's `normal = Reason` fails with
+`{badmatch,{{badmatch,…},[…]}}` at `ex_roundtrips/1`. (The utf16/utf8 `inner_loop` rows are D2, not this.)
+
+### D12b — `unicode:characters_to_binary/3`'s latin1 error split (open, unattributed)
+
+`unicode_SUITE:latin1` fails at staged `unicode_SUITE.erl:414`, i.e.
+`{error,DoubleUtf8,Rest2} = unicode:characters_to_binary([All,AllBin,16#FFF], latin1)` followed by
+`[16#FFF] = lists:flatten(Rest2)` → `{badmatch,<<0,0,…>>}`. The list mixes a *character list* and a
+*binary* and the trailing `16#FFF` is a latin1 error, so the residual reports the wrong remainder (a binary
+instead of `[16#FFF]`). Recorded separately because it is not the utf32 construct: the utf32 lines above it
+in `ex_latin1` pass. **Owner:** not yet attributed — the candidate is `beam_bifs`'s
+`unicode:characters_to_binary/3` error/rest construction on the latin1 character-list path.
+
+## Extra observation — `erts_debug:flat_size/1`
 
 `erts_debug:flat_size/1` raises a **catchable** `error:unsupported_bif` once its argument reaches
-**524288 (`1 bsl 19`)** list elements — 500000 elements answer `1000000`, 524288 answer
-`unsupported_bif`. The oracle computes both. This has nothing to do with `lists:duplicate/2` (which
-is fine up to `1 bsl 21` and beyond) but it *is* what made the first version of the D1 probe abort,
-so it is recorded here rather than silently worked around.
+**524288 (`1 bsl 19`)** list elements (500000 elements answer `1000000`; 524288 answers `unsupported_bif`).
+The oracle computes both. Independent of `lists:duplicate/2`, which is fine well past `1 bsl 21`.
+
+## Sweep rows: which timeouts are budget-only and which are real
+
+The 10 s sweep was load-perturbed (`loadavg` 61.39 before, 58.32 after); the 120 s re-check is authoritative
+for `maps_SUITE`, `lists_SUITE` and `binary_module_SUITE`. Each remaining row was then measured **standalone**
+(same argv, no harness budget, one process) at `loadavg` `4.16`–`12.82`:
+
+| row | 10 s | 120 s | standalone (both sides) | classification |
+|---|---|---|---|---|
+| `binary_module:bin_to_list` | timeout | — | `ok` both (rust 31 s vs sys 1 s) | **budget-only** (perf) |
+| `binary_module:list_to_bin` | timeout | — | `ok` both (1 s / 1 s) | **budget-only** |
+| `binary_module:parts` | timeout | — | `ok` both (rust 27 s vs sys 2 s) | **budget-only** (perf) |
+| `binary_module:random_ref_fla_comp` | timeout | — | `ok` both (rust 24 s vs sys <1 s) | **budget-only** (perf) |
+| `binary_module:random_ref_comp` | timeout | timeout | rust still >400 s (progress: `Number of successes: …`), sys 4 s | **real, perf** (>100×; not a value divergence) |
+| `binary_module:random_ref_sr_comp` | timeout | timeout | rust still >400 s (`Number of successes: 22532`), sys 3 s | **real, perf** (>100×) |
+| `binary_module:copy` | timeout (sys too) | **pass both** | — | **budget-only** (D10 was the earlier blocker) |
+| `dict_SUITE:store` | timeout | — | `ok` both (rust 5 s) | **budget-only** |
+| `lists_SUITE:suffix` | timeout | timeout | `ok` both (<1 s) | **budget-only** (harness/load artifact) |
+| `maps:t_intersect` / `t_intersect_with` / `t_iterator_2` / `t_merge_with` | timeout | **pass both** | — | **budget-only** |
+| `maps:t_keys_trapping` | timeout | `{badmatch,system_limit}` | D1 (`count_nr_of_yields/2` builds a 65537+ element list) | **real** (D1) |
+| `maps:t_values_trapping` / `t_from_keys_check_trapping` | timeout | `{badmatch,system_limit}` | same | **real** (D1) |
+| `maps:t_from_list_check_trapping` | `badarg trace_delivered` | same | D11 | **real** (D11) |
+| `string_SUITE:meas` | timeout (sys too) | — | both sides time out | **budget-only** (system-side; `agree-fail-identical`) |
+| `unicode:category`, `unicode:random_lists`, `unicode:utf8_illegal_sequences_bif` | timeout | — | `ok` / `ok` both standalone | **budget-only** (perf) |
+| `unicode:binaries_errors_limit` | `badmatch,false` | — | D2 | **real** (D2) |
+
+Real divergences that are *not* timeouts at any budget, from both artifacts: `binary_module:doctests`,
+`binary_module:error_info` (D1c), `binary_module:longest_common_trap` (D6), `binary_module:referenced` (D2),
+`maps:doctests`, `maps:t_from_keys`/`t_merge_opt`/`t_with_2`/`t_without_2` (D5), and the five
+`unicode:ex_binaries_errors_*` rows plus `unicode:latin1`/`roundtrips` (D2/D12).
 
 ## Probe files
 
 | file | class | what it measures |
 |---|---|---|
-| `apply_args_probe.erl` | D9 | the `apply/2` argument-position matrix (each row guarded) |
-| `bigterm_spawn_probe.erl` | D1 | the notes' `lists:duplicate(1 bsl 21, x)` repro 5× plain, 5× in a `spawn_monitor` child, plus a deep-recursion/big-term loop and the `flat_size` threshold |
+| `apply_args_probe.erl` | D9 | the `apply/2` argument matrix (each row guarded) |
+| `bigterm_spawn_probe.erl` | D1 | `lists:duplicate(1 bsl 21, x)` 5× plain, 5× in a `spawn_monitor` child, a deep-recursion/big-term loop, and the `flat_size` threshold |
 | `error_info_child_probe.erl` | D1b | `binary_module_SUITE:error_info([])` in the main process and in a spawned child (needs the staged suite `ebin`) |
-| `error_info_abort_probe.erl` | D1c | `error_info/1`'s entry list through `ct_runner:run_case/4`'s shape: `{prefix, N}` (the 69→70 abort threshold) and `{one, Case}` (one lost case, alone in a fresh process) |
-| `maps_bif_loop_probe.erl` | D8 | `merge_with` / `intersect_with` / `iterator+next` reduced-size workloads, with a checksum and a no-callback control row |
-| `queue_oops_probe.erl` | D11 | `erlang:apply/2` from **compiled** code: the smallest reproduction, the `queue_SUITE:call/2` shape, the two-atom `apply(M,F)` → `M:F()` shape, the arity-mismatch reason, the external-fun shape, and the compiler-rewritten control |
-| `stacktrace_head_probe.erl` | D5 | stacktrace head from **compiled** code for `maps:with/2`, `maps:keys/1`, `maps:get/2`, `lists:reverse/1`, `binary:part/3` |
-| `matrix.sh` | shared | one-expression-per-line runner that prints both sides; used for the D2/D3/D4/D6/D7/D10 one-liners |
+| `error_info_abort_probe.erl` | D1c | `error_info/1`'s entry list through `ct_runner:run_case/4`'s shape: `{prefix, N}` (the 69→70 threshold) and `{one, Case}` |
+| `maps_bif_loop_probe.erl` | D8 | `merge_with`/`intersect_with`/`iterator+next` reduced-size workloads, with a checksum and a no-callback control row |
+| `queue_oops_probe.erl` | D9 | `erlang:apply/2` from **compiled** code: the smallest reproduction, the `queue_SUITE:call/2` shape, the two-atom `apply(M,F)`, the arity-mismatch reason, the external-fun shape, and the compiler-rewritten control |
+| `stacktrace_head_probe.erl` | D5 | stacktrace head from **compiled** code for `maps:with/2`, `maps:keys/1`, `maps:get/2`, `lists:reverse/1`, `binary:part/3`, incl. the tail-call-from-a-fun and legacy-`catch` rows |
+| `unicode_utf32_probe.erl` | D12 | `<<E/utf32-little>>` from a parameter vs a literal, the `/utf32-native`, shift-segment, `utf16-little`, match-context and comprehension (suite-helper) shapes |
+| `matrix.sh` | shared | one-expression-per-line runner that prints both sides |
 
 Build and run any of them with:
 
@@ -270,277 +372,4 @@ cd $TMPDIR/stdlib-diag/cwd   # a throwaway cwd
 erl   -noshell -pa $TMPDIR/stdlib-diag/ebin -eval '<probe>:main(), halt(0).'
 ```
 
-## D1 — the suite-path abort: smallest reproduction
-
-Measured at branch head `f869e63416d9e8c77c918ee1b3e5728bba916b71` with
-`erts_rust/target/release/beam_rt` built from it (`cargo.sh build -p beam_rt --release`);
-host `loadavg` `16.21 12.66 14.93` (shared: no absolute time below is a claim).
-The staged suite beams are the shared `/tmp/erts-suites-stage/stdlib` ones, unchanged.
-
-**Probe: `error_info_abort_probe.erl`** (new, in this directory). It drives the suite's own
-code through the **same shape as `ct_runner:run_case/4`** — a `spawn_monitor`'d child, a
-`try`/`catch` around the case, and `exit({ct_case_result, Result})` — with two modes:
-`{prefix, N}` (the first `N` of `error_info/1`'s **73**-entry literal list through
-`error_info_lib:test_error_info(binary, Prefix)`) and `{one, Case}` (one named case, alone in a
-fresh OS process).
-
-### 1. It is still the same abort, and it is stable
-
-The harness's own invocation, run by hand (throwaway cwd):
-
-```
-beam_rt -noshell -pa <stage>/ebin -pa <stage>/ctl \
-        -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "<stage>/src"), halt(0).'
-```
-
-→ **exit 1**, stderr exactly `beam_rt: system_limit`, stdout stops after `CASE encode_decode OK`
-plus the first two `error_info` blocks (44 lines; the ~1100 lines the case really prints are lost
-with the port buffer when the runtime exits). Reproduced 2/2 runs at this head, and 6/6 with the
-same shape narrowed to `error_info` alone, so the abort is deterministic **for a given build**.
-
-### 2. Smallest reproduction: an entry-count threshold inside `error_info`
-
-`error_info_abort_probe:main({prefix, N})`, identical argv on both sides:
-
-| N (entries of `error_info`'s list) | oracle | rust |
-|---|---|---|
-| 68 | `{exception,exit,{test_case_failed,…}}`, exit 0 | same, exit 0 |
-| 69 | same, exit 0 | same, exit 0 |
-| **70** | `{ok,ok}`, exit 0 | **`beam_rt: system_limit`, exit 1** |
-| 73 (= `all`) | `{ok,ok}`, exit 0 | **`beam_rt: system_limit`, exit 1** |
-
-(`error_info_lib` fills every BIF the given list does not cover with `nyi` entries, which is why a
-*short* prefix still raises `{test_case_failed,…}` on both sides — that is the probe's control
-row.) The suite path is the N = 73 row. The threshold is **not** the reason term's size: a child
-that exits with `{x, lists:seq(1, 1000000)}` — three orders of magnitude more words — copies fine
-and the parent receives it. Nor is it a single offending entry: dropping any one entry (including
-entry #70, `{matches,[<<1:1>>,{bm,make_ref()}],…}`) leaves the abort in place.
-
-### 3. Which ingredient is load-bearing: the ct shape, not the spawn
-
-Same `binary_module_SUITE:error_info` call, one shape per OS process:
-
-| shape | rust |
-|---|---|
-| main process, plain | `ok`, exit 0 |
-| main process, inside `try/catch` | `ok`, exit 0 |
-| `spawn_monitor` child, plain (`error_info_child_probe`, D1b) | `DOWN=normal`, exit 0 |
-| child, value returned from the fun (no `exit/1`) | `DOWN=normal`, exit 0 |
-| child, `exit({ct_case_result, error_info(… )})` — no `catch` | `{ct_case_result,ok}`, exit 0 |
-| child, `try/catch` + `exit({ct_case_result, R})` where `R` is the **caught** result, `try` in a **called function** (ct_runner's exact shape) | **abort** — `beam_rt: system_limit` (exit 1) or SIGSEGV (exit 139) |
-| child, the same with the `try/catch` **inline** in the fun instead | passed 3/3 at this build |
-
-So the load-bearing ingredients are `spawn` **together with** the `catch`-and-`exit` hand-off: the
-child must *raise out* of itself with the structured result, i.e. the raise's reason has to cross
-the runtime's escape boundary. `error_info` alone in that same shape and in a fresh process
-**passes** (`{ok,ok}` on both sides — see the per-case table in §5), so the case's own logic is not
-the defect. The difference between the last two rows is one function boundary, which is itself the
-signal: the outcome flips with heap layout, and the two failure *manifests* (a refusal and a
-SIGSEGV) come from the same instruction.
-
-### 4. Mechanism: (b) — a failed escape-store copy of the raise's reason, not an escaping
-
-`system_limit`. No `catch` in the program can see it, because the runtime produces it *while
-handling* the raise:
-
-- `BEAM_RT_BOOT_TRACE=1` shows the child's raise last — class `Exit`, `reason: Structured`,
-  `live_reason: Some("<live reason>")` at `d1_variants_probe:normalize/1` (the `exit/1` that
-  `ct_runner`'s `normalize/1` performs) — immediately followed by
-  `round: … result=Err(SystemLimit)` and `call_bif … -> SystemLimit`, then
-  `beam_rt: system_limit`.
-- The stack of that round, from `gdb` on the SIGSEGV manifest of the same program:
-
-  ```
-  #0 beam_term::bitstring::bit_at            (crates/beam_term/src/bitstring.rs:339)
-  #1 beam_message::copy::copy_match_context  (crates/beam_message/src/copy.rs:365)
-  #2 beam_message::copy::try_copy_fast       (copy.rs:537)   ← copy_struct / copy_struct_simple
-  #5 beam_rt::runtime::Runtime::stabilize_term            (src/runtime.rs:2650)
-  #7 beam_rt::runtime::gc::stabilize_error_live_reason    (src/runtime/gc.rs:1034)
-  #8 beam_rt::runner::run                                 (src/runner/run.rs:1718)
-  ```
-
-  i.e. the arm whose comment reads "a reason that genuinely cannot be copied is the honest
-  `error:system_limit`". `crate::error::enforce_term_heap_limit` is the mapping pointed at by
-  `Runtime::stabilize_term`, and it turns **only** `AllocKind::Heap` (or message-heap exhaustion)
-  into `SystemLimit`; `beam_rt::cli`'s `EXIT_RUNTIME` (= 1) is what the shell then sees.
-- `copy_match_context` takes its bit count from `ErlSubBits`'s `start`/`end` words and dereferences
-  the **base pointer stored in the term** (`bitstring_parts`/`bit_at`) with no owning handle to
-  validate it — because the copy ran on the **empty**-source-table path (`stabilize_term`, not
-  `stabilize_term_with`: `src.is_empty()` in `Runtime::stabilize_term_with` short-circuits to it).
-  Garbage there yields an impossible window size (→ the destination reservation is refused → the
-  `system_limit` above) or an unmapped page (→ the SIGSEGV at the same instruction). Which payload
-  inside the reason is dead is **unknown** from the outside; what is established is that the reader
-  is unsound on that path, not that the term is genuinely too large.
-
-### 5. The 13 cases the sweep reports as `error` — each measured alone
-
-`error_info_abort_probe:main({one, Case})`, one process per row, both sides:
-
-| case | rust | oracle | would record as |
-|---|---|---|---|
-| `error_info` | `{ok,ok}` | `{ok,ok}` | **agree** |
-| `guard` | `{ok,{comment,"…"}}` | same | agree |
-| `hex_encoding` | `{ok,ok}` | `{ok,ok}` | agree |
-| `interesting` | `{case_exception,error,{badmatch,false},…}` | identical | agree-fail-identical |
-| `join` | `{ok,<<>>}` | same | agree |
-| `list_to_bin` | `{ok,ok}` | `{ok,ok}` | agree |
-| `longest_common_trap` | `{case_exception,error,unsupported_bif,{erts_debug,set_internal_state,[binary_loop_limit,10],[]}}` | `{ok,ok}` | rust-gap (typed) |
-| `parts` | `{ok,ok}` | `{ok,ok}` | agree |
-| `random_ref_comp` | **timeout** (60 s budget; log reached `Number of successes: 5287`) | `{ok,ok}` | rust-gap (too slow) |
-| `random_ref_fla_comp` | `{ok,ok}` | `{ok,ok}` | agree |
-| `random_ref_sr_comp` | **timeout** (60 s; `Number of successes: 7500`) | `{ok,ok}` | rust-gap (too slow) |
-| `referenced` | `{case_exception,error,{badmatch,1023},…}` | `{ok,ok}` | **divergence** (D2, `binary:referenced_byte_size/1`) |
-| `scope_return` | `{ok,ok}` | `{ok,ok}` | agree |
-
-Nine of the thirteen are measurable today and eight of those agree (the ninth, `interesting`, fails
-identically on both sides); the losses that remain are one typed gap, one D2 divergence and two
-cases too slow to finish (the sweep's own per-case budget is 10 s, so those two were never
-measurable *in the sweep* either — `random_ref_fla_comp` finishing in the same run shows the
-timeouts are workload cost, not a hang). So the report's "case missing from the rust runtime's
-output" is a property of **running the suite in one process**, not of the cases: the abort takes
-the process down at `error_info` and every later case loses its turn.
-
-
-## queue_SUITE:oops — the value disagreement
-
-`queue_SUITE:oops` (`../stdlib/report.json`, verdict `divergence`) is the **only** row of the
-committed stdlib sweep whose Rust detail is the suite's own model disagreement —
-`{exception,throw,{diff,[{value,…},{…}|…]},{queue_SUITE,emul,4,…}}` — where the other 28
-`divergence` rows are timeouts, doctest counts, `badmatch`es or typed `unsupported_bif`s. A
-`{diff,…}` throw is `queue_SUITE:emul/4`'s "the two models disagree" signal, i.e. the suite
-itself believes it has positive evidence of a wrong value, so it had to be separated into *a
-wrong `queue` result* (serious) versus *the suite catching a runtime error* (still a runtime
-defect, a different one).
-
-Measured at branch head `173e121ec6` with `erts_rust/target/release/beam_rt` built from it
-(`cargo.sh build -p beam_rt --release`); host `loadavg` `13.67 16.92 16.03` (shared — no
-duration below is a claim); oracle OTP `29.1.2` / erts `17.1.1` against this runtime's
-`system_info(version)` `"17.1"`. The staged suite beams are the shared
-`/tmp/erts-suites-stage/stdlib` ones, compiled by the oracle's `erlc`, unchanged; the Rust
-runtime needs no recompilation of the suite.
-
-**Answer: no `queue` value is ever wrong, and the suite's emulation is fair. The models do
-not diverge at all — the disagreement is the *first* op, and it is `erlang:apply/2`
-raising `badarg` for a legitimate call (class D11).**
-
-### 1. The first diverging op is op 1, with both models empty
-
-`queue_SUITE:oops/1` seeds `rand:seed(exsplus, {1,2,4})`, draws 3142 op indices and folds
-`emul/4` over them; each round prints `% Op % AsA % AsB :` before comparing. Same argv on
-both sides (`-noshell -pa <stage>/ebin -pa <stage>/ctl -eval 'R = (catch queue_SUITE:oops([])), …'`):
-
-| side | op lines (`^% `) | op 1 | RESULT |
-|---|---|---|---|
-| oracle | **3142** | `% peek % [{[],[]}] % [{[]}] :<empty> \|[]\| ` | `ok` |
-| rust | **1** | `% peek % [{[],[]}] % [{[]}] :` | `{diff,[{value,empty},{error,badarg},peek,[{[],[]}],[{[]}]]}` |
-
-Op 1 is `peek` on two **empty** queues: `XX = queue:peek({[],[]})` → `{value,empty}` and
-`YY` (the suite's emulation fun) → `{error,badarg}`, so `emul/4`'s `{Exception,Exception}`
-arm cannot match and it throws `{diff,…}`. There is no earlier op to bisect to — **the
-first op is the first divergence** — and no state has been built yet, so the "the two
-models' states (`QsA0`/`QsB0`) diverged on an earlier op" reading does not hold: `AsA=[{[],[]}]`
-and `AsB=[{[]}]` are simply the two empty-queue representations. The `queue` module itself
-agrees (`queue:peek/1` `empty`, `queue:len/1` `0`, `queue:is_queue/1` `true` on both sides).
-
-### 2. Attribution: patch `apply/2` out of the suite and the whole case passes
-
-An instrumented copy of `queue_SUITE` in `$TMPDIR` (module renamed so the stage beams stay
-pristine, compiled with the oracle's `erlc`, everything else untouched) changes exactly one
-line of `call/2` — `_ -> apply(Func, As)` becomes `_ -> dyn(Func, As)` with
-`dyn/2` spelling out `F()`, `F(A)`, `F(A,B)`, `F(A,B,C)`:
-
-* patched driver, **Rust**: **3142** op lines, `RESULT=ok` — every op agrees, `queue`,
-  `rand:uniform_s/2`, `chk/5` and `queue:to_list/1` included.
-* unpatched driver, **Rust**: 1 op line, `RESULT={diff,…}` (op 1, above).
-
-So the whole of `oops/1` is correct on this runtime except `erlang:apply/2`. (A first
-attempt patched the line to `apply(erlang, apply, [Func, As])`, which does **not** help: a
-nested `apply of apply/3` is unwrapped by the engine's `resolve_call_ext_apply`
-(`crates/beam_engine/src/interpreter/dispatch.rs`) straight back onto the host's `apply/2`.)
-
-### 3. Root cause: `erlang:apply/2` is served by an `apply/3`-shaped floor
-
-`apply(Fun, Args)` compiles (OTP's `erlc`) to `call_ext 2 erlang:apply,2`; the engine
-deliberately declines that arity and leaves it to the host —
-`crates/beam_engine/tests/call_ext_apply.rs:43-57` pins "must reach
-`call_bif("erlang","apply",2,[Fun,Args])`, the host's own `apply/2`" — and that same test records
-that the **engine** used to fabricate `Module:Function()` here and was fixed by handing the call to
-the host. The host then fabricates exactly that, i.e. the fabrication moved one layer down:
-
-* `crates/beam_rt/src/native.rs:414` — `("erlang", "apply", 2) => Some(self.apply_dynamic(args, false))`
-* `crates/beam_rt/src/native.rs:781` — `apply_dynamic` reads `args[0]` as the **module** and
-  `args[1]` as the **function**, and calls it with **zero** arguments.
-
-Consequences, all measured from a **compiled** module (`queue_oops_probe`; the `-eval`
-tree-walk evaluator has its own correct `apply_2` in `beam_rt/src/eval/mod.rs`, so an
-`-eval`-only probe hides everything here):
-
-| compiled expression | oracle | rust |
-|---|---|---|
-| `f(As) -> apply(fun(X) -> X end, As).` called `f([a])` | `a` | **`error:badarg`** |
-| `call(Func, As)` = `try apply(Func, As) of …` (the suite's shape), `call(fun(X)->X end, [a])` | `{value,a}` | **`{error,badarg}`** |
-| `apply(erlang, self)` | `error:badarg` | **`<0.35.4>` — it ran `erlang:self/0` and returned a pid** |
-| `apply(lists, reverse)` | `error:badarg` | **`error:undef`** — it ran `lists:reverse/0` |
-| `mismatch(F, As) -> apply(F, As)` with `fun() -> x end`, `[a]` | `error:{badarity,{Fun,[a]}}` | **`error:badarg`** |
-| `apply(fun lists:reverse/1, As)` with `As=[1,2]` | `error:{badarity,{fun lists:reverse/1,[1,2]}}` | **`error:badarg`** |
-| `known_length(F) -> apply(F, [a]).` — unknown fun, list of known **length** | `a` | `a` (the compiler rewrote it: `erlc -S` shows `{call_fun,1}`) |
-| `apply(fun(X) -> X end, [a])` — literal fun **and** list | `a` | `a` (same rewrite, `{call_fun,1}`) |
-
-The last two rows are the controls that explain why this survived: an `apply/2` whose argument
-list has a statically known **length** is rewritten by the compiler into `call_fun` (the fun may
-be unknown — `known_length/1` is the proof: `call_fun,1`, no `apply/2`), so only the genuinely
-dynamic ones reach the runtime — which is why the same defect looks like "works with literals,
-fails with parameters" and why it was recorded (wrongly) as a register/mis-read issue under D9. The floor's own unit test,
-`crates/beam_rt/src/native.rs:1790` `apply_of_two_arguments_calls_a_zero_arity_bif` ("`erlang:apply(erlang,
-self)` — a registered `erlang` BIF reached dynamically", asserting the result is a pid) asserts
-exactly the behaviour the oracle rejects with `badarg` — so it pins the defect rather than
-catching it.
-
-### 4. Owning crate and fix seam
-
-* **Owning crate: `beam_rt`** — the native floor (`crates/beam_rt/src/native.rs:414` and
-  `apply_dynamic` at `:781`). It is reached *by design*: the engine
-  (`crates/beam_engine/src/interpreter/dispatch.rs:803-825`) documents that `erlang:apply/2`
-  is not a `fixed_apply` shape and must stay "the host's own `erlang:apply/2`", and
-  `beam_bifs` is not involved either (`apply/2` is C's `i_apply_fun` instruction, not a SNIF;
-  the registry only answers the `erlang:is_builtin` special case).
-* **Correct shape:** a fun (or external fun) in `args[0]` applied to the proper list in
-  `args[1]` via `ExecutionContext::apply_fun` (the C's `apply_fun(c_p, x(0), x(1), reg)`);
-  anything else in `args[0]`, a non-list/improper `args[1]`, and any arity mismatch must raise
-  the oracle's reason — `badarg` for the first two, `badarity` for the mismatch.
-* **Do not just delete the arm:** the floor's own unit tests drive the two-atom reading —
-  `crates/beam_rt/src/native.rs:1795`, `:1811`, `:1821` call `("erlang","apply")` with
-  `[module, function]` (the first one is the pid test above); they must move to the explicit
-  `apply/3` form (`[module, function, []]`) and the pid test must be replaced by a `badarg`
-  assertion when the arm changes meaning.
-
-### 5. What class is this, stated plainly
-
-* **Not a wrong `queue` result**, and **not** the suite's emulation being unfair — §2 rules
-  both out; `queue_SUITE:oops`'s `divergence` verdict in `../stdlib/report.json` is correct
-  and must stay.
-* **A runtime defect whose error surface is `badarg`**, i.e. the *most* misleading kind: a
-  legal Erlang program gets a plain, catchable `error:badarg` that is indistinguishable from
-  a genuine argument error, instead of either the right answer or the runtime's documented
-  typed `unsupported` channel. If the differential corpus pinned a genuinely dynamic
-  `apply/2`, both tools would classify it as a `mismatch` (a plain Erlang `badarg` is an
-  observation, never one of the two `unsupported` signals) — see the coverage note below.
-* **And it does produce a wrong value** in the sibling shape: `apply(M, F)` with two atoms
-  *executes* `M:F/0` (`apply(erlang, self)` → a pid) where the oracle raises `badarg`. So the
-  class is wrong-result, not merely unimplemented — it is just that `queue_SUITE` sits on the
-  spurious-`badarg` side of it.
-* Blast radius outside this row: `lib/stdlib/test` contains 63 textual `apply(` sites (mixing
-  `apply/2` and `apply/3`), so several suites can reach the same defect; `queue_SUITE:oops`
-  is simply the one whose very first op is a dynamic `apply/2`.
-
-### 6. Why the differential gate did not catch it (out of this node's scope, reported)
-
-`tools/differential` has exactly one case naming `apply/2` —
-`bifs/apply_and_binary_list_conversions` (`corpus/bifs.rs:1514`), whose `erlang:apply(fun(X) ->
-X+1 end, [1])` agrees. It cannot see this defect for **two independent** reasons: it is an
-`Eval` case, so it runs in the `-eval` tree-walk evaluator (which has its own correct
-`apply_2`), and even as compiled code its fun *and* list are literals, so the compiler rewrites
-the call into `call_fun`. A gate case that pins `apply/2` needs **compiled** code (`CaseKind::
-Module`/`ModuleEnv`) with both operands arriving as parameters — i.e. exactly
-`queue_oops_probe:smallest/1`, plus the two-atom `apply(erlang, self)` shape for the
-wrong-value half. Adding it belongs to `tools/differential`, not to this node.
+Staged-suite probes additionally need `-pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl`.
