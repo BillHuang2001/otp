@@ -1,17 +1,17 @@
 {
   "schema": "suites/1",
-  "generated_at": 1793264700,
+  "generated_at": 1793266833,
   "run_command": "suites run --target stdlib --suite maps_SUITE,lists_SUITE,binary_module_SUITE --timeout 120 --suite-budget 900 --jobs 1 --out results/stdlib/recheck-120",
   "host": {
-    "loadavg_before": "58.32 50.07 29.76 141/1478 1104",
-    "loadavg_after": "43.07 71.19 52.17 28/999 1697",
+    "loadavg_before": "6.28 6.20 16.28 3/881 4704",
+    "loadavg_after": "4.72 5.49 12.15 2/879 5297",
     "nproc": 16,
     "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
     "oracle_version": "29/17.1.1"
   },
   "rust": {
     "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt",
-    "sha": "71ffbbb37971d0b193e0dc74b60b6c448874349e",
+    "sha": "e18f151ba89a30f3dffb39d68805b985a1c98133",
     "version": "30/17.1",
     "tier": null
   },
@@ -22,7 +22,7 @@
       "source": {
         "repo": "otp",
         "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/lib/stdlib/test",
-        "sha": "9e860feef6702c61bacf6c24e31b4e5731778f11",
+        "sha": "e18f151ba89a30f3dffb39d68805b985a1c98133",
         "staged": "/tmp/erts-suites-stage/stdlib/src"
       },
       "build": {
@@ -54,16 +54,16 @@
       ],
       "tally": {
         "measured": 130,
-        "agree": 113,
+        "agree": 114,
         "agree_fail_identical": 1,
-        "divergence": 16,
+        "divergence": 15,
         "oracle_only_fail": 0,
         "rust_gap": 0,
         "not_run": 0,
         "sys_passed": 129,
         "sys_failed": 1,
-        "rust_passed": 113,
-        "rust_failed": 17
+        "rust_passed": 114,
+        "rust_failed": 16
       },
       "rows": [
         {
@@ -1527,13 +1527,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2803,7 +2803,7 @@
         "cases that fail identically on both sides (missing `ct` config/data dirs, group-hook dependencies) are `agree-fail-identical`: excluded from both numerators, never counted as passes",
         "per-case timeout: 120 s · suite budget: 900 s (the runner stops launching cases when the budget expires and prints `SUITE_DEADLINE <not-run>`, so the remaining cases are reported as *not measured*, never as failures)",
         "binary_module_SUITE: 20 cases — sys 19/1 pass/fail, rust 13/7 pass/fail",
-        "lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 77/1 pass/fail",
+        "lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 78/0 pass/fail",
         "maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 23/9 pass/fail"
       ]
     }

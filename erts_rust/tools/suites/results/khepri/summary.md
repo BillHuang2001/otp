@@ -1,14 +1,14 @@
 # Test-suite parity sweep
 
-Generated at `1793263701` (Unix seconds) by `suites run --target khepri --jobs 4 --out results/khepri`.
+Generated at `1793266279` (Unix seconds) by `suites run --target khepri --jobs 4 --out results/khepri`.
 
 ## Environment
 
 - oracle: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` — `29/17.1.1`
 - rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt` — `30/17.1`
-- rust workspace commit: `71ffbbb37971d0b193e0dc74b60b6c448874349e`
+- rust workspace commit: `e18f151ba89a30f3dffb39d68805b985a1c98133`
 - tier: `default`
-- loadavg before/after: `9.06 10.67 10.47 97/1596 5` / `14.85 12.52 11.17 18/954 3603` on 16 logical CPUs
+- loadavg before/after: `2.76 6.12 18.63 3/892 4` / `3.98 5.95 17.43 3/844 3602` on 16 logical CPUs
 - the host is **shared**: only pass/fail counts are portable, never a wall time
 
 ### Target `khepri` (eunit)
@@ -17,8 +17,8 @@ Generated at `1793263701` (Unix seconds) by `suites run --target khepri --jobs 4
 - staged copy: `/tmp/erts-suites-stage/khepri/proj`
 - build: `/nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile` — ok (reused a completed build)
 - build detail: reused a completed `rebar3 as test compile` in the staged copy
-- tally: measured 43 · agree 20 · agree-fail-identical (excluded) 8 · divergence 2 · oracle-only-fail 0 · rust-gap 21 · not-run 0
-- totals: sys 1500/1 passed/failed · rust 412/1 passed/failed
+- tally: measured 43 · agree 21 · agree-fail-identical (excluded) 8 · divergence 2 · oracle-only-fail 0 · rust-gap 20 · not-run 0
+- totals: sys 1500/1 passed/failed · rust 403/1 passed/failed
 
 Notes:
 - drive (identical on both sides): `eunit:test('{module}',[verbose]), halt(0).` — the module name is substituted per row
@@ -32,10 +32,10 @@ Notes:
 | row | sys (P/F) | rust (P/F) | verdict | first divergence / note |
 |---|---|---|---|---|
 | `advanced_delete` | 33/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
-| `advanced_get` | 13/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
+| `advanced_get` | 13/0 | 13/0 | agree |  |
 | `advanced_put` | 40/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
-| `advanced_tx_delete` | 39/0 | error | rust-gap | ======================== EUnit ======================== module 'advanced_tx_delete' advanced_tx_delete:22: -delete_non_existing_node_test_/0-fun-4-...[0.097 s] … |
-| `advanced_tx_get` | 15/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
+| `advanced_tx_delete` | 39/0 | error | rust-gap | ======================== EUnit ======================== module 'advanced_tx_delete' advanced_tx_delete:22: -delete_non_existing_node_test_/0-fun-4-...[0.083 s] … |
+| `advanced_tx_get` | 15/0 | 15/0 | agree |  |
 | `advanced_tx_put` | 43/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `app` | 36/0 | 36/0 | agree |  |
 | `async_option` | 20/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
@@ -53,7 +53,7 @@ Notes:
 | `fence` | 6/0 | 6/0 | agree |  |
 | `helpers` | no_tests | no_tests | agree-fail-identical | no eunit tests (common_test suite or helper module) |
 | `keep_while_conditions` | 27/0 | 26/1 | divergence | keep_while_conditions: delete_node_with_many_dependents: **error:{assert,[{module,keep_while_conditions}, |
-| `machine_code_called_from_ra` | 15/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
+| `machine_code_called_from_ra` | 15/0 | 15/0 | agree |  |
 | `mod_used_for_transactions` | no_tests | no_tests | agree-fail-identical | no eunit tests (common_test suite or helper module) |
 | `non_versioned_commands` | 15/0 | 15/0 | agree |  |
 | `path_operations` | 51/0 | 51/0 | agree |  |
@@ -65,13 +65,13 @@ Notes:
 | `protect_against_dups_option` | 13/0 | 13/0 | agree |  |
 | `put_command` | 19/0 | 19/0 | agree |  |
 | `queries` | 16/0 | 16/0 | agree |  |
-| `return_indirect_deletes_option` | 15/0 | 15/0 | agree |  |
+| `return_indirect_deletes_option` | 15/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `root_node` | 22/0 | 22/0 | agree |  |
 | `sigils` | 4/0 | 4/0 | agree |  |
-| `simple_delete` | 42/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
+| `simple_delete` | 42/0 | 42/0 | agree |  |
 | `simple_get` | 94/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `simple_put` | 38/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
-| `simple_tx_delete` | 46/0 | 46/0 | agree |  |
+| `simple_tx_delete` | 46/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `simple_tx_get` | 106/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `simple_tx_misc` | 45/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `simple_tx_put` | 47/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
@@ -80,7 +80,7 @@ Notes:
 | `timeout` | 6/0 | 6/0 | agree |  |
 | `triggers` | 118/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `tx_funs` | 42/0 | 42/0 | agree |  |
-| `tx_sprocs` | 33/0 | 33/0 | agree |  |
+| `tx_sprocs` | 33/0 | unsupported | rust-gap | opcode: run: process blocked (no message available) |
 | `utils` | 7/0 | 7/0 | agree |  |
 
 Recorded invocations (the two sides get the *same* `-pa` set and the *same* `-eval`):

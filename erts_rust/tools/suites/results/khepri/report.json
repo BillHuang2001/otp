@@ -1,17 +1,17 @@
 {
   "schema": "suites/1",
-  "generated_at": 1793263701,
+  "generated_at": 1793266279,
   "run_command": "suites run --target khepri --jobs 4 --out results/khepri",
   "host": {
-    "loadavg_before": "9.06 10.67 10.47 97/1596 5",
-    "loadavg_after": "14.85 12.52 11.17 18/954 3603",
+    "loadavg_before": "2.76 6.12 18.63 3/892 4",
+    "loadavg_after": "3.98 5.95 17.43 3/844 3602",
     "nproc": 16,
     "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
     "oracle_version": "29/17.1.1"
   },
   "rust": {
     "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt",
-    "sha": "71ffbbb37971d0b193e0dc74b60b6c448874349e",
+    "sha": "e18f151ba89a30f3dffb39d68805b985a1c98133",
     "version": "30/17.1",
     "tier": null
   },
@@ -63,15 +63,15 @@
       ],
       "tally": {
         "measured": 43,
-        "agree": 20,
+        "agree": 21,
         "agree_fail_identical": 8,
         "divergence": 2,
         "oracle_only_fail": 0,
-        "rust_gap": 21,
+        "rust_gap": 20,
         "not_run": 0,
         "sys_passed": 1500,
         "sys_failed": 1,
-        "rust_passed": 412,
+        "rust_passed": 403,
         "rust_failed": 1
       },
       "rows": [
@@ -108,13 +108,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "unsupported",
-            "passed": 0,
+            "status": "pass",
+            "passed": 13,
             "failed": 0,
             "skipped": 0,
-            "detail": "opcode: run: process blocked (no message available)"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -154,7 +154,7 @@
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "======================== EUnit ======================== module 'advanced_tx_delete' advanced_tx_delete:22: -delete_non_existing_node_test_/0-fun-4-...[0.097 s] ok advanced_tx_delete:30: -delete_non_existing_node_test_/0-fun-1-...[0.001 s] ok"
+            "detail": "======================== EUnit ======================== module 'advanced_tx_delete' advanced_tx_delete:22: -delete_non_existing_node_test_/0-fun-4-...[0.083 s] ok advanced_tx_delete:30: -delete_non_existing_node_test_/0-fun-1-...[0.001 s] ok"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -171,13 +171,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "unsupported",
-            "passed": 0,
+            "status": "pass",
+            "passed": 15,
             "failed": 0,
             "skipped": 0,
-            "detail": "opcode: run: process blocked (no message available)"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -549,13 +549,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "unsupported",
-            "passed": 0,
+            "status": "pass",
+            "passed": 15,
             "failed": 0,
             "skipped": 0,
-            "detail": "opcode: run: process blocked (no message available)"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -801,13 +801,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 15,
+            "status": "unsupported",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "opcode: run: process blocked (no message available)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -864,13 +864,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "unsupported",
-            "passed": 0,
+            "status": "pass",
+            "passed": 42,
             "failed": 0,
             "skipped": 0,
-            "detail": "opcode: run: process blocked (no message available)"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -927,13 +927,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 46,
+            "status": "unsupported",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "opcode: run: process blocked (no message available)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -1116,13 +1116,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 33,
+            "status": "unsupported",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "opcode: run: process blocked (no message available)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
