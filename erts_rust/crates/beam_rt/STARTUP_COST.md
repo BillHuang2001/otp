@@ -19,20 +19,26 @@ is far above the host's own spread.
 |---|---|---|---|
 | campaign start (the control) | 2 045 799 320 | ≈ 220 ms | 1.00 |
 | the atom-table fork's own control | 1 749.4 M | — | 0.855 |
-| current | 1 473.3 M | — | 0.720 |
+| the previous round's control (commit 2d0fe67808) | 1 083.7 M | — | 0.530 |
+| current | 1 073.6 M | — | 0.525 |
 
 The control is the base commit **rebuilt from its own source**, never a stashed binary: a
 from-source rebuild of identical source is instruction-identical but 2–4 % apart in wall, so a
-kept binary cannot serve as a control.
-`−28.0 %` of the boot is what the changes below account for, and each of their deltas is a **paired**
-measurement against its own from-source rebuild — which is why the fork's control (1 749.4 M) is a
-row of its own and is not the campaign-start figure: the two are different rounds of the same tree
-lineage.
-The current rows quote no wall figure: the host's own spread on wall is 2–4 %, so retired
-instructions are the signal and a wall figure is only quoted where the effect is far above that
-spread (the campaign-start `≈ 220 ms` is the one such figure).
-What the floor still holds and no single change owns is the profile below: dispatch, atom intern,
-the codec and the allocator.
+kept binary cannot serve as a control — the one exception is a **paired** alternate, which is what
+the pre-round binary (`2d0fe67808`) is here: it alternates against the current binary inside every
+round, so each round's own ratio is measured back to back.
+`−47.5 %` of the boot against the campaign start is what the changes below account for, and each of
+their deltas is a **paired** measurement against its own from-source rebuild — which is why each
+round's own control (the fork's 1 749.4 M, this round's 1 083.7 M) is a row of its own and is not
+the campaign-start figure: they are different rounds of the same tree lineage.
+The last round's changes took **1 083.7 M → 1 073.6 M** (**−0.93 %**), the median of 5 interleaved
+rounds, `taskset -c 3`, 1-min load 130–137.
+The floor's current rows quote no wall figure: the host's own spread on wall is 2–4 %, so retired
+instructions are the signal, and a wall figure is quoted only where the effect is far above that
+spread (the campaign-start `≈ 220 ms`) or where it is explicitly load-flagged (§ *Instructions are
+not time*).
+What the floor still holds and no single change owns is the profile below: the interpreter's
+dispatch and the module-graph load.
 
 ## The landed changes and their paired deltas
 
@@ -54,8 +60,8 @@ under `taskset -c 2`, noise band ±0.08 %; §(a) carries the mechanism and the c
 single-nursery-space shortcut (`a36873b8f0`), the off-by-default invocation census plus the per-pid
 admissions/collections block (`f9e22744af`), the mutator block hoisted out into the walk's geometry
 (`caab3d3f90`), and the visited set's room-making moved out of the insert hot path
-(`1304a6b44c`) — which is also why `Visited::insert` and `Walk::seed` still appear in the profile
-below: the walk is cheaper per call, not absent.
+(`1304a6b44c`) — the walk is cheaper per call, not absent, though it no longer holds a self-time row
+of its own in the profile below.
 **The one-shot system-path install** replaced a per-call resolution: `code:get_path/0` cost 1.685 M
 instructions per probe before it and 0.529 M after it, and the boot no longer re-derives the 36-entry
 path on every `code:*` read.
@@ -70,43 +76,94 @@ section.
 runtime actually booted instead of a literal, and it is recorded here because it was measured in the
 same pass and must not be read as a delta.
 
+## Instructions are not time — the execution-tier effect
+
+Measured on one binary (the final HEAD `target/release/beam_rt`), 5 interleaved randomized rounds per
+program, `taskset -c 3`, 1-min load 130–137, `wait4` per-spawn `ru_utime+ru_stime` and `ru_maxrss`:
+
+| program | retired user instr | cpu_core cycles | task-clock p50 (ms) | CPU p50 (ms) | wall p50 (ms) | peak RSS p50 (MiB) |
+|---|---|---|---|---|---|---|
+| default (`JitMode::Auto`) | 1 073.6 M | 342.6 M | 117.5 | 119.1 | 153.6 | 48.53 |
+| `BEAM_RT_TIER=baseline` | 840.4 M | 385.2 M | 128.7 | 129.1 | 161.5 | 55.58 |
+| `BEAM_RT_TIER=interpreter` | 1 073.7 M | 345.1 M | 117.5 | 117.6 | 140.8 | 48.48 |
+| pre-round build (`2d0fe67808`) | 1 083.7 M | 452.9 M | 148.3 | 149.8 | 193.5 | 58.84 |
+| system oracle (OTP 29.1.2 / erts-17.1.1) | 787.9 M | 344.6 M | 126.6 | 122.7 | 139.7 | 59.45 |
+
+The default boot is byte-for-byte the interpreter boot in cost, because the phase-scoped tier rule
+selects the interpreter for the boot phase.
+Yet it retires **27.7 % more** user instructions than the pinned-baseline boot while spending
+**11.1 % fewer** cycles, **8.7 % less** task-clock, **7.7 % less** CPU and **12.7 % less** peak RSS —
+because the baseline tier's compile work (`mmap`/`mprotect`/first-touch page faults on code buffers)
+is kernel-side and stall-bound, invisible to `cpu_core/instructions/u` and expensive in
+cycles/task-clock.
+A retired-instruction count must therefore never be read as a time ratio for a tier comparison.
+Against the pre-round build the final boot is **−24.3 %** cycles, **−20.8 %** task-clock, **−20.5 %**
+CPU and **−17.5 %** peak RSS on **−0.9 %** instructions.
+Wall figures in this table are load-flagged (1-min load 130–137); the load-robust instruments are
+`ru_utime+ru_stime`, `cpu_core/cycles/u` and task-clock.
+
+### The measured wall/CPU record at a quieter window
+
+21 interleaved randomized rounds per binary, `taskset -c 3`, 1-min load 48.6–54.0, per-round paired
+ratios over the same boot program:
+
+| boot A/B (21 paired rounds) | CPU p50 | wall p50 | peak RSS p50 |
+|---|---|---|---|
+| new | 116.1 ms | 122.8 ms | 48.51 MiB |
+| system oracle | 128.1 ms | 133.7 ms | 59.37 MiB |
+| pre-round build (`2d0fe67808`) | 147.2 ms | 156.6 ms | 58.97 MiB |
+
+Paired per-round medians read **new/oracle CPU 0.903, wall 0.910, RSS 0.817** and **pre-round/new
+CPU 1.262, wall 1.260, RSS 1.216**.
+The module run `run <slice.beam> slice:fib/1 25` (15 interleaved rounds, 1-min load 46.2–48.6) reads
+CPU p50 **119.7 / 143.3 / 148.3 ms**, wall p50 **123.6 / 148.9 / 152.2 ms** and peak RSS p50
+**48.57 / 64.52 / 59.00 MiB** in new / oracle / pre-round order in every column, with paired medians
+new/oracle **CPU 0.831, wall 0.837, RSS 0.753** and pre-round/new **1.240 / 1.240 / 1.214**.
+This window is the wall/CPU record; the table above it is the instruction record, and its wall column
+is there to show why the two disagree.
+
 ## The current profile — self-time
 
-`perf report --no-children` over the same invocation:
+`perf record` over 10 boot invocations, 20K samples, `perf report --no-children --sort symbol`
+(self-time), `taskset -c 3`, 1-min load 130–137:
 
 | symbol | self-time |
 |---|---|
-| `__libc_malloc2` | 18.57 % |
-| `Visited::insert` | 9.54 % |
-| `_int_free_chunk` | 6.67 % |
-| `Walk::seed` | 4.98 % |
-| `<HashMap<Arc<str>, Atom>>::insert` | 4.39 % |
-| `group_functions` | 3.71 % |
-| `md5_compress` | 3.38 % |
+| `<beam_engine::machine::Machine>::step_instruction_inner` | 23.54 % |
+| `<beam_engine::machine::Machine>::drive` | 9.11 % |
+| `beam_loader::decode::decode_stream` | 5.94 % |
+| `beam_loader::lower::group::group_functions_checked` | 5.27 % |
+| `__libc_malloc2` | 4.35 % |
+| `<BudgetContext as ExecutionContext>::reduce` | 4.28 % |
+| `beam_engine::families::dispatch` | 3.96 % |
+| `<beam_term::atom::store::IndexShards>::get` | 2.06 % |
+| `<Machine>::eval_test` | 1.96 % |
+| `<beam_common::md5::Md5>::hash_part` | 1.82 % |
+| `beam_rt::context::gc::alloc_words_rooted` | 1.75 % |
+| `_int_free_chunk` | 1.71 % |
+| `beam_loader::lower::instr::lower_instr` | 1.65 % |
+| `beam_loader::lower::build_module` | 1.64 % |
+| `beam_loader::lower::validate::scan_operand` | 1.54 % |
+| `drop_glue::<beam_loader::operand::Operand>` | 1.38 % |
+| `beam_message::copy::shallow_unshared` | 1.31 % |
 
-The shape is a **module-graph load**: an allocator share that is mostly the atom table's name
-strings and the decoded instruction vectors, a GC valve walk over the loaded graph, and the MD5 that
-seals each module.
+The shape is **engine dispatch first** — the boot phase runs on the interpreter, so
+`step_instruction_inner` + `drive` + `families::dispatch` + `eval_test` are ≈ **38.6 %** of the boot.
+**Module-graph loading is second**: the `beam_loader` symbols sum to ≈ **18.3 %** self-time (decode,
+group, lower, operand validation and the raw-operand teardown), with the allocator at ≈ **6.9 %**
+(`__libc_malloc2` + `_int_free_chunk` + `_int_malloc`), the atom store's `IndexShards::get` at
+**2.1 %** and MD5 sealing at **1.8 %**.
 
-## `CodeServer::load_bytes` — the inclusive split (47.02 % of the run)
+## Where the load cost sits
 
-Measured at the campaign-start tree, which is the tree that selected these items:
-
-| phase | inclusive |
-|---|---|
-| `lower::build_module` | 17.49 % |
-| `<AtomTable as Clone>::clone` at `src/codeserver.rs:919` | 15.07 % (298 M) |
-| `decode::decode_stream` | 9.00 % |
-| dropping the decoded `Vec<RawInstr>` | 4.04 % |
-
-The second row is no longer in the profile: `build_module` now takes a **fork** of the shared table
-(`src/codeserver.rs:921`) and appends a literal-only atom to that, so a module load shares the
-`Arc<str>` names instead of materializing one per atom — the fork's own paired measurement is
-**−276.1 M / −15.78 %** (§ the landed changes, §(a) below).
-`Clone` keeps its deliberate deep-copy meaning, which two sibling suites rely on as a positive
-control; the fork is the whole-table copy a load may take.
-What remains is the load's own shape: the lowering, the code decode and the `Vec<RawInstr>`
-teardown.
+In the same `perf record` the loader's inclusive share of the boot is **≈ 13–17 %** of the run
+(`<CodeServer>::load_bytes` inclusive; the call-graph attribution varies by that much under
+`--call-graph dwarf`), with `beam_loader::lower::build_module` ≈ **8 %** inclusive and the
+decode/group/validate self-times above making up most of the rest.
+`load_bytes` hands `lower::build_module` `self.atoms.fork()` and merges the literal-only tail back,
+so a load no longer materializes a name string per atom.
+The fork's own historical combined figure — **−276.1 M / −15.78 %** — predates the merge back of the
+literal tail and is quotable only as that round's paired delta, never as present-day headroom.
 
 ## Boot collection accounting — 384 collections per boot
 
