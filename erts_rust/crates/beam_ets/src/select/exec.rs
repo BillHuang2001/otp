@@ -339,14 +339,16 @@ fn eq_body(
 
 /// `db_match_eq_body` for a **raw** body term (the `{const, X}` subterm tree).
 fn eq_body_raw(a: &pattern::Pattern, b: Eterm, const_mode: bool, atoms: &AtomTable) -> bool {
-    if is_list(b) {
+    if let Some(cell) = crate::shape::cons_cell(b) {
         let pattern::Pattern::Cons(hcar, hcdr) = a else {
             return false;
         };
-        // SAFETY: `is_list(b)` established a live cons cell in the caller-owned
-        // spec term, so both `[CAR, CDR]` words are readable and `b` stays live
-        // for the whole call.
-        let (bcar, bcdr) = unsafe { (car(b), cdr(b)) };
+        // SAFETY: `cons_cell` established that `b` is a `TAG_PRIMARY_LIST`
+        // cons-cell word with a non-null cell pointer, so both `[CAR, CDR]` words
+        // are addressable. Liveness/reachability is the caller's contract (this is
+        // a subterm of the caller-owned spec term, which outlives the call); the
+        // shape test cannot validate it.
+        let (bcar, bcdr) = unsafe { (*cell, *cell.add(1)) };
         return eq_body_raw(hcar, bcar, const_mode, atoms)
             && eq_body_raw(hcdr, bcdr, const_mode, atoms);
     }

@@ -38,6 +38,11 @@ later same-size insert silently reuses (a wrong, well-formed result).
 ## Constraints
 - Term reads return `TableTerm<'g>`; the only ways to an owned `Eterm` are `copy_into` and the
   copy-out select forms (a deep copy into a caller-owned `TermStore`).
+- `TableTerm::list_to_terms`'s walk is gated on `crate::shape::cons_cell` (primary tag `List`
+  **and** a non-null cell pointer), not `beam_term::list::is_list`, whose `!(x & 0x2)` bit trick a
+  `TAG_PRIMARY_HEADER` word also passes. A header-shaped root therefore takes the documented
+  non-list branch (a one-element vector holding the term itself) and a header-shaped tail is kept
+  as the last element — neither is a dereference (`list_to_terms_refuses_a_header_shaped_word_instead_of_reading_it`).
 - Errors are `beam_common::Result`/`BeamError`; the scratch retry loop retries **only**
   `Alloc(Heap)` exhaustion and returns every other error untouched (no swallowing).
 

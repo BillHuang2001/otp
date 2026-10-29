@@ -37,7 +37,7 @@
 //!
 //! The `/3` forms take the oracle's `limit` and produce a continuation when the
 //! limit is reached; the `/1` forms resume it. Both are shared verbatim with
-//! `ets:select/3`+`ets:select/1` through [`super::finish_chunk`] and
+//! `ets:select/3`+`ets:select/1` through [`super::finish_chunk_with_input`] and
 //! [`super::resume_continuation`], so the chunk rendering (including the **bare**
 //! `'$end_of_table'` rule) has exactly one implementation.
 //!
@@ -75,8 +75,7 @@ use beam_ets::compile;
 use beam_term::Eterm;
 
 use super::{
-    copy_out_list, element_pos, finish_chunk, resolve, restore_table, resume_continuation,
-    take_table_gated,
+    copy_out_list, element_pos, resolve, restore_table, resume_continuation, take_table_gated,
 };
 use crate::context::BifContext;
 use crate::error::system_limit;
@@ -123,17 +122,37 @@ fn match_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// A non-integer or negative `Limit` is `badarg` here; `0` is rejected by
 /// `beam_ets`' `select_limit` (matching the oracle).
+///
+/// `Pattern` is deep-copied into the registry's input store and **decoded from that
+/// copy** ([`super::own_spec_input`]), so the `Pattern::Literal`/`Pattern::Map` key
+/// words a minted continuation carries are registry-owned — a `/1` resume never
+/// reads the pattern's caller heap. The copy is retained exactly while a
+/// continuation names it ([`super::finish_chunk_with_input`]).
 fn match_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
-    let limit = element_pos(args[2])?;
-    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    let owned = super::own_spec_input(ctx, args[1])?;
+    let limit = match element_pos(args[2]) {
+        Ok(limit) => limit,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
+    let table = match take_table_gated(ctx, handle, resolve::Gate::Read) {
+        Ok(table) => table,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
     let outcome = {
         let (atoms, heap) = ctx.atom_and_heap();
-        table.match_limit(args[1], limit, atoms, heap)
+        table.match_limit(owned, limit, atoms, heap)
     };
-    restore_table(ctx, handle, table)?;
-    let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont, false)
+    if let Err(err) = restore_table(ctx, handle, table) {
+        return Err(super::released_input(ctx, owned, err));
+    }
+    let (results, cont) = match outcome {
+        Ok(chunk) => chunk,
+        // A malformed pattern is `badarg`, a raising guard/body its own error —
+        // either way nothing was minted, so the copy is dropped.
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
+    super::finish_chunk_with_input(ctx, handle, results, cont, false, owned)
 }
 
 /// `ets:match(Continuation)` — resumes a [`match_3`] traversal.
@@ -143,7 +162,7 @@ fn match_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// the spec's own body values), which falls out of the continuation carrying its
 /// compiled spec. `Table::match_continue` resumes the stored direction, so a
 /// reverse `ets:select_reverse/3` continuation handed here walks backward like the
-/// oracle (the direction parameter is threaded through to [`finish_chunk`] so a
+/// oracle (the direction parameter is threaded through to the chunk renderer so a
 /// minted follow-up chunk keeps it).
 fn match_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     resume_continuation(ctx, args[0], |table, cont, _reverse, atoms, heap| {
@@ -166,17 +185,34 @@ fn match_object_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `ets:match_object(Tab, Pattern, Limit)` — as [`match_object_2`], limit-chunked.
+///
+/// `Pattern` is deep-copied into the registry's input store and decoded from that
+/// copy, exactly as [`match_3`] does, so a minted continuation's pattern literals
+/// are registry-owned words; the copy is retained exactly while a continuation
+/// names it.
 fn match_object_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
-    let limit = element_pos(args[2])?;
-    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    let owned = super::own_spec_input(ctx, args[1])?;
+    let limit = match element_pos(args[2]) {
+        Ok(limit) => limit,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
+    let table = match take_table_gated(ctx, handle, resolve::Gate::Read) {
+        Ok(table) => table,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
     let outcome = {
         let (atoms, heap) = ctx.atom_and_heap();
-        table.match_object_limit(args[1], limit, atoms, heap)
+        table.match_object_limit(owned, limit, atoms, heap)
     };
-    restore_table(ctx, handle, table)?;
-    let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont, false)
+    if let Err(err) = restore_table(ctx, handle, table) {
+        return Err(super::released_input(ctx, owned, err));
+    }
+    let (results, cont) = match outcome {
+        Ok(chunk) => chunk,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
+    super::finish_chunk_with_input(ctx, handle, results, cont, false, owned)
 }
 
 /// `ets:match_object(Continuation)` — resumes a [`match_object_3`] traversal.
@@ -295,7 +331,7 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::{atom_val, signed_value, AtomTable};
 
-    use crate::access::{ref_thing_id, tuple_element};
+    use crate::access::{make_ref_thing, ref_thing_id, tuple_element};
     use crate::ets::{insert_2, lookup_2, new_2, TableRegistry};
     use crate::print::proper_list;
 
@@ -305,6 +341,7 @@ mod tests {
         atoms.seed([
             "true",
             "set",
+            "ordered_set",
             "bag",
             "duplicate_bag",
             "mytab",
@@ -312,6 +349,7 @@ mod tests {
             "duptab",
             "a",
             "b",
+            "c",
             "z",
             "$1",
             "$2",
@@ -728,5 +766,109 @@ mod tests {
         // The registry is the *composition* of this module's roster with the parent
         // module's, so an `ets:new/2` key is present too.
         assert!(reg.contains("ets", "new", 2));
+    }
+
+    /// The `{Key, Float}` object the continuation-ownership test inserts, with a
+    /// runtime-built boxed float (so it is copied into the table's own store, never a
+    /// literal).
+    fn float_pair(ctx: &mut BifContext<'_>, key: &str, value: f64) -> Eterm {
+        let k = ctx.atom(key).expect("seeded");
+        let v = ctx.make_float(value).expect("the float fits");
+        ctx.tuple(&[k, v]).expect("fits")
+    }
+
+    /// Invalidates every word `heap` handed out, rewriting the boxed float that
+    /// carried `value` as `replacement` (the empty list everywhere else, a *different
+    /// number* in the float's two words — see `ets.rs`'s helper of the same shape).
+    ///
+    /// The pattern is built before the objects, so the float it finds is the
+    /// **pattern's** literal even though the inserted objects carry the same value.
+    fn invalidate_caller_heap(heap: &mut Heap, value: f64, replacement: f64) {
+        let index = heap
+            .used_words_mut()
+            .iter()
+            .position(|word| {
+                crate::access::is_float(*word)
+                    && crate::access::float_bits(*word) == value.to_bits()
+            })
+            .expect("the runtime-built pattern float must live on the caller heap");
+        let header = heap.used_words_mut()[index];
+        for word in heap.used_words_mut() {
+            *word = Eterm::nil();
+        }
+        let words = heap.used_words_mut();
+        words[index] = header;
+        words[index + 1] = Eterm::from_raw(replacement.to_bits() as usize);
+    }
+
+    /// **An `ets:match_object/3` continuation outlives the pattern's heap.**
+    ///
+    /// The pattern carries a runtime-built boxed float, so decoding it in the calling
+    /// frame would leave `Pattern::Literal` pointing at that heap. The pattern is
+    /// therefore built on a scratch heap, the first chunk is drawn, every word of that
+    /// heap is invalidated (the float rewritten as a different number), and the resume
+    /// runs from a fresh context over a fresh heap. It must still yield the oracle's
+    /// chunk — the `{c,1.5}` object plus a continuation — which only the registry's
+    /// copy of the pattern makes possible (`super::own_spec_input`).
+    ///
+    /// Goldens (oracle-verified; `ets.rs`'s
+    /// `the_continuation_ownership_goldens_cross_check_the_live_oracle` re-derives
+    /// them): an `ordered_set` holding `{a,1.5}`/`{b,2.5}`/`{c,1.5}`/`{z,3.5}` with
+    /// `P = {'$1', 1 + 0.5}` chunks as `[{a,1.5}]`+cont · `[{c,1.5}]`+cont · the bare
+    /// `'$end_of_table'`.
+    #[test]
+    fn a_match_object_continuation_survives_invalidation_of_the_patterns_heap() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        let mut scratch = Heap::new(8192).expect("scratch heap");
+        let cont_id = {
+            let mut ctx =
+                BifContext::new(&mut scratch, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            // The pattern first: it owns the boxed float the invalidation below
+            // rewrites, and `invalidate_caller_heap` finds the lowest-addressed one.
+            let dollar1 = ctx.atom("$1").expect("seeded");
+            let bound = ctx.make_float(1.5).expect("the float fits");
+            let pattern = ctx.tuple(&[dollar1, bound]).expect("fits");
+            let handle = new_table_kind(&mut ctx, "mytab", "ordered_set");
+            for (key, value) in [("a", 1.5), ("b", 2.5), ("c", 1.5), ("z", 3.5)] {
+                let object = float_pair(&mut ctx, key, value);
+                insert_2(&mut ctx, &[handle, object]).expect("insert");
+            }
+            let limit = ctx.int(1).expect("fits");
+            let chunk =
+                match_object_3(&mut ctx, &[handle, pattern, limit]).expect("ets:match_object/3");
+            let first = proper_list(tuple_element(chunk, 0)).expect("a proper list");
+            assert_eq!(first.len(), 1, "the key `a` is the only object at limit 1");
+            let expected = float_pair(&mut ctx, "a", 1.5);
+            assert!(
+                beam_term::compare::eq(first[0], expected, &atoms),
+                "the first chunk must be the `{{a,1.5}}` object"
+            );
+            ref_thing_id(tuple_element(chunk, 1)).expect("a continuation is a ref thing")
+        };
+        assert!(scratch.used() > 0, "the pattern must occupy caller-heap words");
+        invalidate_caller_heap(&mut scratch, 1.5, 1000.0);
+
+        let mut heap = Heap::new(8192).expect("resume heap");
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(2, 0)).with_tables(&mut reg);
+        let cont = make_ref_thing(ctx.heap(), cont_id).expect("the rebuilt continuation fits");
+        let chunk = match_object_1(&mut ctx, &[cont]).expect("ets:match_object/1");
+        let results = proper_list(tuple_element(chunk, 0)).expect("a proper list");
+        assert_eq!(
+            results.len(),
+            1,
+            "the resumed walk must still match key `c` — the pattern's float has to \
+             come from the registry's copy, not the invalidated caller heap"
+        );
+        let expected = float_pair(&mut ctx, "c", 1.5);
+        assert!(
+            beam_term::compare::eq(results[0], expected, &atoms),
+            "the resumed chunk must be the `{{c,1.5}}` object"
+        );
+        assert!(
+            ref_thing_id(tuple_element(chunk, 1)).is_ok(),
+            "a full chunk (limit 1) carries a continuation"
+        );
     }
 }

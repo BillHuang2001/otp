@@ -69,7 +69,7 @@
 //! not know (a table handle, a continuation, a forged id) is `badarg`, as is a
 //! non-reference.
 //!
-//! # Why the *raw* spec term is what the registry stores
+//! # What the registry stores: a registry-owned copy of the raw spec
 //!
 //! [`beam_ets::match_spec_run`] takes the **raw** clause list and compiles it with
 //! [`beam_ets::compile`] internally — it exposes no entry point that consumes a
@@ -81,17 +81,24 @@
 //! (a stored but never-read field would be a silent lie about what the runtime
 //! holds, not a faithful compiled program).
 //!
-//! **Heap-lifetime caveat (M1).** The stored term is a live `Eterm` on the
-//! *compiling caller's* heap, not a GC-managed magic reference: `beam_term` has no
-//! reference-object machinery in M1 and this BIF cannot allocate it on any other
-//! process's behalf. That is sound for the M1 runtime because a process heap is a
-//! never-relocating bump arena that persists across the BIF calls of the same
-//! process — the same assumption the `ets` table handles and the `ets:select`
-//! continuations already rely on — so a **same-process** `match_spec_run/2` reads
-//! exactly the spec that was compiled. It is *not* sound across processes the way
-//! ERTS's owned program is: a compiled spec handed to another process would read
-//! the compiling process's heap. This is a documented, deliberate M1 substitution,
-//! not a silently wrong result for the same-process use the runtime makes.
+//! # Ownership: the spec lives in the registry's own term store
+//!
+//! [`TableRegistry::insert_spec`] **deep-copies** the caller's spec into the
+//! registry's dedicated [`beam_ets::TermStore`] — a never-relocating bump arena of
+//! registry-owned words — and records only that store-owned root. So:
+//!
+//! * no raw `Eterm` from a caller heap (or from the pooled BIF heap of a reentrant
+//!   call) is ever retained, which is what makes the handle sound: a compiled spec
+//!   is valid in **any** process and across **every** collection, including one a
+//!   different process runs after the compiling process returned (`meck` compiles a
+//!   spec in `meck_args_matcher:new/1` and runs it much later out of `meck_proc`
+//!   state);
+//! * the words are never freed, `reset` or relinquished while a handle is live — one
+//!   store for the registry's lifetime is correct, because no `ets` BIF releases a
+//!   compiled spec (ERTS likewise retains a compiled program until GC). The cost is
+//!   retention only: a runtime compiling specs in a loop grows the store;
+//! * a spec the store refuses (see its *copied subset* docs) is `badarg` and stores
+//!   **nothing** — no handle minted, no half-stored entry.
 
 use beam_common::Result;
 use beam_ets::compile;
@@ -127,12 +134,19 @@ fn match_spec_compile_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
         return Err(badarg());
     }
     // Compiling validates the spec (a malformed one is `badarg`); the compiled form
-    // is not retained — `beam_ets::match_spec_run` recompiles the raw term, which
-    // is therefore what the registry stores (see the module docs).
+    // is not retained — `beam_ets::match_spec_run` recompiles the raw term, which is
+    // therefore what the registry stores (see the module docs).
     compile(raw, ctx.atoms())?;
     let handle = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-        tables.insert_spec(raw)
+        // The registry deep-copies the spec into its own term store, so the stored
+        // words outlive this caller's heap (and any later collection, in any
+        // process). A copy the store refuses is `badarg` on this route — the
+        // oracle's `match_spec_compile/1` either compiles the spec or raises
+        // `badarg`, and the store's only other failure mode is its own arena
+        // allocation — never a panic and never a fabricated handle: a failed copy
+        // mints no id and leaves no entry, so there is nothing to unwind.
+        tables.insert_spec(raw).map_err(|_| badarg())?
     };
     make_ref_thing(ctx.heap(), handle)
 }
@@ -231,7 +245,7 @@ mod tests {
     /// The atom names the specs and the assertions below need.
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
-        atoms.seed(["a", "b", "c", "z", "foo", "$1", "$2", "set"]);
+        atoms.seed(["a", "b", "c", "z", "foo", "$1", "$2", "set", ">"]);
         atoms
     }
 
@@ -288,6 +302,47 @@ mod tests {
         ctx.list(&[clause]).expect("fits")
     }
 
+    /// `[{{'$1','$2'},[{'>','$2',5}],[{{'$2','$1'}}]}]` — matches every 2-tuple
+    /// whose second element is an integer greater than `5` and yields the pair with
+    /// its elements **swapped**. Oracle-probed on OTP 29.1.2 / erts-17.1.1:
+    /// `ets:match_spec_run([{a,1},{z,9},{b,7},foo,{c,6}], MS)` ⇒ `[{9,z},{7,b},{6,c}]`
+    /// (the failing guard on `{a,1}` and the non-tuple `foo` are dropped).
+    fn guarded_swap_spec(ctx: &mut BifContext<'_>) -> Eterm {
+        let v1 = ctx.atom("$1").expect("seeded");
+        let v2 = ctx.atom("$2").expect("seeded");
+        let gt = ctx.atom(">").expect("seeded");
+        let five = ctx.int(5).expect("fits");
+        let head = ctx.tuple(&[v1, v2]).expect("fits");
+        // A guard is a **list** of guard tests (an OR of ANDs), not a bare tuple.
+        let guard = ctx.tuple(&[gt, v2, five]).expect("fits");
+        let guards = ctx.list(&[guard]).expect("fits");
+        // The `{{ … }}` construction form: a 1-tuple holding the tuple to build.
+        let constructed = ctx.tuple(&[v2, v1]).expect("fits");
+        let body_item = ctx.tuple(&[constructed]).expect("fits");
+        let body = ctx.list(&[body_item]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+    /// The oracle's input for [`guarded_swap_spec`], built on `ctx`.
+    fn swap_input(ctx: &mut BifContext<'_>) -> Eterm {
+        let a1 = pair(ctx, "a", 1);
+        let z9 = pair(ctx, "z", 9);
+        let b7 = pair(ctx, "b", 7);
+        let c6 = pair(ctx, "c", 6);
+        let foo = ctx.atom("foo").expect("seeded");
+        ctx.list(&[a1, z9, b7, foo, c6]).expect("fits")
+    }
+    /// The answer the oracle gives for [`guarded_swap_spec`] over
+    /// [`swap_input`] — `[{9,z},{7,b},{6,c}]` — built on `ctx`.
+    fn swap_answer(ctx: &mut BifContext<'_>) -> Eterm {
+        let mut items = Vec::new();
+        for (number, name) in [(9i64, "z"), (7, "b"), (6, "c")] {
+            let key = ctx.int(number).expect("fits");
+            let value = ctx.atom(name).expect("seeded");
+            items.push(ctx.tuple(&[key, value]).expect("fits"));
+        }
+        ctx.list(&items).expect("fits")
+    }
     fn is_raise_atom(err: &BeamError, reason: &'static str) -> bool {
         matches!(err, BeamError::Raise(raise) if raise.reason == beam_common::ExitReason::atom(reason))
     }
@@ -557,6 +612,166 @@ mod tests {
         ));
     }
 
+    /// **The ownership test for the measured `SIGSEGV`.** A compiled spec is a
+    /// registry-owned deep copy, so overwriting every word of the *compiling
+    /// caller's* heap — which is exactly what a rewind-and-reuse of that heap does —
+    /// cannot change the answer.
+    ///
+    /// This is the deterministic form of the real defect: `meck` compiles a spec in
+    /// `meck_args_matcher:new/1` and runs it much later out of `meck_proc` state, so
+    /// the registry's word aliased a heap nobody owned any more and the run
+    /// dereferenced it (`beam_ets::select::list_elements` → `beam_term::list::car`).
+    /// The invalidation is real, not simulated: the words the spec occupied are
+    /// overwritten in place with `[]`, so a registry that kept the caller's raw word
+    /// would hand `[]` to `beam_ets::compile` and raise `badarg` instead of
+    /// answering. The expected value is the oracle's (the live cross-check below
+    /// re-derives it).
+    #[test]
+    fn a_compiled_spec_survives_invalidation_of_the_compiling_caller_heap() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+
+        // The spec lives entirely on a scratch heap, as it does on a real caller's
+        // young heap; the compiled-spec *ref thing* the BIF returns is part of the
+        // caller's heap too, so its id is read out before the invalidation and the
+        // handle is rebuilt on the running heap below.
+        let mut scratch = Heap::new(4096).expect("scratch heap");
+        let id = {
+            let mut ctx =
+                BifContext::new(&mut scratch, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            let spec = guarded_swap_spec(&mut ctx);
+            let handle = match_spec_compile_1(&mut ctx, &[spec]).expect("ets:match_spec_compile/1");
+            ref_thing_id(handle).expect("a compiled spec is a ref thing")
+        };
+        let spec_words = scratch.used();
+        assert!(spec_words > 0, "the spec must occupy caller-heap words");
+
+        // Invalidate the caller's storage for real.
+        for word in scratch.used_words_mut() {
+            *word = Eterm::nil();
+        }
+
+        // Run it on a different heap, from a different context.
+        let mut heap = Heap::new(4096).expect("run heap");
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = make_ref_thing(ctx.heap(), id).expect("the rebuilt handle fits");
+        let input = swap_input(&mut ctx);
+        let got = match_spec_run_2(&mut ctx, &[input, handle]).expect("ets:match_spec_run/2");
+        let expected = swap_answer(&mut ctx);
+        assert!(
+            beam_term::compare::eq(got, expected, &atoms),
+            "a compiled spec must not be read out of the compiling caller's heap"
+        );
+    }
+
+    /// **A compiled-spec handle crosses a process boundary.** The spec is compiled in
+    /// one context (`ProcessId` 1, heap A) and run in another (`ProcessId` 2, heap B),
+    /// with heap A — every word of the spec's source term — dropped in between. The
+    /// registry's copy is what makes the handle valid there, so the answer is the
+    /// oracle's.
+    #[test]
+    fn a_compiled_spec_handle_is_usable_from_another_process_and_heap() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+
+        let (id, spec_words) = {
+            let mut heap_a = Heap::new(4096).expect("compiling heap");
+            let mut ctx =
+                BifContext::new(&mut heap_a, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            let spec = guarded_swap_spec(&mut ctx);
+            let handle = match_spec_compile_1(&mut ctx, &[spec]).expect("ets:match_spec_compile/1");
+            (
+                ref_thing_id(handle).expect("a compiled spec is a ref thing"),
+                heap_a.used(),
+            )
+        }; // heap A — and every word of the spec's source term — is gone.
+        assert!(spec_words > 0, "the spec must occupy caller-heap words");
+
+        let mut heap_b = Heap::new(4096).expect("running heap");
+        let mut ctx =
+            BifContext::new(&mut heap_b, &atoms, ProcessId::new(2, 0)).with_tables(&mut reg);
+        let handle = make_ref_thing(ctx.heap(), id).expect("the rebuilt handle fits");
+        let input = swap_input(&mut ctx);
+        let got = match_spec_run_2(&mut ctx, &[input, handle]).expect("run in the second process");
+        let expected = swap_answer(&mut ctx);
+        assert!(
+            beam_term::compare::eq(got, expected, &atoms),
+            "a compiled spec must be runnable from a process that did not compile it"
+        );
+
+        // The `_r/3` form resolves the same registry entry.
+        let input = swap_input(&mut ctx);
+        let acc = nil(&mut ctx);
+        let got = match_spec_run_r_3(&mut ctx, &[input, handle, acc]).expect("run_r in process 2");
+        // `[{9,z},{7,b},{6,c}]` prepended onto `[]` reverses to `[{6,c},{7,b},{9,z}]`.
+        let mut reversed = Vec::new();
+        for (number, name) in [(6i64, "c"), (7, "b"), (9, "z")] {
+            let key = ctx.int(number).expect("fits");
+            let value = ctx.atom(name).expect("seeded");
+            reversed.push(ctx.tuple(&[key, value]).expect("fits"));
+        }
+        let expected = ctx.list(&reversed).expect("fits");
+        assert!(
+            beam_term::compare::eq(got, expected, &atoms),
+            "ets:match_spec_run_r/3 must read the same registry-owned spec"
+        );
+    }
+
+    /// **The negative: a refused copy stores nothing.** The route taken is the
+    /// registry's, not the BIF's: `beam_ets::compile` validates a spec before the
+    /// store ever sees it and rejects every non-term constant, so no *legal*
+    /// match-spec can carry a construct `TermStore::copy` refuses. The store's own
+    /// refusal is therefore exercised where it can actually fire — at
+    /// [`TableRegistry::insert_spec`] — and the BIF-level `badarg` is asserted to
+    /// mint no handle either.
+    #[test]
+    fn a_spec_the_store_refuses_is_badarg_and_stores_nothing() {
+        let mut reg = TableRegistry::new();
+
+        // A bare header word (`TAG_PRIMARY_HEADER`) is not a standalone term; the
+        // store refuses it with `badarg` and must leave no trace.
+        let header = Eterm::from_raw(0);
+        assert!(
+            matches!(reg.insert_spec(header), Err(BeamError::BadArg)),
+            "a bare header word must be refused"
+        );
+        // Nothing was stored under the id the failed insert would have taken, and
+        // the next successful insert still gets the *first* spec id — no handle was
+        // minted, so no counter moved.
+        assert!(!reg.contains_spec(SPEC_ID_BASE));
+        assert_eq!(reg.spec_raw(SPEC_ID_BASE), None);
+
+        let atoms = seeded_atoms();
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let spec = guarded_swap_spec(&mut ctx);
+        let handle = match_spec_compile_1(&mut ctx, &[spec]).expect("compile");
+        assert_eq!(
+            ref_thing_id(handle).expect("ref thing"),
+            SPEC_ID_BASE,
+            "the refused insert must not have consumed a spec id"
+        );
+
+        // The BIF-level `badarg` for a malformed spec also mints nothing: a spec
+        // whose clause is not a 3-tuple is rejected by the compile, before the store.
+        let one = ctx.int(1).expect("fits");
+        let bad_clause = ctx.tuple(&[one]).expect("fits");
+        let bad_spec = ctx.list(&[bad_clause]).expect("fits");
+        assert!(matches!(
+            match_spec_compile_1(&mut ctx, &[bad_spec]),
+            Err(BeamError::BadArg)
+        ));
+        let spec = guarded_swap_spec(&mut ctx);
+        let next = match_spec_compile_1(&mut ctx, &[spec]).expect("compile");
+        assert_eq!(
+            ref_thing_id(next).expect("ref thing"),
+            SPEC_ID_BASE + 1,
+            "a rejected spec must not consume a spec id"
+        );
+    }
+
     #[test]
     fn match_spec_run_r_reports_a_typed_unsupported_bif_without_a_registry() {
         let (mut heap, atoms, mut reg) = parts();
@@ -582,6 +797,12 @@ mod tests {
         );
     }
 
+    /// The live `erl` re-derivation of every literal this module asserts — the
+    /// `run_r/3` family **and** the ownership spec
+    /// ([`guarded_swap_spec`]/[`swap_input`]/[`swap_answer`]).
+    ///
+    /// A run without `erl` prints the loud banner below and returns: it is a skip,
+    /// not a pass (the file's `resolve_oracle` convention).
     #[test]
     fn match_spec_run_r_cross_checks_the_live_oracle() {
         let Some(oracle) = resolve_oracle() else {
@@ -607,8 +828,13 @@ mod tests {
                     B1 = IsBadArg(fun() -> ets:match_spec_run_r([{1,a}|x], MS, []) end), \
                     B2 = IsBadArg(fun() -> ets:match_spec_run_r([{1,a}], \
                                         [{{1,'$1'},[],['$1']}], []) end), \
+                    MS2 = ets:match_spec_compile([{{'$1','$2'},[{'>','$2',5}], \
+                                                   [{{'$2','$1'}}]}]), \
+                    In = [{a,1},{z,9},{b,7},foo,{c,6}], \
+                    A5 = ets:match_spec_run(In, MS2) =:= [{9,z},{7,b},{6,c}], \
+                    A6 = ets:match_spec_run_r(In, MS2, []) =:= [{6,c},{7,b},{9,z}], \
                     io:format(\"~w~n\", [{R1 =:= [c,a], R2 =:= [c,a,acc], R3 =:= [acc], \
-                                         R4 =:= [a,c], B1, B2}]), \
+                                         R4 =:= [a,c], B1, B2, A5, A6}]), \
                     halt().";
         let output = std::process::Command::new(&oracle)
             .arg("-noshell")
@@ -630,8 +856,8 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).expect("the oracle printed UTF-8");
         assert_eq!(
             stdout.trim(),
-            "{true,true,true,true,true,true}",
-            "the live erts-17.1 oracle disagrees with the pinned run_r/3 expectations"
+            "{true,true,true,true,true,true,true,true}",
+            "the live erts-17.1 oracle disagrees with the pinned run_r/3 and ownership expectations"
         );
     }
 

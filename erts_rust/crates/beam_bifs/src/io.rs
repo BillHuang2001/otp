@@ -3987,7 +3987,8 @@ mod tests {
                 (key, value)
             })
             .collect();
-        crate::access::make_map(ctx.heap(), &pairs).expect("the HAMT fits")
+        let (atoms, heap) = ctx.atom_and_heap();
+        crate::access::make_map(heap, atoms, &pairs).expect("the HAMT fits")
     }
 
     /// The flat `~w` text of [`hamt_map`] in ascending (or descending) key order.

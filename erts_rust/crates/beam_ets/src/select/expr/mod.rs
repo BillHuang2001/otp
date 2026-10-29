@@ -99,6 +99,7 @@ use beam_term::prelude::*;
 
 use super::{atom_name, var_index};
 use crate::error::badarg;
+use crate::shape::cons_cell;
 
 mod arith;
 mod guard;
@@ -391,7 +392,16 @@ impl Value {
 
 /// Decode an expression term. `vars` is the set of `'$N'` bound by the head; a
 /// reference to any other variable is `badarg` (the C `dmc_variable` error).
+///
+/// A word that is not a term at all (a bare `TAG_PRIMARY_HEADER` word, e.g. the
+/// ABI's `THE_NON_VALUE`) is rejected up front with `badarg`: a guard/body term
+/// containing one is a malformed spec, and rejecting it here keeps every header
+/// word away from the shape tests below, at every nesting depth.
 pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &BTreeSet<u32>) -> Result<Expr> {
+    if !is_term_word(term) {
+        // A header word is not a term: a spec holding one is malformed.
+        return Err(badarg());
+    }
     if let Some(name) = atom_name(term, atoms) {
         match name {
             "$_" => return Ok(Expr::WholeObject),
@@ -411,10 +421,13 @@ pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &BTreeSet<u32>) -> Re
     if let Some(elements) = super::tuple_elements(term) {
         return decode_tuple(term, &elements, atoms, vars);
     }
-    if is_list(term) {
-        // SAFETY: `is_list(term)` established a live cons cell, so its two
-        // `[CAR, CDR]` words are readable; the spec term is caller-owned.
-        let (head_term, tail_term) = unsafe { (car(term), cdr(term)) };
+    if let Some(cell) = cons_cell(term) {
+        // SAFETY: `cons_cell` established that `term` is a `TAG_PRIMARY_LIST`
+        // cons-cell word with a non-null cell pointer, so its two `[CAR, CDR]` words
+        // are addressable. Liveness/reachability is the caller's contract (the spec
+        // term is caller-owned and outlives the call); the shape test cannot
+        // validate it.
+        let (head_term, tail_term) = unsafe { (*cell, *cell.add(1)) };
         let head = Box::new(decode(head_term, atoms, vars)?);
         let tail = Box::new(decode(tail_term, atoms, vars)?);
         return Ok(Expr::Cons(head, tail));
@@ -871,27 +884,36 @@ pub(super) fn eval(
         }
         Expr::Hd(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            if !is_list(operand) {
+            // An operand that is not a cons cell (a header word included) is the C
+            // guard failure → `badarg`.
+            let Some(cell) = cons_cell(operand) else {
                 return Err(badarg());
-            }
-            // SAFETY: `is_list(operand)` established a live cons cell.
-            Ok(Value::Term(unsafe { car(operand) }))
+            };
+            // SAFETY: `cons_cell` established a `TAG_PRIMARY_LIST` cons-cell word with
+            // a non-null cell pointer, so the CAR word is addressable. The operand is
+            // a live term the evaluation just produced; the shape test is not a
+            // liveness test, so that half is the contract.
+            Ok(Value::Term(unsafe { *cell }))
         }
         Expr::Tl(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            if !is_list(operand) {
+            let Some(cell) = cons_cell(operand) else {
                 return Err(badarg());
-            }
-            // SAFETY: `is_list(operand)` established a live cons cell.
-            Ok(Value::Term(unsafe { cdr(operand) }))
+            };
+            // SAFETY: as `Hd` — `cons_cell` established the cons shape and the CDR
+            // word at `+1` is addressable within the same cell.
+            Ok(Value::Term(unsafe { *cell.add(1) }))
         }
         Expr::Length(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
             let mut cursor = operand;
             let mut count: i64 = 0;
-            while is_list(cursor) {
-                // SAFETY: `is_list(cursor)` established a live cons cell.
-                cursor = unsafe { cdr(cursor) };
+            while let Some(cell) = cons_cell(cursor) {
+                // SAFETY: `cons_cell` established a `TAG_PRIMARY_LIST` cons-cell word
+                // with a non-null cell pointer, so the CDR word at `+1` is addressable.
+                // The list is a live term; reachability is the caller's contract (the
+                // shape test cannot validate it).
+                cursor = unsafe { *cell.add(1) };
                 count += 1;
             }
             if !is_nil(cursor) {
@@ -1048,7 +1070,13 @@ pub(super) fn value_bool(value: Value, atoms: &AtomTable) -> Result<bool> {
 /// Shared with [`guard`] so every helper classifies a term through the same
 /// documented probe.
 pub(super) fn classify(term: Eterm) -> TermClass {
-    // SAFETY: `class` reads a boxed header only for a boxed word; `term` is a live
-    // term (a spec subterm or a matched value), so its header is valid.
+    // SAFETY: `ops::class` answers `TermClass::NonValue` for a header word with **no
+    // dereference** (`beam_term/src/ops.rs:177`) and classifies every immediate from
+    // the word's bits alone; it dereferences only a `TAG_PRIMARY_BOXED` word. The
+    // callers that must never see a non-term reject one first (both `decode`s test
+    // `is_term_word`, and a spec that arrives here has been decoded), so the word is
+    // not a header word; for a boxed-shaped word, reachability is the caller's
+    // contract (the term is a live spec subterm or matched value), and `class`
+    // panics only on an unknown boxed subtag — a word `beam_term` never writes.
     unsafe { class(term) }
 }

@@ -56,6 +56,10 @@ The four make-atom entry points **record** each interned atom on the env; `enif_
 `enif_make_map_from_arrays` reproduces `erts_map_from_ks_and_vs`'s **duplicate-key refusal** (`erl_map.c`: `THE_NON_VALUE` on a duplicate): a duplicate anywhere in the key array writes `Eterm::non_value()` into `*map_out` (nothing when that pointer is null) and answers `0`; only a duplicate-free set builds the map and answers `1`.
 The basis is **`=:=`** (`compare::eq` — the flat-map writer's `erts_cmp(exact)` and the hash arm's `reject_dupkeys`), so `1` and `1.0` are **distinct** keys on both sides of the `MAP_SMALL_MAP_LIMIT = 32` flat/hash switch.
 The check is an all-pairs scan run **before** any allocation, and the no-duplicate path is unchanged (same content, same key order).
+`enif_make_map_put` / `enif_make_map_update` write through `beam_term::map::map_put_cow`, the path-copying writer (`erts_maps_put`'s shape: only the nodes on `key`'s hash path are copied, every off-path subtree is shared with `map_in` by word, and a flat map's present-key replace reuses the source keys tuple verbatim), reserving `map_put_cow_words_capacity(map_size)` words from the env's heap — `293` for a HAMT put instead of the Θ(n) `map_words_capacity(size + 1)` a full `write_map` rebuild needed.
+The observable result is the rebuild's: the same `=:=` term, the same head word and the same pairs in the same storage (serializer) order, pinned at 0/1/31/32/33/34/250 pairs against `map_put` itself (`map.rs`'s `assert_agrees`, which compares `map_pairs_storage_order` plus a structural walk of the node/leaf/collision words in place of a `term_to_binary` byte comparison — this crate has no `beam_codec` dependency).
+`enif_make_map_update` keeps its missing-key refusal (`0`, nothing written) and a malformed map is the writer's typed `TermError::BadMap`, also answered `0` with nothing written.
+`enif_make_map_remove` still takes the full-rebuild route (`map_remove`).
 
 ### `pred` — predicates, comparison, hashing
 `enif_is_*`, `enif_compare`, `enif_is_identical`, `enif_hash`, `enif_term_type`, `enif_term_size`.

@@ -360,12 +360,13 @@ pub(super) fn decode_counter_ops(update_op: Eterm, keypos: usize) -> Result<(Vec
     }
     let mut ops = Vec::new();
     let mut element = update_op;
-    while is_list(element) {
-        // SAFETY: `element` is a live non-`NIL` cons cell (checked above), so its
-        // two words are initialised.
-        let head = unsafe { car(element) };
-        // SAFETY: as above — the cell's tail word of the same live cell.
-        let tail = unsafe { cdr(element) };
+    while let Some(cell) = crate::shape::cons_cell(element) {
+        // SAFETY: `cons_cell` established that `element` is a `TAG_PRIMARY_LIST`
+        // cons-cell word with a non-null cell pointer, so its two `[CAR, CDR]` words
+        // are addressable and initialised terms. Liveness/reachability is the
+        // caller's contract (the operand is a live term on the caller's heap); the
+        // shape test cannot validate it.
+        let (head, tail) = unsafe { (*cell, *cell.add(1)) };
         ops.push(decode_counter_tuple(head)?);
         element = tail;
     }

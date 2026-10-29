@@ -3462,7 +3462,8 @@ mod tests {
             // `zz` is seeded before `aa`, so the flat map's `erts_cmp_flatmap_keys`
             // (atom-index) storage order is `[zz, aa]` — the reverse of the
             // `[deterministic]` (`cmp`, atom-**name**) order `[aa, zz]`.
-            let map = access::make_map(ctx.heap(), &[(zz, one), (aa, two)]).expect("fits");
+            let (atoms, heap) = ctx.atom_and_heap();
+            let map = access::make_map(heap, atoms, &[(zz, one), (aa, two)]).expect("fits");
             assert!(access::is_flatmap(map), "2 distinct keys ⇒ a flat map");
             assert_eq!(
                 text(term_to_binary_1(ctx, &[map]).unwrap()),
@@ -3480,7 +3481,8 @@ mod tests {
             // A map nested inside a container is re-sorted too (the flag lives on the
             // encoder, so every map it reaches is affected):
             // erl ... 'term_to_binary({1,#{zz=>1,aa=>2}},[deterministic])'
-            let map = access::make_map(ctx.heap(), &[(zz, one), (aa, two)]).expect("fits");
+            let (atoms, heap) = ctx.atom_and_heap();
+            let map = access::make_map(heap, atoms, &[(zz, one), (aa, two)]).expect("fits");
             let nested = ctx.tuple(&[one, map]).expect("fits");
             let det = atom_option(ctx, "deterministic");
             let mut expected = vec![131u8, 104, 2, 97, 1];
@@ -3489,7 +3491,8 @@ mod tests {
 
             // `[deterministic,deterministic]` is the same flag twice, so it is the same
             // image (`parse_t2b_opts` sets it, it does not toggle).
-            let map = access::make_map(ctx.heap(), &[(zz, one), (aa, two)]).expect("fits");
+            let (atoms, heap) = ctx.atom_and_heap();
+            let map = access::make_map(heap, atoms, &[(zz, one), (aa, two)]).expect("fits");
             let det2 = atom_options(ctx, "deterministic", "deterministic");
             assert_eq!(
                 text(term_to_binary_2(ctx, &[map, det2]).unwrap()),
@@ -3532,7 +3535,8 @@ mod tests {
                     )
                 })
                 .collect();
-            let map = access::make_map(ctx.heap(), &pairs).expect("fits");
+            let (atoms, heap) = ctx.atom_and_heap();
+            let map = access::make_map(heap, atoms, &pairs).expect("fits");
             assert!(!access::is_flatmap(map), "40 distinct keys ⇒ a HAMT");
 
             let plain = text(term_to_binary_1(ctx, &[map]).unwrap());

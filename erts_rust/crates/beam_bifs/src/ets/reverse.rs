@@ -60,9 +60,7 @@ use beam_term::Eterm;
 use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
-use super::{
-    copy_out_list, element_pos, finish_chunk, resolve, restore_table, take_table_gated,
-};
+use super::{copy_out_list, element_pos, resolve, restore_table, take_table_gated};
 
 /// Registers the reverse select family (`ets:select_reverse/1,2,3`).
 pub(super) fn register(reg: &mut BifRegistry) {
@@ -107,22 +105,43 @@ fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// direction (see [`super::Continuation`]), so `ets:select/1` resuming it keeps
 /// that direction: a backward walk for an `ordered_set`, and for a hash kind the
 /// same sequence the forward walk would give (see the module docs).
+///
+/// `MatchSpec` is deep-copied into the registry's input store and compiled **from
+/// that copy** ([`super::own_spec_input`]), so the literals the continuation's
+/// compiled program carries are registry-owned words and a resume never reads the
+/// caller's heap; the copy is retained exactly while a continuation names it
+/// ([`super::finish_chunk_with_input`]).
 fn select_reverse_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let _eval = super::self_hook::SpecEval::install(ctx.self_pid());
     let handle = resolve::resolve_handle(ctx, args[0])?;
-    let spec = compile(args[1], ctx.atoms())?;
+    let owned = super::own_spec_input(ctx, args[1])?;
+    let spec = match compile(owned, ctx.atoms()) {
+        Ok(spec) => spec,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
     // A non-integer or a negative limit is `badarg` here; `0` is rejected by
     // `select_reverse_limit` (matching the oracle, like `ets:select/3`).
-    let limit = element_pos(args[2])?;
+    let limit = match element_pos(args[2]) {
+        Ok(limit) => limit,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
 
-    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    let table = match take_table_gated(ctx, handle, resolve::Gate::Read) {
+        Ok(table) => table,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
     let outcome = {
         let (atoms, heap) = ctx.atom_and_heap();
         table.select_reverse_limit(&spec, limit, atoms, heap)
     };
-    restore_table(ctx, handle, table)?;
-    let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont, true)
+    if let Err(err) = restore_table(ctx, handle, table) {
+        return Err(super::released_input(ctx, owned, err));
+    }
+    let (results, cont) = match outcome {
+        Ok(chunk) => chunk,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
+    super::finish_chunk_with_input(ctx, handle, results, cont, true, owned)
 }
 
 /// `ets:select_reverse(Continuation)` — the `/1` resume.

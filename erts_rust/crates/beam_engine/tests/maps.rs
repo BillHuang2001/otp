@@ -30,10 +30,19 @@
 //!
 //! The flat-map arguments are built by the engine's own flat-map builder and keyed
 //! by the **module's** atom table, so the fixture's key operands compare equal.
-//! The **hashmap** (HAMT) *source* arguments are hand-written (see [`Hamt`]) so the
-//! read path can be exercised against an arbitrary frozen node shape; a hashmap the
-//! *engine builds* comes from `put_map_assoc`/`put_map_exact` crossing the flat-map
-//! limit (`beam_term::map::write_map`).
+//! A **hashmap** (HAMT) *source* argument is built by the frozen writer
+//! ([`hashmap`] → `beam_term::map::write_map`) so every leaf sits in the slot its
+//! own key hash selects — the property the read path's per-key `map_get` descent
+//! depends on, and (since `put_map_exact`'s exact-key validation is that same
+//! descent on **both** its arms) the property its validation depends on too. A hash
+//! map at or below `MAP_SMALL_MAP_LIMIT` cannot arise from the frozen builders
+//! (`write_map` writes a flat map there, and `hashmap_delete` rebuilds a HAMT that
+//! shrinks to the limit as a flat map, `erl_map.c:2946-2981`), so every real hashmap
+//! source is above the limit.
+//! [`Hamt`]'s hand-written node blocks serve the **assoc** write arm only, which
+//! enumerates the source (or rebuilds it flat) and never follows a hash.
+//! A hashmap the *engine builds* comes from `put_map_assoc`/`put_map_exact`
+//! crossing the flat-map limit (`beam_term::map::write_map`).
 //!
 //! # The two load paths (atom nameability)
 //!
@@ -62,12 +71,20 @@ use beam_common::{BeamError, ExceptionClass};
 use beam_engine::jit::Tier;
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{load_file, Module};
-use beam_term::{cmp, make_atom, make_small, Atom, Eterm};
+use beam_term::{cmp, make_atom, make_small, Atom, Eterm, NIL};
 
 use support::ModuleHost;
 
 /// The committed oracle fixture (this crate owns it, unlike `slice.beam`).
 const MAPFX_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mapfx.beam");
+/// The committed `get_map_elements` source/destination-**alias** fixture
+/// (`mapalias.erl`): `erlc` reuses the source register as the first pair's
+/// destination whenever the map is dead after the match, which is the shape
+/// `khepri_tree:gather_node_props/2` emits (`khepri_tree.erl:268`).
+const MAPALIAS_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/mapalias.beam"
+);
 
 /// Resolve a name interned in the module's atom table.
 fn atom(module: &Module, name: &str) -> Atom {
@@ -164,14 +181,19 @@ fn head_bitmap_header(bitmap: u16) -> Eterm {
     beam_term::make_header(size, beam_term::MAP_SUBTAG)
 }
 
-/// A hand-written **hashmap** (HAMT) fixture.
+/// A hand-written **hashmap** (HAMT) fixture for the *write* path.
 ///
-/// No crate in the rewrite can *build* a HAMT (`beam_engine::terms::map_entries`
-/// can read one; the builder belongs to `beam_term`/`beam_codec` and does not
-/// exist yet), so these tests write the frozen `erl_map.h` node blocks directly.
 /// Every block lives in a `Box<[Eterm]>` the fixture keeps alive, so a sub-node
 /// pointer stored in a parent node stays valid — moving the `Box` moves the
 /// pointer, never the pointed-to block.
+///
+/// This shape is only a **fixture**, not a well-formed hash map: a leaf's slot
+/// here is chosen by position, while the frozen reader (`map_get`) follows
+/// `hashmap_nibble(hash(key), L)` and picks the slot by count of lower set bits
+/// in the head bitmap. The write path enumerates (`map_entries`) or takes the
+/// flat rebuild arm for a 32-pair source, so it reads this fixture positionally;
+/// a **read** test needs a map whose leaves sit in their own hash slots, i.e. one
+/// the real builder ([`hashmap`]) produced.
 #[derive(Default)]
 struct Hamt {
     blocks: Vec<Box<[Eterm]>>,
@@ -216,6 +238,11 @@ impl Hamt {
 
 /// A 32-entry hashmap: a bitmap head whose single occupied slot holds a collision
 /// node with the 32 leaves for `keys` (values are the leaf index).
+///
+/// Its leaves are **not** placed by the keys' hashes, so it serves the `assoc` write
+/// arm only (which enumerates the source and never follows a hash); a source the
+/// per-key `map_get` descent must read — the read instructions, and `put_map_exact`'s
+/// exact-key validation — is [`hashmap`].
 fn hashmap_32(hamt: &mut Hamt, keys: &[Eterm]) -> Eterm {
     assert_eq!(keys.len(), 32);
     let leaves: Vec<Eterm> = keys
@@ -225,6 +252,29 @@ fn hashmap_32(hamt: &mut Hamt, keys: &[Eterm]) -> Eterm {
         .collect();
     let child = hamt.collision(&leaves);
     hamt.head_bitmap(1, 32, &[child])
+}
+
+/// A **well-formed** hashmap source: the frozen writer
+/// (`beam_term::map::write_map`, via [`terms::make_map`]) over `entries` plus
+/// distinct small-integer filler keys, so the key count is past
+/// `MAP_SMALL_MAP_LIMIT` and the layout really is the HAMT one.
+///
+/// A hand-written node block cannot serve the read path: `map_get` picks a slot
+/// by `popcount(bitmap & ((1 << nibble(hash(key))) - 1))`, so only the real
+/// builder places each leaf where its own key's hash leads.
+fn hashmap(ctx: &mut dyn ExecutionContext, module: &Module, entries: &[(&str, i64)]) -> Eterm {
+    let mut pairs: Vec<(Eterm, Eterm)> = entries
+        .iter()
+        .map(|(name, value)| (make_atom(atom(module, name)), make_small(*value)))
+        .collect();
+    let mut filler = 1i64;
+    while pairs.len() <= beam_term::map::MAP_SMALL_MAP_LIMIT {
+        pairs.push((make_small(filler), make_small(filler)));
+        filler += 1;
+    }
+    let map = terms::make_map(ctx, &pairs, &module.atom_table).expect("build a hashmap");
+    assert!(terms::is_hashmap(map), "a >32-key map is the HAMT layout");
+    map
 }
 
 #[test]
@@ -381,14 +431,14 @@ fn assoc_exact_runs_both_updates() {
 fn get_reads_a_hashmap_source() {
     let module = load();
     let mut ctx = MinimalContext::new();
-    let mut hamt = Hamt::new();
-    let a = hamt.leaf(make_atom(atom(&module, "a")), make_small(10));
-    let b = hamt.leaf(make_atom(atom(&module, "b")), make_small(20));
-    let map = hamt.head_bitmap(0b0011, 2, &[a, b]);
+    let map = hashmap(&mut ctx, &module, &[("a", 10), ("b", 20)]);
 
-    // The engine's reader enumerates the HAMT (both keys).
-    assert_eq!(terms::map_entries(map).expect("a hashmap is readable").len(), 2);
-    // ... and `get_map_elements` reads it exactly like a flat map.
+    // The source really is the >32-key HAMT layout ...
+    assert_eq!(
+        terms::map_entries(map).expect("a hashmap is readable").len(),
+        33
+    );
+    // ... and `get_map_elements` descends it per key, exactly like a flat map.
     let result = run(&mut ctx, &module, "get", &[map]).expect("get on a hashmap");
     assert_eq!(terms::tuple_element(result, 0).unwrap(), make_small(10));
     assert_eq!(terms::tuple_element(result, 1).unwrap(), make_small(20));
@@ -398,9 +448,8 @@ fn get_reads_a_hashmap_source() {
 fn get_with_a_missing_key_in_a_hashmap_takes_the_fail_label() {
     let module = load();
     let mut ctx = MinimalContext::new();
-    let mut hamt = Hamt::new();
-    let a = hamt.leaf(make_atom(atom(&module, "a")), make_small(10));
-    let map = hamt.head_bitmap(0b0001, 1, &[a]);
+    // `a` (plus the filler keys) is present, `b` is not.
+    let map = hashmap(&mut ctx, &module, &[("a", 10)]);
     // `get/1`'s `case_end` fail label raises `{case_clause, Map}` uncaught.
     assert!(matches!(
         run(&mut ctx, &module, "get", &[map]).unwrap_err(),
@@ -415,15 +464,10 @@ fn has_reports_presence_in_a_hashmap() {
     let yes = make_atom(atom(&module, "yes"));
     let no = make_atom(atom(&module, "no"));
 
-    let mut both = Hamt::new();
-    let a = both.leaf(make_atom(atom(&module, "a")), make_small(1));
-    let b = both.leaf(make_atom(atom(&module, "b")), make_small(2));
-    let both_map = both.head_bitmap(0b0011, 2, &[a, b]);
+    let both_map = hashmap(&mut ctx, &module, &[("a", 1), ("b", 2)]);
     assert_eq!(run(&mut ctx, &module, "has", &[both_map]).unwrap(), yes);
 
-    let mut one = Hamt::new();
-    let a = one.leaf(make_atom(atom(&module, "a")), make_small(1));
-    let one_map = one.head_bitmap(0b0001, 1, &[a]);
+    let one_map = hashmap(&mut ctx, &module, &[("a", 1)]);
     assert_eq!(run(&mut ctx, &module, "has", &[one_map]).unwrap(), no);
 }
 
@@ -464,21 +508,129 @@ fn assoc_that_exceeds_the_flat_map_limit_builds_a_hashmap() {
 }
 
 #[test]
-fn exact_on_a_32_pair_hashmap_builds_an_equivalent_flat_map() {
-    // A ≤ 32-pair result still fits the flat-map layout, so `put_map_exact` updates
-    // a hashmap source successfully; the *bindings* are identical and the ≤ 32-pair
-    // result is written back as a flat map (the layout rule the oracle uses).
+fn exact_on_a_hashmap_source_updates_the_binding() {
+    // The path-copying (COW) arm through the real fixture. A hash map of 32 pairs or
+    // fewer cannot come from the frozen builders — `write_map` writes a flat map at or
+    // below `MAP_SMALL_MAP_LIMIT`, and a HAMT that shrinks to the limit is rebuilt flat
+    // (`hashmap_delete`, `erl_map.c:2946-2981`, which `map_remove_cow` reproduces) — so
+    // `hashmap_32`'s hand-written node block is the only shape at that size, and it is
+    // exactly the shape no per-key `map_get` can read.
     let module = load();
     let mut ctx = MinimalContext::new();
-    let mut keys = vec![make_atom(atom(&module, "a"))];
-    keys.extend((1..=31i64).map(make_small));
-    let mut hamt = Hamt::new();
-    let map = hashmap_32(&mut hamt, &keys);
-
-    let result = run(&mut ctx, &module, "exact", &[map]).expect("exact on a <=32-pair hashmap");
-    assert!(!terms::is_hashmap(result), "32 pairs is a flat map");
+    let map = hashmap(&mut ctx, &module, &[("a", 10)]);
+    assert_eq!(terms::map_entries(map).unwrap().len(), 33);
+    let result = run(&mut ctx, &module, "exact", &[map]).expect("exact on a hashmap source");
+    assert!(terms::is_hashmap(result), "33 pairs stay a hash map");
+    assert_eq!(
+        beam_term::map::map_size(result, &module.atom_table).unwrap(),
+        33
+    );
     assert_eq!(entry(result, &module, "a"), Some(make_small(9)));
-    assert_eq!(terms::map_entries(result).unwrap().len(), 32);
+}
+
+// ---------------------------------------------------------------------------
+// `get_map_elements` with a destination that ALIASES the source register
+// ---------------------------------------------------------------------------
+
+/// Load the alias fixture through `beam_loader::load_file`'s private table.
+fn load_alias() -> Module {
+    load_file(MAPALIAS_BEAM).expect("load mapalias.beam")
+}
+
+/// The fixture's `#node{}` value — a 10-element tuple
+/// `{node, Id, Props, Payload, ChildNodes, ChildListVersion, PayloadVersion,
+/// KeepWhile, Expiry, Meta}` whose `Props` map (element 2) carries the two
+/// versions the fixture's pattern reads.
+fn node_tuple(ctx: &mut dyn ExecutionContext, module: &Module) -> Eterm {
+    let props = flatmap(
+        ctx,
+        module,
+        &[("payload_version", 7), ("child_list_version", 9)],
+    );
+    let elements = [
+        make_atom(atom(module, "node")),
+        make_small(1),
+        props,
+        make_small(42),
+        NIL,
+        make_small(9),
+        make_small(7),
+        NIL,
+        make_small(0),
+        NIL,
+    ];
+    terms::make_tuple(ctx, &elements).expect("a #node{} tuple")
+}
+
+/// `erlc` reuses the register holding the map as the **first pair's destination**
+/// whenever the map is dead after the match:
+///
+/// ```text
+/// {get_map_elements,{f,1},
+///                   {tr,{x,1},{t_map,any,any}},
+///                   {list,[{atom,payload_version},{x,1},
+///                          {atom,child_list_version},{x,2}]}}
+/// ```
+///
+/// The instruction is atomic (`i_get_map_elements` reads `map = $Src` into a local
+/// before descending, `emu/map_instrs.tab:64`), so the second pair must still read
+/// the map the register held at entry — not the first pair's value.
+///
+/// Oracle-pinned: `mapalias:values/1` on this node answers `{7, 9, 42, []}`.
+#[test]
+fn a_destination_that_aliases_the_source_reads_the_original_map() {
+    let module = load_alias();
+    let mut ctx = MinimalContext::new();
+    let node = node_tuple(&mut ctx, &module);
+    let result = run(&mut ctx, &module, "values", &[node]).expect("values/1");
+    assert_eq!(terms::tuple_element(result, 0).unwrap(), make_small(7));
+    assert_eq!(
+        terms::tuple_element(result, 1).unwrap(),
+        make_small(9),
+        "the second pair must read the ORIGINAL map, not the first pair's value"
+    );
+    assert_eq!(terms::tuple_element(result, 2).unwrap(), make_small(42));
+    assert_eq!(terms::tuple_element(result, 3).unwrap(), NIL);
+}
+
+/// The same alias shape on a key that is absent: the instruction takes the
+/// function's `func_info` fail path (`error:function_clause`), never a `badarg`.
+///
+/// Oracle-pinned: `mapalias:missing/1` on this node raises `error:function_clause`.
+#[test]
+fn an_aliasing_read_of_an_absent_key_takes_the_clause_path() {
+    // Through the **seeded** host, as `beam_rt` loads it: `function_clause` is the
+    // `func_info` failure's reason atom and is a host load-time obligation (the
+    // private `beam_loader` table of a module without a head clause does not carry it).
+    let mut host = ModuleHost::new(".");
+    host.register("mapalias", MAPALIAS_BEAM);
+    let module = host
+        .load("mapalias")
+        .expect("load mapalias.beam through the seeded host");
+    let node = node_tuple(&mut host, &module);
+    let err = host.call("mapalias", "missing", &[node]).unwrap_err();
+    let raise = match &err {
+        BeamError::Raise(raise) => raise,
+        other => panic!("expected the clause raise, got {other:?}"),
+    };
+    assert_eq!(raise.class, ExceptionClass::Error);
+    let reason = live_reason(&err).expect("the clause raise carries its live reason term");
+    assert!(
+        cmp(
+            reason,
+            make_atom(atom(&module, "function_clause")),
+            &module.atom_table
+        )
+        .is_eq(),
+        "an absent key is the bare-atom clause failure the oracle raises, never badarg"
+    );
+    // The uncaught frames name the fixture's own clause, so the failure really is
+    // the failed head (a `badarg` would carry no such frame).
+    assert_eq!(
+        raise.stacktrace.frames.first().map(|f| f.function.as_str()),
+        Some("missing"),
+        "the clause failure names the failed head"
+    );
 }
 
 // ---------------------------------------------------------------------------

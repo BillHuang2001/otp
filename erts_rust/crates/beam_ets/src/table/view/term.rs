@@ -274,11 +274,15 @@ impl<'g> TableTerm<'g> {
     pub fn list_to_terms(&self) -> Vec<TableTerm<'g>> {
         let mut elements = Vec::new();
         let mut cursor = self.term;
-        while is_list(cursor) {
-            // SAFETY: `is_list` established a live cons cell, so both words are
-            // initialised terms.
-            let head = unsafe { car(cursor) };
-            let tail = unsafe { cdr(cursor) };
+        while let Some(cell) = crate::shape::cons_cell(cursor) {
+            // SAFETY: `cons_cell` established that `cursor` is a `TAG_PRIMARY_LIST`
+            // cons-cell word with a non-null cell pointer, so both words are
+            // addressable and initialised terms. Liveness/reachability is the
+            // view's contract — the term was read out of live table storage under
+            // this guard — and the shape test cannot validate it. A header-shaped
+            // word (which `is_list`'s `!(x & 0x2)` trick would have accepted) now
+            // falls out of the walk into the non-list branch below.
+            let (head, tail) = unsafe { (*cell, *cell.add(1)) };
             elements.push(TableTerm::new(head));
             cursor = tail;
         }

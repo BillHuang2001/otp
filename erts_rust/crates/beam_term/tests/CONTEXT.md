@@ -19,6 +19,7 @@ the cross-module and public-surface behaviour.
 | `map_alloc.rs` | `cmp` of two flat maps allocates **0**; `write_map` of a 32-pair input allocates **1** and is word-for-word `write_flatmap`'s output; a >32-key pair is the sensitive control; a hand-built unsorted flat map still compares exactly |
 | `map_build_equivalence.rs` | **the `write_map` word-equality harness**: every matrix row (0/1/31/32/33/34/40/100/1000 keys, the dedup crossover, `0.0`/`-0.0` vs `1`/`1.0` distinctness, insertion-order permutations, a 20 000-key row) built twice — live writer vs `mod retired`, a frozen verbatim copy of the pre-sort-and-collapse algorithm — compared word for word after `normalize` block-relativizes every tagged in-buffer pointer, plus `GOLDEN_*` vectors, the overflow sentinel beyond `map_words_capacity`, shape and the readers |
 | `map_words_capacity.rs` | the reservation-vs-written measurement for `map_words_capacity` plus the sound-bound and untouched-tail guards |
+| `map_cow_equivalence.rs` | **the incremental (path-copying) writers' equivalence, structural-safety and scaling harness** — long because it carries four harnesses (op-script sweep, canonical renderer, copier's structural walk, sizing pin) plus the 11-class fixture pool. *Equivalence:* one deterministic op script (value replace, insert, present/absent remove, the flat↔HAMT conversions both ways, delete-to-empty) at 0/1/2/31/32/33/34/64/250/2 500 keys over atoms, small ints, bignums, an on-heap and a `refc` binary, tuples, lists, an `EXPORT_EXT` fun, a nested map, `1` vs `1.0` and a low-nibble collision group, driven through `write_map` **and** through `map_put_cow`/`map_remove_cow`, requiring `=:=` identity plus equal `map_size`/`map_pairs`/`map_pairs_storage_order`/`map_get` and an identical `render_map` (equal stored pair sequence + equal node shape = the `term_to_binary`-bytes claim, stated without the `beam_codec` dependency cycle). *Structural safety:* walks every reachable object through `layout::object_words`/`for_each_child_slot`, requiring the result block's objects to price **exactly** the words written, every off-block object to be reachable from the source (off-path subtrees shared by word, never copied), the flat value-replace's keys-tuple word to be the source's own, both conversions to share no node, `size_object` to agree with the *sizing* walk, and the copy walk's delta to be exactly one 3-word `BinRef` per `refc` binary (the two enumerators' documented divergence). *Scaling:* reserves exactly `*_words_required` under a sentinel tail, bounds it by `*_words_capacity`, requires n = 2 500 to exceed n = 250 by at most one 18-word node and a 32-put fold to stay within `32 × 293` words (measured 33.8 words/op at n = 250 vs the rebuild's 1 033 = 31×; 47.2 vs 9 282 = 197× at n = 2 500), and records the one arm whose plan is a bound rather than an exact write (the flat→HAMT conversion: 711 planned, 127 written). One `#[ignore]`d test prints `map_put` vs `map_put_cow` ns/op and asserts nothing |
 | `map_hash.rs` | HAMT pair-**storage** order vs a live `erl` (two offline-pinned vectors + 33/40/50/64/100-key mixed maps) |
 | `map_order.rs` | the **discriminating** flat-map key-order pin (the fixtures' atom index order is neither the name order nor the input-pair order): stored order is atom-index order, `map_pairs_storage_order` agrees, `map_pairs` is the *name* order and differs, mixed-class keys follow `cmp_flatmap_keys`, reversed input pairs are byte-identical, last-wins dedup leaves no trace |
 | `bitstring_checked.rs` | the shape-validating readers on corrupt data: 20 000 LCG-drawn raw words (every non-boxed one ⇒ `NotATerm`) and 20 000 mutated in-buffer blocks (header menu × null/poison/in-buffer `base_flags` × ordered/reversed/arbitrary `start`/`end` × `orig` menu), asserting every verdict is typed, `Ok` ⇒ `offset + size` cannot overflow and `try_bit_at(t, size)` is an error, `Err` ⇒ all three readers refuse, and the unchecked readers never panic |
@@ -42,6 +43,11 @@ the cross-module and public-surface behaviour.
   retired-instruction figures are the load-independent evidence; timing shapes go to `../examples/`.
 - `map_build_equivalence.rs` is an **equivalence gate, not a golden re-pin**: a dedup rewrite must keep the
   file unchanged and green.
+- `map_cow_equivalence.rs` pins the path-copying writers' **semantics** against `write_map` (the rebuild
+  route) and their **sharing** against the copier's own walk, so a COW-internal refactor must keep it green
+  and unchanged; only a deliberate semantic change may edit it.
+- The `beam_gc` copy test over a *partially shared* map (a collection relocating the source and the result
+  across heaps) is **not here** — it belongs to `beam_gc`, and `map_cow_equivalence.rs`'s module docs say so.
 - The counting `#[global_allocator]` pattern (a `std::alloc::System` wrapper with counters armed **per
   thread**) is deliberate: libtest's harness must never perturb a measurement.
 - Exact-allocation pins are deliberate and bidirectional: a *reduction* fails them exactly like a regression,
@@ -59,6 +65,10 @@ the cross-module and public-surface behaviour.
   capacity reservation, its stored key order and the discriminating index-order pin
 - `bitstring_checked.rs`, `refc_window.rs` → the checked bitstring readers on corrupt data, and the refc sub-binary window
   writer / payload key (incl. why the referenced size cannot live in the term)
+- `map_alloc.rs`, `map_build_equivalence.rs`, `map_words_capacity.rs`, `map_hash.rs` → the map builder, its
+  capacity reservation and its stored key order
+- `map_cow_equivalence.rs` → the incremental (path-copying) writers: rebuild-vs-COW equivalence, the
+  canonical node rendering, the copier's structural/sharing walk and the flat-in-n word scaling
 - `oracle.rs`, `number_oracle.rs`, `compare_oracle.rs`, `compare_external.rs`, `map_hash.rs` → the live-`erl`
   oracle cross-checks
 - `compare_terms.rs`, `compare_class_order.rs` → the term-order surface
