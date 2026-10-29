@@ -811,6 +811,19 @@ impl TermStore {
             Some(&run) if run.words >= 2 && run.words % 2 == 0 => Some(run),
             _ => None,
         };
+        // Reserve the hint slot **before** the first cell is copied. From here on the
+        // run is this spine's storage: it is counted live and lies in the committed
+        // prefix (`plan[..plan_used]`), so a nested copy — which allocates, and buckets
+        // the still-candidate suffix whenever its size does not match — can neither
+        // replay those words for a child nor pop them out from under the cells being
+        // filled below. (Nested commits only ever *push* after this slot, so the slot
+        // index stays valid until the spine is finished.)
+        let slot = hinted.map(|run| {
+            let slot = self.plan_used;
+            self.plan_used += 1;
+            self.live_words += run.words;
+            slot
+        });
         let cells = match hinted {
             Some(run) => run.words / 2,
             None => {
@@ -856,13 +869,13 @@ impl TermStore {
             }
         }
         if let Some(run) = hinted {
-            if used == cells {
-                self.plan_used += 1;
-                self.live_words += run.words;
-            } else {
+            // The full-width case is already committed: the reservation counted the
+            // whole hint live and left it in place.
+            if used != cells {
                 // The hint overshot: keep exactly the `2 * used` words that hold the
                 // spine and hand the surplus back. `run` came from a freed object, so
-                // the surplus is dead storage — bucket it, do not release it.
+                // the surplus is dead storage — bucket it, do not release it, and take
+                // its words out of the live count the reservation added.
                 let keep = AllocSlice {
                     words: used * 2,
                     ..run
@@ -872,10 +885,12 @@ impl TermStore {
                     words: run.words - keep.words,
                     ..run
                 };
-                self.plan[self.plan_used] = keep;
+                let slot = slot.expect("a hinted run reserved its slot");
+                // Nested commits only push after `slot`, and the committed prefix never
+                // shrinks, so the slot is still this spine's run.
+                self.plan[slot] = keep;
+                self.live_words -= rest.words;
                 self.bucket_run(rest);
-                self.plan_used += 1;
-                self.live_words += keep.words;
             }
         }
         // The spine ends at an improper tail (`NIL`, a non-list term, or the rest of a
