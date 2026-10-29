@@ -133,8 +133,12 @@ fn bounded_words_reference(term: Eterm, limit: usize, ctx: &CopyContext<'_>) -> 
                 PrimaryTag::Boxed => {
                     if layout::is_off_heap_term(current) {
                         total = total.saturating_add(ERL_BIN_REF_SIZE);
-                    } else if layout::is_refc_binary_term(current) {
-                        total = total.saturating_add(refc_binary_words(current, ctx));
+                    } else if matches!(
+                        layout::classify_sub_bits(current),
+                        Ok(Some(layout::SubBitsKind::RefcBinary))
+                    ) {
+                        total =
+                            total.saturating_add(refc_binary_words(current, ctx).unwrap_or(0));
                     } else {
                         // Everything else — including a `SUB_BITS` match context, whose
                         // `object_words` is the flattened heap-bits block's size — is sized by
@@ -230,7 +234,12 @@ fn is_acyclic_reference(term: Eterm) -> bool {
                         }
                     }
                     PrimaryTag::Boxed => {
-                        if layout::is_off_heap_term(t) || layout::is_refc_binary_term(t) {
+                        if layout::is_off_heap_term(t)
+                            || matches!(
+                                layout::classify_sub_bits(t),
+                                Ok(Some(layout::SubBitsKind::RefcBinary))
+                            )
+                        {
                             continue;
                         }
                         let p = boxed_val(t);
@@ -752,16 +761,22 @@ mod tests {
         // Each matches its own reference answer (the same `refc_binary_words` feeds both).
         assert_pricing_agrees("refc_binary_handled", handled, &handled_off);
         assert_pricing_agrees("refc_binary_flattened", loose, &empty_off);
-        // ... and a sub-binary (a `write_sub_bits` window over the refc pair) does too.
-        // SAFETY: `handled` is a live refc binary and the window is inside its payload.
+        // ... and a sub-binary (a `write_sub_bits` window over the refc pair) does too. Its `orig`
+        // is the pair's `BinRef` sub-block, the only origin an `ErlSubBits` over a refc binary ever
+        // names (`ERTS_GET_BITSTRING_REF`) — the checked shape rules refuse anything else, so a
+        // nested `ErlSubBits` origin would be a mis-shaped block.
+        // SAFETY: `handled` is the pair's `ErlSubBits` root, so the `BinRef` it names sits
+        // `ERL_BIN_REF_SIZE` words before it; `handled` is a live refc binary and the window is
+        // inside its payload.
         let sub = unsafe {
+            let bin_ref = make_boxed(boxed_val(handled).sub(ERL_BIN_REF_SIZE));
             let hp = src.alloc_words(5).expect("the sub-binary fits");
             write_sub_bits(
                 hp,
                 Eterm::from_raw(handled_ptr as usize),
                 Eterm::from_raw(16),
                 Eterm::from_raw(96),
-                handled,
+                bin_ref,
             )
         };
         assert_pricing_agrees("refc_sub_binary", sub, &handled_off);

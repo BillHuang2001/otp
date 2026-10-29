@@ -1251,4 +1251,114 @@ mod tests {
             );
         });
     }
+
+    /// The registry keeps **owned** data — a [`Resource`] of plain `u64`/`i64` cells — keyed by
+    /// the numeric id word, never a caller-heap [`Eterm`]. Poisoning every word the caller's heap
+    /// has handed out must therefore leave the resource resolvable through a freshly minted handle
+    /// that names the same id.
+    ///
+    /// The sloppy implementations this catches: a registry keyed by (or storing) the handle
+    /// **term** itself, or a [`Resource`] holding an argument `Eterm` (an index/value) instead of
+    /// its converted integer. Either reads poisoned words once a collection relocates the caller's
+    /// heap, so the rebuilt-handle round trip below would return a wrong value or a `badarg`.
+    #[test]
+    fn the_resource_registry_is_keyed_by_the_id_value_not_a_caller_heap_word() {
+        let mut reg = BifRegistry::new();
+        crate::runtime::register(&mut reg);
+        let atoms = atoms();
+        let mut heap = Heap::new(8192).expect("test heap");
+
+        // --- atomics: mint, store a value, then poison the whole caller heap -----------------
+        let (original, id) = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+            let handle = new_atomics(&reg, &mut ctx, 3, 0);
+            let one = ctx.int(1).unwrap();
+            let seven = ctx.int(7).unwrap();
+            reg.call("atomics", "put", 3, &mut ctx, &[handle, one, seven])
+                .unwrap();
+            let id = access::ref_thing_id(handle).expect("the handle is an internal ref thing");
+            (handle, id)
+        };
+        // Poison EVERY word the caller's heap handed out.
+        for word in heap.used_words_mut() {
+            *word = beam_term::make_small(-42);
+        }
+        assert!(
+            access::ref_thing_id(original).is_err(),
+            "the poison must clobber the original handle word"
+        );
+        // A handle naming the same id still resolves: the registry keys on the numeric id.
+        let fresh = access::make_ref_thing(&mut heap, id).expect("a fresh handle");
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+            let one = ctx.int(1).unwrap();
+            let got = reg
+                .call("atomics", "get", 2, &mut ctx, &[fresh, one])
+                .unwrap();
+            let seven = ctx.int(7).unwrap();
+            assert_eq!(got, seven);
+            let info = reg.call("atomics", "info", 1, &mut ctx, &[fresh]).unwrap();
+            let size = map_value(&ctx, info, "size");
+            let three = ctx.int(3).unwrap();
+            assert_eq!(size, three);
+        }
+
+        // --- counters: the same mint-poison-rebuild cycle ------------------------------------
+        let (original_c, id_c) = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+            let handle = new_counters(&reg, &mut ctx, 4);
+            let one = ctx.int(1).unwrap();
+            let nine = ctx.int(9).unwrap();
+            reg.call(
+                "erts_internal",
+                "counters_put",
+                3,
+                &mut ctx,
+                &[handle, one, nine],
+            )
+            .unwrap();
+            let id = access::ref_thing_id(handle).expect("an internal ref thing");
+            (handle, id)
+        };
+        for word in heap.used_words_mut() {
+            *word = beam_term::make_small(-42);
+        }
+        assert!(
+            access::ref_thing_id(original_c).is_err(),
+            "the poison must clobber the original counters handle word"
+        );
+        let fresh_c = access::make_ref_thing(&mut heap, id_c).expect("a fresh handle");
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+            let one = ctx.int(1).unwrap();
+            let got = reg
+                .call(
+                    "erts_internal",
+                    "counters_get",
+                    2,
+                    &mut ctx,
+                    &[fresh_c, one],
+                )
+                .unwrap();
+            let nine = ctx.int(9).unwrap();
+            assert_eq!(got, nine);
+        }
+
+        // --- a poisoned / garbage handle is `badarg`, never a wrong resource ------------------
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+            let garbage = beam_term::make_small(-42);
+            let one = ctx.int(1).unwrap();
+            assert_badarg(reg.call("atomics", "get", 2, &mut ctx, &[garbage, one]));
+            let garbage = beam_term::make_small(-42);
+            let one = ctx.int(1).unwrap();
+            assert_badarg(reg.call(
+                "erts_internal",
+                "counters_get",
+                2,
+                &mut ctx,
+                &[garbage, one],
+            ));
+        }
+    }
 }

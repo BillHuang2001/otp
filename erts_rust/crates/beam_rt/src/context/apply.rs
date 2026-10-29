@@ -545,11 +545,17 @@ impl RuntimeContext<'_> {
     ///    `reg[arity]` must still take the fun). [`beam_engine::MAX_REGISTER`] is the
     ///    one definition of that bound.
     /// 3. **A first argument that is not a fun** is the C's `EXC_BADFUN`
-    ///    (`call_fun`'s `is_not_any_fun` arm, `:1610-1616`) with `fvalue = fun`, i.e.
-    ///    [`crate::error::bad_fun`] — the class and reason atom the oracle raises.
-    ///    `expand_error_value`'s `{badfun, Fun}` payload is the engine's to build (see
-    ///    that constructor's docs), and the innermost cooked frame the oracle shows for
-    ///    it is the **caller's**, which is also the engine's call.
+    ///    (`call_fun`'s `is_not_any_fun` arm, `:1610-1616`) with `fvalue = fun`, whose
+    ///    `expand_error_value` step wraps the pair into `{badfun, Fun}` — reported here as
+    ///    [`crate::error::bad_fun_with`], the same class and reason atom the oracle raises
+    ///    plus the payload an enclosing `try` observes.
+    ///
+    /// A fun applied at the **wrong arity** is the sibling `EXC_BADARITY`, whose payload is
+    /// `{badarity, {Fun, Args}}` with `Args` the caller's own list
+    /// ([`crate::error::bad_arity_with`]). Only a *direct* arity mismatch is wrapped: an
+    /// application whose body raises `badarity` further in keeps its own reason, so the
+    /// predicate is the fun's declared arity against the argument count, never the arrival of
+    /// a bare [`BeamError::BadArity`].
     ///
     /// # The application itself
     ///
@@ -583,9 +589,21 @@ impl RuntimeContext<'_> {
             return Err(BeamError::SystemLimit);
         }
         if !terms::is_fun(fun) {
-            return Err(crate::error::bad_fun());
+            return Err(crate::error::bad_fun_with(self, fun));
         }
-        self.apply_fun(fun, &call_args)
+        let result = self.apply_fun(fun, &call_args);
+        // The arity guard belongs to the application itself, so a mismatch between the fun's
+        // **declared** arity and this call is the C's `EXC_BADARITY`: wrap it into
+        // `{badarity, {Fun, Args}}` on the *caller's* list. A `badarity` that arrives from
+        // inside the applied body is a different application's raise and keeps its own reason
+        // (its own `call_fun` already expanded it).
+        if let Err(BeamError::BadArity) = &result {
+            let declared = terms::fun_arity(fun).ok().map(u64::from);
+            if declared != Some(call_args.len() as u64) {
+                return Err(crate::error::bad_arity_with(self, fun, list));
+            }
+        }
+        result
     }
 }
 

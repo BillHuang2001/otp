@@ -27,8 +27,8 @@
 //! from the same value that was *copied*: OTP's `maps:put/3`, `maps:update/3` and
 //! `maps:remove/2` answer the caller's own map when the operation is a no-op, and
 //! `lists:reverse/1` answers `[]` for `[]` — the oracle then reports `true`, and a runtime that
-//! re-copied the unchanged argument reports `false`. This suite runs the whole matrix under
-//! **both** of the runtime's routes and cross-checks every row against the live `erl`:
+//! re-copied the unchanged argument reports `false`. This suite runs every row under **both** of
+//! the runtime's routes where both can express it, and cross-checks each against the live `erl`:
 //!
 //! * the **`-eval`** route (`beam_rt -noshell -eval <expr>`) — the tree-walking evaluator, a
 //!   **table-less** `RuntimeContext`, whose copy-out destination is the runtime-lifetime
@@ -61,15 +61,15 @@
 //! by the `put_map_assoc` instruction's no-op rule instead of by this crate's door. Bound to a
 //! variable it becomes the real no-op case (`put_bound`), which is what the matrix uses.
 //!
-//! # One documented cross-crate residual
+//! # The compiled route's opcode shape
 //!
-//! OTP's compiler rewrites a direct `maps:put/3` call into the **`put_map_assoc`
-//! instruction**, which this runtime's engine implements without the C's no-op short-circuit
-//! (`erts_maps_put` returns the input map when nothing changed). A compiled `M#{a => 1}` on a
-//! map that already holds `a => 1` therefore answers `false` here where the oracle answers
-//! `true`. That is `../beam_engine`'s instruction family, not this crate's door, so it is
-//! pinned as a **characterization** row (`an_engine_opcode_gap_is_pinned`) rather than
-//! asserted as parity — the fixture keeps `maps:put/3` a real `call_ext` by passing key and
+//! OTP's compiler rewrites a direct `maps:put/3` call into the **`put_map_assoc` instruction**,
+//! so a compiled `M#{a => 1}` never reaches a BIF at all: the engine implements the C's
+//! `erts_maps_put` no-op rule itself and hands the input map through, which is why the
+//! `opcode_put_bound` row answers the oracle's `true` on the compiled route. That row is
+//! **compiled-route-only** — the `-eval` route's tree-walking evaluator reads source directly
+//! and has no compiler, so it has no `put_map_assoc` to observe (its `eval` field is `None`).
+//! The fixture keeps `maps:put/3` a real `call_ext` for the shared rows by passing key and
 //! value through a helper, which is why `put_bound` observes the BIF door on both routes.
 //!
 //! # Running
@@ -95,8 +95,8 @@ const MODULE: &str = "bif_result_identity";
 ///
 /// `put_via_helper/3` exists so the compiler keeps `maps:put/3` a **`call_ext`**: a direct
 /// `maps:put(K, V, M)` is rewritten into the `put_map_assoc` instruction (OTP's own maps
-/// optimization), and that opcode's no-op behaviour is `beam_engine`'s (see the residual row
-/// `opcode_put_bound/0`).
+/// optimization), which the engine executes itself — that shape is the separate
+/// `opcode_put_bound/0` row.
 const FIXTURE: &str = r#"
 -module(bif_result_identity).
 
@@ -143,20 +143,22 @@ rebuilt_map_is_a_copy() ->
     Map = maps:from_list([{a, 1}]),
     erts_debug:same(maps:filter(fun(_K, V) -> V =:= 1 end, Map), Map).
 
+%% The compiler's own rewrite of that call: a value-identical `put_map_assoc` keeps the map.
 opcode_put_bound() ->
     Map = maps:from_list([{a, 1}]),
     erts_debug:same(Map#{a => 1}, Map).
 "#;
 
-/// One row of the matrix, run on **both** routes.
+/// One row of the matrix, run on **both** routes where both can express it.
 struct Row {
     /// The row's name in a failure message.
     name: &'static str,
-    /// The `-eval` expression as a **sub-expression** (the suite adds the printer wrapper).
-    eval: &'static str,
+    /// The `-eval` expression as a **sub-expression** (the suite adds the printer wrapper), or
+    /// `None` for a row only compiled code can produce.
+    eval: Option<&'static str>,
     /// The compiled fixture's zero-arity function for the same shape.
     fun: &'static str,
-    /// The oracle's answer — what this runtime must reproduce on **both** routes.
+    /// The oracle's answer — what this runtime must reproduce on every route that runs it.
     expected: &'static str,
 }
 
@@ -165,44 +167,55 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         name: "a bound no-op maps:put/3 hands the map through",
-        eval: "M = #{a => 1}, erts_debug:same(maps:put(a, 1, M), M)",
+        eval: Some("M = #{a => 1}, erts_debug:same(maps:put(a, 1, M), M)"),
         fun: "put_bound",
+        expected: "true",
+    },
+    // The compiler's own rewrite of that BIF call: a value-identical `put_map_assoc` keeps the
+    // input map's identity, which the engine implements itself. Compiled-route-only — the
+    // `-eval` walker has no compiler, hence no opcode to observe.
+    Row {
+        name: "a compiled value-identical map update (`put_map_assoc`) hands the map through",
+        eval: None,
+        fun: "opcode_put_bound",
         expected: "true",
     },
     Row {
         name: "a changed maps:put/3 builds a new map",
-        eval: "M = #{a => 1}, erts_debug:same(maps:put(a, 2, M), M)",
+        eval: Some("M = #{a => 1}, erts_debug:same(maps:put(a, 2, M), M)"),
         fun: "put_changed",
         expected: "false",
     },
     Row {
         name: "removing an absent key hands the map through",
-        eval: "M = #{a => 1}, erts_debug:same(maps:remove(zz, M), M)",
+        eval: Some("M = #{a => 1}, erts_debug:same(maps:remove(zz, M), M)"),
         fun: "remove_absent",
         expected: "true",
     },
     Row {
         name: "removing a present key builds a new map",
-        eval: "M = #{a => 1}, erts_debug:same(maps:remove(a, M), M)",
+        eval: Some("M = #{a => 1}, erts_debug:same(maps:remove(a, M), M)"),
         fun: "remove_present",
         expected: "false",
     },
     Row {
         name: "reversing the empty list answers the empty list",
-        eval: "erts_debug:same(lists:reverse([]), [])",
+        eval: Some("erts_debug:same(lists:reverse([]), [])"),
         fun: "reverse_of_empty",
         expected: "true",
     },
     Row {
         name: "a bound term is identical to itself",
-        eval: "T = maps:from_list([{N, N * N} || N <- lists:seq(1, 40)]), \
-               erts_debug:same(T, T)",
+        eval: Some(
+            "T = maps:from_list([{N, N * N} || N <- lists:seq(1, 40)]), \
+             erts_debug:same(T, T)",
+        ),
         fun: "same_on_a_bound_term",
         expected: "true",
     },
     Row {
         name: "a whole binary:part/3 is a **new** sub-binary",
-        eval: "B = <<1, 2, 3>>, erts_debug:same(binary:part(B, 0, byte_size(B)), B)",
+        eval: Some("B = <<1, 2, 3>>, erts_debug:same(binary:part(B, 0, byte_size(B)), B)"),
         fun: "binary_part_of_the_whole",
         expected: "false",
     },
@@ -211,13 +224,15 @@ const ROWS: &[Row] = &[
     // answer `true` here).
     Row {
         name: "a freshly built list is a copy, not the literal",
-        eval: "erts_debug:same(lists:seq(1, 3), [1, 2, 3])",
+        eval: Some("erts_debug:same(lists:seq(1, 3), [1, 2, 3])"),
         fun: "fresh_list_is_a_copy",
         expected: "false",
     },
     Row {
         name: "a rebuilt map is a copy, not the argument",
-        eval: "M = #{a => 1}, erts_debug:same(maps:filter(fun(_K, V) -> V =:= 1 end, M), M)",
+        eval: Some(
+            "M = #{a => 1}, erts_debug:same(maps:filter(fun(_K, V) -> V =:= 1 end, M), M)",
+        ),
         fun: "rebuilt_map_is_a_copy",
         expected: "false",
     },
@@ -264,11 +279,8 @@ fn ask_oracle(oracle: &Path, expr: &str, code_dir: Option<&Path>) -> Option<Stri
 /// The `-eval` wrapper: bindings must sit inside `begin … end` because they land in
 /// `io:format/2`'s argument list (the `-eval` grammar rejects `io:format("~w", [M = #{}])` on
 /// both runtimes, so an unwrapped row would compare two `badarg`s).
-fn eval_probe(row: &Row) -> String {
-    format!(
-        "io:format(\"~w~n\", [begin {} end]), halt(0).",
-        row.eval
-    )
+fn eval_probe(eval: &str) -> String {
+    format!("io:format(\"~w~n\", [begin {eval} end]), halt(0).")
 }
 
 /// The compiled route's probe expression (the oracle side; this runtime is driven by `run`).
@@ -296,12 +308,18 @@ fn runtime_run(fixture: &support::ErlangFixture, fun: &str) -> String {
     observed.stdout.trim().to_string()
 }
 
-/// The `-eval` route: every row answers the oracle's value.
+/// The `-eval` route: every row the route can express answers the oracle's value.
+///
+/// A row whose shape only exists in compiled code (`opcode_put_bound`, the `put_map_assoc`
+/// instruction) has no `-eval` expression and is skipped here; the compiled route asserts it.
 #[test]
 fn the_eval_route_reproduces_the_oracles_no_op_identity() {
     let oracle = support::require_oracle(SUITE);
     for row in ROWS {
-        let probe = eval_probe(row);
+        let Some(eval) = row.eval else {
+            continue;
+        };
+        let probe = eval_probe(eval);
         let ours = runtime_eval(&probe, None);
         assert_eq!(
             ours, row.expected,
@@ -353,7 +371,8 @@ fn the_compiled_route_reproduces_the_oracles_no_op_identity() {
         assert_eq!(
             ours, row.expected,
             "`run {}` must answer the oracle's {} for {}\n(if this row regressed to `false` on a \
-             no-op shape, check whether the fixture's `maps:put/3` call is still a call_ext)",
+             no-op shape, check whether the fixture's `maps:put/3` call is still a call_ext — or, \
+             for `opcode_put_bound`, whether `put_map_assoc` still keeps the input map's identity)",
             row.fun, row.expected, row.name
         );
         let probe = compiled_probe(row);
@@ -365,42 +384,4 @@ fn the_compiled_route_reproduces_the_oracles_no_op_identity() {
             );
         }
     }
-}
-
-/// The documented **cross-crate residual**: OTP's `put_map_assoc` keeps the input map's
-/// identity for a value-identical put (`erts_maps_put`), this runtime's engine does not — it
-/// lives in `../beam_engine`'s map family, outside this crate's door.
-///
-/// Pinned as a characterization row so the difference is a recorded, visible fact rather than
-/// a surprise: when the engine grows the short-circuit this test fails on the `false` and its
-/// message says the gap closed.
-#[test]
-fn an_engine_opcode_gap_is_pinned() {
-    let Some(oracle) = support::require_oracle(SUITE) else {
-        return;
-    };
-    let Some(fixture) = support::ErlangFixture::compile(SUITE, "bif_result_identity", MODULE, FIXTURE)
-    else {
-        return;
-    };
-    let ours = runtime_run(&fixture, "opcode_put_bound");
-    let probe = compiled_probe(&Row {
-        name: "a compiled value-identical map update (`put_map_assoc`)",
-        eval: "",
-        fun: "opcode_put_bound",
-        expected: "",
-    });
-    let Some(theirs) = ask_oracle(&oracle, &probe, Some(fixture.dir())) else {
-        return;
-    };
-    assert_eq!(
-        theirs, "true",
-        "the oracle keeps the map's identity for `M#{{a => 1}}` when `a => 1` is already there"
-    );
-    assert_eq!(
-        ours, "false",
-        "the `put_map_assoc` no-op short-circuit landed — `beam_engine`'s map family now matches \
-         erts_maps_put: move this row into `ROWS` with `expected = \"true\"` and drop the \
-         residual paragraph from this suite's docs"
-    );
 }

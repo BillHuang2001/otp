@@ -1809,11 +1809,27 @@ mod tests {
         assert!(matches!(error, BeamError::BadArg), "{error}");
     }
 
+    /// The reason term of the C `expand_error_value` raise this floor builds for
+    /// `erlang:apply/2` — `{badfun, Fun}` / `{badarity, {Fun, Args}}` — as
+    /// `(tag, payload)`, recovered through the crate's one live-reason point
+    /// ([`crate::error::live_reason_term`]).
+    ///
+    /// `None` for every other shape: a bare-atom reason (the *pre*-expansion half the engine's
+    /// own closure seams report) has no payload at all — the recovery point refuses to attach
+    /// one next to an atom reason — so a test written with this helper cannot silently accept
+    /// the unexpanded reason.
+    fn expanded_reason<'a>(runtime: &'a crate::Runtime, error: &BeamError) -> Option<(&'a str, Eterm)> {
+        let reason = error::live_reason_term(error)?;
+        let tag = terms::tuple_element(reason, 0).ok()?;
+        let payload = terms::tuple_element(reason, 1).ok()?;
+        Some((runtime.atom_name_of(tag)?, payload))
+    }
+
     /// A first argument that is not a fun is the C's `EXC_BADFUN` (`call_fun`'s
-    /// `is_not_any_fun` arm): class `error` with the reason atom `badfun` — never the
-    /// `badarg` the floor used to raise. Measured on the oracle:
-    /// `catch apply(notafun, [1])` ⇒ `{'EXIT',{{badfun,notafun},[{qq10,e,0,…}]}}`; the
-    /// `{badfun, Fun}` payload is the engine's to expand (`crate::error::bad_fun`).
+    /// `is_not_any_fun` arm) *expanded* by `expand_error_value` into `{badfun, Fun}`
+    /// (`../../erts/emulator/beam/beam_common.c:750-772`) — never the `badarg` the floor used
+    /// to raise, and never the bare reason atom alone. Measured on the oracle:
+    /// `catch apply(notafun, [1])` ⇒ `{'EXIT',{{badfun,notafun},[{qq10,e,0,…}]}}`.
     #[test]
     fn apply_of_two_arguments_rejects_a_non_fun_with_badfun() {
         let mut runtime = runtime();
@@ -1824,9 +1840,20 @@ mod tests {
         };
         let error = call(&mut runtime, "erlang", "apply", &[make_small(7), arguments])
             .expect_err("apply/2 of a non-fun");
-        assert_eq!(error.as_atom(), Some("badfun"), "{error}");
+        assert_eq!(
+            expanded_reason(&runtime, &error),
+            Some(("badfun", make_small(7))),
+            "{error:?}"
+        );
     }
 
+    // The sibling `EXC_BADARITY` (`{badarity, {Fun, Args}}`) is produced by the same door
+    // ([`crate::error::bad_arity_with`]) but needs a real fun at a mismatched arity to
+    // trigger, which a floor-only unit test cannot build without a loaded module; its
+    // oracle-measured shape (`catch apply(fun(X) -> X end, [1,2])` ⇒
+    // `{'EXIT',{{badarity,{#Fun<…>,[1,2]}},…}}`) is pinned end to end on the `-eval` route,
+    // whose `apply/2` is this very function.
+    //
     /// A non-list or an **improper** second argument is `badarg` — and it wins over a
     /// non-fun first argument, because C walks the argument list first (measured:
     /// `catch apply(erlang, self)` is `badarg`, not `{badfun,erlang}`).
@@ -1870,7 +1897,11 @@ mod tests {
         };
         let error = call(&mut runtime, "erlang", "apply", &[make_small(7), max])
             .expect_err("apply/2 of 1023 arguments and a non-fun");
-        assert_eq!(error.as_atom(), Some("badfun"), "{error}");
+        assert_eq!(
+            expanded_reason(&runtime, &error),
+            Some(("badfun", make_small(7))),
+            "{error:?}"
+        );
         let error = call(&mut runtime, "erlang", "apply", &[make_small(7), over])
             .expect_err("apply/2 of 1024 arguments");
         assert!(matches!(error, BeamError::SystemLimit), "{error}");

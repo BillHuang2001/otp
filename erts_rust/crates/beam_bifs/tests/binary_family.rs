@@ -486,3 +486,101 @@ fn a_zero_length_off_heap_window_is_the_empty_binary() {
     let zero = f.ints(&[0]).remove(0);
     assert!(matches!(f.call("binary", "at", &[b, zero]), Err(BeamError::BadArg)));
 }
+
+/// `binary:part/2,3` and `erlang:binary_part/2,3` reach **one** producer
+/// (`binary::part_slice`), so over an off-heap parent — where a part above 512 bits is a
+/// real `[BinRef][ErlSubBits]` window — the two spellings must agree on the bytes, on the
+/// result's own size, on `binary:referenced_byte_size/1` and on every refusal.
+///
+/// The `referenced_byte_size/1` answer is the arm the *window's* size selects, so a
+/// 1025-byte parent answers `1025` for a > 64-byte part and the part's own size at or
+/// below it. The oracle rows (compiled fixture, OTP 29.1.2 / erts-17.1.1, with
+/// `B = <<"z", (binary:copy(<<255>>,1024))/binary>>`): `bp3_same` `true`, `bp2_same`
+/// `true`, `bp3_ref` `1025`, `bp3_md5_same` `true`.
+#[test]
+fn binary_part_and_erlang_binary_part_agree_over_an_off_heap_parent() {
+    let mut f = Fixture::new();
+    let bytes: Vec<u8> = (0..1025u32).map(|i| (i % 251) as u8).collect();
+    let b = f.whole_refc(&bytes);
+
+    // `(Start, Len, lo, hi)`: the reverse-part negative length is included, as is the
+    // empty tail part.
+    let cases = [
+        (0i64, 1025i64, 0usize, 1025usize),
+        (0, 64, 0, 64),
+        (0, 65, 0, 65),
+        (1, 510, 1, 511),
+        (1, 1024, 1, 1025),
+        (512, -511, 1, 512),
+        (1025, 0, 1025, 1025),
+    ];
+    for (start, len, lo, hi) in cases {
+        let args = f.ints(&[start, len]);
+        let via_binary = f.ok("binary", "part", &[b, args[0], args[1]]);
+        let via_erlang = f.ok("erlang", "binary_part", &[b, args[0], args[1]]);
+        assert_eq!(bytes_of(via_binary), bytes[lo..hi].to_vec(), "({start},{len}) bytes");
+        assert_eq!(
+            bytes_of(via_erlang),
+            bytes_of(via_binary),
+            "({start},{len}): erlang:binary_part/3 must read the same bytes as binary:part/3"
+        );
+        assert_eq!(
+            signed_value(f.ok("binary", "referenced_byte_size", &[via_erlang])),
+            signed_value(f.ok("binary", "referenced_byte_size", &[via_binary])),
+            "({start},{len}): both spellings must land on the same arm"
+        );
+        assert_eq!(
+            bytes_of(f.ok("erlang", "md5", &[via_erlang])),
+            bytes_of(f.ok("erlang", "md5", &[via_binary])),
+            "({start},{len}): the two spellings digest the same bytes"
+        );
+        // The `{Start, Len}` tuple forms too.
+        let pair = {
+            let mut ctx = BifContext::new(&mut f.heap, &f.atoms, ProcessId::new(1, 0));
+            ctx.tuple(&[args[0], args[1]]).expect("the {Start,Len} tuple fits")
+        };
+        let two_binary = f.ok("binary", "part", &[b, pair]);
+        let two_erlang = f.ok("erlang", "binary_part", &[b, pair]);
+        assert_eq!(bytes_of(two_binary), bytes[lo..hi].to_vec(), "({start},{len}) part/2 bytes");
+        assert_eq!(bytes_of(two_erlang), bytes_of(two_binary), "({start},{len}) part/2 agreement");
+    }
+
+    // The window arm itself: a 510-byte part of the 1025-byte payload answers the
+    // payload's width through both spellings, and a 64-byte one answers its own size.
+    let (one, five_ten, zero, n64) =
+        (f.ints(&[1]).remove(0), f.ints(&[510]).remove(0), f.ints(&[0]).remove(0), f.ints(&[64]).remove(0));
+    for spelling in ["binary", "erlang"] {
+        let function = if spelling == "binary" { "part" } else { "binary_part" };
+        let window = f.ok(spelling, function, &[b, one, five_ten]);
+        assert_eq!(
+            signed_value(f.ok("binary", "referenced_byte_size", &[window])),
+            1025,
+            "{spelling}:{function}/3 of a 510-byte part must window the 1025-byte payload"
+        );
+        let copy = f.ok(spelling, function, &[b, zero, n64]);
+        assert_eq!(
+            signed_value(f.ok("binary", "referenced_byte_size", &[copy])),
+            64,
+            "{spelling}:{function}/3 of a 64-byte part is the copy arm"
+        );
+        // A bad range is `badarg` in both spellings: past the end, a negative `Start`, a
+        // non-integer position and a `|Len|` larger than `Start`.
+        let (past, len1, neg, float) =
+            (f.ints(&[1025]).remove(0), f.ints(&[1]).remove(0), f.ints(&[-1]).remove(0), {
+                let mut ctx = BifContext::new(&mut f.heap, &f.atoms, ProcessId::new(1, 0));
+                ctx.make_float(1.0).expect("a float fits")
+            });
+        for args in [
+            vec![b, past, len1],
+            vec![b, zero, f.ints(&[1026]).remove(0)],
+            vec![b, neg, len1],
+            vec![b, zero, neg],
+            vec![b, float, len1],
+        ] {
+            assert!(
+                matches!(f.call(spelling, function, &args), Err(BeamError::BadArg)),
+                "{spelling}:{function}/3 must be badarg for this range"
+            );
+        }
+    }
+}

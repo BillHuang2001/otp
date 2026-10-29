@@ -1387,12 +1387,18 @@ impl Evaluator<'_, '_> {
     /// host's ordinary dispatch, which is what
     /// [`RuntimeContext::apply_fun`](crate::context::RuntimeContext) does for it.
     fn apply_value(&mut self, function: Eterm, args: &[Eterm]) -> EResult<Eterm> {
-        if terms::is_fun(function)
-            && !matches!(
-                heap!(beam_codec::term::fun_kind_term(function)),
-                beam_codec::FunKind::External
-            )
-        {
+        // erl_eval's `do_apply` classifies the *application target* before it dispatches:
+        // a value that is not a fun is C's `{badfun, Fun}` (`expand_error_value`), never the
+        // `badarg` the dispatch seams below answer for a term they cannot resolve — measured
+        // on the oracle, `F = notafun, F(1)` and `apply(notafun, [1])` are both
+        // `{'EXIT',{{badfun,notafun},…}}`.
+        if !terms::is_fun(function) {
+            return Err(self.expanded(ExceptionClass::Error, "badfun", function));
+        }
+        if !matches!(
+            heap!(beam_codec::term::fun_kind_term(function)),
+            beam_codec::FunKind::External
+        ) {
             let uniq = heap!(terms::fun_uniq(function));
             let index = heap!(terms::fun_index(function)) as usize;
             if uniq == EVAL_FUN_UNIQ {
@@ -1446,9 +1452,9 @@ impl Evaluator<'_, '_> {
         args: &[Eterm],
     ) -> EResult<Eterm> {
         let (slot, route) = nesting::Slot::enter();
-        // An arity its own clauses do not declare is the walker's `BadArity` (the oracle's
-        // `badarity`), and it cannot recurse — so it keeps that reason instead of being reported
-        // as a capability gap the compile route would answer with.
+        // An arity its own clauses do not declare is C's `EXC_BADARITY` — the walker raises
+        // it as the expanded `{badarity, {Fun, Args}}` reason (see `walk_closure`) rather than
+        // as a capability gap, so a catch binds the oracle's reason.
         let arity_matches = terms::fun_arity(function)
             .ok()
             .and_then(|arity| usize::try_from(arity).ok())
@@ -1537,6 +1543,18 @@ impl Evaluator<'_, '_> {
                         continue;
                     }
                     return self.exprs(&clause.body, &mut clause_env);
+                }
+                // An application at an arity the fun does not declare is C's `EXC_BADARITY`,
+                // whose `expand_error_value` step wraps the fun and the **argument list** into
+                // `{badarity, {Fun, Args}}` — measured on the oracle:
+                // `apply(fun(X) -> X end, [1,2])` ⇒ `{'EXIT',{{badarity,{#Fun<…>,[1,2]}},…}}`.
+                // A clause/guard mismatch at the *right* arity is a different failure
+                // (`function_clause` on the oracle) and keeps today's documented residual.
+                let declared = terms::fun_arity(function).ok().map(u64::from);
+                if declared != Some(args.len() as u64) {
+                    let list = heap!(terms::make_list(self.ctx, args));
+                    let pair = heap!(terms::make_tuple(self.ctx, &[function, list]));
+                    return Err(self.expanded(ExceptionClass::Error, "badarity", pair));
                 }
                 Err(Flow::Fatal(BeamError::BadArity))
             }
@@ -2804,6 +2822,29 @@ impl Evaluator<'_, '_> {
         }
     }
 
+    /// The C `expand_error_value` raise: class `error`, reason the tuple `{Tag, Payload}`.
+    ///
+    /// The compound shape (`{badfun, Fun}`, `{badarity, {Fun, Args}}`) is what an enclosing
+    /// `try … catch C:R` observes on the oracle; the payload is built on the evaluator's heap
+    /// and handed over as a [`Flow::Raise`] **term**, so the catch binds the real reason
+    /// instead of the atom-only placeholder.
+    fn expanded(&mut self, class: ExceptionClass, tag: &str, payload: Eterm) -> Flow {
+        let tag_term = self.atom(tag);
+        match terms::make_tuple(self.ctx, &[tag_term, payload]) {
+            Ok(reason) => Flow::Raise {
+                class,
+                reason,
+                origin: None,
+                head: None,
+            },
+            // A heap that cannot hold the two-word reason degrades to the **atom-only** raise —
+            // the same class and reason atom, without the payload — exactly as
+            // [`crate::error::bad_fun_with`] does. A buildable reason is never reshaped into a
+            // capability gap.
+            Err(_) => self.raise(class, tag),
+        }
+    }
+
     /// The `{bad_generator, X}` reason a comprehension generator raises for a source that
     /// cannot be iterated (`[Y || Y <- X]` / `<<… || <<…>> <= X>>` on a non-list /
     /// non-bitstring `X`) — the oracle's exact reason, with `X` the offending value.
@@ -3508,6 +3549,42 @@ mod tests {
         assert_eq!(signed_value(elements[0]), 1);
         assert_eq!(signed_value(elements[1]), 4);
         assert_eq!(signed_value(elements[2]), 9);
+    }
+
+    /// `erlang:apply/2`'s two failure classes reach a `catch` as C's **expanded** reasons
+    /// (`expand_error_value`, `../../erts/emulator/beam/beam_common.c:750-772`), never as the
+    /// bare `badfun`/`badarity` atoms the floor used to answer: a non-fun target is
+    /// `{badfun, Fun}` and a wrong argument count is `{badarity, {Fun, Args}}` with `Args` the
+    /// **caller's own list** (C stores `fvalue = TUPLE2(Fun, Args)`; it never walks it).
+    ///
+    /// Measured live on the system oracle (OTP 29.1.2 / erts-17.1.1):
+    /// `catch apply(notafun,[1])` ⇒ `{'EXIT',{{badfun,notafun},[{erl_eval,do_apply,6,…}]}}` and
+    /// `catch apply(fun(X) -> X end,[1,2])` ⇒ `{'EXIT',{{badarity,{#Fun<…>,[1,2]}},…}}`.
+    /// The fun is inspected structurally rather than printed: rendering an `-eval` template
+    /// closure's `#Fun<…>` identity is this evaluator's documented `~p` gap.
+    #[test]
+    fn the_apply_failure_classes_are_expanded_like_the_oracle() {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        // The `badfun` payload is the offending value itself.
+        let reason = eval(&mut ctx, "try apply(notafun,[1]) catch error:R -> R end")
+            .expect("the reason is caught, not fatal");
+        let printed = ctx.runtime.format_term_w(reason, None).expect("~w");
+        assert_eq!(printed.trim_end(), "{badfun,notafun}");
+        // The `badarity` payload is the `{Fun, Args}` pair: a real fun and the caller's list.
+        let reason = eval(&mut ctx, "try apply(fun(X) -> X end,[1,2]) catch error:R -> R end")
+            .expect("the reason is caught, not fatal");
+        let tag = terms::tuple_element(reason, 0).expect("the reason is a tuple");
+        assert_eq!(ctx.runtime.atom_name_of(tag), Some("badarity"));
+        let pair = terms::tuple_element(reason, 1).expect("the {Fun, Args} pair");
+        let fun = terms::tuple_element(pair, 0).expect("the fun");
+        assert!(terms::is_fun(fun), "the payload's first element is the fun");
+        let args = terms::tuple_element(pair, 1).expect("the argument list");
+        let elements = terms::list_elements(args).expect("a proper list");
+        assert_eq!(elements.len(), 2, "the caller's own two arguments");
+        assert_eq!(signed_value(elements[0]), 1);
+        assert_eq!(signed_value(elements[1]), 2);
     }
 
     #[test]

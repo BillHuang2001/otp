@@ -880,6 +880,59 @@ mod tests {
         assert_eq!(fx.render(out), expected, "info({name:?}, processes)");
     }
 
+    /// A loaded driver's registry entry is **owned** Rust data (a `String` key, the path, the
+    /// `DriverLibrary` and the loader [`ProcessId`]) — never a caller-heap `Eterm`. Poisoning every
+    /// word the fixture heap handed out must leave `info/2` and `loaded_drivers/0` answering from
+    /// the owned copy.
+    ///
+    /// The sloppy implementation this catches: `try_load` keeping the `Path`/`Name` **charlist
+    /// terms** (or the loader pid term) instead of their converted values — after a collection
+    /// relocates the caller's heap the entry names moved words, so `loaded_drivers/0` would render
+    /// garbage and `info(Name, processes)` would compare against a clobbered key.
+    #[test]
+    fn a_loaded_entry_survives_a_poisoned_caller_heap() {
+        clear_registry();
+        let Some(dir) = compile_driver_fixture() else {
+            return;
+        };
+        let mut fx = Fixture::new();
+
+        // Load the fixture with a **charlist** name and path, exactly as the neighbouring tests do.
+        let path = fx.charlist(&dir);
+        let name = fx.charlist("test_drv");
+        let out = fx
+            .call("try_load", 3, &[path, name, NIL])
+            .expect("a first load is a result");
+        assert_eq!(fx.render(out), "{ok,loaded}");
+
+        // The charlists are caller-heap words; poison every one of them.
+        fx.poison_heap();
+
+        // Query by an **atom** name (an immediate, so it survives the poison): the registry's
+        // key/path/loader are owned, not the poisoned words.
+        let name_atom = fx.atom("test_drv");
+        let item = fx.atom("processes");
+        let out = fx
+            .call("info", 2, &[name_atom, item])
+            .expect("info/2 of a loaded driver with a known item is a value");
+        let expected = {
+            let pid = ProcessId::new(1, 0).to_eterm();
+            let pair = fx.tuple(&[pid, make_small(1)]);
+            let pairs = fx.cons(pair);
+            fx.render(pairs)
+        };
+        assert_eq!(
+            fx.render(out),
+            expected,
+            "info(test_drv, processes) after the poison"
+        );
+
+        let out = fx
+            .call("loaded_drivers", 0, &[])
+            .expect("loaded_drivers/0 never fails");
+        assert_eq!(fx.render(out), STATIC_THREE_AND_TEST_DRV);
+    }
+
     /// `try_unload`'s `{monitor, _}` option selects the C's 3-tuple `{ok, Status, Ref}`
     /// (`erl_bif_ddll.c:611-620`), and the reference demonitors cleanly.
     #[test]

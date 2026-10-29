@@ -36,33 +36,39 @@
 //! takes: `Args = id([...])` hides the value from the compiler, so the call really goes through
 //! `erlang:apply/2`.
 //!
-//! # The three failure classes, in the C's order
+//! # The four failure classes, in the C's order
 //!
 //! `apply_fun` (`beam_common.c:1734`) decodes the argument list **first**, so a bad list is
 //! reported before a non-fun is:
 //!
-//! 1. a non-list or improper `Args` ⇒ `error:badarg` with the BIF stacktrace head
-//!    `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}`;
-//! 2. more than `MAX_REG - 1` arguments (`decode_arglist`) ⇒ `error:system_limit`, same head;
-//! 3. a non-fun `Fun` ⇒ `EXC_BADFUN` (`badfun`).
+//! 1. a non-list or improper `Args` ⇒ `error:badarg`;
+//! 2. more than `MAX_REG - 1` arguments (`decode_arglist`) ⇒ `error:system_limit`;
+//! 3. a non-fun `Fun` ⇒ `EXC_BADFUN`, which C's `expand_error_value` wraps into
+//!    `{badfun, Fun}` (`beam_common.c:750-772`);
+//! 4. a fun applied at the wrong arity ⇒ `{badarity, {Fun, Args}}`, the same expansion.
 //!
-//! The fixture reports all three through one `caught/2` helper so the answers are values (atoms,
-//! booleans, small integers, short tuples) and never a `#Fun<…>` render.
+//! The fixture reports every class through one `caught/2` helper so the answers are values
+//! (atoms, booleans, small integers, short tuples) and never a `#Fun<…>` render.
 //!
 //! # What is pinned, and what is a documented residual
 //!
-//! [`PROBES`] must agree **exactly** with the oracle on the default tier and on
-//! `BEAM_RT_TIER=interpreter`. [`RESIDUALS`] pins the four shapes that do **not** yet: a
-//! non-fun / wrong-arity application reports the right class but differs in the trace head (this
-//! runtime arms the `erlang,apply` BIF item, the oracle keeps the **caller** frame) and in the
-//! reason (C's `expand_error_value` wraps `{badfun, Fun}` / `{badarity, {Fun, Args}}`, this
-//! runtime raises the bare atom). Both belong to the engine's `call_ext` raise path
-//! (`beam_engine::Machine::resolve_call_ext_apply` handles arity 3 only), not to this crate; the
-//! test pins today's behaviour so the day that gap closes is visible.
+//! `beam_engine` decodes the arity-2 `call_ext` shape in-machine (C's `i_apply_fun*`,
+//! `emu/ops.tab:872-874`), so all four classes agree with the oracle: the reason **wrappers**
+//! (`{badfun, Fun}`, `{badarity, {Fun, Args}}`) and, for classes 3 and 4, the **caller's** own
+//! stacktrace head (C's `non_bif_stacktrace` — the raise comes out of the inner `call_fun`).
+//! [`PROBES`] is that equality set and must hold on the default tier and on
+//! `BEAM_RT_TIER=interpreter`.
 //!
-//! [`APPLIED_RECEIVE`] pins the `receive` inside an applied fun: the `-eval` route, which pumps,
-//! really waits (`timeout`, like the oracle), while the scheduled route — a nested machine that
-//! may not suspend the process — is the honest `unsupported` gap.
+//! [`RESIDUALS`] pins the one shape that still differs: classes 1 and 2 report the oracle's class
+//! and reason but a different **stacktrace head**. The oracle arms the BIF item
+//! `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}` there, while this
+//! engine raises `badarg`/`system_limit` through its non-BIF path and keeps the caller frame. The
+//! arming site is `beam_engine`'s raise path, not this crate's; the test pins today's behaviour so
+//! the day it closes is a visible, deliberate change to that table.
+//!
+//! [`APPLIED_RECEIVE`] pins the `receive` inside an applied fun: on **both** routes the nested
+//! machine enters in-machine and really parks, so `recv_after/0` waits out its `after 200` and
+//! answers `timeout`, exactly like the oracle.
 use std::path::Path;
 mod support;
 /// The banner every loud skip names.
@@ -82,8 +88,9 @@ const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
 ///   key (`fun erlang:self/0`) and a local `fun ap2:id/1`;
 /// * `cd/0` … `ch/0`, `ctoo/0`, `cok/0`, `carity/0` — the same shapes through `caught/2`, which
 ///   turns each class into a value and reports the stacktrace head as
-///   `{frame, Module, Function, ArityMark, Location}` where `ArityMark` is
-///   `[Fun =:= Fun, Args =:= Args]` for the BIF's own `[Fun, Args]` argument vector;
+///   `{frame, Module, Function, ArityMark, Location}`, where `ArityMark` is
+///   `[Fun =:= Fun, Args =:= Args]` when the head is a BIF item (its `A` slot is then the BIF's
+///   own `[Fun, Args]` argument vector) and `not_a_list` for a caller frame;
 /// * `ce_shape/0`, `carity_shape/0` — the **reason's** shape (does C's `expand_error_value` wrap
 ///   it?);
 /// * `d/0`, `e/0`, `f/0`, `g/0`, `h/0`, `toomany/0` — the uncaught forms, where the runtime's own
@@ -169,7 +176,7 @@ send_recv() ->
 /// The strings are the oracle's own `~1000p` rendering (`ap2:<probe>()` under OTP 29.1.2 /
 /// `erts-17.1.1`) and are re-measured against it on every run, so a drift in the oracle is a
 /// failure here rather than a silently stale golden.
-const PROBES: [(&str, &str); 15] = [
+const PROBES: [(&str, &str); 14] = [
     // The success path: one argument, zero arguments, a free variable, two arguments.
     ("a", "2"),
     ("c", "{[]}"),
@@ -181,43 +188,59 @@ const PROBES: [(&str, &str); 15] = [
     ("ext", "[3,2,1]"),
     ("ext0", "true"),
     ("local_mfa", "9"),
-    // A non-list / improper argument list is `badarg`, head = the BIF's own `[Fun, Args]`.
-    ("cd", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    ("cf", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    ("cg", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    ("ch", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    // Past `MAX_REG` arguments (`decode_arglist`) is `system_limit`, same head.
-    (
-        "ctoo",
-        "{error,system_limit,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
-    ),
+    // A non-fun target (`EXC_BADFUN`) and a fun applied at the wrong arity
+    // (`EXC_BADARITY`) come out of the inner `call_fun`, so their stacktrace head is the
+    // **caller's** frame — `{ap2, caught, not_a_list, {other, 2}}`: C's `non_bif_stacktrace`,
+    // where the arity slot is not a list (the raise names no argument vector).
+    ("ce", "{error,badfun,{frame,ap2,caught,not_a_list,{other,2}}}"),
+    ("carity", "{error,badarity,{frame,ap2,caught,not_a_list,{other,2}}}"),
+    // …and C's `expand_error_value` wraps the reason: `{badfun, Fun}` / `{badarity, {Fun, Args}}`.
+    ("ce_shape", "{error,{badfun,true}}"),
+    ("carity_shape", "{error,{badarity,true,true}}"),
     // The control: a served key that really applies.
     ("cok", "{value,42}"),
     // A `receive` whose message is already in the mailbox never parks, so a nested machine
     // answers it on the scheduled route too.
     ("send_recv", "{got,hello}"),
 ];
-/// The four shapes this runtime does **not** yet reproduce, pinned as they are measured.
+/// The shapes this runtime does **not** yet reproduce, pinned as they are measured.
 ///
-/// Each entry is `(probe, oracle, this runtime)`. Every one of them is the same engine gap — the
-/// `erlang:apply/2` raise does not carry the C's stacktrace head (`non_bif_stacktrace` keeps the
-/// **caller** frame) nor `expand_error_value`'s reason wrapper. Closing it is a change in
-/// `beam_engine` (`Machine::resolve_call_ext_apply` handles only `import_arity == 3`), so the
-/// expectations below are what this crate can honestly claim today; when the engine lands the
-/// gap these rows become equalities and this table is what says so.
-const RESIDUALS: [(&str, &str, &str); 4] = [
+/// Each entry is `(probe, oracle, this runtime)`, and every one of them is the **same** engine
+/// gap: `apply_fun`'s own argument-list decode (`badarg` for a non-list/improper list,
+/// `system_limit` past the register-file bound) reports the oracle's class and reason but a
+/// different stacktrace head. The oracle arms the BIF item
+/// `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}`
+/// (`erts_engine_error` — the `[true,true]` arity mark says the item's `A` slot really is the
+/// BIF's own `[Fun, Args]` argument vector); this runtime raises those two classes through the
+/// non-BIF path, which keeps the **caller** frame. Arming the BIF item is `beam_engine`'s, so
+/// the expectations below are what this crate can honestly claim today; when the engine lands it
+/// these rows become equalities and this table is what says so.
+const RESIDUALS: [(&str, &str, &str); 5] = [
     (
-        "ce",
-        "{error,badfun,{frame,ap2,caught,not_a_list,{other,2}}}",
-        "{error,badfun,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "cd",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
     ),
     (
-        "carity",
-        "{error,badarity,{frame,ap2,caught,not_a_list,{other,2}}}",
-        "{error,badarity,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "cf",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
     ),
-    ("ce_shape", "{error,{badfun,true}}", "{error,badfun}"),
-    ("carity_shape", "{error,{badarity,true,true}}", "{error,badarity}"),
+    (
+        "cg",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
+    ),
+    (
+        "ch",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
+    ),
+    (
+        "ctoo",
+        "{error,system_limit,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,system_limit,{frame,ap2,caught,not_a_list,{other,2}}}",
+    ),
 ];
 /// The uncaught probes and the reason atom each must name in the runtime's own diagnostic (the
 /// oracle's equivalent observable is a `catch` value — these are the same classes, uncaught).
@@ -327,24 +350,26 @@ fn apply_of_two_arguments_answers_the_oracle_on_both_tiers() {
         }
     }
 }
-/// **The two remaining classes keep their oracle class, with the residual difference pinned.**
+/// **The `apply_fun` argument-decode classes keep the oracle's class, with the head residual
+/// pinned.**
 ///
-/// `ce` (a non-fun), `carity` (the wrong arity), and their reason-shape twins must report the same
-/// `error`/`badfun`/`badarity` classification as the oracle. What differs today is *where* the
-/// report comes from:
+/// `cd` (a pid where the argument list belongs), `cf` (an improper list), `cg` (a bare atom),
+/// `ch` (a module atom) and `ctoo` (past the register-file bound) must report the same
+/// `error`/`badarg`/`system_limit` classification as the oracle — and they do. What differs today
+/// is *where* the report comes from: the oracle arms the BIF item
+/// `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}`, this runtime
+/// raises through the non-BIF path and keeps the caller's frame
+/// (`{ap2, caught, not_a_list, {other, 2}}`).
 ///
-/// * the trace head — this runtime arms the BIF item
-///   `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}` for **every**
-///   failing `apply/2`, where the oracle keeps the caller's frame (C's `non_bif_stacktrace`: only
-///   `badarg`/`system_limit` come from `apply_fun` itself, a `badfun`/`badarity` comes out of the
-///   inner `call_fun`);
-/// * the reason — C's `expand_error_value` turns `EXC_BADFUN`/`EXC_BADARITY` into
-///   `{badfun, Fun}` / `{badarity, {Fun, Args}}`, where this runtime raises the bare atom.
+/// The two classes that used to sit in this table are gone: `ce` (a non-fun) and `carity` (the
+/// wrong arity) now reproduce the oracle **exactly**, reason wrapper
+/// (`{badfun, Fun}` / `{badarity, {Fun, Args}}`) and caller frame included, and they are pinned as
+/// equalities in [`PROBES`].
 ///
-/// Both are the engine's `call_ext` raise path, not this crate's; pinning them here keeps the
-/// claim honest and makes the day they are fixed a visible, deliberate change to this table.
+/// The remaining difference is the engine's raise path, not this crate's; pinning it here keeps
+/// the claim honest and makes the day it is fixed a visible, deliberate change to this table.
 #[test]
-fn the_badfun_and_badarity_classes_keep_their_oracle_class_with_a_pinned_residual() {
+fn the_argument_decode_classes_pin_their_one_head_item_residual() {
     let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two_res", "ap2", FIXTURE_SRC)
     else {
         return;
@@ -422,31 +447,25 @@ fn an_uncaught_apply_two_failure_names_the_oracles_reason_atom() {
         }
     }
 }
-/// **A `receive` inside the applied fun: fine where the route can pump, the typed gap where it
-/// cannot.**
+/// **A `receive` inside the applied fun parks on both routes.**
 ///
-/// `apply/2` folds the closure into a **nested** machine, so whether the process may suspend
-/// inside it is a property of the calling route, and the two routes differ honestly:
+/// `apply/2` enters the closure **in-machine** on every route, so a `receive` that has to wait
+/// suspends the process for real instead of folding into a `blocked` verdict:
 ///
 /// * the `-eval` route pumps (`RECEIVE_PUMP_SLICES` + one port round + the timer heap), so
-///   `recv_after/0` really waits out its `after 200` and answers `timeout` — exactly the
-///   oracle's value, and `send_recv/0` answers `{got,hello}` because the message is already in
-///   the process's mailbox;
-/// * the **scheduled** route (`beam_rt run`) must not run an inner scheduler, so a `receive` that
-///   has to park inside the nested machine is the documented `unsupported` gap: exit 3 with one
-///   `beam_rt: unsupported: …` line (a future in-machine `apply/2` entry — the engine's
-///   `resolve_call_ext_apply` accepting arity 2 — would turn this row into `timeout`).
-///
-/// `send_recv/0` on the scheduled route is the control that separates the two: a message that is
-/// already there never parks, so it answers `{got,hello}` on **both** routes.
+///   `recv_after/0` waits out its `after 200` and answers `timeout` — the oracle's value;
+/// * the **scheduled** route (`beam_rt run`) answers the same `timeout` on both tiers: the
+///   nested machine parks the scheduled process and a later pass resumes it;
+/// * `send_recv/0` is the control that shows the parking is not unconditional — a message
+///   already in the mailbox is answered `{got,hello}` on both routes.
 #[test]
-fn a_receive_inside_the_applied_fun_is_answered_where_the_route_can_pump() {
+fn a_receive_inside_the_applied_fun_parks_on_both_routes() {
     let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two_recv", "ap2", FIXTURE_SRC)
     else {
         return;
     };
     for (tier, label) in TIERS {
-        // The pumping route reproduces the oracle, waiting included.
+        // Every route reproduces the oracle, waiting included.
         let oracle = support::fixture_oracle_answer(BANNER, fixture.dir(), "ap2:recv_after()")
             .unwrap_or_else(|| panic!("the oracle could not answer ap2:recv_after/0"));
         assert_eq!(oracle, "timeout", "ap2:recv_after/0 under the oracle");
@@ -473,19 +492,25 @@ fn a_receive_inside_the_applied_fun_is_answered_where_the_route_can_pump() {
             "{got,hello}",
             "{label}: ap2:send_recv/0 on the scheduled route must answer the oracle's value"
         );
-        // A receive that must park inside the nested machine is the typed capability gap.
+        // A receive that must wait inside the nested machine parks the scheduled process and
+        // takes its timeout, like the oracle.
         let parked = run_scheduled(&fixture, "recv_after", tier);
         assert_eq!(
-            parked.code, 3,
-            "{label}: ap2:recv_after/0 cannot suspend the process inside a nested machine, so it \
-             must be the typed gap; stdout={:?} stderr={:?}",
+            parked.code, 0,
+            "{label}: ap2:recv_after/0 must park the scheduled process and answer, not fail; \
+             stdout={:?} stderr={:?}",
             parked.stdout.trim(),
             parked.stderr.trim()
         );
         assert_eq!(
-            parked.stderr.trim(),
-            "beam_rt: unsupported: opcode: run: process blocked (no message available)",
-            "{label}: ap2:recv_after/0's scheduled-route gap"
+            parked.stdout.trim(),
+            oracle,
+            "{label}: ap2:recv_after/0 on the scheduled route must answer the oracle's value"
+        );
+        assert!(
+            !parked.stderr.contains("unsupported"),
+            "{label}: ap2:recv_after/0 must not be a capability gap; stderr={:?}",
+            parked.stderr.trim()
         );
     }
 }
