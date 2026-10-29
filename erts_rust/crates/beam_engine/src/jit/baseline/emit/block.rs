@@ -57,6 +57,7 @@ use super::arith::try_inline_gc_bif;
 use super::bif::try_inline_bif;
 use super::bitstr_inline;
 use super::compare::try_inline_comparison;
+use super::cons;
 use super::family::{self, emit_bitstr};
 use super::frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use super::heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
@@ -525,7 +526,7 @@ pub(crate) fn emit_block(
             // crate `CONTEXT.md`), and the interpreter's own arm is `push_frame` then
             // `Step::Next`.
             Instr::Allocate { stack_need, .. } => {
-                emit_allocate(buffer, allocation, done, func, pc, stack_need.words())?
+                emit_allocate(buffer, allocation, done, pc, stack_need.words())?
             }
             // `allocate_heap Ns Nh Live` admits heap FIRST, then pushes the frame (the
             // interpreter's order — a failed admission must leave no frame behind).
@@ -552,7 +553,8 @@ pub(crate) fn emit_block(
             // `trim N Remaining` shrinks the current frame to `N` Y slots; a frame-size
             // mismatch (no live frame, or `N` past the frame) stays the interpreter's own
             // typed error.
-            Instr::Trim { n, .. } => emit_trim(buffer, allocation, done, func, pc, *n)?,            Instr::Jump { target } => match labels.resolve(*target) {
+            Instr::Trim { n, .. } => emit_trim(buffer, allocation, done, func, pc, *n)?,
+            Instr::Jump { target } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
                     // A compiled successor is entered **directly** (the linker tears
                     // this block's frame down and jumps to its entry); anything else
@@ -734,24 +736,31 @@ pub(crate) fn emit_block(
                     // helper (byte-identical to before); an uncompiled one asks for the
                     // linking twin.
                     let linked = linker.is_compiled(target_func, target_pc);
+                    // The **plain** store never enters the callee, so it is handed no
+                    // `callee_pc`: the immediate would be emitted (one 10-byte `movabs`)
+                    // and then never read on the release path, where only a `debug_assert!`
+                    // cross-check consumed it. The linking twin still carries the pair —
+                    // it resolves the entry through it.
+                    let plain = [
+                        i64::from(func),
+                        i64::from(pc),
+                        i64::from(target_func),
+                        i64::from(*arity),
+                    ];
+                    let linking = [
+                        i64::from(func),
+                        i64::from(pc),
+                        i64::from(target_func),
+                        i64::from(target_pc),
+                        i64::from(*arity),
+                    ];
                     let helper: *const () = if linked {
                         jit_call_store as *const ()
                     } else {
                         jit_call_store_linked as *const ()
                     };
-                    emit_helper_call(
-                        buffer,
-                        allocation,
-                        helper,
-                        &[
-                            i64::from(func),
-                            i64::from(pc),
-                            i64::from(target_func),
-                            i64::from(target_pc),
-                            i64::from(*arity),
-                        ],
-                        pc,
-                    )?;
+                    let args: &[i64] = if linked { &plain } else { &linking };
+                    emit_helper_call(buffer, allocation, helper, args, pc)?;
                     buffer.mov_ri(Reg::R11, CALL_STORED)?;
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
                     buffer.jcc(Cond::Ne, done)?;
@@ -1346,6 +1355,25 @@ pub(crate) fn emit_block(
             _ if bitstrings::claimed(instr) => {
                 emit_bitstr(buffer, allocation, done, func, pc)?
             }
+            // The cons **constructor**, in-block. `put_list`'s body allocates through the
+            // rooted door (`terms::make_cons_rooted`), which only Rust can reach, so the
+            // arm is a guard phase plus one positioned helper call (see
+            // [`cons::emit_put_list`]). Its shape predicate proves every operand is an
+            // in-bound `X` register, an addressable `Y` slot or an immediate constant —
+            // i.e. slack-free, so the family's `extra` is 0 — and emits zero bytes when
+            // it declines.
+            //
+            // **This is the one deviation from the `try_inline_*` convention**: a
+            // refusal falls through to the *family* arm below, never to [`emit_deopt`].
+            // `put_list` has no deopt route of its own — the family body `emit_family`
+            // runs IS the interpreter's per-instruction step — so declining here is a
+            // change of emitter, not a change of semantics, and `Ok(false)` must not be
+            // reported as a static deopt.
+            Instr::PutList { head, tail, dst } => {
+                if !cons::emit_put_list(buffer, allocation, done, func, pc, head, tail, dst)? {
+                    family::emit_family(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole family-owned surface** the interpreter's `other` arm hands to
             // [`crate::families::dispatch`] — every variant [`crate::families::dispatch`]
             // claims and the interpreter's core arms above do **not** (the tuples/list
@@ -1361,7 +1389,9 @@ pub(crate) fn emit_block(
             // interpreter emits (both reach the identical `families::dispatch` call), so
             // this arm can never produce a different result than the interpreter's
             // per-instruction step it replaces.
-            Instr::PutList { .. } | Instr::PutTuple2 { .. }
+            // `PutList` has its own arm above (the native cons constructor); every other
+            // construction/record/fun/exception/float/map instruction stays here.
+            Instr::PutTuple2 { .. }
             | Instr::UpdateRecord(_) | Instr::IsAnyNativeRecord { .. } | Instr::IsNativeRecord { .. }
             | Instr::GetRecordElements { .. } | Instr::GetRecordElementsId { .. } | Instr::PutRecord(_)
             | Instr::IsRecordAccessible { .. } | Instr::GetRecordField(_) | Instr::UpdateRecordId(_)

@@ -130,6 +130,7 @@ pub(crate) mod bitstr_inline;
 mod block;
 mod compare;
 mod compile;
+mod cons;
 mod family;
 mod frame;
 mod heap;
@@ -167,11 +168,16 @@ use regs::{fill, spill};
 // submodules changed no item path. Only the tests use them, hence `cfg(test)`.
 #[cfg(test)]
 pub(crate) use arith::{
-    fast_arith, uses_y, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T,
-    MAX_SMALL_WORD, MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
+    fast_arith, uses_y, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_T, MAX_SMALL_WORD,
+    MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
 };
 #[cfg(test)]
 pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
+// The `put_list` arm's test-only counters: the only proof that the shape lowered natively (a
+// deopted instruction is executed by the interpreter on **both** tiers, so tier agreement
+// cannot show it).
+#[cfg(test)]
+pub(crate) use cons::{declined, lowered, reset_counters};
 #[cfg(test)]
 pub(crate) use r#move::{move_shape, MoveShape};
 #[cfg(test)]
@@ -479,12 +485,49 @@ pub(super) fn emit_continue_check_helper_refresh(
     buffer: &mut CodeBuffer,
     done: CodeLabel,
     allocation: &Allocation,
-    func: u32,
     pc: u32,
 ) -> Result<()> {
-    // `rax` holds the helper's word; only "the next instruction" continues here.
-    buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
-    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
-    buffer.jcc(Cond::Ne, done)?;
-    fill(buffer, allocation, FillSite::Helper, pc)
+    emit_signed_continue_check(buffer, done, allocation, pc, false)
+}
+
+/// [`emit_continue_check`] for a helper whose **only** failing answer is a negative word:
+/// the [`crate::jit::baseline::runtime::CONTINUE`] success answer is non-negative and
+/// every failure is [`ERROR`](super::super::runtime::ERROR) (`-2`), so the arm tests the
+/// sign instead of materialising a target word to compare against.
+///
+/// Used by the heap/frame-admission family, whose helpers answer the fixed
+/// [`CONTINUE`](super::super::runtime::CONTINUE) word rather than
+/// `encode_target(func, pc + 1)`: one `test rax, rax` + `js` (9 B, two instructions)
+/// replaces a `movabs` + `cmp` + `jcc` (19 B, three). The refill and the gated
+/// [`Allocation::refresh_y_after`] refresh are the plain arm's.
+pub(super) fn emit_continue_check_reject_only(
+    buffer: &mut CodeBuffer,
+    done: CodeLabel,
+    allocation: &Allocation,
+    pc: u32,
+) -> Result<()> {
+    emit_signed_continue_check(buffer, done, allocation, pc, true)
+}
+
+/// The shared body of the two sign-tested continue arms: `test rax, rax` / `js done`, the
+/// partial register refill every helper-originated continuation needs, and — when the
+/// caller's helper changed the frame and did **not** re-publish the window itself — the
+/// gated [`Allocation::refresh_y_after`] `jit_refresh_y` call.
+fn emit_signed_continue_check(
+    buffer: &mut CodeBuffer,
+    done: CodeLabel,
+    allocation: &Allocation,
+    pc: u32,
+    refresh_y: bool,
+) -> Result<()> {
+    // `rax` holds the helper's word: continue in-block only on a non-negative answer.
+    buffer.test_rr(Reg::Rax, Reg::Rax)?;
+    buffer.jcc(Cond::S, done)?;
+    fill(buffer, allocation, FillSite::Helper, pc)?;
+    if refresh_y && allocation.refresh_y_after(pc) {
+        #[cfg(test)]
+        super::counters::record_y_invalidation();
+        emit_refresh_y(buffer)?;
+    }
+    Ok(())
 }

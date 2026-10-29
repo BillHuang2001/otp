@@ -203,10 +203,11 @@ struct CallSite {
     /// seam's subject and the linker's transfer target.
     callee: u32,
     /// The resolved target `pc` (the interpreter's `callee_pc`): the address the in-block
-    /// transfer enters when the emitted block asked for one, carried so the emitter hands
-    /// over the whole resolution and a debug build can prove the pair is the
-    /// instruction's own.
-    callee_pc: u32,
+    /// transfer enters when the emitted block asked for one.
+    /// `Some` only on the **linking** entry point — the plain store never enters the callee,
+    /// so its emitted site does not materialize the immediate at all — and a debug build
+    /// proves the pair is the instruction's own whenever it is carried.
+    callee_pc: Option<u32>,
     /// The instruction's `arity` operand: the callee's register-argument count, which
     /// only the local-call seam consumes.
     arity: u32,
@@ -218,11 +219,12 @@ struct CallSite {
 ///
 /// Emitted by the block for `Instr::Call` (see `super::emit`), which passes the
 /// instruction's compile-time resolution as block-ABI arguments: `func`, `pc`, the
-/// resolved `callee`, its `callee_pc` and the `arity` operand (in that order, in the
-/// argument registers after `rt`). It has the
-/// [`StepHelper`](super::runtime::StepHelper) signature for that prefix, so the arm drives
-/// it through the shared `emit::emit_helper_call` sequence and then branches on its
-/// answer:
+/// resolved `callee` and the `arity` operand (in that order, in the argument registers
+/// after `rt`), and the [`jit_call_store_linked`] twin additionally carries `callee_pc`
+/// before `arity`. The plain store never enters the callee, so its emitted site does not
+/// materialize that immediate at all: it would be one 10-byte `movabs` whose only
+/// release-time consumer does not exist. The arm drives the helper through the shared
+/// `emit::emit_helper_call` sequence and then branches on its answer:
 ///
 /// * [`CALL_STORED`] — the continuation is in place; the block transfers to the callee;
 /// * any other word — the host served the same-module callee as a BIF (so the callee's
@@ -239,10 +241,9 @@ pub(crate) extern "C" fn jit_call_store(
     func: u32,
     pc: u32,
     callee: u32,
-    callee_pc: u32,
     arity: u32,
 ) -> i64 {
-    call_store_impl(rt, func, pc, callee, callee_pc, arity, CallMode::Store)
+    call_store_impl(rt, func, pc, callee, None, arity, CallMode::Store)
 }
 
 /// [`jit_call_store`] for a callee whose block is **not** part of this compilation (the
@@ -271,7 +272,7 @@ pub(crate) extern "C" fn jit_call_store_linked(
     callee_pc: u32,
     arity: u32,
 ) -> i64 {
-    call_store_impl(rt, func, pc, callee, callee_pc, arity, CallMode::StoreAndLink)
+    call_store_impl(rt, func, pc, callee, Some(callee_pc), arity, CallMode::StoreAndLink)
 }
 
 /// The body both `extern "C"` entry points share: the store + the local-call seam
@@ -287,7 +288,7 @@ fn call_store_impl(
     func: u32,
     pc: u32,
     callee: u32,
-    callee_pc: u32,
+    callee_pc: Option<u32>,
     arity: u32,
     mode: CallMode,
 ) -> i64 {
@@ -327,8 +328,8 @@ fn call_store_impl(
     // The transfer is resolved only for the linked entry point and only once the
     // continuation is in place: a **served** callee's own code never runs, so it must get
     // neither a return address nor a transfer, and a folded diagnostic has already left.
-    let outcome = match (outcome, mode) {
-        (CallOutcome::Stored, CallMode::StoreAndLink) => {
+    let outcome = match (outcome, mode, callee_pc) {
+        (CallOutcome::Stored, CallMode::StoreAndLink, Some(callee_pc)) => {
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver
             // owns; the borrows derived from it above are dead by now (the outcome owns no
             // reference into it), so this borrow does not alias them.
@@ -353,7 +354,7 @@ fn call_store_impl(
                 CallOutcome::Word(word)
             }
         }
-        (outcome, _) => outcome,
+        (outcome, _, _) => outcome,
     };
     match outcome {
         CallOutcome::Stored => CALL_STORED,
@@ -400,7 +401,10 @@ fn store_continuation(
         {
             Some(Instr::Call { target, arity: operand }) =>
                 *operand == arity
-                    && matches!(labels.resolve(*target), Ok(resolved) if resolved == (callee, callee_pc)),
+                    && matches!(
+                        labels.resolve(*target),
+                        Ok(resolved) if resolved.0 == callee && callee_pc.is_none_or(|cp| resolved.1 == cp)
+                    ),
             _ => false,
         },
         "jit_call_store: the emitter passes the `call`'s own resolution for          (func={func}, pc={pc})"

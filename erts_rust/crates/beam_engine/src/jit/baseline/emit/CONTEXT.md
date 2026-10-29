@@ -51,7 +51,7 @@ them.
   (`emit_helper_call`) and the block/link emitters.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
   `MOVE_SCRATCH_2`=`r10` (`mod.rs`); `Y_SCRATCH`=`r9` and `SWAP_END`=`rax` (`r#move.rs`);
-  `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10`, `FAST_R`=`r11` (`arith.rs`);
+  `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10` (`arith.rs`);
   `TEST_A`=`rax`, `TEST_B`=`r8`, `TEST_C`=`r9`, `TEST_T`=`r10`, `TEST_H`=`r11` (`test.rs`);
   `GUARD_SCRATCH`=`r8` (`aggregate.rs`); `Y_ADDR_SCRATCH`=`r9` / `Y_ADDR_SCRATCH_2`=`r8`
   (`operands.rs`, the pre-computed Y destination addresses for a multi-destination writer).
@@ -287,6 +287,13 @@ by construction).
   Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
   split, `a_frame_changing_helper_emits_no_separate_refresh_call` and the structural
   `the_allocate_arm_pushes_the_frame_with_a_helper_call_only`).
+- `cons.rs` -> the `put_list` arm `emit_put_list` (one `emit_positioned_helper_call` to
+  `../cons.rs::jit_put_list` — the instruction's own position published inline, since the helper stores
+  none — plus a `jmp` to `fast_done`, a local `fallback` running exactly one `emit_step_and_continue`,
+  and `emit_continue_check`), its refusal-only `put_list_shape` predicate, its `uses_y()` view and the
+  `#[cfg(test)]` `lowered`/`declined` emission counters. Unlike the `try_inline_*` shapes it answers
+  `Ok(false)` rather than `None` when it declines, so `emit_block`'s own arm falls through to
+  `emit_family` in one place instead of routing on a guard predicate.
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
   `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`) and `emit_bitstr` (the same
   arm for the `Bs*` family through `../bitstr.rs::jit_bitstr`, plus the inline position store its

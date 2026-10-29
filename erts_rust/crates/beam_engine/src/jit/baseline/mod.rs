@@ -207,6 +207,7 @@ mod bif_helper;
 mod bitstr;
 mod call;
 mod code;
+mod cons;
 mod emit;
 mod family;
 mod receive;
