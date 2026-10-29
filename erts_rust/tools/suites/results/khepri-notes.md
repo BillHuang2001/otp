@@ -120,9 +120,17 @@ nothing passes on the rust side that fails on the oracle.
 
 ## Root causes (each with its first failing test and smallest failing expression)
 
-### RC-A — `{error,badarg}` from the `prim_file` iodata walk: a valid improper iolist whose tail is a binary is rejected
+### 1. RC-A — `{error,badarg}` from the `prim_file` iodata walk: a valid improper iolist whose tail is a binary is rejected
 **29 rows.** Every Khepri module whose fixture starts an `ra` system dies in setup: `ra_log_ets`
 opens its `dets` directory file, and `dets` cannot open it.
+
+Affected rows (all 29 `rust-gap` rows whose fixture is ra-backed): `advanced_delete`,
+`advanced_get`, `advanced_put`, `advanced_tx_delete`, `advanced_tx_get`, `advanced_tx_put`, `app`,
+`async_option`, `bang_functions`, `db_info`, `export`, `export_erlang`, `favor_option`, `fence`,
+`keep_while_conditions`, `machine_code_called_from_ra`, `projections`,
+`protect_against_dups_option`, `return_indirect_deletes_option`, `simple_delete`, `simple_get`,
+`simple_put`, `simple_tx_delete`, `simple_tx_get`, `simple_tx_misc`, `simple_tx_put`, `timeout`,
+`triggers`, `tx_sprocs` (plus `stored_procs`, whose verdict is `divergence` for the same reason).
 
 First failing test (of any of the 29 rows): `helpers:start_ra_system/1` (test/helpers.erl:75) —
 i.e. the eunit `{setup, …}` context, so eunit reports `cancelled` (or, in `app`/`projections`/
@@ -153,8 +161,9 @@ being appended). Not a documented divergence in that module's header table. Fix 
 `beam_rt` (out of this node's write scope) — one extra arm for a binary tail would unblock the
 whole `ra` family.
 
-### RC-B — `process_flag/2` answers `badarg` for `min_heap_size` / `min_bin_vheap_size` / `fullsweep_after`
+### 2. RC-B — `process_flag/2` answers `badarg` for `min_heap_size` / `min_bin_vheap_size` / `fullsweep_after`
 **Revealed behind RC-A** (with RC-A worked around, the same 29 rows then die in `ra_log_wal:init/1`).
+Affected rows: the same 29 as RC-A.
 
 First failing test: the same fixture (`helpers:start_ra_system/1`), now via
 `ra_log_wal:init/1` (ra/src/ra_log_wal.erl:313–315) →
@@ -177,8 +186,9 @@ Failing crate: **`beam_rt`** (`crates/beam_rt/src/context/process_bridge.rs`, `P
 is blocked, so whether the ~1 200 not-yet-run Khepri tests would then pass is *unknown*, not
 "failing". Both classes must be fixed (or worked around) before the next sweep can say more.
 
-### RC-C — `term_to_binary`/`external_size` of a term that *contains* a local fun: typed `unsupported_local_fun`
-**1 row** (`display_tree`: rust 10 passed / 1 failed, the oracle 11/0).
+### 3. RC-C — `term_to_binary`/`external_size` of a term that *contains* a local fun: typed `unsupported_local_fun`
+**1 row** (`display_tree`: rust 10 passed / 1 failed, the oracle 11/0) — the single genuine
+"computed something different" divergence in this sweep.
 
 First failing test: `display_tree:machine_overview_test/0` (test/display_tree.erl:380) →
 `khepri_machine:compute_command_size/1` (src/khepri_machine.erl:2994) →
@@ -206,9 +216,9 @@ difference for any term carrying a `#Fun<…>` (Khepri's stored procedures). Out
 scope. (The differential corpus' recorded A.5 gap `wire/new_fun_ext_encode` is the `erl_eval`
 lambda flavour of the same encoder limitation.)
 
-### RC-D — performance: a keep-while delete fan-out is ~250–330× slower than the oracle
-**1 row** (`keep_while_conditions`: 21 pass, 1 fail — the only failure is this one; the rest of the
-module's rows cancel on RC-A).
+### 4. RC-D — performance: a keep-while delete fan-out is ~250–330× slower than the oracle
+**1 row** (`keep_while_conditions`: rust 21 pass, 1 fail — the only failure is this one; the rest of
+the module's rows cancel on RC-A).
 
 First failing test: `keep_while_conditions:delete_node_with_many_dependents/0`
 (test/keep_while_conditions.erl:800) — `?assert(DeletionTime < 1000)` on a one-second wall-clock
