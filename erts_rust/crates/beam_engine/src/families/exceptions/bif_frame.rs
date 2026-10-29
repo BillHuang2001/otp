@@ -144,19 +144,30 @@
 //! the machine's post-collection registers), so no `Eterm` is ever held across the
 //! allocating door.
 //!
+//! The **cause** is the one value resolved before it: the host's
+//! [`ExecutionContext::bif_error_cause`] may allocate on its own heap, so it is asked
+//! first (with the arguments read at that moment) and must answer an **immediate** —
+//! the only kind of word the carve can embed verbatim without re-rooting it. A boxed
+//! answer is dropped (the one-pair form), never stored.
+//!
 //! # Residuals (each a documented omission, never a wrong value)
 //!
 //! * The **`cause` variant** of the extension (`#{cause => Value, module =>
-//!   FormatModule}`, C's `EXF_HAS_EXT_INFO` arm, :996-1004) is not rendered: the
-//!   engine emits `#{module => FormatModule}` only. `ets:lookup/2`,
-//!   `erlang:register/2`, `erlang:process_flag/2,3`, `erlang:start_timer/3,4` and
-//!   the bit-syntax BIFs carry a `cause` in the oracle.
+//!   FormatModule}`, C's `EXF_HAS_EXT_INFO` arm, :992-1000) is rendered only when
+//!   the **host** answers one through [`ExecutionContext::bif_error_cause`]; the
+//!   trait default is `Ok(None)`, which keeps the one-pair
+//!   `#{module => FormatModule}` form. Deciding a cause is a property of the layer
+//!   that owns the BIF's own state (its table registry, its name registry), never of
+//!   this crate: no engine-side door can tell `ets:lookup/2`'s `id` from
+//!   `erlang:register/2`'s `none`. `ets:lookup/2`, `erlang:register/2`,
+//!   `erlang:process_flag/2,3`, `erlang:start_timer/3,4` and the bit-syntax BIFs
+//!   carry a `cause` in the oracle.
 //! * A BIF that **published its own ext info** would still render
 //!   `#{module => FormatModule}` here: this carve builds the item from the BIF's
-//!   own dispatch site and never reads a `Raise` payload, so it has no C
-//!   `#{cause => Fvalue, module => …}` arm. No BIF in the tree publishes one —
-//!   the only producer is `erlang:error/3`, which the [`is_non_bif_raise`] gate
-//!   excludes from this path entirely; the *caller-frame* path renders a
+//!   own dispatch site and never reads a `Raise` payload, so its `cause` can only
+//!   come from the host seam above. No BIF in the tree publishes one through a
+//!   raise — the only producer is `erlang:error/3`, which the [`is_non_bif_raise`]
+//!   gate excludes from this path entirely; the *caller-frame* path renders a
 //!   `Raise::error_info` payload verbatim instead (`stacktrace.rs`'s
 //!   `raise_error_info` latch).
 //! * Every item cooked here has an **empty** `{file,_}`/`{line,_}` position, where the
@@ -188,6 +199,11 @@ const ITEM_WORDS: usize = 5;
 /// so it costs nothing.
 const EXTENSION_WORDS: usize = beam_term::map::map_words_capacity(1) + 3 + 2;
 
+/// [`EXTENSION_WORDS`] for C's **two-pair** form
+/// (`#{cause => Fvalue, module => FormatModule}`, `beam_common.c:992-1000`): the map
+/// is one pair larger, the tuple and the cons cell are unchanged.
+const EXTENSION_WORDS_WITH_CAUSE: usize = beam_term::map::map_words_capacity(2) + 3 + 2;
+
 /// The `format_error/2` module a failing BIF's `error_info` names — C's **closed**
 /// table in `save_stacktrace` (`../../erts/emulator/beam/beam_common.c:937-1006`).
 ///
@@ -210,9 +226,14 @@ const EXTENSION_WORDS: usize = beam_term::map::map_words_capacity(1) + 3 + 2;
 /// source body raises through `error_with_info/2` — an Erlang-level
 /// `erlang:error/3` carrying `#{module => erl_stdlib_errors}`, exactly the extension
 /// this table names. Both shapes keep the extension; only the bare
-/// `function_clause` reason and a module outside the table drop it (see
-/// [`extension_allowed`]).
-pub(crate) fn format_module(bif_module: &str) -> Option<&'static str> {
+/// `function_clause` reason and a module outside the table drop it (the crate's
+/// shape rule, `extension_allowed`).
+///
+/// `pub` (re-exported as `beam_engine::format_module`) because the `-eval`
+/// tree-walking route in `beam_rt` cooks the same `{error_info, …}` extension
+/// without a compiled module, and the closed table must have exactly **one**
+/// definition in the workspace.
+pub fn format_module(bif_module: &str) -> Option<&'static str> {
     match bif_module {
         "atomics" | "counters" | "erlang" | "erts_internal" | "persistent_term" => {
             Some("erl_erts_errors")
@@ -237,7 +258,11 @@ pub(crate) fn format_module(bif_module: &str) -> Option<&'static str> {
 ///
 /// Every other `erlang` BIF — `hd/1`, `binary_to_atom/1`, `map_get/2`, … — **does**
 /// get the head item, whatever its arity.
-pub(crate) fn is_non_bif_raise(bif_module: &str, bif_function: &str, arity: u32) -> bool {
+///
+/// `pub` (re-exported as `beam_engine::is_non_bif_raise`) for the same reason as
+/// [`format_module`]: `beam_rt`'s `-eval` route renders the same item without a
+/// compiled module and must apply the same exclusion.
+pub fn is_non_bif_raise(bif_module: &str, bif_function: &str, arity: u32) -> bool {
     bif_module == "erlang"
         && match bif_function {
             "error" => (1..=3).contains(&arity),
@@ -287,9 +312,38 @@ fn is_function_clause_reason(error: &BeamError) -> bool {
     matches!(error, BeamError::Raise(raise) if raise.reason.as_atom() == Some("function_clause"))
 }
 
-/// The three atoms the `[{error_info, #{module => FormatModule}}]` extension needs,
-/// or `None` when the BIF module has no format module or a name cannot be
-/// resolved.
+/// The resolved atoms of the `[{error_info, #{cause => …, module => FormatModule}}]`
+/// extension, or of its one-pair form when no cause rides along (see
+/// [`extension_atoms`]).
+#[derive(Clone, Copy)]
+struct Extension {
+    /// The `error_info` atom — the location entry's own key.
+    error_info: Atom,
+    /// The `module` atom — the pair naming the `format_error/2` owner.
+    module_key: Atom,
+    /// The `format_error/2` owner itself.
+    format: Atom,
+    /// The `cause` atom, `Some` **iff** a cause value is attached: C's
+    /// `EXF_HAS_EXT_INFO` arm additionally emits `cause => c_p->fvalue`
+    /// (`../../erts/emulator/beam/beam_common.c:992-1000`). `None` keeps the one-pair
+    /// `#{module => FormatModule}` map (`:1001-1004`).
+    cause_key: Option<Atom>,
+}
+
+impl Extension {
+    /// The words the whole extension costs: [`EXTENSION_WORDS`], or
+    /// [`EXTENSION_WORDS_WITH_CAUSE`] for the two-pair map. `cause_key` is `Some`
+    /// **only** when a cause value exists, so sizing and writing cannot disagree.
+    fn words(&self) -> usize {
+        match self.cause_key {
+            Some(_) => EXTENSION_WORDS_WITH_CAUSE,
+            None => EXTENSION_WORDS,
+        }
+    }
+}
+
+/// The atoms the `[{error_info, …}]` extension needs, or `None` when the BIF module
+/// has no format module or a name cannot be resolved.
 ///
 /// Every name goes through [`namespace_atom`] — the host's **live** namespace
 /// first, the running module's load-time snapshot second — because none of
@@ -297,17 +351,31 @@ fn is_function_clause_reason(error: &BeamError) -> bool {
 /// module's own atom chunk. An unnameable atom leaves the item **without** the
 /// extension (never a substituted index, never a fabricated key), which is a
 /// documented residual rather than a wrong term.
+///
+/// `cause` is the host's cause value, if any: it makes the `cause` key part of the
+/// answer, and an unnameable `cause` atom **drops the cause** (the one-pair form)
+/// rather than the whole extension — a missing key must never fabricate one and must
+/// never cost the module name either.
 fn extension_atoms(
     ctx: &dyn ExecutionContext,
     module: &Module,
     bif_module: &str,
-) -> Option<(beam_loader::Atom, beam_loader::Atom, beam_loader::Atom)> {
+    cause: Option<Eterm>,
+) -> Option<Extension> {
     let format = format_module(bif_module)?;
-    Some((
-        namespace_atom(ctx, module, "error_info")?,
-        namespace_atom(ctx, module, "module")?,
-        namespace_atom(ctx, module, format)?,
-    ))
+    let error_info = namespace_atom(ctx, module, "error_info")?;
+    let module_key = namespace_atom(ctx, module, "module")?;
+    let format = namespace_atom(ctx, module, format)?;
+    let cause_key = match cause {
+        Some(_) => namespace_atom(ctx, module, "cause"),
+        None => None,
+    };
+    Some(Extension {
+        error_info,
+        module_key,
+        format,
+        cause_key,
+    })
 }
 
 /// Where an entry point's **argument list** comes from.
@@ -355,15 +423,16 @@ impl Args<'_> {
 ///
 /// `item_atoms` is the `(module, function)` pair, already resolved to atom indices
 /// (an atom is an immediate, so holding the two words across the reservation is
-/// safe); `extension` names the `{error_info, #{module => FormatModule}}` location
-/// (see [`extension_atoms`]) or `None` for the empty-list location.
+/// safe); `extension` names the `{error_info, …}` location (see [`extension_atoms`])
+/// or `None` for the empty-list location; `cause` is the host's `cause` value when
+/// [`extension`]'s [`cause_key`](Extension::cause_key) is `Some`.
 ///
 /// The whole graph is **one** rooted reservation, sized from metadata only —
 /// `2 * argc` words for the argument list (one cons cell per argument), `5` for the
-/// item tuple, and [`EXTENSION_WORDS`] more when the location carries the
-/// extension. Children are written before parents, in that order, and every
-/// argument is read **after** the reservation (the frozen reserve → read → write
-/// discipline: a moving collector may run under it).
+/// item tuple, and [`Extension::words`] more when the location carries the extension.
+/// Children are written before parents, in that order, and every argument is read
+/// **after** the reservation (the frozen reserve → read → write discipline: a moving
+/// collector may run under it).
 ///
 /// An argument that cannot be read is **not** a runtime value (it comes from the
 /// instruction or from the BIF's declared arity), so the honest answer is
@@ -374,11 +443,12 @@ fn carve(
     ctx: &mut dyn ExecutionContext,
     module: &Module,
     item_atoms: (Atom, Atom),
-    extension: Option<(Atom, Atom, Atom)>,
+    extension: Option<Extension>,
+    cause: Option<Eterm>,
     args: Args<'_>,
 ) -> Result<Option<Eterm>> {
     let argc = args.len();
-    let total = 2 * argc + ITEM_WORDS + extension.map_or(0, |_| EXTENSION_WORDS);
+    let total = 2 * argc + ITEM_WORDS + extension.map_or(0, |ext| ext.words());
     // A host that cannot serve the reservation — a minimal embedding host with no
     // `alloc_words` at all, or a genuinely exhausted heap — must **not** have the
     // BIF's own raise replaced by this marshalling failure (the one outcome the
@@ -394,12 +464,21 @@ fn carve(
     };
     // Children before parents, in the order `total` counts.
     let location = match extension {
-        Some((error_info, key, value)) => {
-            let map = sink.map(
-                &[(make_atom(key), make_atom(value))],
-                &module.atom_table,
-            )?;
-            let pair = sink.tuple(&[make_atom(error_info), map])?;
+        Some(ext) => {
+            // C's `MAP2(hp, am_cause, fvalue, am_module, format_module)` writes the
+            // two pairs (or `MAP1` the one), and `beam_term::map::write_map` is the
+            // only map writer in the tree. It **sorts a flat map's atom keys by atom
+            // index** — C's `erts_cmp_flatmap_keys` order — so the rendered order is
+            // the table's index order, which on a table in `atom.names` order puts
+            // `cause` (line 178) before `module` (line 471): the oracle's
+            // `#{cause => …, module => …}`.
+            let module_pair = (make_atom(ext.module_key), make_atom(ext.format));
+            let (pairs, count) = match (ext.cause_key, cause) {
+                (Some(key), Some(value)) => ([(make_atom(key), value), module_pair], 2),
+                _ => ([module_pair, module_pair], 1),
+            };
+            let map = sink.map(&pairs[..count], &module.atom_table)?;
+            let pair = sink.tuple(&[make_atom(ext.error_info), map])?;
             sink.list(&[pair])?
         }
         None => NIL,
@@ -530,11 +609,22 @@ fn build(
     ) else {
         return Ok(None);
     };
-    // Resolved before the reservation: the three atom words are `Copy` indices and
-    // can never be relocated. An extension the module cannot name — or one the shape
-    // rule dropped — is simply absent, and then costs no words at all.
+    // The host's `cause` (C's `c_p->fvalue`) is resolved **before** the reservation:
+    // the seam may allocate on the host's own heap, and the carve must be one
+    // uninterrupted reserve → read → write. The arguments it is asked about are read
+    // here, from the machine's pre-collection registers; the carve re-reads them
+    // afterwards for the item's `A` slot (`Args::read` is total and cheap).
+    let cause = if attach {
+        error_cause(machine, ctx, bif_module, bif_function, args)
+    } else {
+        None
+    };
+    // Resolved before the reservation: the atom words are `Copy` indices and can never
+    // be relocated — an immediate `cause` value neither. An extension the module
+    // cannot name — or one the shape rule dropped — is simply absent, and then costs
+    // no words at all.
     let extension = if attach {
-        extension_atoms(ctx, module, bif_module)
+        extension_atoms(ctx, module, bif_module, cause)
     } else {
         None
     };
@@ -544,8 +634,45 @@ fn build(
         module,
         (module_atom, function_atom),
         extension,
+        cause,
         args,
     )
+}
+
+/// Resolve the host's `cause` value for `bif_module:bif_function(args…)` — C's
+/// `c_p->fvalue` when the BIF fails with `BADARG | EXF_HAS_EXT_INFO`
+/// (`../../erts/emulator/beam/beam_common.c:992-1000`) — through
+/// [`ExecutionContext::bif_error_cause`].
+///
+/// Called **before** the item's reservation, because the seam may allocate on the
+/// host's heap and the carve must stay one reserve → read → write sequence.
+///
+/// Every way of not getting a usable cause **declines** to the one-pair
+/// `#{module => FormatModule}` form instead of failing the item, because this value is
+/// decoration on a trace that is already being raised:
+///
+/// * the host answers `Ok(None)` (the trait default: "no cause to attach");
+/// * the host answers `Err` — marshalling the decoration must never replace the BIF's
+///   own reason;
+/// * an argument operand is unreadable (a malformed instruction, not a runtime value);
+/// * the answer is not an **immediate**. The word is embedded verbatim into the map
+///   and is never re-read or re-rooted, so a boxed word would point into a heap the
+///   carve's own reservation may relocate under it (see the seam's stability
+///   contract). An unrootable answer is dropped, never written.
+fn error_cause(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    bif_module: &str,
+    bif_function: &str,
+    args: Args<'_>,
+) -> Option<Eterm> {
+    let argc = args.len();
+    let mut values = Vec::with_capacity(argc);
+    for index in 0..argc {
+        values.push(args.read(machine, ctx, index).ok()?);
+    }
+    let cause = ctx.bif_error_cause(bif_module, bif_function, &values).ok().flatten()?;
+    beam_term::is_immediate(cause).then_some(cause)
 }
 
 // `pub(crate)` so the sibling route suites (`tests/error_info.rs`) reuse the

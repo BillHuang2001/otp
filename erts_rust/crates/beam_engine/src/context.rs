@@ -1244,6 +1244,68 @@ pub trait ExecutionContext: ReduceHookSource {
         Ok(false)
     }
 
+    /// The **`cause`** value of a failing BIF's `error_info` location extension — the
+    /// `#{cause => Fvalue, module => FormatModule}` arm of C's `save_stacktrace`
+    /// (`../../erts/emulator/beam/beam_common.c:992-1000`).
+    ///
+    /// C stores the cause in `c_p->fvalue` when the BIF fails with
+    /// `BADARG | EXF_HAS_EXT_INFO` and renders a **two-pair** `error_info` map; without
+    /// the flag it renders `#{module => FormatModule}` alone (`:1001-1004`), which is
+    /// what the engine emits without this seam. The cause is a value the failing BIF
+    /// itself chose — the format module only *describes* it — so the mapping from
+    /// `(module, function, args)` to that value belongs to the layer that owns the
+    /// BIF's own state, never to this crate.
+    ///
+    /// * `Ok(Some(cause))` — attach it: the synthesized innermost item's `Location`
+    ///   becomes `[{error_info, #{cause => cause, module => FormatModule}}]`.
+    /// * `Ok(None)` — "there is no cause to attach": the one-pair
+    ///   `#{module => FormatModule}` form, byte-identical to the shape before this
+    ///   seam existed. **This is the default**, so every existing implementor
+    ///   compiles untouched and renders exactly as it did.
+    ///
+    /// A host must answer `Ok(None)` rather than guess: reporting an *absence* it
+    /// cannot support (a cause the oracle would have attached) is a rendering
+    /// divergence, and inventing one for a BIF outside its measured roster is a
+    /// fabricated frame — the engine has no way to tell either from a real answer.
+    ///
+    /// # Stability contract (how the returned word is used)
+    ///
+    /// The word is embedded **verbatim** into the engine's `error_info` map, inside
+    /// one rooted reservation carved immediately afterwards, and it is stored with
+    /// **no** re-read and **no** conversion. It must therefore be a word that
+    /// survives the reservation unchanged: an **immediate** (`is_immediate` — today
+    /// every modelled cause is an atom, e.g. `id`, `type`, `none`), which no
+    /// relocation can rewrite. The engine validates that and **degrades to the
+    /// one-pair form** rather than writing an unrootable word, so a boxed answer is a
+    /// silent loss of the cause, never a dangling pointer in a stacktrace.
+    ///
+    /// A host must not build the cause on a heap it may later **rewind or relocate**
+    /// (a mark/rewind arena whose whole purpose is to be discarded, or the process
+    /// heap of a run that may collect): the item's own reservation can collect, and
+    /// an interior pointer into a moved or freed region would be stored verbatim.
+    ///
+    /// # When the engine asks, and what it does with an `Err`
+    ///
+    /// Consulted only where the item's `error_info` extension is attached at all
+    /// (the closed format-module table plus the `function_clause` reason gate) and
+    /// only where the raise can land (a live catch frame), always **before** the
+    /// item's reservation. `args` are the failing BIF's real arguments, read from the
+    /// machine immediately before the call (the same arguments the item's `A` slot
+    /// will name, re-read after the reservation).
+    ///
+    /// An `Err` — like a failed reservation — **declines**: the item is built with
+    /// the one-pair form and the BIF's own raise proceeds unmodified. Marshalling
+    /// this decoration must never replace the reason being raised.
+    fn bif_error_cause(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: &[Eterm],
+    ) -> Result<Option<Eterm>> {
+        let _ = (module, function, args);
+        Ok(None)
+    }
+
     /// Resolve a **record definition** that is not the running module's own — the
     /// host record-table seam behind `put_record`'s **create** form.
     ///
