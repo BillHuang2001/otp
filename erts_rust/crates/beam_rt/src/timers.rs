@@ -50,7 +50,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::time::{Duration, Instant};
 
-use beam_process::ProcessId;
+use beam_process::{MonitorRef, ProcessId};
 use beam_term::prelude::{is_atom, is_small, signed_value, atom_val, Atom, Eterm};
 
 use crate::hasher::FastHashMap;
@@ -350,11 +350,41 @@ pub(crate) struct Timers {
     /// This is what makes `erlang:cancel_timer/1`'s three answers exact: an unknown term is
     /// not a timer reference at all, a `Some` one is cancellable (its remaining time is
     /// answered), and a `None` one already fired (the oracle's `false`).
+    ///
+    /// Keyed by the reference **term**, so it only recognises the caller's own handle — see
+    /// [`Timers::refs_by_id`] for the identity half.
     refs: FastHashMap<Eterm, Option<TimerId>>,
+    /// The same table keyed by each timer reference's **identity** — the `id` word of the
+    /// reference thing (`beam_term::boxed::internal_ref_id`), not the term word.
+    ///
+    /// A reference's identity is its id (the workspace has ONE reference-id space,
+    /// `beam_common::next_ref_id`), while the **word** is the address of a 4-word thing: a
+    /// reference that was *copied* — round-tripped through ETS, or sent in a message — is the
+    /// same reference at a different address, so the term-keyed [`Timers::refs`] misses it.
+    /// The oracle answers such a copy exactly as the original (`inet_gethost_native.erl` stores
+    /// its `start_timer/3` reference in an ETS row and later cancels the *copy* out of it), so
+    /// every lookup falls back to this table after a word miss.
+    ///
+    /// Written **in lockstep** with [`Timers::refs`] at every mutation
+    /// ([`Timers::schedule`], [`Timers::cancel`], [`Timers::take_due`]), and only ever by that
+    /// timer bookkeeping, so a hit here is a timer reference **this** heap minted: a dead NIF
+    /// resource or a monitor reference has no entry and stays unknown.
+    refs_by_id: FastHashMap<u64, Option<TimerId>>,
     /// Monotonic source of unique timer ids.
     next_id: u64,
     /// Monotonic source of insertion sequence numbers (the heap tie-break).
     next_seq: u64,
+}
+
+/// The **identity** of `reference` — the `id` word of the reference thing — or `None` when the
+/// term is not an internal reference at all.
+///
+/// A reference's identity is its id ([`beam_process::MonitorRef`] is the sanctioned decoder over
+/// `beam_term`'s `internal_ref_id`, reached without `unsafe`), while a *copy* of it is a
+/// different **word** naming the same reference. [`Timers`] keys its word table by the word and
+/// its identity table by this id, so the two halves agree on what "the same timer" means.
+fn reference_id(reference: Eterm) -> Option<u64> {
+    MonitorRef::from_eterm(reference).ok().map(MonitorRef::id)
 }
 
 impl Timers {
@@ -386,6 +416,11 @@ impl Timers {
             Some(reference),
         );
         self.refs.insert(reference, Some(id));
+        // The identity index moves in lockstep with the word index (see `refs_by_id`), so a
+        // **copy** of this reference resolves to the same timer.
+        if let Some(id_word) = reference_id(reference) {
+            self.refs_by_id.insert(id_word, Some(id));
+        }
     }
 
     /// Schedules a **receive timeout**: on expiry the parked process `pid` resumes at
@@ -527,11 +562,30 @@ impl Timers {
         id
     }
 
+    /// The timer `reference` identifies: `Some(Some(id))` while it is pending, `Some(None)` once
+    /// it fired or was cancelled, and `None` when the heap never minted it.
+    ///
+    /// The **word** table is asked first and the **identity** table ([`Timers::refs_by_id`])
+    /// second, so a *copy* of a timer reference — a round trip through ETS, a message, a stored
+    /// term — is recognised as the same timer. Identity is the reference's id, exactly as the
+    /// workspace's one reference-id space defines it.
+    fn timer_entry(&self, reference: Eterm) -> Option<Option<TimerId>> {
+        if let Some(entry) = self.refs.get(&reference) {
+            return Some(*entry);
+        }
+        let id_word = reference_id(reference)?;
+        self.refs_by_id.get(&id_word).copied()
+    }
+
     /// Whether `reference` is a timer reference **this** heap minted (pending, fired or
     /// cancelled) — the test `erlang:cancel_timer/1` uses to tell `badarg` (not a reference)
     /// from `false` (a reference that is not cancellable).
+    ///
+    /// A **copy** of a timer reference answers `true` (its identity is in
+    /// [`Timers::refs_by_id`]); a reference this heap did not mint — a `make_ref/0`, a monitor,
+    /// a NIF resource, live or dead — answers `false`.
     pub(crate) fn is_timer_ref(&self, reference: Eterm) -> bool {
-        self.refs.contains_key(&reference)
+        self.timer_entry(reference).is_some()
     }
 
     /// How long is left of the pending timer `reference` identifies — the **read-only** twin of
@@ -541,7 +595,8 @@ impl Timers {
     /// still fire), and `None` for a reference that already fired, was already cancelled, or is
     /// not a timer reference at all — the caller tells the last case apart with
     /// [`Timers::is_timer_ref`] (the C's `is_not_ref` → `badarg` versus `is_not_internal_ref` →
-    /// `false` split, `erts/emulator/beam/erl_hl_timer.c:2244-2251`).
+    /// `false` split, `erts/emulator/beam/erl_hl_timer.c:2244-2251`). A copy of the reference is
+    /// as good as the original.
     ///
     /// A deadline that has already passed but has not fired yet answers `Duration::ZERO`, not
     /// `None`: the timer is still **active**, which is exactly the oracle's `0` versus `false`
@@ -549,9 +604,21 @@ impl Timers {
     /// `erts/emulator/beam/erl_hl_timer.c:681-689`; `return_info` answers `false` only when the
     /// timer is gone, `:1975-1989`).
     pub(crate) fn remaining(&self, reference: Eterm) -> Option<Duration> {
-        let id = (*self.refs.get(&reference)?)?;
+        let id = self.timer_entry(reference)??;
         let pending = self.pending.get(&id)?;
         Some(pending.deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// The **canonical** reference word of the timer `reference` identifies, when it is still
+    /// pending.
+    ///
+    /// The runtime keeps a second, `Eterm`-keyed mirror of the pending deadlines
+    /// ([`crate::runtime::TimerWakes`]) that must be forgotten by the word
+    /// [`Timers::schedule`] was *given*, so a cancellation taken through a **copy** has to
+    /// resolve the original first — otherwise it would leave one stale wake record behind.
+    pub(crate) fn canonical_reference(&self, reference: Eterm) -> Option<Eterm> {
+        let id = self.timer_entry(reference)??;
+        self.pending.get(&id).and_then(|pending| pending.reference)
     }
 
     /// Cancels the pending timer `reference` identifies, answering how long was left.
@@ -559,18 +626,19 @@ impl Timers {
     /// Returns `Some(remaining)` when the timer was still pending (it will not fire), and
     /// `None` for a reference that already fired, was already cancelled, or is not a timer
     /// reference at all (the caller distinguishes the last case with
-    /// [`Timers::is_timer_ref`]). The heap entry is left in place as a tombstone and dropped
-    /// lazily.
+    /// [`Timers::is_timer_ref`]). A copy of the reference cancels exactly the original. The heap
+    /// entry is left in place as a tombstone and dropped lazily.
     pub(crate) fn cancel(&mut self, reference: Eterm) -> Option<Duration> {
-        let id = match self.refs.get_mut(&reference) {
-            Some(slot @ Some(_)) => {
-                let id = slot.expect("matched a pending timer");
-                *slot = None;
-                id
-            }
-            _ => return None,
-        };
+        let id = self.timer_entry(reference)??;
         let pending = self.pending.remove(&id).expect("a pending id has a payload");
+        // Both indices mark the id dead, so a later cancel/read of the original *or* of any
+        // copy answers the oracle's `false` instead of resurrecting it.
+        if let Some(canonical) = pending.reference {
+            self.refs.insert(canonical, None);
+        }
+        if let Some(id_word) = reference_id(reference) {
+            self.refs_by_id.insert(id_word, None);
+        }
         // The heap entry stays in place as a tombstone and is dropped lazily.
         Some(pending.deadline.saturating_duration_since(Instant::now()))
     }
@@ -598,9 +666,13 @@ impl Timers {
                 continue; // a tombstone that was not at the head when we pruned
             };
             // A caller-visible reference is no longer cancellable, but it stays *known* so
-            // a later `cancel_timer/1` answers the oracle's `false` instead of `badarg`.
+            // a later `cancel_timer/1` answers the oracle's `false` instead of `badarg` — and
+            // the identity index moves in lockstep, so that holds for a copy of it too.
             if let Some(reference) = pending.reference {
                 self.refs.insert(reference, None);
+                if let Some(id_word) = reference_id(reference) {
+                    self.refs_by_id.insert(id_word, None);
+                }
             }
             fired.push(FiredTimer {
                 action: pending.action,
@@ -842,6 +914,151 @@ mod tests {
         assert!(!timers.is_timer_ref(reference(1)));
         assert_eq!(timers.cancel(reference(1)), None);
         assert_eq!(timers.remaining(reference(1)), None);
+    }
+    // ---- the identity half: a *copy* of a timer reference is the same reference -----------
+    /// A **real** reference term — the on-heap `[header, node, serial, id]` thing
+    /// [`MonitorRef::to_eterm`] builds, not the `make_small` stand-in [`reference`] uses.
+    ///
+    /// Only a real thing has an identity (its `id` word) distinct from its term word, so only a
+    /// real thing can model what an ETS round trip or a message hands back. `heap` must outlive
+    /// the term: the returned word names memory inside it.
+    fn real_reference(heap: &mut Heap, id: u64) -> Eterm {
+        MonitorRef::from_id(id)
+            .to_eterm(heap)
+            .expect("a real reference thing")
+    }
+    /// A **copy** of `reference`: the same identity at a different address — exactly what
+    /// `ets:lookup/2` (or a message) returns. Built through the sanctioned accessor pair, so the
+    /// test needs no `unsafe`.
+    fn copy_of(heap: &mut Heap, reference: Eterm) -> Eterm {
+        MonitorRef::from_eterm(reference)
+            .expect("an internal reference")
+            .to_eterm(heap)
+            .expect("a copied reference thing")
+    }
+    #[test]
+    fn a_scheduled_reference_is_recognised_through_a_copy() {
+        let mut heap = Heap::new(64).expect("a test heap");
+        let mut timers = Timers::new();
+        let reference = real_reference(&mut heap, 7);
+        let copy = copy_of(&mut heap, reference);
+        assert_ne!(copy, reference, "a copy is a different word (its own allocation)");
+        timers.schedule(
+            Duration::from_millis(3_600_000),
+            TimerTarget::Pid(pid(1)),
+            make_small(1),
+            make_small(1),
+            reference,
+        );
+        // Pending: the copy names the same timer, so it is a timer reference and its remaining
+        // time is readable through it (`erlang:read_timer/1,2` on an ETS round trip).
+        assert!(timers.is_timer_ref(copy), "the copy names a pending timer");
+        let remaining = timers.remaining(copy).expect("the copy reads the timer");
+        assert!(
+            remaining > Duration::from_millis(3_000_000) && remaining <= Duration::from_millis(3_600_000),
+            "the reading is the delay that is left: {remaining:?}"
+        );
+        assert_eq!(timers.canonical_reference(copy), Some(reference), "the original word");
+    }
+    #[test]
+    fn a_copied_reference_cancels_exactly_the_original_timer() {
+        let mut heap = Heap::new(64).expect("a test heap");
+        let mut timers = Timers::new();
+        let reference = real_reference(&mut heap, 9);
+        let copy = copy_of(&mut heap, reference);
+        timers.schedule(
+            Duration::from_millis(3_600_000),
+            TimerTarget::Pid(pid(1)),
+            make_small(1),
+            make_small(1),
+            reference,
+        );
+        assert!(timers.cancel(copy).is_some(), "a copy cancels the timer");
+        assert_eq!(timers.pending_count(), 0);
+        // Cancelled: still *known* through either word (the oracle's `false`, never `badarg`),
+        // but no longer pending — so neither a read nor a second cancel answers anything.
+        assert!(timers.is_timer_ref(copy));
+        assert!(timers.is_timer_ref(reference));
+        assert_eq!(timers.remaining(copy), None);
+        assert_eq!(timers.remaining(reference), None);
+        assert_eq!(timers.cancel(reference), None, "the same timer is not cancelled twice");
+        assert_eq!(timers.cancel(copy), None);
+        assert!(
+            timers.take_due(Instant::now() + Duration::from_secs(7200)).is_empty(),
+            "a cancelled timer never fires"
+        );
+    }
+    #[test]
+    fn a_copy_of_another_timers_reference_is_a_different_timer() {
+        let mut heap = Heap::new(64).expect("a test heap");
+        let mut timers = Timers::new();
+        let first = real_reference(&mut heap, 11);
+        let second = real_reference(&mut heap, 12);
+        for (index, reference) in [first, second].into_iter().enumerate() {
+            timers.schedule(
+                Duration::from_millis(3_600_000),
+                TimerTarget::Pid(pid(index as u64)),
+                make_small(1),
+                make_small(index as i64),
+                reference,
+            );
+        }
+        let copy = copy_of(&mut heap, second);
+        assert!(timers.cancel(copy).is_some());
+        assert_eq!(timers.pending_count(), 1, "only the referenced timer was cancelled");
+        assert!(timers.remaining(first).is_some(), "the other timer is untouched");
+        assert_eq!(timers.remaining(copy), None);
+    }
+    #[test]
+    fn take_due_leaves_a_references_copy_known_but_not_pending() {
+        let mut heap = Heap::new(64).expect("a test heap");
+        let mut timers = Timers::new();
+        let reference = real_reference(&mut heap, 13);
+        let copy = copy_of(&mut heap, reference);
+        timers.schedule(
+            Duration::ZERO,
+            TimerTarget::Pid(pid(1)),
+            make_small(1),
+            make_small(1),
+            reference,
+        );
+        assert_eq!(timers.take_due(Instant::now()).len(), 1, "it fires");
+        // Fired: `cancel_timer/1` on either word answers the oracle's `false` (`None` here),
+        // never the `badarg` an unrecognised reference gets.
+        assert!(timers.is_timer_ref(reference));
+        assert!(timers.is_timer_ref(copy), "the fired timer's copy stays known");
+        assert_eq!(timers.cancel(copy), None);
+        assert_eq!(timers.remaining(copy), None);
+        assert_eq!(timers.canonical_reference(copy), None, "nothing is pending any more");
+    }
+    #[test]
+    fn a_plain_reference_is_still_not_a_timer_reference_even_when_copied() {
+        let mut heap = Heap::new(64).expect("a test heap");
+        let mut timers = Timers::new();
+        // A reference this heap never minted as a timer — an `erlang:make_ref/0`, a monitor, a
+        // NIF resource — is unknown through **both** words and both identities, so the id index
+        // can never resurrect one (which is what keeps a *dead* NIF resource dead).
+        let plain = real_reference(&mut heap, 21);
+        let copy = copy_of(&mut heap, plain);
+        assert!(!timers.is_timer_ref(plain));
+        assert!(!timers.is_timer_ref(copy));
+        assert_eq!(timers.cancel(copy), None);
+        assert_eq!(timers.remaining(copy), None);
+        assert_eq!(timers.canonical_reference(plain), None);
+        // A reference thing whose id *is* a live timer id, but which this heap did not mint as a
+        // timer **is** the timer (identity is the id) — the other direction of the same rule.
+        let scheduled = real_reference(&mut heap, 22);
+        timers.schedule(
+            Duration::from_millis(3_600_000),
+            TimerTarget::Pid(pid(1)),
+            make_small(1),
+            make_small(1),
+            scheduled,
+        );
+        let same_identity = MonitorRef::from_id(22)
+            .to_eterm(&mut heap)
+            .expect("the same identity at a new address");
+        assert!(timers.is_timer_ref(same_identity));
     }
 
     #[test]

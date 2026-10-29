@@ -424,11 +424,25 @@ fn copy_cons_chain<A: CopyTarget>(to: &mut A, work: &mut Vec<Fixup>, head: Eterm
 /// source payload. Nothing is registered in the destination off-heap table, and the cost is the
 /// flattened block — which [`refc_binary_words`](crate::preflight::refc_binary_words) sizes, so the
 /// preflight and this copy agree.
+///
+/// The block's shape is validated up front by the checked reader ([`try_sub_bits_parts`]) and the
+/// origin must be a `BinRef`: [`layout::classify_sub_bits`](crate::layout::classify_sub_bits) sends
+/// this function only a `RefcBinary`, so a caller that reaches it with anything else gets a typed
+/// `BadArg` rather than heap-bits words read as a `BinRef`.
 fn copy_refc_binary<A: CopyTarget>(to: &mut A, ctx: &mut CopyContext<'_>, src: Eterm) -> Result<Eterm> {
-    // SAFETY: `src` is a live refc binary, so its `ErlSubBits` words 1..4 are initialised and its
-    // `orig` slot is a live `BinRef` term.
-    let (base_flags, start, end, orig) = unsafe { sub_bits_parts(src) };
-    // SAFETY: `orig` is the `BinRef` of a refc binary, so its two payload words are live.
+    // SAFETY: `src` is a boxed term whose header word is readable; the checked reader validates the
+    // block's shape (window order, non-null base, a recognised `orig`) and refuses a mis-shaped one
+    // with a typed error instead of building a tuple from garbage words.
+    let (base_flags, start, end, orig) = unsafe { try_sub_bits_parts(src) }?;
+    // The classifier proved the origin is *some* recognised one; only a `BinRef` gives this
+    // function a `val`/`next` pair to share. A caller that hands over a match context (or any other
+    // block) gets a typed error rather than heap-bits words read as a `BinRef`.
+    // SAFETY: `orig` is the validated block's word 4; `is_bin_ref` dereferences only a boxed header.
+    if !unsafe { is_bin_ref(orig) } {
+        return Err(crate::error::bad_term());
+    }
+    // SAFETY: `orig` is a `BinRef` (the test above read its header word), so its two payload words
+    // are live and `val` is the off-heap payload's first data byte.
     let (val, next) = unsafe { bin_ref_parts(orig) };
 
     let Some(handle) = ctx.src_off_heap().binary_by_data_ptr(val as *const u8) else {
@@ -467,18 +481,29 @@ fn copy_refc_binary<A: CopyTarget>(to: &mut A, ctx: &mut CopyContext<'_>, src: E
 /// matching the C's `ASSERT(erl_sub_bits_is_match_context(from_sb))`; a refc binary whose payload
 /// no source handle owns takes this path too ([`copy_refc_binary`]) and its window may be larger,
 /// so the flattened block can exceed the on-heap limit (see the crate `CONTEXT.md` Known Issues).
+///
+/// The window is read **once** through the checked reader [`try_bitstring_parts`], which accepts
+/// both representations (an `ErlSubBits` window or a heap bitstring) — so a mis-shaped block is the
+/// typed `BadArg` instead of a flattening pass driven by a garbage base pointer.
 fn copy_match_context<A: CopyTarget>(to: &mut A, src: Eterm) -> Result<Eterm> {
-    // SAFETY: `src` is a live match-context `ErlSubBits`, so its words 1..4 are initialised and
-    // the window `start..end` is covered by its base storage.
-    let (_base_flags, start, end, _orig) = unsafe { sub_bits_parts(src) };
-    let size = end.raw().saturating_sub(start.raw());
+    // SAFETY: `src` is a boxed term whose header word is readable; the checked reader validates the
+    // block's shape and reports a mis-shaped one as a typed error, so the returned base/offset/size
+    // are a validated triple.
+    let (base, offset, size) = unsafe { try_bitstring_parts(src) }?;
 
-    // Pack the window bits MSB-first, bit by bit, exactly as the C `HEAP_BITSTRING` does.
+    // Pack the window bits MSB-first, bit by bit, exactly as the C `HEAP_BITSTRING` does: source
+    // bit `offset + i` is bit `(offset + i) & 7` of byte `base[(offset + i) >> 3]`.
     let mut bytes = vec![0u8; bit_count_to_bytes(size)];
-    for i in 0..size {
-        // SAFETY: `src` is a live bitstring and `i < size` is within its bit range.
-        if unsafe { bit_at(src, i) } {
-            bytes[i >> 3] |= 1 << (7 - (i & 7));
+    // SAFETY: the validated triple covers bits `offset .. offset + size` of `base` (a `SUB_BITS`
+    // has `start <= end` with `size = end - start`; a heap bitstring's header arity agrees with its
+    // own bit count), so every byte read is inside the block's own window and `i < size` keeps the
+    // write inside `bytes`.
+    unsafe {
+        for i in 0..size {
+            let bit = offset + i;
+            if (*base.add(bit >> 3) >> (7 - (bit & 7))) & 1 != 0 {
+                bytes[i >> 3] |= 1 << (7 - (i & 7));
+            }
         }
     }
 
@@ -538,17 +563,19 @@ pub(crate) fn shallow_unshared<A: CopyTarget>(
                 return to.off_heap_container(dst_slot);
             }
 
-            // A refc binary (the `[BinRef][ErlSubBits]` pair) shares its off-heap payload.
-            if layout::is_refc_binary_term(src) {
-                return copy_refc_binary(to, ctx, src);
-            }
-
-            // A `SUB_BITS` **match context** (an `ErlSubBits` over an on-heap bitstring) is
-            // *flattened* into a fresh on-heap bitstring, so the copy never leaves the destination
-            // term pointing into the source process's heap — the dangling reference a verbatim
-            // 5-word leaf copy (the generic path below) would produce.
-            if layout::is_match_context_term(src) {
-                return copy_match_context(to, src);
+            // A `SUB_BITS` term is dispatched on its **validated** shape (one shape proof, before
+            // anything reads its `orig` slot): a refc binary (the `[BinRef][ErlSubBits]` pair)
+            // shares its off-heap payload, while a **match context** (an `ErlSubBits` over an
+            // on-heap bitstring) is *flattened* into a fresh on-heap bitstring, so the copy never
+            // leaves the destination term pointing into the source process's heap — the dangling
+            // reference a verbatim 5-word leaf copy (the generic path below) would produce. A
+            // mis-shaped block is the typed `BadArg` the classifier reports, never a read of its
+            // garbage `base_flags`/`orig` words.
+            if let Some(kind) = layout::classify_sub_bits(src)? {
+                return match kind {
+                    layout::SubBitsKind::RefcBinary => copy_refc_binary(to, ctx, src),
+                    layout::SubBitsKind::MatchContext => copy_match_context(to, src),
+                };
             }
 
             let src_obj = boxed_val(src);

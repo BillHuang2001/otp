@@ -1,0 +1,37 @@
+# m23 cowboy measurement session — /proc/loadavg before/after every pass (1-min load is the first field)
+2026-10-29T06:46:38Z PASS=m23-cowboy-sys-r1 event=before loadavg=5.38 13.69 21.24 2/860 7
+2026-10-29T06:46:53Z PASS=m23-cowboy-sys-r1 event=after loadavg=4.85 13.16 20.95 2/848 1031 rc=0 wall_s=15
+2026-10-29T06:46:53Z PASS=m23-cowboy-sys-r1 event=hygiene port8080=free
+2026-10-29T06:46:53Z PASS=m23-cowboy-sys-r1 event=hygiene stray_runtime_procs=0
+2026-10-29T06:46:53Z PASS=m23-cowboy-rust-r1 event=before loadavg=4.85 13.16 20.95 2/849 1040
+2026-10-29T06:47:08Z PASS=m23-cowboy-rust-r1 event=after loadavg=4.58 12.70 20.67 2/843 1836 rc=0 wall_s=15
+2026-10-29T06:47:08Z PASS=m23-cowboy-rust-r1 event=hygiene port8080=free
+2026-10-29T06:47:08Z PASS=m23-cowboy-rust-r1 event=hygiene stray_runtime_procs=0
+2026-10-29T06:47:08Z PASS=m23-cowboy-rust-r2 event=before loadavg=4.58 12.70 20.67 2/843 1845
+2026-10-29T06:47:24Z PASS=m23-cowboy-rust-r2 event=after loadavg=4.44 12.27 20.40 2/835 2641 rc=0 wall_s=16
+2026-10-29T06:47:24Z PASS=m23-cowboy-rust-r2 event=hygiene port8080=free
+2026-10-29T06:47:24Z PASS=m23-cowboy-rust-r2 event=hygiene stray_runtime_procs=0
+2026-10-29T06:47:24Z PASS=m23-cowboy-sys-r2 event=before loadavg=4.44 12.27 20.40 2/835 2650
+2026-10-29T06:47:39Z PASS=m23-cowboy-sys-r2 event=after loadavg=3.99 11.78 20.11 2/839 3674 rc=0 wall_s=15
+2026-10-29T06:47:39Z PASS=m23-cowboy-sys-r2 event=hygiene port8080=free
+2026-10-29T06:47:39Z PASS=m23-cowboy-sys-r2 event=hygiene stray_runtime_procs=0
+2026-10-29T06:47:39Z PASS=m23-cowboy-sys-r3 event=before loadavg=3.99 11.78 20.11 2/839 3683
+2026-10-29T06:47:54Z PASS=m23-cowboy-sys-r3 event=after loadavg=3.78 11.35 19.83 2/831 4707 rc=0 wall_s=15
+2026-10-29T06:47:54Z PASS=m23-cowboy-sys-r3 event=hygiene port8080=free
+2026-10-29T06:47:54Z PASS=m23-cowboy-sys-r3 event=hygiene stray_runtime_procs=0
+2026-10-29T06:47:54Z PASS=m23-cowboy-rust-r3 event=before loadavg=3.78 11.35 19.83 2/831 4716
+2026-10-29T06:48:10Z PASS=m23-cowboy-rust-r3 event=after loadavg=3.62 10.94 19.56 4/839 5512 rc=0 wall_s=16
+2026-10-29T06:48:10Z PASS=m23-cowboy-rust-r3 event=hygiene port8080=free
+2026-10-29T06:48:10Z PASS=m23-cowboy-rust-r3 event=hygiene stray_runtime_procs=0
+2026-10-29T06:48:17Z PASS=m23-cowboy-full-rust event=before loadavg=3.38 10.65 19.37 5/834 7
+2026-10-29T06:48:36Z PASS=m23-cowboy-full-rust event=after loadavg=4.64 10.57 19.21 4/850 813 rc=0 wall_s=19
+2026-10-29T06:48:36Z PASS=m23-cowboy-full-rust event=hygiene port8080=free
+2026-10-29T06:48:36Z PASS=m23-cowboy-full-rust event=hygiene stray_runtime_procs=0
+2026-10-29T06:48:36Z PASS=m23-cowboy-full-sys event=before loadavg=4.64 10.57 19.21 5/850 822
+2026-10-29T06:48:55Z PASS=m23-cowboy-full-sys event=after loadavg=4.73 10.19 18.90 3/859 1854 rc=0 wall_s=19
+2026-10-29T06:48:55Z PASS=m23-cowboy-full-sys event=hygiene port8080=free
+2026-10-29T06:48:55Z PASS=m23-cowboy-full-sys event=hygiene stray_runtime_procs=0
+2026-10-29T06:48:55Z PASS=m23-cowboy-budgetprobe-all event=before loadavg=4.73 10.19 18.90 3/859 1867
+2026-10-29T06:49:26Z PASS=m23-cowboy-budgetprobe-all event=after loadavg=4.80 9.71 18.46 2/857 3682 rc=0 wall_s=31
+2026-10-29T06:49:26Z PASS=m23-cowboy-budgetprobe-all event=hygiene port8080=free
+2026-10-29T06:49:26Z PASS=m23-cowboy-budgetprobe-all event=hygiene stray_runtime_procs=0

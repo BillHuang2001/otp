@@ -63,7 +63,7 @@ use beam_term::{is_atom, is_small, make_atom, signed_value, Atom, AtomTable, Ete
 use crate::error;
 use crate::port::PortRegistry;
 use crate::runner::RunnerState;
-use crate::runtime::Runtime;
+use crate::runtime::{HeapSizingFlag, Runtime};
 
 use super::RuntimeContext;
 
@@ -401,6 +401,67 @@ impl ProcessHook for ProcessBridge<'_> {
                 let atom = atoms.lookup("on_heap").ok_or(BeamError::TermNotFound)?;
                 Ok(Some(make_atom(atom)))
             }
+            // The three heap-sizing flags — `fullsweep_after`, `min_heap_size` and
+            // `min_bin_vheap_size` (`bif.c:2104-2145`). Each takes a **non-negative small
+            // integer** (a bignum, a float, an atom or a negative value is the C's
+            // `goto error`, i.e. the oracle's `badarg`), answers the **old** value and stores
+            // the new one on the process.
+            //
+            // The value is recorded in the runtime's own per-pid store
+            // ([`Runtime::heap_flags`]), because `beam_process::ProcessFlags` carries no field
+            // for any of the three; that store is also what `process_info(P, Flag)` and
+            // `process_info(P, garbage_collection)` read, so the write and the readback cannot
+            // disagree. **The stored value is bookkeeping only**: nothing sizes a heap from it
+            // yet — adopting it is the `beam_gc` policy seam's job, and until that lands the
+            // collector keeps running on the process's birth policy (see [`HeapSizingFlags`]).
+            //
+            // `min_heap_size` / `min_bin_vheap_size` follow the C's `i < H_MIN_SIZE ?
+            // H_MIN_SIZE : erts_next_heap_size(i, 0)` against the **emulator's** grain
+            // (`H_MIN_SIZE` / `BIN_VH_MIN_SIZE`, i.e. `+hms`/`+hmbs`) and *not* the process's
+            // own minimum, so a process born with `{min_heap_size, 10_000}` can still lower it
+            // (probed: old `10958`, new `610`). `HeapPolicy::spawn_policy` is that rule's one
+            // implementation — the very one `spawn_opt` uses — so the two can never drift.
+            // `fullsweep_after` is instead stored **verbatim** into the C's `Uint16
+            // max_gen_gcs`, which is the truncation on readback the oracle shows (measured:
+            // `100000` ⇒ `34464`, `65536` ⇒ `0`).
+            "min_heap_size" | "min_bin_vheap_size" | "fullsweep_after" => {
+                if !is_small(value) {
+                    return Ok(None);
+                }
+                let requested = signed_value(value);
+                if requested < 0 {
+                    return Ok(None);
+                }
+                let requested = requested as usize;
+                // The process's own policy is what the flag reports while it was never set —
+                // its birth value (`spawn_opt`, `+hms`/`+hmbs`). Read off the PCB; the borrow
+                // of the table ends with this read.
+                let policy = process.collector().policy().clone();
+                let flag = match name.as_str() {
+                    "min_heap_size" => HeapSizingFlag::MinHeapSize,
+                    "min_bin_vheap_size" => HeapSizingFlag::MinBinVheapSize,
+                    _ => HeapSizingFlag::FullsweepAfter,
+                };
+                // The emulator-wide grain, never the process's own minimum (`bif.c:2124`).
+                let emulator = self.runtime.config().heap_options().policy();
+                let stored = match flag {
+                    HeapSizingFlag::MinHeapSize => {
+                        emulator.spawn_policy(requested, 0, None).min_heap_words
+                    }
+                    HeapSizingFlag::MinBinVheapSize => {
+                        emulator.spawn_policy(0, requested, None).min_bin_vheap_words
+                    }
+                    // No floor, no rounding — the raw request, narrowed to the C's field.
+                    HeapSizingFlag::FullsweepAfter => requested,
+                };
+                let current = self
+                    .runtime
+                    .heap_sizing_flags(pid)
+                    .unwrap_or_default()
+                    .report(flag, &policy);
+                self.runtime.set_heap_sizing_flag(pid, flag, stored);
+                Ok(Some(beam_term::make_small(current as i64)))
+            }
             // `max_heap_size` — the per-process heap bound and its three flags
             // (`MAX_HEAP_SIZE_GET(p)`/`MAX_HEAP_SIZE_FLAGS_GET(p)`, `bif.c:2148-2166`).
             //
@@ -424,15 +485,25 @@ impl ProcessHook for ProcessBridge<'_> {
             // terminate the process with the bare atom `killed` or emit the ERTS
             // `=ERROR REPORT====` — never both, never an exception.
             "max_heap_size" => {
-                // The floor is the process's own stored `min_heap_size` (the C's
-                // `MIN_HEAP_SIZE(BIF_P)`), the setting it reports right now is its PCB's, and
-                // the emulator's birth default needs the process's own policy snapshot — all
-                // three are read off the PCB we already hold, and that borrow **ends** at the
-                // last read below so the runtime can be read (and the table re-borrowed) after
-                // it.
-                let floor = process.collector().policy().min_heap_words;
+                // The setting the process reports right now is its PCB's, and the emulator's
+                // birth default needs the process's own policy snapshot — both are read off the
+                // PCB we already hold, and that borrow **ends** at the last read below so the
+                // runtime can be read (and the table re-borrowed) after it. The floor is the
+                // per-flag store's `min_heap_size` when one was set, else the birth policy's.
+                let birth_floor = process.collector().policy().min_heap_words;
                 let policy = process.collector().policy().clone();
                 let recorded = process.max_heap_size();
+                // The C's floor is `MIN_HEAP_SIZE(p)` = the process's **own**
+                // `min_heap_size` field (`erl_process.h:1031`), which is the very field
+                // `process_flag(min_heap_size, …)` writes — so a flag set earlier moves this
+                // floor as well (probed: after `process_flag(min_heap_size, 1000)` ⇒ 1598,
+                // `process_flag(max_heap_size, 1597)` is `badarg` and `1598` is accepted). The
+                // birth policy answers while the flag was never set.
+                let floor = self
+                    .runtime
+                    .heap_sizing_flags(pid)
+                    .and_then(|flags| flags.get(HeapSizingFlag::MinHeapSize))
+                    .unwrap_or(birth_floor);
                 let current = if self.runtime.max_heap_was_set(pid) {
                     recorded
                 } else {
@@ -1310,6 +1381,271 @@ mod tests {
                 result.is_some(),
                 accepted,
                 "size {size} against a 1598-word min_heap_size"
+            );
+        }
+    }
+    /// `process_info(Pid, Flag)` as the integer it answers, through the same bridge.
+    fn info_int(rt: &mut Runtime, pid: ProcessId, name: &str) -> i64 {
+        let item = atom(rt, name);
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(rt, None, ports, None, pid);
+        let mut pool = heap();
+        match bridge.process_info_item(&mut pool, &atoms, pid, item).unwrap() {
+            ProcessInfoItem::Value(term) => signed_value(term),
+            other => panic!("expected the {name} item, got {other:?}"),
+        }
+    }
+    /// `process_flag(Flag, Value)` through the bridge, answering the previous value as an
+    /// integer (`None` = the hook's `badarg`).
+    fn set_int_flag(
+        rt: &mut Runtime,
+        pid: ProcessId,
+        name: &str,
+        value: i64,
+    ) -> Option<i64> {
+        let flag = atom(rt, name);
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(rt, None, ports, None, pid);
+        let mut pool = heap();
+        bridge
+            .process_flag(&mut pool, &atoms, flag, make_small(value))
+            .unwrap()
+            .map(signed_value)
+    }
+    /// The three measured oracle tables, walked in order so each step's *old* value is the
+    /// previous step's *new* one: `process_flag(Flag, V)` ⇒ `{V, Old, process_info(self(), Flag)}`.
+    ///
+    /// Probed on OTP 29.1.1 / erts-17.1 (`pf_probe:run/0`):
+    ///
+    /// ```text
+    /// min_heap_size:      0 ⇒ {0,233,233}      12 ⇒ {12,233,233}    233 ⇒ {233,233,233}
+    ///                     500 ⇒ {500,233,610}  1000 ⇒ {1000,610,1598}
+    ///                     1597 ⇒ {1597,1598,1598}                    1598 ⇒ {1598,1598,1598}
+    ///                     4096 ⇒ {4096,1598,4185}                    2^40 ⇒ {…,4185,1249668211299}
+    /// min_bin_vheap_size: 0/500/46422 ⇒ 46422 (unchanged, all below the grain)
+    ///                     50000 ⇒ {…,46422,75113}                    100000 ⇒ {…,75113,121536}
+    /// fullsweep_after:    0 ⇒ {0,65535,0}  3 ⇒ {3,0,3}  65535 ⇒ {65535,3,65535}
+    ///                     100000 ⇒ {100000,65535,34464}              65536 ⇒ {…,34464,0}
+    /// ```
+    ///
+    /// The last `min_heap_size` row is the growth table's own tail: `2^40 = 1099511627776`
+    /// has no smaller curated size, and the **stored** figure is the next one up. (On the oracle
+    /// that process then dies at its next heap growth — `eheap_alloc: Cannot allocate 9997345690392
+    /// bytes`; here the value is bookkeeping only, so nothing is allocated and the readback is
+    /// observable. The stored figure is the same number on both sides.)
+    #[test]
+    fn the_three_heap_sizing_flags_report_the_oracle_tables() {
+        let mut rt = runtime();
+        let pid = rt.self_pid();
+        let tables: [(&str, &[(i64, i64, i64)]); 3] = [
+            (
+                "min_heap_size",
+                &[
+                    (0, 233, 233),
+                    (12, 233, 233),
+                    (233, 233, 233),
+                    (500, 233, 610),
+                    (1000, 610, 1598),
+                    (1597, 1598, 1598),
+                    (1598, 1598, 1598),
+                    (4096, 1598, 4185),
+                    (1_i64 << 40, 4185, 1_249_668_211_299),
+                ],
+            ),
+            (
+                "min_bin_vheap_size",
+                &[
+                    (0, 46_422, 46_422),
+                    (500, 46_422, 46_422),
+                    (46_422, 46_422, 46_422),
+                    (50_000, 46_422, 75_113),
+                    (100_000, 75_113, 121_536),
+                ],
+            ),
+            (
+                "fullsweep_after",
+                &[
+                    (0, 65_535, 0),
+                    (3, 0, 3),
+                    (65_535, 3, 65_535),
+                    (100_000, 65_535, 34_464),
+                    (65_536, 34_464, 0),
+                ],
+            ),
+        ];
+        for (name, rows) in tables {
+            for (requested, previous, stored) in rows {
+                assert_eq!(
+                    set_int_flag(&mut rt, pid, name, *requested),
+                    Some(*previous),
+                    "{name}: setting {requested} reports the previous value"
+                );
+                assert_eq!(
+                    info_int(&mut rt, pid, name),
+                    *stored,
+                    "{name}: {requested} reads back as {stored}"
+                );
+            }
+        }
+    }
+    /// Every `badarg` the oracle raises for the three flags (`pf_probe:badarg/0`), and the
+    /// rule that a rejected value leaves the flag **untouched**.
+    ///
+    /// Oracle:
+    ///
+    /// ```text
+    /// process_flag(Flag, foo | 1.5 | -1)                ⇒ {error,badarg}  (all three flags)
+    /// process_flag(no_such_flag, 1)                     ⇒ {error,badarg}
+    /// process_flag(min_heap_size, {1000, true, false})  ⇒ {error,badarg}
+    ///   … and process_info(self(), min_heap_size) still reports the value set before it
+    /// ```
+    ///
+    /// The float probe's branch is the same `!is_small` test as the atom's and the cons cell's
+    /// (writing a float needs the crate-forbidden raw heap writer).
+    #[test]
+    fn a_rejected_heap_sizing_flag_is_badarg_and_leaves_the_flag_untouched() {
+        let mut rt = runtime();
+        let pid = rt.self_pid();
+        let boxed = {
+            let mut scratch = Heap::new(16).expect("a scratch heap");
+            scratch.cons(make_small(1), NIL).expect("a cons cell")
+        };
+        let rejected = [
+            ("an atom", make_atom(atom(&mut rt, "foo"))),
+            ("a boxed term", boxed),
+            ("nil", NIL),
+            ("a negative integer", make_small(-1)),
+        ];
+        for (name, default) in [
+            ("min_heap_size", 233),
+            ("min_bin_vheap_size", 46_422),
+            ("fullsweep_after", 65_535),
+        ] {
+            // Give the flag a value first, so "untouched" is observable.
+            assert_eq!(
+                set_int_flag(&mut rt, pid, name, 1000),
+                Some(default),
+                "{name}: the fresh-process value"
+            );
+            let before = info_int(&mut rt, pid, name);
+            for (label, value) in rejected {
+                let flag = atom(&mut rt, name);
+                let atoms = rt.code_server.atoms_handle();
+                let ports = Rc::clone(&rt.ports);
+                let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+                let mut pool = heap();
+                assert!(
+                    bridge
+                        .process_flag(&mut pool, &atoms, flag, value)
+                        .unwrap()
+                        .is_none(),
+                    "{name} with {label} must be the oracle's badarg"
+                );
+                assert_eq!(
+                    info_int(&mut rt, pid, name),
+                    before,
+                    "{name} with {label} leaves the flag untouched"
+                );
+            }
+        }
+        // A flag this runtime does not know, and the 3-tuple form the oracle also rejects.
+        assert_eq!(set_int_flag(&mut rt, pid, "no_such_flag", 1), None);
+        // The tuple is built on a scratch heap that outlives the call: the bridge only tests
+        // `is_small` on it, but a dangling term would still be the wrong thing to hand it.
+        let mut scratch = Heap::new(16).expect("a scratch heap");
+        let three_tuple = scratch
+            .tuple(&[make_small(1000), NIL, NIL])
+            .expect("a 3-tuple");
+        let flag = atom(&mut rt, "min_heap_size");
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+        let mut pool = heap();
+        assert!(
+            bridge
+                .process_flag(&mut pool, &atoms, flag, three_tuple)
+                .unwrap()
+                .is_none(),
+            "a tuple value is the oracle's badarg"
+        );
+        assert_eq!(
+            info_int(&mut rt, pid, "min_heap_size"),
+            1598,
+            "the rejected 3-tuple left the 1000 ⇒ 1598 min_heap_size in place"
+        );
+    }
+    /// A flag set through `process_flag/2` is the **caller's** alone: a process spawned
+    /// afterwards reports the figure it was born with, and a `spawn_opt` child reports its own
+    /// option — against the C's **emulator** grain, so a child born with `{min_heap_size,
+    /// 10000}` (⇒ 10958) can still *lower* its minimum (`pf_probe:child/0` and `:touching/0`).
+    #[test]
+    fn heap_sizing_flags_are_per_process_and_a_child_starts_from_its_birth_policy() {
+        let mut rt = runtime();
+        let pid = rt.self_pid();
+        assert_eq!(set_int_flag(&mut rt, pid, "min_heap_size", 1000), Some(233));
+        assert_eq!(info_int(&mut rt, pid, "min_heap_size"), 1598);
+        // A plain sibling spawned **after** the set still reports the fresh-process defaults.
+        let sibling = rt
+            .processes
+            .spawn(beam_gc::HeapPolicy::from_spawn_opts(0, 0, 65_535))
+            .expect("a sibling process");
+        for (name, expected) in [
+            ("min_heap_size", 233),
+            ("min_bin_vheap_size", 46_422),
+            ("fullsweep_after", 65_535),
+        ] {
+            assert_eq!(info_int(&mut rt, sibling, name), expected, "sibling {name}");
+        }
+        assert_eq!(info_int(&mut rt, pid, "min_heap_size"), 1598, "the caller keeps its own");
+        // A `spawn_opt` child: born with the three options, and the minimum it then sets is
+        // floored at the **emulator's** grain (233), not its own birth value.
+        let child = rt
+            .processes
+            .spawn(beam_gc::HeapPolicy::from_spawn_opts(10_000, 100_000, 3))
+            .expect("a spawn_opt child");
+        for (name, expected) in [
+            ("min_heap_size", 10_958),
+            ("min_bin_vheap_size", 121_536),
+            ("fullsweep_after", 3),
+        ] {
+            assert_eq!(info_int(&mut rt, child, name), expected, "child {name}");
+        }
+        assert_eq!(
+            set_int_flag(&mut rt, child, "min_heap_size", 500),
+            Some(10_958),
+            "the previous value is the child's own rounded birth figure"
+        );
+        assert_eq!(
+            info_int(&mut rt, child, "min_heap_size"),
+            610,
+            "500 is above the emulator grain, so it rounds to 610 rather than staying 10958"
+        );
+    }
+    /// The `max_heap_size` floor is the process's **own** `min_heap_size`, so a value set through
+    /// `process_flag(min_heap_size, …)` moves it too — the C's `MIN_HEAP_SIZE(p)` is that very
+    /// field. Oracle (`pf_gc:run/0`): after `process_flag(min_heap_size, 1000)` ⇒ 1598,
+    /// `process_flag(max_heap_size, 1597)` is `badarg` and `1598` is accepted.
+    #[test]
+    fn the_max_heap_size_floor_follows_a_process_flag_min_heap_size() {
+        let mut rt = runtime();
+        let pid = rt.self_pid();
+        assert_eq!(set_int_flag(&mut rt, pid, "min_heap_size", 1000), Some(233));
+        let flag = atom(&mut rt, "max_heap_size");
+        for (size, accepted) in [(1597_i64, false), (1598, true)] {
+            let value = max_heap_arg(&mut rt, &[("size", Some(make_small(size)))]);
+            let atoms = rt.code_server.atoms_handle();
+            let ports = Rc::clone(&rt.ports);
+            let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, pid);
+            let mut pool = heap();
+            let result = bridge
+                .process_flag(&mut pool, &atoms, flag, value)
+                .unwrap();
+            assert_eq!(
+                result.is_some(),
+                accepted,
+                "size {size} against the process_flag-set 1598-word min_heap_size"
             );
         }
     }

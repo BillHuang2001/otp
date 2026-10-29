@@ -202,6 +202,37 @@ impl Machine {
         self.raise_function_clause_args
     }
 
+    /// Consume the **live raise**'s `{error_info, Map}` extension
+    /// ([`Machine::raise_error_info`]).
+    ///
+    /// `Some(map)` means the exception currently in flight was raised by an
+    /// `erlang:error/3` that scanned that map out of its options list, and C's cooked
+    /// stacktrace appends `{error_info, Map}` as the **tail of the innermost item's
+    /// location** (`erts_build_mfa_item`,
+    /// `../../erts/emulator/beam/utils.c:3430-3457`, fed by `save_stacktrace`'s
+    /// `error_info = c_p->fvalue` for `EXC_ERROR_3`,
+    /// `../../erts/emulator/beam/beam_common.c:1024-1026`) — so the oracle reports
+    /// `[{file,F},{line,N},{error_info,Map}]` for that one item and the plain
+    /// two-element location for every outer frame. `None` for every other raise.
+    ///
+    /// Taking it consumes it: the map describes exactly **one** cooking.
+    pub(crate) fn take_raise_error_info(&mut self) -> Option<Eterm> {
+        self.raise_error_info.take()
+    }
+
+    /// The **read half** of [`Machine::take_raise_error_info`]: the live
+    /// `{error_info, Map}` map term, **without** consuming it.
+    ///
+    /// The cooked-trace builder needs the extension's presence to size its single
+    /// rooted reservation before taking it, and must not carry the pre-reservation
+    /// word into the carve: a collecting host may **move** the map under that
+    /// reservation, so the term is taken *after* it, through
+    /// [`Machine::take_raise_error_info`], which yields the re-seated (post-move)
+    /// word — exactly the split [`Machine::live_raise_function_clause_args`] has.
+    pub(crate) fn live_raise_error_info(&self) -> Option<Eterm> {
+        self.raise_error_info
+    }
+
     /// Consume the **live raise**'s explicitly supplied symbolic frames
     /// ([`Machine::raise_supplied_trace`]).
     ///
@@ -234,6 +265,34 @@ impl Machine {
         self.raise_supplied_term.take()
     }
 
+    /// Consume the **live raise**'s *verbatim echo* marker
+    /// ([`Machine::raise_supplied_term_verbatim`]).
+    ///
+    /// `true` means the trace term the raise in flight supplies is the
+    /// `erlang:raise/3` third argument itself, so the cooked stacktrace is that term
+    /// returned unchanged — C's `build_stacktrace` `is_raised_exc` arm
+    /// (`../../erts/emulator/beam/beam_common.c:1219-1223`), which resolves nothing,
+    /// re-encodes nothing and validates no frame shape. It is the only discriminator
+    /// an **explicitly empty** supplied trace has, because the term `[]` is
+    /// word-identical to "no trace supplied".
+    ///
+    /// Taking it consumes it: the marker describes exactly **one** raise.
+    pub(crate) fn take_raise_supplied_term_verbatim(&mut self) -> bool {
+        std::mem::take(&mut self.raise_supplied_term_verbatim)
+    }
+
+    /// The **read half** of [`Machine::take_raise_supplied_term_verbatim`]: whether
+    /// the raise in flight is a verbatim echo, **without** consuming the marker.
+    ///
+    /// `raw_raise`'s re-supply needs it ([`Machine::raise_supplied`]): C stores the
+    /// caught exception's trace **object** in `c_p->ftrace` again
+    /// (`../../erts/emulator/beam/beam_common.c:1148-1179`), so whether
+    /// `build_stacktrace` echoes it or cooks it is a property of that object
+    /// (`is_raised_exc`), not of the raise site — a re-raise therefore keeps it.
+    pub(crate) fn live_raise_supplied_term_verbatim(&self) -> bool {
+        self.raise_supplied_term_verbatim
+    }
+
     /// Whether the raise currently in flight **supplied** its trace — either as
     /// explicit symbolic frames or as a trace term — **without** consuming the
     /// latch.
@@ -242,7 +301,9 @@ impl Machine {
     /// state at all: a raise that supplied a trace carries no derived snapshot, so
     /// the usual "empty snapshot ⇒ `NIL`" shortcut would drop the supplied trace.
     pub(crate) fn has_raise_supplied_trace(&self) -> bool {
-        self.raise_supplied_trace.is_some() || self.raise_supplied_term.is_some()
+        self.raise_supplied_trace.is_some()
+            || self.raise_supplied_term.is_some()
+            || self.raise_supplied_term_verbatim
     }
 
     /// Consume the **live raise**'s *propagated* marker
@@ -437,6 +498,14 @@ impl Machine {
     ///
     /// A family body typically ends with `machine.throw(class, reason).map(Some)`
     /// (or, for a `{badmatch,V}`-style raise, [`Machine::throw_error`]).
+    ///
+    /// **The `reason`/`trace` words are landed verbatim.** A caught raise publishes
+    /// them raw in `x(1)`/`x(2)` (no copy, no re-home), and the engine adds no
+    /// region knowledge of its own: whether the word stays valid is the *producer's*
+    /// obligation — a machine-heap term is rooted by the landing itself, a
+    /// never-rewound pooled word or a literal is stable by the host's guarantee.
+    /// [`Machine::land_exception`] states the rule, its consumers and the one
+    /// allocating door between a BIF seam's word and the landing.
     pub(crate) fn throw_with_trace(
         &mut self,
         class: ExceptionClass,
@@ -508,6 +577,11 @@ impl Machine {
             // live state from here on, so a raise that carries no such list clears it to
             // `None` (never a stale list from an earlier raise).
             self.raise_function_clause_args = self.pending_function_clause_args.take();
+            // The `{error_info, Map}` extension an `erlang:error/3` raise arrived
+            // carrying rides the same protocol: the raise site armed the one-shot
+            // latch, and this raise owns the live state from here on, so a raise that
+            // carries no such map clears it to `None`.
+            self.raise_error_info = self.pending_error_info.take();
             // The explicitly **supplied** symbolic frames ride the same protocol: the
             // raise site armed the one-shot latch (only when the incoming raise carried
             // a non-empty trace), and this raise — whoever raised it — owns the live
@@ -518,6 +592,12 @@ impl Machine {
             // raise must not rebuild the chain — the chain of the raise being re-raised
             // IS the supplied trace, and the term is published as the handler's `x(2)`.
             self.raise_supplied_term = self.pending_supplied_term.take();
+            // … and *which* term flavour it is. `true` means the term is the
+            // `erlang:raise/3` third argument to echo **verbatim** (C's `is_raised_exc`
+            // arm), `false` that it is the preserved cooked chain `raw_raise` supplies.
+            // Taken unconditionally so a raise that arrives with no such marker clears
+            // it: the marker describes exactly one raise.
+            self.raise_supplied_term_verbatim = std::mem::take(&mut self.pending_supplied_term_verbatim);
         }
         // A propagating raise takes none of the latches: they describe the exception
         // in flight, which is exactly what is being handed on.
@@ -580,6 +660,12 @@ impl Machine {
         // The trace the handler sees in `x(2)`: the term this raise supplied when it
         // supplied one (C's `c_p->ftrace = x(2)` after `raw_raise`), else the raise's
         // own raw-trace word.
+        //
+        // Nothing allocates between the raise's words and this landing (the unwind is
+        // two `truncate`s, `set_continuation` and `class_atom` are pure), so the words
+        // reach `x(1)`/`x(2)` exactly as the raise carried them — the raw-word landing
+        // rule whose soundness condition a *producer* owns
+        // ([`Machine::land_exception`] states it in full).
         let supplied = self.raise_supplied_term.take();
         self.land_exception(class_atom, reason, trace, supplied)?;
         // The handler's `(func, pc)` are indices into the *landing context's*
@@ -627,6 +713,15 @@ impl Machine {
     /// derived trace is empty the raise is returned unchanged too, so a raise the
     /// module cannot name is never given an invented frame.
     ///
+    /// **Frames only — the reason word is never touched.** An **uncaught** raise
+    /// carries its reason out in
+    /// [`Raise::live_reason`](beam_common::Raise::live_reason), and this funnel neither
+    /// re-homes nor substitutes that word (it decorates
+    /// [`stacktrace`](beam_common::Raise::stacktrace) alone), so the term a renderer
+    /// reads back is the term the raise held — the uncaught half of the raw-word
+    /// landing rule [`Machine::land_exception`] states. Pinned by
+    /// `raise_reason_tests::an_uncaught_raise_keeps_its_reason_word_through_the_uncaught_funnel`.
+    ///
     /// **Engine diagnostics are deliberately excluded** ([`is_engine_diagnostic`]):
     /// a [`BeamError::Raise`] whose reason is the [`crate::error::unsupported`]
     /// sentinel describes a **coverage limit of the engine itself** (an
@@ -656,12 +751,39 @@ impl Machine {
             BeamError::Raise(raise)
                 if raise.stacktrace.is_empty() && !is_engine_diagnostic(&raise.reason) =>
             {
+                // The `{error_info, Map}` extension belongs to the **innermost cooked
+                // item's location tail** (C's `erts_build_mfa_item` prepends the
+                // `{file,_}`/`{line,_}` pairs to it), and this funnel's symbolic model —
+                // [`beam_common::StackTrace`], a list of `{M,F,A,Location}` frames with a
+                // two-element location — has no tail to put it in. It is therefore
+                // **consumed and declined** here rather than left armed for a later,
+                // unrelated cooking; the residual is recorded in
+                // `families/exceptions/CONTEXT.md`.
+                let _error_info = self.take_raise_error_info();
                 // A raise that arrived carrying **explicit symbolic frames** renders
                 // those (an empty supplied trace stays empty); a raise that supplied a
                 // trace **term** renders the preserved chain — the trace of the raise
                 // it re-raises — instead of deriving one from this site.
                 if let Some(supplied) = self.take_raise_supplied_trace() {
                     return BeamError::Raise(raise.with_stacktrace(supplied));
+                }
+                // A **verbatim echo** (`erlang:raise/3`'s own third argument, see
+                // [`Machine::raise_supplied_term_verbatim`]) renders NO frames here: the
+                // supplied term is the whole answer, and this funnel's model cannot
+                // express it (its frames carry an arity, never an argument list), while
+                // the snapshot a supplied raise deliberately does not rebuild would
+                // supply frames from an earlier exception. `raise(_, _, [])` — the
+                // oracle's empty trace — is exactly this arm, and it renders nothing.
+                // The residual (an uncaught supplied trace of unrepresentable frames
+                // reports no frames where the oracle prints the supplied items) is
+                // recorded in `families/exceptions/CONTEXT.md`.
+                if self.take_raise_supplied_term_verbatim() {
+                    let _supplied_term = self.take_raise_supplied_term();
+                    // Consume the failed-clause argument list and the propagated marker
+                    // all the same: they describe exactly this one raise.
+                    let _failed_clause_args = self.take_raise_function_clause_args();
+                    let _propagated = self.take_raise_propagated();
+                    return BeamError::Raise(raise);
                 }
                 // A **propagated** raise ([`Machine::throw_propagating`]) and a raise
                 // that supplied a trace **term** both render the chain the landed
@@ -713,6 +835,80 @@ impl Machine {
     /// * `x(3) = class_atom` — `exception_tag[GET_EXC_CLASS(freason)]`, installed by
     ///   [`Machine::set_class_atom`]; the handler only has to move it to `x(0)`
     ///   (`try_case`) or compare it against `throw`/`error` (`catch_end`).
+    ///
+    /// # The raw-word landing rule (the raise-reason producer contract)
+    ///
+    /// Every word this writes is embedded **verbatim**: `reason` goes into `x(1)` and
+    /// `supplied_term.unwrap_or(trace)` into `x(2)` exactly as the raise carried them
+    /// — no copy, no re-home, no validation, no region knowledge. The engine cannot
+    /// tell one host region from another, so it never re-homes a word it was handed;
+    /// there is no copying seam here and none should be grown (this crate has no
+    /// `copy_struct`, and would have no way to arbitrate the pointers across crates).
+    ///
+    /// **Consumers.** `x(1)`/`x(2)` are read back by the handler opcodes
+    /// ([`Instr::TryCase`](beam_loader::Instr), `catch_end`), which embed the words in
+    /// a freshly carved tuple — `families::exceptions` re-reads `x(1)` **inside** its
+    /// one rooted reservation, so a collecting host relocates the reason as a root
+    /// rather than a stale Rust local; by [`Instr::BuildStacktrace`](beam_loader::Instr)
+    /// via `families::exceptions::stacktrace::symbolic_stacktrace` (which echoes a
+    /// cooked supplied trace verbatim and otherwise cooks the raise snapshot); and by
+    /// an **uncaught** raise, which carries the reason out of the machine in
+    /// [`Raise::live_reason`](beam_common::Raise::live_reason) and is decorated
+    /// frames-only by [`Machine::with_uncaught_frames`] — that funnel re-homes nothing
+    /// and substitutes nothing, so the word it hands on is the word the raise held.
+    ///
+    /// **Producers** (all of them reach this method through
+    /// [`Machine::throw_with_trace`]/[`Machine::throw_propagating`]):
+    ///
+    /// * an **instruction-level** raise — the exception family's
+    ///   `{badmatch,V}`/`{case_clause,V}`/`{badrecord,V}` builders (each written into a
+    ///   rooted reservation immediately before the throw), [`Instr::Raise`] /
+    ///   [`Instr::RawRaise`](beam_loader::Instr) (`x(1)`/`x(2)` as operands), the
+    ///   `func_info` failed-clause raise;
+    /// * the **BIF door** — `interpreter::bif::raise_error` over the `BeamError` that
+    ///   `ExecutionContext::call_bif`/`call_bif_outcome` returned, whose compound reason
+    ///   rides `Raise::live_reason` (the same opaque slot carries `error/2,3`'s
+    ///   argument list, its `{error_info,Map}` and `erlang:raise/3`'s trace term);
+    /// * [`Machine::raise_supplied`] — C's `raw_raise`, which stores the caught
+    ///   exception's trace object and publishes it as the handler's `x(2)`.
+    ///
+    /// **Soundness — a condition the producer owns, not this method.** The landed word
+    /// is a raw pointer word, so it stays valid only while the region it names does:
+    ///
+    /// 1. A **machine-heap** word (an instruction-level raise, or a BIF result the host
+    ///    copied onto the machine heap) is a root from the landing onward — it sits in
+    ///    `x(1)`/`x(2)`, inside the frozen [`RootSet`](crate::context::RootSet) — so
+    ///    every later collecting allocation relocates it in place. Nothing else in the
+    ///    machine may keep a raw copy of it.
+    /// 2. A word from a **region the host never rewinds or moves** while the machine
+    ///    holds it is equally sound, and is this workspace's shape for a BIF failure's
+    ///    reason graph: `beam_rt` sets its pool-rewind flag only inside its `Ok`-result
+    ///    arm (`beam_rt/src/context/calls.rs`, `call_registered`'s tail), so a failed
+    ///    call leaves its region untouched — `beam_rt/src/context/pool/CONTEXT.md`
+    ///    records the requirement, a raise may carry a live reason term
+    ///    (`beam_common::Raise::live_reason`) that points into that heap — and the word
+    ///    stays at its own address ("leak, never dangle"). An `Ok` container result is
+    ///    copied onto the process's scanned young heap before that rewind, so it
+    ///    arrives here as a machine-heap word (case 1). A literal-area word is stable
+    ///    for the same reason.
+    /// 3. The **one allocating door** the engine itself can run between the seam and
+    ///    this landing is the BIF call site's synthesized head item
+    ///    (`families::exceptions::bif_frame`), and it runs **before** the reason word is
+    ///    read out of the `BeamError`: its reservation relocates only what the frozen
+    ///    root set carries (its own reserve → read → write discipline re-reads every
+    ///    argument afterwards). This method itself crosses no allocating door at all —
+    ///    `unwind_to_frame`/`set_continuation`/`class_atom` are pure and the four
+    ///    `set_x` calls are register writes — which
+    ///    `raise_reason_tests::a_raise_through_the_bif_door_lands_without_crossing_an_allocating_door`
+    ///    pins.
+    ///
+    /// **What a host must not do.** Hand over an unrooted word from a heap it may
+    /// collect, rewind, reuse or move before the machine is done with it — and, in
+    /// particular, treat this landing as a copying boundary that stabilizes a
+    /// transient word for it. A host whose `call_bif` builds a result on a scratch
+    /// region owns re-homing that graph itself (the copy-out requirement); the engine
+    /// neither inspects nor repairs it. A violation is a dangling word read back by the
+    /// handler, never a typed error.
     fn land_exception(
         &mut self,
         class_atom: Eterm,
@@ -739,13 +935,30 @@ impl Machine {
     /// preserves ([`Machine::raise_snapshot`]) in
     /// [`Machine::with_uncaught_frames`]. No allocation happens between the two
     /// steps, so the term never leaves the frozen root set.
+    ///
+    /// `verbatim` says **what kind** of term it is, and it is the caller's assertion:
+    /// * `false` — `term` is the cooked chain the raise **preserves**, which the
+    ///   uncaught funnel re-renders from the snapshot (`raw_raise` over a
+    ///   raise the engine derived itself);
+    /// * `true` — `term` is C's **raised** trace object, `is_raised_exc` set, so
+    ///   `build_stacktrace` echoes it unchanged
+    ///   (`../../erts/emulator/beam/beam_common.c:1219-1223`). `raw_raise` keeps
+    ///   that property because it stores the caught exception's trace object back
+    ///   into `c_p->ftrace` (`:1164`), so the re-supplied term is the same object
+    ///   and `[]` stays distinguishable from "no trace supplied" — the caller reads
+    ///   the incoming marker through [`Machine::live_raise_supplied_term_verbatim`].
+    ///
+    /// Either way the marker is **written**, never inherited: a raise that supplies
+    /// a term always states which flavour it is.
     pub(crate) fn raise_supplied(
         &mut self,
         class: ExceptionClass,
         reason: Eterm,
         term: Eterm,
+        verbatim: bool,
     ) -> Result<Step> {
         self.pending_supplied_term = Some(term);
+        self.pending_supplied_term_verbatim = verbatim;
         self.throw_with_trace(class, reason, term)
     }
 

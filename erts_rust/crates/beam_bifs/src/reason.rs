@@ -53,10 +53,16 @@
 //! Both [`exit_reason_from_term`] and [`reason_term_from_exit_reason`] are part of
 //! the crate's public API (re-exported from the crate root) — the documented
 //! `beam_process`/`beam_rt` handoff, not crate-internal helpers.
+//!
+//! The **other** half of a BIF frame's `error_info` payload — the `cause` the
+//! oracle packs beside `module` — is modelled next door, by
+//! `crate::error_cause::error_cause`; this module owns only the
+//! `erlang:error/2,3` argument/`error_info` payload.
 
-use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
-use beam_term::{atom_val, make_atom, AtomTable, Eterm};
+use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Result};
+use beam_term::{atom_val, is_atom, make_atom, AtomTable, Eterm};
 
+use crate::access;
 use crate::context::BifContext;
 use crate::error::{self, raise_error, raise_exit, raise_throw};
 use crate::registry::BifRegistry;
@@ -136,51 +142,221 @@ fn raise(class: ExceptionClass, term: Eterm, atoms: &AtomTable) -> BeamError {
     }
 }
 
+/// Attaches the `error/2,3` stacktrace payloads to a raise built by [`raise`].
+///
+/// `saved_args` is the raise's second argument, stored **verbatim** (the C's
+/// `TUPLE2(BIF_ARG_1, BIF_ARG_2)`, `bif.c:1450`); `error_info` is the map the
+/// `error/3` scan accepted, when it accepted one. Both ride the opaque
+/// [`Raise::saved_args`](beam_common::Raise::saved_args) /
+/// [`Raise::error_info`](beam_common::Raise::error_info) slots with the workspace
+/// payload convention: the **live `Eterm` word** of the argument.
+///
+/// # Live-term contract
+///
+/// The two payloads are raw words on the **caller's** heap, not copies, so nothing
+/// between reading them out of `args` and returning this raise may allocate on a
+/// BEAM heap, intern an atom or call back into the host — the engine publishes them
+/// into its root set the moment it receives the raise. (`LiveReason::new` boxes the
+/// word in an `Arc`, a Rust-side allocation that moves no BEAM term; the
+/// [`BifContext::atoms`] reads in the scan are non-interning lookups.)
+///
+/// [`raise`] only ever builds a `Raise`; any other [`BeamError`] passes through
+/// unchanged rather than being swallowed.
+fn with_error_payloads(
+    raised: BeamError,
+    saved_args: Eterm,
+    error_info: Option<Eterm>,
+) -> BeamError {
+    match raised {
+        BeamError::Raise(raise) => {
+            let raise = raise.with_saved_args(LiveReason::new(saved_args));
+            let raise = match error_info {
+                Some(map) => raise.with_error_info(LiveReason::new(map)),
+                None => raise,
+            };
+            BeamError::Raise(raise)
+        }
+        other => other,
+    }
+}
+
+/// The C's `error_3` option scan (`../../erts/emulator/beam/bif.c:1462-1501`):
+/// the **last** `{error_info, Map}` of a wholly-valid option list, else `None`.
+///
+/// The scan mirrors the C literally:
+///
+/// - it walks a cons-list, so `[]` (the C's `is_list(NIL)` is **false**, `NIL` being
+///   an immediate) and any non-list stop it immediately with nothing accepted;
+/// - an element that is not a 2-tuple `{error_info, Map}` **breaks** the walk, and a
+///   trailing non-`NIL` tail — an improper list, or a legal pair followed by any
+///   illegal element — **invalidates** whatever was accepted;
+/// - every accepted pair overwrites the previous one, so the **last wins**.
+///
+/// Every deviation therefore yields `None` — the silent `error/2` fallback, never
+/// `badarg`. A table with no `error_info` atom can match no term, which is also
+/// `None` (correct, not a fallback).
+fn scan_error_info(ctx: &BifContext<'_>, options: Eterm) -> Option<Eterm> {
+    scan_error_info_at(options, ctx.atoms())
+}
+
+/// The stacktrace-side payload of `erlang:error/2,3` — the caller's argument list and,
+/// for `error/3`, the `error_info` map the raise carries.
+///
+/// Built by [`error_meta`] from the same option rule [`scan_error_info`] applies. ERTS
+/// keeps the pair in the exception object (`{Reason, Args}` / `{Reason, Args, ErrorInfo}`,
+/// `error_2`/`error_3` in `../../erts/emulator/beam/bif.c:1448-1503`) and renders it into
+/// the **innermost** stacktrace item: the argument list in the item's `A` slot, the map as
+/// the last element of its `Location` list (`erts_build_mfa_item`,
+/// `../../erts/emulator/beam/utils.c:3430-3457`).
+///
+/// This is the host-facing **model** of that payload; the raise itself carries the two
+/// words on [`Raise::saved_args`](beam_common::Raise::saved_args) /
+/// [`Raise::error_info`](beam_common::Raise::error_info) (see [`with_error_payloads`]), and
+/// the engine's `families/exceptions/bif_frame.rs` renders them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorMeta {
+    /// The caller's argument list, **verbatim** — never validated, never coerced.
+    ///
+    /// ERTS stores whatever `error/2,3`'s second argument was, whatever its shape
+    /// (`error(foo, notalist)` keeps the atom `notalist`); the renderer is what degrades a
+    /// non-list to the plain arity (`is_list(args) || is_nil(args)` in `erts_build_mfa_item`),
+    /// not this rule.
+    pub args: Eterm,
+    /// The `error_info` map the raise carries, or `None` when the option list held no
+    /// conforming one (see [`error_meta`]).
+    pub error_info: Option<Eterm>,
+}
+
+/// [`ErrorMeta::args`] plus the `error_info` the C's `error/3` extracts from `options`
+/// (`../../erts/emulator/beam/bif.c:1462-1503`).
+///
+/// `options` is `None` for the `error/2` shape, which always carries `args` and never an
+/// `error_info`. The rule is [`scan_error_info`]'s: a proper, non-empty list whose every
+/// element is `{error_info, Map}` with `is_map(Map)` yields the **last** such map;
+/// everything else (empty list, improper list, any illegal element, a non-list) yields
+/// `None` — never `badarg`, because `args` and `options` are never validated.
+///
+/// `atoms` resolves the `error_info` name; a table that does not know it can never match,
+/// which is the same namespace every comparison in this crate reads.
+///
+/// Oracle-pinned (`tests/error_meta.rs`): `[]` ⇒ none, `[{error_info,#{}}]` ⇒ `#{}`,
+/// `[{error_info,#{a=>1}},{error_info,#{b=>2}}]` ⇒ `#{b=>2}` (last wins),
+/// `[{error_info,bogus}]` / `[{bogus,1}]` / `[bogus]` / `notalist` /
+/// `[{error_info,#{a=>1}}|tail]` / `[{error_info,#{a=>1}},bogus]` ⇒ none.
+#[must_use]
+pub fn error_meta(args: Eterm, options: Option<Eterm>, atoms: &AtomTable) -> ErrorMeta {
+    let error_info = match options {
+        None => None,
+        Some(options) => scan_error_info_at(options, atoms),
+    };
+    ErrorMeta { args, error_info }
+}
+
+/// [`scan_error_info`]'s rule, resolved against an [`AtomTable`] instead of a
+/// [`BifContext`] (the shape [`error_meta`] exposes to hosts).
+fn scan_error_info_at(options: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+    let err_info_atom = atoms.lookup("error_info")?;
+    let mut error_info: Option<Eterm> = None;
+    let mut list = options;
+    while access::is_list(list) {
+        let elem = access::car(list);
+        if !access::is_tuple(elem) || access::tuple_size(elem) != 2 {
+            break;
+        }
+        let key = access::tuple_element(elem, 0);
+        if !is_atom(key) || atom_val(key) != err_info_atom {
+            break;
+        }
+        let second = access::tuple_element(elem, 1);
+        if !access::is_map(second) {
+            break;
+        }
+        error_info = Some(second);
+        list = access::cdr(list);
+    }
+    // The C's `if (is_not_nil(list)) error_info = THE_NON_VALUE;` invalidation.
+    if !access::is_nil(list) {
+        return None;
+    }
+    error_info
+}
+
 /// `erlang:error/1`.
 fn error_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
-/// `erlang:error/2` — the argument list is ignored in M1 (documented simplification).
-fn error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
-}
-
-/// `erlang:error/3` — as `error/1` with the argument list and `error_info`
-/// options folded into the **stacktrace** only.
+/// `erlang:error/2` — the reason plus the raise's **argument list**.
 ///
-/// The reason is the **first** argument, unchanged, for both shapes the C
-/// produces (`error_3`, `../../erts/emulator/beam/bif.c:1462`). `Args` and
-/// `Options` never become the reason and are **not validated**:
+/// `error_2` (`../../erts/emulator/beam/bif.c:1448-1452`) builds
+/// `TUPLE2(Arg1, Arg2)` as the raise's `fvalue` and raises `EXC_ERROR_2`, so the
+/// second argument is kept **verbatim and unvalidated** (`error(foo, notalist)`
+/// succeeds) and the reason is still the first argument. It is not the reason's
+/// payload but the innermost stacktrace item's `Args` slot, which the renderer uses
+/// only when it is a list (`utils.c:3430-3451` — hence `notalist` prints the arity).
 ///
-/// - the C scans `Options` for a run of `{error_info, Map}` 2-tuples and, on
-///   anything else (a non-list, an improper list, an empty list, an illegal
-///   element, a non-map `error_info`), silently falls back to the `error/2`
-///   shape — no `badarg`;
-/// - `Args` is stored verbatim, whatever its shape.
-///
-/// Either way the caught value is `CAR(fvalue)` = the first argument
-/// (`beam_common.c:478-490`, `EXC_ERROR_2`/`EXC_ERROR_3`), so all of this is
-/// unobservable in the reason and the BIF degenerates to `error/1`. Oracle
-/// probes (erts-17.1, compiled module):
+/// The list rides the [`Raise::saved_args`](beam_common::Raise::saved_args) slot as
+/// the live `Eterm` word (see [`with_error_payloads`]); the engine renders it into
+/// the innermost frame. Oracle probes (erts-17.1, compiled module, `hd(S)`):
 ///
 /// ```text
-/// erlang:error(foo, [1,2], [])                 ⇒ error:foo
-/// erlang:error({bad,x}, [1,2], [])             ⇒ error:{bad,x}
-/// erlang:error(foo, [], [{error_info, #{}}])   ⇒ error:foo
-/// erlang:error(foo, notalist, [])              ⇒ error:foo
-/// erlang:error(foo, [], notalist)              ⇒ error:foo
-/// erlang:error(foo, [], [{bogus,1}])           ⇒ error:foo
-/// erlang:error(foo, [], [bogus])               ⇒ error:foo
-/// erlang:error(foo, [], [{error_info, bogus}]) ⇒ error:foo
+/// erlang:error(foo)            ⇒ error:foo, head {P,F,0,[{file,_},{line,_}]}
+/// erlang:error(foo, [1,2])     ⇒ error:foo, head {P,F,[1,2],[{file,_},{line,_}]}
+/// erlang:error(foo, notalist)  ⇒ error:foo, head {P,F,0,[{file,_},{line,_}]}
+/// erlang:error({bad,x}, [1,2]) ⇒ error:{bad,x}, head {P,F,[1,2],[{file,_},{line,_}]}
+/// ```
+fn error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let raised = raise(ExceptionClass::Error, args[0], ctx.atoms());
+    Err(with_error_payloads(raised, args[1], None))
+}
+
+/// `erlang:error/3` — as `error/2`, plus the scanned `error_info` map.
+///
+/// The reason is the **first** argument, unchanged, for both shapes the C
+/// produces (`error_3`, `../../erts/emulator/beam/bif.c:1462`). `Args` is stored
+/// verbatim; `Options` is **filtered, never validated**:
+///
+/// - [`scan_error_info`] keeps the **last** `{error_info, Map}` of a proper,
+///   non-empty option list whose every element is such a pair with a map value, and
+///   accepts nothing at all on any deviation (a non-list, the empty list, an
+///   improper list, a non-tuple element, a wrong arity, a wrong key atom, a non-map
+///   value, or a valid pair followed by anything invalid) — silently falling back to
+///   the `error/2` shape, never `badarg`.
+///
+/// Either way the caught value is `CAR(fvalue)` = the first argument
+/// (`beam_common.c:478-490`, `EXC_ERROR_2`/`EXC_ERROR_3`): the two payloads only
+/// reach the **stacktrace**, riding
+/// [`Raise::saved_args`](beam_common::Raise::saved_args) and
+/// [`Raise::error_info`](beam_common::Raise::error_info) (see
+/// [`with_error_payloads`]). Oracle probes (erts-17.1, compiled module, `hd(S)`):
+///
+/// ```text
+/// error(foo, [1,2], [])                            ⇒ error:foo, {P,F,[1,2],[{file,_},{line,_}]}
+/// error(foo, [], [{error_info,#{module=>erl_stdlib_errors}}])
+///                                                  ⇒ error:foo, {P,F,[],[{file,_},{line,_},{error_info,#{module => erl_stdlib_errors}}]}
+/// error(foo, [3,4], [{error_info,#{k=>v}}])        ⇒ error:foo, {P,F,[3,4],[{file,_},{line,_},{error_info,#{k => v}}]}
+/// error(foo, [], [{error_info,#{a=>1}},{error_info,#{b=>2}}])
+///                                                  ⇒ error:foo, {P,F,[],[{file,_},{line,_},{error_info,#{b => 2}}]}   (LAST wins)
+/// error(foo, notalist, [])                         ⇒ error:foo, {P,F,0,[{file,_},{line,_}]}     (Args not a list ⇒ arity)
+/// error(foo, [], [])                               ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}    (empty list ⇒ nothing accepted)
+/// error(foo, [], notalist)                         ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}
+/// error(foo, [], [{bogus,1}])                      ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}
+/// error(foo, [], [bogus])                          ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}
+/// error(foo, [], [{error_info,bogus}])             ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}    (non-map value)
+/// error(foo, [], [{error_info,#{a=>1}},{bogus,1}]) ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}    (invalidate)
+/// error(foo, [], [{error_info,#{}}|a])             ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}    (improper ⇒ invalidate)
+/// error(foo, [], [{error_info,#{}},[]])            ⇒ error:foo, {P,F,[],[{file,_},{line,_}]}    (invalid element ⇒ invalidate)
 /// ```
 ///
 /// They also pin `error/3`'s **non-atom** behaviour: like `error/1`, a non-atom
 /// reason rides the [`Raise::live_reason`](beam_common::Raise::live_reason) slot
 /// (see [`raise`]) — `error({bad,x}, [1,2], [])` reports `error:{bad,x}`, not
-/// `error:structured`.
+/// `error:structured`, and `{bad,x}` is *also* the scanned reason while `[1,2]` is
+/// the saved args.
 fn error_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
+    let error_info = scan_error_info(ctx, args[2]);
+    let raised = raise(ExceptionClass::Error, args[0], ctx.atoms());
+    Err(with_error_payloads(raised, args[1], error_info))
 }
 
 /// `erlang:exit/1`.
@@ -207,11 +383,19 @@ fn nif_error_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `erlang:nif_error/2` — as `nif_error/1`; the second argument is metadata.
 ///
 /// `nif_error_2` in `../../erts/emulator/beam/bif.c:1525` raises with the
-/// **first** argument as the reason and lets the second (the argument list the
-/// crash report prints) fall away: `nif_error(foo, [1,2])` is `error:foo` and
-/// `nif_error(true, [1,2])` is `error:true`.
+/// **first** argument as the reason and stores the second (the argument list the
+/// crash report prints) exactly as `error/2` does — `TUPLE2(Reason, Args)` with
+/// `EXC_ERROR_2` — so `nif_error(foo, [1,2])` is `error:foo` and
+/// `nif_error(true, [1,2])` is `error:true`. The raise carries that list in
+/// [`Raise::saved_args`](beam_common::Raise::saved_args) like `error/2` does, but
+/// **it is stored and not observable** in the oracle's trace: `nif_error/1,2` take
+/// the genuine-BIF-frame path, which rebuilds `Args` from the BIF's own arity
+/// (`make_arglist`, so the head item is always
+/// `{erlang,nif_error,[foo,[1,2]],[{error_info,#{module => erl_erts_errors}}]}`),
+/// unlike `error/2,3`, which take `non_bif_stacktrace` and read `fvalue`.
 fn nif_error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
+    let raised = raise(ExceptionClass::Error, args[0], ctx.atoms());
+    Err(with_error_payloads(raised, args[1], None))
 }
 
 /// Registers `erlang:error/1,2,3`, `exit/1`, `throw/1` and `nif_error/1,2`.
@@ -247,6 +431,13 @@ mod tests {
             "nif_not_loaded",
             "m",
             "f",
+            // `erlang:error/3`'s well-known option pair (`bif.c:1471`).
+            "error_info",
+            "module",
+            "erl_stdlib_errors",
+            "bogus",
+            "a",
+            "b",
         ]);
         atoms
     }
@@ -276,6 +467,35 @@ mod tests {
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         match f(&mut ctx, &[first, second]) {
             Err(BeamError::Raise(raise)) => (raise.class, raise.reason),
+            other => panic!("expected a raise, got {other:?}"),
+        }
+    }
+
+    /// Runs a raise BIF and returns the whole raise's observable parts plus the
+    /// three opaque payloads: `(class, reason, live reason, saved args, error info)`.
+    fn raise_payloads(
+        f: fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>,
+        args: &[Eterm],
+    ) -> (
+        ExceptionClass,
+        ExitReason,
+        Option<Eterm>,
+        Option<Eterm>,
+        Option<Eterm>,
+    ) {
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = seeded();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        match f(&mut ctx, args) {
+            Err(BeamError::Raise(raise)) => {
+                let slot = |payload: Option<&LiveReason>| {
+                    payload.and_then(|l| l.downcast_ref::<Eterm>().copied())
+                };
+                let live = slot(raise.live_reason());
+                let saved = slot(raise.saved_args());
+                let info = slot(raise.error_info());
+                (raise.class, raise.reason, live, saved, info)
+            }
             other => panic!("expected a raise, got {other:?}"),
         }
     }
@@ -318,9 +538,10 @@ mod tests {
             raise_of(throw_1, hello),
             (ExceptionClass::Throw, ExitReason::atom("hello"))
         );
-        // `error/2` behaves like `error/1` (ignoring the argument list).
+        // `error/2` behaves like `error/1` (the argument list only reaches the
+        // stacktrace, never the reason).
         assert_eq!(
-            raise_of(error_2, hello),
+            raise_of2(error_2, hello, NIL),
             (ExceptionClass::Error, ExitReason::atom("hello"))
         );
     }
@@ -394,6 +615,213 @@ mod tests {
         assert_eq!(
             classify(error_3(&mut ctx, &[shutdown, NIL, NIL])),
             (ExceptionClass::Error, ExitReason::Shutdown, None)
+        );
+    }
+
+    #[test]
+    fn error_2_saves_the_argument_list_verbatim() {
+        // `error_2` (`../../erts/emulator/beam/bif.c:1448-1452`) stores
+        // `TUPLE2(Arg1, Arg2)` with `EXC_ERROR_2`: the second argument is kept
+        // **verbatim and unvalidated** and the reason is unchanged.
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = seeded();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let foo = ctx.atom("foo").expect("seeded");
+        let args = ctx.list(&[make_small(1), make_small(2)]).expect("fits");
+        let notalist = make_small(7);
+
+        assert_eq!(
+            raise_payloads(error_2, &[foo, args]),
+            (
+                ExceptionClass::Error,
+                ExitReason::atom("foo"),
+                None,
+                Some(args),
+                None
+            )
+        );
+        // `erlang:error(foo, notalist)` ⇒ `error:foo`, the non-list saved anyway
+        // (the renderer then prints the arity instead: `utils.c:3430-3451`).
+        assert_eq!(
+            raise_payloads(error_2, &[foo, notalist]),
+            (
+                ExceptionClass::Error,
+                ExitReason::atom("foo"),
+                None,
+                Some(notalist),
+                None
+            )
+        );
+        // A non-atom reason still rides the live slot, *and* the args are saved.
+        let tuple = ctx.tuple(&[foo, make_small(1)]).expect("fits");
+        assert_eq!(
+            raise_payloads(error_2, &[tuple, args]),
+            (
+                ExceptionClass::Error,
+                ExitReason::Structured,
+                Some(tuple),
+                Some(args),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn error_3_scans_the_error_info_option_list() {
+        // `error_3`'s scan (`../../erts/emulator/beam/bif.c:1462-1501`): the **last**
+        // `{error_info, Map}` of a wholly-valid proper option list, else nothing.
+        let mut heap = Heap::new(512).expect("test heap");
+        let atoms = seeded();
+        let error_info = make_atom(atoms.lookup("error_info").expect("seeded"));
+        let module = make_atom(atoms.lookup("module").expect("seeded"));
+        let stdlib = make_atom(atoms.lookup("erl_stdlib_errors").expect("seeded"));
+        let bogus = make_atom(atoms.lookup("bogus").expect("seeded"));
+        let a = make_atom(atoms.lookup("a").expect("seeded"));
+        let b = make_atom(atoms.lookup("b").expect("seeded"));
+
+        // Maps first: `BifContext` borrows the heap for its whole lifetime.
+        let empty = access::make_flatmap(&mut heap, &[]).expect("fits");
+        let ma = access::make_flatmap(&mut heap, &[(a, make_small(1))]).expect("fits");
+        let mb = access::make_flatmap(&mut heap, &[(b, make_small(2))]).expect("fits");
+        let meta = access::make_flatmap(&mut heap, &[(module, stdlib)]).expect("fits");
+
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let foo = ctx.atom("foo").expect("seeded");
+        let args = ctx.list(&[make_small(1), make_small(2)]).expect("fits");
+
+        let pair = |ctx: &mut BifContext<'_>, k: Eterm, v: Eterm| -> Eterm {
+            ctx.tuple(&[k, v]).expect("fits")
+        };
+        // Option lists, one `pair(...)` at a time: `ctx.list` needs `&mut ctx` and so
+        // cannot take a `pair(&mut ctx, ..)` inline in its argument.
+        let info_meta = pair(&mut ctx, error_info, meta);
+        let info_ma = pair(&mut ctx, error_info, ma);
+        let info_mb = pair(&mut ctx, error_info, mb);
+        let info_bogus = pair(&mut ctx, error_info, bogus);
+        // The empty map, for the two invalidation shapes below.
+        let info_empty = pair(&mut ctx, error_info, empty);
+        let bogus_one = pair(&mut ctx, bogus, make_small(1));
+
+        let valid = ctx.list(&[info_meta]).expect("fits");
+        let valid_args = ctx.list(&[info_ma, info_mb]).expect("fits");
+        let valid_then_bogus_key = ctx.list(&[info_ma, bogus_one]).expect("fits");
+        let valid_then_non_pair = ctx.list(&[info_empty, NIL]).expect("fits");
+        let improper = ctx.cons(info_empty, a).expect("fits");
+        let non_map = ctx.list(&[info_bogus]).expect("fits");
+        let bogus_pair = ctx.list(&[bogus_one]).expect("fits");
+        let bare_element = ctx.list(&[bogus]).expect("fits");
+        let notalist = make_small(7);
+
+        let err_3 = |args_list: Eterm, options: Eterm| {
+            raise_payloads(error_3, &[foo, args_list, options])
+        };
+
+        // The two valid shapes: both slots set, `error_info` = the accepted map.
+        assert_eq!(
+            err_3(NIL, valid),
+            (
+                ExceptionClass::Error,
+                ExitReason::atom("foo"),
+                None,
+                Some(NIL),
+                Some(meta)
+            )
+        );
+        assert_eq!(
+            err_3(args, valid),
+            (
+                ExceptionClass::Error,
+                ExitReason::atom("foo"),
+                None,
+                Some(args),
+                Some(meta)
+            )
+        );
+        // Two valid pairs ⇒ the **last** map wins.
+        assert_eq!(
+            err_3(NIL, valid_args),
+            (
+                ExceptionClass::Error,
+                ExitReason::atom("foo"),
+                None,
+                Some(NIL),
+                Some(mb)
+            )
+        );
+        // Every deviation keeps `saved_args` and drops `error_info`.
+        for (name, options) in [
+            ("empty list", NIL),
+            ("non-list", notalist),
+            ("non-map value", non_map),
+            ("bogus key", bogus_pair),
+            ("bare element", bare_element),
+            ("valid then bogus key", valid_then_bogus_key),
+            ("valid then non-pair", valid_then_non_pair),
+            ("improper tail", improper),
+        ] {
+            assert_eq!(
+                err_3(args, options),
+                (
+                    ExceptionClass::Error,
+                    ExitReason::atom("foo"),
+                    None,
+                    Some(args),
+                    None
+                ),
+                "error/3 with a {name} options list"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_shapes_that_carry_payloads_set_the_slots() {
+        // `error/1`, `exit/1`, `throw/1` and `nif_error/1` set **no** slot; the
+        // `error/2,3` and `nif_error/2` shapes set `saved_args` (never an
+        // `error_info`).
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = seeded();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let foo = ctx.atom("foo").expect("seeded");
+        let hello = ctx.atom("hello").expect("seeded");
+        let args = ctx.list(&[make_small(1), make_small(2)]).expect("fits");
+
+        for (name, f, class) in [
+            (
+                "error/1",
+                error_1 as fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>,
+                ExceptionClass::Error,
+            ),
+            ("exit/1", exit_1, ExceptionClass::Exit),
+            ("throw/1", throw_1, ExceptionClass::Throw),
+            ("nif_error/1", nif_error_1, ExceptionClass::Error),
+        ] {
+            assert_eq!(
+                raise_payloads(f, &[foo]),
+                (class, ExitReason::atom("foo"), None, None, None),
+                "{name} carries no stacktrace payload"
+            );
+        }
+        assert_eq!(
+            raise_payloads(error_1, &[hello]),
+            (
+                ExceptionClass::Error,
+                ExitReason::atom("hello"),
+                None,
+                None,
+                None
+            )
+        );
+        // `nif_error(Reason, Args)` stores the list like `error/2` — the oracle's
+        // *trace* overrides it with the BIF's own arglist, but the C stores it.
+        assert_eq!(
+            raise_payloads(nif_error_2, &[foo, args]),
+            (
+                ExceptionClass::Error,
+                ExitReason::atom("foo"),
+                None,
+                Some(args),
+                None
+            )
         );
     }
 

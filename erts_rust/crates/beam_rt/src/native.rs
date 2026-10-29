@@ -47,14 +47,23 @@
 //! | `erl_distribution:start_link/0,1` | the Erlang-level distribution **supervisor** `kernel_sup` starts as its `net_sup` child: answered `ignore` because this runtime's distribution is the native [`beam_dist`](crate::dist)/`DistNode`, not the `inet_tcp`/`prim_inet` stack that supervisor would run (contract A.5, `src/native/net/`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:get_object_code/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) — and, for `get_object_code/1`, its `.beam` bytes |
-//! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
+//! | *(none — the `application` namespace is entirely `lib/kernel/src/application.erl` bodies)* | every `application:*` key is a one-line delegation to the **live** `application_controller` the boot script starts (directive 14, `src/boot/drive.rs`), which answers from its `ac_tab`; the floor owns no key, so the whole namespace is entered in-machine |
 //! | `prim_file:get_cwd/0,1`, `prim_file:read_file/1`, `prim_file:open/2`, `prim_file:read/2`, `prim_file:write/2`, `prim_file:close/1`, `prim_file:position/2` | the file-system **primitives** `file.erl` delegates to: they are the host's own `getcwd`/`open`/`read`/`write`/`close`/`lseek` (`std::env`/`std::fs`), which only the host can perform |
 //!
-//! The `init`/`code`/`application` calls are **preloaded-module surface** (contract
-//! A.7): the oracle serves them from `init.beam`/`code.beam`/`application.beam`, but
+//! `application` is deliberately **absent** from that table: its whole namespace is
+//! `lib/kernel/src/application.erl` bodies, and every one of them is a one-line delegation
+//! to the **live** `application_controller` the boot script starts (directive 14,
+//! `../boot/drive.rs`). That server holds the `ac_tab` the whole `application:*` query
+//! surface reads — the ten `ac_tab`-backed keys (`get_env/1,2,3`, `get_all_env/1`,
+//! `get_key/1,2`, `get_all_key/1`, `get_application/0,1`, `loaded_applications/0`) and
+//! `which_applications/0`, whose `#state.running` list `start_application` really
+//! populates on this boot path — so the floor owns **no** key of the namespace and every
+//! call is entered in-machine (see [`floor_keys`]).
+//!
+//! The `init`/`code` calls are **preloaded-module surface** (contract
+//! A.7): the oracle serves them from `init.beam`/`code.beam`, but
 //! those modules are written against the process/message machinery Milestone-1 does not
-//! run (for `application`, that is the `application_controller`/`application_master`
-//! process pair plus a group leader), so this runtime answers them directly from its own
+//! run, so this runtime answers them directly from its own
 //! state instead of loading a module it cannot execute. `os:cmd/1` is the same story for
 //! the spawn **driver** (contract A.4): the port machinery is a later stage, but the host
 //! is perfectly able to spawn a shell.
@@ -89,14 +98,14 @@
 //!
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
 //! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
-//! `erlang:*` process/registry/reference entries in [`process`], the `application:*`
-//! entries in [`application`], the `prim_file:*` primitives in [`prim`], the `erl_ddll:*`
+//! `erlang:*` process/registry/reference entries in [`process`], the
+//! `prim_file:*` primitives in [`prim`], the two static-NIF libraries (`prim_tty`'s terminal
+//! handles in [`prim_tty`], `prim_buffer`'s byte queue in [`prim_buffer`]), the `erl_ddll:*`
 //! loaded-driver-list entries in [`ddll`], the distribution **identity** in [`node`] and the
 //! distribution **node set + connector** (`erlang:nodes/0,1,2`, `net_adm:ping/1`,
 //! `net_kernel:connect_node/1`, `erl_distribution:start_link/0,1`) in [`net`]. The submodules
 //! reach the shared helpers through `super` (they are `pub(super)`).
 
-mod application;
 mod code;
 mod ddll;
 mod erts_internal;
@@ -111,7 +120,8 @@ pub(crate) mod net_kernel;
 mod node;
 pub(crate) mod port;
 mod prim;
-mod prim_file;
+pub(crate) mod prim_buffer;
+pub(crate) mod prim_file;
 pub(crate) mod prim_tty;
 mod process;
 #[cfg(test)]
@@ -131,7 +141,7 @@ use crate::error;
 /// The module namespaces [`RuntimeContext::try_native`] serves — the floor's own dispatch.
 ///
 /// Every one of them is a module the code server can *also* load as a `.beam` (`erlang`,
-/// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`, `erl_ddll`,
+/// `io`, `init`, `os`, `code`, `erts_internal`, `prim_file`, `erl_ddll`,
 /// `net_adm`, `net_kernel`, `erl_distribution`), so the cross-module-call seam
 /// ([`RuntimeContext::resolve_external_call`]) must answer `Ok(None)` for all of them:
 /// entering the module body would run it *instead of* the host implementation. The list is
@@ -143,8 +153,10 @@ use crate::error;
 /// namespace is refused or only [`floor_keys`]' enumerated keys is decided there. The
 /// `erl_distribution` entry is key-granular (the floor serves exactly `start_link/0,1`), so
 /// the rest of the module stays enterable — see [`floor_keys`].
+///
+/// `application` is **not** a member: the floor serves no key of that namespace (the live
+/// `application_controller` owns all of them), so the whole module is entered in-machine.
 pub(crate) const FLOOR_MODULES: [&str; 14] = [
-    "application",
     "code",
     "erl_ddll",
     "erl_distribution",
@@ -156,6 +168,7 @@ pub(crate) const FLOOR_MODULES: [&str; 14] = [
     "net_adm",
     "net_kernel",
     "os",
+    "prim_buffer",
     "prim_file",
     "prim_tty",
 ];
@@ -214,6 +227,11 @@ pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
 /// `None` for a namespace [`try_native`] serves through a **wildcard** arm
 /// (`erts_internal`, `prim_file`, `erl_ddll`) or for one whose arms are too numerous to
 /// mirror here (`erlang`); those keep the module-wide exclusion.
+///
+/// A namespace the floor has withdrawn from **entirely** has no arm at all: it is not in
+/// [`FLOOR_MODULES`] (so every key of it is enterable) and not in this list either.
+/// `application` is the one such namespace — its `.app`-resource view was withdrawn in
+/// favour of the live `application_controller`, which owns every one of its keys.
 fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
     match module {
         // The `io` **device** surface: `put_chars/1,2` plus the `io.erl` request wrappers
@@ -248,22 +266,11 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
         // refused (→ `call_bif` → `try_native`) while the module's Erlang wrappers are
         // ordinary `.beam` bodies.
         "prim_tty" => Some(&prim_tty::NIF_KEYS),
-        // `application` is partly `lib/kernel/src/application.erl` bodies (`set_env/3,4`,
-        // `load/1`, `start_boot/2`, `unset_env/2,3`, …), each a thin wrapper that delegates
-        // to `application_controller` — the mirror of the `io` case.
-        "application" => Some(&[
-            ("get_env", 1),
-            ("get_env", 2),
-            ("get_env", 3),
-            ("get_all_env", 1),
-            ("get_key", 1),
-            ("get_key", 2),
-            ("get_application", 0),
-            ("get_application", 1),
-            ("get_all_key", 1),
-            ("loaded_applications", 0),
-            ("which_applications", 0),
-        ]),
+        // `prim_buffer` is the identical shape: its `NIF_KEYS` list is exactly the nine `-nifs`
+        // stubs of `erts/preloaded/src/prim_buffer.erl`, so those stubs are refused (→ `call_bif`
+        // → `try_native`) while the module's `read/2`, `read_iovec/2` and `wipe/1` — exported
+        // **Erlang bodies** over the stubs — stay enterable in-machine.
+        "prim_buffer" => Some(&prim_buffer::NIF_KEYS),
         // `code` is the same shape: the floor answers the *queries* below **and** the
         // path-mutating entries (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`,
         // `del_path/1`). Entering the `lib/kernel/src/code.erl` bodies instead would reach the
@@ -404,8 +411,14 @@ impl RuntimeContext<'_> {
             ("io", "request", 2) => self.io_native_request(args, 2, false),
             ("io", "requests", 1) => self.io_native_request(args, 1, true),
             ("io", "requests", 2) => self.io_native_request(args, 2, true),
-            ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
-            ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
+            // `erlang:apply/2` is `apply(Fun, Args)` — *not* a zero-arity `Module:Function`
+            // call. C implements both apply forms as **instructions** rather than SNIFs
+            // (`emu/ops.tab:872-874` rewrites a `call_ext*` to them into `i_apply_fun*`;
+            // neither name appears in `bif.tab`), and the engine special-cases only the
+            // arity-3 form, so the arity-2 form is served here:
+            // [`RuntimeContext::apply_2`](crate::context::RuntimeContext).
+            ("erlang", "apply", 2) => Some(self.apply_2(args)),
+            ("erlang", "apply", 3) => Some(self.apply_3(args)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
             // `process_info/1,2` stay on the floor: they answer from *this* runtime's
             // process tables through the shared `crate::native::memory` implementation
@@ -474,23 +487,13 @@ impl RuntimeContext<'_> {
             ("code", "add_pathz", 1 | 2) => Some(self.code_add_pathz(args)),
             ("code", "add_path", 1 | 2) => Some(self.code_add_pathz(args)),
             ("code", "del_path", 1) => Some(self.code_del_path(args)),
-            ("application", "get_env", 1) => Some(self.application_get_env_1()),
-            ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
-            ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
-            ("application", "get_all_env", 1) => Some(self.application_get_all_env_1(args)),
-            ("application", "get_key", 2) => Some(self.application_get_key_2(args)),
-            ("application", "get_application", 0) => Some(self.application_get_application_0()),
-            ("application", "get_application", 1) => {
-                Some(self.application_get_application_1(args))
-            }
-            ("application", "get_all_key", 1) => Some(self.application_get_all_key_1(args)),
-            ("application", "get_key", 1) => Some(self.application_get_key_1(args)),
-            ("application", "loaded_applications", 0) => {
-                Some(self.application_loaded_applications())
-            }
-            ("application", "which_applications", 0) => {
-                Some(self.application_which_applications())
-            }
+            // `application` has **no** arm here: every key of the namespace is a
+            // `lib/kernel/src/application.erl` one-line delegation to the live
+            // `application_controller` (see [`FLOOR_MODULES`]), which answers from the `ac_tab`
+            // it really populates. An `.app`-resource floor over the same keys shadowed that
+            // server: `application:set_env/4` (never floored) wrote `ac_tab` while
+            // `application:get_env/2` read the resource file, so a value written by the
+            // running node was invisible to the very next read.
             ("erlang", "make_ref", 0) => Some(self.make_ref_0()),
             ("erlang", "send_after", 3) => Some(self.send_after_3(args)),
             ("erlang", "cancel_timer", 1) => Some(self.cancel_timer_1(args)),
@@ -653,6 +656,15 @@ impl RuntimeContext<'_> {
             // every unlisted Erlang wrapper (`load/0`, `init/1`, `writer/1`, …) stays
             // enterable in-machine, protecting its `receive`s.
             ("prim_tty", _, _) => self.prim_tty_call(function, arity, args),
+            // The `prim_buffer` NIF library's stubs (contract A.7) — the same shape as
+            // `prim_tty` and for the same reason: ERTS serves the nine `-nifs` stubs of
+            // `erts/preloaded/src/prim_buffer.erl` from a **statically linked** NIF
+            // (`erts/emulator/nifs/common/prim_buffer_nif.c`), so `load_nif("prim_buffer", …)`
+            // never `dlopen`s anything; [`prim_buffer`] is the Rust counterpart, its `NIF_KEYS`
+            // is the key list [`floor_keys`] enumerates — so exactly the NIF stubs reach this arm
+            // and the three **exported Erlang bodies** over them (`read/2`, `read_iovec/2`,
+            // `wipe/1`) stay enterable in-machine.
+            ("prim_buffer", _, _) => self.prim_buffer_call(function, arity, args),
             _ => None,
         }
     }
@@ -766,24 +778,23 @@ impl RuntimeContext<'_> {
         error::halt(status)
     }
 
-    // -- erlang:apply/2,3 -----------------------------------------------------
-    /// `erlang:apply(Mod, Fun)` / `erlang:apply(Mod, Fun, Args)`.
+    // -- erlang:apply/3 -------------------------------------------------------
+    /// `erlang:apply(Module, Function, Args)`.
     ///
     /// Re-enters the host's dispatch with `self` as the context, so the target may be a
     /// native BIF, a `beam_bifs` BIF **or** an external module function loaded on
     /// demand from the code path.
-    fn apply_dynamic(&mut self, args: &[Eterm], with_args: bool) -> Result<Eterm> {
+    ///
+    /// The arity-2 form is a **different operation** — `apply(Fun, Args)` — and lives
+    /// in [`RuntimeContext::apply_2`](crate::context::RuntimeContext) (see the floor arm).
+    fn apply_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let module = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
         let function = self
             .atom_name(*args.get(1).ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
-        let call_args: Vec<Eterm> = if with_args {
-            terms::list_elements(*args.get(2).ok_or(BeamError::BadArg)?)?
-        } else {
-            Vec::new()
-        };
+        let call_args: Vec<Eterm> = terms::list_elements(*args.get(2).ok_or(BeamError::BadArg)?)?;
         let arity = call_args.len() as u32;
         self.call_bif(&module, &function, arity, &call_args)
     }
@@ -820,9 +831,11 @@ impl RuntimeContext<'_> {
         // that scheduled the timer may have been collected. Copy it onto the pointer-stable
         // arena now (see `Runtime::try_stabilize_escaped`, which reports a term the copier
         // genuinely cannot copy as the honest `system_limit` instead of storing it). `from`
-        // needs no copy (a pid term is a heap-free immediate), and `reference` must **not** be
-        // copied: it is the caller's own handle (returned below) *and* the `Timers::refs`
-        // lookup key, so a copy would break `erlang:cancel_timer/1`.
+        // needs no copy (a pid term is a heap-free immediate), and `reference` is not copied
+        // either: it is the caller's own handle (returned below) *and* the word `Timers`
+        // records, so the timer's own wake record is keyed by exactly what `cancel_timer/1`
+        // is later handed (a copy would still resolve, by identity, but the canonical word is
+        // what the heap and its wake mirror are keyed by).
         let message = self.runtime.try_stabilize_escaped(message)?;
         let from = self.pid().to_eterm();
         self.runtime
@@ -842,6 +855,11 @@ impl RuntimeContext<'_> {
     ///   (a `#Ref<>` this runtime minted for something else — `make_ref/0`, a monitor —
     ///   answers `false` too);
     /// * anything that is not a reference at all → `badarg`.
+    ///
+    /// The reference is recognised by its **identity**, so a *copy* of a timer reference — an
+    /// `ets` round trip, a message — cancels the same timer. A copied `make_ref/0`/monitor
+    /// reference still answers `badarg` where the C answers `false` (see
+    /// [`Self::is_runtime_reference`]).
     pub(super) fn cancel_timer_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         // A timer reference, or a reference this runtime minted for something else
@@ -864,11 +882,14 @@ impl RuntimeContext<'_> {
     ///
     /// This is the argument test `erlang:cancel_timer/1` and `erts_internal:group_leader/3`
     /// share. The C only checks the *shape* (`is_not_internal_ref`), because it can read the
-    /// thing's payload; reading one here would need `beam_term::boxed_val`, which is `unsafe`
-    /// (and this crate is `#![deny(unsafe_code)]`), so the runtime's term-keyed registries —
-    /// the only safe way to recognise a reference — are the test. The comparison is by raw
-    /// term word, which is exact for a reference: two distinct references are distinct terms,
-    /// and an equal term word denotes the same reference. Delegates to the ONE provenance test,
+    /// thing's payload; this crate is `#![deny(unsafe_code)]`, so the runtime's term-keyed
+    /// registries are the test. Those registries are **not** all keyed the same way, and the
+    /// difference is observable: a reference's identity is its id (ONE reference-id space,
+    /// `beam_common::next_ref_id`), not the address of its term, so a **copy** of a reference
+    /// (an `ets` round trip, a message) is the same reference. `Timers` keeps an id-keyed index
+    /// beside its word-keyed one and therefore recognises a copied **timer** reference, while
+    /// `Runtime::references` is word-keyed only, so a copied `make_ref/0`/monitor reference is
+    /// not recognised. Delegates to the ONE provenance test,
     /// [`Runtime::is_known_local_reference`].
     pub(super) fn is_runtime_reference(&self, term: Eterm) -> bool {
         self.runtime.is_known_local_reference(term)
@@ -1338,12 +1359,16 @@ mod tests {
     /// A namespace belongs here only when the floor really owns an enumerated key set; a new
     /// `try_native` arm for one of them must be reflected in [`floor_keys`], which the drift
     /// guard above pins key by key.
+    ///
+    /// A namespace the floor owns **no** key of is in neither this table nor
+    /// [`MODULE_WIDE_NAMESPACES`] and is not a [`FLOOR_MODULES`] member: `application` (the live
+    /// `application_controller` owns every key, so the whole module is entered in-machine).
     const KEY_GRANULAR_NAMESPACES: [&str; 6] = [
-        "application",
         "code",
         "erl_distribution",
         "init",
         "io",
+        "prim_buffer",
         "prim_tty",
     ];
 
@@ -1461,9 +1486,9 @@ mod tests {
     /// arm, or a new floor namespace, must be reflected in those tables (and, for a key-granular
     /// one, in [`floor_keys`]) — the guard is loud, never silently skippable.
     ///
-    /// `prim_tty` is the one key-granular namespace whose arm is a `_, _` wildcard, so its key set
-    /// is checked against `floor_shadows` rather than against the parsed arms (its
-    /// [`prim_tty::NIF_KEYS`] list is the curated `-nifs` surface).
+    /// `prim_tty` and `prim_buffer` are the two key-granular namespaces whose arm is a `_, _`
+    /// wildcard, so their key sets are checked against `floor_shadows` rather than against the
+    /// parsed arms (their `NIF_KEYS` lists are the curated `-nifs` surfaces).
     #[test]
     fn every_floor_arm_key_is_refused_and_every_key_granular_list_is_exact() {
         let arms = try_native_arms();
@@ -1529,8 +1554,9 @@ mod tests {
                     listed.dedup();
                     let parsed = arm_keys(module);
                     if has_wildcard_arm(module) {
-                        // `prim_tty`: the arm dispatches per function into `prim_tty_call`, so
-                        // `NIF_KEYS` — not the arms — is the curated key set.
+                        // `prim_tty`/`prim_buffer`: the arm dispatches per function into
+                        // `prim_tty_call`/`prim_buffer_call`, so `NIF_KEYS` — not the arms — is
+                        // the curated key set.
                         assert!(
                             parsed.is_empty(),
                             "`{module}` has both a `_, _` wildcard arm and explicit arms"
@@ -1765,16 +1791,120 @@ mod tests {
         // pins — a `~p` renderer (the floor's deleted one) writes a bare `\n`.
         assert_eq!(sink.as_str(), "42\r\n");
     }
+    /// `erlang:apply/2` is `apply(Fun, Args)` — **never** a zero-arity `Module:Function()`.
+    ///
+    /// The floor used to read `args[0]` as a module and `args[1]` as a function, so
+    /// `erlang:apply(erlang, self)` answered a pid (it called `erlang:self/0`). C's
+    /// `apply_fun` decodes the **second** argument as the argument list *before* it looks
+    /// at the first, so this shape — the second argument is the atom `self`, not a list —
+    /// is `error:badarg` (measured on the oracle: `catch erlang:apply(erlang, self)` ⇒
+    /// `{'EXIT',{badarg,[{erlang,apply,[erlang,self],…},…]}}`).
     #[test]
-    fn apply_of_two_arguments_calls_a_zero_arity_bif() {
+    fn apply_of_two_arguments_reads_the_second_argument_as_an_argument_list() {
         let mut runtime = runtime();
-        // `erlang:apply(erlang, self)` — a registered `erlang` BIF reached dynamically.
         let module = atom(&mut runtime, "erlang");
         let function = atom(&mut runtime, "self");
-        let self_pid = call(&mut runtime, "erlang", "apply", &[module, function])
-            .expect("apply/2 dispatches to the BIF registry");
-        assert!(!is_small(self_pid));
-        assert!(!is_atom(self_pid));
+        let error = call(&mut runtime, "erlang", "apply", &[module, function])
+            .expect_err("apply/2 must not call erlang:self/0");
+        assert!(matches!(error, BeamError::BadArg), "{error}");
+    }
+
+    /// The reason term of the C `expand_error_value` raise this floor builds for
+    /// `erlang:apply/2` — `{badfun, Fun}` / `{badarity, {Fun, Args}}` — as
+    /// `(tag, payload)`, recovered through the crate's one live-reason point
+    /// ([`crate::error::live_reason_term`]).
+    ///
+    /// `None` for every other shape: a bare-atom reason (the *pre*-expansion half the engine's
+    /// own closure seams report) has no payload at all — the recovery point refuses to attach
+    /// one next to an atom reason — so a test written with this helper cannot silently accept
+    /// the unexpanded reason.
+    fn expanded_reason<'a>(runtime: &'a crate::Runtime, error: &BeamError) -> Option<(&'a str, Eterm)> {
+        let reason = error::live_reason_term(error)?;
+        let tag = terms::tuple_element(reason, 0).ok()?;
+        let payload = terms::tuple_element(reason, 1).ok()?;
+        Some((runtime.atom_name_of(tag)?, payload))
+    }
+
+    /// A first argument that is not a fun is the C's `EXC_BADFUN` (`call_fun`'s
+    /// `is_not_any_fun` arm) *expanded* by `expand_error_value` into `{badfun, Fun}`
+    /// (`../../erts/emulator/beam/beam_common.c:750-772`) — never the `badarg` the floor used
+    /// to raise, and never the bare reason atom alone. Measured on the oracle:
+    /// `catch apply(notafun, [1])` ⇒ `{'EXIT',{{badfun,notafun},[{qq10,e,0,…}]}}`.
+    #[test]
+    fn apply_of_two_arguments_rejects_a_non_fun_with_badfun() {
+        let mut runtime = runtime();
+        let arguments = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_list(&mut context, &[make_small(1)]).expect("a list")
+        };
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), arguments])
+            .expect_err("apply/2 of a non-fun");
+        assert_eq!(
+            expanded_reason(&runtime, &error),
+            Some(("badfun", make_small(7))),
+            "{error:?}"
+        );
+    }
+
+    // The sibling `EXC_BADARITY` (`{badarity, {Fun, Args}}`) is produced by the same door
+    // ([`crate::error::bad_arity_with`]) but needs a real fun at a mismatched arity to
+    // trigger, which a floor-only unit test cannot build without a loaded module; its
+    // oracle-measured shape (`catch apply(fun(X) -> X end, [1,2])` ⇒
+    // `{'EXIT',{{badarity,{#Fun<…>,[1,2]}},…}}`) is pinned end to end on the `-eval` route,
+    // whose `apply/2` is this very function.
+    //
+    /// A non-list or an **improper** second argument is `badarg` — and it wins over a
+    /// non-fun first argument, because C walks the argument list first (measured:
+    /// `catch apply(erlang, self)` is `badarg`, not `{badfun,erlang}`).
+    #[test]
+    fn apply_of_two_arguments_rejects_a_non_list_and_an_improper_list() {
+        let mut runtime = runtime();
+        // A non-list second argument.
+        let notalist = atom(&mut runtime, "notalist");
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), notalist])
+            .expect_err("apply/2 with an atom argument list");
+        assert!(matches!(error, BeamError::BadArg), "{error}");
+        // An improper list `[1 | 2]`.
+        let improper = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_cons(&mut context, make_small(1), make_small(2)).expect("a cons cell")
+        };
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), improper])
+            .expect_err("apply/2 with an improper argument list");
+        assert!(matches!(error, BeamError::BadArg), "{error}");
+    }
+
+    /// More arguments than the x-register file can hold is `error:system_limit`, and the
+    /// boundary is C's: `MAX_REG - 1` arguments are accepted (`apply_fun` must still be
+    /// able to put the fun at `reg[arity]`), the next one is `system_limit`.
+    ///
+    /// The first argument is deliberately a non-fun, so a `MAX_REG - 1`-element list
+    /// answers `badfun` (the list was decoded and the fun check was reached) while a
+    /// `MAX_REG`-element list never gets there.
+    #[test]
+    fn apply_of_two_arguments_stops_at_the_register_file_bound() {
+        let mut runtime = runtime();
+        let (max, over) = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            let mut bytes = vec![make_small(1); beam_engine::MAX_REGISTER as usize - 1];
+            let max = terms::make_list(&mut context, &bytes).expect("a 1023-element list");
+            bytes.push(make_small(1));
+            let over = terms::make_list(&mut context, &bytes).expect("a 1024-element list");
+            (max, over)
+        };
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), max])
+            .expect_err("apply/2 of 1023 arguments and a non-fun");
+        assert_eq!(
+            expanded_reason(&runtime, &error),
+            Some(("badfun", make_small(7))),
+            "{error:?}"
+        );
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), over])
+            .expect_err("apply/2 of 1024 arguments");
+        assert!(matches!(error, BeamError::SystemLimit), "{error}");
     }
 
     #[test]
@@ -1792,12 +1922,24 @@ mod tests {
         assert_eq!(signed_value(sum), 5);
     }
 
+    /// `apply/3`'s two leading atoms are checked **in order** — a non-atom module *or* a
+    /// non-atom function is `badarg` — and the arity-2 form is not involved at all.
     #[test]
-    fn apply_rejects_a_non_atom_target() {
+    fn apply_of_three_arguments_rejects_a_non_atom_target() {
         let mut runtime = runtime();
         let function = atom(&mut runtime, "self");
+        let arguments = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_list(&mut context, &[]).expect("the empty list")
+        };
         assert!(matches!(
-            call(&mut runtime, "erlang", "apply", &[make_small(1), function]),
+            call(
+                &mut runtime,
+                "erlang",
+                "apply",
+                &[make_small(1), function, arguments]
+            ),
             Err(BeamError::BadArg)
         ));
     }

@@ -199,6 +199,22 @@ fn assert_unsupported_reason(err: BeamError, reason: &str) {
     );
 }
 
+/// The value bound to `key` in a `terms::map_entries` pair list, using exact key
+/// equality.
+///
+/// A **test-side** scan only: the production read instructions descend the map once
+/// per key with `beam_term::map::map_get` and never build such a list, but a test
+/// that has already enumerated the *produced* map (from a write instruction) wants
+/// one pair out of that enumeration. The comparison is delegated to
+/// `beam_term::cmp` (the exact `=:=` ordering), the same key rule the instructions
+/// use.
+fn lookup(entries: &[(Eterm, Eterm)], key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+    entries
+        .iter()
+        .find(|(candidate, _)| cmp(*candidate, key, atoms).is_eq())
+        .map(|(_, value)| *value)
+}
+
 // -- get_map_elements ----------------------------------------------------
 
 #[test]
@@ -866,6 +882,443 @@ fn put_map_assoc_growing_past_the_limit_enumerates_exactly_the_inserted_pairs() 
         assert!(cmp(found[0].1, *value, &module.atom_table).is_eq());
     }
 }
+// -- the no-change fast path (term identity) -----------------------------
+
+/// `f/1` that runs `PutMapExact` with `pairs`, leaving the result in `x(0)`.
+fn exact_function(fixture: &mut Fixture, pairs: Vec<(Operand, Operand)>) -> (Label, Atom) {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::PutMapExact(Box::new(MapWriteArgs {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            dst: Operand::X(0),
+            live: 1,
+            pairs,
+        })),
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 1, code);
+    (entry, fixture.module.name)
+}
+
+/// A `keys`-pair map `k => k * k` over integer keys `0..keys` — 40 keys is above
+/// `MAP_SMALL_MAP_LIMIT` (32), so the source is a **hashmap** (HAMT).
+fn squares_map(ctx: &mut MinimalContext, module: &Module, keys: i64) -> Eterm {
+    let pairs: Vec<(Eterm, Eterm)> = (0..keys)
+        .map(|i| (make_small(i), make_small(i * i)))
+        .collect();
+    terms::make_map(ctx, &pairs, &module.atom_table).unwrap()
+}
+
+/// `#{a => 1}` — the flat-map source every identity row starts from.
+fn flat_source(ctx: &mut MinimalContext, a: Atom) -> Eterm {
+    make_flatmap(ctx, &[(make_atom(a), make_small(1))]).unwrap()
+}
+
+#[test]
+fn put_map_assoc_no_change_returns_the_source_word() {
+    // The oracle: `M = #{a => 1}, erts_debug:same(M#{a => 1}, M)` ⇒ `true`
+    // (`erts_debug:same/2` is raw `Eterm` word identity). The C keeps the map and
+    // effectively releases the new allocation (`beam_common.c:2131-2143`).
+    let mut fixture = Fixture::new(&["a"]);
+    let a = fixture.atom("a");
+    let (entry, _name) = assoc_function(&mut fixture, vec![(Operand::Atom(a), Operand::Integer(1))]);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = flat_source(&mut ctx, a);
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    assert_eq!(
+        result.unwrap(),
+        source,
+        "a value-identical replacement must answer the source map's own word"
+    );
+}
+
+#[test]
+fn put_map_assoc_no_change_allocates_nothing() {
+    // The identity path is a pure read: no reservation, no materialized operand, so a
+    // collecting host could not have relocated the source word it copies to `dst`.
+    // `live_words` is the arena's *current* figure, so this is an invariant (unchanged),
+    // not a magic count.
+    let mut fixture = Fixture::new(&["a"]);
+    let a = fixture.atom("a");
+    let (entry, _name) = assoc_function(&mut fixture, vec![(Operand::Atom(a), Operand::Integer(1))]);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = flat_source(&mut ctx, a);
+    let before = ctx.heap_stats().live_words;
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    assert_eq!(result.unwrap(), source);
+    assert_eq!(
+        ctx.heap_stats().live_words,
+        before,
+        "the no-change fast path must allocate no arena word at all"
+    );
+}
+
+#[test]
+fn put_map_assoc_no_change_on_a_hash_map_returns_the_source_word() {
+    // The HAMT route's own same-value answer: `erl_map.c:2477-2505`'s
+    // `if (CDR(ptr) == value) { *sz = 0; … return 1; }` ⇒ `res = map`.
+    // Oracle: a 40-key map, `erts_debug:same(H#{7 => 49}, H)` ⇒ `true`.
+    let module = Fixture::new(&[]).finish();
+    let mut ctx = MinimalContext::new();
+    let source = squares_map(&mut ctx, &module, 40);
+    assert!(terms::is_hashmap(source), "the 40-key source is a hash map");
+
+    let mut fixture = Fixture::new(&[]);
+    let (entry, _name) =
+        assoc_function(&mut fixture, vec![(Operand::Integer(7), Operand::Integer(49))]);
+    let module = fixture.finish();
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    assert_eq!(
+        result.unwrap(),
+        source,
+        "a hash-map no-op must answer the source map's own word"
+    );
+}
+
+#[test]
+fn put_map_assoc_changed_value_is_not_the_source_word() {
+    // Oracle: `erts_debug:same(M#{a => 2}, M)` ⇒ `false`.
+    let mut fixture = Fixture::new(&["a"]);
+    let a = fixture.atom("a");
+    let (entry, _name) = assoc_function(&mut fixture, vec![(Operand::Atom(a), Operand::Integer(2))]);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = flat_source(&mut ctx, a);
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let result = result.unwrap();
+    assert_ne!(result, source, "a changed value builds a fresh map");
+    let entries = terms::map_entries(result).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        lookup(&entries, make_atom(a), &module.atom_table),
+        Some(make_small(2))
+    );
+}
+
+#[test]
+fn put_map_assoc_added_key_is_not_the_source_word() {
+    // Oracle: `erts_debug:same(M#{a => 1, b => 2}, M)` ⇒ `false` — a new key always
+    // sets the C's `changed_keys` (`beam_common.c:2086-2089`).
+    let mut fixture = Fixture::new(&["a", "b"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let (entry, _name) = assoc_function(
+        &mut fixture,
+        vec![
+            (Operand::Atom(a), Operand::Integer(1)),
+            (Operand::Atom(b), Operand::Integer(2)),
+        ],
+    );
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = flat_source(&mut ctx, a);
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let result = result.unwrap();
+    assert_ne!(result, source, "an added key builds a fresh map");
+    let entries = terms::map_entries(result).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        lookup(&entries, make_atom(a), &module.atom_table),
+        Some(make_small(1))
+    );
+    assert_eq!(
+        lookup(&entries, make_atom(b), &module.atom_table),
+        Some(make_small(2))
+    );
+}
+
+#[test]
+fn put_map_assoc_multi_pair_no_op_is_the_source_word() {
+    // Oracle: `M = #{a => 1, b => 2}, erts_debug:same(M#{a => 1, b => 2}, M)` ⇒ `true`.
+    let mut fixture = Fixture::new(&["a", "b"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let (entry, _name) = assoc_function(
+        &mut fixture,
+        vec![
+            (Operand::Atom(a), Operand::Integer(1)),
+            (Operand::Atom(b), Operand::Integer(2)),
+        ],
+    );
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = make_flatmap(
+        &mut ctx,
+        &[(make_atom(a), make_small(1)), (make_atom(b), make_small(2))],
+    )
+    .unwrap();
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    assert_eq!(result.unwrap(), source, "every pair is a no-op ⇒ identity");
+}
+
+#[test]
+fn put_map_assoc_multi_pair_with_one_change_is_not_the_source_word() {
+    // Oracle: `M = #{a => 1, b => 2}, erts_debug:same(M#{a => 1, b => 3}, M)` ⇒ `false`.
+    let mut fixture = Fixture::new(&["a", "b"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let (entry, _name) = assoc_function(
+        &mut fixture,
+        vec![
+            (Operand::Atom(a), Operand::Integer(1)),
+            (Operand::Atom(b), Operand::Integer(3)),
+        ],
+    );
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = make_flatmap(
+        &mut ctx,
+        &[(make_atom(a), make_small(1)), (make_atom(b), make_small(2))],
+    )
+    .unwrap();
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let result = result.unwrap();
+    assert_ne!(result, source, "one changed pair builds a fresh map");
+    let entries = terms::map_entries(result).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        lookup(&entries, make_atom(a), &module.atom_table),
+        Some(make_small(1))
+    );
+    assert_eq!(
+        lookup(&entries, make_atom(b), &module.atom_table),
+        Some(make_small(3))
+    );
+}
+
+#[test]
+fn put_map_exact_no_change_returns_the_source_word() {
+    // Oracle: `M = #{a => 1}, erts_debug:same(M#{a := 1}, M)` ⇒ `true`
+    // (`erts_gc_update_map_exact`'s `if (*hp != *old_vals) changed = 1;` … `return map;`).
+    let mut fixture = Fixture::new(&["a"]);
+    let a = fixture.atom("a");
+    let (entry, _name) = exact_function(&mut fixture, vec![(Operand::Atom(a), Operand::Integer(1))]);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = flat_source(&mut ctx, a);
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    assert_eq!(
+        result.unwrap(),
+        source,
+        "a value-identical exact update must answer the source map's own word"
+    );
+}
+
+#[test]
+fn put_map_exact_no_change_on_a_hash_map_returns_the_source_word() {
+    let module = Fixture::new(&[]).finish();
+    let mut ctx = MinimalContext::new();
+    let source = squares_map(&mut ctx, &module, 40);
+    assert!(terms::is_hashmap(source));
+
+    let mut fixture = Fixture::new(&[]);
+    let (entry, _name) =
+        exact_function(&mut fixture, vec![(Operand::Integer(3), Operand::Integer(9))]);
+    let module = fixture.finish();
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    assert_eq!(result.unwrap(), source);
+}
+
+#[test]
+fn put_map_exact_changed_value_is_not_the_source_word() {
+    // Oracle: `M = #{a => 1}, erts_debug:same(M#{a := 2}, M)` ⇒ `false`.
+    let mut fixture = Fixture::new(&["a"]);
+    let a = fixture.atom("a");
+    let (entry, _name) = exact_function(&mut fixture, vec![(Operand::Atom(a), Operand::Integer(2))]);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = flat_source(&mut ctx, a);
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let result = result.unwrap();
+    assert_ne!(result, source, "a changed value builds a fresh map");
+    let entries = terms::map_entries(result).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        lookup(&entries, make_atom(a), &module.atom_table),
+        Some(make_small(2))
+    );
+}
+
+#[test]
+fn put_map_exact_missing_key_is_never_a_no_op() {
+    // `M#{b := 1}` on `#{a => 1}`: key `b` is absent, so the no-change test cannot
+    // answer `true` — the `{badkey,b}` validation must still run (the fast path
+    // subsumes it only for its own `true`).
+    let mut fixture = Fixture::new(&["a", "b", "badkey", "error"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let badkey = fixture.atom("badkey");
+    let code = with_catch(vec![Instr::PutMapExact(Box::new(MapWriteArgs {
+        fail: NO_FAIL,
+        source: Operand::X(0),
+        dst: Operand::X(0),
+        live: 1,
+        // `a := 1` is a no-op, `b := 1` is absent: the second pair must still raise.
+        pairs: vec![
+            (Operand::Atom(a), Operand::Integer(1)),
+            (Operand::Atom(b), Operand::Integer(1)),
+        ],
+    }))]);
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let source = flat_source(&mut ctx, a);
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let expected = make_tuple(&mut ctx, &[make_atom(badkey), make_atom(b)]).unwrap();
+    assert!(cmp(result.unwrap(), expected, &module.atom_table).is_eq());
+}
+
+/// The flat sizes the no-change matrix is measured at: 3..=8 keys (the 1- and
+/// 2-key rows are pinned above; the 33-key boundary is the hash-map section below).
+const FLAT_NO_CHANGE_SIZES: [i64; 6] = [3, 4, 5, 6, 7, 8];
+
+#[test]
+fn a_no_op_update_answers_the_source_word_at_every_flat_size() {
+    // Oracle rows, measured on OTP 29.1.2 / erts-17.1.1 (the system `erl`), for
+    // every `n` in 3..=8 with `M = #{0 => 0, 1 => 1, …, (n-1) => (n-1)*(n-1)}`:
+    //   `erts_debug:same(M#{K => K*K}, M)`                      ⇒ `true`
+    //   `erts_debug:same(M#{K := K*K}, M)`                      ⇒ `true`
+    //   `erts_debug:same(M#{0 => 0, …, (n-1) => (n-1)*(n-1)}, M)` ⇒ `true`
+    //   `erts_debug:same(M#{0 := 0, …, (n-1) := (n-1)*(n-1)}, M)` ⇒ `true`
+    //   `erts_debug:same(M#{K => 99}, M)`                       ⇒ `false`
+    // `erts_debug:same/2` is raw `Eterm` word identity, so a `true` row states that
+    // the instruction answered the **source** map itself and a `false` row that it
+    // built a fresh one. The multi-pair rows matter because the whole-map form is
+    // one instruction with `n` pairs, not `n` single-pair updates.
+    for n in FLAT_NO_CHANGE_SIZES {
+        let last = n - 1;
+        let whole: Vec<(Operand, Operand)> = (0..n)
+            .map(|i| (Operand::Integer(i), Operand::Integer(i * i)))
+            .collect();
+        let last_pair = vec![(Operand::Integer(last), Operand::Integer(last * last))];
+        let forms: [(&str, bool, Vec<(Operand, Operand)>); 4] = [
+            ("assoc, one pair", false, last_pair.clone()),
+            ("exact, one pair", true, last_pair),
+            ("assoc, the whole map", false, whole.clone()),
+            ("exact, the whole map", true, whole),
+        ];
+        for (what, exact, pairs) in forms {
+            let mut fixture = Fixture::new(&[]);
+            let (entry, _) = if exact {
+                exact_function(&mut fixture, pairs)
+            } else {
+                assoc_function(&mut fixture, pairs)
+            };
+            let module = fixture.finish();
+            let mut ctx = MinimalContext::new();
+            let source = squares_map(&mut ctx, &module, n);
+            assert!(
+                !terms::is_hashmap(source),
+                "n={n}: the source must be a flat map, or the row is measuring the \
+                 hash-map route instead"
+            );
+            assert_eq!(
+                run(&mut ctx, &module, entry, &[source]).0.unwrap(),
+                source,
+                "n={n}: {what} changes nothing, so the source word IS the answer"
+            );
+        }
+        // The changing row, in the same shape: one value differs ⇒ a fresh map.
+        let mut fixture = Fixture::new(&[]);
+        let (entry, _) = assoc_function(
+            &mut fixture,
+            vec![(Operand::Integer(last), Operand::Integer(99))],
+        );
+        let module = fixture.finish();
+        let mut ctx = MinimalContext::new();
+        let source = squares_map(&mut ctx, &module, n);
+        let result = run(&mut ctx, &module, entry, &[source]).0.unwrap();
+        assert_ne!(result, source, "n={n}: a changed value builds a fresh map");
+        let entries = terms::map_entries(result).unwrap();
+        assert_eq!(entries.len(), n as usize, "n={n}: the key count is unchanged");
+        assert_eq!(
+            lookup(&entries, make_small(last), &module.atom_table),
+            Some(make_small(99)),
+            "n={n}: the changed pair carries the new value"
+        );
+    }
+}
+
+/// The hash-map keys the no-change matrix is measured at: the first key the fold
+/// inserted, two interior ones and the last — `erl_map.c`'s trie places them at
+/// different depths, so a single interior key would not prove the whole route.
+const HAMT_NO_CHANGE_KEYS: [i64; 4] = [0, 7, 20, 39];
+
+#[test]
+fn a_no_op_update_answers_the_source_word_at_every_hash_map_key() {
+    // Oracle rows (OTP 29.1.2 / erts-17.1.1), `H` = the 40-key fold-built map
+    // `lists:foldl(fun(I, M) -> M#{I => I*I} end, #{}, lists:seq(0, 39))`:
+    //   `erts_debug:same(H#{K => K*K}, H)` ⇒ `true`,
+    //   `erts_debug:same(H#{K := K*K}, H)` ⇒ `true`,
+    //   `erts_debug:same(H#{K := 99}, H)`  ⇒ `false`,
+    // for K = 0, 7, 20 and 39. The two BIF spellings of the same update
+    // (`maps:put/3`, `maps:update/3`) answer the same on the oracle and on
+    // `beam_rt`, but they are `beam_bifs`'s implementations — not this
+    // instruction's — so no row here can pin them.
+    for key in HAMT_NO_CHANGE_KEYS {
+        let pair = vec![(Operand::Integer(key), Operand::Integer(key * key))];
+        for exact in [false, true] {
+            let mut fixture = Fixture::new(&[]);
+            let (entry, _) = if exact {
+                exact_function(&mut fixture, pair.clone())
+            } else {
+                assoc_function(&mut fixture, pair.clone())
+            };
+            let module = fixture.finish();
+            let mut ctx = MinimalContext::new();
+            let source = squares_map(&mut ctx, &module, 40);
+            assert!(
+                terms::is_hashmap(source),
+                "key={key}: the 40-key source is a hash map"
+            );
+            assert_eq!(
+                run(&mut ctx, &module, entry, &[source]).0.unwrap(),
+                source,
+                "key={key}, exact={exact}: a hash-map no-op answers the source word"
+            );
+        }
+        let mut fixture = Fixture::new(&[]);
+        let (entry, _) = exact_function(
+            &mut fixture,
+            vec![(Operand::Integer(key), Operand::Integer(99))],
+        );
+        let module = fixture.finish();
+        let mut ctx = MinimalContext::new();
+        let source = squares_map(&mut ctx, &module, 40);
+        let result = run(&mut ctx, &module, entry, &[source]).0.unwrap();
+        assert_ne!(
+            result, source,
+            "key={key}: a changed value builds a fresh hash map"
+        );
+        let entries = terms::map_entries(result).unwrap();
+        assert_eq!(entries.len(), 40, "key={key}: the key count is unchanged");
+        assert_eq!(
+            lookup(&entries, make_small(key), &module.atom_table),
+            Some(make_small(99)),
+            "key={key}: the changed pair carries the new value"
+        );
+    }
+}
+
 // -- the O(1) capacity count ---------------------------------------------
 
 /// The sizes the capacity count is checked at: the empty map, the two ends of the
@@ -926,13 +1379,18 @@ fn the_map_size_word_counts_distinct_keys() {
 
 /// A `put_map_assoc` over a 1 000-pair hash map produces exactly the map the
 /// reference builder produces for the merged pair list — same key set, same values,
-/// same **storage order** (the HAMT shape, not just `cmp` equality) — and repeating
-/// the instruction on the same source yields the identical map again.
+/// same **canonical** key sequence (`beam_term::map::map_pairs`, which the frozen
+/// layout guarantees) — and repeating the instruction on the same source yields the
+/// identical map again.
+///
+/// The *storage* order is deliberately not pinned here any more: the update now
+/// descends the key's hash path instead of rebuilding the tree, so its internal HAMT
+/// node order is not the rebuild's (content, `=:=` and canonical order are).
 ///
 /// This pins the *result* independently of the capacity arithmetic: the reservation's
-/// size only has to be an upper bound (the builder deduplicates), so a wrong count
-/// would show up here as a `make_map_rooted` capacity error or a wrong map, never as a
-/// silently truncated update.
+/// size only has to be an upper bound, so a wrong count would show up here as a
+/// `map_cow_rooted` sizing error or a wrong map, never as a silently truncated
+/// update.
 #[test]
 fn put_map_assoc_over_a_large_hash_map_matches_the_reference_builder() {
     let mut fixture = Fixture::new(&[]);
@@ -985,14 +1443,15 @@ fn put_map_assoc_over_a_large_hash_map_matches_the_reference_builder() {
         1_001,
         "999 stays, 5 000 is added"
     );
-    // Storage order too (the HAMT shape), which `cmp` alone would not pin.
-    let produced = terms::map_entries(first).unwrap();
-    let expected = terms::map_entries(reference).unwrap();
+    // The canonical key sequence too, which `cmp` alone would not pin; the internal
+    // HAMT node order is not pinned (`beam_term::map::map_pairs` is the canonical one).
+    let produced = beam_term::map::map_pairs(first, atoms).unwrap();
+    let expected = beam_term::map::map_pairs(reference, atoms).unwrap();
     assert_eq!(produced.len(), expected.len());
     for (got, want) in produced.iter().zip(expected.iter()) {
         assert!(
             cmp(got.0, want.0, atoms).is_eq() && cmp(got.1, want.1, atoms).is_eq(),
-            "storage-order pair mismatch: {got:?} vs {want:?}"
+            "canonical-order pair mismatch: {got:?} vs {want:?}"
         );
     }
 }
@@ -1180,3 +1639,15 @@ fn exec_claims_only_the_map_variants() {
     .unwrap();
     assert!(claimed.is_none());
 }
+// ---------------------------------------------------------------------------
+// The path-copying (COW) update arm — its own file (see `tests_path_copying.rs`)
+// ---------------------------------------------------------------------------
+#[path = "tests_path_copying.rs"]
+mod path_copying;
+
+// ---------------------------------------------------------------------------
+// The read instructions over the whole size sweep — its own file (see
+// `tests_read.rs`)
+// ---------------------------------------------------------------------------
+#[path = "tests_read.rs"]
+mod read_path;

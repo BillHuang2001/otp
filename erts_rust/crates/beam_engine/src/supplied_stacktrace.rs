@@ -41,20 +41,22 @@
 //! # The atom source (what the caller must pass)
 //!
 //! Every name a frame mentions is resolved by **lookup** — nothing is interned —
-//! against the passed `module`'s atom table:
+//! through the host's **live atom namespace** ([`ExecutionContext::atoms`]), with the
+//! passed `module`'s load-time snapshot as the fallback (the engine's one
+//! name-resolution rule, [`crate::machine::namespace_atom`]):
 //!
 //! * each frame's `module` and `function`, and
 //! * for a frame that carries a [`SourceLocation`](beam_common::SourceLocation), the
 //!   `file` and `line` atoms (`Location`'s `[{file,Name},{line,N}]` keys).
 //!
-//! So the caller passes a `&Module` whose **atom table already names every atom the
-//! frames use**, and the returned term's atom words are that table's indices. A
-//! host whose atoms live in a shared runtime namespace (rather than in one module's
-//! load-time snapshot) must therefore pass a `Module` whose `atom_table` **is** that
-//! shared table (a clone is fine — [`beam_term::AtomTable`] preserves every index),
-//! not a fresh table that would number the same names differently.
+//! A host that owns ONE shared runtime namespace overrides `atoms`, and the returned
+//! term's atom words are **that** namespace's ids; the `module` is only the fallback,
+//! so a name the runtime interned *after* the module was loaded still resolves. (The
+//! trace being rendered usually names modules the caller's own module never
+//! mentioned — `proc_lib`/`gen_server`/a supervisor re-raising a captured trace — so
+//! a snapshot-only lookup would refuse a trace the oracle echoes verbatim.)
 //!
-//! A name the table cannot resolve is the typed
+//! A name **neither** source can name is the typed
 //! [`unsupported`](crate::error::unsupported) — the engine never substitutes an atom
 //! the caller did not name, because a substituted atom is a *wrong* term.
 //!
@@ -84,17 +86,18 @@ use crate::machine::Machine;
 /// whose caller is not running compiled BEAM code) can render a caught raise's
 /// supplied frames without constructing one.
 ///
-/// `module` supplies atom resolution and must already name every atom the frames
-/// use — each frame's `module`/`function` and, for a located frame, the `file`/
-/// `line` atoms (see the module docs, "The atom source"). Pass the module whose
-/// atom namespace the returned term will be read in: for a shared runtime namespace
-/// that is a `Module` carrying the shared table, NOT a fresh one.
+/// `module` supplies the **fallback** atom snapshot: a frame's `module`/`function`
+/// and, for a located frame, the `file`/`line` atoms are resolved through the live
+/// namespace (`ctx`'s [`ExecutionContext::atoms`]) first and `module`'s table second
+/// (see the module docs, "The atom source"). Pass the module the caller is running
+/// in; a host with one shared runtime namespace has already installed it as the
+/// `atoms` seam.
 ///
 /// `ctx` supplies the heap the term is built on (and may collect during the one
 /// reservation — the scratch machine hands it the whole root set). Returns the
-/// cooked list, or the typed [`unsupported`](crate::error::unsupported) when the
-/// module cannot resolve a name a frame mentions; it never substitutes an atom and
-/// never panics on runtime data.
+/// cooked list, or the typed [`unsupported`](crate::error::unsupported) when a name
+/// **neither** the live namespace nor the module can name; it never substitutes an
+/// atom and never panics on runtime data.
 pub fn encode_supplied_stacktrace(
     module: &Module,
     ctx: &mut dyn ExecutionContext,

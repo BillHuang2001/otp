@@ -344,4 +344,58 @@ mod tests {
             assert!(reg.contains(module, function, *arity));
         }
     }
+
+    /// A recorded monitor is **owned** data ([`Monitor`]'s `String`s and a [`ProcessId`]), keyed by
+    /// the numeric reference id — never the caller's heap words. Poisoning every word the fixture
+    /// heap handed out must leave the entry intact and reachable through a rebuilt handle.
+    ///
+    /// The sloppy implementation this catches: a registry keeping the caller's `Name`/`Item`
+    /// `Eterm`s (or the reference term) instead of copies — after a collection relocates the
+    /// caller's heap the slot names moved words, so the recorded name/item/pid would read garbage.
+    #[test]
+    fn a_monitors_name_and_pid_survive_a_poisoned_caller_heap() {
+        let mut fx = Fixture::new();
+        let driver = fx.atom("driver");
+        let name = fx.charlist("poison_drv"); // a real heap charlist, not an atom
+        let item = fx.atom("unloaded");
+        let pair = fx.tuple(&[name, item]);
+        let reference = fx
+            .call("monitor", 2, &[driver, pair])
+            .expect("a valid monitor mints a reference");
+        let id = access::ref_thing_id(reference).expect("an internal ref thing");
+
+        // Poison every word the fixture heap handed out: the reference, the name charlist
+        // and the tuple are all clobbered.
+        fx.poison_heap();
+        assert!(
+            access::ref_thing_id(reference).is_err(),
+            "the poison must clobber the original handle word"
+        );
+
+        // The registry kept owned data, not the caller's words.
+        {
+            let guard = registry().lock().unwrap_or_else(|e| e.into_inner());
+            let entry = guard
+                .get(&id)
+                .expect("the monitor entry survives the poison");
+            assert_eq!(entry.name, "poison_drv");
+            assert_eq!(entry.item, "unloaded");
+            assert_eq!(entry.pid, ProcessId::new(1, 0));
+        }
+
+        // A handle naming the same id still resolves, and `demonitor` drops the entry.
+        let fresh = fx.mint_ref(id);
+        let out = fx
+            .call("demonitor", 1, &[fresh])
+            .expect("demonitor of a reference is true");
+        assert_eq!(fx.render(out), "true");
+        assert!(
+            registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .is_none(),
+            "demonitor drops the recorded entry"
+        );
+    }
 }

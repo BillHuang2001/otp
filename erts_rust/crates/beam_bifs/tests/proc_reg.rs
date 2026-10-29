@@ -21,7 +21,8 @@
 //! Oracle-pinned tests for the runtime process/name/global-state query BIFs
 //! (`src/proc_reg.rs`): `erlang:whereis/1`, `register/2`, `unregister/1`,
 //! `registered/0`, `is_process_alive/1`, `processes/0`, `ports/0`,
-//! `process_info/1,2`, `process_flag/2` and `group_leader/0`.
+//! `process_info/1,2`, `process_flag/2`, `group_leader/0` and
+//! `bump_reductions/1`.
 //!
 //! They are driven through the **public** API only (`default_registry()` +
 //! `BifRegistry::call`), in three layers:
@@ -55,7 +56,9 @@ fn heap() -> Heap {
 /// The atoms these tests resolve by name.
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    atoms.seed(["true", "false", "ok", "undefined", "init", "a", "b", "missing", "status"]);
+    atoms.seed([
+        "true", "false", "ok", "undefined", "init", "a", "b", "missing", "status", "x",
+    ]);
     atoms
 }
 
@@ -299,6 +302,10 @@ fn every_query_is_unsupported_without_a_hook() {
     assert_unsupported(call(&reg, &mut ctx, "erlang", "process_info", 2, &[pid, status]));
     assert_unsupported(call(&reg, &mut ctx, "erlang", "process_flag", 2, &[init, pid]));
     assert_unsupported(call(&reg, &mut ctx, "erlang", "group_leader", 0, &[]));
+    // `bump_reductions/1` with a *valid* count: the seam has no default value, so
+    // an uninstalled `ProcessHook` must report the gap — never the oracle's `true`.
+    let hundred = make_small(100);
+    assert_unsupported(call(&reg, &mut ctx, "erlang", "bump_reductions", 1, &[hundred]));
 }
 
 #[test]
@@ -344,6 +351,37 @@ fn argument_errors_are_badarg_even_without_a_hook() {
     assert_badarg(call(&reg, &mut ctx, "erlang", "process_info", 2, &[pid, non_atom]));
     // `process_flag/2`: a `Flag` that is not an atom (`bif.c:2024-2025`).
     assert_badarg(call(&reg, &mut ctx, "erlang", "process_flag", 2, &[non_atom, pid]));
+}
+#[test]
+fn bump_reductions_rejects_everything_but_a_non_negative_small() {
+    // ORACLE (erts-17.1):
+    //   `catch erlang:bump_reductions(-1)`        => `{'EXIT',{badarg,…}}`
+    //   `catch erlang:bump_reductions(1.0)`       => badarg
+    //   `catch erlang:bump_reductions(1 bsl 70)`  => badarg   (a bignum)
+    //   `catch erlang:bump_reductions(x)`         => badarg
+    //   `catch erlang:bump_reductions(<<>>)`      => badarg
+    // … while every non-negative *small* is accepted, `MAX_SMALL` included:
+    //   `erlang:bump_reductions((1 bsl 59) - 1)`  => `true`.
+    //
+    // The argument-only rows are `badarg` even with **no** hook installed: the C
+    // checks `is_not_small(BIF_ARG_1) || (reds < 0)` before it touches the process
+    // (`bif.c:5457-5459`), so a host can never turn one of them into a gap.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let minus_one = make_small(-1);
+    let max_small = make_small((1i64 << 59) - 1);
+    let float = beam_codec::term::make_float(&mut heap, 1.0).expect("a float fits");
+    let bignum = beam_codec::term::make_big(&mut heap, false, &[1 << 40]).expect("a legal bignum");
+    let binary = beam_codec::term::make_binary(&mut heap, &[]).expect("an on-heap empty binary");
+    let x = atom_term(&atoms, "x");
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+    for bad in [minus_one, float, bignum, x, binary] {
+        assert_badarg(call(&reg, &mut ctx, "erlang", "bump_reductions", 1, &[bad]));
+    }
+    // `MAX_SMALL` is *accepted* — so it must fail as the typed gap (no hook), never
+    // as `badarg`: the boundary is `is_small`, not a size heuristic.
+    assert_unsupported(call(&reg, &mut ctx, "erlang", "bump_reductions", 1, &[max_small]));
 }
 
 // ---------------------------------------------------------------------------
@@ -909,8 +947,113 @@ fn group_leader_returns_the_hooks_pid() {
     assert!(ProcessId::is_process(got));
 }
 
+/// A `ProcessHook` that records the exact count it was handed, and can be told to
+/// fail — the `bump_reductions/1` seam's own contract, in isolation.
+#[derive(Default)]
+struct ReductionRecorder {
+    /// Every `bump_reductions/1` count, in call order.
+    counts: Vec<u64>,
+    /// When set, the hook reports this failure instead of answering.
+    fail: bool,
+}
+impl ProcessHook for ReductionRecorder {
+    fn whereis(&mut self, _name: Atom) -> Result<Option<Eterm>> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn register(&mut self, _name: Atom, _id: Eterm) -> Result<bool> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn unregister(&mut self, _name: Atom) -> Result<bool> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn registered(&mut self) -> Result<Vec<Atom>> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn is_process_alive(&mut self, _pid: ProcessId) -> Result<bool> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn processes(&mut self) -> Result<Vec<ProcessId>> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn ports(&mut self) -> Result<Vec<PortId>> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn process_info_keys(&mut self, _pid: ProcessId) -> Result<Option<Vec<Atom>>> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn process_info_item(
+        &mut self,
+        _heap: &mut Heap,
+        _atoms: &AtomTable,
+        _pid: ProcessId,
+        _item: Atom,
+    ) -> Result<ProcessInfoItem> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn process_flag(
+        &mut self,
+        _heap: &mut Heap,
+        _atoms: &AtomTable,
+        _flag: Atom,
+        _value: Eterm,
+    ) -> Result<Option<Eterm>> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn group_leader(&mut self) -> Result<ProcessId> {
+        unreachable!("not exercised by the bump_reductions tests")
+    }
+    fn bump_reductions(&mut self, n: u64) -> Result<()> {
+        if self.fail {
+            return Err(BeamError::BadArg);
+        }
+        self.counts.push(n);
+        Ok(())
+    }
+}
 #[test]
-fn register_installs_the_eleven_keys() {
+fn bump_reductions_answers_true_and_passes_the_charged_count() {
+    // ORACLE (erts-17.1): `erlang:bump_reductions(N)` => `true` for every
+    // non-negative small N — `0`, `100`, `4000`, `100000` and `(1 bsl 59) - 1`
+    // (= `MAX_SMALL`) included. The charge the seam sees is the C's `reds`
+    // *after* its cap (`bif.c:5460-5462`), i.e. `min(N, CONTEXT_REDS = 4000)`;
+    // the cap lives in this layer because `CONTEXT_REDS` is a frozen interface
+    // constant (`beam_common::CONTEXT_REDS`), not host state.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut hook = ReductionRecorder::default();
+    let max_small = (1i64 << 59) - 1;
+    let counts = [0i64, 100, 4_000, 100_000, max_small];
+    {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_process_hook(&mut hook);
+        for n in counts {
+            let answer = call(&reg, &mut ctx, "erlang", "bump_reductions", 1, &[make_small(n)])
+                .expect("the hook answers");
+            assert_eq!(atom_name(&atoms, answer), "true", "bump_reductions({n}) must be true");
+        }
+    }
+    // The exact `u64` the seam saw, in order: in-range counts pass through
+    // unchanged (no truncation, no sign loss) and an over-budget one arrives as
+    // `CONTEXT_REDS` — never the raw `100000` / `MAX_SMALL`.
+    assert_eq!(hook.counts, vec![0, 100, 4_000, 4_000, 4_000]);
+}
+#[test]
+fn bump_reductions_propagates_a_hook_failure() {
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut hook = ReductionRecorder {
+        counts: Vec::new(),
+        fail: true,
+    };
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_process_hook(&mut hook);
+    assert_badarg(call(&reg, &mut ctx, "erlang", "bump_reductions", 1, &[make_small(7)]));
+    assert!(hook.counts.is_empty(), "a failing hook records nothing");
+}
+#[test]
+fn register_installs_the_twelve_keys() {
     let reg = default_registry();
     assert!(reg.contains("erlang", "whereis", 1));
     assert!(reg.contains("erlang", "register", 2));
@@ -923,6 +1066,7 @@ fn register_installs_the_eleven_keys() {
     assert!(reg.contains("erlang", "process_info", 2));
     assert!(reg.contains("erlang", "process_flag", 2));
     assert!(reg.contains("erlang", "group_leader", 0));
+    assert!(reg.contains("erlang", "bump_reductions", 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1198,45 @@ fn live_oracle_agrees_on_the_inventory_shapes() {
     );
 }
 
+#[test]
+fn live_oracle_agrees_on_the_reduction_charge() {
+    // One live cross-check against the system ERTS: every shape the (a)/(b) layers
+    // pin must also come out of the real `erl` today — `true` for a non-negative
+    // small, `badarg` for a negative one, a float, a bignum, an atom and a binary,
+    // and a counter that actually **moves** by the clamped count. Skips loudly when
+    // the oracle is unavailable.
+    //
+    // The measured deltas (erts-17.1, this host): `bump_reductions(100)` moves
+    // `process_info(self(), reductions)` by 104, `(0)` by 4, `(4000)`/`(100000)`/
+    // `(MAX_SMALL)` by 3992 — i.e. the charge is `min(N, CONTEXT_REDS = 4000)` plus
+    // the call's own cost, which is why the exact figure is asserted as a *band*
+    // here and the clamp itself is this layer's (`proc_reg::bump_reductions_1`).
+    let Some(output) = oracle_eval(
+        "G = fun(N) -> case (catch erlang:bump_reductions(N)) of {'EXIT', _} -> 'EXIT'; \
+                             Other -> Other end end, \
+         D = fun(N) -> B = element(2, erlang:process_info(self(), reductions)), \
+                       _ = erlang:bump_reductions(N), \
+                       element(2, erlang:process_info(self(), reductions)) - B end, \
+         io:format(\"~p|~p|~p|~p|~p|~p|~p|~p|~p|~p~n\",[\
+             G(100) =:= true,\
+             G(0) =:= true,\
+             G((1 bsl 59) - 1) =:= true,\
+             G(1 bsl 40) =:= true,\
+             G(-1) =:= 'EXIT',\
+             G(1.0) =:= 'EXIT',\
+             G(1 bsl 70) =:= 'EXIT',\
+             G(x) =:= 'EXIT',\
+             G(<<>>) =:= 'EXIT',\
+             D(100) >= 100])",
+    ) else {
+        return;
+    };
+    assert_eq!(
+        output.trim(),
+        "true|true|true|true|true|true|true|true|true|true",
+        "the live oracle disagrees with the pinned bump_reductions/1 semantics"
+    );
+}
 // ---------------------------------------------------------------------------
 // The produced `undefined` atom is interned on demand
 // ---------------------------------------------------------------------------

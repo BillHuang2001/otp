@@ -172,10 +172,12 @@
 //! (`erl_bif_lists.c`), never a no-clause failure.
 //! Arithmetic on a non-number (`sum([a])`) is
 //! [`BeamError::BadArith`](beam_common::BeamError::BadArith). `sum/1` folds with the
-//! `arith` module's exact `+`, so it promotes to a bignum exactly like the oracle; a
-//! 60-bit overflow is
-//! [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) only where the
-//! arithmetic is *not* term arithmetic (`seq/2,3`'s bound check).
+//! `arith` module's exact `+`, so it promotes to a bignum exactly like the oracle, and
+//! `seq/2,3` evaluates its bounds with the same term arithmetic — a bignum bound or a
+//! bignum step is a sequence, not a clause failure (`seq/2,3`'s *small*-integer
+//! fast path keeps machine arithmetic, whose only residual
+//! [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) is a step that
+//! leaves the `i64` range while the sequence is still buildable).
 //!
 //! # `is_list/1` in guards is *shallow*
 //!
@@ -192,7 +194,8 @@ use beam_term::compare::{eq, LocalNodeId};
 use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access::{
-    car, cdr, fun_arity, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
+    car, cdr, fun_arity, is_atom, is_integer, is_list, is_nil, is_small, is_tuple, tuple_element,
+    tuple_size,
 };
 use crate::compare::{cmp_arith_node, local_node_id};
 use crate::context::BifContext;
@@ -836,9 +839,21 @@ fn sublist3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // ---------------------------------------------------------------------------
 
 /// `seq(From, To)` — `[From, From+1, …, To]`.
+///
+/// # The small-integer fast path
+///
+/// Two 60-bit smalls answer the whole call in machine arithmetic (the loop below);
+/// anything else is classified by [`seq2_wide`], which evaluates the very same
+/// clause with **term** arithmetic, so a bignum bound is a sequence rather than a
+/// clause failure (`lists:seq(B, B+2)` ⇒ `[B,B+1,B+2]` for
+/// `B = 748274827583793785928592859`) while a non-integer stays the oracle's
+/// `error:function_clause` (`lists:seq(1.0, 2)`).
 fn seq2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let first = small_int_clause(args[0])?;
-    let last = small_int_clause(args[1])?;
+    if !(is_small(args[0]) && is_small(args[1])) {
+        return seq2_wide(ctx, args[0], args[1]);
+    }
+    let first = signed_value(args[0]);
+    let last = signed_value(args[1]);
     // The guard is `From - 1 =< To`; `From` is a 60-bit small, so this cannot
     // overflow `i64`.
     if first - 1 > last {
@@ -855,6 +870,36 @@ fn seq2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
     Ok(acc)
 }
+/// [`seq2`] for a call whose operands are not both small integers — the bignum
+/// path.
+///
+/// `lists.erl`'s clause is `seq(First, Last) when is_integer(First), is_integer(Last),
+/// First-1 =< Last`, whose guard is exact integer arithmetic. That is reproduced
+/// as `First =< Last + 1` (⇔ `First - 1 =< Last`, and exact for a bignum on either
+/// side), then walked **forward** from `First` to `Last` — the step-by-one
+/// sequence `lists.erl`'s `seq_loop/3` builds, one element at a time.
+///
+/// Each step adds one and therefore moves strictly toward `Last`, so the walk
+/// terminates for every accepted call; the only growth is the result itself.
+///
+/// # Errors
+///
+/// `error:function_clause` — that one clause's guard — for a **non-integer**
+/// operand (`lists:seq(1.0, 2)`, `lists:seq(B, 2.0)`) and for `First - 1 > Last`
+/// (`lists:seq(B, B-1)` is *accepted* and answers `[]`; only `First > Last + 1`
+/// fails).
+fn seq2_wide(ctx: &mut BifContext<'_>, first: Eterm, last: Eterm) -> Result<Eterm> {
+    if !(is_integer(first) && is_integer(last)) {
+        return Err(function_clause());
+    }
+    let one = ctx.int(1)?;
+    // `First - 1 =< Last` ⇔ `First =< Last + 1`.
+    let bound = crate::arith::add_terms(ctx, last, one)?;
+    if arith_order(ctx, first, bound) == Ordering::Greater {
+        return Err(function_clause());
+    }
+    seq_walk(ctx, first, last, one, true)
+}
 
 /// `seq(From, To, Incr)` — the arithmetic sequence from `From` to `To`.
 fn seq3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
@@ -865,7 +910,7 @@ fn seq3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             Some(signed_value(args[2])),
         )
     } else {
-        (None, None, None)
+        return seq3_wide(ctx, args[0], args[1], args[2]);
     };
     if let (Some(from), Some(to), Some(incr)) = (from, to, incr) {
         let ascending = incr > 0 && from - incr <= to;
@@ -882,6 +927,87 @@ fn seq3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         }
     }
     Err(badarg())
+}
+/// [`seq3`] for a call whose operands are not all small integers — the bignum
+/// path.
+///
+/// The three `lists.erl` clauses are reproduced with **term** arithmetic:
+///
+/// 1. `is_integer(First), is_integer(Last), is_integer(Incr)` and
+///    `(Incr > 0 andalso First - Incr =< Last) orelse
+///    (Incr < 0 andalso First - Incr >= Last)` — the bound check is written as
+///    `First =< Last + Incr` / `First >= Last + Incr` (⇔ `First - Incr =<`/`>=`
+///    `Last`, exact for a bignum on either side) and the sequence is walked
+///    forward from `First` by `Incr` while it has not passed `Last`. That is the
+///    very element set `lists.erl`'s `N = (Last - First + Inc) div Inc` /
+///    `seq_loop(N, Inc * (N - 1) + First, Inc, [])` produces, for a positive and a
+///    negative `Incr` alike, without a `div` on a widened value;
+/// 2. `seq(Same, Same, 0)` ⇒ `[Same]`;
+/// 3. otherwise `error:badarg` — the one raise of the clause set, and the class a
+///    **non-integer** operand keeps (`lists:seq(1.0, 2, 1)`).
+///
+/// `Incr` is compared with `0` first, so a zero step never enters the walk: an
+/// invalid `Incr` is the `badarg` (or the `[Same]` of clause 2) above, never a
+/// non-terminating loop.
+fn seq3_wide(ctx: &mut BifContext<'_>, first: Eterm, last: Eterm, incr: Eterm) -> Result<Eterm> {
+    if !(is_integer(first) && is_integer(last) && is_integer(incr)) {
+        return Err(badarg());
+    }
+    let zero = ctx.int(0)?;
+    let step = arith_order(ctx, incr, zero);
+    if step != Ordering::Equal {
+        // `First - Incr =< Last` ⇔ `First =< Last + Incr` (and `>=` likewise).
+        let bound = crate::arith::add_terms(ctx, last, incr)?;
+        let start = arith_order(ctx, first, bound);
+        let ascending = step == Ordering::Greater && start != Ordering::Greater;
+        let descending = step == Ordering::Less && start != Ordering::Less;
+        if ascending || descending {
+            return seq_walk(ctx, first, last, incr, ascending);
+        }
+        return Err(badarg());
+    }
+    if arith_order(ctx, first, last) == Ordering::Equal {
+        // `seq(Same, Same, 0) -> [Same]`.
+        return ctx.list(&[first]);
+    }
+    Err(badarg())
+}
+/// The forward walk shared by both wide `seq` paths: `first`, `first + incr`, …
+/// while the next element has not passed `last` (ascending), or the same with the
+/// comparison flipped (descending).
+///
+/// Every step adds `incr`, whose sign is the walk's direction, so each iteration
+/// moves strictly toward `last` and the loop terminates. Building the elements
+/// first and consing once through [`build_list`] keeps the result in the oracle's
+/// order (ascending for a positive step, descending for a negative one).
+fn seq_walk(
+    ctx: &mut BifContext<'_>,
+    first: Eterm,
+    last: Eterm,
+    incr: Eterm,
+    ascending: bool,
+) -> Result<Eterm> {
+    let stop = if ascending {
+        Ordering::Greater
+    } else {
+        Ordering::Less
+    };
+    let mut elems = Vec::new();
+    let mut x = first;
+    while arith_order(ctx, x, last) != stop {
+        elems.push(x);
+        x = crate::arith::add_terms(ctx, x, incr)?;
+    }
+    build_list(ctx, &elems, NIL)
+}
+/// The arithmetic (`==`) order of two terms — the relation `lists.erl`'s `seq`
+/// guards compare with (`=<`, `>`, `==`).
+///
+/// The callers have already established that both operands are integers, so this
+/// is the exact integer order; a mixed internal/external `pid`/`port`/`ref` pair
+/// (which the node-aware [`cmp_arith_node`] would need) cannot occur here.
+fn arith_order(ctx: &BifContext<'_>, a: Eterm, b: Eterm) -> Ordering {
+    beam_term::compare::cmp_arith(a, b, ctx.atoms())
 }
 
 /// The `seq_loop/4` worker: `N` terms from `first`, stepping by `incr`.

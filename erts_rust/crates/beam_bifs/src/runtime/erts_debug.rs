@@ -28,7 +28,9 @@
 //! `instructions/0` (this tree's generated `beam_makeops` roster),
 //! `unaligned_bitstring/2` (a bitstring-to-bitstring transformation), `map_info/1` (a
 //! walk of a HAMT map's node interiors), the `lcnt`/`interpreter_size`/`disassemble`
-//! constants, the `get_internal_state` / `set_internal_state` gate, `size_shared/1` and
+//! constants, the `get_internal_state` / `set_internal_state` gate and its three
+//! debugging **loop limits** (`binary_loop_limit`/`re_loop_limit`/
+//! `unicode_loop_limit` — see [`LoopLimit`]), `size_shared/1` and
 //! `copy_shared/2` (term walks), and the two `notsup` protocol stubs of the
 //! trace/literal-area collectors.
 //!
@@ -40,7 +42,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use beam_common::{BeamError, ExitReason, Result};
 use beam_term::prelude::signed_value;
@@ -292,14 +294,20 @@ fn get_internal_state_1(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Et
 /// enable, `true` on the second, `true` on the disable, and `{error,undef}` for the
 /// non-boolean.
 ///
-/// With the gate on, the remaining arms (`reds_left`, `next_pid`, `block`, …) are
-/// emulator internals this runtime cannot serve, so they answer the typed
-/// [`unsupported_bif`] gap.
+/// With the gate on, the three debugging **loop limits** (`binary_loop_limit`,
+/// `re_loop_limit`, `unicode_loop_limit`) are served by [`set_loop_limit`]: each is a
+/// bare `xchg` over one emulator atomic (`erl_bif_info.c:5204-5236`), so its answer
+/// needs no VM introspection and this runtime reproduces it exactly. Every other arm
+/// (`reds_left`, `next_pid`, `block`, …) is an emulator internal this runtime cannot
+/// serve, so it answers the typed [`unsupported_bif`] gap.
 ///
 /// # Errors
 ///
 /// `error:undef` while the gate is off and the first argument is not the
-/// `available_internal_state` pair; the typed `unsupported_bif` raise while it is on.
+/// `available_internal_state` pair; `error:badarg` for a loop-limit arm whose second
+/// argument is neither the atom `default` nor a non-negative integer fitting an `Uint`
+/// (the C falls out of the `else if` chain to the function's final `badarg`); the typed
+/// `unsupported_bif` raise for every other arm while the gate is on.
 fn set_internal_state_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if atom_is(ctx, args[0], "available_internal_state") {
         if let Some(on) = boolean_of(ctx, args[1]) {
@@ -307,11 +315,194 @@ fn set_internal_state_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
             return ctx.boolean(previous);
         }
     }
-    if AVAILABLE_INTERNAL_STATE.load(Ordering::SeqCst) {
-        Err(unsupported_bif())
-    } else {
-        Err(undefined_bif())
+    if !AVAILABLE_INTERNAL_STATE.load(Ordering::SeqCst) {
+        return Err(undefined_bif());
     }
+    if let Some(answer) = set_loop_limit(ctx, args[0], args[1]) {
+        return answer;
+    }
+    Err(unsupported_bif())
+}
+
+/// The three debugging **loop limits** `set_internal_state/2` can tune, as the
+/// process-global emulator atomics ERTS keeps for them.
+///
+/// Ground truth: the three arms at `../../erts/emulator/beam/erl_bif_info.c:5204-5236`
+/// over `erts_binary_set_loop_limit` (`erl_bif_binary.c:111-121`),
+/// `erts_re_set_loop_limit` (`erl_bif_re.c:229-237`) and `erts_unicode_set_loop_limit`
+/// (`erl_unicode.c:155-163`), every one of which is the same exchange:
+///
+/// ```text
+/// Sint save = (Sint) max_loop_limit;
+/// if (limit <= 0) max_loop_limit = <that module's default>;
+/// else            max_loop_limit = (Uint) limit;
+/// return save;                                  /* the PREVIOUS value */
+/// ```
+///
+/// The BIF arm maps the atom `default` to the C's `-1`, converts anything else with
+/// `term_to_Uint` (`../erts/emulator/beam/big.c:3505-3538`) and lets a failed
+/// conversion fall out of the `else if` chain to the function's final
+/// `BIF_ERROR(BIF_P, BADARG)` — so `badarg` covers a negative integer, a float, an atom
+/// and a bignum too wide for one `Uint`, with no `system_limit` in between (oracle:
+/// `1 bsl 64` ⇒ `{error,badarg}`).
+///
+/// The initial values are the C's initialisers — `CONTEXT_REDS * LOOP_FACTOR` =
+/// `4000 * 16 = 64_000` for `re` (`erl_bif_re.c:42`), `4000 * 10 = 40_000` for
+/// `unicode` (`erl_unicode.c:48`) and **`0`** ("disabled", `erl_bif_binary.c:102`) for
+/// `binary` — stored as the `Uint` bit pattern of the `Sint` limit.
+///
+/// Process-global like [`AVAILABLE_INTERNAL_STATE`] (ERTS keeps one `max_loop_limit`
+/// per module), never per-`BifContext`.
+static BINARY_LOOP_LIMIT: AtomicU64 = AtomicU64::new(0);
+static RE_LOOP_LIMIT: AtomicU64 = AtomicU64::new(64_000);
+static UNICODE_LOOP_LIMIT: AtomicU64 = AtomicU64::new(40_000);
+
+/// One of the three loop limits: which atomic it names and what its default is.
+///
+/// # What a limit does — and does not — change
+///
+/// A limit is only the number of loop iterations a **trapping** operation
+/// (`binary`'s search family, `re`'s NFA run, `unicode`'s conversion walkers) may run
+/// before it yields back to the scheduler — `get_reds`/`allowed_iterations` in those
+/// same modules. It is a **scheduling-granularity knob, never a semantic one**: no
+/// result, exception class or term depends on it, so `1`, `0` and `default` are
+/// indistinguishable to a program apart from *when* it is pre-empted (and this
+/// runtime's `binary`/`re`/`unicode` BIFs do not trap at all, so the stored values are
+/// inert here). Serving the arms is therefore faithful and side-effect-free.
+#[derive(Clone, Copy)]
+enum LoopLimit {
+    Binary,
+    Re,
+    Unicode,
+}
+
+impl LoopLimit {
+    /// The limit `name` selects, or `None` when the atom is not one of the three (the
+    /// caller then falls through to the typed gap — the C's `else if` chain).
+    fn of(ctx: &BifContext<'_>, name: Eterm) -> Option<LoopLimit> {
+        if atom_is(ctx, name, "binary_loop_limit") {
+            Some(LoopLimit::Binary)
+        } else if atom_is(ctx, name, "re_loop_limit") {
+            Some(LoopLimit::Re)
+        } else if atom_is(ctx, name, "unicode_loop_limit") {
+            Some(LoopLimit::Unicode)
+        } else {
+            None
+        }
+    }
+
+    /// The module's default (`max_loop_limit`'s initialiser, restored by `default` and
+    /// by any non-positive limit).
+    fn default_bits(self) -> u64 {
+        match self {
+            LoopLimit::Binary => 0,
+            LoopLimit::Re => 64_000,
+            LoopLimit::Unicode => 40_000,
+        }
+    }
+
+    /// The module-global slot this limit lives in.
+    fn slot(self) -> &'static AtomicU64 {
+        match self {
+            LoopLimit::Binary => &BINARY_LOOP_LIMIT,
+            LoopLimit::Re => &RE_LOOP_LIMIT,
+            LoopLimit::Unicode => &UNICODE_LOOP_LIMIT,
+        }
+    }
+
+    /// `erts_<module>_set_loop_limit(requested)`: store the new limit and answer the
+    /// **previous** one (read before the store, as the C's `Sint save` is). A
+    /// non-positive request — the atom `default` (the C's `-1`), the integer `0`, or a
+    /// `Uint` whose `Sint` reinterpretation is negative — restores the default.
+    fn exchange(self, requested: i64) -> u64 {
+        let new = if requested <= 0 {
+            self.default_bits()
+        } else {
+            requested as u64
+        };
+        self.slot().swap(new, Ordering::SeqCst)
+    }
+}
+
+/// The C's `BIF_RET(make_small(max_loops))` as `signed_val` reads it back.
+///
+/// `make_small(x)` is `(x << 4) + TAG_IMMED1_SMALL` and `signed_val` is an arithmetic
+/// `>> 4` over the 60-bit immediate, so a stored limit in `2^59 .. 2^63` — reachable
+/// only through a **bignum** second argument — answers **sign-wrapped**, exactly as the
+/// oracle answers it: after `set_internal_state(binary_loop_limit, 1 bsl 59)` the next
+/// call answers `-576460752303423488` (`-2^59`) and after `1 bsl 62 + 7` it answers
+/// `7`. The wrap is the C's own term construction, not a substitution: the stored limit
+/// itself is faithful and no limit is ever *used* at these magnitudes.
+fn make_small_answer(bits: u64) -> i64 {
+    // `TAG_IMMED1_SMALL` (`erl_term.h`); irrelevant to the answer below (`bits << 4`
+    // has a zero low nibble) but kept so the round trip reads like the C.
+    const TAG_IMMED1_SMALL: u64 = 0xF;
+    ((bits << 4).wrapping_add(TAG_IMMED1_SMALL) as i64) >> 4
+}
+
+/// The C's `term_to_Uint` (`../erts/emulator/beam/big.c:3505-3538`) for the limit arms:
+/// the `Uint` a non-negative integer term denotes, or `None` for any other term.
+///
+/// A small integer is its value when non-negative. A **bignum** is accepted iff it is
+/// non-negative and its magnitude fits one `ErtsDigit` — the C's
+/// `xl * D_EXP > sizeof(Uint) * 8` reject, `D_EXP == 64` here, so exactly one limb; the
+/// magnitude is normalised first (leading zero limbs dropped), as
+/// [`crate::runtime::atomics`]'s `term_to_uword` does for the same reason. A negative
+/// integer, a float, an atom, a list, … are all rejected.
+///
+/// The C stores `BADARG`/`SYSTEM_LIMIT` in `*up` on failure but the limit arms ignore
+/// which — every failure falls to the function's final `badarg` — so one `None` is the
+/// faithful answer for all of them.
+fn loop_limit_argument(term: Eterm) -> Option<u64> {
+    if access::is_small(term) {
+        return u64::try_from(signed_value(term)).ok();
+    }
+    if access::is_big(term) {
+        let (negative, limbs) = beam_codec::term::big_parts(term).ok()?;
+        if negative {
+            return None;
+        }
+        return match limbs.iter().rposition(|limb| *limb != 0) {
+            // An all-zero magnitude is the integer 0.
+            None => Some(0),
+            // One `ErtsDigit` — the widest bignum `term_to_Uint` accepts.
+            Some(0) => Some(limbs[0]),
+            Some(_) => None,
+        };
+    }
+    None
+}
+
+/// The `set_internal_state/2` loop-limit arm: `Some(answer)` when `name` is one of the
+/// three limits, `None` when it is not (the caller then answers the typed gap).
+///
+/// See [`LoopLimit`] for the C it reproduces, the defaults and why no observable
+/// depends on the stored value.
+///
+/// # Errors
+///
+/// `error:badarg` when the second argument is neither the atom `default` nor a
+/// non-negative integer fitting an `Uint`; a heap failure materialising the answer
+/// (unreachable: the answer is always a small integer).
+fn set_loop_limit(
+    ctx: &mut BifContext<'_>,
+    name: Eterm,
+    value: Eterm,
+) -> Option<Result<Eterm>> {
+    let limit = LoopLimit::of(ctx, name)?;
+    // `default` is the C's `erts_*_set_loop_limit(-1)`; anything else must pass
+    // `term_to_Uint`, whose `Uint` result is reinterpreted as the C's `Sint limit`
+    // (so a value ≥ 2^63 is negative and restores the default).
+    let requested = if atom_is(ctx, value, "default") {
+        -1
+    } else {
+        match loop_limit_argument(value) {
+            Some(bits) => bits as i64,
+            None => return Some(Err(badarg())),
+        }
+    };
+    let previous = limit.exchange(requested);
+    Some(arith::int_from_i64(ctx, make_small_answer(previous)))
 }
 
 /// `erts_debug:size_shared/1` — the words of `Term`'s graph, each distinct object
@@ -1053,6 +1244,14 @@ mod tests {
             "c",
             "foo",
             "atom",
+            // `set_internal_state/2`'s three loop-limit arms and the conversion the
+            // "no result depends on a limit" probe drives.
+            "binary_loop_limit",
+            "re_loop_limit",
+            "unicode_loop_limit",
+            "default",
+            "utf8",
+            "x",
             // `map_info/1`'s tags.
             "depth",
             "arrays",
@@ -1326,6 +1525,241 @@ mod tests {
         assert_eq!(observe("get_internal_state", 1, &[memory]), "error:undef");
     }
 
+    /// Restores the three process-global loop limits to their defaults when dropped —
+    /// for the same reason [`GateOff`] does for the gate: the limits are per-VM state
+    /// shared by every test in this binary, so a leaked value would make another test's
+    /// "previous value" assertion wrong.
+    struct LimitsDefault;
+
+    impl Drop for LimitsDefault {
+        fn drop(&mut self) {
+            for limit in [LoopLimit::Binary, LoopLimit::Re, LoopLimit::Unicode] {
+                limit.exchange(-1);
+            }
+        }
+    }
+
+    /// The three loop-limit arms of `set_internal_state/2` are the emulator's
+    /// **trapping-granularity** knobs, and each is a faithful `xchg`: it answers the
+    /// PREVIOUS value, the atom `default` and the integer `0` both restore the module
+    /// default (and still answer the previous value), and a negative / non-integer /
+    /// too-wide second argument is `badarg`.
+    ///
+    /// Oracle transcript — OTP 29.1.2 / erts-17.1.1, `erl` on `PATH`, a compiled module
+    /// calling `erts_debug:set_internal_state/2` inside `try … catch C:R -> {C,R} end`
+    /// (a bare BIF name is not auto-imported under `-eval`, so the rows below are one
+    /// program in exactly this order):
+    ///
+    /// ```text
+    /// (unicode_loop_limit,7) gate off      => {error,undef}
+    /// (binary_loop_limit,default) gate off => {error,undef}
+    /// (available_internal_state,true)      => {ok,false}
+    /// (unicode_loop_limit,7)               => {ok,40000}
+    /// (unicode_loop_limit,default)         => {ok,7}
+    /// (unicode_loop_limit,0)               => {ok,40000}
+    /// (re_loop_limit,5)                    => {ok,64000}
+    /// (re_loop_limit,default)              => {ok,5}
+    /// (binary_loop_limit,5)                => {ok,0}
+    /// (binary_loop_limit,0)                => {ok,5}
+    /// (binary_loop_limit,default)          => {ok,0}
+    /// (unicode_loop_limit,-1)              => {error,badarg}
+    /// (unicode_loop_limit,x)               => {error,badarg}
+    /// (unicode_loop_limit,1.0)             => {error,badarg}
+    /// (binary_loop_limit,1 bsl 64)         => {error,badarg}    (wider than one Uint)
+    /// (binary_loop_limit,1 bsl 59)         => {ok,0}
+    /// (binary_loop_limit,default)          => {ok,-576460752303423488}
+    /// (re_loop_limit,1 bsl 63)             => {ok,64000}         (negative as a Sint)
+    /// (re_loop_limit,default)              => {ok,64000}
+    /// (available_internal_state,true)      => {ok,true}          (gate-free while on)
+    /// (foo,default)                        => {error,badarg}     (not a limit name, gate on)
+    /// ```
+    ///
+    /// The `2^59` row shows the C's term construction, not a divergence: `make_small` of
+    /// a limit `>= 2^59` wraps the 60-bit immediate, so the oracle answers `-2^59` (see
+    /// [`make_small_answer`]). The stacktrace item of every `badarg` row is
+    /// `{erts_debug,set_internal_state,[binary_loop_limit,-1],[]}` — no `error_info`
+    /// extension, i.e. the C's plain `BIF_ERROR(BIF_P, BADARG)`, which is exactly what
+    /// [`badarg`] raises.
+    #[test]
+    fn the_loop_limit_arms_exchange_and_answer_the_previous_value() {
+        let _lock = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        AVAILABLE_INTERNAL_STATE.store(false, Ordering::SeqCst);
+        let _gate = GateOff;
+        let _limits = LimitsDefault;
+
+        let binary = atom_of("binary_loop_limit");
+        let re = atom_of("re_loop_limit");
+        let unicode = atom_of("unicode_loop_limit");
+        let default = atom_of("default");
+        let available = atom_of("available_internal_state");
+        let true_ = atom_of("true");
+
+        // Gate off: the arms sit behind the gate, so every one raises the bare `undef`
+        // (the C checks `available_internal_state` before the `else if` chain).
+        assert_eq!(
+            observe("set_internal_state", 2, &[unicode, make_small(7)]),
+            "error:undef"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[binary, default]),
+            "error:undef"
+        );
+
+        // Enable, then exchange each limit three ways.
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, true_]),
+            "atom(false)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[unicode, make_small(7)]),
+            "int(40000)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[unicode, default]),
+            "int(7)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[unicode, make_small(0)]),
+            "int(40000)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[re, make_small(5)]),
+            "int(64000)"
+        );
+        assert_eq!(observe("set_internal_state", 2, &[re, default]), "int(5)");
+        assert_eq!(
+            observe("set_internal_state", 2, &[binary, make_small(5)]),
+            "int(0)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[binary, make_small(0)]),
+            "int(5)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[binary, default]),
+            "int(0)"
+        );
+
+        // A second argument `term_to_Uint` rejects: negative, an atom, a float, and a
+        // bignum wider than one `Uint` — all `badarg`, none `system_limit` and none a
+        // silent default restore.
+        let mut scratch = Heap::new(256).expect("test heap");
+        let two_59 = beam_codec::term::make_big(&mut scratch, false, &[1 << 59])
+            .expect("the bignum fits");
+        let two_63 = beam_codec::term::make_big(&mut scratch, false, &[1 << 63])
+            .expect("the bignum fits");
+        let two_64 = beam_codec::term::make_big(&mut scratch, false, &[0, 1])
+            .expect("the bignum fits");
+        let one_point_zero = access::make_float(&mut scratch, 1.0).expect("the float fits");
+        for (label, value) in [
+            ("-1", make_small(-1)),
+            ("x", atom_of("x")),
+            ("1.0", one_point_zero),
+            ("1 bsl 64", two_64),
+        ] {
+            assert_eq!(
+                observe("set_internal_state", 2, &[unicode, value]),
+                "badarg",
+                "set_internal_state(unicode_loop_limit, {label})"
+            );
+        }
+
+        // A limit that only a bignum can express: stored faithfully, answered through the
+        // C's `make_small` round trip, and `2^63` (negative as a `Sint`) restores the
+        // default instead of storing.
+        assert_eq!(
+            observe("set_internal_state", 2, &[binary, two_59]),
+            "int(0)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[binary, default]),
+            format!("int({})", -(1i64 << 59))
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[re, two_63]),
+            "int(64000)"
+        );
+        assert_eq!(observe("set_internal_state", 2, &[re, default]), "int(64000)");
+
+        // The gate-free arm keeps working while the gate is on, and a name that is not a
+        // loop limit still answers the typed gap rather than `badarg`.
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, true_]),
+            "atom(true)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[atom_of("foo"), default]),
+            "error:unsupported_bif"
+        );
+    }
+
+    /// The bytes of the binary `module:function/arity` answers, over a fresh heap — the
+    /// arguments are built **on that same heap** by `build`, so a charlist or binary
+    /// argument is valid at the call site (unlike [`observe_args`], whose labels cannot
+    /// compare two runs' results).
+    fn binary_answer(
+        module: &str,
+        function: &str,
+        arity: u32,
+        build: impl FnOnce(&mut BifContext<'_>) -> Vec<Eterm>,
+    ) -> Result<Vec<u8>> {
+        let reg = crate::registry::default_registry();
+        let mut heap = Heap::new(1 << 12).expect("test heap");
+        let atoms = probe_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let args = build(&mut ctx);
+        let out = reg.call(module, function, arity, &mut ctx, &args)?;
+        access::binary_bytes(out)
+    }
+
+    /// The invariant the three limits exist under: they tune **trapping granularity
+    /// only**, so no result depends on them. `unicode:characters_to_binary/2` and
+    /// `binary:part/3` — both served in-crate — answer the identical bytes with every
+    /// limit set to `1` (which forces a yield as early as possible), to `0` (unlimited,
+    /// the `binary` default) and back to `default`.
+    ///
+    /// Oracle-verified reference results: `unicode:characters_to_binary([97,98,99],
+    /// utf8)` ⇒ `<<"abc">>` and `binary:part(<<"abcdef">>, 1, 3)` ⇒ `<<"bcd">>`, with
+    /// each of the three limits set to `1`, `0` and `default` in turn.
+    #[test]
+    fn the_limits_change_no_result() {
+        let _lock = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _limits = LimitsDefault;
+
+        let characters = |ctx: &mut BifContext<'_>| {
+            let units: Vec<Eterm> = [b'a', b'b', b'c']
+                .iter()
+                .map(|unit| ctx.int(i64::from(*unit)).expect("the unit fits"))
+                .collect();
+            let list = ctx.list(&units).expect("the charlist fits");
+            vec![list, atom_of("utf8")]
+        };
+        let window = |ctx: &mut BifContext<'_>| {
+            let subject = access::make_heap_bitstring(ctx.heap(), b"abcdef", 48)
+                .expect("the source fits");
+            vec![subject, make_small(1), make_small(3)]
+        };
+
+        // `1` = yield after a single iteration, `0` and `-1` (`default`) = the module
+        // default. Every setting must answer byte-identical results.
+        for setting in [1i64, 0, -1] {
+            for limit in [LoopLimit::Binary, LoopLimit::Re, LoopLimit::Unicode] {
+                limit.exchange(setting);
+            }
+            assert_eq!(
+                binary_answer("unicode", "characters_to_binary", 2, characters)
+                    .expect("the conversion runs"),
+                b"abc".to_vec(),
+                "unicode:characters_to_binary/2 with every loop limit at {setting}"
+            );
+            assert_eq!(
+                binary_answer("binary", "part", 3, window).expect("the slice runs"),
+                b"bcd".to_vec(),
+                "binary:part/3 with every loop limit at {setting}"
+            );
+        }
+    }
+
     /// `size_shared/1` prices a run-time-built graph once per object and shares by
     /// identity — `size/1`'s number, oracle-verified (see [`size_shared_1`]):
     ///
@@ -1374,13 +1808,16 @@ mod tests {
     #[test]
     fn size_shared_prices_a_hash_map_node_twice_like_the_oracle() {
         let mut heap = Heap::new(1 << 18).expect("test heap");
+        // Integer keys only, so the table names no key: any namespace gives the same
+        // trie and the same stored order here.
+        let atoms = AtomTable::new();
         for (range, flat, shared) in [
             (1..=33i64, 123i64, 180i64),
             (1..=34, 126, 184),
             (1..=40, 148, 216),
             (1..=100, 364, 528),
         ] {
-            let map = int_map(&mut heap, range.clone());
+            let map = int_map(&mut heap, &atoms, range.clone());
             assert_eq!(
                 beam_term::size::size_object(map) as i64,
                 flat,
@@ -1398,6 +1835,39 @@ mod tests {
                 "{range:?} behind two cons cells"
             );
         }
+    }
+
+    /// `size_shared/1`'s pricing state is **call-scoped**: [`SharedOnce`] is constructed inside
+    /// [`size_shared_1`] for each call, so the same term prices identically every time. A `seen`
+    /// set that outlived the call (a `thread_local!`/`static`, a plausible "optimisation") would
+    /// remember the first call's objects and price the repeat as `0`.
+    ///
+    /// The term is `[L, L, L]` over **one** shared `[1, 2]` subterm, so the repeated object is
+    /// genuinely the same pointer (an identity-sharing walk prices it once per call). Every
+    /// `observe` below runs over its own fresh [`BifContext`], so a third call proves the state is
+    /// per-**call**, not per-context either.
+    #[test]
+    fn size_shared_is_call_scoped_and_answers_the_same_number_twice() {
+        let mut heap = Heap::new(1 << 12).expect("test heap");
+        let one = make_small(1);
+        let two = make_small(2);
+        let inner = list2(&mut heap, one, two); // [1, 2]
+        let repeated = list2(&mut heap, inner, inner); // [ [1,2], [1,2] ]
+        let triple = list2(&mut heap, inner, repeated); // [ [1,2], [1,2], [1,2] ]
+
+        let first = observe("size_shared", 1, &[triple]);
+        let second = observe("size_shared", 1, &[triple]);
+        assert_ne!(
+            first, "int(0)",
+            "the repeated subterm's words must be counted at least once"
+        );
+        assert_eq!(
+            first, second,
+            "size_shared/1 must be call-scoped: a fresh call says the same number"
+        );
+        // A third call through yet another fresh context must agree again.
+        let third = observe("size_shared", 1, &[triple]);
+        assert_eq!(first, third);
     }
 
     /// The keys that stay **seam-backed** answer the typed capability gap — never a
@@ -2275,13 +2745,15 @@ mod tests {
     // index and legitimately differs (see `beam_term::ihash`).
 
     /// Builds `maps:from_list([{K, K} || K <- keys])` through this crate's map
-    /// producer ([`access::make_map`] → `beam_term::map::write_map`).
-    fn int_map(heap: &mut Heap, keys: impl IntoIterator<Item = i64>) -> Eterm {
+    /// producer ([`access::make_map`] → `beam_term::map::write_map`), over the atom
+    /// table the caller's BIF context will see — the same live namespace the
+    /// path-copying writers get.
+    fn int_map(heap: &mut Heap, atoms: &AtomTable, keys: impl IntoIterator<Item = i64>) -> Eterm {
         let pairs: Vec<(Eterm, Eterm)> = keys
             .into_iter()
             .map(|key| (make_small(key), make_small(key)))
             .collect();
-        access::make_map(heap, &pairs).expect("the map fits")
+        access::make_map(heap, atoms, &pairs).expect("the map fits")
     }
 
     /// Calls `map_info/1` on `map` (which must already live on `heap`).
@@ -2363,8 +2835,8 @@ mod tests {
         let mut atoms = AtomTable::new();
         atoms.seed(["badmap", "depth", "arrays", "collisions", "bitmaps", "leafs"]);
         let mut heap = Heap::new(1 << 12).expect("test heap");
-        let empty = access::make_map(&mut heap, &[]).expect("the empty map fits");
-        let flat = int_map(&mut heap, 1..=32);
+        let empty = access::make_map(&mut heap, &atoms, &[]).expect("the empty map fits");
+        let flat = int_map(&mut heap, &atoms, 1..=32);
         let tuple = heap.tuple(&[make_small(1)]).expect("the tuple fits");
         for (label, term) in [("empty map", empty), ("32-key flat map", flat)] {
             match probe_info(&mut heap, &atoms, term) {
@@ -2408,7 +2880,7 @@ mod tests {
         let mut heap = Heap::new(1 << 16).expect("test heap");
 
         // 33 keys: a bitmap head with 13 slots, 4 of them leaves.
-        let m33 = int_map(&mut heap, 1..=33);
+        let m33 = int_map(&mut heap, &atoms, 1..=33);
         let info = probe_info(&mut heap, &atoms, m33).expect("map_info runs");
         assert_eq!(
             read_info(info, &atoms),
@@ -2426,7 +2898,7 @@ mod tests {
         );
 
         // 40 keys: a deeper bitmap head (14 nodes, one of them with 14 slots).
-        let m40 = int_map(&mut heap, 1..=40);
+        let m40 = int_map(&mut heap, &atoms, 1..=40);
         let info = probe_info(&mut heap, &atoms, m40).expect("map_info runs");
         assert_eq!(
             read_info(info, &atoms),
@@ -2451,12 +2923,12 @@ mod tests {
         let mut atoms = AtomTable::new();
         atoms.seed(["badmap", "depth", "arrays", "collisions", "bitmaps", "leafs"]);
         let mut heap = Heap::new(1 << 16).expect("test heap");
-        let inner = int_map(&mut heap, 1..=40);
+        let inner = int_map(&mut heap, &atoms, 1..=40);
         let mut pairs: Vec<(Eterm, Eterm)> = (50..=90)
             .map(|key| (make_small(key), make_small(key)))
             .collect();
         pairs.push((make_small(100), inner));
-        let map = access::make_map(&mut heap, &pairs).expect("the map fits");
+        let map = access::make_map(&mut heap, &atoms, &pairs).expect("the map fits");
 
         let info = probe_info(&mut heap, &atoms, map).expect("map_info runs");
         assert_eq!(
@@ -2482,7 +2954,7 @@ mod tests {
         let mut atoms = AtomTable::new();
         atoms.seed(["badmap", "depth", "arrays", "collisions", "bitmaps", "leafs"]);
         let mut heap = Heap::new(1 << 16).expect("test heap");
-        let map = int_map(&mut heap, 1..=33);
+        let map = int_map(&mut heap, &atoms, 1..=33);
         let node = {
             let view = access::hamt_node(map).expect("a head node");
             // A sub-node slot: a boxed HAMT node.

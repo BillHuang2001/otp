@@ -63,6 +63,21 @@
 //! (the layout has exactly one owner; `crate::thing` re-exports them so
 //! `beam_term::thing`'s accessor surface is unchanged).
 //!
+//! # Checked readers (shape validation)
+//!
+//! [`sub_bits_parts`] / [`bitstring_parts`] / [`bit_at`] are the *unchecked* readers: an
+//! `ErlSubBits`'s `base_flags` word becomes a `*const u8` with no test at all, so a
+//! corrupt or stale payload word turns into an arbitrary-address read. The `try_*`
+//! siblings — [`try_sub_bits_parts`] / [`try_bitstring_parts`] / [`try_bit_at`] — live in
+//! the `checked` child module (`src/bitstring/checked.rs`) and are re-exported here, so
+//! every public path is unchanged. They run the same reads *after* a shape check and
+//! answer a typed error instead, and they are what a copier, a GC pass or a message
+//! encoder should call on a term whose provenance it does not own.
+//!
+//! The exact rules the check enforces, the `NotATerm`/`BadBitstring` split and the
+//! honest limit of the check are that child module's docs; `CONTEXT.md` in this directory
+//! states the whole invariant in one paragraph.
+//!
 //! # `unsafe` contract
 //!
 //! Every reader is `unsafe`: an `Eterm` being a live, well-formed term of the
@@ -71,6 +86,10 @@
 //! borrowed data. A writer that can detect a bad *argument* (a byte count too small
 //! for the bit count) returns a typed [`TermError`] instead of writing a corrupt
 //! term (workspace `CONTEXT.md` §3).
+
+mod checked;
+
+pub use checked::{try_bit_at, try_bitstring_parts, try_sub_bits_parts};
 
 use core::mem::size_of;
 
@@ -268,6 +287,13 @@ pub unsafe fn write_sub_bits(
 ///
 /// `t` must be a live `ErlSubBits` term (a bitstring whose header is
 /// `HEADER_SUB_BITS`), kept alive by the caller.
+///
+/// **The block's shape is not validated here.** A corrupt header, or an `orig` slot
+/// that is not a `BinRef`/on-heap bitstring, is read as if it were well formed. Use
+/// [`try_sub_bits_parts`] when the term's provenance is in doubt: it refuses every
+/// mis-shaped block with a typed error, though — like this reader — it cannot tell a
+/// freed block from a live one (the `checked` module's docs, *The honest limit is
+/// provenance*).
 pub unsafe fn sub_bits_parts(t: Eterm) -> (Eterm, Eterm, Eterm, Eterm) {
     let p = boxed_val(t);
     // SAFETY: the caller guarantees `t` is a live `ErlSubBits`, so words 1..4 are
@@ -294,12 +320,20 @@ pub unsafe fn sub_bits_parts(t: Eterm) -> (Eterm, Eterm, Eterm, Eterm) {
 /// bit `i` of the bitstring is bit `(offset + i) % 8` (MSB-first) of
 /// `base[(offset + i) / 8]`.
 ///
+/// A `size` word that is not a bit count makes this a garbage window: the arithmetic
+/// is **panic-free** (`end < start` saturates to `0`, so a corrupt sub-bits reports an
+/// empty window instead of underflowing), but the base pointer and the size are
+/// otherwise reported verbatim. Nothing here is a substitute for
+/// [`try_bitstring_parts`], which refuses a mis-shaped block outright.
+///
 /// # Safety
 ///
 /// `t` must be a live bitstring (on-heap or sub) term. For a sub-bitstring the base
 /// pointer must still be valid (not a volatile writable binary that has moved). The
 /// returned base pointer borrows the term's storage, so the caller must keep the
 /// owning heap (or the underlying binary) alive and unmoved while it is used.
+///
+/// **The block's shape is not validated** — only [`try_bitstring_parts`] does that.
 pub unsafe fn bitstring_parts(t: Eterm) -> (*const u8, usize, usize) {
     let p = boxed_val(t);
     // SAFETY: `t` is a live boxed bitstring, so its header word is initialised.
@@ -313,7 +347,9 @@ pub unsafe fn bitstring_parts(t: Eterm) -> (*const u8, usize, usize) {
         (
             (base_flags & !ERL_SUB_BITS_FLAG_MASK) as *const u8,
             start,
-            end - start,
+            // Saturating, not `-`: a corrupt `end < start` must not panic in a debug
+            // profile on runtime data (it reports an empty window instead).
+            end.saturating_sub(start),
         )
     } else {
         // SAFETY: an `ErlHeapBits` is `[thing_word, size, data…]`, so word 1 is the bit
@@ -323,7 +359,7 @@ pub unsafe fn bitstring_parts(t: Eterm) -> (*const u8, usize, usize) {
     }
 }
 
-/// Reads bit `i` (0-based, most-significant bit of the first byte first) of a
+/// Reads bit `i` (0-based, most significant bit of the first byte first) of a
 /// bitstring term.
 ///
 /// Reproduces the bit test of `erts_cmp_bits` / `erts_bs_get_*` (`erl_bits.c`):
@@ -333,17 +369,28 @@ pub unsafe fn bitstring_parts(t: Eterm) -> (*const u8, usize, usize) {
 ///
 /// `t` must be a live bitstring term and `i` must be less than its bit size. For a
 /// sub-bitstring the base storage must still be valid.
+///
+/// An `i` that is out of range, or an `offset + i` that overflows, answers `false`
+/// instead of reading out of bounds — a defined answer, never a panic. That is *not* a
+/// substitute for [`try_bit_at`], which validates the block's shape and refuses an
+/// out-of-range `i` with a typed error.
 pub unsafe fn bit_at(t: Eterm, i: usize) -> bool {
     // SAFETY: `t` is a live bitstring; bit `i` is within its size by the caller.
     let (base, offset, _size) = unsafe { bitstring_parts(t) };
-    unsafe { raw_bit(base, offset + i) != 0 }
+    match offset.checked_add(i) {
+        // SAFETY: the caller guarantees bit `offset + i` is inside `base`'s storage.
+        Some(bit) => unsafe { raw_bit(base, bit) != 0 },
+        // A corrupt `start` word: report "not set" rather than addressing past the end.
+        None => false,
+    }
 }
 
 /// Read bit `bit` (0 = most significant bit of the base byte) of a bitstring base.
 ///
 /// The one bit-level reader of the crate: [`bit_at`] applies it to a term's base and
 /// offset, and the comparison arm ([`crate::compare`]'s `erts_cmp_bits` port) applies
-/// it to a base/offset pair it already resolved.
+/// it to a base/offset pair it already resolved. The `checked` child module applies the
+/// same bit test to a validated base/offset pair.
 ///
 /// # Safety
 ///

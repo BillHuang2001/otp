@@ -324,6 +324,48 @@
     }
 
     #[test]
+    fn a_header_shaped_word_is_a_typed_badarg_never_a_read() {
+        // The deep copy walks lists through the crate-level shape gate
+        // (`crate::shape::cons_cell`: primary tag `TAG_PRIMARY_LIST` **and** a
+        // non-null cell pointer), not through `is_list` — whose `!(x & 0x2)` bit
+        // trick a header word also passes. So a header-shaped word reaching
+        // `ets:insert/2` is the typed `badarg`, at the root and nested inside a list.
+        //
+        // Residual: the shape test is not a liveness test. A word whose low bits look
+        // like a cons pointer but which points at freed/foreign memory is
+        // unverifiable by any word-local test (the residual ERTS's C shares); the
+        // ownership rule upstream — a stored word must stay rooted or be copied into
+        // storage the table owns — is the contract there, which is why this test only
+        // builds words that cannot be a cons pointer.
+        let mut store = test_store();
+        let mut heap = Heap::new(16);
+        for word in [
+            make_arityval_zero(),
+            make_arityval(1),
+            make_arityval(5),
+            make_header(1, FLOAT_SUBTAG),
+            make_header(1, MAP_SUBTAG),
+            Eterm::from_raw(TAG_PRIMARY_LIST), // the cons tag with a null cell pointer
+        ] {
+            assert!(
+                matches!(store.copy(word), Err(beam_common::BeamError::BadArg)),
+                "a header-shaped root word is a typed badarg: {word:?}"
+            );
+        }
+        // A rejected root word reserves nothing: the arena is untouched.
+        assert_eq!(store.words(), 0, "a rejected word reserves no store words");
+        assert_eq!(store.blocks(), 0, "a rejected word maps no block");
+        // Nested: a cons cell whose CAR is a header word.
+        let list = heap.cons(make_arityval(1), NIL).expect("test heap has room");
+        assert!(matches!(store.copy(list), Err(beam_common::BeamError::BadArg)));
+        // Nested: a 2-tuple whose second element is a header word.
+        let tuple = heap
+            .tuple(&[make_small(1), make_header(1, FLOAT_SUBTAG)])
+            .expect("test heap has room");
+        assert!(matches!(store.copy(tuple), Err(beam_common::BeamError::BadArg)));
+    }
+
+    #[test]
     fn cons_list_copy_is_equal_and_lives_in_table_storage() {
         let atoms = AtomTable::new();
         let mut heap = Heap::new(16);

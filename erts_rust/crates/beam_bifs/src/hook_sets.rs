@@ -39,7 +39,7 @@
 //! | [`MemoryHook`] | [`MEMORY_HOOK_BIFS`] | 2 |
 //! | [`LocalFunIdentity`] | [`LOCAL_FUN_IDENTITY_BIFS`] | 12 |
 //! | [`DictHook`] | [`DICT_HOOK_BIFS`] | 7 |
-//! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 11 |
+//! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 12 |
 //! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 8 |
 //! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 4 |
 //! | [`NifLoader`] | [`NIF_LOADER_BIFS`] | 1 |
@@ -49,7 +49,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 24 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 140 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 139 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -104,7 +104,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 140-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 139-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -211,10 +211,14 @@ pub const DICT_HOOK_BIFS: &[(&str, &str, u32)] = &[
 /// process/name/global-state surface of `src/proc_reg.rs`, each through a `proc_*`
 /// accessor.
 ///
-/// The set is exactly `proc_reg::register`'s roster (11 keys): every key routes
+/// The set is exactly `proc_reg::register`'s roster (12 keys): every key routes
 /// through the seam, so the module's registration and this table are asserted equal.
+/// `bump_reductions/1` is the one member whose answer is a *mutation* rather than a
+/// query: it charges the calling process's reduction counter (`bif.c:5454`), which
+/// is the same per-process state `process_flag/2` writes.
 /// Sorted by `(module, function, arity)`; see [`needs_process_hook`].
 pub const PROCESS_HOOK_BIFS: &[(&str, &str, u32)] = &[
+    ("erlang", "bump_reductions", 1),
     ("erlang", "group_leader", 0),
     ("erlang", "is_process_alive", 1),
     ("erlang", "ports", 0),
@@ -403,8 +407,8 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 ///
 /// The union of the five `runtime_bif!` family modules: `runtime/erlang.rs` (76),
 /// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (20),
-/// `runtime/debugger.rs` (13) and `runtime/other.rs` (28) = **193** registered keys,
-/// of which **140** forward to the seam — the fifty-three keys with real implementations
+/// `runtime/debugger.rs` (13) and `runtime/other.rs` (28) = **192** registered keys,
+/// of which **139** forward to the seam — the fifty-three keys with real implementations
 /// (`erlang:is_builtin/3`, `erlang:term_to_iovec/1,2`, the fourteen `erts_debug` /
 /// `erts_trace_cleaner` / `erts_literal_area_collector` constants, term walks and the
 /// two self-contained decoders (`copy_shared/2`, `disassemble/1`,
@@ -443,7 +447,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("code", "reset_coverage", 1),
     ("code", "set_coverage_mode", 1),
     ("erlang", "alias", 1),
-    ("erlang", "bump_reductions", 1),
     ("erlang", "call_on_load_function", 1),
     ("erlang", "cancel_timer", 1),
     ("erlang", "cancel_timer", 2),
@@ -890,6 +893,7 @@ mod tests {
         assert_eq!(
             PROCESS_HOOK_BIFS,
             &[
+                ("erlang", "bump_reductions", 1),
                 ("erlang", "group_leader", 0),
                 ("erlang", "is_process_alive", 1),
                 ("erlang", "ports", 0),
@@ -1254,7 +1258,31 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 140);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 139);
+    }
+    /// `erlang:bump_reductions/1` reads the [`ProcessHook`] seam, not the
+    /// `RuntimeHooks` one: its only runtime dependency is the calling process's own
+    /// reduction counter (`bump_reductions_1`, `bif.c:5454`), which is the same
+    /// per-process state `process_flag/2` already writes through this seam.
+    ///
+    /// Both predicates are asserted in both directions, so neither table can
+    /// re-acquire (or silently lose) the key, and the arity pins prove the gate is
+    /// the key rather than a prefix. The uninstalled-default leg — the typed
+    /// `unsupported_bif` gap, never a fabricated `true` — is pinned in
+    /// `src/proc_reg.rs`.
+    #[test]
+    fn bump_reductions_belongs_to_the_process_hook_roster() {
+        assert!(needs_process_hook("erlang", "bump_reductions", 1));
+        assert!(
+            !needs_runtime_hooks("erlang", "bump_reductions", 1),
+            "the key must not be listed by both seams"
+        );
+        assert!(
+            default_registry().contains("erlang", "bump_reductions", 1),
+            "the gate is only reachable for a registered key"
+        );
+        assert!(!needs_process_hook("erlang", "bump_reductions", 0));
+        assert!(!needs_process_hook("erlang", "bump_reductions", 2));
     }
 
     /// The module-doc table at the top of this file is the human-readable record of the
@@ -1428,6 +1456,8 @@ mod tests {
                     ("erlang", "group_leader", 1),   // wrong arity
                     ("erlang", "nodes", 0),          // the runtime-hooks seam, not this one
                     ("erlang", "get_module_info", 1), // the module-info seam
+                    ("erlang", "bump_reductions", 0), // wrong arity
+                    ("erlang", "bump_reductions", 2), // wrong arity
                 ],
             ),
             (
@@ -1533,6 +1563,7 @@ mod tests {
                     ("lists", "reverse", 1),        // a plain BIF
                     ("ets", "lookup", 2),           // the ets bridge, not this seam
                     ("erlang", "get_module_info", 1), // the module-info seam
+                    ("erlang", "bump_reductions", 1), // the process hook, not this seam
                 ],
             ),
         ];

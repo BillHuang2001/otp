@@ -19,8 +19,8 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   one-instruction dispatcher every driver calls — the interpreter's `Machine::drive` **and** the native tiers'
   per-instruction deopt helper `../jit/baseline/runtime.rs::jit_step_one` — which wraps the body
   `step_instruction_inner` with the uniform raise funnel, see below), `Machine::step_instruction` (the
-  single-module shorthand for it, `#[cfg(test)]`-callers only), `return_step`, `resolve_call_ext_apply` (the `erlang:apply/3` special case — C's
-  `fixed_apply`→`apply()`), `resolve_call_ext_send` (the `erlang:send/2` / `'!'/2` off-heap-aware send),
+  single-module shorthand for it, `#[cfg(test)]`-callers only), `return_step`, `resolve_call_ext_apply` (the
+  `erlang:apply/2,3` special cases — C's `i_apply_fun*` and `fixed_apply`→`apply()`), `resolve_call_ext_send` (the `erlang:send/2` / `'!'/2` off-heap-aware send),
   `resolve_external_entry` (the `call_ext*` cross-module seam), `call_ext_dispatch` (the single shared body of the
   three `call_ext*` arms — see below), `apply_import_target` + `ImportFrame` (the arm's own frame discipline over a
   resolved target). `ImportFrame` is `pub(crate)` and re-exported from `mod.rs` as
@@ -70,7 +70,7 @@ pub(crate) fn call_ext_dispatch(
     seam: Option<Option<(u32, u32, u32)>>,
 ) -> StepResult;   // `StepResult` = `Result<Step, Box<BeamError>>` (the crate-internal hot step result)
 ```
-Its resolution order is: `resolve_call_ext_apply` (the `erlang:apply/3` special case and
+Its resolution order is: `resolve_call_ext_apply` (the `erlang:apply/2,3` special cases and
 the cross-module call seam), then `resolve_call_ext_send`, then the host's cross-module seam, then the synchronous
 `call_import` BIF route — the last one marshalled with the **instruction's own `arity` operand**, never the import
 table's arity (the seam's own resolution uses the table's). The resolved `ApplyTarget` is then handed to
@@ -84,12 +84,23 @@ shared catch-aware `raise_bif_error`.
 - Each arm keeps its own tracing (`trace_call_import`) **before** delegating, so contract A.8 emission order is
   unchanged.
 
+### The in-machine `erlang:apply/2` arm (`Machine::resolve_call_ext_apply2`)
+`resolve_call_ext_apply` dispatches an `erlang:apply` import whose table arity is `2` to `resolve_call_ext_apply2`; the arity-3 `fixed_apply` decode is unchanged.
+Arity 2 is C's **dedicated `i_apply_fun*` shape** (`emu/ops.tab:872-874`, `APPLY_FUN` → `apply_fun(c_p, x(0), x(1), reg)`, `emu/instrs.tab:314-334`), **not** the `fixed_apply` module/function register shape: `x(0)` is the fun and `x(1)` its argument list.
+Running it **in this machine** is the point: the host's synchronous `apply/2` BIF runs the closure on a *fresh* machine, so a `receive` inside it dies in the uncatchable `blocked()` gap instead of suspending this process, where C resolves the fun's code and enters it in the same process (`call_fun`'s `$DISPATCH_FUN`).
+Its argument bound is the **register file**, not `apply/3`'s `MAX_ARG = 255`: the walk accepts `register_count() - 2` arguments (`MAX_REG - 2` = 1022, two slots being kept past them for the fun and the parked list) and the next one raises `error:system_limit`, C's default-tier `MAX_REG - 1` bound (`jit/x86/instr_fun.cpp:307-313`).
+Oracle-measured payloads: a non-fun `x(0)` ⇒ `error:{badfun, Term}`; a fun applied with the wrong count ⇒ `error:{badarity, {Fun, Args}}`; a non-list or improper `x(1)` ⇒ `error:badarg` — the list walk runs first, so a bad `x(1)` answers `badarg` whatever `x(0)` is, and a non-fun `x(0)` with a non-list `x(1)` is `badarg`, not `badfun`.
+Every one of them goes through `Machine::raise_bif_error`, so a live `try`/`catch` observes it.
+The arm parks the fun at `x(count)` and the list at `x(count+1)` before consulting the closure seam (C's `reg[arity] = fun` plus its `arg_reg` save/restore), so a `Suspend` reports `Step::Suspend { func, pc }` **at the instruction itself** and the resume re-executes it from those two restored sources; `CallExtTarget::{Target, Suspend}` carries that into the unchanged `CallExt*` frame discipline.
+`call_fun`'s classification and application ladder is **one** core — `funs::call_fun_target` → `CallFunOutcome { Enter, Value, Suspend, Raised }` — shared by `call_fun`/`call_fun2` and this arm (`funs::apply_fun_target`), so `badfun`/`badarity`, the `resolve_local_fun` entry and the `apply_fun_outcome` fallback cannot drift between them.
+Pin: `tests/call_ext_apply.rs` (an in-machine closure body over all three `call_ext*` forms, the four payloads, the 1022/1023 bound, the suspend-and-resume pair, the host closure door and the oracle fixture); the shape answers identically on both native tiers, because the baseline tier routes `call_ext*` through the same `call_ext_dispatch`.
+
 ## Instruction ownership
 - **Core arms executed inline in `step_instruction`** (`dispatch.rs`): the metadata no-ops (`Label`, `Line`,
   `IntCodeEnd`, `ExecutableLine`, `DebugLine`, `NifStart`, `OnLoad`); `FuncInfo`; `Move`/`Swap`/`InitYregs`;
   `Test`; `SelectVal` (its pair decision is the ladder of `select.rs`, next section); `Jump`; `GcBif`/`Bif`/`Bif0`; `Call`/`CallLast`/`CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`
   (each `CallExt*` arm traces the callee's entry and then delegates its whole body to `Machine::call_ext_dispatch`,
-  which runs the ordered resolution — the `erlang:apply/3` special case + the cross-module call seam, the
+  which runs the ordered resolution — the `erlang:apply/2,3` special cases + the cross-module call seam, the
   `erlang:send/2` seam, the host's cross-module seam, the synchronous BIF route — and applies the form's
   `ImportFrame`);
   `Allocate`/`AllocateHeap`/`TestHeap`/`Deallocate`/`DeallocateReturn`/`Trim`; `Return`; `Generic`.
@@ -362,7 +373,7 @@ The `Machine`-side halves it cites (the dirty-extent refill and `Machine::label_
 
 ## The `call_ext*` / `return` / raise context transfers (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.
-- **The `call_ext*` / `return` / raise context transfers.** Each `CallExt`/`CallExtOnly`/`CallExtLast` arm first calls `resolve_call_ext_apply` (`dispatch.rs:689`), the `erlang:apply/3` special case: for an `erlang:apply/3` import (`import_arity == 3`; `erlang:apply/2` is `apply(Fun, Args)` and is not special-cased) it reproduces C's `fixed_apply` -> `apply()` register decode (`x(0)=Module`, `x(1)=Function`, `x(2)=Args`, the nested `apply of apply/3` unwrap, the argument-list walk -- `MAX_ARG` -> `error:system_limit`, a non-proper tail -> the catchable `badarg`) and hands the outcome to `families::funs::apply_target`; any other import returns `None`. Otherwise the arm resolves the import through `resolve_external_entry` (the per-run `LabelMap::import_target` for the `(module, function, arity)`, then `ctx.resolve_external_call`; a `Some` registers the callee context and resolves the entry label against the callee's own map). On `Some` they use the LOCAL discipline and report `Step::Enter`: `CallExt` = `Instr::Call` (stores `Continuation::Address{func, pc+1, context: current_context()}` in the current frame, i.e. the caller's context), `CallExtOnly` = `CallOnly` (no continuation change), `CallExtLast` = `CallLast` (the target is resolved **before** `pop_frame_checked(deallocate)`, and the arm applies the same `ImportFrame` discipline to a resolved `apply/3` target via `apply_import_target`). On `None` they are byte-identical to a plain `call_bif` dispatch. A **host BIF error** from the resolved target -- on the synchronous `call_bif` route or the `apply/3` route -- is routed through `Machine::raise_bif_error` (`ApplyTarget::Raised`), landing in the caller's live `try`/`catch`. `Instr::Return` emits `Step::Enter` when the target context differs; `throw_with_trace` emits `Step::Enter` when a live catch frame lives in another context; `ApplyLast` follows its (popped) frame's continuation through `Machine::continuation_step` and emits `Step::Enter` when that continuation's context differs from the running module's.
+- **The `call_ext*` / `return` / raise context transfers.** Each `CallExt`/`CallExtOnly`/`CallExtLast` arm first calls `resolve_call_ext_apply` (`dispatch.rs`), the `erlang:apply/2,3` special cases: for an `erlang:apply/3` import (`import_arity == 3`) it reproduces C's `fixed_apply` -> `apply()` register decode (`x(0)=Module`, `x(1)=Function`, `x(2)=Args`, the nested `apply of apply/3` unwrap, the argument-list walk -- `MAX_ARG` -> `error:system_limit`, a non-proper tail -> the catchable `badarg`) and hands the outcome to `families::funs::apply_target`; for an `erlang:apply/2` import it runs C's dedicated `i_apply_fun*` shape (the fun at `x(0)`, its argument list at `x(1)`, the register-file bound and the `badfun`/`badarity`/`badarg` payloads of the section above); any other import returns `None`. Otherwise the arm resolves the import through `resolve_external_entry` (the per-run `LabelMap::import_target` for the `(module, function, arity)`, then `ctx.resolve_external_call`; a `Some` registers the callee context and resolves the entry label against the callee's own map). On `Some` they use the LOCAL discipline and report `Step::Enter`: `CallExt` = `Instr::Call` (stores `Continuation::Address{func, pc+1, context: current_context()}` in the current frame, i.e. the caller's context), `CallExtOnly` = `CallOnly` (no continuation change), `CallExtLast` = `CallLast` (the target is resolved **before** `pop_frame_checked(deallocate)`, and the arm applies the same `ImportFrame` discipline to a resolved `apply/3` target via `apply_import_target`). On `None` they are byte-identical to a plain `call_bif` dispatch. A **host BIF error** from the resolved target -- on the synchronous `call_bif` route or the `apply/3` route -- is routed through `Machine::raise_bif_error` (`ApplyTarget::Raised`), landing in the caller's live `try`/`catch`. `Instr::Return` emits `Step::Enter` when the target context differs; `throw_with_trace` emits `Step::Enter` when a live catch frame lives in another context; `ApplyLast` follows its (popped) frame's continuation through `Machine::continuation_step` and emits `Step::Enter` when that continuation's context differs from the running module's.
 
 ## The `resolve_local_call` seam: host contract and the `prim_tty`/`zlib` motivation (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.

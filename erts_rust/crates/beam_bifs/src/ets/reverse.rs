@@ -60,9 +60,7 @@ use beam_term::Eterm;
 use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
-use super::{
-    copy_out_list, element_pos, finish_chunk, resolve, restore_table, take_table_gated,
-};
+use super::{copy_out_list, element_pos, resolve, restore_table, take_table_gated};
 
 /// Registers the reverse select family (`ets:select_reverse/1,2,3`).
 pub(super) fn register(reg: &mut BifRegistry) {
@@ -107,22 +105,43 @@ fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// direction (see [`super::Continuation`]), so `ets:select/1` resuming it keeps
 /// that direction: a backward walk for an `ordered_set`, and for a hash kind the
 /// same sequence the forward walk would give (see the module docs).
+///
+/// `MatchSpec` is deep-copied into the registry's input store and compiled **from
+/// that copy** ([`super::own_spec_input`]), so the literals the continuation's
+/// compiled program carries are registry-owned words and a resume never reads the
+/// caller's heap; the copy is retained exactly while a continuation names it
+/// ([`super::finish_chunk_with_input`]).
 fn select_reverse_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let _eval = super::self_hook::SpecEval::install(ctx.self_pid());
     let handle = resolve::resolve_handle(ctx, args[0])?;
-    let spec = compile(args[1], ctx.atoms())?;
+    let owned = super::own_spec_input(ctx, args[1])?;
+    let spec = match compile(owned, ctx.atoms()) {
+        Ok(spec) => spec,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
     // A non-integer or a negative limit is `badarg` here; `0` is rejected by
     // `select_reverse_limit` (matching the oracle, like `ets:select/3`).
-    let limit = element_pos(args[2])?;
+    let limit = match element_pos(args[2]) {
+        Ok(limit) => limit,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
 
-    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    let table = match take_table_gated(ctx, handle, resolve::Gate::Read) {
+        Ok(table) => table,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
     let outcome = {
         let (atoms, heap) = ctx.atom_and_heap();
         table.select_reverse_limit(&spec, limit, atoms, heap)
     };
-    restore_table(ctx, handle, table)?;
-    let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont, true)
+    if let Err(err) = restore_table(ctx, handle, table) {
+        return Err(super::released_input(ctx, owned, err));
+    }
+    let (results, cont) = match outcome {
+        Ok(chunk) => chunk,
+        Err(err) => return Err(super::released_input(ctx, owned, err)),
+    };
+    super::finish_chunk_with_input(ctx, handle, results, cont, true, owned)
 }
 
 /// `ets:select_reverse(Continuation)` — the `/1` resume.
@@ -141,7 +160,9 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::{atom_val, signed_value, AtomTable};
 
-    use crate::access::{is_atom, is_nil, is_tuple, make_ref_thing, tuple_element, tuple_size};
+    use crate::access::{
+        is_atom, is_nil, is_tuple, make_ref_thing, ref_thing_id, tuple_element, tuple_size,
+    };
     use crate::print::proper_list;
 
     use super::super::{insert_2, new_2, TableRegistry};
@@ -172,6 +193,11 @@ mod tests {
             "node",
             "nonode@nohost",
             "undefined",
+            // The keys/objects of the continuation-ownership test below.
+            "a",
+            "b",
+            "c",
+            "z",
         ]);
         atoms
     }
@@ -531,5 +557,121 @@ mod tests {
         }
         out.push_str(rest);
         out
+    }
+
+    /// The `{Key, Float}` object the continuation-ownership test inserts, with a
+    /// runtime-built boxed float (so it is copied into the table's own store, never a
+    /// literal).
+    fn float_pair(ctx: &mut BifContext<'_>, key: &str, value: f64) -> Eterm {
+        let k = ctx.atom(key).expect("seeded");
+        let v = ctx.make_float(value).expect("the float fits");
+        ctx.tuple(&[k, v]).expect("fits")
+    }
+
+    /// Invalidates every word `heap` handed out, rewriting the boxed float that
+    /// carried `value` as `replacement` (the empty list everywhere else, a *different*
+    /// number in the float's two words — see `ets.rs`'s helper of the same shape).
+    ///
+    /// The spec is built before the objects, so the float it finds is the **spec's**
+    /// literal even though the inserted objects carry the same value.
+    fn invalidate_caller_heap(heap: &mut Heap, value: f64, replacement: f64) {
+        let index = heap
+            .used_words_mut()
+            .iter()
+            .position(|word| {
+                crate::access::is_float(*word)
+                    && crate::access::float_bits(*word) == value.to_bits()
+            })
+            .expect("the runtime-built spec float must live on the caller heap");
+        let header = heap.used_words_mut()[index];
+        for word in heap.used_words_mut() {
+            *word = Eterm::nil();
+        }
+        let words = heap.used_words_mut();
+        words[index] = header;
+        words[index + 1] = Eterm::from_raw(replacement.to_bits() as usize);
+    }
+
+    /// **An `ets:select_reverse/3` continuation outlives the spec's heap.**
+    ///
+    /// The spec's head pattern carries a runtime-built boxed float, so compiling it
+    /// in the calling frame would leave `Pattern::Literal` pointing at that heap. The
+    /// spec is therefore built on a scratch heap, the first (highest-key) chunk is
+    /// drawn, every word of that heap is invalidated (the float rewritten as a
+    /// different number), and the resume runs from a fresh context over a fresh heap.
+    /// It must still yield the next descending chunk — the `{a,1.5}` object — which
+    /// only the registry's copy of the spec makes possible (`super::own_spec_input`).
+    ///
+    /// A copy-less `select_reverse_3` (compiling `args[1]` instead of the registry's
+    /// copy) therefore reads a destroyed term on the resume: the pin fails either as
+    /// a non-match — the literal now denotes 1000.0 — or, as measured, as a dangling
+    /// read of the invalidated spec structure.
+    ///
+    /// Goldens (mirroring `matches.rs`'s fixture, on an ordered key sequence): an
+    /// `ordered_set` holding `{a,1.5}`/`{b,2.5}`/`{c,1.5}`/`{z,3.5}` with
+    /// `P = {'$1', 1.5}`, body `['$_']` and `L = 1` chunks — descending — as
+    /// `[{c,1.5}]`+cont · `[{a,1.5}]`+cont · the bare `'$end_of_table'`.
+    #[test]
+    fn a_select_reverse_continuation_survives_invalidation_of_the_specs_heap() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        let mut scratch = Heap::new(8192).expect("scratch heap");
+        let cont_id = {
+            let mut ctx =
+                BifContext::new(&mut scratch, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            // The spec first: it owns the boxed float the invalidation below rewrites,
+            // and `invalidate_caller_heap` finds the lowest-addressed one.
+            let dollar1 = ctx.atom("$1").expect("seeded");
+            let bound = ctx.make_float(1.5).expect("the float fits");
+            let pattern = ctx.tuple(&[dollar1, bound]).expect("fits");
+            let guards = ctx.list(&[]).expect("fits");
+            // `['$_']` is the whole matched object, so the chunk carries the object
+            // term (its float value from the table store, not the spec's literal).
+            let body = ctx.list(&[ctx.atom("$_").expect("seeded")]).expect("fits");
+            let clause = ctx.tuple(&[pattern, guards, body]).expect("fits");
+            let spec = ctx.list(&[clause]).expect("fits");
+
+            let handle = new_table(&mut ctx, "mytab", "ordered_set");
+            for (key, value) in [("a", 1.5), ("b", 2.5), ("c", 1.5), ("z", 3.5)] {
+                let object = float_pair(&mut ctx, key, value);
+                insert_2(&mut ctx, &[handle, object]).expect("insert");
+            }
+            let limit = ctx.int(1).expect("fits");
+            let chunk = select_reverse_3(&mut ctx, &[handle, spec, limit])
+                .expect("ets:select_reverse/3");
+            let first = proper_list(tuple_element(chunk, 0)).expect("a proper list");
+            assert_eq!(first.len(), 1, "one object at limit 1");
+            let expected = float_pair(&mut ctx, "c", 1.5);
+            assert!(
+                beam_term::compare::eq(first[0], expected, &atoms),
+                "the first reverse chunk must be the `{{c,1.5}}` object — the highest \
+                 matching key of the descending walk"
+            );
+            ref_thing_id(tuple_element(chunk, 1)).expect("a continuation is a ref thing")
+        };
+        assert!(scratch.used() > 0, "the spec must occupy caller-heap words");
+        invalidate_caller_heap(&mut scratch, 1.5, 1000.0);
+
+        let mut heap = Heap::new(8192).expect("resume heap");
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(2, 0)).with_tables(&mut reg);
+        let cont = make_ref_thing(ctx.heap(), cont_id).expect("the rebuilt continuation fits");
+        let chunk = select_reverse_1(&mut ctx, &[cont]).expect("ets:select_reverse/1");
+        let results = proper_list(tuple_element(chunk, 0)).expect("a proper list");
+        assert_eq!(
+            results.len(),
+            1,
+            "the resumed walk must still match key `a` — the spec's float has to come \
+             from the registry's copy, not the invalidated caller heap"
+        );
+        let expected = float_pair(&mut ctx, "a", 1.5);
+        assert!(
+            beam_term::compare::eq(results[0], expected, &atoms),
+            "the resumed chunk must be the `{{a,1.5}}` object, the next one descending"
+        );
+        assert!(
+            ref_thing_id(tuple_element(chunk, 1)).is_ok(),
+            "a full chunk (limit 1) carries a continuation"
+        );
     }
 }

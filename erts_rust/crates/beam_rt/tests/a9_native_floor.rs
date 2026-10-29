@@ -32,9 +32,8 @@
 //!
 //! | Surface | Shape |
 //! |---|---|
-//! | `application:get_all_key/1` | the loaded-application gate, the controller's 13-key order, and the `env` divergence |
-//! | `application:get_key/1,2` | `undefined` for `/1`; the controller key set + documented defaults for `/2` |
-//! | `application:get_application/0,1` | the module → loaded-application map, the `/0` `undefined`, and the non-atom guard |
+//! | `application:*` (the **live** controller) | `set_env/4` → `get_env/2` visibility, the environment incl. kernel's injected `logger`/`connect_all`, the 13-key `get_all_key/1` order, the `get_key/2` defaults, the module → application map, the pid clause, and both application lists |
+//! | `application:which_applications/0`, `loaded_applications/0` | the live `application_controller`'s two triples in its own orders (`stdlib`,`kernel` / `kernel`,`stdlib`) |
 //! | `init:get_argument/1` | the four automatic flags (`root`, `home`, `progname`, `bindir`) and an absent flag |
 //! | `init:script_id/0` | the **loaded** boot script's real header on the default boot path, and the typed gap for a runtime that drives no script |
 //! | `code:lib_dir/2` | the app dir joined with any subdir, `{error,bad_name}`, `function_clause` |
@@ -46,8 +45,23 @@
 //! ([`script_id_is_the_loaded_boot_scripts_real_header`]).
 //!
 //! Every rendering compared here comes from the **same printer** on both sides: this runtime's
-//! `~p` drives the registered `io:format/2`, so [`agrees_with_the_oracle`] is a byte comparison of
-//! the two answers, never a hardcoded expectation.
+//! `~p` drives the registered `io:format/2`, so [`agrees_with_the_oracle`] (the in-process route)
+//! and [`agrees_on_the_booted_route`] (the built binary, after the boot script) are byte
+//! comparisons of the two answers, never hardcoded expectations.
+//!
+//! # Why maps are compared in a canonical order
+//!
+//! `~p` renders a **small** map in the map's *internal* key order, which ERTS does not keep stable
+//! across VMs. Measured on this host, with no code change: `kernel`'s injected `logger` handler
+//! configuration carries `#{single_line => false,legacy_header => true}`, which the oracle renders
+//! in that order on most runs and in the reverse order on the rest (5/40 standalone probes of
+//! `lists:sort(application:get_all_env(kernel))` differed only there), while this runtime's own
+//! rendering is invariant (12/12). Map iteration order is not part of the contract these tests
+//! pin, so both comparison helpers put every map literal's entries — at every nesting depth — into
+//! one fixed (sorted) order first ([`canonical_map_order`]); everything else, every key and every
+//! value included, is still compared byte for byte. The sibling
+//! [`logger_default_handler.rs`](logger_default_handler) suite avoids the same instability by
+//! rendering its maps as sorted `{Key, Value}` pairs.
 //!
 //! # The routes these values are measured on
 //!
@@ -58,27 +72,26 @@
 //! supervision tree the oracle
 //! has — a live `kernel_sup`, `application_controller`, `logger` and `file_server_2` — rather than
 //! the preloaded-only floor an earlier runtime reported. The in-process
-//! [`Runtime::with_defaults`] route the helpers below use drives **no** script (it boots the
-//! preloaded set only), which is why the few route-sensitive answers are asserted on the route
-//! that really produces them.
+//! [`Runtime::with_defaults`] route ([`renders`]) drives **no** script (it boots the preloaded set
+//! only), so an `application:*` query there has no `ac_tab` to read: every `application:*`
+//! assertion below therefore uses [`renders_booted`] / [`agrees_on_the_booted_route`], the built
+//! binary's booted route — the only route on which a live `application_controller` exists on
+//! either side (`erl -noshell` always boots).
 //!
 //! # Where the values diverge **by construction** (never a bug)
 //!
 //! Each is marked `// documented divergence:` where it is asserted, and every one is an answer
 //! that reads *this* runtime's own state truthfully:
 //!
-//! * **`application:get_all_key/1` / `get_key/2`'s `env`.** The oracle's `kernel` environment
-//!   carries two **runtime-injected** entries (`connect_all`, `logger`) that the resource file
-//!   never declares, in the application controller's own storage order. This runtime's
-//!   `application:*` view is a **native floor over the parsed `.app` resource**, so it reports that
-//!   resource's `env` **verbatim** and never the controller's injections — the floor claims the
-//!   call ahead of the registry on *every* route, live `application_controller` or not. The test
-//!   proves the list against the oracle's own `file:consult` of that resource (`stdlib`'s empty
-//!   environment agrees outright, and the resource file's list is *not* what the oracle's loaded
-//!   controller reports).
-//! * **`application:get_application/1` on a pid.** The oracle has an `is_pid/1` clause answering
-//!   `undefined`; this runtime's native floor has no pid clause, so a pid reports the non-atom
-//!   guard's `function_clause` shape instead.
+//! * **`application:*`'s loaded-release `vsn`.** Every `application:*` query is now the live
+//!   `application_controller`'s — there is no `.app`-resource floor left — so the environment it
+//!   reports is the running node's (nine `kernel` pairs, the injected `logger`/`connect_all`
+//!   included) and a `set_env/4` is visible to the next `get_env/2`. The one value that can still
+//!   differ from the oracle's is a **version**: the default route loads *this runtime's own*
+//!   release's boot script, which embeds this checkout's `stdlib` version (`8.1`) where the
+//!   oracle's embeds its installation's (`8.1.1`) — the same relationship `init:script_id/0`
+//!   pins. `kernel`'s version happens to coincide, and every name/description/order is compared
+//!   with the oracle outright.
 //! * **`init:script_id/0` on the default boot path.** The default boot script really is loaded, so
 //!   there *is* an id: the **loaded** script's real `{Name, Vsn}` header, never a fabricated one.
 //!   The typed capability gap survives only for a runtime that drives **no** script (the plain
@@ -164,6 +177,224 @@ fn unwrapped(text: &str) -> String {
     text.lines().map(str::trim_start).collect::<String>()
 }
 
+/// The canonical comparison form of a `~p` rendering: every **map literal's** entries re-ordered
+/// into sorted order, at every nesting depth, with everything else byte-identical.
+///
+/// `~p` renders a small map in the map's *internal* key order, which ERTS does not keep stable
+/// across VMs (see the module docs: the oracle alternates the two orders of `kernel`'s injected
+/// `#{single_line => …, legacy_header => …}` while this runtime's own rendering is invariant). Map
+/// iteration order is not part of the contract these tests pin, so the two renderings are taken to
+/// this form before being compared: every entry — and so every key and every value — is still
+/// compared byte for byte, in one fixed order. Nothing that *is* part of the contract moves: a
+/// tuple's or a list's element order is preserved (only maps are re-ordered), quoted strings and
+/// quoted atoms are copied verbatim (so a `"#{…}"` in a *value* is never mistaken for a map), and
+/// only the printer's own layout *around* a map entry — the line break and indentation it precedes
+/// one with — is trimmed, since that belongs to the entry's position rather than to its content.
+fn canonical_map_order(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            // A string or a quoted atom: copy it whole, `#{`, `,` and `}` inside included.
+            b'"' | b'\'' => {
+                let end = skip_quoted(bytes, index);
+                out.push_str(&text[index..end]);
+                index = end;
+            }
+            // A character literal (`$#`, `$}`, `$\n`, `$\x{1F}`): copy it whole.
+            b'$' => {
+                let end = skip_char_literal(bytes, index);
+                out.push_str(&text[index..end]);
+                index = end;
+            }
+            b'#' if bytes.get(index + 1) == Some(&b'{') => {
+                let Some(end) = map_end(bytes, index + 2) else {
+                    // Unterminated (never produced by a printer): copy the rest verbatim.
+                    out.push_str(&text[index..]);
+                    break;
+                };
+                let body = &text[index + 2..end - 1];
+                let mut entries: Vec<String> = map_entries(body)
+                    .into_iter()
+                    // The printer's layout around an entry (the line break and indentation it
+                    // puts before one) belongs to the entry's *position*, not to its content, so
+                    // it is trimmed away: that is what makes the form independent of the order
+                    // the entries are printed in.
+                    .map(|entry| canonical_map_order(entry.trim()))
+                    .collect();
+                entries.sort();
+                out.push_str("#{");
+                out.push_str(&entries.join(","));
+                out.push('}');
+                index = end;
+            }
+            _ => {
+                let character = text[index..].chars().next().expect("a character");
+                out.push(character);
+                index += character.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// The index just past the `}` matching the map whose body starts at `start`, or `None` when the
+/// braces are unbalanced. Quoted strings/atoms, character literals and nested brackets are skipped,
+/// so a `}` inside any of them cannot close the map.
+fn map_end(bytes: &[u8], start: usize) -> Option<usize> {
+    scan_top_level(bytes, start).1.map(|brace| brace + 1)
+}
+
+/// The comma-separated entries of a map body, split only at **top-level** commas (a `,` inside a
+/// nested tuple, list, binary or map stays part of its entry).
+fn map_entries(body: &str) -> Vec<&str> {
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+    let (commas, _) = scan_top_level(body.as_bytes(), 0);
+    let mut entries = Vec::with_capacity(commas.len() + 1);
+    let mut begin = 0;
+    for comma in commas {
+        entries.push(&body[begin..comma]);
+        begin = comma + 1;
+    }
+    entries.push(&body[begin..]);
+    entries
+}
+
+/// Scans from `start` for the **top-level** commas and for the `}` closing the enclosing map.
+///
+/// "Top level" means outside every quoted string/atom, character literal and nested `(…)`/`[…]`/
+/// `{…}`/`#{…}`/`<<…>>`, which is exactly what a `~p` rendering's map body needs: its entries hold
+/// commas of their own, but only their own brackets nest over them.
+fn scan_top_level(bytes: &[u8], start: usize) -> (Vec<usize>, Option<usize>) {
+    let mut commas = Vec::new();
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' => index = skip_quoted(bytes, index),
+            b'$' => index = skip_char_literal(bytes, index),
+            b'#' if bytes.get(index + 1) == Some(&b'{') => {
+                depth += 1;
+                index += 2;
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'<') => {
+                depth += 1;
+                index += 2;
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' if depth == 0 => return (commas, Some(index)),
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'>' if depth > 0 && bytes.get(index + 1) == Some(&b'>') => {
+                depth -= 1;
+                index += 2;
+            }
+            b',' if depth == 0 => {
+                commas.push(index);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    (commas, None)
+}
+
+/// The index just past the closing quote of the string or quoted atom starting at `start`, an
+/// escaped character (`\"`, `\\`) never counting as the close.
+fn skip_quoted(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            byte if byte == quote => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The index just past the character literal (`$a`, `$\\`, `$\n`, `$\x{1F}`) starting at `start`.
+fn skip_char_literal(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    if index >= bytes.len() {
+        return bytes.len();
+    }
+    if bytes[index] != b'\\' {
+        return (index + 1).min(bytes.len());
+    }
+    index += 1; // past the backslash
+    if index >= bytes.len() {
+        return bytes.len();
+    }
+    match bytes[index] {
+        b'x' if bytes.get(index + 1) == Some(&b'{') => {
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end] != b'}' {
+                end += 1;
+            }
+            (end + 1).min(bytes.len())
+        }
+        b'x' | b'^' => (index + 2).min(bytes.len()),
+        b'0'..=b'7' => (index + 3).min(bytes.len()),
+        _ => (index + 1).min(bytes.len()),
+    }
+}
+
+/// [`canonical_map_order`] re-orders **map entries and nothing else** — the one normalization the
+/// two comparison helpers apply, pinned on the shapes `~p` really produces.
+#[test]
+fn canonical_map_order_reorders_map_entries_and_nothing_else() {
+    // The measured flake, verbatim: the two orders ERTS alternates for `kernel`'s injected
+    // `logger` handler configuration, one level down in the environment list.
+    let reversed = "{[{handler,default,logger_std_h,#{formatter =>{logger_formatter,\
+                    #{legacy_header => true,single_line => false}},config => #{type => standard_io}}}]}";
+    let natural = "{[{handler,default,logger_std_h,#{config => #{type => standard_io},\
+                   formatter =>{logger_formatter,#{single_line => false,legacy_header => true}}}}]}";
+    assert_eq!(canonical_map_order(natural), canonical_map_order(reversed));
+    // A different key or a different value still differs — the values are compared, not dropped.
+    assert_ne!(
+        canonical_map_order("#{single_line => false,legacy_header => true}"),
+        canonical_map_order("#{single_line => true,legacy_header => true}")
+    );
+    assert_ne!(
+        canonical_map_order("#{single_line => false,legacy_header => true}"),
+        canonical_map_order("#{single_line => false}")
+    );
+    // Lists, tuples and binaries keep their order: only a `#{…}` is re-ordered.
+    assert_eq!(canonical_map_order("[{b,1},{a,2}]"), "[{b,1},{a,2}]");
+    assert_ne!(canonical_map_order("{b,a}"), canonical_map_order("{a,b}"));
+    assert_ne!(canonical_map_order("<<2,1>>"), canonical_map_order("<<1,2>>"));
+    // `#{`, `,` and `}` inside a string or a quoted atom are not a map; a character literal is
+    // one character. A nested map *is* canonicalized, and an entry holding a comma, a `=>` or a
+    // binary stays one entry.
+    assert_eq!(canonical_map_order("{\"#{b,a}\",'#{b,a}',b}"), "{\"#{b,a}\",'#{b,a}',b}");
+    assert_eq!(canonical_map_order("[$#,b]"), "[$#,b]");
+    assert_eq!(canonical_map_order("#{b => 1,a => 2}"), canonical_map_order("#{a => 2,b => 1}"));
+    assert_eq!(
+        canonical_map_order("#{x => {1,2},y => <<1,2>>}"),
+        canonical_map_order("#{y => <<1,2>>,x => {1,2}}")
+    );
+    // The printer's own line break and indentation move with an entry's *position*, so a map the
+    // printer broke across lines normalizes like the same map on one line.
+    assert_eq!(canonical_map_order("#{b => 1,\n  a => 2}"), "#{a => 2,b => 1}");
+    assert_eq!(
+        canonical_map_order("#{b => 1,\n  a => 2}"),
+        canonical_map_order("#{a => 2,\n  b => 1}")
+    );
+    // The empty map, and text holding no map at all, are untouched.
+    assert_eq!(canonical_map_order("#{}"), "#{}");
+    assert_eq!(canonical_map_order("{{ok,[]},undefined}"), "{{ok,[]},undefined}");
+}
+
 /// The error `call` raises, asserting it really raises.
 fn raise_of(call: &str) -> BeamError {
     let mut runtime = Runtime::with_defaults().expect("the default runtime");
@@ -172,8 +403,9 @@ fn raise_of(call: &str) -> BeamError {
         .expect_err(&format!("`{call}` must raise"))
 }
 
-/// Asserts this runtime renders `call` **exactly** as the live oracle does, and returns the
-/// rendering.
+/// Asserts this runtime renders `call` **exactly** as the live oracle does — up to the *internal
+/// key order* of a map in the term, which `~p` reads out and ERTS does not keep stable across VMs
+/// ([`canonical_map_order`]) — and returns the rendering.
 ///
 /// A missing oracle — or one that cannot answer — is a loud skip: the runtime's own rendering is
 /// still returned, so the caller's assertions still run instead of passing silently.
@@ -182,7 +414,11 @@ fn agrees_with_the_oracle(call: &str) -> String {
     let Some(expected) = oracle_renders(call) else {
         return rendered;
     };
-    assert_eq!(rendered, expected, "the oracle renders `{call}` differently");
+    assert_eq!(
+        canonical_map_order(&rendered),
+        canonical_map_order(&expected),
+        "the oracle renders `{call}` differently"
+    );
     rendered
 }
 
@@ -197,6 +433,46 @@ fn oracle_renders(call: &str) -> Option<String> {
             None
         }
     }
+}
+// ---------------------------------------------------------------------------------------
+// The booted route
+// ---------------------------------------------------------------------------------------
+/// The `~p` rendering of `call` on the **booted** route: the built `beam_rt` binary, which drives
+/// the default boot script before its action, so the live `kernel_sup` / `application_controller`
+/// the caller needs really exists.
+///
+/// The in-process [`Runtime::with_defaults`] route boots the preloaded set only. It has **no**
+/// `application_controller` and therefore no `ac_tab`, so an `application:*` query there is an
+/// honest `badarg` — which is why every `application:*` assertion below uses this route instead
+/// of [`renders`].
+fn renders_booted(call: &str) -> String {
+    let cli = beam_rt_eval(&format!("io:format(\"~p\", [{call}])."));
+    assert_eq!(
+        cli.code, 0,
+        "`{call}` on the booted route must answer (stderr {:?})",
+        cli.err
+    );
+    cli.out.trim_end().to_string()
+}
+/// Asserts the **booted** route renders `call` exactly as the live oracle does, and returns the
+/// rendering. Line wrapping is undone on both sides ([`unwrapped`]), since a long term is broken
+/// across lines by whichever printer is closer to the width limit, and a map's *internal* key
+/// order is canonicalized on both sides ([`canonical_map_order`]), since `~p` reads that order out
+/// and ERTS does not keep it stable across VMs — every key and every value is still compared.
+///
+/// A missing oracle — or one that cannot answer — is a loud skip: the runtime's own rendering is
+/// still returned, so the caller's assertions still run instead of passing silently.
+fn agrees_on_the_booted_route(call: &str) -> String {
+    let rendered = renders_booted(call);
+    let Some(expected) = oracle_renders(call) else {
+        return rendered;
+    };
+    assert_eq!(
+        canonical_map_order(&unwrapped(&rendered)),
+        canonical_map_order(&unwrapped(&expected)),
+        "the oracle renders `{call}` differently"
+    );
+    rendered
 }
 
 /// Runs the arbitrary Erlang `program` (which must terminate on its own) under the oracle and
@@ -314,15 +590,113 @@ fn single_argument(runtime: &mut Runtime, flag: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------
+// 0. the `application` namespace is the LIVE controller's, not a floor
+// ---------------------------------------------------------------------------------------
+/// This checkout's `kernel` release (`lib/kernel/vsn.mk`, embedded in the committed
+/// `bootstrap/bin/start.boot` the default route loads).
+const KERNEL_VSN: &str = "11.0.4";
+/// This checkout's `stdlib` release (`lib/stdlib/vsn.mk`, likewise embedded in *our* start
+/// script). The oracle reports the version of **its** installation instead (`8.1.1` on an
+/// OTP-29 host), exactly as `init:script_id/0` reports `{"Erlang/OTP","30"}` here and
+/// `{"Erlang/OTP","29"}` there: each runtime answers for the release it loaded. The name, the
+/// description and the ordering are compared with the oracle outright; only this literal is
+/// the local release's.
+const STDLIB_VSN: &str = "8.1";
+/// `application:set_env/4` writes the live `application_controller`'s `ac_tab`; the very next
+/// `application:get_env/2` must see it. This is the regression the withdrawn `.app`-resource
+/// floor introduced, and the reason it was withdrawn: the writer was never floored (it is a
+/// `gen_server:call` into the controller) while the reader was, so a value the running node
+/// had just set was invisible to the read that followed.
+///
+/// `unset_env/2` restores the environment, so the probe leaves nothing behind.
+#[test]
+fn set_env_is_visible_to_get_env() {
+    let expr = "ok = application:set_env(kernel, beam_rt_probe_key, {visible, 42}),\
+                Answer = application:get_env(kernel, beam_rt_probe_key),\
+                ok = application:unset_env(kernel, beam_rt_probe_key),\
+                Gone = application:get_env(kernel, beam_rt_probe_key),\
+                io:format(\"~p\", [{Answer, Gone}])";
+    let cli = beam_rt_eval(expr);
+    assert_eq!(cli.code, 0, "the probe exits 0 (stderr {:?})", cli.err);
+    assert_eq!(cli.out.trim_end(), "{{ok,{visible,42}},undefined}");
+    // … and the oracle answers the same pair, so this is the oracle's semantics, not a shape
+    // this runtime happens to produce.
+    let Some(expected) = oracle_program(expr) else {
+        return;
+    };
+    assert_eq!(cli.out.trim_end(), expected, "`set_env/4` → `get_env/2` on the oracle");
+}
+/// Every `application:*` query is a `lib/kernel/src/application.erl` one-line delegation to
+/// the **live** `application_controller`, whose `ac_tab` carries the environment the booted
+/// `kernel` really injected (`logger`, `connect_all`, …). The withdrawn floor answered from the
+/// parsed `.app` resource instead, so the environment it reported was the *file's* seven
+/// entries and it never saw a `set_env/4`. Both halves are now the server's:
+/// `get_all_env(kernel)` lists the same nine pairs as the oracle (order unpinned — it is the
+/// controller's own `ets:match` order), and `get_env(kernel, logger)`/`(kernel, connect_all)`
+/// answer their injected values.
+#[test]
+fn get_env_and_get_all_env_are_the_live_controllers_environment() {
+    // `stdlib` declares no environment, so both runtimes answer `[]` outright.
+    assert_eq!(agrees_on_the_booted_route("application:get_all_env(stdlib)"), "[]");
+    // The injected entries: `connect_all` and `logger` are set by `kernel`'s own start, never
+    // by its resource file.
+    assert_eq!(
+        agrees_on_the_booted_route("application:get_env(kernel, connect_all)"),
+        "{ok,true}"
+    );
+    assert_eq!(
+        agrees_on_the_booted_route("application:get_env(kernel, net_ticktime)"),
+        "{ok,60}"
+    );
+    assert_ne!(
+        agrees_on_the_booted_route("application:get_env(kernel, logger)"),
+        "undefined",
+        "kernel's start injects the default `logger` handler configuration"
+    );
+    // The whole environment: nine pairs in both runtimes (the file declares seven; the
+    // controller's `kernel` start adds `logger` and `connect_all`). Compared as a sorted list
+    // because the traversal order is the controller's own `ets:match` order, which no contract
+    // pins — the two ETS implementations enumerate it differently.
+    assert_eq!(agrees_on_the_booted_route("length(application:get_all_env(kernel))"), "9");
+    let _ = agrees_on_the_booted_route("lists:sort(application:get_all_env(kernel))");
+    // The three-arity form falls back to its default exactly like the oracle.
+    for call in [
+        "application:get_env(kernel, nope_key, def)",
+        "application:get_env(kernel, net_ticktime, def)",
+        "application:get_env(nosuchapp_xyz, key, def)",
+        "application:get_env(kernel, 42, def)",
+    ] {
+        let _ = agrees_on_the_booted_route(call);
+    }
+    // A non-atom argument never raises (`application.erl`'s guards leave such a call to the
+    // controller's plain lookups, which simply miss) — the answer is the not-found shape.
+    for call in [
+        "application:get_env(42)",
+        "application:get_env(42, key)",
+        "application:get_env(kernel, 42)",
+    ] {
+        assert_eq!(agrees_on_the_booted_route(call), "undefined", "`{call}`");
+    }
+    assert_eq!(agrees_on_the_booted_route("application:get_all_env(42)"), "[]");
+}
+/// `application:get_env/1` — the calling process's *own* application, resolved through its
+/// group leader (`application.erl:927`) — is `undefined` in both runtimes: a `-noshell`
+/// process belongs to none.
+#[test]
+fn get_env_1_is_undefined_in_both_runtimes() {
+    for argument in ["kernel", "42"] {
+        let call = format!("application:get_env({argument})");
+        assert_eq!(agrees_on_the_booted_route(&call), "undefined", "`{call}`");
+    }
+}
+// ---------------------------------------------------------------------------------------
 // 1. application:get_all_key/1
 // ---------------------------------------------------------------------------------------
-
 /// `application:get_all_key/1`'s key order is the application controller's own
-/// (`application_controller:get_pid_all_key/1`), not the resource file's declaration order.
+/// (`application_controller.erl:412-446`), not the resource file's declaration order.
 const APPLICATIONS_CONTROLLER_KEYS: &str = "[description,id,vsn,modules,maxP,maxT,registered,\
                                             included_applications,optional_applications,\
                                             applications,env,mod,start_phases]";
-
 #[test]
 fn get_all_key_reports_the_loaded_applications_in_the_controller_key_order() {
     // The gate is the oracle's `ets:lookup(ac_tab, {loaded, AppName})`: only an application this
@@ -330,29 +704,40 @@ fn get_all_key_reports_the_loaded_applications_in_the_controller_key_order() {
     for app in ["kernel", "stdlib"] {
         let call = format!("[K || {{K,_}} <- element(2, application:get_all_key({app}))]");
         assert_eq!(
-            unwrapped(&agrees_with_the_oracle(&call)),
+            unwrapped(&agrees_on_the_booted_route(&call)),
             unwrapped(APPLICATIONS_CONTROLLER_KEYS),
             "`application:get_all_key({app})`'s key order"
         );
         let call = format!("length(element(2, application:get_all_key({app})))");
-        assert_eq!(agrees_with_the_oracle(&call), "13", "`{app}` reports 13 keys");
+        assert_eq!(agrees_on_the_booted_route(&call), "13", "`{app}` reports 13 keys");
     }
-
     // The three keys the A.9 surface names, on the loaded pair.
     for (app, key) in [("kernel", "modules"), ("kernel", "env"), ("kernel", "mod")] {
         let call = format!("lists:keymember({key}, 1, element(2, application:get_all_key({app})))");
-        assert_eq!(agrees_with_the_oracle(&call), "true", "`{app}` has `{key}`");
+        assert_eq!(agrees_on_the_booted_route(&call), "true", "`{app}` has `{key}`");
     }
-
-    // The per-key values are assembled by the very helper `application:get_key/2` uses
-    // (`loaded_app_value`), so the value cross-check in
-    // `get_key_2_resolves_the_controller_key_set_and_its_defaults` covers this list too.
+    // The per-key values are the controller's own `get_key/2` clauses, so the value cross-check
+    // in `get_key_2_resolves_the_controller_key_set_and_its_defaults` covers this list too.
     assert_eq!(
-        agrees_with_the_oracle("lists:keyfind(mod, 1, element(2, application:get_all_key(kernel)))"),
+        agrees_on_the_booted_route(
+            "lists:keyfind(mod, 1, element(2, application:get_all_key(kernel)))"
+        ),
         "{mod,{kernel,[]}}"
     );
+    // The `env` slot is the live environment, not the resource file's declaration: it holds the
+    // same nine pairs `get_all_env/1` reports, the two injected ones included.
+    assert_eq!(
+        agrees_on_the_booted_route(
+            "length(element(2, application:get_all_key(kernel))) - 0"
+        ),
+        "13"
+    );
+    assert_eq!(
+        agrees_on_the_booted_route("lists:sort(element(2, application:get_key(kernel, env)))"),
+        agrees_on_the_booted_route("lists:sort(application:get_all_env(kernel))"),
+        "`get_all_key/1`'s `env` slot is `get_all_env/1`'s list"
+    );
 }
-
 #[test]
 fn get_all_key_is_undefined_for_an_unloaded_or_non_atom_application() {
     // An application outside the loaded set — installed (`erts`, `compiler`), unknown, or not an
@@ -360,97 +745,101 @@ fn get_all_key_is_undefined_for_an_unloaded_or_non_atom_application() {
     for argument in ["erts", "compiler", "sasl", "nosuchapp_xyz", "42", "[kernel]"] {
         let call = format!("application:get_all_key({argument})");
         assert_eq!(
-            agrees_with_the_oracle(&call),
+            agrees_on_the_booted_route(&call),
             "undefined",
             "`application:get_all_key({argument})`"
         );
     }
 }
-
-/// The `env` key is the one **documented divergence** in the all-key list, and this test proves it
-/// is *not* a parse or ordering bug: the runtime's list is byte-identical to the resource file's
-/// own `env` declaration (as read by the oracle's `file:consult/1`), while the oracle's *loaded*
-/// list additionally carries the `application_controller`'s runtime injections — which this
-/// runtime's resource-based native view never has, booted controller or not.
+/// The `vsn` a controller reports is the version of the release the application was **loaded
+/// from**: for `kernel` this checkout's and the installation's agree (`11.0.4`), for `stdlib`
+/// they do not — the default route loads **this runtime's own** release's boot script, which
+/// embeds this checkout's `stdlib` version where the oracle's embeds its installation's. That
+/// is the same relationship `init:script_id/0` pins (each runtime reports the release it
+/// loaded), so the *predicate* is compared with the oracle here, not the string.
 #[test]
-fn the_env_key_is_the_resource_declaration_while_the_oracle_injects_two_entries() {
-    // `stdlib` declares no environment at all, so both runtimes agree outright.
-    assert_eq!(agrees_with_the_oracle("application:get_key(stdlib, env)"), "{ok,[]}");
-
-    // `kernel`'s resource declares seven entries; the oracle's loaded environment carries nine.
-    let declared = oracle_program(
-        "{ok,[{application,kernel,Props}]} = \
-           file:consult(filename:join([code:lib_dir(kernel),\"ebin\",\"kernel.app\"])),\
-         {env,E} = lists:keyfind(env,1,Props),\
-         io:format(\"~p\",[{ok,E}])",
-    );
-    let Some(declared) = declared else {
-        eprintln!("warning: the oracle could not read kernel.app; the env comparison is skipped");
-        return;
-    };
-    // `// documented divergence:` the runtime answers the resource file's `env` verbatim — which
-    // is exactly what the oracle's own `file:consult` of that file holds. The oracle's *loaded*
-    // environment differs because its `application_controller` stores two injected entries (and
-    // keeps its own order); this runtime's `application:*` view is a **native floor over the
-    // parsed `.app` resource**, claimed ahead of the registry on every route, so it never reflects
-    // the controller's injections — not even on the default route, where the booted `kernel` does
-    // start a live `application_controller`.
+fn the_reported_vsn_is_the_loaded_releases() {
     assert_eq!(
-        renders("application:get_key(kernel, env)"),
-        declared,
-        "the runtime's env must be the resource file's declaration"
-    );
-
-    // The two injected entries are what the oracle's controller adds: the resource file never
-    // declares them, and the oracle serves them from its live environment.
-    assert_eq!(
-        renders("application:get_env(kernel, connect_all)"),
-        "undefined",
-        "kernel.app declares no `connect_all`"
+        agrees_on_the_booted_route("application:get_key(kernel, vsn)"),
+        format!("{{ok,\"{KERNEL_VSN}\"}}")
     );
     assert_eq!(
-        oracle_renders("application:get_env(kernel, connect_all)").as_deref(),
-        Some("{ok,true}"),
-        "the oracle's application_controller injects `connect_all` at kernel start"
+        renders_booted("application:get_key(stdlib, vsn)"),
+        format!("{{ok,\"{STDLIB_VSN}\"}}")
     );
-    assert_eq!(renders("application:get_env(kernel, logger)"), "undefined");
-    assert_ne!(
-        oracle_renders("application:get_env(kernel, logger)").as_deref(),
-        Some("undefined"),
-        "the oracle's application_controller injects `logger` at kernel start"
+    assert_eq!(
+        renders_booted("lists:any(fun({_,_,V}) -> V =:= \"\" end, application:loaded_applications())"),
+        "false",
+        "every reported version is a non-empty string"
     );
-    // …and the same injection is why the oracle's *loaded* env list is longer than the file's 7.
-    if let Some(len) = oracle_renders("length(element(2, application:get_key(kernel, env)))") {
-        assert!(
-            len.parse::<usize>().expect("a length") > 7,
-            "the oracle's loaded kernel env ({len}) is longer than the file's 7 entries"
+    // Self-consistency, which holds on both runtimes: the `get_key/2` answer and the triple the
+    // two application lists report carry the same version.
+    for list in ["loaded_applications", "which_applications"] {
+        let predicate = format!(
+            "element(2, application:get_key(stdlib, vsn)) =:= \
+             element(3, lists:keyfind(stdlib, 1, application:{list}()))"
         );
+        assert_eq!(agrees_on_the_booted_route(&predicate), "true", "`{predicate}`");
     }
 }
-
+/// The two application **lists** are the live controller's: `loaded_applications/0` reads
+/// `ac_tab` directly (`application_controller.erl:300-306`) and reports `kernel` first;
+/// `which_applications/0` is the controller's `#state.running` list
+/// (`application_controller.erl:295-296`, `:904`), which `start_application` really populates
+/// on this boot path — so it reports the two **running** applications, `stdlib` first, exactly
+/// as the oracle does. Both were floor answers before; `which_applications/0` was the one key
+/// that could not have been un-floored had `#state.running` stayed empty.
+#[test]
+fn the_application_lists_are_the_live_controllers() {
+    assert_eq!(
+        agrees_on_the_booted_route("[A || {A,_,_} <- application:loaded_applications()]"),
+        "[kernel,stdlib]"
+    );
+    assert_eq!(
+        agrees_on_the_booted_route("[A || {A,_,_} <- application:which_applications()]"),
+        "[stdlib,kernel]"
+    );
+    // The description is the resource file's own string in both, compared outright — a
+    // fabricated triple cannot pass this.
+    assert_eq!(
+        agrees_on_the_booted_route("[D || {_,D,_} <- application:loaded_applications()]"),
+        "[\"ERTS  CXC 138 10\",\"ERTS  CXC 138 10\"]"
+    );
+    assert_eq!(
+        agrees_on_the_booted_route("[D || {_,D,_} <- application:which_applications()]"),
+        "[\"ERTS  CXC 138 10\",\"ERTS  CXC 138 10\"]"
+    );
+    // Both lists are two `{atom, string, string}` triples: shape-checked so the test still
+    // asserts something without an oracle.
+    for list in ["loaded_applications", "which_applications"] {
+        let call = format!(
+            "lists:all(fun({{A,D,V}}) -> is_atom(A) andalso is_list(D) andalso is_list(V) end, \
+             application:{list}()) andalso length(application:{list}()) =:= 2"
+        );
+        assert_eq!(renders_booted(&call), "true", "`{list}`'s triple shape");
+    }
+}
 // ---------------------------------------------------------------------------------------
 // 2. application:get_key/1 and get_key/2
 // ---------------------------------------------------------------------------------------
-
 #[test]
 fn get_key_1_is_undefined_in_both_runtimes() {
     // `get_key(Key)` resolves the *calling process's* application through its group leader
     // (`application.erl:986-987`); neither runtime gives a `-noshell` process one.
     for argument in ["kernel", "stdlib", "nosuchapp_xyz", "42"] {
         let call = format!("application:get_key({argument})");
-        assert_eq!(agrees_with_the_oracle(&call), "undefined", "`{call}`");
+        assert_eq!(agrees_on_the_booted_route(&call), "undefined", "`{call}`");
     }
 }
-
 #[test]
 fn get_key_2_resolves_the_controller_key_set_and_its_defaults() {
-    // Every key of the controller's set: the resource file's declaration, or the controller's own
-    // default (`make_appl_i`, `application_controller.erl:1572-1598`). `agrees_with_the_oracle`
-    // asserts the two runtimes' renderings are byte-identical.
+    // Every key of the controller's set (`application_controller.erl:380-404`): the loaded
+    // app's own value. `agrees_on_the_booted_route` asserts the two runtimes' renderings are
+    // byte-identical, so the controller's defaults (`{ok,infinity}` for `maxP`, `{ok,[]}` for a
+    // `mod` the file does not declare) are compared, not assumed.
     for key in [
         "description",
         "id",
-        "vsn",
         "modules",
         "maxP",
         "maxT",
@@ -461,16 +850,14 @@ fn get_key_2_resolves_the_controller_key_set_and_its_defaults() {
         "mod",
         "start_phases",
     ] {
-        let _ = agrees_with_the_oracle(&format!("application:get_key(kernel, {key})"));
+        let _ = agrees_on_the_booted_route(&format!("application:get_key(kernel, {key})"));
     }
-    for key in ["vsn", "mod", "applications"] {
-        let _ = agrees_with_the_oracle(&format!("application:get_key(stdlib, {key})"));
+    for key in ["mod", "applications"] {
+        let _ = agrees_on_the_booted_route(&format!("application:get_key(stdlib, {key})"));
     }
-
-    // The three documented shapes, pinned literally so the test still asserts without an oracle.
-    assert_eq!(renders("application:get_key(kernel, vsn)"), "{ok,\"11.0.4\"}");
-    assert_eq!(renders("application:get_key(stdlib, mod)"), "{ok,[]}");
-
+    // Two shapes pinned literally, so the test still asserts without an oracle.
+    assert_eq!(renders_booted("application:get_key(stdlib, mod)"), "{ok,[]}");
+    assert_eq!(renders_booted("application:get_key(kernel, maxP)"), "{ok,infinity}");
     // A key outside the controller's set — a file-only property such as `runtime_dependencies` —
     // and any unknown key is `undefined`, as is a non-atom application, an unknown one, or a
     // non-atom key.
@@ -478,39 +865,51 @@ fn get_key_2_resolves_the_controller_key_set_and_its_defaults() {
         "application:get_key(kernel, runtime_dependencies)",
         "application:get_key(kernel, nope_key)",
         "application:get_key(bogusapp_xyz, vsn)",
+        "application:get_key(erts, vsn)",
         "application:get_key(42, vsn)",
         "application:get_key(kernel, 42)",
     ] {
-        assert_eq!(agrees_with_the_oracle(call), "undefined", "`{call}`");
+        assert_eq!(agrees_on_the_booted_route(call), "undefined", "`{call}`");
     }
 }
-
 // ---------------------------------------------------------------------------------------
 // 3. application:get_application/0,1
 // ---------------------------------------------------------------------------------------
-
 #[test]
 fn get_application_1_maps_a_module_to_its_loaded_application() {
-    assert_eq!(agrees_with_the_oracle("application:get_application(kernel)"), "{ok,kernel}");
-    assert_eq!(agrees_with_the_oracle("application:get_application(lists)"), "{ok,stdlib}");
-    assert_eq!(agrees_with_the_oracle("application:get_application(digraph)"), "{ok,stdlib}");
+    assert_eq!(agrees_on_the_booted_route("application:get_application(kernel)"), "{ok,kernel}");
+    assert_eq!(agrees_on_the_booted_route("application:get_application(lists)"), "{ok,stdlib}");
+    assert_eq!(agrees_on_the_booted_route("application:get_application(digraph)"), "{ok,stdlib}");
     assert_eq!(
-        agrees_with_the_oracle("application:get_application(nosuchmodule_xyz)"),
+        agrees_on_the_booted_route("application:get_application(nosuchmodule_xyz)"),
         "undefined"
     );
     // `/0` is the calling process's own application: `undefined` in both runtimes.
-    assert_eq!(agrees_with_the_oracle("application:get_application()"), "undefined");
+    assert_eq!(agrees_on_the_booted_route("application:get_application()"), "undefined");
+    // A **pid** takes the oracle's `is_pid/1` clause (`application.erl:1047-1050`): the pid's
+    // group leader names no application here (a `-noshell` process belongs to none), so the
+    // answer is the oracle's `undefined` rather than the non-atom guard's `function_clause` the
+    // floor reported.
+    assert_eq!(
+        agrees_on_the_booted_route("application:get_application(self())"),
+        "undefined"
+    );
+    assert_eq!(
+        agrees_on_the_booted_route("application:get_application(whereis(init))"),
+        "undefined"
+    );
 }
-
 #[test]
 fn get_application_1_reports_the_non_atom_guard_as_function_clause() {
-    // The oracle's guard is `is_atom(Module); is_pid(Module)` (`application.erl:1051`); a non-atom
-    // that is not a pid leaves the function with no clause at all.
+    // The oracle's guards are `is_pid(Pid); is_atom(Module)` (`application.erl:1047,1051`); any
+    // other argument leaves the function with no clause at all.
     for call in ["application:get_application([lists])", "application:get_application(42)"] {
+        let cli = beam_rt_eval(&format!("{call}."));
+        assert_eq!(cli.code, 1, "`{call}` raises (stderr {:?})", cli.err);
         assert_eq!(
-            raise_of(call).as_atom().expect("the bare function_clause atom"),
-            "function_clause",
-            "`{call}`"
+            cli.err.trim_end(),
+            "beam_rt: error function_clause",
+            "`{call}` is the bare `function_clause` raise"
         );
     }
     // The oracle answers the same class for the same argument.
@@ -520,25 +919,7 @@ fn get_application_1_reports_the_non_atom_guard_as_function_clause() {
     ) {
         assert_eq!(shape, "error:function_clause", "the oracle's own raise shape");
     }
-
-    // `// documented divergence:` the oracle's extra `is_pid/1` clause answers `undefined` for a
-    // pid. This runtime's native `application:get_application/1` floor has no pid clause (it
-    // resolves atom module names only), so a pid takes the non-atom guard's `function_clause`
-    // shape instead of being walked as a pid.
-    assert_eq!(
-        raise_of("application:get_application(self())")
-            .as_atom()
-            .expect("the bare function_clause atom"),
-        "function_clause"
-    );
-    if let Some(answer) = oracle_renders("application:get_application(self())") {
-        assert!(
-            answer == "undefined" || answer.starts_with("{ok,"),
-            "the oracle does not raise for a pid: {answer}"
-        );
-    }
 }
-
 // ---------------------------------------------------------------------------------------
 // 4. init:get_argument/1
 // ---------------------------------------------------------------------------------------
@@ -1019,5 +1400,70 @@ fn filelib_existence_probes_on_an_existing_path_agree_with_the_oracle() {
         ),
     ] {
         assert_eq!(agrees_with_the_oracle(&call), expected, "`{call}`");
+    }
+}
+/// The **audit** of the twelve remaining floor namespaces: `src/native/CONTEXT.md`'s
+/// *Namespace audit* section says every one of them stays floored, and the two reasons a key can
+/// stay are (a) its OTP body needs a facility this runtime does not run, or (b) it answers a
+/// question whose true source is a live server this runtime keeps its own copy of. This pins the
+/// part that *is* falsifiable without withdrawing anything: for the keys a body **could** plausibly
+/// serve, the floor's answer is the oracle's answer, argument by argument — so "kept because it
+/// agrees" is measured rather than asserted.
+///
+/// The withdrawn `application` namespace is the counter-example this pins against: it agreed on
+/// the plain reads too and still had to go, because it disagreed on the *state* (`set_env/4`).
+/// A key that merely agrees on a read is therefore kept here only where no body can disagree
+/// later — every probe below is a pure query.
+#[test]
+fn the_kept_floor_namespaces_agree_with_the_oracle() {
+    // Environment-independent answers: pinned outright (so the probe is meaningful without an
+    // oracle), then required to be the oracle's rendering too.
+    for (call, expected) in [
+        // `code:is_loaded/1` — the `CodeServer`'s own loaded set.
+        // `is_loaded/1` answers `{file, Path}` for a loaded module, `false` for one it never saw.
+        ("is_tuple(code:is_loaded(lists))", "true"),
+        ("code:is_loaded(no_such_xyz)", "false"),
+        // `code:is_sticky/1` — the release's sticky directory rule.
+        ("code:is_sticky(lists)", "true"),
+        ("code:is_sticky(mnesia)", "false"),
+        // `code:get_mode/0` — the floor's `-mode` init argument.
+        ("code:get_mode()", "interactive"),
+        // `code:load_file/1`, `ensure_loaded/1` and `get_object_code/1` — a miss is the same
+        // `{error,nofile}`/`error` the oracle's own loader answers.
+        ("code:load_file(no_such_xyz)", "{error,nofile}"),
+        ("code:ensure_loaded(no_such_xyz)", "{error,nofile}"),
+        ("code:get_object_code(no_such_xyz)", "error"),
+        // The node's own link table: `net_adm:ping/1` on a name nothing is listening for is
+        // `pang` (the oracle's timeout answer) and `net_kernel:connect_node/1` is `ignored`.
+        ("net_adm:ping(nonode@nohost)", "pang"),
+        ("net_kernel:connect_node(nonode@nohost)", "ignored"),
+        // `code:lib_dir/1` and `code:priv_dir/1` — the release layout, whose version suffix the
+        // installation owns, so the two are pinned by their relationship and by `is_list/1`.
+        ("is_list(code:lib_dir(stdlib))", "true"),
+        ("is_list(code:priv_dir(stdlib))", "true"),
+        ("code:priv_dir(stdlib) =:= code:lib_dir(stdlib) ++ \"/priv\"", "true"),
+        // `os:cmd/1` runs a real shell; the comparison form keeps the rendering independent of
+        // the shell's own output buffering.
+        ("os:cmd(\"echo hi\") =:= \"hi\\n\"", "true"),
+        ("os:cmd(\"printf hi\") =:= \"hi\"", "true"),
+    ] {
+        assert_eq!(agrees_on_the_booted_route(call), expected, "`{call}`");
+    }
+    // Path-valued answers name the installation, so only the oracle can pin them — each is
+    // compared outright, and independently required to be a non-empty quoted path naming what
+    // was asked for, so a probe that stops answering cannot pass vacuously.
+    for (call, suffix) in [
+        ("code:which(lists)", "lists.beam\""),
+        ("code:which(erlang)", "preloaded"),
+        ("code:where_is_file(\"lists.beam\")", "lists.beam\""),
+        ("code:root_dir()", "erlang\""),
+        ("code:priv_dir(stdlib)", "priv\""),
+        ("filename:basename(code:which(lists))", "\"lists.beam\""),
+    ] {
+        let rendered = agrees_on_the_booted_route(call);
+        assert!(
+            rendered.ends_with(suffix),
+            "`{call}` renders {rendered:?}, not an answer ending {suffix:?}"
+        );
     }
 }

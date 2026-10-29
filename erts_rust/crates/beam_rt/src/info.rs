@@ -32,10 +32,10 @@
 //! # Key families (the module split)
 //!
 //! The key surface is large, so this parent keeps only the materialization core —
-//! [`InfoValue`], [`InfoValue::to_eterm`], the shared helpers, [`INFO_ATOMS`] and the
-//! [`system_info_value`] dispatcher — and delegates the per-key logic to child
-//! modules, each exposing `pub(crate) fn try_value(key, rt) -> Option<Result<InfoValue>>`
-//! (`None` means "not my key"):
+//! [`InfoValue`], [`InfoValue::to_eterm`], the shared helpers, [`INFO_ATOMS`] /
+//! [`info_atoms`] and the [`system_info_value`] dispatcher — and delegates the per-key
+//! logic to child modules, each exposing `pub(crate) fn try_value(key, rt) ->
+//! Option<Result<InfoValue>>` (`None` means "not my key"):
 //!
 //! | module | keys |
 //! |---|---|
@@ -47,6 +47,7 @@
 //! | [`dist`] | the distribution-state keys `dist` / `dist_ctrl` (answered only in the oracle's non-distributed state) |
 //! | [`time`] | the ERTS monotonic-time interface constants `start_time` / `end_time` |
 //! | [`unsupported`] | the oracle's keys for facilities this runtime does not have — an honest capability gap |
+//! | [`snifs_atoms`] | no key of its own: the static-NIF roster's atom-name table behind `system_info(snifs)` (built by [`system`]) |
 //!
 //! # Implemented vs unsupported vs badarg
 //!
@@ -71,7 +72,7 @@
 //! [`InfoValue::to_eterm`] resolves an [`InfoValue::Atom`] **through the runtime's own
 //! atom table**; a name that table does not hold is reported as
 //! [`BeamError::TermNotFound`], never invented. So the table must hold every atom this
-//! surface can emit — [`INFO_ATOMS`] is that complete list. Interning is idempotent and
+//! surface can emit — [`info_atoms`] is that complete list. Interning is idempotent and
 //! name-keyed, and the boot core seed ([`crate::boot::CORE_ATOMS`]) already interns part
 //! of it, so seeding both is safe.
 
@@ -88,6 +89,9 @@ mod host;
 mod limits;
 mod memory;
 mod schedulers;
+// The static-NIF roster's atom vocabulary behind `system_info(snifs)` — a static name
+// table of its own so this parent stays small and the roster's names stay checkable.
+pub(crate) mod snifs_atoms;
 mod system;
 // The ERTS monotonic-time interface constants are shared: `system_info(start_time|end_time)`
 // answers them ([`time::START_TIME`]/[`time::END_TIME`]), and `crate::timers` uses the very
@@ -152,6 +156,9 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "hipe_architecture",
     "literal_test",
     "sequential_tracer",
+    // The static-NIF roster: the `{Module,Function,Arity}` rows `beam_bifs::snifs()` holds
+    // in the oracle's order (see [`system`]).
+    "snifs",
     // -- `limits`: counts and emulator limits (see [`limits`]) --
     "atom_count",
     "atom_limit",
@@ -243,14 +250,13 @@ pub const UNSUPPORTED_KEYS: &[&str] = &[
     "loaded",
     // ERTS *C-emulator internals* with no counterpart in this runtime: the C toolchain's
     // build flags, the ethread library, the constant-pool/jump-table loader switches, the
-    // static NIF table and its taints, the emulator argument vector, the scheduler
+    // NIF taints, the emulator argument vector, the scheduler
     // distribution maps, the `BIG_ARITY_MAX` bignum cap and the thread-progress debug dump.
     "compile_info",
     "ethread_info",
     "ethread_used_tse",
     "constant_pool_support",
     "beam_jump_table",
-    "snifs",
     "taints",
     "emu_args",
     "reader_groups_map",
@@ -268,11 +274,15 @@ pub const UNSUPPORTED_KEYS: &[&str] = &[
 /// hold, so the runtime's table must contain these names before any key of
 /// [`SUPPORTED_KEYS`] is materialized. It is spelled out here — rather than left to the
 /// seeding site — so "the introspection surface is materializable" is checkable in one
-/// place (the test below seeds exactly this list and materializes every key). The boot
-/// core seed ([`crate::boot::seed_core_atoms`]) interns this whole list after
+/// place (the test below seeds exactly [`info_atoms`] and materializes every key). The boot
+/// core seed ([`crate::boot::seed_core_atoms`]) interns [`info_atoms`] after
 /// [`crate::boot::CORE_ATOMS`]; interning is idempotent and name-keyed, so overlapping
 /// with the core set is harmless, and **appending** to this list keeps every index the
 /// core seed assigned before it unchanged.
+///
+/// The static-NIF roster's 465 module/function names are the one group that does not live
+/// in this literal: they are [`snifs_atoms::SNIFS_ATOMS`] (a table generated from
+/// `beam_bifs`' roster), chained on by [`info_atoms`].
 pub const INFO_ATOMS: &[&str] = &[
     // `os_type`: the `{unix,linux}` / `{win32,nt}` pair of the two families (see [`host`]),
     // the other ERTS OS names a supported platform answers (`{unix,darwin}` on macOS,
@@ -392,6 +402,20 @@ pub const INFO_ATOMS: &[&str] = &[
     "port",
 ];
 
+/// **Every** atom name the introspection surface can emit: [`INFO_ATOMS`] followed by the
+/// static-NIF roster's names ([`snifs_atoms::SNIFS_ATOMS`]).
+///
+/// This is the list the boot seed interns ([`crate::boot::seed_core_atoms`]) and the list
+/// the completeness test seeds, so "`system_info/1` is materializable" is one statement
+/// covering the whole surface — the roster's ~465 names are kept in their own table only
+/// because they are generated data, not because they are a different kind of name.
+pub fn info_atoms() -> impl Iterator<Item = &'static str> {
+    INFO_ATOMS
+        .iter()
+        .copied()
+        .chain(snifs_atoms::SNIFS_ATOMS.iter().copied())
+}
+
 /// A `system_info/1` value, independent of any heap.
 ///
 /// The scalar variants (`Int`, `Str`, `Atom`, `Bool`, `Tuple`, `Binary` and the pid-valued
@@ -454,7 +478,7 @@ impl InfoValue {
     ///
     /// * [`BeamError::TermNotFound`] when an atom this value names is not interned in
     ///   `atoms` — never an invented atom. A runtime materializing this crate's keys
-    ///   seeds [`INFO_ATOMS`], which covers every atom the surface can emit;
+    ///   seeds [`info_atoms`], which covers every atom the surface can emit;
     /// * the heap's allocation failure for a string, a list, a tuple, a map, a binary or
     ///   the block of an [`InfoValue::Int`] outside the small range.
     pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm> {
@@ -819,8 +843,10 @@ mod tests {
                 .unwrap_or_else(|error| panic!("system_info({key}) failed: {error}"));
         }
         // The surface is the union of the family modules; keep the count pinned so a key
-        // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 88);
+        // dropped from a family is caught. `89` is derived from the oracle's accepted
+        // roster: 89 supported + 26 unsupported = the 115 names it accepts (the partition
+        // itself is pinned against the live oracle by `tests/system_info_oracle.rs`).
+        assert_eq!(SUPPORTED_KEYS.len(), 89);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -845,18 +871,21 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
-        assert_eq!(sorted.len(), 27);
+        // `26` — the other half of the 115 oracle-accepted names (see
+        // `every_supported_key_answers`).
+        assert_eq!(sorted.len(), 26);
     }
 
     #[test]
     fn every_supported_key_materializes_once_the_info_atoms_are_seeded() {
-        // `INFO_ATOMS` is the whole contract the introspection surface has with the atom
-        // table: seeding exactly this list must materialize **every** supported key (the
-        // oracle's `system_info/1` never returns an unrepresentable value).
+        // `info_atoms()` is the whole contract the introspection surface has with the atom
+        // table: seeding exactly that list must materialize **every** supported key (the
+        // oracle's `system_info/1` never returns an unrepresentable value) — the static-NIF
+        // roster's names included, which the boot seed interns through the same helper.
         let rt = runtime();
         let mut heap = Heap::new(8_192).expect("test heap");
         let mut atoms = AtomTable::new();
-        atoms.seed(INFO_ATOMS.iter().copied());
+        atoms.seed(info_atoms());
         for key in SUPPORTED_KEYS {
             let value = system_info_value(key, &rt)
                 .unwrap_or_else(|error| panic!("system_info({key}) failed: {error}"));

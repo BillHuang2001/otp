@@ -447,9 +447,12 @@ mod tests {
         let mut return_to = Fixture::new("[return_to]", None);
         assert!(return_to.enabled(), "the `return_to` flag arms the gate too");
 
-        // `erlang:trace(Pid, false, [])` clears the entry again.
+        // `erlang:trace(Pid, false, [call])` clears the flag again. The flag list must **name**
+        // the flags: an empty list is the C's `ref->flags &= ~0`, a no-op on an already-traced
+        // process (`../../erts/emulator/beam/erl_bif_trace.c:866-867`), so `[all]`/`[call]` is
+        // what a clearing call has to carry.
         let how_false = calls.rt.intern("false");
-        let empty = calls.rt.eval("[]").expect("[]");
+        let empty = calls.rt.eval("[all]").expect("[all]");
         let tracee_term = calls.tracee.to_eterm();
         let tracer = calls.tracer;
         {

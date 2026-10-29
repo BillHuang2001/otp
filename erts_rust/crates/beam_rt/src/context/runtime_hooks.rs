@@ -109,7 +109,7 @@ use beam_bifs::{BifContext, BifRegistry, RuntimeHooks};
 use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use beam_io::signal::{Disposition, Signal};
-use beam_process::{PidTarget, ProcessId, ProcessTable};
+use beam_process::{PidTarget, PortId, ProcessId, ProcessTable};
 use beam_term::prelude::{
     atom_val, is_atom, is_small, make_small, signed_value, try_make_small, NIL,
 };
@@ -228,7 +228,10 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// Oracle-verified (OTP 29/`erts-17.1`), and exactly what this answers:
     ///
     /// * the first argument must be a **reference this runtime minted** (a timer reference,
-    ///   a `make_ref/0` reference, a monitor reference) — anything else is `badarg`;
+    ///   a `make_ref/0` reference, a monitor reference) — anything else is `badarg`. A timer
+    ///   reference is recognised by its **identity**, so a *copy* of it (an `ets` round trip,
+    ///   a message) names the same timer: `inet_gethost_native.erl:365-368,270-275` stores its
+    ///   `start_timer/3` reference in an `ets` row and cancels the copy it reads back;
     /// * `Options` must be a list of `{async, boolean()}` / `{info, boolean()}` tuples, in
     ///   any order, **last occurrence winning**; anything else (a bare atom such as `[info]`,
     ///   a non-list, an improper list, `[{info, 1}]`, an unknown key) is `badarg`;
@@ -241,9 +244,21 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// # Errors
     ///
     /// `badarg` for a non-reference first argument or a malformed option list.
+    ///
+    /// # Divergence — a *copied* non-timer reference
+    ///
+    /// The predicate is [`Runtime::is_known_local_reference`], and the two halves of its
+    /// provenance map disagree about copies: `Timers` is keyed by identity as well as by word
+    /// (so any copy of a timer reference is accepted), while [`Runtime::references`] is
+    /// word-keyed (so a copy of a `make_ref/0` or monitor reference is not). A copied
+    /// **non-timer** reference therefore answers `badarg` here where the C — which reads the
+    /// thing's payload — answers `false`. Timer references are the case a real application
+    /// depends on (a timer ref is stored somewhere and cancelled through the copy); widening
+    /// the rest means id-keying `Runtime::references` and the alias/monitor tables behind it.
     fn cancel_timer_2(&mut self, heap: &mut Heap, args: &[Eterm]) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
-        // A timer reference, or a reference this runtime minted for something else
+        // A timer reference (a copy included — its identity is what `Timers` keys the second
+        // half of its map by), or a reference this runtime minted for something else
         // (`make_ref/0`, a monitor) — anything else is not a reference and is `badarg`, the
         // same test `erlang:cancel_timer/1` (the runtime-native floor) applies. The ONE
         // provenance test decides (`Runtime::is_known_local_reference`).
@@ -348,13 +363,13 @@ impl<'a> RuntimeHooksBridge<'a> {
         async_: bool,
     ) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
-        // A timer reference, or a reference this runtime minted for something else
+        // A timer reference (a copy included — `Timers` keys its second index by the
+        // reference's identity), or a reference this runtime minted for something else
         // (`make_ref/0`, a monitor) — anything else is not a reference and is `badarg`, the
         // same shape/provenance test `erlang:cancel_timer/1,2` applies (see
-        // [`Self::cancel_timer_2`]). The ONE provenance test decides
-        // (`Runtime::is_known_local_reference`); a reference this runtime did not mint answers
-        // `badarg` here where the C answers `false` — the same documented divergence the
-        // cancellation pair carries, and the reason it is stated once, here.
+        // [`Self::cancel_timer_2`], which states the one divergence a *copied* non-timer
+        // reference still carries). The ONE provenance test decides
+        // (`Runtime::is_known_local_reference`).
         let pending = if self.runtime.is_known_local_reference(term) {
             self.runtime.timers.remaining(term)
         } else {
@@ -519,12 +534,31 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// `erlang:link/1` (`unlink = false`) and `erlang:unlink/1` (`unlink = true`): link or
     /// unlink the calling process and `Target`, answering `true`.
     ///
-    /// Oracle-verified (OTP 29/`erts-17.1`): `Target` must be a pid — anything else is
-    /// `badarg`; a pid answers `true`, including `self()`, a pid no process backs (the
-    /// oracle discards a link to a non-existent process and still reports success, exactly
-    /// as the C's `erts_proc_lookup_raw` miss does) **and a remote pid** (measured against a
-    /// real peer: `erl -sname Peer` + `erlang:link(rpc:call(Peer, erlang, self, []))` ⇒
-    /// `true`, and `erlang:unlink/1` on the same pid ⇒ `true`).
+    /// Two target families, both the C's: an `is_internal_pid`/`is_external_pid` target
+    /// (`bif.c:1231`/`:1294`) and a **port** (`bif.c:1265-1291`'s `erts_port_unlink`). The port
+    /// family is what makes `inet.erl`'s `tcp_controlling_process/2` work at all: right after
+    /// `erlang:port_connect(S, NewOwner)` it calls `unlink(S)`
+    /// (`lib/kernel/src/inet.erl:4870`), so a `badarg` there turns a `gen_tcp:controlling_process/2`
+    /// into an uncaught error instead of the oracle's `ok`.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): `Target` must be a pid or a port — anything else is
+    /// `badarg` (`unlink(foo)` ⇒ `badarg`); a pid answers `true`, including `self()`, a pid no
+    /// process backs (the oracle discards a link to a non-existent process and still reports
+    /// success, exactly as the C's `erts_proc_lookup_raw` miss does) **and a remote pid**
+    /// (measured against a real peer: `erl -sname Peer` + `erlang:link(rpc:call(Peer, erlang,
+    /// self, []))` ⇒ `true`, and `erlang:unlink/1` on the same pid ⇒ `true`); a port answers
+    /// `true` whether it is live or the term of one already closed
+    /// (`link/1`/`unlink/1` of a `port_close`d port ⇒ `true`).
+    ///
+    /// # The port arm
+    ///
+    /// A port's link set is this runtime's own state — [`PortRegistry::extra_links`], what
+    /// `port_info(Port, links)` reports and what the close-time snapshot walks to owe each link
+    /// its `{'EXIT', Port, Reason}` — so the two verbs move it rather than being a no-op:
+    /// `link_port` adds the caller (materializing `open_port/2`'s own `[owner]` link first) and
+    /// `unlink_port` removes it without touching `PortMeta.owner`, the C's
+    /// `erts_port_unlink`/`desc->connected` split. A port the registry no longer holds is the
+    /// oracle's discarded-link case: `true`, nothing to do.
     ///
     /// # The remote pid is a **remote link**, not a capability gap
     ///
@@ -548,11 +582,28 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// router's typed transport error for a remote pid it cannot deliver; and any other
     /// link-set failure the table reports.
     fn link(&mut self, args: &[Eterm], unlink: bool) -> Result<Eterm> {
-        let target = link_target(*args.first().ok_or(BeamError::BadArg)?)?;
+        let term = *args.first().ok_or(BeamError::BadArg)?;
         let self_pid = self.self_pid;
         if !self.table_mut().contains(self_pid) {
             return Err(error::no_process(self_pid));
         }
+        // A **port** target (`is_internal_port`, `bif.c:1265`): the port's own link set, which
+        // the close-time snapshot walks to owe each link its `{'EXIT', Port, Reason}`.
+        if let Ok(port) = PortId::from_eterm(term) {
+            let ports = Rc::clone(&self.runtime.ports);
+            match ports.try_borrow_mut() {
+                Ok(mut registry) => {
+                    if unlink {
+                        registry.unlink_port(port.number(), self_pid);
+                    } else {
+                        registry.link_port(port.number(), self_pid);
+                    }
+                }
+                Err(_) => return Err(error::unsupported("the port table is already in use")),
+            }
+            return atom_term(self.runtime.code_server.atoms(), "true");
+        }
+        let target = link_target(term)?;
         let outcome = if unlink {
             self.table_mut().unlink_term(self_pid, target)
         } else {

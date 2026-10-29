@@ -21,6 +21,8 @@ Sections:
   plus three shapes.
 * [Heap-sizing measurements](#heap-sizing-measurements) — why the fresh mature space is sized from
   the exact live set and the nursery from the same whole-heap live set, through one target.
+* [The heap-sizing flags](#the-heap-sizing-flags-what-a-process_flag2-flag-actually-sizes) — what a
+  `process_flag/2` heap flag writes, when the effect lands, and the three gaps it leaves.
 * [The nursery chain: indexed containment and the one-step-then-doubling growth rule](#the-nursery-chain-indexed-containment-and-the-one-step-then-doubling-growth-rule)
   — the `O(log #spaces)` range test, the growth step, and the measured `compile:file/2` curve.
 * [The debt signal and the collection](#the-debt-signal-and-the-collection) — why only a collection
@@ -290,6 +292,139 @@ what fixes the *destination sizing* in Design Decisions.
   heap plateaus at **1 220** (Copying) / **1 257** (Immix) words, and the same load with a *growing*
   live set drags the nursery up the growth table in live-set-target steps (233 → 1 598 → … → **17
   731**, the live set's own target). Evidence: `tests/nursery_bounded.rs`, `tests/steady_state.rs`.
+
+## The heap-sizing flags: what a `process_flag/2` flag actually sizes
+
+Sources: `tests/heap_flags.rs` (the in-crate derivation — deterministic counters, asserted on **both**
+mature strategies, identical on every run: no wall clock, no load sensitivity) and an out-of-tree
+oracle probe (the table below), a single-process module run under `erl -noshell` with a
+`process_info/2` readback.
+
+**The model: a pure policy store, and the effect is deferred.** A process's `HeapPolicy` is built
+once at spawn; `process_flag(min_heap_size | min_bin_vheap_size | fullsweep_after, N)` now writes the
+corresponding policy field **in place** through `HeapPolicy::set_min_heap_words` /
+`set_min_bin_vheap_words` / `set_fullsweep_after`, reached on a live collector through the identical
+methods on `Collector` / `GenImmixCollector` / `AnyCollector` (`src/flags.rs`). The C arm is the same
+pure store (`erts/emulator/beam/bif.c:2101-2142`: read `old_value`, assign the field, return): no
+collection, no growth, no `minor_gcs` reset, no space allocated, freed, resized or retired, no term
+moved, and no other policy field touched. Rounding — `erts_next_heap_size(i, 0)` plus the `H_MIN_SIZE`
+/ `BIN_VH_MIN_SIZE` floor, and the `Uint16` narrowing for the cadence — is the **caller's**, so the
+value a program reads back and the value that sizes the heap are one number; this crate stores exactly
+what it is given and rounds nothing a second time. Each setter returns the value it replaced (the
+default policy answers `0` / `46422` / `65535` for `min_heap_words` / `min_bin_vheap_words` /
+`fullsweep_after`), and the three pairs are the **only** post-construction write path — the generated
+policy sizes, thresholds and defaults in `policy.rs` are untouched, so every other collection keeps
+taking the banded decision exactly as before.
+
+### The oracle table
+
+Measured 2026-10-29 on the host oracle (OTP 29 / erts-17.1.1), a probe module under `erl -noshell`,
+one process, `process_info/2` readback. The *stored / installed* column is what a program reads back
+and what the next size computation makes of it.
+
+| flag | request | stored / installed | where it is observed |
+|---|---|---|---|
+| `min_heap_size` | 100000 | 121536 | the **next** collection installs it as `heap_size` |
+| `min_heap_size` | 200000 | 318187 | same |
+| `min_heap_size` | 500000 | 514838 | same |
+| `min_heap_size` | `1 bsl 40` | 1249668211299 | the growth table's largest entry (the clamp) |
+| `min_heap_size` | 100 (below `H_MIN_SIZE`) | 233 | the floor, not the request |
+| `min_bin_vheap_size` | 10000000 | 10695351 | next `next_vheap_size` |
+| `min_bin_vheap_size` | 100 (below `BIN_VH_MIN_SIZE`) | 46422 (unchanged) | the floor |
+| `fullsweep_after` | 100000 | 34464 | the `Uint16` field's truncation |
+| `fullsweep_after` | 70000 / 65536 | 4464 / 0 | same |
+
+**The floor, the clamp and the truncation are all the caller's, and each is visible on the oracle.**
+`min_heap_size` 100 reads back **233** — the floor, not the request; `1 bsl 40` reads back
+**1249668211299**, the growth table's largest entry; `fullsweep_after` 100000 reads back **34464** =
+`100000 land 16#FFFF`, and 70000 / 65536 read back **4464** / **0**, the `Uint16` field's truncation.
+The three legal `min_heap_size` requests land on three growth-table entries; the first of them,
+**121536**, is *derived* from this crate's own rule — `next_heap_size(100_000, 0)` — and is the
+figure `tests/heap_flags.rs` asserts (see §The in-crate derivation). The other two rows are oracle
+readbacks and are not asserted anywhere in the crate.
+
+### The deferral is the load-bearing part
+
+**The call writes the policy; the *next collection* installs the floor.** With `min_heap_size`
+raised from 233 to 200000, `process_info(self(), heap_size)` reads **610** immediately after the
+call, again after 50 cons cells of allocation, and again across a `receive after` — the process keeps
+running on the heap it already has. Only the next **collection** installs the floor (**318187**),
+and in an isolated probe that collection was triggered by a `spawn` (the caller's argument copy),
+not by the raise itself.
+
+**Raising the floor does not force a fullsweep and does not reset `minor_gcs`.** Measured **44 → 45**
+across the raise (with `fullsweep_after` at 65535, so no fullsweep was due): the counter advances by
+the ordinary next collection and nothing else. The raise is therefore a *capacity* lever on the next
+collection, never a pause.
+
+**Lowering it is the live-set rule, not the floor.** Lowering `min_heap_size` back to 233 and taking a
+collection shrinks a 514838-word heap to **376** — the live-set target (`young_minor_target_words`
+of that live set, in this crate's rule) — because the floor is a lower bound on the target, never the
+target itself (the rule is
+[the nursery follows the live set](#the-nursery-follows-the-live-set--the-live-set-nursery-target)).
+This is the same field the `+hms` lever in [the cadence against the
+oracle](#the-cadence-against-the-oracle-counts) installs at spawn; here it is written after birth,
+and only the installation point differs.
+
+**`fullsweep_after` is a cadence.** `0` makes every collection a fullsweep, and a fullsweep resets
+`minor_gcs` to 0 (measured **1 → 0**); `3` gives three minors then one fullsweep, after which
+`minor_gcs` is 0 again. It is a **maximum, never a guarantee** — see the gaps below.
+
+### The in-crate derivation
+
+`tests/heap_flags.rs` pins the model as deterministic counters on both mature strategies, so it is a
+test invariant rather than a probe record:
+
+* the floor installed at the **next minor** and at the **next fullsweep** is
+  `next_heap_size(100_000, 0)` = **121536** (derived from the crate's own growth rule, no oracle
+  needed);
+* a `grow_nursery` taken *after* the raise never yields a capacity below the floor — the
+  no-relocation growth seam answers to the same policy field;
+* lowering it installs `young_minor_target_words(stats.words_copied)`, i.e. the live-set target and
+  not the floor;
+* `fullsweep_after` `0` / `3` give the cadence above (`0` ⇒ every collection a fullsweep with
+  `minor_gcs` reset; `3` ⇒ three minors then one fullsweep, after which `minor_gcs` is 0);
+* the **binary** floor lands at `BinVheap::record_collection` and **not** at the setter: after the
+  refit, `triggered()` is **false** for an overhead between the old and the new limit (a live
+  `bin_vheap_sz` is never lifted retroactively);
+* and each setter leaves `heap_size_words`, `total_heap_size_words`, `minor_gcs`, the `GcStats` and
+  `young_space_count` **byte-identical** (returning the value it replaced) — the measurable
+  statement of "a pure policy write".
+
+### Honest gaps
+
+* **The mature generation shares the floored `next_words`.** `HeapPolicy::mature_target_words` goes
+  through `next_words`, so a raised `min_heap_size` floors the **mature** target too: a fullsweep
+  after `process_flag(min_heap_size, 121536)` installs a 121536-word young space **and** a mature
+  space of at least 121536 words, so `total_heap_size` reads ≈2× the oracle's, whose old heap is
+  sized by `erts_next_heap_size` with no `min_heap_size` floor (`erl_gc.c:1203`, `:1471`). The
+  **young** figure — the one the flag is named for (`HEAP_SIZE`) — is exact. Fix seam: an unfloored
+  `next_words` variant used only by `mature_target_words`; not done here because it would move the
+  spawn-policy geometry (a request below 233 would round to 142 instead of 233) and hence the
+  dependents' pinned tables.
+* **A flag cannot shape a birth heap.** `process_flag` on a live process cannot change where the
+  heap *starts*: the birth size comes from the spawn policy and the first collection applies the new
+  floor. The oracle behaves identically.
+* **`min_bin_vheap_size` is invisible until the next collection.** A live `bin_vheap_sz` is not
+  lifted retroactively (`erl_gc.c:2958`, `:3288`), so a probe that raises it and immediately
+  allocates still runs on the old budget. Faithful to the C, but it means the flag has no
+  instantaneous effect to observe.
+* **A cadence is a maximum, never a guarantee.** A minor still escalates to a fullsweep on the room
+  test (`minor_promotion_fits`) and, in `GenImmixCollector`, on a tight block space — the C's
+  `F_HEAP_GROW`/room escalation, unchanged by the flags.
+* **No live-counter comparison with the oracle.** Per this workspace's test convention the
+  invariants are pinned in `tests/heap_flags.rs` and no suite compares GC counter values against the
+  oracle; the deferral figures above are a probe record, not an assertion.
+* **Nothing else is touched.** The off-heap valve ([the off-heap binary
+  roster](#the-off-heap-binary-roster-reachability-reclaim-and-the-binary-virtual-heap-trigger)),
+  the `IMMIX_BREAK_EVEN_WORDS` auto-selection ([the four-class
+  record](#the-four-class-record-and-the-standing-decision)) and the live-float-register pin are all
+  untouched: no flag selects a mature strategy, disables a collection or unpins a process. The
+  capacities quoted elsewhere in this file (the churn table under [per-op
+  attribution](#per-op-attribution-of-the-gc_boundchurn-shape-the-collectors-own-counters), the
+  compile route under [the growth request carried into the
+  collapse](#the-growth-request-carried-into-the-collapse-the-compile-route-paired-ab)) are the
+  banded rule with no flag set, and are not restated here.
 
 ## The mature-generation room policy (generational cadence)
 

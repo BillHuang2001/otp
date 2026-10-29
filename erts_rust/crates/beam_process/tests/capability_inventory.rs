@@ -703,11 +703,9 @@ fn the_outgoing_port_watch_set_is_not_a_collector_root() {
         .expect("watcher")
         .port_monitors()
         .is_empty());
-    let down = f.atom("DOWN");
-    assert!(payload_is_down_for(
+    assert!(payload_is_monitor_down_for(
         sole_payload(&f.table, watcher),
-        reference,
-        down
+        reference
     ));
 }
 
@@ -758,7 +756,6 @@ fn oracle_monitor_of_a_closed_port_is_born_down_with_noproc() {
 
     // The Rust side: an unallocated port is born down with the same tag/reason/target shape.
     let mut f = Fixture::new();
-    let down = f.atom("DOWN");
     let port_atom = f.atom("port");
     let noproc = f.atom_term("noproc");
     let watcher = f.table.spawn_default().expect("a watcher process");
@@ -769,7 +766,7 @@ fn oracle_monitor_of_a_closed_port_is_born_down_with_noproc() {
         .monitor_port(watcher, closed, &mut ports)
         .expect("a port that is gone is born down");
     let payload = sole_payload(&f.table, watcher);
-    assert!(payload_is_down_for(payload, reference, down));
+    assert!(payload_is_monitor_down_for(payload, reference));
     // SAFETY: `payload` is the live DOWN tuple the table built on the watcher's heap.
     unsafe {
         assert_eq!(tuple_element(payload, 2), make_atom(port_atom));

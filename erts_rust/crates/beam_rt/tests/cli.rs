@@ -246,8 +246,14 @@ fn a_missing_file_fails() {
     assert!(!stderr(&output).contains("Usage:"));
 }
 
+/// `-s Mod F A` applies `Mod:F([A])` — **arity 1** whose one argument is the list of the
+/// tokens (ERTS's `run_args_to_start_instructions/2`) — and the result is **discarded**.
+///
+/// `slice:pick/1` answers `1` for the atom `a` and `2` for anything else, so this row is
+/// silent whichever clause matched; the shape itself (arity and the list) is pinned
+/// differentially by [`cli_s_run_arity`](../cli_s_run_arity.rs).
 #[test]
-fn the_s_action_applies_with_atom_arguments_and_discards_the_result() {
+fn the_s_action_applies_one_list_argument_and_discards_the_result() {
     let fixtures = Path::new(SLICE_BEAM)
         .parent()
         .expect("the fixture has a parent directory")

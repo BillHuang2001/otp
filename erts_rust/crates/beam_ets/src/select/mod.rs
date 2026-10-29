@@ -105,8 +105,20 @@
 //! `tuple_size`, `tuple_element`, `car`, `cdr`) as `unsafe fn`, because "this word
 //! is a live term of the right shape" is a caller invariant the word itself cannot
 //! re-check. Reading the spec term therefore needs `unsafe`; every block below
-//! carries a `// SAFETY:` rationale and the reads never go beyond the
-//! caller-owned spec term (or a table-owned object, which is a validated tuple).
+//! carries a `// SAFETY:` rationale.
+//!
+//! **Every list read goes through the [`cons_cell`](crate::shape::cons_cell) shape
+//! predicate** (primary tag `TAG_PRIMARY_LIST` **and** a non-null cell pointer),
+//! never through `beam_term::list::is_list` alone: `is_list` mirrors the C bit trick
+//! `(x & (_TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) != 0`, i.e. `!(x & 0x2)`, which is
+//! **also** true for every `TAG_PRIMARY_HEADER` word — a word that is not a term at
+//! all — so a stale/foreign caller-heap word could pass it and reach a `car`
+//! dereference (a measured SIGSEGV). The shape test is *not* a liveness test: a
+//! word whose low bits look like a cons pointer but which does not point at a live
+//! cell is unverifiable by any word-local test (the same residual ERTS's C has), so
+//! the ownership rule upstream — a spec word a caller stores anywhere must stay
+//! rooted or be copied, and the spec term passed here must outlive the call — is
+//! the real fix for that half.
 
 use std::collections::BTreeSet;
 
@@ -114,6 +126,7 @@ use beam_common::Result;
 use beam_term::prelude::*;
 
 use crate::error::badarg;
+use crate::shape::cons_cell;
 
 mod continuation;
 mod exec;
@@ -200,9 +213,13 @@ pub(super) fn var_index(name: &str) -> Option<u32> {
 
 /// The elements of a tuple term, or `None` when `term` is not a tuple.
 pub(super) fn tuple_elements(term: Eterm) -> Option<Vec<Eterm>> {
-    // SAFETY: `is_tuple` inspects only the header word of a boxed term and checks
-    // the boxed/arityval shape first, so it is sound for any value word (it never
-    // dereferences a non-boxed, e.g. immediate, term).
+    // SAFETY: `is_tuple` is sound for any word: it routes through
+    // `beam_term::boxed::is_boxed_term`, which rejects header words (and every
+    // immediate) *before* dereferencing anything — `is_boxed`'s `(x & 1) == 0` bit
+    // trick is true for `TAG_PRIMARY_HEADER` too, and `is_boxed_term` is the
+    // predicate that closes that hole — and only then reads the boxed word and
+    // checks that it is an arityval header. So a header-shaped word is *rejected*,
+    // never read.
     if !unsafe { is_tuple(term) } {
         return None;
     }
@@ -216,16 +233,28 @@ pub(super) fn tuple_elements(term: Eterm) -> Option<Vec<Eterm>> {
 
 /// The elements of a proper list term, or `None` when `term` is not a proper list
 /// (a non-cons value, or an improper list).
+///
+/// The walk is gated on [`cons_cell`] (the crate-level shape predicate), so a
+/// `TAG_PRIMARY_HEADER` word, any immediate except `NIL` and the all-ones word
+/// all terminate the walk as "not a proper list" (`None`), which [`compile`] turns
+/// into the `badarg` the oracle raises.
 pub(super) fn list_elements(term: Eterm) -> Option<Vec<Eterm>> {
     let mut elements = Vec::new();
     let mut cursor = term;
-    while is_list(cursor) {
-        // SAFETY: `is_list(cursor)` established that `cursor` is a live cons cell,
-        // so its two `[CAR, CDR]` words are readable. The spec term is caller-owned
-        // and stays live for the whole call, so `cursor` never dangles.
+    while let Some(cell) = cons_cell(cursor) {
+        // SAFETY: `cons_cell` established that `cursor` is a `TAG_PRIMARY_LIST`
+        // cons-cell word with a non-null cell pointer, so the two words at `cell`
+        // (CAR at `+0`, CDR at `+1` — `beam_term::list::{CAR_OFFSET, CDR_OFFSET}`)
+        // are addressable. Liveness comes from the caller-owns-the-spec-term
+        // contract: the spec term passed to `compile`/`match_spec_run` is
+        // caller-owned and outlives the call, so the cells it names are not freed
+        // under us. The shape test cannot validate that reachability — a word with
+        // cons-shaped low bits naming freed/foreign memory is indistinguishable from
+        // a live cell by any word-local test (the residual ERTS's C shares), which
+        // is why the ownership rule upstream is the real fix.
         unsafe {
-            elements.push(car(cursor));
-            cursor = cdr(cursor);
+            elements.push(*cell);
+            cursor = *cell.add(1);
         }
     }
     // A proper list terminates in `NIL`; anything else is an improper list.
@@ -271,4 +300,125 @@ fn decode_clause(clause: Eterm, atoms: &AtomTable) -> Result<MatchClause> {
         body.push(expr::decode(term, atoms, &vars)?);
     }
     Ok(MatchClause { head, guards, body })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the proper-list walk ([`list_elements`]) that reads through
+    //! the crate-level shape gate ([`crate::shape::cons_cell`], whose own unit tests
+    //! live beside it).
+    //!
+    //! The helpers here are `pub(super)`, so these tests live in the module rather
+    //! than in `tests/`; `tests/select_word_classification.rs` covers the same
+    //! contract through the public API.
+
+    use super::*;
+
+    /// A leaked `[CAR, CDR]` cell plus the list word naming it.
+    ///
+    /// The cell is leaked because the walk needs it to outlive this function's
+    /// stack frame; a test process leaking a handful of 16-byte cells is harmless.
+    fn cons(head: Eterm, tail: Eterm) -> Eterm {
+        let cell: &'static mut [Eterm; 2] = Box::leak(Box::new([head, tail]));
+        make_list(cell.as_ptr())
+    }
+
+    /// A proper list of `elements`, built from leaked cells.
+    fn proper_list(elements: &[Eterm]) -> Eterm {
+        let mut acc = NIL;
+        for element in elements.iter().rev() {
+            acc = cons(*element, acc);
+        }
+        acc
+    }
+
+    /// Every header-shaped word the module must refuse: arityvals of several
+    /// arities plus two non-arityval thing headers (a float and a map header).
+    fn header_words() -> Vec<Eterm> {
+        vec![
+            make_arityval_zero(),
+            make_arityval(1),
+            make_arityval(2),
+            make_arityval(5),
+            make_header(1, FLOAT_SUBTAG),
+            make_header(1, MAP_SUBTAG),
+        ]
+    }
+
+    #[test]
+    fn list_elements_reads_a_proper_list() {
+        let list = proper_list(&[make_small(1), make_small(2), make_small(3)]);
+        assert_eq!(
+            list_elements(list),
+            Some(vec![make_small(1), make_small(2), make_small(3)])
+        );
+        assert_eq!(
+            list_elements(cons(make_small(7), NIL)),
+            Some(vec![make_small(7)])
+        );
+    }
+
+    #[test]
+    fn list_elements_of_nil_is_the_empty_list() {
+        // `[]` is a proper (empty) list: no cons cells to read.
+        assert_eq!(list_elements(NIL), Some(Vec::new()));
+    }
+
+    #[test]
+    fn list_elements_of_an_improper_list_is_none() {
+        // `[1 | 2]`: the walk stops at the non-cons tail `2`, which is not `NIL`.
+        let improper = cons(make_small(1), make_small(2));
+        assert_eq!(list_elements(improper), None);
+        // `[1 | [2 | 3]]` likewise.
+        assert_eq!(list_elements(cons(make_small(1), cons(make_small(2), make_small(3)))), None);
+    }
+
+    #[test]
+    fn list_elements_of_a_header_word_is_none() {
+        for word in header_words() {
+            // The reason the old guard was unsound: `is_list`'s `!(x & 0x2)` bit
+            // trick is *also* true for a header word (primary tag 0).
+            assert!(is_list(word), "a header word passes the is_list bit trick");
+            assert_eq!(primary_tag(word), PrimaryTag::Header);
+            assert_eq!(list_elements(word), None, "a header word is not a proper list");
+        }
+    }
+
+    #[test]
+    fn list_elements_of_a_non_list_word_is_none() {
+        // Every other primary tag: a small int, an atom, a boxed-shaped word (whose
+        // pointer is null) and the all-ones word (tag IMMED1).
+        let words = [
+            make_small(7),
+            make_small(0),
+            make_small(-1),
+            make_atom(Atom::from_raw(3)),
+            Eterm::from_raw(0x2),
+            Eterm::from_raw(usize::MAX),
+        ];
+        for word in words {
+            assert!(!is_nil(word));
+            assert_eq!(list_elements(word), None, "not a proper list: {word:?}");
+        }
+    }
+
+    #[test]
+    fn a_list_word_with_a_null_cell_pointer_is_refused() {
+        // `raw == TAG_PRIMARY_LIST` is the cons *tag* with a zero cell pointer — the
+        // null check, not the tag check, is what stops this one from dereferencing
+        // address 0.
+        let word = Eterm::from_raw(TAG_PRIMARY_LIST);
+        assert!(is_list(word), "the tag bit alone looks like a cons cell");
+        assert!(list_val(word).is_null());
+        assert_eq!(crate::shape::cons_cell(word), None);
+        assert_eq!(list_elements(word), None);
+    }
+
+    #[test]
+    fn the_walk_reaches_every_cell_of_a_long_list() {
+        // A 1 000-element list: the walk is a plain cursor loop, so this pins that it
+        // neither stops early nor reads past the last cell.
+        let elements: Vec<Eterm> = (0..1000_i64).map(make_small).collect();
+        assert_eq!(list_elements(proper_list(&elements)), Some(elements));
+    }
 }

@@ -60,8 +60,8 @@
 use beam_gc::{AnyCollector, HeapPolicy, MatureKind, ScannedBounds, IMMIX_BREAK_EVEN_WORDS};
 use beam_process::{Process, ProcessTable};
 use beam_term::prelude::{
-    is_boxed, is_list, make_atom, make_boxed, make_internal_pid, make_internal_port, make_pid_data,
-    make_port_data, make_small, Atom, Eterm, NIL,
+    make_atom, make_boxed, make_internal_pid, make_internal_port, make_pid_data, make_port_data,
+    make_small, Atom, Eterm, NIL,
 };
 use beam_term::AtomTable;
 
@@ -101,7 +101,15 @@ fn exact_root_is_unscanned(process: &Process, term: Eterm) -> bool {
 /// then the mature generation). The oracle's own classifier: `in_heap_block` for the current
 /// mutator block, then the collector's per-region predicates — never the aggregate.
 fn exact_is_scanned(process: &Process, word: Eterm) -> bool {
-    if !is_boxed(word) && !is_list(word) {
+    // The oracle must use the **same** pointer test as the production classifier it stands in
+    // for: the primary tag, never the mirrored C bit tricks. `!is_boxed(w) && !is_list(w)` is
+    // true for *any* word with bit 0 clear, so it would accept a bare header word — the engine's
+    // `THE_NON_VALUE` (`0x18` in a debug build) among them — and this module would then disagree
+    // with `forwards_word_matching`'s real gate instead of checking it.
+    if !matches!(
+        beam_term::tag::primary_tag(word),
+        beam_term::tag::PrimaryTag::List | beam_term::tag::PrimaryTag::Boxed
+    ) {
         return false;
     }
     if beam_term::literal::is_literal(word) {
@@ -846,7 +854,7 @@ fn the_result_shape_test_is_the_region_classifiers_own_prelude() {
         };
         let process = table.get(pid).expect("the process");
         let bounds = process.collector().scanned_bounds();
-        let cases: [(&str, Eterm, bool); 9] = [
+        let cases: [(&str, Eterm, bool); 10] = [
             ("a small int", make_small(7), false),
             ("an atom", make_atom(Atom::from_raw(3)), false),
             ("NIL", NIL, false),
@@ -866,6 +874,15 @@ fn the_result_shape_test_is_the_region_classifiers_own_prelude() {
                 make_boxed(1 as *const Eterm),
                 false,
             ),
+            // The engine's exception-landing register set publishes this word in `x(0)`
+            // (`machine/catch.rs`), so it is a machine root the valve can really be handed: a bare
+            // `TAG_PRIMARY_HEADER` word is **not** a term and must not be classified as a
+            // container by either half of this equivalence.
+            (
+                "the engine's non-value (a bare header word)",
+                beam_term::prelude::THE_NON_VALUE,
+                false,
+            ),
             ("a heap 2-tuple", boxed, true),
             ("a heap cons", cons, true),
         ];
@@ -881,5 +898,131 @@ fn the_result_shape_test_is_the_region_classifiers_own_prelude() {
                 "{kind:?}: the region classifier disagrees with the shape test on {what}"
             );
         }
+    }
+}
+
+/// **The engine's exception-landing register set survives a collection byte-identically.**
+///
+/// `handle_error` writes `x(0) = THE_NON_VALUE` (`beam_engine`'s C-faithful landing convention) and
+/// `try_case` refuses any other word there, so a collection that runs *inside* the landing window —
+/// which a slice pre-emption at a reduction boundary can — must put the same word back:
+/// `publish_roots_full` → collect → `scatter_roots_full`, never a "safer" substitute.
+///
+/// The word is a bare `TAG_PRIMARY_HEADER` (`0x18` in a debug build, `0` in release). It must also
+/// classify as **non-pointer-bearing**, which is what makes the collection runnable at all: read as
+/// a container it used to be dereferenced as a cons cell (`si_addr = 0x18`).
+#[test]
+fn the_exception_landing_register_set_survives_a_collection() {
+    use beam_engine::context::RootSet;
+    let non_value = beam_term::prelude::THE_NON_VALUE;
+    for kind in KINDS {
+        let (mut table, pid) = process_with(kind);
+        // A real root beside the non-value, on the process's own **young** heap, so the collection
+        // has something to relocate: the register file is not a list of immediates.
+        let cons = table
+            .get_mut(pid)
+            .expect("the fixture process is live")
+            .heap_mut()
+            .tuple(&[make_small(11), make_small(22)])
+            .expect("the young heap builds `{11,22}`");
+        let mut x = [non_value, cons, NIL, NIL];
+        let mut stack: [Eterm; 0] = [];
+        let mut fr: [Eterm; 0] = [];
+        {
+            let process = table.get_mut(pid).expect("the fixture process is live");
+            assert_eq!(
+                root_is_unscanned(process, non_value),
+                false,
+                "{kind:?}: a bare header word is not a container, so it cannot be an unscanned root"
+            );
+            assert!(
+                super::publish_roots_full(
+                    process,
+                    &RootSet::new(&mut x, &mut stack, &mut fr, RootSet::ALL_LIVE),
+                    0
+                ),
+                "{kind:?}: the register file publishes"
+            );
+            assert_eq!(
+                process
+                    .registers()
+                    .x()
+                    .get(0)
+                    .expect("register 0 is live after the publish")
+                    .raw(),
+                non_value.raw(),
+                "{kind:?}: the published register file carries the non-value"
+            );
+        }
+        table
+            .get_mut(pid)
+            .expect("the fixture process is live")
+            .collect()
+            .expect("the collection runs with the landing set published");
+        {
+            let process = table.get_mut(pid).expect("the fixture process is live");
+            let mut back_stack: [Eterm; 0] = [];
+            let mut back_fr: [Eterm; 0] = [];
+            assert!(
+                super::scatter_roots_full(
+                    process,
+                    &mut RootSet::new(&mut x, &mut back_stack, &mut back_fr, RootSet::ALL_LIVE),
+                    0
+                ),
+                "{kind:?}: the relocated region matches what the publish wrote"
+            );
+        }
+        assert_eq!(
+            x[0].raw(),
+            non_value.raw(),
+            "{kind:?}: the non-value must come back byte-identically (a normalised word \
+             would turn the fault into `try_case: x(0) is not THE_NON_VALUE`)"
+        );
+        assert!(
+            matches!(
+                beam_term::tag::primary_tag(x[1]),
+                beam_term::tag::PrimaryTag::List | beam_term::tag::PrimaryTag::Boxed
+            ),
+            "{kind:?}: the real root beside it is still a compound term after the collection"
+        );
+    }
+}
+
+/// **The valve's per-word phase is inert on the landing set and does not fault.**
+///
+/// The same register file goes through the reductions-boundary door's own classification
+/// (`valve_verdict_at`, the walk `collect_at_reds_boundary` installs) with the descent open: a bare
+/// header word beside one real root must reach no foreign container, so the verdict is *not*
+/// declined and nothing dereferences the header word as a cons cell.
+#[test]
+fn the_valve_is_inert_on_the_exception_landing_set() {
+    let non_value = beam_term::prelude::THE_NON_VALUE;
+    for kind in KINDS {
+        let (mut table, pid) = process_with(kind);
+        let young = table
+            .get_mut(pid)
+            .expect("the fixture process is live")
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("the young heap builds `{1,2}`");
+        let process = table.get(pid).expect("the fixture process is live");
+        let roots = [non_value, young, NIL];
+        let mut scratch = crate::context::gc_walk::WalkScratch::default();
+        let verdict = crate::context::gc_walk::valve_verdict_at(
+            crate::context::gc_valve_trace::ValveDoor::RedsBoundary,
+            &mut scratch,
+            process,
+            roots.iter(),
+            true,
+        );
+        assert!(
+            !verdict.declined,
+            "{kind:?}: a landing set over one young tuple relocates soundly, so the valve must not \
+             decline the collection"
+        );
+        assert!(
+            verdict.foreign_free,
+            "{kind:?}: the descent reached no foreign container, so the latch may close"
+        );
     }
 }

@@ -69,6 +69,7 @@ pub mod collector;
 pub mod config;
 pub mod copy;
 mod error; // pub(crate) helpers only — NOT public
+mod flags; // the live heap-sizing-flag entry points (`Collector`/`GenImmixCollector`/`AnyCollector` setters) — inherent impls, no items to re-export
 pub mod footprint;
 pub mod heap_info;
 pub mod immix;

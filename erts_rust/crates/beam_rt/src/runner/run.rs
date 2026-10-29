@@ -43,7 +43,7 @@ use crate::runtime::Runtime;
 use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEngine, ProcessEntry, RunnerState, UnrunnableProcess};
 use super::perf::record_baseline_code;
-use super::reason::{exit_reason, killed, normal};
+use super::reason::{exit_reason, killed, normal, signalled_or_bare, signalled_reason};
 use super::tier::{select_entry_tier, JitMode};
 
 // The slice/park accounting for this thread's runner, for the **deterministic** counter pin on
@@ -1738,20 +1738,26 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // handles on this pid's scan state; the copy's source payloads are the union of
                 // the two (`Runtime::source_payloads`), so a reason like `exit(<<big/binary>>)`
                 // resolves either kind rather than tripping the valve over a payload the empty
-                // source table could not resolve. A reason that *genuinely* cannot be copied is
-                // the honest `error:system_limit` (it is propagated, never stored dangling),
-                // while the documented off-heap capability gap keeps the original term and
-                // freezes the heaps — see `Runtime::try_stabilize_escaped_with`.
+                // source table could not resolve. A reason the copier **refuses** is a
+                // *diagnostic* failure, not the process's error: the raise keeps its class,
+                // reason and stacktrace and loses only the opaque payload, so one un-copyable
+                // child reason can never abort the whole run (see
+                // `Runtime::stabilize_error_live_reason`, which is total).
                 let error = {
                     let payloads =
                         self.runtime.source_payloads(pid, engine.machine.refc_binaries());
-                    self.runtime.stabilize_error_live_reason(error, &payloads)?
+                    self.runtime.stabilize_error_live_reason(error, &payloads)
                 };
                 // The exit reason is now **derived from the stabilized error**, so it inherits the
                 // runtime-lifetime term: an atom reason interns the atom, a structured reason
                 // reuses the copy just made (no second pass, no second allocation), and plumbing
                 // without an atom interns its `Display` text. `state.exits` is therefore safe for
                 // every reader (`process_exit`, the crash dump, the `run` route's quiescence arm).
+                //
+                // This is the **bare** reason — the raise's reason untouched by its class. Two
+                // readers want it: the crash report renders `{Reason, Stacktrace}` from it
+                // (`report::exit_value` wraps it for a `throw` and leaves an `exit` bare), and it
+                // is the fallback for a signalled exit value that cannot be built.
                 let reason = if kill {
                     killed(self.runtime)
                 } else {
@@ -1766,6 +1772,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // `exit`-class one, never the `run` action's own target), so the normal path —
                 // a returning process, a park, an `exit` — formats nothing at all.
                 //
+                // Its input stays the **bare** reason: the report's own `report::exit_value`
+                // builds and renders the exit value on a private heap, so passing the signalled
+                // term as well would build it twice for a byte-identical rendering.
+                //
                 // A `max_heap_size` **kill** is not an exception termination (the raise the
                 // collection latched is replaced by the `killed` exit reason), so it reports
                 // nothing here; the C logs its own, different `max_heap_size` message, which this
@@ -1773,12 +1783,28 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 if !kill {
                     report::report_crash(self.runtime, pid, reason, &error);
                 }
-                self.state.exits.insert(pid, reason);
+                // **What the death signals.** ERTS's `{'EXIT', Pid, R}` / `'DOWN' … R` carries the
+                // *exit value*, not the raw raise reason: `{Reason, Stacktrace}` for an `error`,
+                // `{{nocatch, V}, Stacktrace}` for an uncaught `throw`, and the bare reason for an
+                // `exit` (see `reason::signalled_reason`). A `max_heap_size` kill keeps the bare
+                // `killed` atom — it is a termination, never an exception, so it has no exit value.
+                //
+                // A build failure degrades to the bare reason and is traced, never a lost death:
+                // `signalled_or_bare` is that rule, and it is why the outcome below is always a
+                // term. `state.errors` keeps the structured `BeamError` unchanged, so the CLI's
+                // `unsupported`/`error` classification is unaffected by the signal's shape.
+                let signalled = if kill {
+                    reason
+                } else {
+                    let built = signalled_reason(self.runtime, &error);
+                    signalled_or_bare(reason, built)
+                };
+                self.state.exits.insert(pid, signalled);
                 // Keep the error as well: it carries the raise class and the `unsupported`
                 // classification the CLI keys off (see `RunnerState::errors`) — now with a
                 // reason term that outlives this process's heap.
                 self.state.errors.insert(pid, error);
-                Ok(RunOutcome::Exit(reason))
+                Ok(RunOutcome::Exit(signalled))
             }
         }
     }

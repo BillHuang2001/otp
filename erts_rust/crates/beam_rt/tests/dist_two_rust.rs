@@ -193,6 +193,22 @@ const RR_PEER_DRIVES_LINKS_SPEC: &str = "two_vm:peer_drives_links/1";
 /// `erlang:monitor/2` of a victim we host, our victim's death of `{boom,[1,2,3]}`, and the
 /// `{'DOWN', …}` the peer forwards back to us.
 const RR_PEER_MONITORS_SPEC: &str = "two_vm:peer_monitors/1";
+/// The **exit value** of an uncaught `error` over the wire, in all three directions between two
+/// `beam_rt` nodes: the peer monitors our error-dying victim
+/// ([`a_rust_peers_monitor_of_our_error_dying_process_gets_the_exit_value`]), the peer traps our
+/// error-dying victim's link exit (`…_traps_our_error_dying_victims_exit_value`), and we monitor
+/// a victim the peer hosts (`our_monitor_of_a_rust_error_dying_process_receives_the_exit_value`).
+const RR_PEER_MONITORS_ERROR_SPEC: &str = "two_vm:peer_monitors_error/1";
+const RR_PEER_LINKS_ERROR_SPEC: &str = "two_vm:peer_links_error/1";
+const RR_MONITORS_PEER_ERROR_SPEC: &str = "two_vm:monitors_peer_error/1";
+/// The **shape** both nodes print for one error death's exit value — see
+/// [`dist_two_vm.rs`](../dist_two_vm.rs)'s `EXIT_VALUE_SHAPE`: the outer arity, the reason head
+/// and a first frame naming `two_vm:error_victim/0` with a source position, never the term.
+const EXIT_VALUE_SHAPE: &str = "{pair,boom,two_vm,error_victim,0,true}";
+/// The full transcript line a `shape` assertion expects: the peer's own prefix plus the shape.
+fn shape_line(prefix: &str) -> String {
+    format!("{prefix}{EXIT_VALUE_SHAPE}")
+}
 
 // ---------------------------------------------------------------------------------------
 // 1. The handshake, in both directions
@@ -945,6 +961,120 @@ fn a_rust_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason() {
         &pair.runtime,
         &["SAW_DOWN_TIMEOUT", "NOMONITOR"],
         "the peer's monitor fired and its DOWN reached us",
+    );
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+/// **The exit value of an uncaught `error` survives the wire between two `beam_rt` nodes**: the
+/// peer's monitor of our error-dying victim gets a `{'DOWN', …}` whose reason is
+/// `{boom, Stacktrace}` — the term our node encoded in `DOP_MONITOR_P_EXIT` and the peer decoded.
+///
+/// The mirror of
+/// [`dist_two_vm.rs`'s `a_real_erl_peers_monitor_of_our_error_dying_process_gets_the_exit_value`](../dist_two_vm.rs),
+/// over the same responder (`two_vm:peer_monitors_error/1`) and actor (`actor_monitor_error/1`).
+/// Both transcripts print the same `REASON_SHAPE` — ours from the forwarded tuple, the peer's from
+/// what it decoded — so one death's signalled value is asserted from both nodes; a bare `boom`
+/// would print `{bare,boom}` on both and fail here.
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn a_rust_peers_monitor_of_our_error_dying_process_gets_the_exit_value() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_inbound_monitor_error",
+        RR_PEER_MONITORS_ERROR_SPEC,
+        "actor_monitor_error",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("MONITORED_BY ", "MONITORED_BY 1 [true]");
+    pair.runtime_equals("DOWN_SIZE ", "DOWN_SIZE 5");
+    pair.runtime_equals("DOWN_OBJ ", "DOWN_OBJ true");
+    pair.runtime_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.actor_equals("MONITORING ", "MONITORING true");
+    pair.actor_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.assert_absent(
+        &pair.runtime,
+        &["SAW_DOWN_TIMEOUT", "NOMONITOR"],
+        "the peer's monitor fired and its DOWN reached us",
+    );
+    pair.assert_absent(&pair.actor, &["PEER_DOWN_TIMEOUT"], "the peer's monitor fired");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+/// **The link half between two `beam_rt` nodes**: the peer traps exits and links our error-dying
+/// victim, so the `{'EXIT', Pid, R}` our node routes in `DOP_EXIT` carries the exit value, while
+/// our own local monitor of the same victim reads the death back independently.
+///
+/// `LINKS 1 [true]` is the non-vacuous half on our side (the arm really was recorded against the
+/// victim before it died).
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn a_rust_peer_traps_our_error_dying_victims_exit_value() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_inbound_link_error",
+        RR_PEER_LINKS_ERROR_SPEC,
+        "actor_link_error",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("LINKS ", "LINKS 1 [true]");
+    pair.runtime_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    pair.actor_equals("EXIT_SHAPE ", &shape_line("EXIT_SHAPE "));
+    pair.assert_absent(
+        &pair.runtime,
+        &["DOWN_TIMEOUT", "NOLINK"],
+        "the victim's local monitor fired",
+    );
+    pair.assert_absent(
+        &pair.actor,
+        &["EXIT_TIMEOUT", "NOLINK"],
+        "the peer trapped the link exit",
+    );
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+/// **The inbound direction between two `beam_rt` nodes**: the peer hosts a process that dies of an
+/// uncaught `error`, we monitor it, and the exit value arrives as a `DOP_MONITOR_P_EXIT` this
+/// runtime has to decode.
+///
+/// The peer's own witness (`spawn_monitor`) prints the same shape, so the two nodes' readings of
+/// one death are compared rather than trusting either alone.
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn our_monitor_of_a_rust_error_dying_process_receives_the_exit_value() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_monitor_error",
+        RR_MONITORS_PEER_ERROR_SPEC,
+        "actor_host_error",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("DOWN_MATCH ref=bound pid=true", "DOWN_MATCH ref=bound pid=true");
+    pair.runtime_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_HOSTED ", "VICTIM_HOSTED true");
+    pair.actor_equals("PEER_MONITORED_BY ", "PEER_MONITORED_BY true");
+    pair.actor_equals("WITNESS_SHAPE ", &shape_line("WITNESS_SHAPE "));
+    pair.assert_absent(
+        &pair.runtime,
+        &["DOWN_TIMEOUT"],
+        "the peer's DOP_MONITOR_P_EXIT reached our monitor",
     );
     pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
     pair.actor_equals("BYE ", "BYE done");

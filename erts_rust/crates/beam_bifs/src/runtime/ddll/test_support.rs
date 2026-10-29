@@ -152,6 +152,21 @@ impl Fixture {
         let mut ctx = BifContext::new(&mut self.heap, &self.atoms, ProcessId::new(1, 0));
         crate::print::format_term(&mut ctx, term, false).expect("a printable term")
     }
+
+    /// Overwrites **every** word the fixture heap has handed out with a poison small
+    /// integer, so a registry slot that kept a raw word of this heap (instead of an owned
+    /// copy) is detectable afterwards.
+    pub(crate) fn poison_heap(&mut self) {
+        for word in self.heap.used_words_mut() {
+            *word = make_small(-42);
+        }
+    }
+
+    /// Mints an internal reference thing naming `id` on the fixture heap — the rebuilt
+    /// handle a poisoned-then-recovered caller uses.
+    pub(crate) fn mint_ref(&mut self, id: u64) -> Eterm {
+        crate::access::make_ref_thing(&mut self.heap, id).expect("a reference fits")
+    }
 }
 
 /// Registers every real `erl_ddll` key (the loading keys, `info/2` and the monitor pair).

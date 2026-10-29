@@ -97,6 +97,7 @@ pub mod timer;
 
 mod error; // pub(crate) constructors only — NOT public
 mod scratch; // pub(crate) collection buffers only — NOT public
+mod tag; // pub(crate) monitor/3 user-tag ownership — NOT public
 pub use crate::dict::*;
 pub use crate::dirty::*;
 pub use crate::exit_observer::*;

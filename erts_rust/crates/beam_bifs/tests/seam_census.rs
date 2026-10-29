@@ -343,7 +343,7 @@ const CENSUS: &[Row] = &[
     seam!("code", "set_coverage_mode", 1, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
     seam!("erlang", "!", 2, "SendHook seam: delivery needs the target mailbox and the scheduler wake-up"),
     seam!("erlang", "alias", 1, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
-    seam!("erlang", "bump_reductions", 1, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
+    seam!("erlang", "bump_reductions", 1, "ProcessHook seam: the reduction counter is the calling process's own (scheduler) state; the count is validated here and the slice-budget cap is the hook's"),
     seam!("erlang", "call_on_load_function", 1, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
     seam!("erlang", "cancel_timer", 1, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
     seam!("erlang", "cancel_timer", 2, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),

@@ -1,0 +1,687 @@
+SUITE maps_SUITE
+CASE doctests OK
+
+maps:filter(bad_fun, {x,y,z})
+exception error: bad argument
+  in function  maps:filter/2
+     called as maps:filter(bad_fun,{x,y,z})
+     *** argument 1: not a fun that takes two arguments
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filter(bad_fun, [-1|#{}])
+exception error: bad argument
+  in function  maps:filter/2
+     called as maps:filter(bad_fun,[-1|#{}])
+     *** argument 1: not a fun that takes two arguments
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filter(bad_fun, [0|#{}])
+exception error: bad argument
+  in function  maps:filter/2
+     called as maps:filter(bad_fun,[0|#{}])
+     *** argument 1: not a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filter(#Fun<maps_SUITE.71.31244144>, abc)
+exception error: bad map: abc
+  in function  maps:filter/2
+     called as maps:filter(#Fun<maps_SUITE.71.31244144>,abc)
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filter(#Fun<maps_SUITE.72.31244144>, [-1|#{}])
+exception error: bad map: [-1|#{}]
+  in function  maps:filter/2
+     called as maps:filter(#Fun<maps_SUITE.72.31244144>,[-1|#{}])
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filter(#Fun<maps_SUITE.73.31244144>, {x,y,z})
+exception error: bad map: {x,y,z}
+  in function  maps:filter/2
+     called as maps:filter(#Fun<maps_SUITE.73.31244144>,{x,y,z})
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filtermap(#Fun<maps_SUITE.74.31244144>, abc)
+exception error: bad map: abc
+  in function  maps:filtermap/2
+     called as maps:filtermap(#Fun<maps_SUITE.74.31244144>,abc)
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filtermap(#Fun<maps_SUITE.75.31244144>, [-1|#{}])
+exception error: bad map: [-1|#{}]
+  in function  maps:filtermap/2
+     called as maps:filtermap(#Fun<maps_SUITE.75.31244144>,[-1|#{}])
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filtermap(#Fun<maps_SUITE.76.31244144>, {x,y,z})
+exception error: bad map: {x,y,z}
+  in function  maps:filtermap/2
+     called as maps:filtermap(#Fun<maps_SUITE.76.31244144>,{x,y,z})
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filtermap(#Fun<maps_SUITE.77.31244144>, [0|#{}])
+exception error: bad argument
+  in function  maps:filtermap/2
+     called as maps:filtermap(#Fun<maps_SUITE.77.31244144>,[0|#{}])
+     *** argument 1: not a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:filtermap(#Fun<maps_SUITE.78.31244144>, #{})
+exception error: bad argument
+  in function  maps:filtermap/2
+     called as maps:filtermap(#Fun<maps_SUITE.78.31244144>,#{})
+     *** argument 1: not a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:find(key, no_map)
+exception error: bad map: no_map
+  in function  maps:find/2
+     called as maps:find(key,no_map)
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:fold(#Fun<maps_SUITE.79.31244144>, init, abc)
+exception error: bad map: abc
+  in function  maps:fold/3
+     called as maps:fold(#Fun<maps_SUITE.79.31244144>,init,abc)
+     *** argument 3: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:fold(#Fun<maps_SUITE.80.31244144>, init, [-1|#{}])
+exception error: bad map: [-1|#{}]
+  in function  maps:fold/3
+     called as maps:fold(#Fun<maps_SUITE.80.31244144>,init,[-1|#{}])
+     *** argument 3: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:fold(#Fun<maps_SUITE.81.31244144>, init, {x,y,z})
+exception error: bad map: {x,y,z}
+  in function  maps:fold/3
+     called as maps:fold(#Fun<maps_SUITE.81.31244144>,init,{x,y,z})
+     *** argument 3: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:fold(#Fun<maps_SUITE.82.31244144>, init, [0|#{}])
+exception error: bad argument
+  in function  maps:fold/3
+     called as maps:fold(#Fun<maps_SUITE.82.31244144>,init,[0|#{}])
+     *** argument 1: not a fun that takes three arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:fold(#Fun<maps_SUITE.83.31244144>, init, #{})
+exception error: bad argument
+  in function  maps:fold/3
+     called as maps:fold(#Fun<maps_SUITE.83.31244144>,init,#{})
+     *** argument 1: not a fun that takes three arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:foreach(#Fun<maps_SUITE.84.31244144>, no_map)
+exception error: bad map: no_map
+  in function  maps:foreach/2
+     called as maps:foreach(#Fun<maps_SUITE.84.31244144>,no_map)
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:foreach(#Fun<maps_SUITE.85.31244144>, [-1|#{}])
+exception error: bad map: [-1|#{}]
+  in function  maps:foreach/2
+     called as maps:foreach(#Fun<maps_SUITE.85.31244144>,[-1|#{}])
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:foreach(#Fun<maps_SUITE.86.31244144>, {x,y,z})
+exception error: bad map: {x,y,z}
+  in function  maps:foreach/2
+     called as maps:foreach(#Fun<maps_SUITE.86.31244144>,{x,y,z})
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:foreach(#Fun<maps_SUITE.87.31244144>, [0|#{}])
+exception error: bad argument
+  in function  maps:foreach/2
+     called as maps:foreach(#Fun<maps_SUITE.87.31244144>,[0|#{}])
+     *** argument 1: not a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:foreach(#Fun<maps_SUITE.88.31244144>, #{})
+exception error: bad argument
+  in function  maps:foreach/2
+     called as maps:foreach(#Fun<maps_SUITE.88.31244144>,#{})
+     *** argument 1: not a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:from_keys(#{a => b}, whatever)
+exception error: bad argument
+  in function  maps:from_keys/2
+     called as maps:from_keys(#{a => b},whatever)
+     *** argument 1: not a list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:from_keys([a|b], whatever)
+exception error: bad argument
+  in function  maps:from_keys/2
+     called as maps:from_keys([a|b],whatever)
+     *** argument 1: not a proper list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:from_list(#{a => b})
+exception error: bad argument
+  in function  maps:from_list/1
+     called as maps:from_list(#{a => b})
+     *** argument 1: not a list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:from_list([a|b])
+exception error: bad argument
+  in function  maps:from_list/1
+     called as maps:from_list([a|b])
+     *** argument 1: not a proper list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:get(key, {no,map})
+exception error: bad map: {no,map}
+  in function  maps:get/2
+     called as maps:get(key,{no,map})
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:get(key, {no,map}, default)
+exception error: bad map: {no,map}
+  in function  maps:get/3
+     called as maps:get(key,{no,map},default)
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:get(key, #{})
+exception error: bad key: key
+  in function  maps:get/2
+     called as maps:get(key,#{})
+     *** argument 1: not present in map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:groups_from_list(not_a_fun, #Fun<maps_SUITE.89.31244144>, [])
+exception error: bad argument
+  in function  maps:groups_from_list/3
+     called as maps:groups_from_list(not_a_fun,#Fun<maps_SUITE.89.31244144>,
+                                     [])
+     *** argument 1: not a fun that takes one argument
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:groups_from_list(not_a_fun, [])
+exception error: bad argument
+  in function  maps:groups_from_list/2
+     called as maps:groups_from_list(not_a_fun,[])
+     *** argument 1: not a fun that takes one argument
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:groups_from_list(#Fun<maps_SUITE.90.31244144>, not_a_fun, [])
+exception error: bad argument
+  in function  maps:groups_from_list/3
+     called as maps:groups_from_list(#Fun<maps_SUITE.90.31244144>,not_a_fun,
+                                     [])
+     *** argument 2: not a fun that takes one argument
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:groups_from_list(#Fun<maps_SUITE.91.31244144>, #Fun<maps_SUITE.92.31244144>, not_a_list)
+exception error: bad argument
+  in function  maps:groups_from_list/3
+     called as maps:groups_from_list(#Fun<maps_SUITE.91.31244144>,
+                                     #Fun<maps_SUITE.92.31244144>,not_a_list)
+     *** argument 3: not a list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:groups_from_list(fun erlang:hd/1, not_a_list)
+exception error: bad argument
+  in function  maps:groups_from_list/2
+     called as maps:groups_from_list(fun erlang:hd/1,not_a_list)
+     *** argument 2: not a list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:intersect(x, y)
+exception error: bad map: x
+  in function  maps:intersect/2
+     called as maps:intersect(x,y)
+     *** argument 1: not a map
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:intersect(x, #{a => b})
+exception error: bad map: x
+  in function  maps:intersect/2
+     called as maps:intersect(x,#{a => b})
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:intersect(#{a => b}, y)
+exception error: bad map: y
+  in function  maps:intersect/2
+     called as maps:intersect(#{a => b},y)
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:intersect_with(#Fun<maps_SUITE.93.31244144>, #{a => b}, y)
+exception error: bad map: y
+  in function  maps:intersect_with/3
+     called as maps:intersect_with(#Fun<maps_SUITE.93.31244144>,#{a => b},y)
+     *** argument 3: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:intersect_with(#Fun<maps_SUITE.94.31244144>, x, #{a => b})
+exception error: bad map: x
+  in function  maps:intersect_with/3
+     called as maps:intersect_with(#Fun<maps_SUITE.94.31244144>,x,#{a => b})
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:intersect_with(#Fun<maps_SUITE.95.31244144>, x, y)
+exception error: bad map: x
+  in function  maps:intersect_with/3
+     called as maps:intersect_with(#Fun<maps_SUITE.95.31244144>,x,y)
+     *** argument 2: not a map
+     *** argument 3: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:intersect_with(#Fun<maps_SUITE.96.31244144>, #{}, #{})
+exception error: bad argument
+  in function  maps:intersect_with/3
+     called as maps:intersect_with(#Fun<maps_SUITE.96.31244144>,#{},#{})
+     *** argument 1: not a fun that takes three arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:is_key(key, no_map)
+exception error: bad map: no_map
+  in function  maps:is_key/2
+     called as maps:is_key(key,no_map)
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:iterator({no,map})
+exception error: bad map: {no,map}
+  in function  maps:iterator/1
+     called as maps:iterator({no,map})
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:iterator({no,map}, ordered)
+exception error: bad argument
+  in function  maps:iterator/2
+     called as maps:iterator({no,map},ordered)
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:iterator({no,map}, reversed)
+exception error: bad argument
+  in function  maps:iterator/2
+     called as maps:iterator({no,map},reversed)
+     *** argument 1: not a map
+     *** argument 2: not 'undefined', 'ordered', 'reversed', or a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:iterator({no,map}, undefined)
+exception error: bad argument
+  in function  maps:iterator/2
+     called as maps:iterator({no,map},undefined)
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:iterator({no,map}, #Fun<maps_SUITE.69.31244144>)
+exception error: bad argument
+  in function  maps:iterator/2
+     called as maps:iterator({no,map},#Fun<maps_SUITE.69.31244144>)
+     *** argument 1: not a map
+     *** argument 2: not 'undefined', 'ordered', 'reversed', or a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:iterator({no,map}, #Fun<maps_SUITE.70.31244144>)
+exception error: bad argument
+  in function  maps:iterator/2
+     called as maps:iterator({no,map},#Fun<maps_SUITE.70.31244144>)
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:iterator(#{a => b}, #Fun<maps_SUITE.69.31244144>)
+exception error: bad argument
+  in function  maps:iterator/2
+     called as maps:iterator(#{a => b},#Fun<maps_SUITE.69.31244144>)
+     *** argument 2: not 'undefined', 'ordered', 'reversed', or a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:keys({no,map})
+exception error: bad map: {no,map}
+  in function  maps:keys/1
+     called as maps:keys({no,map})
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:map(#Fun<maps_SUITE.97.31244144>, abc)
+exception error: bad map: abc
+  in function  maps:map/2
+     called as maps:map(#Fun<maps_SUITE.97.31244144>,abc)
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:map(#Fun<maps_SUITE.98.31244144>, [-1|#{}])
+exception error: bad map: [-1|#{}]
+  in function  maps:map/2
+     called as maps:map(#Fun<maps_SUITE.98.31244144>,[-1|#{}])
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:map(#Fun<maps_SUITE.99.31244144>, {x,y,z})
+exception error: bad map: {x,y,z}
+  in function  maps:map/2
+     called as maps:map(#Fun<maps_SUITE.99.31244144>,{x,y,z})
+     *** argument 2: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:map(#Fun<maps_SUITE.100.31244144>, [0|#{}])
+exception error: bad argument
+  in function  maps:map/2
+     called as maps:map(#Fun<maps_SUITE.100.31244144>,[0|#{}])
+     *** argument 1: not a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:map(#Fun<maps_SUITE.101.31244144>, #{})
+exception error: bad argument
+  in function  maps:map/2
+     called as maps:map(#Fun<maps_SUITE.101.31244144>,#{})
+     *** argument 1: not a fun that takes two arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:merge({x,y}, {a,b})
+exception error: bad map: {x,y}
+  in function  maps:merge/2
+     called as maps:merge({x,y},{a,b})
+     *** argument 1: not a map
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:merge({x,y}, #{a => b})
+exception error: bad map: {x,y}
+  in function  maps:merge/2
+     called as maps:merge({x,y},#{a => b})
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:merge(#{a => b}, {a,b})
+exception error: bad map: {a,b}
+  in function  maps:merge/2
+     called as maps:merge(#{a => b},{a,b})
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:merge_with(a, b, c)
+exception error: bad argument
+  in function  maps:merge_with/3
+     called as maps:merge_with(a,b,c)
+     *** argument 1: not a fun that takes three arguments
+     *** argument 2: not a map
+     *** argument 3: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:merge_with(#Fun<maps_SUITE.102.31244144>, #{}, #{})
+exception error: bad argument
+  in function  maps:merge_with/3
+     called as maps:merge_with(#Fun<maps_SUITE.102.31244144>,#{},#{})
+     *** argument 1: not a fun that takes three arguments
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:next(no_iterator)
+exception error: bad argument
+  in function  maps:next/1
+     called as maps:next(no_iterator)
+     *** argument 1: not a valid iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:next([-1|#{}])
+exception error: bad argument
+  in function  maps:next/1
+     called as maps:next([-1|#{}])
+     *** argument 1: not a valid iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:put(key, value, {no,map})
+exception error: bad map: {no,map}
+  in function  maps:put/3
+     called as maps:put(key,value,{no,map})
+     *** argument 3: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:remove(key, {no,map})
+exception error: bad map: {no,map}
+  in function  maps:remove/2
+     called as maps:remove(key,{no,map})
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:size(no_map)
+exception error: bad map: no_map
+  in function  maps:size/1
+     called as maps:size(no_map)
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:take(key, no_map)
+exception error: bad map: no_map
+  in function  maps:take/2
+     called as maps:take(key,no_map)
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:to_list(xyz)
+exception error: bad map: xyz
+  in function  maps:to_list/1
+     called as maps:to_list(xyz)
+     *** argument 1: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:to_list({x,y,z})
+exception error: bad map: {x,y,z}
+  in function  maps:to_list/1
+     called as maps:to_list({x,y,z})
+     *** argument 1: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:to_list([-1|#{}])
+exception error: bad map: [-1|#{}]
+  in function  maps:to_list/1
+     called as maps:to_list([-1|#{}])
+     *** argument 1: not a map or an iterator
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:update(key, value, no_map)
+exception error: bad map: no_map
+  in function  maps:update/3
+     called as maps:update(key,value,no_map)
+     *** argument 3: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:update_with(key, #Fun<maps_SUITE.103.31244144>, {no,map})
+exception error: bad map: {no,map}
+  in function  maps:update_with/3
+     called as maps:update_with(key,#Fun<maps_SUITE.103.31244144>,{no,map})
+     *** argument 3: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:update_with(key, #Fun<maps_SUITE.104.31244144>, #{})
+exception error: bad argument
+  in function  maps:update_with/3
+     called as maps:update_with(key,#Fun<maps_SUITE.104.31244144>,#{})
+     *** argument 2: not a fun that takes one argument
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:update_with(key, #Fun<maps_SUITE.105.31244144>, init, {no,map})
+exception error: bad map: {no,map}
+  in function  maps:update_with/4
+     called as maps:update_with(key,#Fun<maps_SUITE.105.31244144>,init,
+                                {no,map})
+     *** argument 4: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:update_with(key, #Fun<maps_SUITE.106.31244144>, init, #{})
+exception error: bad argument
+  in function  maps:update_with/4
+     called as maps:update_with(key,#Fun<maps_SUITE.106.31244144>,init,#{})
+     *** argument 2: not a fun that takes one argument
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:values(no_map)
+exception error: bad map: no_map
+  in function  maps:values/1
+     called as maps:values(no_map)
+     *** argument 1: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:with(not_list, #{})
+exception error: bad argument
+  in function  maps:with/2
+     called as maps:with(not_list,#{})
+     *** argument 1: not a list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:with([1,2,3], {no,map})
+exception error: bad map: {no,map}
+  in function  maps:with/2
+     called as maps:with([1,2,3],{no,map})
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:without(not_list, #{})
+exception error: bad argument
+  in function  maps:without/2
+     called as maps:without(not_list,#{})
+     *** argument 1: not a list
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)
+maps:without([1,2,3], {no,map})
+exception error: bad map: {no,map}
+  in function  maps:without/2
+     called as maps:without([1,2,3],{no,map})
+     *** argument 2: not a map
+  in call from error_info_lib:eval_bif_error/6 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src/error_info_lib.erl:96)
+  in call from ct_runner:call_case/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:170)
+  in call from ct_runner:'-run_case/4-fun-0-'/3 (/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl/ct_runner.erl:152)CASE error_info OK
+CASE t_filter_2 OK
+CASE t_filtermap_2 OK
+CASE t_fold_3 OK
+CASE t_foreach_2 OK
+CASE t_from_keys OK
+No of yields: 247
+CASE t_from_keys_check_trapping OK
+Sarting Round 0
+CASE t_from_keys_kill_process OK
+No of yields: 22
+CASE t_from_list_check_trapping OK
+Sarting Round 0
+CASE t_from_list_kill_process OK
+CASE t_get_3 OK
+CASE t_groups_from_list OK
+CASE t_intersect OK
+CASE t_intersect_with OK
+CASE t_iterator_1 OK
+CASE t_iterator_2 OK
+CASE t_iterator_valid OK
+Sarting Round 0
+CASE t_keys_kill_process OK
+No of yields: 17
+CASE t_keys_trapping OK
+CASE t_map_2 OK
+CASE t_merge_opt OK
+CASE t_merge_with OK
+CASE t_order_consistency OK
+CASE t_put_opt OK
+CASE t_size_1 OK
+CASE t_update_with_3 OK
+CASE t_update_with_4 OK
+Sarting Round 0
+CASE t_values_kill_process OK
+No of yields: 18
+CASE t_values_trapping OK
+CASE t_with_2 OK
+CASE t_without_2 OK
+DONE maps_SUITE

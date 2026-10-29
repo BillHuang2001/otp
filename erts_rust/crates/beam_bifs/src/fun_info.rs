@@ -155,6 +155,29 @@
 //! [`function`](beam_codec::FunIdentity::function) is `None` leaves `name` the typed
 //! gap on its own.
 //!
+//! ## The `-eval` template closure, measured (OTP 29.1.2 / erts-17.1.1)
+//!
+//! `fun_info(fun() -> ok end, …)` on the `-eval` route is **not** a `make_fun3`
+//! closure: `erl_eval` builds it from a parsed template, so the oracle answers
+//!
+//! ```text
+//! {type,local} {module,erl_eval} {arity,0}
+//! {uniq,130099583} {index,43}                     %% the descriptor word
+//! {name,'-expr/6-fun-7-'}
+//! {env,[{11,[],none,none,#{},[{clause,11,[],[],[{atom,11,ok}]}]}]}
+//! ```
+//!
+//! — a `(uniq, index)` pair that exists only because `erl_eval` interned it into its
+//! own module table, and an `env` holding the parsed AST. Nothing in the frozen term
+//! carries `module`/`name`/`old_index`/`old_uniq`/the 16-byte module MD5, so no seam
+//! can derive them: `beam_rt`'s bridge answers `Ok(None)` (its scan of the loaded
+//! modules finds no `FunT` entry with that pair), and every seam-backed item stays the
+//! typed gap — including `term_to_binary/1` of the closure (`unsupported_local_fun`;
+//! the oracle's image is 138 bytes, and its `NEW_FUN_EXT` `old_index` is the same
+//! `erl_eval`-interned `index`). A `uniq` is never fabricated to close this: doing so
+//! would put a wrong identity into the wire image, which is worse than the gap. See
+//! `tests/term_to_binary_local_fun.rs` for the assertions on both routes.
+//!
 //! The seam is consulted **at most once per `fun_info` call**: a runtime
 //! implementation scans the loaded modules and hashes a `.beam`, so the ten-key
 //! `fun_info/1` walk must not pay for it once per key. `/1` and `/2` resolve it at

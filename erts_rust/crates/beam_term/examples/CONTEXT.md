@@ -32,5 +32,6 @@ read the **retired-instruction count** or a ratio between two measured quantitie
 - `atom_intern_bench.rs` → the atom table's name→index probe and index→name reader, ns/call
 - `atom_witness.rs` → the O(1) witness vs the O(table) clone
 - `map_build_bench.rs` → `write_map` builder A/B
+- `map_cow_bench.rs` → the incremental (`map_put_cow`/`map_remove_cow`) writers against the rebuild routes, with the `*_words_required` word counters
 - `cmp_lookup_bench.rs` → comparison/map-lookup/hash micro-buckets for `perf` attribution
 - `size_walk_bench.rs` → the sizing walk A/B (retired / fresh / warm scratch)

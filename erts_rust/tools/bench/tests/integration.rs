@@ -131,10 +131,11 @@ fn comparison_flags_presence_and_status_changes() {
 /// `rust` runtime) and keep declaring the contracts it exercises. If it is ever flipped
 /// back to `SysOnly` or removed, this fails loudly — no silent loss of Rust coverage.
 ///
-/// The same guard covers the six other cross-runtime signals: `list_walk` (compute),
+/// The same guard covers the other cross-runtime signals: `list_walk` (compute),
 /// `copy_bound` (messaging/copy), `gc_bound` (GC allocation churn), `binary_append` (binary
-/// building), `file_io` (I/O) and `gc_class` (GC classes: a collector-running ping-pong, the
-/// ETS copy boundary and an in-process compile).
+/// building), `file_io` (file-system I/O), `cowboy` (HTTP I/O — one built Cowboy
+/// `hello_world` tree served by both runtimes) and `gc_class` (GC classes: a
+/// collector-running ping-pong, the ETS copy boundary and an in-process compile).
 #[test]
 fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     let foreign = workload::find("foreign").expect("the `foreign` workload must be registered");
@@ -241,8 +242,8 @@ fn a_real_foreign_workload_is_measured_under_both_runtimes() {
         "the rust-schedulable workload set must include `binary_append`; got {rust_capable:?}"
     );
 
-    // `file_io` closes the I/O-bound gap (it was the one mandated class with no cross-runtime
-    // workload: `cowboy` is `SysOnly`). Same guard: registered, `Both`, `io`, A.1+A.7.
+    // `file_io` is the file-system I/O-bound signal (the `cowboy` row covers the HTTP side).
+    // Same guard: registered, `Both`, `io`, A.1+A.7.
     let file_io = workload::find("file_io").expect("the `file_io` workload must be registered");
     assert!(
         matches!(file_io.runtimes(), Runtimes::Both),
@@ -279,6 +280,27 @@ fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     assert!(
         rust_capable.contains(&"gc_class"),
         "the rust-schedulable workload set must include `gc_class`; got {rust_capable:?}"
+    );
+
+    // `cowboy` is the HTTP I/O-bound target: both sides serve the *same* Cowboy
+    // `hello_world` `.beam`s through the *same* dispatch (`{'_', [{"/", toppage_h, []}]}`),
+    // built once from the read-only checkout, so the row is a real cross-runtime
+    // measurement of a real HTTP server. Same guard: registered, `Both`, `io`, A.1+A.6.
+    let cowboy = workload::find("cowboy").expect("the `cowboy` workload must be registered");
+    assert!(
+        matches!(cowboy.runtimes(), Runtimes::Both),
+        "`cowboy` must run under both runtimes, got {:?}",
+        cowboy.runtimes()
+    );
+    assert_eq!(cowboy.category(), Category::Io);
+    assert!(
+        cowboy.contracts().contains(&"A.1") && cowboy.contracts().contains(&"A.6"),
+        "contracts: {:?}",
+        cowboy.contracts()
+    );
+    assert!(
+        rust_capable.contains(&"cowboy"),
+        "the rust-schedulable workload set must include `cowboy`; got {rust_capable:?}"
     );
 
     // `jsone` and `bbmustache` are whole-application pure-Erlang programs (a JSON codec and a

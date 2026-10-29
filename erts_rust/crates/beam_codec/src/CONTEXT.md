@@ -88,7 +88,8 @@ per-rule wire detail lives one level down in
   (the C `dec_atom`: no `NIL_EXT` marker) vs `decode_node_atom` (the C `dec_sysname`: marker
   allowed), `MAX_DECODE_DEPTH` — [`decode/CONTEXT.md`](./decode/CONTEXT.md)
 - `encode/` → the `Encoder` state machine, the tag emitters (incl. the internal pid/port/**ref**
-  branches), the fun/record/map/float emitters, `FunIdentity`, the flavours, `encode_term*` —
+  branches), the fun/record/map/float emitters, `FunIdentity` + `FunIdentityResolver`, the
+  flavours, `encode_term*` —
   [`encode/CONTEXT.md`](./encode/CONTEXT.md)
 - `term/` → the **only** `unsafe` subtree: safe forwarding/allocation wrappers over `beam_term`
   (`binary`/`fun`/`record`/`ref`), the record definition hash, the oversized-flatmap writer —

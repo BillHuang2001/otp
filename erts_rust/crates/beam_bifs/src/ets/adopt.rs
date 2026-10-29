@@ -541,6 +541,11 @@ fn fold(ctx: &mut BifContext<'_>, args: &[Eterm], reverse: bool) -> Result<Eterm
     // `objects` is already in *visit* order — the fold direction was applied while
     // collecting, exactly as the oracle's `do_foldl`/`do_foldr` walk.
     let mut acc = acc0;
+    // `acc`/`object` may be held across `ctx.call_fun` only because of the host's
+    // guarantees: `beam_rt`'s `apply_fun` keeps the process `relocation_exempt` for
+    // the whole run and the nested run has `gc_armed == false`, and each nested
+    // dispatch takes its own pool mark above these words (crate CONTEXT § *Heap
+    // lifetime* — the nested-call hazard shape).
     for &object in objects.iter() {
         acc = ctx.call_fun(fun, &[object, acc])?;
     }

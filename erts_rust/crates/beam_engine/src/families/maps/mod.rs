@@ -27,29 +27,34 @@
 //! - [`Instr::PutMapAssoc`] — update/build a map (associating new keys)
 //! - [`Instr::PutMapExact`] — update a map (failing on an unknown key)
 //!
-//! Map terms are read/built with the `crate::terms` map helpers
-//! (`map_entries` / `make_map`); key matching uses `beam_term::cmp` (the exact
-//! `=:=` ordering, i.e. `erts_cmp` with `exact=1`) so the engine never reimplements
-//! term ordering and maps keep their `=:=` key semantics (`1` and `1.0` are
-//! distinct keys).
+//! Map terms are read with [`beam_term::map::map_get`] and built with the
+//! `crate::terms` map helpers (`make_map` / `map_cow_rooted`); key matching is
+//! `beam_term::cmp`'s `EQ` (the exact `=:=` ordering, i.e. `erts_cmp` with
+//! `exact=1`) so the engine never reimplements term ordering and maps keep their
+//! `=:=` key semantics (`1` and `1.0` are distinct keys).
 //!
-//! `map_entries` reads **both** frozen map layouts — a flat map and a hashmap
-//! (HAMT, walked node by node) — so the read instructions
-//! ([`Instr::GetMapElements`] / [`Instr::HasMapFields`]) handle a hashmap source
-//! with a plain `beam_term::cmp` scan and no hash function. *Building* a map goes
-//! through [`crate::terms::make_map`] (`beam_term::map::write_map`), which picks
-//! the frozen layout by size: a **flat** map at/below `MAP_SMALL_MAP_LIMIT` (32)
-//! distinct keys, a **hashmap** (HAMT) above it — exactly the oracle's choice, so a
-//! map grown past the limit by compiled code is a correct hashmap.
+//! `map_get` reads **both** frozen map layouts — the bounded key scan of a flat map
+//! and a hashmap's hashed path walk — so each read instruction
+//! ([`Instr::GetMapElements`] / [`Instr::HasMapFields`]) performs **one descent per
+//! key** (the C's `erts_hashmap_get`, `emu/map_instrs.tab:49-122`) and never
+//! materializes the source as a pair list. *Building* a map goes through
+//! [`crate::terms::make_map`] (`beam_term::map::write_map`) on a flat source, which
+//! picks the frozen layout by size: a **flat** map at/below `MAP_SMALL_MAP_LIMIT`
+//! (32) distinct keys, a **hashmap** (HAMT) above it — exactly the oracle's choice,
+//! so a map grown past the limit by compiled code is a correct hashmap; a hashmap
+//! source is updated by [`beam_term::map::map_put_cow`] instead (see [`write`]).
 //!
 //! # Layout
 //!
 //! The work is split by responsibility: this file holds [`exec`] (the dispatch), the
-//! key-lookup helpers and the failure paths shared by both halves; [`read`] holds the
-//! read side (`get_map_elements` / `has_map_fields`); [`write`] holds the update side
-//! (`put_map_assoc` / `put_map_exact`). The comprehensive unit suite (every opcode
+//! `position` scan the flat write arm needs and the failure paths shared by both
+//! halves; [`read`] holds the read side (`get_map_elements` / `has_map_fields`: the
+//! source operand is read **once** per instruction and every key descends that one
+//! held word, one `map_get` descent per key); [`write`] holds the update side (`put_map_assoc` /
+//! `put_map_exact`). The comprehensive unit suite (every opcode
 //! variant, both map layouts incl. the 32/33-key boundary, the failure paths and the
-//! dispatch contract) lives in the sibling `tests` module.
+//! dispatch contract) lives in the sibling `tests` module, whose `read_path` submodule
+//! sweeps the read instructions over the whole size range.
 //!
 //! # Ground truth (read-only)
 //!
@@ -74,15 +79,25 @@
 //!
 //! # Semantics
 //!
-//! * `GetMapElements { fail, source, pairs }` — read `source`; if it is not a map
+//! * `GetMapElements { fail, source, pairs }` — read `source` **once**, before the
+//!   loop; if it is not a map
 //!   jump to `fail` (or raise `{badmap, Source}` when `fail` is
 //!   [`NO_FAIL`] — the reason the compiler's own `is_map` guard branch raises). For
-//!   each `(key, dst)` pair, look `key` up; **a missing key jumps to `fail`**, or —
+//!   each `(key, dst)` pair, descend that **held** word once for `key`
+//!   ([`beam_term::map::map_get`], the source is never enumerated), so a destination
+//!   that aliases the source register cannot change any later pair's answer — the C
+//!   holds `map = $Src` in a local for exactly this reason
+//!   (`emu/map_instrs.tab:64-122`); **a missing key
+//!   jumps to `fail`**, or —
 //!   when `fail` is [`NO_FAIL`] — raises the bare atom `function_clause` (the
 //!   engine-defined reason for this branchless failure, see below), otherwise the
 //!   value is written to `dst`. Partial writes before a failure are harmless (the
 //!   clause matcher restarts at `fail`).
-//! * `HasMapFields { fail, source, keys }` — every key must be present, else jump
+//!   A `map_get` `TermError::BadMap` on a word that already passed the `is_map` check
+//!   is a malformed map **interior** and stays a typed `BeamError::BadArg`; "this
+//!   operand is not a map" is the entry check's outcome above, never that error.
+//! * `HasMapFields { fail, source, keys }` — read `source` once; every key must be
+//!   present (one descent of the held word per key; no writes), else jump
 //!   to `fail`, or raise the same bare `function_clause` when `fail` is
 //!   [`NO_FAIL`]. No writes.
 //! * `PutMapAssoc { fail, source, dst, live, pairs }` — build a **new** map =
@@ -93,6 +108,14 @@
 //! * `PutMapExact { fail, source, dst, live, pairs }` — as `PutMapAssoc`, but every
 //!   key must already exist; a missing key jumps to `fail` (or raises
 //!   `{badkey, Key}` when `fail` is [`NO_FAIL`], the ground-truth reason above).
+//!
+//! An update that **changes nothing** — every pair replaces an existing key with the
+//! identical value *word* (`Eterm` word equality, never `=:=`) — writes the **source
+//! map term itself** to `dst`, so `erts_debug:same(M#{a => 1}, M)` is `true` when `M`
+//! already holds `a => 1`: the C's `changed_values`/`changed_keys` fast path
+//! (`beam_common.c:2094-2142`) and the HAMT route's `*sz = 0` same-value answer
+//! (`erl_map.c:2493,2523-2526`). A new key, or any value whose word differs, still builds
+//! a fresh map. Detail and the one declining shape: [`write`]'s module docs.
 //!
 //! `live` (the count of live X registers the C collector treats as GC roots across
 //! the update) is **unused at M1**: `MinimalContext` has no moving collector, so the
@@ -203,18 +226,6 @@ pub(crate) fn exec(
         // Not this family's variant.
         _ => Ok(None),
     }
-}
-
-/// The value bound to `key` in `entries`, using exact key equality.
-///
-/// The comparison is delegated to `beam_term::cmp` (the exact `=:=` ordering) so
-/// map keys keep `erts_cmp`'s semantics — in particular `1` and `1.0` are distinct
-/// keys — and the engine never reimplements term ordering.
-fn lookup(entries: &[(Eterm, Eterm)], key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
-    entries
-        .iter()
-        .find(|(candidate, _)| cmp(*candidate, key, atoms).is_eq())
-        .map(|(_, value)| *value)
 }
 
 /// The index of `key`'s binding in `entries`, using exact key equality (for the

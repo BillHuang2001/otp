@@ -89,6 +89,11 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 /// `system_info/1` atom vocabulary ([`crate::info::INFO_ATOMS`]) and the
 /// `beam_process` signal names, so this list is deliberately not exhaustive on its own.
 ///
+/// It is **not** the start of the index space either: [`crate::codeserver::CodeServer::new`]
+/// first interns `erts/emulator/beam/atom.names` in file order ([`crate::atom_seed`]), so every
+/// name this list holds that the file also lists already has its ERTS index, and only the names
+/// the file lacks are appended here (in the order below).
+///
 /// Six groups:
 ///
 /// * the atoms `system_info/1` can materialize — the `os_type` pair of both platforms
@@ -119,11 +124,10 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 ///   table, so the whole emitted vocabulary must be present.
 ///
 /// Everything after the first three groups is **appended last** on purpose: every index
-/// assigned before it must stay stable (module code and the positional-atom tests depend
-/// on the existing prefix), so the groups may only ever be extended at the end.
-///
-/// This is deliberately **not** the full `atom.names` ordering of the legacy emulator:
-/// positional atom indices for preloaded code are a documented Milestone-1 gap.
+/// assigned before it must stay stable (`CORE_ATOMS` is a constant and module code compiled
+/// against an earlier runtime names these indices), so the groups may only ever be extended at
+/// the end. Within the table the list is appended **after** the `atom.names` seed, so the
+/// indices this list assigns begin past that seed's run.
 pub const CORE_ATOMS: &[&str] = &[
     // `system_info/1` values.
     "unix",
@@ -287,16 +291,28 @@ impl PreloadedModules {
 ///
 /// Idempotent — [`AtomTable::intern`] returns the existing index for a name already
 /// present — so it is safe to call on a table that already has entries.
+///
+/// # Where this sits in the index space
+///
+/// The table's **first** seed is `erts/emulator/beam/atom.names`, applied by
+/// [`crate::codeserver::CodeServer::new`] ([`crate::atom_seed`]) because that file's order *is*
+/// real ERTS' atom index order. This function is the second step — the boot/floor/introspection/
+/// port/signal vocabulary the runtime needs by name, appended after that seed — so the names
+/// below are **not** an absolute prefix of the table: a name the file lists keeps the file's
+/// index, and a name it does not list is appended here, in the order this function interns it.
+/// The boot sequence is therefore: `atom.names` (server construction) → [`CORE_ATOMS`] →
+/// [`crate::info::info_atoms`] → [`crate::port::PORT_INFO_ATOMS`] → `beam_process`'s signals.
 pub fn seed_core_atoms(atoms: &mut AtomTable) {
     for name in CORE_ATOMS {
         atoms.intern(name);
     }
     // The introspection surface ([`crate::info`]) materializes its atom-valued keys
-    // through this table, so every name it can emit must be present. `INFO_ATOMS` is the
-    // single source of truth for that vocabulary (the platform/boolean group overlaps
-    // `CORE_ATOMS`, and interning is idempotent), so derive the seed from it rather than
-    // repeating the names here.
-    for name in crate::info::INFO_ATOMS {
+    // through this table, so every name it can emit must be present. `info_atoms()` is the
+    // single source of truth for that vocabulary — `INFO_ATOMS` plus the static-NIF
+    // roster's names ([`crate::info::snifs_atoms`]), which `system_info(snifs)` emits — and
+    // the platform/boolean group overlaps `CORE_ATOMS`. Interning is idempotent, so derive
+    // the seed from it rather than repeating the names here.
+    for name in crate::info::info_atoms() {
         atoms.intern(name);
     }
     // The port surface ([`crate::port`]) resolves the atoms `port_info/1,2` can emit
@@ -413,13 +429,18 @@ mod tests {
     fn seed_core_atoms_interns_the_whole_info_vocabulary() {
         // The introspection surface (`crate::info`) resolves an `InfoValue::Atom` through
         // this table and reports `TermNotFound` for a name that is absent, so the seed
-        // must contain every name `system_info/1` can emit. `INFO_ATOMS` is that list and
+        // must contain every name `system_info/1` can emit. `info_atoms()` is that list and
         // the seed is derived from it, so deriving and asserting cannot drift apart; the
         // flavor atom (`jit` for the JIT emulator, `emu` for the interpreter) is the one
         // that used to fall through the seed.
         let mut atoms = AtomTable::new();
         seed_core_atoms(&mut atoms);
-        for name in crate::info::INFO_ATOMS {
+        for name in crate::info::info_atoms() {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        // The static-NIF roster's names are the half that lives in its own table; a name
+        // there that the seed skipped would make `system_info(snifs)` answer `TermNotFound`.
+        for name in crate::info::snifs_atoms::SNIFS_ATOMS {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
         for name in ["jit", "emu", "true", "false", "unix", "linux", "win32", "nt"] {
@@ -517,6 +538,7 @@ mod tests {
             "no_spread",
         ];
         let mut atoms = AtomTable::new();
+        crate::atom_seed::seed(&mut atoms);
         seed_core_atoms(&mut atoms);
         for name in tail {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
@@ -524,9 +546,10 @@ mod tests {
         // `error` is the class of every raise the two paths produce; it is part of the
         // documented core set.
         assert!(atoms.lookup("error").is_some(), "error must be seeded");
-        // The group is **appended**: every index the seed assigned before it is unchanged
-        // (module code and the positional-atom assumptions depend on the prefix), so a
-        // table seeded with the prefix alone must resolve those names identically.
+        // The group is **appended**: every index the seed assigned before it is unchanged, so a
+        // table seeded with the same real seed (the `atom.names` run) plus this prefix alone must
+        // resolve those names identically. The reference table therefore starts from the *real*
+        // base — `CORE_ATOMS` does not occupy indices `0..`, it follows the `atom.names` run.
         let split = CORE_ATOMS.len() - tail.len();
         assert_eq!(
             &CORE_ATOMS[split..],
@@ -534,6 +557,7 @@ mod tests {
             "the appended group must be the last entries, in this order"
         );
         let mut prefix = AtomTable::new();
+        crate::atom_seed::seed(&mut prefix);
         for name in &CORE_ATOMS[..split] {
             prefix.intern(name);
         }
@@ -544,6 +568,24 @@ mod tests {
                 "{name} must keep the index it had before the appended group"
             );
         }
+        // The old belief — that this list *is* the start of the index space — is what the seed
+        // removed: its first name is not in `atom.names` (the `os_type` group is interned by the
+        // C emulator outside that file), so it is appended **after** the file's whole run.
+        let mut base = AtomTable::new();
+        crate::atom_seed::seed(&mut base);
+        let unix = atoms.lookup("unix").expect("seeded").raw() as usize;
+        assert!(
+            unix >= base.len(),
+            "`{}` is absent from atom.names and must therefore follow the seed's run: {unix} < \
+             {} seeded names",
+            CORE_ATOMS[0],
+            base.len()
+        );
+        assert_eq!(
+            atoms.lookup("false").map(|a| a.raw()),
+            Some(0),
+            "the file's first name"
+        );
     }
     #[test]
     fn seed_core_atoms_interns_the_global_reason_vocabulary() {

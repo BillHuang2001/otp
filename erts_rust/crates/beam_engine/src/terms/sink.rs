@@ -40,10 +40,11 @@
 //!   ([`crate::machine::location`]).
 //!
 //! Both share the same low-level writers ([`write_tuple_at`], [`write_list_at`],
-//! [`write_cons_at`]), so the word layout of a tuple/list/cons node is defined once.
+//! [`write_cons_at`], [`write_map_at`]), so the word layout of a tuple/list/cons/map
+//! node is defined once.
 
 use beam_common::{BeamError, Result};
-use beam_term::{make_arityval, make_tuple, Eterm, NIL};
+use beam_term::{make_arityval, make_tuple, AtomTable, Eterm, NIL};
 
 use super::Slack;
 use crate::context::ExecutionContext;
@@ -66,8 +67,8 @@ fn check_tuple_arity(n: usize) -> Result<()> {
 /// A sink a term-shape writer carves its nodes out of.
 ///
 /// The trait is deliberately tiny: every node a shape writer builds is a tuple, a
-/// proper list or a single cons cell, and all three are expressed with the methods
-/// below. The implementation chooses *where* the words come from (one rooted
+/// proper list, a single cons cell or a map, and all four are expressed with the
+/// methods below. The implementation chooses *where* the words come from (one rooted
 /// reservation carved node-by-node, or one `alloc_words` per node) and nothing else.
 pub trait Sink {
     /// Build the tuple `{Elem, …}` out of `elems`, carving the `1 + elems.len()`-word
@@ -91,6 +92,22 @@ pub trait Sink {
     /// the size computation cannot diverge. `Cdr` may be any term — an improper tail
     /// is representable.
     fn cons(&mut self, car: Eterm, cdr: Eterm) -> Result<Eterm>;
+
+    /// Build the map `#{K => V, …}` out of `pairs`, carving
+    /// [`beam_term::map::map_words_capacity`]`(pairs.len())` words from the sink.
+    ///
+    /// Delegates to [`beam_term::map::write_map`], which reproduces
+    /// `erts_map_from_ks_and_vs`: duplicate keys collapse **last value wins**, at most
+    /// `MAP_SMALL_MAP_LIMIT` (32) distinct keys become a flat map (keys in
+    /// `erts_cmp_flatmap_keys` order) and a larger one a hash map — so the carve size
+    /// is sound for either layout.
+    ///
+    /// `atoms` is the table `write_map` orders and compares keys with, and it must be
+    /// the table `pairs`' atom words were read against (the same discipline
+    /// [`beam_term::cmp`] follows). A one-pair map — what the synthesized BIF head
+    /// item's `{error_info, #{module => FormatModule}}` extension builds — never
+    /// compares a key, so the reservation is exactly consumed.
+    fn map(&mut self, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) -> Result<Eterm>;
 }
 
 /// The **rooted** sink: the slack of one whole-region rooted reservation
@@ -119,6 +136,15 @@ impl Sink for Slack {
         // SAFETY: `alloc_words` returned 2 exclusively-owned, writable words inside
         // this slack's reserved region, which nothing else writes.
         Ok(unsafe { write_cons_at(hp, car, cdr) })
+    }
+
+    fn map(&mut self, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) -> Result<Eterm> {
+        let words = beam_term::map::map_words_capacity(pairs.len());
+        let hp = self.alloc_words(words)?;
+        // SAFETY: `alloc_words` returned `map_words_capacity(pairs.len())`
+        // exclusively-owned, writable words inside this slack's reserved region, which
+        // nothing else writes — the precondition `write_map` documents.
+        unsafe { write_map_at(hp, pairs, atoms) }
     }
 }
 
@@ -172,6 +198,16 @@ impl Sink for ContextSink<'_> {
         // allocation; the write below is the very next thing this sink does, and
         // `alloc_words` never collects.
         Ok(unsafe { write_cons_at(hp, car, cdr) })
+    }
+
+    fn map(&mut self, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) -> Result<Eterm> {
+        let words = beam_term::map::map_words_capacity(pairs.len());
+        let hp = self.ctx.alloc_words(words)?;
+        // SAFETY: `alloc_words` returned `map_words_capacity(pairs.len())` words valid
+        // until the next collecting allocation; the write below is the very next thing
+        // this sink does, and `alloc_words` never collects — the precondition
+        // `write_map` documents.
+        unsafe { write_map_at(hp, pairs, atoms) }
     }
 }
 
@@ -239,3 +275,29 @@ pub(crate) unsafe fn write_cons_at(hp: *mut Eterm, car: Eterm, cdr: Eterm) -> Et
     }
     beam_term::make_list(hp)
 }
+
+/// Write the map `#{pairs…}` into
+/// [`beam_term::map::map_words_capacity`]`(pairs.len())` words at `hp`.
+///
+/// The one definition of the map node both sinks carve, so the rooted and the
+/// unrooted path cannot differ in layout (they differ only in *where* the words
+/// come from).
+///
+/// # Safety
+///
+/// `hp` must point at [`beam_term::map::map_words_capacity`]`(pairs.len())`
+/// exclusively-owned, writable words that nothing else writes and that stay put for
+/// as long as the returned term is live — the precondition
+/// [`beam_term::map::write_map`] documents.
+pub(crate) unsafe fn write_map_at(
+    hp: *mut Eterm,
+    pairs: &[(Eterm, Eterm)],
+    atoms: &AtomTable,
+) -> Result<Eterm> {
+    // SAFETY: the caller guarantees `map_words_capacity(pairs.len())` exclusive words
+    // at `hp`; `write_map` writes every word of the produced map and never more than
+    // that (deduplication can only shrink it).
+    let map = unsafe { beam_term::map::write_map(hp, pairs, atoms) }?;
+    Ok(map)
+}
+

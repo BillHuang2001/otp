@@ -54,19 +54,31 @@
 //! A copying collector acts on a root word only if it is a heap **pointer**: an immediate is
 //! never relocated and is never a reachability edge, so it can neither keep a term alive nor
 //! add a "reaches an unscanned region" fact. [`root_is_unscanned`] itself answers `false` for
-//! any word that is neither boxed nor a list, so **omitting a non-pointer word cannot change
-//! the valve's decision** — it can only skip work. Each in-slice door therefore bounds both
-//! register files to their **pointer-bearing prefix**: one past the **last** boxed-or-list word
-//! of the file (`NIL` and every other immediate is neither), computed **once** per call by
+//! any word whose **primary tag** is neither `LIST` nor `BOXED` ([`is_pointer_bearing`]), so
+//! **omitting a non-pointer word cannot change the valve's decision** — it can only skip work.
+//! Each in-slice door therefore bounds both register files to their **pointer-bearing prefix**:
+//! one past the **last** word whose primary tag is `LIST` or `BOXED` (`NIL`, every other
+//! immediate, and every bare `HEADER` word is not), computed **once** per call by
 //! [`machine_root_bounds`] and used consistently for the iterator handed to
 //! [`any_root_is_unscanned`], for [`publish_roots_full`] and for [`scatter_roots_full`]. The
 //! Erlang stack is always published whole, because there are no frame liveness maps.
 //!
+//! A bare `HEADER` word is the case that matters: the engine's exception-landing convention
+//! writes [`THE_NON_VALUE`](beam_term::ops::THE_NON_VALUE) into `x(0)` (`0x18` in a debug build —
+//! `make_header(0, FLOAT_SUBTAG)`), and that word must be classified as "not a term", exactly as
+//! the C's `copy.c` does (its primary-tag switch has a `TAG_PRIMARY_HEADER` arm) and exactly as
+//! the engine's own census does (`Machine::is_pointer_root`). The C bit tricks `is_boxed`/`is_list`
+//! are true for *any* word with bit 0 clear, so they classify such a word as a container and a
+//! dereference of it faults.
+//!
 //! [`pointer_prefix_len`] finds that prefix with a backwards **block sweep**: a
 //! [`POINTER_PREFIX_BLOCK`]-word block whose bitwise-ANDed words still carry the `IMMED1` primary
-//! tag is wholly immediate and is skipped on one cache-line read, and the block that stops the
-//! sweep is the only one resolved word by word — the per-word fallback therefore examines at most
-//! one block (or a sub-block tail, for a file whose blocks were all skipped), never the file.
+//! tag is wholly immediate and is skipped on one cache-line read, and any other block is resolved
+//! word by word. The AND is a sound *skip* test but not an *answer*: a bare `HEADER` word also
+//! clears a tag bit, so a stopping block may hold no pointer-bearing word at all — in which case
+//! the sweep continues backwards over the earlier blocks, preserving exact equivalence to a full
+//! per-word `rposition`. Cost is therefore at most one resolved block (the one that answers) plus
+//! one per header-only block above it, never the file.
 //!
 //! The bound keeps every live root by construction: it is "last pointer-bearing index + 1", so
 //! a live or boxed word at a high index is always included, and only a tail that is *already*
@@ -374,12 +386,31 @@ fn module_may_be_collected(runtime: &mut Runtime, name: &str) -> bool {
 /// ([`word_region_exactly`]); every production classifier inside a walk takes the block from a
 /// [`Geometry`] instead, so the descent reads these three fields once per walk rather than once
 /// per classified word (see [`Geometry`]).
-#[cfg(test)]
-fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
+pub(crate) fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
     let words = heap.used().saturating_mul(std::mem::size_of::<Eterm>());
     let base = (heap.hp() as usize).wrapping_sub(words);
     let end = heap.hend() as usize;
     ptr >= base && ptr < end
+}
+
+/// Whether `term`'s **root object** already lives inside `heap`'s block — the containment test
+/// for a destination that is a [`beam_alloc::Heap`] the caller owns outright.
+///
+/// [`in_heap_block`] against the address [`word_region`] would classify, i.e. an immediate, a
+/// literal-area constant and a word naming no dereferenceable address all answer `false` (they
+/// point into no block *and* the tag tricks cannot tell them from a cons). Its one production
+/// caller is the BIF-result copy-out's destination-containment short-circuit
+/// ([`super::calls::dest`]): the `-eval`/single-pass store, whose regions are [`Runtime`]'s own
+/// [`beam_alloc::Heap`] values rather than a collector's spaces, so [`Geometry::word_is_scanned`]
+/// has no geometry to read for them.
+///
+/// [`Runtime`]: crate::runtime::Runtime
+#[inline]
+pub(crate) fn term_in_heap_block(heap: &Heap, term: Eterm) -> bool {
+    match foreign_shape_pointer(term) {
+        Some(ptr) => in_heap_block(heap, ptr),
+        None => false,
+    }
 }
 
 /// The **two per-walk geometries** every per-word classification is decided against, read
@@ -807,29 +838,54 @@ where
 const POINTER_PREFIX_BLOCK: usize = 8;
 
 /// Whether `word` is a word a copying collector must treat as a **pointer**: a boxed term or a
-/// cons cell ([`beam_term::prelude::is_boxed`] / [`beam_term::prelude::is_list`]). Every other
-/// primary tag — `IMMED1` only — is an immediate, which is neither relocated nor a reachability
-/// edge.
+/// cons cell, decided by its **primary tag** ([`beam_term::tag::primary_tag`]).
+///
+/// # Why the primary tag, and not the C bit tricks
+///
+/// The frozen helpers [`beam_term::prelude::is_boxed`] / [`beam_term::prelude::is_list`] mirror
+/// the C bit tricks `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0` and
+/// `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0`, and both are **also true for a bare
+/// `HEADER`-tagged word** — `0` and `0x18` satisfy each. Such a word is **not a term at all**
+/// ([`beam_term::tag::is_term_word`]), and one of them is produced by the engine on purpose: the
+/// C ABI's `THE_NON_VALUE` ([`beam_term::ops::THE_NON_VALUE`], `Eterm::non_value()`) is
+/// `make_header(0, FLOAT_SUBTAG)` = `0x18` in a debug build and `0` in release, and the
+/// exception-landing convention writes it into `x(0)` (the C's `handle_error`:
+/// `x(0..4) = {THE_NON_VALUE, Reason, Trace, Class}`, which `try_case` then *requires*). A
+/// decoder that treats it as a container then dereferences its pointer bits — `0x18` — and
+/// faults, which is exactly the SIGSEGV this classifier used to cause.
+///
+/// Primary-tag classification is both the C's own rule (`copy.c` switches on the primary tag and
+/// has an explicit `TAG_PRIMARY_HEADER` arm) and what every other correct consumer in the
+/// workspace already does — `beam_gc`'s copier (`beam_gc/src/copy.rs`'s `is_non_value` arms,
+/// classified by `primary_tag`) and the engine's own root census (`beam_engine`'s
+/// `Machine::is_pointer_root`). So `HEADER` (`THE_NON_VALUE` and every other stray header word)
+/// and `IMMED1` (every immediate) are both **not** pointer-bearing: neither is relocated and
+/// neither is a reachability edge.
+///
+/// The address guard ([`dereferenceable_pointer`]) stays, and is still needed: it rejects the
+/// remaining class — a `LIST`/`BOXED`-tagged word whose pointer is null or mis-aligned.
 fn is_pointer_bearing(word: Eterm) -> bool {
-    beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word)
+    matches!(
+        beam_term::tag::primary_tag(word),
+        beam_term::tag::PrimaryTag::List | beam_term::tag::PrimaryTag::Boxed
+    )
 }
 
 /// The address `word`'s pointer bits name, or `None` when **no live term can be there** — so the
 /// valve classifies such a word inert (answers `false` from [`root_is_unscanned`]) instead of
 /// reading the object it appears to point at.
 ///
-/// # Why: the frozen bit tricks cannot tell a container from the non-value
+/// # Why the address guard is still needed
 ///
-/// [`is_pointer_bearing`] is the C's own bit trick, mirrored verbatim, and it is **also true for
-/// words that are not terms**: `is_list(x)` is `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0`
-/// and `is_boxed(x)` is `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0`, so **both** answer
-/// `true` for the all-zero word. `make_header(0, 0)` — the C ABI's `THE_NON_VALUE`, which
-/// `beam_term` names with [`beam_term::boxed::is_boxed_term`] — is therefore classified as a
-/// container by the tag test alone, and its pointer is `NULL`. The witness is that very word: a
-/// fixture BIF returning `make_header(0, 0)` (a bare header word) as its "result" used to abort
-/// the whole `beam_rt` lib-test binary with `null pointer dereference occurred` inside
-/// [`forwards_word_matching`], because the pre-rework valve happened to answer `true` for a
-/// list-tagged word without ever reading its two words.
+/// [`is_pointer_bearing`] classifies by the **primary tag**, so the non-term class is already
+/// rejected before this runs: `THE_NON_VALUE` is a `HEADER` word, not a container. What is left is
+/// a `LIST`/`BOXED`-tagged word whose pointer bits name nothing a term can live at — a null or
+/// mis-aligned address. The witness that made this guard load-bearing before the primary-tag fix
+/// is [`beam_term::boxed::is_boxed_term`]'s own example: a fixture BIF returning
+/// `make_header(0, 0)` (a bare header word) as its "result" used to abort the whole `beam_rt`
+/// lib-test binary with `null pointer dereference occurred` inside [`forwards_word_matching`],
+/// because the bit tricks answer `true` for it. Both halves of the guard are kept: the tag test
+/// rejects the non-term, this one rejects the non-address, and neither subsumes the other.
 ///
 /// A term word is always **non-null and word-aligned** (`ptr_val` strips the tag bits, so every
 /// pointer it yields is `align_of::<Eterm>()` aligned; a `NULL` address is the one the allocator
@@ -838,12 +894,11 @@ fn is_pointer_bearing(word: Eterm) -> bool {
 ///
 /// # What this does NOT make safe
 ///
-/// The residual is any **non-null, word-aligned but bogus** pointer — a garbage slot, or a bare
-/// header word such as `make_header(3, FLOAT_SUBTAG)` that survives the frozen `is_boxed`/
-/// `is_list` tricks with a plausible-looking address. No cheap test can reject those: whether an
-/// aligned address is mapped, let alone a term, is not decidable without faulting. The C runtime
-/// faults there too, and this valve inherits that bound; what it no longer does is fault on the
-/// one word the C ABI defines as "not a term at all".
+/// The residual is any **non-null, word-aligned but bogus** pointer inside a `LIST`/`BOXED`-tagged
+/// word — a garbage slot. No cheap test can reject those: whether an aligned address is mapped,
+/// let alone a term, is not decidable without faulting. The C runtime faults there too, and this
+/// valve inherits that bound; what it does not do is fault on a word whose primary tag says it is
+/// not a term at all.
 ///
 /// `pub(super)` because it is the node's **one** address guard: the unscanned-root valve
 /// ([`word_region`]) and the BIF-result reference walk
@@ -859,32 +914,41 @@ pub(super) fn dereferenceable_pointer(word: Eterm) -> Option<usize> {
 /// One past the last **pointer-bearing** word of `words` — the bound the full-root doors publish
 /// and classify a register file at.
 ///
-/// A word is pointer-bearing when it is boxed or a list ([`is_pointer_bearing`]); `NIL` and every
-/// other immediate is neither, so an all-immediate file (the common case: a 1024-slot FR file a
-/// process never wrote) answers `0`.
+/// A word is pointer-bearing when its primary tag is `LIST` or `BOXED` ([`is_pointer_bearing`]);
+/// `NIL`, every other immediate **and** every bare header word (the engine's `THE_NON_VALUE`
+/// included) is not, so an all-immediate file (the common case: a 1024-slot FR file a process
+/// never wrote) answers `0`.
 ///
 /// The sweep is backwards and block-wise: while the bitwise AND of a [`POINTER_PREFIX_BLOCK`]-word
 /// block's words still carries the `IMMED1` primary tag in its low two bits, *every* word of the
 /// block carries that tag — a bit is set in the AND only if it is set in all of them — so all of
-/// them are immediates, none is boxed, none is a list, and the whole block is skipped on one
-/// 64-byte read. The block is taken as a `&[Eterm; POINTER_PREFIX_BLOCK]` through `TryInto`, so
-/// its eight word reads carry no per-element bounds check, and the eight raw words are ANDed in a
-/// short unrolled loop.
+/// them are immediates, none is a container, and the whole block is skipped on one 64-byte read.
+/// The block is taken as a `&[Eterm; POINTER_PREFIX_BLOCK]` through `TryInto`, so its eight word
+/// reads carry no per-element bounds check, and the eight raw words are ANDed in a short unrolled
+/// loop.
 ///
-/// That AND test is **exactly** the pointer-bearing test: `IMMED1` is the only primary tag that is
-/// neither boxed nor a list, so a tag other than `IMMED1` means some word of the block has a low
-/// tag bit clear (an AND bit is clear only if it is clear in some word) and is therefore
-/// pointer-bearing. The block that stops the sweep thus holds at least one pointer-bearing word,
-/// and every word above it — the whole skipped tail — is an immediate, so the file's last
-/// pointer-bearing word lies **inside that block**. The single fallback `rposition` is therefore
-/// bounded to it: it scans the block that stopped the sweep, or — when *every* whole block was
-/// skipped — the `0..[`POINTER_PREFIX_BLOCK`]`-word tail left in front of it. The returned index
-/// is identical to a full per-word scan's for every input, while the words the fallback examines
-/// are at most [`POINTER_PREFIX_BLOCK`] instead of the whole file, at any file length.
+/// # The stopping block is not necessarily the answer
+///
+/// The AND test is a sound **skip** test, not an exact one: a block whose AND does not carry
+/// `IMMED1` merely holds *some* word that is not an `IMMED1` — which includes a bare `HEADER`
+/// word (a word that is not a term at all, e.g. `THE_NON_VALUE`), and such a word is **not**
+/// pointer-bearing. So a stopping block may hold nothing worth publishing. Truncating the prefix
+/// there would be unsound — a `rposition` over the block alone would answer "none", and the caller
+/// would drop a real root that sits in an earlier block — so the sweep resolves the block word by
+/// word and, finding no pointer-bearing word in it, **continues backwards** over the earlier
+/// blocks. The returned index is therefore identical to a full per-word scan's for every input.
+///
+/// # Cost
+///
+/// Every word above the answer is either inside a skipped (all-immediate) block or inside a block
+/// that was resolved and held no `LIST`/`BOXED` word. A register file's tail is a run of `NIL`, so
+/// the common case is all-skip and the per-word work is at most one block. A file of bare header
+/// words — which no production path produces — is the worst case at `O(len)`, and it is still
+/// correct: those words name nothing.
 ///
 /// See the module docs' *pointer-bearing prefix* section for why bounding a register file there
-/// can never lose a root: every omitted word is an immediate, which is neither relocatable nor a
-/// reachability edge, and [`root_is_unscanned`] answers `false` for it.
+/// can never lose a root: every omitted word is not a container, which is neither relocatable nor
+/// a reachability edge, and [`root_is_unscanned`] answers `false` for it.
 fn pointer_prefix_len(words: &[Eterm]) -> usize {
     #[cfg(test)]
     prefix_counters::note_call();
@@ -906,32 +970,33 @@ fn pointer_prefix_len(words: &[Eterm]) -> usize {
             tags &= block[offset].raw();
             offset += 1;
         }
-        if tags & beam_term::prelude::TAG_PRIMARY_MASK != beam_term::prelude::TAG_PRIMARY_IMMED1 {
-            // This block stopped the sweep, so it holds the file's last pointer-bearing word.
-            break;
+        if tags & beam_term::prelude::TAG_PRIMARY_MASK == beam_term::prelude::TAG_PRIMARY_IMMED1 {
+            #[cfg(test)]
+            prefix_counters::note_block_skipped();
+            end -= POINTER_PREFIX_BLOCK;
+            continue;
         }
+        // The block's AND says at least one word is not an `IMMED1`, which is only a *maybe*: a
+        // `HEADER` word also clears a tag bit and is not pointer-bearing. Resolve the block.
         #[cfg(test)]
-        prefix_counters::note_block_skipped();
-        end -= POINTER_PREFIX_BLOCK;
-    }
-    // `end` is the exclusive end of the only region that can still hold the answer: the block that
-    // stopped the sweep (`end >= POINTER_PREFIX_BLOCK` — and that block holds a pointer-bearing
-    // word, so `rposition` always finds one there and the `map_or` default is unreachable; a test
-    // pins that), or the sub-block tail in front of a file whose whole blocks were all skipped
-    // (`end < POINTER_PREFIX_BLOCK`).
-    let start = end.saturating_sub(POINTER_PREFIX_BLOCK);
-    #[cfg(test)]
-    {
-        if end >= POINTER_PREFIX_BLOCK {
+        prefix_counters::note_block_resolved();
+        let start = end - POINTER_PREFIX_BLOCK;
+        if let Some(index) = words[start..end].iter().rposition(|&word| is_pointer_bearing(word)) {
+            #[cfg(test)]
             prefix_counters::note_block_bounded_fallback();
-        } else {
-            prefix_counters::note_tail_bounded_fallback(end);
+            return start + index + 1;
         }
+        // A block of bare header words: nothing to publish here, so keep sweeping. This is the
+        // case the AND test alone cannot express (see the docs above).
+        end = start;
     }
-    words[start..end]
+    // The sub-block tail in front of a file whose whole blocks were skipped or resolved away.
+    #[cfg(test)]
+    prefix_counters::note_tail_bounded_fallback(end);
+    words[..end]
         .iter()
         .rposition(|&word| is_pointer_bearing(word))
-        .map_or(0, |index| start + index + 1)
+        .map_or(0, |index| index + 1)
 }
 
 /// The `(x_count, fr_count)` bound the full-root doors hand the machine's two register files over
@@ -2879,9 +2944,14 @@ pub(crate) mod prefix_counters {
         /// Whole [`super::POINTER_PREFIX_BLOCK`]-word blocks the fast path skipped: their eight
         /// words were ANDed together and no one of them was resolved on its own.
         pub(crate) blocks_skipped: usize,
-        /// Words the per-word fallback `rposition` examined, summed over every call — the
-        /// [`super::POINTER_PREFIX_BLOCK`]-word block that stopped the fast path, or the
-        /// sub-block tail left when every whole block was skipped.
+        /// Blocks whose AND did not carry the `IMMED1` tag and which were therefore resolved word
+        /// by word — the block that stopped the sweep, plus any block above it that held no
+        /// pointer-bearing word (only bare `HEADER` words) and so had to be swept past.
+        pub(crate) blocks_resolved: usize,
+        /// Words the per-word `rposition` examined, summed over every call — one
+        /// [`super::POINTER_PREFIX_BLOCK`]-word scan per **resolved** block (the one that answered
+        /// plus any bare-`HEADER` block swept past), plus the sub-block tail left when no block
+        /// answered.
         pub(crate) fallback_words: usize,
         /// Calls whose fallback was **block-bounded**: the fast path stopped on a block, so the
         /// scan covered that one block plus its offset.
@@ -2896,6 +2966,7 @@ pub(crate) mod prefix_counters {
         pub(crate) const ZERO: PrefixCounts = PrefixCounts {
             calls: 0,
             blocks_skipped: 0,
+            blocks_resolved: 0,
             fallback_words: 0,
             block_bounded: 0,
             tail_bounded: 0,
@@ -2935,12 +3006,23 @@ pub(crate) mod prefix_counters {
         });
     }
 
+    /// Records one block the fast path had to resolve word by word (its AND did not carry the
+    /// `IMMED1` tag). Most such blocks answer immediately; a block of bare `HEADER` words does not,
+    /// and the sweep continues backwards past it.
+    pub(crate) fn note_block_resolved() {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.blocks_resolved += 1;
+            value.fallback_words += super::POINTER_PREFIX_BLOCK;
+            counters.set(value);
+        });
+    }
+
     /// Records a fallback bounded to the block that stopped the fast path.
     pub(crate) fn note_block_bounded_fallback() {
         COUNTERS.with(|counters| {
             let mut value = counters.get();
             value.block_bounded += 1;
-            value.fallback_words += super::POINTER_PREFIX_BLOCK;
             counters.set(value);
         });
     }
@@ -3344,55 +3426,71 @@ mod tests {
     }
 
     /// **The block sweep is an optimization only: `pointer_prefix_len` returns the same bound
-    /// whether it skips an immediate run a block at a time or walks it word by word — and the
-    /// word-by-word fallback never scans more than one block.**
+    /// whether it skips an all-immediate run a block at a time or walks it word by word — and the
+    /// word-by-word fallback never scans more than one block per resolved block.**
     ///
-    /// A block is skipped only when the AND of its words still carries the `IMMED1` primary
-    /// tag, which can happen only if *every* word of the block carries it; the block that stops
-    /// the sweep then holds the file's last boxed-or-list word, so the fallback is bounded to it.
+    /// A block is *skipped* only when the AND of its words still carries the `IMMED1` primary
+    /// tag, which can happen only if *every* word of the block is immediate. That AND test is a
+    /// sound **skip** test, not an exact one: a bare `HEADER` word (primary tag 0 —
+    /// `THE_NON_VALUE`'s shape) also clears a tag bit and therefore stops the sweep, yet it is
+    /// **not** pointer-bearing, so the stopping block is resolved word by word and — when it holds
+    /// nothing worth publishing — the sweep continues over the earlier blocks. Truncating there
+    /// would drop a real root below it, which is the regression this restructure exists for.
     /// Every case below is pinned twice — against an explicit expected index, and against the
-    /// per-word scan (the independent reference implementation) — **and** against the sweep's own
-    /// counters, which pin that fallback's width. The 8-word-aligned families (exhaustive over one
-    /// block's tag patterns, then exhaustive over the natural indices, then pseudo-random) cover
-    /// the two ends of the sweep: a pointer at index 0, in the middle, at the start of the last
-    /// block and in the very last word of the file, where only the last block carries one. The
-    /// mixed pseudo-random family over all four primary tags covers files of every length.
+    /// per-word scan (`is_pointer_bearing`, the reference rule) — **and** against the sweep's own
+    /// counters, which pin the fallback's width to `blocks_resolved * BLOCK` plus the sub-block
+    /// tail. The 8-word-aligned families (exhaustive over one block's tag patterns, then
+    /// exhaustive over the natural indices, then pseudo-random) cover the two ends of the sweep: a
+    /// pointer at index 0, in the middle, at the start of the last block and in the very last word
+    /// of the file, where only the last block carries one. The mixed pseudo-random family over all
+    /// four primary tags covers files of every length.
     #[test]
     fn the_block_skip_finds_the_same_pointer_prefix_as_the_per_word_scan() {
-        use beam_term::prelude::{is_boxed, is_immediate, is_list};
+        use beam_term::prelude::{TAG_PRIMARY_IMMED1, TAG_PRIMARY_MASK};
 
         const BLOCK: usize = POINTER_PREFIX_BLOCK;
         // `NIL`: the filler of an unwritten register slot, and the shape a file's tail is.
         const IMM: Eterm = NIL;
         // A `BOXED`-tagged word (primary tag 2) and a `LIST`-tagged one (tag 1): the two
-        // pointer-bearing shapes.
+        // pointer-bearing primary tags.
         const BOXED: Eterm = Eterm::from_raw(0x2);
         const LIST: Eterm = Eterm::from_raw(0x1);
-        // A bare header word (primary tag 0, value 0 — the C ABI's `THE_NON_VALUE`): not an
-        // immediate, and both mirrored C bit tricks accept it (`is_boxed` is `(x & 0x1) == 0`,
-        // `is_list` is `(x & 0x2) == 0`), so the sweep must stop at the block holding it and the
-        // per-word fallback must resolve it exactly as before — a header word is not an immediate
-        // run, so it may not be skipped past.
+        // A bare header word (primary tag 0, value 0): not a term at all, and — unlike the two
+        // mirrored C bit tricks, which both accept it — **not** pointer-bearing.
         const HEADER: Eterm = Eterm::from_raw(0);
+        // The engine's exception-landing word, `x(0)` in the `try`/`catch` win: a header word on
+        // every profile (the literal `make_header(0, FLOAT_SUBTAG)` = `0x18` in a debug build, the
+        // raw zero in release), and the exact word the valve used to dereference as a cons cell.
+        const NONVALUE: Eterm = beam_term::prelude::THE_NON_VALUE;
 
-        assert!(is_immediate(IMM) && !is_boxed(IMM) && !is_list(IMM));
-        assert!(!is_immediate(BOXED) && is_boxed(BOXED) && !is_list(BOXED));
-        assert!(!is_immediate(LIST) && !is_boxed(LIST) && is_list(LIST));
-        assert!(!is_immediate(HEADER) && is_boxed(HEADER) && is_list(HEADER));
+        assert_eq!(
+            IMM.raw() & TAG_PRIMARY_MASK,
+            TAG_PRIMARY_IMMED1,
+            "NIL is an immediate, so a whole block of them is skippable"
+        );
+        assert!(is_pointer_bearing(BOXED), "a BOXED word names a container");
+        assert!(is_pointer_bearing(LIST), "a LIST word names a cons cell");
+        assert_eq!(HEADER.raw() & TAG_PRIMARY_MASK, 0, "a bare header word");
+        assert!(
+            !is_pointer_bearing(HEADER),
+            "a bare header word is not a term: it names nothing and is not pointer-bearing"
+        );
+        assert!(
+            !is_pointer_bearing(NONVALUE),
+            "THE_NON_VALUE is a header word: the valve must never dereference it"
+        );
 
-        // The rule the block sweep must not change: one past the last boxed-or-list word.
+        // The rule the block sweep must not change: one past the last pointer-bearing word.
         fn per_word(words: &[Eterm]) -> usize {
             words
                 .iter()
-                .rposition(|&word| {
-                    beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word)
-                })
+                .rposition(|&word| is_pointer_bearing(word))
                 .map_or(0, |index| index + 1)
         }
 
-        // One call, with the sweep's **structure** pinned by its counters: exactly one fallback
-        // scan, never wider than one block — and exactly one block, scanned from the start of
-        // that block, whenever the fast path stopped on one.
+        // One call, with the sweep's **structure** pinned by its counters: exactly one final scan
+        // (a bounded one, or the sub-block tail), and every word that scan looks at is inside a
+        // block the sweep had to resolve because its AND said "some word is not an `IMMED1`".
         fn checked(file: &[Eterm]) -> usize {
             prefix_counters::reset();
             let bound = pointer_prefix_len(file);
@@ -3401,29 +3499,33 @@ mod tests {
             assert_eq!(
                 counts.block_bounded + counts.tail_bounded,
                 1,
-                "every call ends in exactly one fallback scan; {counts:?}"
+                "every call ends in exactly one final scan; {counts:?}"
             );
             if counts.block_bounded == 1 {
+                assert!(
+                    counts.blocks_resolved >= 1,
+                    "a block bounded the sweep, so at least one block was resolved; {counts:?}"
+                );
                 assert_eq!(
-                    counts.fallback_words, BLOCK,
-                    "the fast path stopped on a block, so the fallback scanned exactly that one \
-                     block and no more; {counts:?}"
+                    counts.fallback_words,
+                    counts.blocks_resolved * BLOCK,
+                    "every resolved block is scanned word by word, and nothing else is; {counts:?}"
                 );
                 assert!(
-                    (counts.blocks_skipped + 1) * BLOCK <= file.len(),
-                    "the block that stopped the sweep lies inside the file; {counts:?}"
+                    (counts.blocks_skipped + counts.blocks_resolved) * BLOCK <= file.len(),
+                    "every block the sweep processed lies inside the file; {counts:?}"
                 );
             } else {
                 assert_eq!(
-                    counts.fallback_words,
-                    file.len() % BLOCK,
-                    "no block stopped the sweep, so only the sub-block tail was scanned; \
-                     {counts:?}"
+                    counts.blocks_skipped + counts.blocks_resolved,
+                    file.len() / BLOCK,
+                    "no block bounded the sweep, so it exhausted every whole block and ended on \
+                     the sub-block tail; {counts:?}"
                 );
                 assert_eq!(
-                    counts.blocks_skipped,
-                    file.len() / BLOCK,
-                    "every whole block was skipped; {counts:?}"
+                    counts.fallback_words,
+                    counts.blocks_resolved * BLOCK + file.len() % BLOCK,
+                    "the resolved blocks plus the sub-block tail; {counts:?}"
                 );
             }
             bound
@@ -3513,25 +3615,57 @@ mod tests {
         assert_eq!(checked(&file), 2 * BLOCK + 4);
         assert_eq!(checked(&file), per_word(&file));
 
-        // A header word is not an immediate, so its block is never skipped and the per-word
-        // fallback resolves it exactly as before (both `is_boxed` and `is_list` accept the
-        // value-invalid `HEADER` pattern).
-        for index in [0, BLOCK, 2 * BLOCK, 2 * BLOCK + 5] {
-            let header_at = |len: usize| {
-                let mut file = vec![IMM; len];
-                file[index] = HEADER;
-                file
-            };
-            for len in [index + 1, 3 * BLOCK] {
-                let file = header_at(len);
-                assert_eq!(
-                    checked(&file),
-                    index + 1,
-                    "a header word at {index} of {len} bounds the prefix"
-                );
-                assert_eq!(checked(&file), per_word(&file));
+        // **The stopping block is not the answer.** A bare header word is not an immediate, so its
+        // block is never *skipped* — but it is not pointer-bearing either, so a block of nothing
+        // but header words must be resolved, found empty, and swept **past**: truncating there
+        // would drop a real root below it. This is the case the pre-fix sweep got wrong.
+        for header_block in 1..=3usize {
+            let mut file = vec![IMM; 4 * BLOCK];
+            file[3] = BOXED; // a real root in the FIRST block
+            for index in (header_block * BLOCK)..((header_block + 1) * BLOCK) {
+                file[index] = HEADER; // a whole block of header words above it
             }
+            assert_eq!(
+                checked(&file),
+                4,
+                "a header-only block at block {header_block} must not truncate the prefix below it"
+            );
+            assert_eq!(checked(&file), per_word(&file));
         }
+
+        // The same with the engine's own exception-landing word in place of a synthetic header:
+        // `THE_NON_VALUE` is a header word on every profile, and it is exactly what a published
+        // register file carries in `x(0)` before the handler runs.
+        let mut file = vec![IMM; 2 * BLOCK];
+        for word in &mut file[..BLOCK] {
+            *word = NONVALUE;
+        }
+        file[BLOCK + 5] = LIST;
+        assert_eq!(checked(&file), BLOCK + 6);
+        assert_eq!(checked(&file), per_word(&file));
+
+        // A file of nothing but header words publishes nothing — and the sweep resolves **every**
+        // block (the AND test cannot skip a header word) before the empty tail.
+        for blocks in 1..=3usize {
+            let file = vec![HEADER; blocks * BLOCK];
+            assert_eq!(
+                checked(&file),
+                0,
+                "a header-only file of {blocks} blocks publishes nothing"
+            );
+            assert_eq!(checked(&file), per_word(&file));
+        }
+        let file = vec![NONVALUE; 5];
+        assert_eq!(checked(&file), 0, "a sub-block file of header words publishes nothing");
+        assert_eq!(checked(&file), per_word(&file));
+
+        // A header word **below** a real pointer root: the pointer's block resolves first, so the
+        // header word is never even examined — the prefix is the pointer's index + 1.
+        let mut file = vec![IMM; 3 * BLOCK];
+        file[2] = HEADER;
+        file[2 * BLOCK + 6] = BOXED;
+        assert_eq!(checked(&file), 2 * BLOCK + 7);
+        assert_eq!(checked(&file), per_word(&file));
 
         // An immediate tail shorter than one block is resolved by the per-word fallback alone.
         assert_eq!(checked(&[BOXED, IMM, IMM]), 1);

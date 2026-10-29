@@ -87,9 +87,9 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **251
-passing / 0 failing**; the whole `-p beam_io` run is **1337 passed / 0 failed / 2 ignored** over **28
-test binaries** (1 lib + 26 integration + 1 doctest binary), i.e. **1083** lib tests + 251
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 27 suites, **261
+passing / 0 failing**; the whole `-p beam_io` run is **1358 passed / 0 failed / 2 ignored** over **29
+test binaries** (1 lib + 27 integration + 1 doctest binary), i.e. **1094** lib tests + 261
 integration tests + 5 doctests, of which 3 run and 2 are `ignore`-fenced examples (nothing in this
 crate carries `#[ignore]`). Per file:
 
@@ -106,7 +106,7 @@ crate carries `#[ignore]`). Per file:
 | `abi_busy.rs` | 8 | `inet.rs` | 10 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
 | `abi_failure.rs` | 11 | `active_mode.rs` | 10 |
-| `inet_accept.rs` | 7 | | |
+| `inet_accept.rs` | 7 | `inet_server.rs` | 10 |
 | `port_task.rs` | 5 | `udp_inet.rs` | 6 |
 | | | `port.rs` | 4 |
 
@@ -282,6 +282,14 @@ rot.
   error, the OTP header is locatable); a broken fixture is a hard failure. `output_shape_driver.c` is
   built by its own suite (`abi_failure.rs`)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers
+- `support/server.rs` → the **TCP server harness** (`pub mod server;` in `support/mod.rs`): `ServerRig`
+  holds what `beam_rt`'s main loop holds (one `Poller` + `PortRegistry` + `DriverRegistry`), the
+  numeric `INET_REQ_*`/`TCP_REQ_*` vocabulary with its operand builders (`open_arg`, `loopback_arg`,
+  `accept_operand`, `recv_operand`, `record`, `active_multi`, the `INET_OPT_*`/`TCP_OPT_*` codes and
+  `CONTROL_MAGIC`), the condition-pumped round recipe (`round`, `wait_until`, `wait_for_completions`,
+  `wait_for_data`, `wait_for_deliveries`, `assert_quiet`, `wait_for_peer_close`), the
+  listen/accept/adopt helpers (`listen`, `queue_accept`, `accept_connection`, `adopt`) and the raw
+  `erl`-oracle dump (`run_erl`, `erl_reply_dump`, `parse_dump`, `field`)
 - `fixtures/` → the C driver objects (see above)
 - **`inet_accept.rs` (7)** — the **TCP accept chain** end to end over a foreign `std::net::TcpStream` peer:
   two successive loopback connections accepted through the multi-op list and adopted (`from_socket`), the
@@ -294,3 +302,16 @@ rot.
   across several deadlines is the unit suite's row (`src/drivers/inet/accept_tests.rs`). The runtime's
   obligations (second port, `{inet_async, Listener, Id, {ok, NewPort}}`, `tcp_inet_copy` inheritance) are
   the crate doc's *Handoffs* (0).
+- **`inet_server.rs` (10)** — the **end-to-end TCP server data path** over `beam_io`'s public seams
+  (listen → accept → adopt the accepted descriptor → request/response over framing and the active
+  modes → shutdown → close), the chain a Cowboy/ranch listener is driven through and the one the
+  other suites leave out (`inet_accept.rs` pins completion shapes, `active_mode.rs` a `from_socket`
+  connection, `src/drivers/inet/accept_opts_tests.rs` the option inheritance). Rows: the listener's
+  option block read back against the oracle, three sequential connections accepted and adopted, the
+  accept loop leaking no descriptor, a passive request answered through the `prim_inet` caller tag,
+  `{packet,4}` in both directions, `{active,once}` delivering once and needing a re-arm,
+  `{active,N}` delivering its credit then one `Passive`, `{active,true}` delivering the staged bytes
+  before the peer close, `shutdown(write)`+close keeping the oracle's refusals, and `{packet,line}`
+  framing one line per delimiter. Every wait is a condition pumped under a hang guard, the negative
+  rows pump a bounded budget and assert nothing arrived in any round, and the oracle legs run the
+  same sequence against the system runtime's `tcp_inet`/`gen_tcp` and **skip loudly** without `erl`.

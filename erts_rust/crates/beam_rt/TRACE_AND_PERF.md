@@ -21,6 +21,12 @@ change log.
 
 **The `tracer == tracee` discard rule.** `emit_trace_event` drops an event whose tracer **is** the tracee (mirroring `erl_tracer_nif.c:143-146`); a `silent` tracee and a tracer no longer in the process table are dropped the same way, never as an error.
 
+## The trace flag state (`erlang:trace/3`, `src/trace.rs`)
+`erlang:trace/3` records flags **set-wise** — the C's `start_trace` on/off halves: the mask OR-ed in and the tracer replaced; `remove_flags` clearing only the named bits and dropping a process with no flags left — so `[send]` then `[running]` reports both and a later `false, [running]` leaves `[send]` (`src/native/erts_internal/trace.rs`, `tests/trace.rs`).
+`running` is **accepted, recorded and reported** (`trace_info(P, flags)` answers `[running]`), but the scheduler `in`/`out` **events** the flag would gate are not emitted (single-threaded runtime, no scheduler-yield trace point), so a caller that *waits* for one parks until its timeout — never a wrong message.
+`{tracer, Pid}` is accepted and recorded (`{tracer, erl_tracer, Pid}` is the same pid tracer); a **second live** tracer is the oracle's `badarg` (`erl_bif_trace.c:853-864`), and a port tracer or any other `{tracer, Module, State}` stays the typed gap; only the `send` and `'receive'` **events** are emitted (both from the send seam), the other flags being state only.
+The flags `spawn`/`exit`/`register`/`call`/`return_*`/`in`/`out` are recorded and reported, never traced.
+
 ## Performance measurement
 
 ### Per-call overhead regression harnesses

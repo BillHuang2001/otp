@@ -198,20 +198,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   shapes agree and are pinned in `phash.rs`. Owner: `beam_rt` (`-eval` evaluator).
 
 ## A.9 — preloaded / boot (owner: `beam_rt`, `beam_bifs`)
-- `application:get_all_key/1` / `application:get_key(App, env)`'s **`env` member** differs: the
-  oracle injects its runtime-added entries (`logger`, `connect_all`, …) with a per-VM-start
-  order, the rust runtime returns the raw, shorter `.app` env. The `{ok,…}` shape and the other
-  keys agree and are pinned. Owner: `beam_rt`.
-- `application:get_key(erts, vsn)` differs: the oracle answers `undefined` (the emulator is not a
-  *loaded* application — the same conclusion as the pinned `loaded_applications_excludes_erts` and
-  `application:get_application(erts)` cases), the rust runtime answers `{ok,"17.1"}`. The
-  `kernel`/`stdlib` forms agree and are pinned. Owner: `beam_rt`.
-- `application:get_application/1` on a **pid** differs: the oracle answers `{ok,App}` for a
-  process an application owns and `undefined` for every other process (`application:get_application(self())`
-  and `application:get_application(spawn(fun() -> ok end))` are both `undefined` under `-noshell`),
-  while the rust runtime raises `error:function_clause` (it runs no application-owned process).
-  The **module** form agrees and is pinned (`boot_extra/application_get_application_1_*`).
-  Owner: `beam_rt`.
 - `erlang:module_info(exports)` → oracle the export table, rust `undef`
   (`lists:module_info(exports)` works but with a different entry order).
 - The kernel registered names (`code_server`, `kernel_sup`, `application_controller`, `logger`,
@@ -335,6 +321,46 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   (`error:{badrecord,{recdef,rec}}` unless `code:ensure_loaded/1` ran first), which is why those
   cases load the owner explicitly. Owner of the seam: `beam_engine` (`families::records`).
 - Generic opcodes **192/193** cannot be emitted by the installed OTP-29 `erlc`, so no case can pin them.
+- The **`-eval` evaluator renders a caught raise from its own symbolic model, not from the raise's
+  payload**: the trace is the synthesized callee `undef` head item (when the raise has one) consed
+  onto the frames parsed out of `Raise::stacktrace` — `Raise::saved_args`, `Raise::error_info` and
+  `Raise::supplied_trace` are never read — so `error/2,3`'s argument list and a `{error_info,Map}`
+  extension are lost and a caller-supplied `erlang:raise/3` trace comes back as `[]`. Measured:
+  `(catch error(boom,[1,2]))` answers `{'EXIT',{boom,[]}}` here and
+  `{'EXIT',{boom,[{erl_eval,do_apply,[1,2],…},…,{init,start_it,1,[]}]}}` on the oracle, and
+  `(catch erlang:raise(error,boom,[{m,f,[1,2],[]}]))` answers `{'EXIT',{boom,[]}}` where the oracle
+  echoes the supplied list. Owner: `crates/beam_rt/src/eval/mod.rs` (`cook_supplied_trace`). The
+  payload is observable only from **compiled** code — a spawned closure or a module run — which is
+  what `errors_extra/*` and `modules/bif_head_item_*` do.
+- A BIF's `{error_info,…}` location extension stays the **one-key** `#{module => FormatModule}`
+  map even where the BIF's own frame is cooked (compiled code): an `#{cause => Fvalue, module => …}`
+  is never rendered, so `ets:lookup(nonexistent_tab, k)` is
+  `{ets,lookup,[nonexistent_tab,k],[{error_info,#{cause => id,module => erl_stdlib_errors}}]}` in
+  the oracle against the one-key map here — the same for `erlang:register(a,1)` (`cause => none`,
+  module `erl_erts_errors`), `erlang:start_timer(bad,self(),x)` (`cause => time`) and a bit-syntax
+  failure (`{Segment,Op,type,Value}`). Measured exactly, from **compiled** code (a spawned closure,
+  `Probe::Value`, erts-17.1.1), for the `ets:lookup/2` row the oracle answers
+  `{error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{cause,id},{module,erl_stdlib_errors}]}]}`
+  and `beam_rt` answers the same item without the pair,
+  `{error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{module,erl_stdlib_errors}]}]}` — a
+  plain differing value, never the runtime's `unsupported` signal, so it is a **mismatch** class
+  no allowlist can cover and no case may pin it today. Owner: the host side of
+  `crates/beam_engine`'s defaulted `ExecutionContext::bif_error_cause` seam — the engine already
+  asks it per failed BIF and already sizes C's two-pair extension
+  (`families/exceptions/bif_frame.rs`), and `crates/beam_bifs::error_cause` already decides the
+  `ets` table-argument rows (`ets:lookup(unknown_atom_xyz, k)` ⇒ `Cause(id)`), so what is missing
+  is an implementation in `crates/beam_rt` (`context/execution.rs`, over the per-call `BifContext`)
+  mapping `Cause(v) ⇒ Some(v)` / `Undecided ⇒ None`. A BIF raising a `Raise::error_info` payload is
+  the other, unused half: the engine renders one **verbatim** through
+  `pending_error_info`/`raise_error_info`, and no in-tree BIF sets one today. Ready recipe once a
+  host answers the seam: `CASE_DRAFTS.md` §10 (`errors/ets_bad_table_cause`).
+- An Erlang-**source** extension loses the oracle's position: `lists:seq(1,2,0)` is
+  `{lists,seq,[1,2,0],[{file,"lists.erl"},{line,541},{error_info,#{module => erl_stdlib_errors}}]}`
+  in the oracle and a position-free location here, and `unicode:characters_to_binary(42)` likewise.
+  Owner: `crates/beam_engine/src/families/exceptions/` (every item it cooks carries an empty
+  `{file,_}`/`{line,_}`). A case therefore pins only the module-key extension
+  (`modules/bif_head_item_stdlib_extension_in_compiled_code`) and the position-free location
+  (`modules/bif_head_item_shape_in_compiled_code`).
 
 ## A.3 — NIF load/call shapes (owner: `beam_abi` / `beam_rt`)
 - A **`.so`-suffixed** `load_nif/2` path fails in the oracle — it appends the platform suffix again,
@@ -451,6 +477,23 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   then the following `<<"zz">>` on both sides (`{ok,<<42,122,122>>,ok}`, 3 of 3 runs each), so
   `inet_write`'s `no_case_sends_a_bare_integer_payload` guard is about the error-report race above,
   not about the integer byte. Owner: `beam_rt` / `beam_io`.
+- **An accepted socket belongs to the accept's issuer, never to the listener's owner**: C takes
+  `driver_caller` of the *listening* port (`erts/emulator/drivers/common/inet_drv.c:12233`), passes
+  it as `tcp_inet_copy`'s `owner` (`:11795`) and hands it to
+  `driver_create_port(…, owner, "tcp_inet", …)`, so `erlang:port_info(S, connected)` inside the
+  accepting process names the acceptor and `gen_tcp:controlling_process/2` then hands the socket to
+  a third process, whose `port_info(S, connected)` names it in turn. The relation is **pinned** by
+  `inet_control/tcp_accept_ownership_follows_the_acceptor`; the only unpinnable part is the owner
+  pid itself (each side reduces it to `=:= self()`), so no case may name it.
+- **`prim_file:advise/4` on a malformed descriptor** answers the value `{error,badarg}` here where
+  the oracle raises `error:function_clause` (its probe then exits `1` with the `exception …` line) —
+  owner `crates/beam_rt/src/native/prim_file/advise.rs` (`prim_advise`'s `decode_descriptor` →
+  `None` arm, the documented uniform malformed-descriptor divergence of the whole `prim_file`
+  floor), so the refusal of a non-`#file_descriptor{}` argument is unpinnable. What a case MAY pin
+  is the wrapper's `{error,badarg}` for a non-number `Offset`/`Length` on a **live** descriptor (and
+  `{error,einval}` for a negative extent or an out-of-set advice atom), which is
+  `sendfile/prim_file_advise_badarg_wrapper_shape` and
+  `sendfile/prim_file_advise_on_a_live_descriptor_answers_ok`.
 ## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
 - `-extra foo`: the oracle prints a SIGTERM info report and **hangs** (no exit within a 20 s timeout);
   the Rust runtime exits `0`. A **plain argument after `--`** (`-- foo`) is a `mismatch`:
@@ -534,15 +577,36 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   arity). The nearest served `ets:info/1` observation is pinned by
   `ets/info_all_item_keys_and_deterministic_counters` (the item set and its deterministic
   counters).
-- ETS query surface: `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a
-  bare single-use ref where the oracle answers its own opaque `{Ref, _, _, Ref, _, _}` handle (so
-  only the `{Matches, continuation}` split and the ref-ness are pinned).
-- ETS access control: the mode set at `ets:new/2` **is** enforced — a non-owner `ets:lookup/2` of a
-  `private` table and a non-owner `ets:insert/2` of a `private`/`protected` table raise
-  `error:badarg` in both runtimes — but the raised **reason shape** differs: the rust runtime raises
-  the bare atom `badarg`, the oracle `{badarg, Stacktrace}`. The *denied* cells are therefore
-  unpinned (the allowed half and the ungated `ets:info/1,2` surface are pinned).
-  Owner: `beam_bifs` / `beam_ets`.
+- ETS query surface — the continuation's **representation only**: a `select/3` (also `match/3` /
+  `match_object/3`) chunk's continuation is a bare **reference** here, while the oracle answers its
+  own opaque table-type-specific tuple — measured (OTP 29.1.2 / erts-17.1.1) a 6-tuple
+  `{Ref, _, _, Ref, _, _}` for a `set` and an 8-tuple for an `ordered_set`, both carrying per-VM
+  refs — so `is_reference/1` / `is_tuple/1` on that value are the diverging observables. Everything
+  else about the surface **agrees**: the `{Matches, Continuation}` split and the chunk's arity
+  (`ets/select_3_continuation`, `ets/match_3_continuation`), the result list, the
+  `'$end_of_table'` answer of an exhausted continuation (`ets/select_1_end_of_table`), the bare
+  `'$end_of_table'` **argument** (both runtimes reject it with the plain `error:badarg`), and the
+  re-read of a spent continuation (measured over a 3-object `ordered_set` at `Limit = 1`:
+  `{[1], {[2], <handle>}, [2], [3], '$end_of_table', '$end_of_table'}` on **both** sides — a
+  continuation is re-readable, not single-use). Owner: `beam_bifs` / `beam_ets` (the shape of the
+  value `select/3` hands back).
+- ETS access control: the mode set at `ets:new/2` **is** enforced and the raised **reason** agrees —
+  a non-owner `ets:lookup/2` of a `private` table and a non-owner write of a `private`/`protected`
+  table raise the plain `error:badarg` (the **bare atom**, not `{badarg, Stacktrace}`) in both
+  runtimes. Measured over twelve denied cells — non-owner `lookup`/`insert`/`delete`/
+  `delete_all_objects`/`tab2list`/`select`/`match`/`update_counter`/`lookup_element` on a `private`
+  table, plus `insert`/`delete`/`update_element` on a `protected` one — every cell answers
+  `{reason, badarg}` on **both** sides. What differs is the **stacktrace**: the innermost item's
+  `error_info` extension is `#{cause => access, module => erl_stdlib_errors}` on the oracle against
+  `#{module => erl_stdlib_errors}` here (the `bif_error_cause` seam of `CASE_DRAFTS.md` §10 —
+  `beam_bifs::error_cause` answers `Undecided` for a live table's access gate), and the trace is
+  shallower (5 frames vs 2 off the `-eval` route, whose evaluator frames are volatile anyway). So a
+  denied cell may pin its **class and reason**, never its stacktrace; the allowed half and the
+  ungated `ets:info/1,2` surface are pinned end to end by the `ets_access/*` group, which carries no
+  denied cell yet — now that the reason agrees, one may pin the bare `error:badarg` (never the
+  trace).
+  Owner: `beam_engine` (the extension's sizing/rendering) / `beam_bifs` (the decision) / `beam_rt`
+  (the missing host impl of `ExecutionContext::bif_error_cause`).
 - `erlang:module_loaded/1`: `module_loaded(lists)` is `true` vs `false`.
 - `erlang:delete_module/1` **unloads**, where the oracle only *retires* code: this runtime has no
   old-code slot, so the two runtimes agree on the first delete and part ways *after* it. Measured
@@ -590,6 +654,61 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   this size figure is unpinned — no case may read it (guarded by
   `bitbin::tests::no_case_pins_referenced_byte_size`). Owner: `beam_term` / `beam_bifs` (the
   sub-binary representation).
+- **`maps`' no-op identity is preserved everywhere but `maps:without/2`**: the oracle's `without/2`
+  is a `lists:foldl(fun maps:remove/2, M, Ks)` (`lib/stdlib/src/maps.erl:1141-1142`), so an empty
+  key list — or a key the map does not hold — hands back the **source map's own word**. Measured
+  with `M = maps:from_list([{a,1},{b,2}])`, over
+  `[same(M,without([],M)), same(M,without([zz],M)), same(M,without([a],M)), same(M,put(a,1,M)),
+  same(M,remove(zz,M))]`: `[true,true,false,true,true]` on the oracle against
+  `[false,false,false,true,true]` here — identically off the `-eval` route and from a compiled
+  module. The cause is the `without/2` **fast path** this runtime registers: it rebuilds the whole
+  map through `build` (`crates/beam_bifs/src/maps.rs::without_2`, which has no no-op early return,
+  unlike `put_3`/`update_3`/`remove_2`), so a `without/2` case would be a plain-value `mismatch` and
+  none may be written. The rest of the family **agrees**: the registered
+  `maps:put/3`/`update/3`/`remove/2`/`merge/2` no-ops keep the argument's word through result
+  admission (the destination-containment short-circuit,
+  `crates/beam_rt/src/context/calls/dest.rs` — measured
+  `[same(M,put(a,1,M)), same(M,update(a,1,M)), same(M,remove(zz,M)), same(M,merge(M,M)), same(M,Q),
+  M =:= Q, same(M,with([a],M)), same(M,put(a,2,M))]` is `[true,true,true,true,false,true,false,false]`
+  on **both** sides, with `Q = maps:from_list([{b,2},{a,1}])`), `maps:with/2`/`map/2`/`filter/2`
+  rebuild on both sides, the inlined-guard rows are `{true,true,false,true}` on both from compiled
+  code (`{true,true,true,true}` off `-eval`), and the **compiled** map-update identity `M#{a => 1}`
+  is pinned by `maps/no_op_update_keeps_identity` and
+  `maps/no_op_update_identity_at_the_map_boundaries` (both `[AGREE]`; oracle masks `16352` and
+  `32744`). Owner: `beam_bifs` (`without_2`'s missing no-op early return).
+- **`iolist_to_binary/1`'s short-circuit does not preserve its argument's identity**: the C
+  BIF returns the argument itself when it is already a byte-aligned bitstring
+  (`erts/emulator/beam/erl_iolist.c:918-921`) and, for a list, returns the **head** when the
+  list is exactly one byte-aligned bitstring (`erl_iolist.c:881-886`, `BIF_RET(h)`) — so
+  `iolist_to_binary([B])` hands back `B`'s own word, no copy at all. This runtime implements
+  the bare-argument fast path but sends the `[B]` form through the iolist walk and builds a
+  fresh binary (`crates/beam_bifs/src/binary.rs::iolist_to_binary_1`). Measured (OTP 29.1.2 /
+  erts-17.1.1) with `Small = <<"hello">>` (a heap binary) and
+  `Big = binary:copy(<<"x">>, 512)` (a refc one), over
+  `F = fun(B) -> [same(B, iolist_to_binary([B])), same(B, iolist_to_binary(B)),
+  same(B, iolist_to_binary([B, <<>>])), same(B, list_to_binary([B])),
+  same(B, binary:list_to_bin([B])), iolist_to_binary([B]) =:= B,
+  byte_size(iolist_to_binary([B]))] end` — where `same/2` is `erts_debug:same/2` — the answer
+  is `[[true,true,false,true,true,true,5],[true,true,false,true,true,true,512]]` on the
+  **oracle** against
+  `[[false,true,false,false,false,true,5],[false,true,false,false,false,true,512]]` on
+  `beam_rt`. What **agrees**: the bare-argument shape `iolist_to_binary(B)` is the argument's
+  own word on both sides (row 1), the *values* agree everywhere (the bytes, the size and
+  `=:=` are identical — `iolist_to_binary([B]) =:= B` is `true` on both), an element that is
+  not the caller's own term immediately makes the answer `false` on both
+  (`[B, <<>>]`, `[[B]]`, `[[], B]`), and so does head identity across distinct words
+  (`same(B, iolist_to_binary([X]))` with `X = <<B/binary>>` is `false` on both, while
+  `same(X, iolist_to_binary([X]))` is `true` on the oracle against `false` here — the oracle
+  returns the **head's** word). `list_to_binary/1` and `binary:list_to_bin/1` reach the same
+  missing branch (`list_to_bitstring_bif` is shared in the `Unit = 8` form) and diverge
+  identically. A plain differing **value**, so a case pinning any of these cells would be a
+  `mismatch`, which no allowlist can cover; none may be written. Re-verified on this host by
+  running the expression above inside the `CASE_DRAFTS.md` `Probe::Value` wrapper on both
+  runtimes — `erl -noshell -eval 'try ((fun() -> … end)()) of V -> io:format("ok ~w~n",[V]),
+  halt(0) catch C:R -> io:format("exception ~w ~w~n",[C,R]), halt(1) end.'` and the same
+  argument to `erts_rust/target/debug/beam_rt -noshell -eval` — each printing one `ok …` line
+  and exiting `0`. Owner: `beam_bifs` (`iolist_to_binary_1`'s missing `[bitstring()]` head
+  short-circuit).
 ## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
 - `erl_ddll`'s refusal shapes all agree and are pinned: the missing-object / missing-directory /
   non-string-name `{error,{open_error,-10}}`, the not-loaded `{error,not_loaded}`, the

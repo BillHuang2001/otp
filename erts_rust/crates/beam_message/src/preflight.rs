@@ -45,18 +45,23 @@
 //!    shares it by identity, `copy.c:99,119`). The `beam_term` default policy would count its
 //!    interior and over-demand words the copy never writes; `tests/destination_pricing.rs` pins the
 //!    delta.
-//! 2. **Per-object pricing** — [`SizingPolicy::object_words`] overrides the one shape
-//!    `beam_term::layout::object_words` prices for the *source* heap: a **refc binary whose payload
-//!    no source off-heap handle owns** costs its *flattened* window ([`refc_binary_words`]), because
-//!    the copier finds no payload to share and flattens it into an on-heap bitstring — the
-//!    `heap_bits_size_words(end - start)` block `copy.rs`'s `copy_match_context` writes, typically
-//!    far more than the 8-word `[BinRef(3)][ErlSubBits(5)]` pair the layout counts. The default
-//!    policy would under-count and the sized path would reserve too few words, failing *mid-copy*
-//!    after a partial write; the price depends on [`CopyContext`]'s **source** off-heap table, which
-//!    is precisely why the policy is a struct over the copy boundary rather than a term-only walk.
+//! 2. **Per-object pricing** — [`SizingPolicy::object_words`] overrides both `SUB_BITS` shapes
+//!    `beam_term::layout::object_words` prices for the *source* heap, from the validated shape
+//!    [`crate::layout::classify_sub_bits`] reports (the same classifier the copy dispatches on): a
+//!    **refc binary** costs [`refc_binary_words`] — the 8-word pair when the source holds its
+//!    payload, else the *flattened* window, because the copier finds no payload to share and
+//!    flattens it into an on-heap bitstring, the `heap_bits_size_words(end - start)` block
+//!    `copy.rs`'s `copy_match_context` writes, typically far more than the 8 words the layout
+//!    counts — while a **match context** costs the same flattened block taken from the checked
+//!    reader. The default policy would under-count and the sized path would reserve too few words,
+//!    failing *mid-copy* after a partial write; the refc-binary price depends on [`CopyContext`]'s
+//!    **source** off-heap table, which is precisely why the policy is a struct over the copy
+//!    boundary rather than a term-only walk.
 //!
-//! Every other shape keeps the canonical answer, including a `SUB_BITS` **match context**, whose
-//! `beam_term::layout::object_words` already *is* the flattened window the copier writes.
+//! Every other shape keeps the canonical `beam_term::layout::object_words` answer — reached only
+//! for a non-`SUB_BITS` header, so a corrupt `SUB_BITS` never walks into `beam_term`'s unchecked
+//! `sub_bits_words`. A corrupt `SUB_BITS` prices nothing (`None`): the copy that follows raises the
+//! classifier's typed `BadArg`, so a 0 price cannot produce a wrong copy.
 //!
 //! # One walk, exact in both directions, and the cycle guard on it
 //!
@@ -225,10 +230,11 @@ pub fn shrink_warm_scratch() {
 ///
 /// The copier's price differs from `beam_term::size_object`'s source occupancy on exactly the two
 /// axes the trait exposes, one per method: the copy **shares** a literal-area subterm by identity
-/// ([`is_shared`], so it costs `0` destination words and is not descended into) and it **flattens** a
-/// refc binary whose payload no source off-heap handle owns ([`refc_binary_words`]). Every other
-/// object is priced by the canonical `beam_term::layout::object_words`, while the DFS, the bound and
-/// the cycle verdict stay `beam_term::size`'s (see the module docs).
+/// ([`is_shared`], so it costs `0` destination words and is not descended into) and it prices both
+/// `SUB_BITS` shapes from their validated shape rather than the layout's source count (a **refc
+/// binary** through [`refc_binary_words`], a **match context** as the flattened window the copy
+/// writes). Every other object is priced by the canonical `beam_term::layout::object_words`, while
+/// the DFS, the bound and the cycle verdict stay `beam_term::size`'s (see the module docs).
 struct CopyPricing<'a> {
     ctx: &'a CopyContext<'a>,
 }
@@ -243,41 +249,75 @@ impl SizingPolicy for CopyPricing<'_> {
         // bless exactly this, and a literal-tagged word was already filtered out by `is_shared`
         // before any pricing happened.
         let t = make_boxed(payload);
-        if layout::is_refc_binary_term(t) {
-            // The one shape `beam_term::layout::object_words` prices for the *source* heap while
-            // the copier writes a flattened window, so its price depends on the copy boundary's
-            // source off-heap table.
-            return Some(refc_binary_words(t, self.ctx));
+        // A `SUB_BITS` (an `ErlSubBits` refc binary *or* match context) is priced here from its
+        // **validated** shape, through the one classifier the copier's dispatch uses too — so a
+        // corrupt block never reaches `beam_term`'s unchecked `sub_bits_words`, and a block priced
+        // as a copy is a block the copy will accept.
+        match layout::classify_sub_bits(t) {
+            Ok(Some(layout::SubBitsKind::RefcBinary)) => {
+                // The 8-word pair when the source holds the payload handle, else the flattened
+                // window the copy writes (`copy_match_context`) — the one shape whose price depends
+                // on the copy boundary's source off-heap table.
+                refc_binary_words(t, self.ctx)
+            }
+            Ok(Some(layout::SubBitsKind::MatchContext)) => {
+                // The flattened heap-bits block `copy_match_context` writes, taken from the same
+                // checked reader that produces the window it packs.
+                // SAFETY: `classify_sub_bits` proved the block's shape, so the reader's triple is
+                // the validated `(base, offset, size)`; only `size` is used here.
+                unsafe { try_bitstring_parts(t) }
+                    .ok()
+                    .map(|(_base, _offset, size)| heap_bits_size_words(size))
+            }
+            // A corrupt `SUB_BITS`: price nothing and expose no child. The copy that follows raises
+            // the same typed `BadArg` the classifier reported, so a 0 price cannot produce a wrong
+            // copy — it only lets the copy itself report the error.
+            Err(_) => None,
+            // Any other object (the classifier answers `None` only for a non-`SUB_BITS` header,
+            // whose shape the walk has already proven by reaching it) keeps the canonical price.
+            // SAFETY: the walk only prices a live, initialized object of `header`'s shape, which is
+            // exactly `object_words`'s caller contract.
+            Ok(None) => Some(unsafe { layout::object_words(header, payload) }),
         }
-        // SAFETY: the walk only prices a live, initialized object of `header`'s shape, which is
-        // exactly `object_words`'s caller contract.
-        Some(unsafe { layout::object_words(header, payload) })
     }
 }
 
-/// The destination words the copier writes for the refc binary `t`.
+/// The destination words the copier writes for the refc binary `t`, or `None` when `t` is not a
+/// well-shaped refc binary at all.
 ///
 /// A refc binary whose payload is owned by a handle in the source process's off-heap table is copied
 /// as the 8-word `[BinRef(3)][ErlSubBits(5)]` pair ([`ERL_REFC_BITS_SIZE`]) that **shares** the
 /// payload (see `copy.rs`'s `copy_refc_binary`). One whose payload no held handle owns has no pair to
 /// share, so the copier **flattens** it into a fresh on-heap bitstring of the window's bits — the
-/// `heap_bits_size_words(end - start)` block `copy.rs`'s `copy_match_context` writes.
+/// `heap_bits_size_words(end - start)` block `copy.rs`'s `copy_match_context` writes. Anything the
+/// shape-validating reader [`try_sub_bits_parts`] refuses, or whose `orig` is not a `BinRef`, prices
+/// as `None`: the copy raises the typed `BadArg` for such a block, so there is no price to reserve.
 ///
-/// This sizing lives beside the flag it mirrors (`layout::is_refc_binary_term`) so the preflight and
-/// the copy never disagree about what a refc binary costs. It is the one price [`CopyPricing`]
-/// overrides, and the retired walk kept by `copy_reference` prices through it too.
-pub(crate) fn refc_binary_words(t: Eterm, ctx: &CopyContext<'_>) -> usize {
-    // SAFETY: `t` is a live refc binary (the caller's `is_refc_binary_term` guard), so its
-    // `ErlSubBits` words 1..4 are initialised and its `orig` slot is the live `BinRef` whose `val`
-    // is the payload's first data byte.
-    let (_base_flags, start, end, orig) = unsafe { sub_bits_parts(t) };
+/// Price and copy share one reader (`copy.rs`'s `copy_refc_binary` validates with the same
+/// `try_sub_bits_parts`), so the preflight and the copy can never disagree about what a refc binary
+/// costs. It is the one price [`CopyPricing`] overrides, and the retired walk kept by
+/// `copy_reference` prices through it too.
+pub(crate) fn refc_binary_words(t: Eterm, ctx: &CopyContext<'_>) -> Option<usize> {
+    // SAFETY: `t` is a boxed term whose header word is readable; the checked reader validates the
+    // block's shape and answers a typed error for a mis-shaped one.
+    let (_base_flags, start, end, orig) = unsafe { try_sub_bits_parts(t) }.ok()?;
+    // SAFETY: the validated block's `orig` is word 4; `is_bin_ref` dereferences only a boxed header.
+    if !unsafe { is_bin_ref(orig) } {
+        return None;
+    }
     // SAFETY: `orig` is the `BinRef` of a refc binary, so its two payload words are live.
     let (val, _next) = unsafe { bin_ref_parts(orig) };
-    if ctx.src_off_heap().binary_by_data_ptr(val as *const u8).is_some() {
-        ERL_REFC_BITS_SIZE
-    } else {
-        heap_bits_size_words(end.raw().saturating_sub(start.raw()))
-    }
+    Some(
+        if ctx
+            .src_off_heap()
+            .binary_by_data_ptr(val as *const u8)
+            .is_some()
+        {
+            ERL_REFC_BITS_SIZE
+        } else {
+            heap_bits_size_words(end.raw().saturating_sub(start.raw()))
+        },
+    )
 }
 
 #[cfg(test)]

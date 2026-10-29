@@ -20,17 +20,17 @@
 
 //! Runtime process/name/global-state query BIFs for `erlang`: `whereis/1`,
 //! `register/2`, `unregister/1`, `registered/0`, `is_process_alive/1`,
-//! `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2` and
-//! `group_leader/0`.
+//! `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2`,
+//! `group_leader/0` and `bump_reductions/1`.
 //!
 //! Ground truth (read-only): the entries in
 //! `../../../erts/emulator/beam/bif.tab` — `group_leader/0:78`, `process_flag/2:129`,
 //! `process_info/1:131`, `process_info/2:132`, `ports/0:127`, `processes/0:133`,
 //! `register/2:135`, `registered/0:136`, `unregister/1:157`, `whereis/1:158`,
-//! `is_process_alive/1:281` — and their implementations in
+//! `is_process_alive/1:281`, `bump_reductions/1:228` — and their implementations in
 //! `../../../erts/emulator/beam/bif.c` (`process_flag_2:2028`,
 //! `process_flag_aux:1897`, `register_2:2310`, `unregister_1:2324`, `whereis_1:2342`,
-//! `processes_0:4101`, `ports_0:4129`, `group_leader_0:4903`),
+//! `bump_reductions_1:5454`, `processes_0:4101`, `ports_0:4129`, `group_leader_0:4903`),
 //! `../../../erts/emulator/beam/register.c` (`erts_register_name:175`,
 //! `erts_whereis_name_to_id:277`, `registered_0:576`) and
 //! `../../../erts/emulator/beam/erl_bif_info.c` (`process_info_2:1556`,
@@ -41,12 +41,13 @@
 //!
 //! These BIFs answer questions about the *running* node — the name registry, the
 //! process table, the port table and each process's own state (its flags, its group
-//! leader, its message queue, its heap counters) — that no BIF can reach; it all
+//! leader, its message queue, its heap counters, its reduction counter) — that no BIF can reach; it all
 //! lives in the Stage-5 machinery (`beam_process`/`beam_rt`). Each therefore routes
 //! through the optional [`ProcessHook`](crate::context::ProcessHook) seam that
 //! `beam_rt` supplies. With no hook installed **every** one of them reports a typed
 //! `unsupported_bif` capability gap — never a fabricated empty list, never
-//! `undefined`, never `false` and never a made-up previous flag value (workspace
+//! `undefined`, never `false`, never a made-up previous flag value and never the
+//! `true` a reduction charge answers (workspace
 //! `CONTEXT.md` §3: a wrong value is far worse than an honest gap).
 //!
 //! # What the BIF layer decides itself
@@ -66,6 +67,9 @@
 //!   `{dictionary, Key}` 2-tuple — is recognized and reported as the typed
 //!   capability gap; see [`is_dictionary_lookup`].)
 //! * `process_flag/2` — a `Flag` that is not an atom (`bif.c:2024-2025`).
+//! * `bump_reductions/1` — a count that is not a small integer, or a negative one
+//!   (`bif.c:5457-5459`). The *cap* ERTS then applies (`CONTEXT_REDS`) is the
+//!   hook's, not this layer's.
 //!
 //! Everything else is the hook's judgement: `whereis` answers `None` for an
 //! unregistered name (this layer renders the atom `undefined`), `register` /
@@ -88,7 +92,7 @@
 
 use beam_common::Result;
 use beam_process::{PortId, ProcessId};
-use beam_term::{atom_val, make_atom, Atom, AtomTable, Eterm};
+use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access;
 use crate::context::{BifContext, ProcessInfoItem};
@@ -417,7 +421,42 @@ fn group_leader_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
     Ok(leader.to_eterm())
 }
 
-/// Registers the eleven runtime process/name/global-state query BIFs.
+/// `erlang:bump_reductions(N)` — charges `N` reductions to the calling process's
+/// reduction counter and answers `true` (`bump_reductions_1`, `bif.c:5454`).
+///
+/// The argument validation is the C's, verbatim, and runs **before** the seam:
+/// `is_not_small` or a **negative** small is `badarg` (`bif.c:5457-5459`), so a
+/// float, a bignum, an atom, a binary and `-1` all fail here even with no hook
+/// installed (oracle-verified; `MAX_SMALL` is the accepted upper bound).
+///
+/// ERTS then clamps the *charged* amount to one scheduler slice
+/// (`bif.c:5460-5462`: `if (reds > CONTEXT_REDS) reds = CONTEXT_REDS;`, the frozen
+/// interface constant `CONTEXT_REDS` 4000 at `erl_vm.h:47`) and answers `true`
+/// with that count as the BIF's reduction charge (`BIF_RET2(am_true, reds)`), so
+/// the counter moves by `min(N, 4000)` plus the call's own cost.
+///
+/// The cap is applied **here**, not in the hook: `CONTEXT_REDS` is a compile-time
+/// constant of the ERTS interface (canonical in `beam_common::CONTEXT_REDS`, which
+/// `beam_process` already derives its per-process slice budget from), so a host
+/// cannot get it wrong — [`ProcessHook::bump_reductions`] receives the charge
+/// already capped and only has to add it.
+fn bump_reductions_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let count = args[0];
+    if !access::is_small(count) {
+        return Err(error::badarg());
+    }
+    let reds = signed_value(count);
+    if reds < 0 {
+        return Err(error::badarg());
+    }
+    // A small integer is a 60-bit two's-complement value, so a non-negative one
+    // always fits a `u64` exactly (the cast is the widening, never a truncation).
+    let reds = (reds as u64).min(beam_common::CONTEXT_REDS as u64);
+    ctx.proc_bump_reductions(reds)?;
+    ctx.boolean(true)
+}
+
+/// Registers the twelve runtime process/name/global-state query BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "whereis", 1, whereis_1);
     reg.register("erlang", "register", 2, register_2);
@@ -430,4 +469,5 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "process_info", 2, process_info_2);
     reg.register("erlang", "process_flag", 2, process_flag_2);
     reg.register("erlang", "group_leader", 0, group_leader_0);
+    reg.register("erlang", "bump_reductions", 1, bump_reductions_1);
 }

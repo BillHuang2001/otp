@@ -115,6 +115,7 @@ use raise::{classify_class, install_class_atom, raise_error_atom, raise_error_tu
 use stacktrace::symbolic_stacktrace;
 
 mod raise;
+pub(crate) mod bif_frame;
 pub(crate) mod callee;
 pub(crate) mod stacktrace;
 
@@ -261,8 +262,32 @@ pub(crate) fn exec(
                         // `{'EXIT',Inner}` and the inner `{Reason,Trace}`, carved from
                         // its spare `Sink` tail, so no second (collecting) allocation
                         // can strand a node written by the first.
+                        //
+                        // The raise may have published a synthesized **head item** —
+                        // the failing BIF's `{Module,Function,ArgList,Location}`
+                        // (`super::bif_frame`) or an `undef`'s unresolvable callee
+                        // (`super::callee`) — as its raw-trace word, which the landing
+                        // published in `x(2)`. It is C's **innermost** cooked item, and
+                        // it belongs to exactly one cooking: consume the one-shot latch
+                        // here, in the arm that cooks, and hand it to the builder — the
+                        // same protocol [`Instr::BuildStacktrace`] uses below. Without
+                        // it the `catch`-fold's list would start at the first
+                        // `raise_snapshot` frame, i.e. at the **caller** that invoked
+                        // the BIF, where the oracle names the BIF.
+                        //
+                        // A `true` also carries the "the head word IS `x(2)`"
+                        // obligation: `symbolic_stacktrace` re-reads that register
+                        // **after** its rooted reservation (the word cannot be captured
+                        // as a pre-reservation `Eterm`), so the term handed on is the
+                        // operand, never a stale term. The `throw`/`exit` arms do NOT
+                        // consume it (they cook no trace at all); a stale latch cannot
+                        // leak into a later cooking because every **fresh** raise
+                        // re-derives it from its own site (`Machine::throw_inner`), and
+                        // a propagating one deliberately carries the in-flight
+                        // exception's head onward.
+                        let head = machine.take_raise_head_item();
                         let cooked =
-                            symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?;
+                            symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), head)?;
                         machine.set_x(0, cooked)?;
                         // The reservation's spare tail (3 words: the inner pair's
                         // `arityval` header plus its 2 elements) is the inner
@@ -394,7 +419,18 @@ pub(crate) fn exec(
                     // Whether the trace must be cooked at all is a **tag test** on `x(2)`:
                     // keep the answer as a `bool`, never the term, because the cooking
                     // itself reserves (and a collecting host may move every root).
-                    let cook = is_nil(read_operand(machine, ctx, &Operand::X(2))?);
+                    //
+                    // … unless the raise being handled is a **verbatim echo**
+                    // (`erlang:raise/3`'s supplied term, `Machine::raise_supplied_term_verbatim`):
+                    // then `x(2)` IS the raised trace object C re-stores in `c_p->ftrace`
+                    // (`beam_common.c:1164`), and `build_stacktrace` echoes it unchanged
+                    // (`:1219-1223`) — including the **empty** trace, whose term `[]` is
+                    // word-identical to the raw-trace word `NIL` this operand holds when
+                    // no term was landed. Cooking that would derive the *previous*
+                    // exception's frames (a supplied raise deliberately rebuilds no
+                    // snapshot), so the marker decides the arm, not the tag.
+                    let echo = machine.live_raise_supplied_term_verbatim();
+                    let cook = !echo && is_nil(read_operand(machine, ctx, &Operand::X(2))?);
                     let cooked = if cook {
                         Some(symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?)
                     } else {
@@ -417,8 +453,12 @@ pub(crate) fn exec(
                     // Nothing allocates between these reads and `raise_supplied` (it arms
                     // the one-shot latch and forwards to `throw_with_trace`, which only
                     // unwinds and writes registers), so both words stay valid to the
-                    // raise.
-                    machine.raise_supplied(class, value, supplied).map(Some)
+                    // raise. `echo` re-arms the verbatim marker on the new raise, so the
+                    // echoed shape (an argument-list `A` slot, an unknown module, or the
+                    // empty list) survives a rethrow exactly as C's trace object does.
+                    machine
+                        .raise_supplied(class, value, supplied, echo)
+                        .map(Some)
                 }
                 None => {
                     // C: an unknown class is not an error — `raw_raise` returns 1,

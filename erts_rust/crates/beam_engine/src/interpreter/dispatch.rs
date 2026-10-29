@@ -35,8 +35,10 @@ use beam_term::{
 use crate::context::{BifOutcome, ExecutionContext};
 use crate::error;
 use crate::families;
-use crate::families::exceptions::callee;
-use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
+use crate::families::exceptions::{bif_frame, callee};
+use crate::families::funs::{
+    apply_fun_target, apply_target, raise_badarg, ApplyTarget, CallFunOutcome,
+};
 use crate::machine::{namespace_atom, Continuation, Machine, RunOutcome, Verdict};
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
@@ -813,16 +815,18 @@ impl Machine {
     /// instead resolves the export and **jumps into its code in the same process**,
     /// so the callee's `receive` suspends the caller normally.
     ///
-    /// This method returns `Ok(None)` for any import that is not `erlang:apply/3`
-    /// (the caller keeps its normal seam/BIF route). `erlang:apply/2` is **not** a
-    /// `fixed_apply` shape: it is `apply(Fun, Args)` — a *fun* applied to an argument
-    /// list — which C compiles to the dedicated `i_apply_fun` instruction
-    /// (`emu/ops.tab:872`; `APPLY_FUN` → `apply_fun(c_p, x(0), x(1), reg)`,
-    /// `emu/instrs.tab:314-334`) and never routes through `apply()`/`fixed_apply`
-    /// (`beam_common.c:1555` special-cases **only** `arity == 3`). Treating it as the
-    /// `fixed_apply` module/function shape would fabricate `Module:Function()`
-    /// semantics, so arity 2 falls through unchanged to the ordinary export/BIF
-    /// route — the host's own `erlang:apply/2`.
+    /// This method returns `Ok(None)` for any import that is not `erlang:apply/2` or
+    /// `erlang:apply/3` (the caller keeps its normal seam/BIF route).
+    /// `erlang:apply/2` is **not** a `fixed_apply` shape: it is `apply(Fun, Args)` — a
+    /// *fun* applied to an argument list — which C compiles to the dedicated
+    /// `i_apply_fun` instruction (`emu/ops.tab:872`; `APPLY_FUN` →
+    /// `apply_fun(c_p, x(0), x(1), reg)`, `emu/instrs.tab:314-334`) and never routes
+    /// through `apply()`/`fixed_apply` (`beam_common.c:1555` special-cases **only**
+    /// `arity == 3`). Treating it as the `fixed_apply` module/function shape would
+    /// fabricate `Module:Function()` semantics, so it has its own decode —
+    /// [`Machine::resolve_call_ext_apply2`], which walks the list and hands the
+    /// resulting register shape to the same closure application
+    /// `call_fun`/`call_fun2` use.
     ///
     /// Otherwise it decodes the call exactly as C's `apply()` does and hands the
     /// outcome to
@@ -849,10 +853,17 @@ impl Machine {
         labels: &LabelMap,
         target: ImportRef,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Option<ApplyTarget>> {
+    ) -> Result<Option<CallExtTarget>> {
         let (module_name, function_name, import_arity) = labels.import_target(module, target)?;
         if module_name != "erlang" || function_name != "apply" {
             return Ok(None);
+        }
+        // `erlang:apply(Fun, Args)` is a **fun** applied to an argument list — C's
+        // dedicated `i_apply_fun*` instructions (`emu/ops.tab:872-874`), never the
+        // `fixed_apply` module/function shape — so it has its own decode and its own
+        // outcome (`Suspend` is expressible there and not in `ApplyTarget`).
+        if import_arity == 2 {
+            return self.resolve_call_ext_apply2(module, ctx).map(Some);
         }
         if import_arity != 3 {
             return Ok(None);
@@ -871,14 +882,18 @@ impl Machine {
         let apply_atom = module.atom_table.lookup("apply");
         // C's `apply()` checks `is_not_atom(function)` up front, before the loop.
         if !is_atom(function_term) {
-            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
+            return Ok(Some(CallExtTarget::Target(ApplyTarget::Raised(
+                raise_badarg(self, module, ctx)?,
+            ))));
         }
         // C's nested `apply of apply/3` unwrap (`beam_common.c:1462-1497`): while the
         // target is `erlang:apply` and `Args` is exactly `[M, F, Inner]`, replace
         // `(Module, Function, Args)` with `(M, F, Inner)` and repeat.
         loop {
             if !is_atom(module_term) {
-                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
+                return Ok(Some(CallExtTarget::Target(ApplyTarget::Raised(
+                    raise_badarg(self, module, ctx)?,
+                ))));
             }
             let is_erlang = erlang_atom.is_some_and(|a| atom_val(module_term) == a);
             let is_apply = apply_atom.is_some_and(|a| atom_val(function_term) == a);
@@ -892,7 +907,9 @@ impl Machine {
             function_term = f;
             args_term = inner;
             if !is_atom(function_term) {
-                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
+                return Ok(Some(CallExtTarget::Target(ApplyTarget::Raised(
+                    raise_badarg(self, module, ctx)?,
+                ))));
             }
         }
         // Walk the argument list into `x(0..N)` (C's `beam_common.c:1503-1516`). A
@@ -902,7 +919,84 @@ impl Machine {
         let mut cursor = args_term;
         while is_list(cursor) {
             if count as usize >= MAX_ARG {
-                return Ok(Some(ApplyTarget::Raised(
+                return Ok(Some(CallExtTarget::Target(ApplyTarget::Raised(
+                    self.raise_bif_error(module, beam_common::BeamError::SystemLimit, ctx)?,
+                ))));
+            }
+            let element = crate::terms::cons_head(cursor)?;
+            self.set_x(count, element)?;
+            count += 1;
+            cursor = crate::terms::cons_tail(cursor)?;
+        }
+        if !is_nil(cursor) {
+            return Ok(Some(CallExtTarget::Target(ApplyTarget::Raised(
+                raise_badarg(self, module, ctx)?,
+            ))));
+        }
+        // `fixed_apply`'s register shape for the resolved `M`/`F`: the module is
+        // `x(N)` and the function is `x(N+1)`, with the arguments in `x(0..N)`.
+        self.set_x(count, module_term)?;
+        self.set_x(count + 1, function_term)?;
+        Ok(Some(CallExtTarget::Target(apply_target(
+            self,
+            entry_module,
+            module,
+            count,
+            ctx,
+        )?)))
+    }
+    /// The `call_ext*`-encoded `erlang:apply/2` shape — C's `i_apply_fun*`
+    /// (`emu/ops.tab:872-874`; `APPLY_FUN` → `apply_fun(c_p, x(0), x(1), reg)`,
+    /// `emu/instrs.tab:314-334`, `beam_common.c:1734-1763`).
+    ///
+    /// `erlang:apply(Fun, Args)` is `apply(Fun, Args)`: a **fun** applied to an argument
+    /// **list**. It shares nothing with the `fixed_apply` shape above beyond the list
+    /// walk — C's `apply_fun` walks `Args` into `reg[0..arity]`, stores `Fun` at
+    /// `reg[arity]` and hands *that register shape* to `call_fun`, so the closure's own
+    /// application (the `{badfun,_}`/`{badarity,_}` classification, the in-machine
+    /// closure seam and the outcome-aware fallback) is exactly the code
+    /// [`funs::apply_fun_target`](crate::families::funs::apply_fun_target) already runs
+    /// for `call_fun`/`call_fun2`.
+    ///
+    /// Running it **in this machine** is the point: the host's synchronous `apply/2` BIF
+    /// runs a local closure on a *fresh* machine, so a `receive` inside the closure dies
+    /// in the uncatchable typed `error::blocked()` gap at the call site instead of
+    /// suspending *this* process. C resolves the fun's code and enters it in the same
+    /// process (`call_fun`'s `$DISPATCH_FUN`), which is what the seam reproduces.
+    ///
+    /// The walk's bound is the **default (JIT) tier's**, not `apply/3`'s `MAX_ARG`: the
+    /// JIT's `apply_fun_shared` raises `system_limit` as soon as the argument count
+    /// reaches `MAX_REG - 1` (`jit/x86/instr_fun.cpp:307-313`; measured on the oracle:
+    /// 1022 arguments reach the fun/`badfun` answer, 1023 raise `system_limit`), so the
+    /// largest accepted list is `MAX_REG - 2`. A non-proper tail is the catchable
+    /// `badarg` (C checks `is_not_nil(tmp)` after the walk). Both are raised through
+    /// [`Machine::raise_bif_error`], the catch-aware funnel, so a live `try`/`catch`
+    /// observes them.
+    fn resolve_call_ext_apply2(
+        &mut self,
+        module: &Module,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<CallExtTarget> {
+        // C's `apply_fun` takes `x(0)`/`x(1)` as its **arguments**, i.e. both are read
+        // before the walk below overwrites the register file; nothing in the walk
+        // allocates (only `cons_head`/`cons_tail` reads and register writes), so the
+        // captured `fun` stays live until C's `reg[arity] = fun` stores it again.
+        let fun = self.x(0).ok_or_else(|| error::bad_register(0))?;
+        let args = self.x(1).ok_or_else(|| error::bad_register(1))?;
+        let mut cursor = args;
+        let mut count: u32 = 0;
+        // The accepted count is `MAX_REG - 2` of **this** machine's register file: C's
+        // default (JIT) tier raises `system_limit` as soon as the count reaches
+        // `MAX_REG - 1` (`jit/x86/instr_fun.cpp:307-313`, the `inc` then
+        // `cmp ...; jb` — measured: 1022 arguments answer, 1023 raise), and this engine
+        // needs **two** spare slots past the arguments — `x(count)` for the fun (C's
+        // `reg[arity] = fun`) and `x(count + 1)` for the parked argument list a
+        // suspending closure door must re-read — so the largest accepted count is
+        // `MAX_REG - 2`.
+        let arg_limit = self.register_count().saturating_sub(2);
+        while is_list(cursor) {
+            if count >= arg_limit {
+                return Ok(CallExtTarget::Target(ApplyTarget::Raised(
                     self.raise_bif_error(module, beam_common::BeamError::SystemLimit, ctx)?,
                 )));
             }
@@ -912,13 +1006,51 @@ impl Machine {
             cursor = crate::terms::cons_tail(cursor)?;
         }
         if !is_nil(cursor) {
-            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module, ctx)?)));
+            return Ok(CallExtTarget::Target(ApplyTarget::Raised(
+                raise_badarg(self, module, ctx)?,
+            )));
         }
-        // `fixed_apply`'s register shape for the resolved `M`/`F`: the module is
-        // `x(N)` and the function is `x(N+1)`, with the arguments in `x(0..N)`.
-        self.set_x(count, module_term)?;
-        self.set_x(count + 1, function_term)?;
-        Ok(Some(apply_target(self, entry_module, module, count, ctx)?))
+        // C's `reg[arity] = fun; return call_fun(p, arity, reg, args);`. The list itself
+        // is parked at `x(count + 1)` (a scratch slot: the walk has already consumed it
+        // and the fun occupies `x(count)`) so the two **sources** of this instruction
+        // survive a host seam that collects, which is what the `Suspend` arm below
+        // restores them from.
+        self.set_x(count, fun)?;
+        self.set_x(count + 1, args)?;
+        Ok(match apply_fun_target(self, module, count, ctx)? {
+            // The closure names code in this machine (free variables already copied into
+            // `x(count..)`): the arm's own `ImportFrame` discipline stores the
+            // continuation (`call_ext`), stores none (`call_ext_only`) or pops first
+            // (`call_ext_last`).
+            CallFunOutcome::Enter {
+                context,
+                func,
+                pc,
+            } => CallExtTarget::Target(ApplyTarget::Enter {
+                context,
+                func,
+                pc,
+            }),
+            CallFunOutcome::Value(value) => CallExtTarget::Target(ApplyTarget::Called(value)),
+            // The application could not complete without waiting and applied nothing:
+            // the arm reports `Step::Suspend` at its own instruction, and the resume
+            // **re-executes** it — so the two sources it reads (`x(0)` = the fun,
+            // `x(1)` = the list) must be put back first, from the machine's own root
+            // set (the seam may have collected), exactly as C's `arg_reg` save/restore
+            // does for a trapping BIF (`erts/emulator/beam/bif.h:406-423`). Every other
+            // register the walk wrote is rewritten by the re-walk, so nothing else needs
+            // restoring.
+            CallFunOutcome::Suspend => {
+                let fun = self.x(count).ok_or_else(|| error::bad_register(count))?;
+                let args = self
+                    .x(count + 1)
+                    .ok_or_else(|| error::bad_register(count + 1))?;
+                self.set_x(0, fun)?;
+                self.set_x(1, args)?;
+                CallExtTarget::Suspend
+            }
+            CallFunOutcome::Raised(step) => CallExtTarget::Target(ApplyTarget::Raised(step)),
+        })
     }
 
     /// The `call_ext*`-encoded `erlang:send/2` / `erlang:'!'/2` seam.
@@ -1008,7 +1140,18 @@ impl Machine {
             // byte-identical to the one it replaces — without it, a send to a dead
             // pid would turn from a silent drop into a raise.
             Err(BeamError::TermNotFound) => Ok(Some(ApplyTarget::Called(message))),
-            Err(e) => Ok(Some(ApplyTarget::Raised(self.raise_bif_error(module, e, ctx)?))),
+            // A failing send is a BIF failure of `erlang:send/2`, so the oracle's
+            // innermost cooked item is `{erlang,send,[To,Msg],[{error_info,#{module =>
+            // erl_erts_errors}}]}` — the **canonical** name, never the `'!'/2` alias the
+            // import may have been written with (measured: `erlang:'!'(1,hi)` cooks
+            // `{erlang,send,[1,hi],…}`), with the destination and message in `x(0)`/`x(1)`.
+            Err(e) => {
+                let head =
+                    bif_frame::bif_head_item_regs(self, ctx, module, "erlang", "send", 2, &e)?;
+                Ok(Some(ApplyTarget::Raised(
+                    self.raise_bif_error_with_head(module, e, head, ctx)?,
+                )))
+            }
         }
     }
     /// The **single shared body** of the three `call_ext*` arms.
@@ -1057,8 +1200,18 @@ impl Machine {
         seam: Option<Option<(u32, u32, u32)>>,
     ) -> StepResult {
         let apply_target =
-            if let Some(t) = self.resolve_call_ext_apply(entry_module, module, labels, target, ctx)? {
-                t
+            if let Some(resolved) =
+                self.resolve_call_ext_apply(entry_module, module, labels, target, ctx)?
+            {
+                match resolved {
+                    CallExtTarget::Target(t) => t,
+                    // `erlang:apply/2`'s closure application could not complete without
+                    // waiting and applied nothing — no continuation, no frame pop and no
+                    // register write on this arm — so the instruction parks here and the
+                    // resume re-executes it (the class-A BIF rule; the fun and the
+                    // argument list are re-read from the machine's own root set).
+                    CallExtTarget::Suspend => return Ok(Step::Suspend { func, pc }),
+                }
             } else if let Some(t) = self.resolve_call_ext_send(module, labels, target, ctx)? {
                 t
             } else {
@@ -1093,8 +1246,40 @@ impl Machine {
                             // instruction's own `arity` operands hold its arguments, so
                             // the item is synthesized here (a no-op for any other error
                             // shape, or when the raise cannot land).
-                            let head =
-                                callee::import_callee_head_item(self, ctx, module, target, arity, &e)?;
+                            //
+                            // Every **other** host failure on this route is a real BIF
+                            // error, and the oracle's innermost item is then the BIF
+                            // itself with its real argument list and its `error_info`
+                            // extension (C's `save_stacktrace`, `beam_common.c:877-1063`
+                            // — see [`crate::families::exceptions::bif_frame`]). The
+                            // `undef` item takes precedence: it names a callee that does
+                            // not exist, whose `Location` is the empty list, and C never
+                            // reaches the BIF arm for it.
+                            let head = match callee::import_callee_head_item(
+                                self, ctx, module, target, arity, &e,
+                            )? {
+                                Some(item) => Some(item),
+                                None => match labels.import_target(module, target) {
+                                    // `bif_mfa->arity` — the **import table's** declared
+                                    // arity, which is not the instruction's own for the
+                                    // `call_ext 3 erlang:apply/3` split.
+                                    Ok((bif_module, bif_function, bif_arity)) => {
+                                        bif_frame::bif_head_item_regs(
+                                            self,
+                                            ctx,
+                                            module,
+                                            bif_module,
+                                            bif_function,
+                                            bif_arity,
+                                            &e,
+                                        )?
+                                    }
+                                    // The import reference is unreadable: there is no
+                                    // callee identity to name, and the BIF's own error
+                                    // must never be replaced by a marshalling one.
+                                    Err(_) => None,
+                                },
+                            };
                             return self
                                 .raise_bif_error_with_head(module, e, head, ctx)
                                 .map_err(Box::new);
@@ -1441,7 +1626,30 @@ impl Machine {
             // on the *call instruction* — re-executing it re-asks the host, which
             // re-issues the BIF with the same registers.
             Ok(BifOutcome::Suspend) => return Ok(Some(Step::Suspend { func, pc })),
-            Err(e) => return self.raise_bif_error(module, e, ctx).map_err(Box::new).map(Some),
+            Err(e) => {
+                // This seam **is** a BIF dispatch (`call_bif_named`), so its failure
+                // cooks the same innermost item a `call_ext` BIF failure does: the
+                // callee named with its real argument registers and the
+                // `{error_info, #{module => FormatModule}}` extension (the running
+                // module owns the callee, so its own atom table names it).
+                //
+                // Residual: OTP reaches a module's own `*_nif` stub through the
+                // **NIF** epilogue, which hands `handle_error` the *calling* MFA
+                // (`../../erts/emulator/beam/emu/bif_instrs.tab:633`,
+                // `handle_error(c_p, cp, reg, c_p->current)`), so an oracle trace for a
+                // failing NIF stub names the caller rather than the stub. No
+                // differential case reaches a failing `zlib`/`prim_tty` stub, and the
+                // engine's seam has no NIF epilogue to consult, so the item follows
+                // the BIF route — a documented shape difference, never a wrong term.
+                let head = bif_frame::bif_head_item_regs(
+                    self, ctx, module, module_name, function_name, arity, &e,
+                )
+                .map_err(Box::new)?;
+                return self
+                    .raise_bif_error_with_head(module, e, head, ctx)
+                    .map_err(Box::new)
+                    .map(Some);
+            }
         };
         self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
             .map(Some)
@@ -1526,6 +1734,22 @@ pub(crate) enum ImportFrame {
 /// The argument count past which C's `apply()` raises `error:system_limit`
 /// (`../../erts/emulator/beam/erl_vm.h:48`, `MAX_ARG = 255`).
 const MAX_ARG: usize = 255;
+
+/// What a `call_ext*` **special case** resolved to
+/// ([`Machine::resolve_call_ext_apply`]).
+///
+/// [`CallExtTarget::Target`] is a dispatch the arm's own
+/// [`ImportFrame`] discipline applies. [`CallExtTarget::Suspend`] is the one outcome
+/// [`ApplyTarget`] cannot express: the closure application could not complete without
+/// waiting and applied **nothing**, so the arm reports [`Step::Suspend`] at its own
+/// instruction.
+enum CallExtTarget {
+    /// A dispatch for the arm's `ImportFrame` discipline (`call_ext` stores a
+    /// continuation, `call_ext_only` stores none, `call_ext_last` pops first).
+    Target(ApplyTarget),
+    /// The application must wait; nothing was applied.
+    Suspend,
+}
 
 /// The `(module name, function name, arity)` of the **same-module** callee a local
 /// `call`/`call_only`/`call_last` resolved to, or `None` when the callee's function

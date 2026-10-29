@@ -28,6 +28,22 @@
 //! available; they run against a fresh empty `AtomTable`. They are exact whenever the key terms are
 //! not atoms — the overwhelmingly common NIF case, where the key is a term the NIF was handed.
 //!
+//! `enif_make_map_put` / `enif_make_map_update` write through `beam_term`'s **incremental
+//! (path-copying) writer** `map_put_cow`, the shape the C uses (`erts_maps_put` copies only the
+//! nodes on `key`'s hash path and shares every off-path subtree by word; a flat map's present-key
+//! replace reuses the source keys tuple verbatim). A single-key update therefore costs Θ(log n)
+//! fresh words instead of the Θ(n) a full `write_map` rebuild copies — the reservation comes from
+//! `map_put_cow_words_capacity(map_size)`, the writer's size-only bound. Two consequences, both the
+//! C's: the result **shares storage with `map_in`** (sound — terms are immutable and never
+//! relocated, so sharing a word is a copy-free copy), and a put whose stored value word is already
+//! the new value word returns `map_in` itself, writing nothing. `map_out` and `map_in` may alias
+//! (a NIF's `enif_make_map_put(env, M, K, V, &M)` idiom): `map_in` is read once, and every write
+//! goes to the freshly reserved region. A malformed map is the writer's typed
+//! `TermError::BadMap` refusal, answered as the C's `0` — nothing is written to `*map_out` then.
+//!
+//! `enif_make_map_remove` still takes the full-rebuild route (`map_remove`), whose result borrows
+//! nothing from `map_in`.
+//!
 //! `enif_make_map_from_arrays` **refuses a duplicate key** (answering `0` with `THE_NON_VALUE` in
 //! `*map_out`), exactly as `erts_map_from_ks_and_vs` does (`erl_map.c:671-714`); the duplicate basis
 //! is the exact (`=:=`) key identity, so `1` and `1.0` — two different map keys — are accepted.
@@ -133,11 +149,14 @@ pub unsafe extern "C" fn enif_make_map_put(
     let Ok(size) = prelude::map_size(map, &no_atoms()) else {
         return 0;
     };
-    // SAFETY: `map_words_capacity(size + 1)` sizes the result of a put.
-    let Some(hp) = (unsafe { alloc(e, prelude::map_words_capacity(size + 1)) }) else {
+    // SAFETY: `map_put_cow` requires a region of `map_put_cow_words_capacity(size)` words
+    // (its size-only bound — the words one put *copies*, not the whole map's extent: the
+    // off-path subtrees are shared with `map_in` by word, exactly as `erts_maps_put`
+    // shares them, which is sound because terms are immutable and never relocated).
+    let Some(hp) = (unsafe { alloc(e, prelude::map_put_cow_words_capacity(size)) }) else {
         return 0;
     };
-    match unsafe { prelude::map_put(hp, map, t(key), t(value), &no_atoms()) } {
+    match unsafe { prelude::map_put_cow(hp, map, t(key), t(value), &no_atoms()) } {
         // SAFETY: `map_out` may be null (handled) or valid for one write.
         Ok(out) => (unsafe { write_out(map_out, n(out)) }) as c_int,
         Err(_) => 0,
@@ -169,11 +188,12 @@ pub unsafe extern "C" fn enif_make_map_update(
     let Ok(size) = prelude::map_size(map, &no_atoms()) else {
         return 0;
     };
-    // SAFETY: `map_words_capacity(size + 1)` sizes the result of a put.
-    let Some(hp) = (unsafe { alloc(e, prelude::map_words_capacity(size + 1)) }) else {
+    // SAFETY: as `enif_make_map_put` — `map_put_cow`'s size-only capacity, the words the
+    // put copies (a present key copies the value sequence / the HAMT path only).
+    let Some(hp) = (unsafe { alloc(e, prelude::map_put_cow_words_capacity(size)) }) else {
         return 0;
     };
-    match unsafe { prelude::map_put(hp, map, t(key), t(value), &no_atoms()) } {
+    match unsafe { prelude::map_put_cow(hp, map, t(key), t(value), &no_atoms()) } {
         // SAFETY: `map_out` may be null (handled) or valid for one write.
         Ok(out) => (unsafe { write_out(map_out, n(out)) }) as c_int,
         Err(_) => 0,
@@ -331,6 +351,16 @@ mod tests {
         fn new() -> MapHost {
             MapHost {
                 heap: Heap::new(4096).expect("a small test heap is allocatable"),
+                atoms: AtomTable::new(),
+            }
+        }
+
+        /// A host whose arena holds `words` words — the 250-pair cases carry a source map plus two
+        /// writers' reservations: `map_put_cow_words_capacity` is `293` for a HAMT put, while the
+        /// rebuild it is compared against reserves `map_words_capacity(size + 1)` = `5289`.
+        fn with_heap(words: usize) -> MapHost {
+            MapHost {
+                heap: Heap::new(words).expect("a test heap is allocatable"),
                 atoms: AtomTable::new(),
             }
         }
@@ -535,5 +565,343 @@ mod tests {
             )
         };
         assert_eq!(code, 0, "the refusal does not depend on the out slot");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The incremental (path-copying) writer behind `enif_make_map_put` / `enif_make_map_update`
+    // ---------------------------------------------------------------------------------------
+    //
+    // Both slots write through `beam_term::map::map_put_cow` (the C's `erts_maps_put` shape: only
+    // the nodes on `key`'s hash path are copied, every off-path subtree is shared by word) instead
+    // of the Θ(n) `map_put` (a full `write_map` rebuild). The two must be **indistinguishable**:
+    // the same `=:=` term, the same head word, and the same **interior** — the same pairs in the
+    // same storage order (which is what `maps:to_list/1` and every image-preserving serializer
+    // read) over the same node/bitmap arrangement.
+    //
+    // `beam_abi` deliberately has no `beam_codec` dependency (ETF goes through `NifHost`), so the
+    // comparison below stands in for a `term_to_binary` byte comparison: `map_pairs_storage_order`
+    // (the serializer's order) plus a structural walk of the boxed map/node/leaf/collision words,
+    // with block *addresses* excluded — a path-copied node is fresh storage by design, and an
+    // off-path subtree is shared by word.
+
+    /// `k => k * 100` for `k` in `0..n`, built by `enif_make_map_from_arrays`, so the source map is
+    /// built by the one-shot builder rather than by either writer under test.
+    fn map_of(env: &NifEnv, n: i64) -> Eterm {
+        let keys = smalls(0..n);
+        let values = smalls((0..n).map(|k| k * 100));
+        let (code, map) = from_arrays(env, &keys, &values);
+        assert_eq!(code, 1, "the source map builds");
+        map
+    }
+
+    /// The **rebuild** route both slots used to take: `map_put` = `map_pairs` + `write_map`.
+    fn rebuild(env: &NifEnv, map: Eterm, key: Eterm, value: Eterm) -> Eterm {
+        let size = prelude::map_size(map, &no_atoms()).expect("a well-formed map");
+        // SAFETY: `map_words_capacity(size + 1)` is `map_put`'s documented reservation and `alloc`
+        // hands out that many words of the host arena, which the live `env` keeps alive.
+        let hp = unsafe { alloc(env, prelude::map_words_capacity(size + 1)) }.expect("heap room");
+        // SAFETY: as above, and `map` is a well-formed map.
+        unsafe { prelude::map_put(hp, map, key, value, &no_atoms()) }.expect("a well-formed map")
+    }
+
+    /// The head (first) word of a boxed term.
+    ///
+    /// # Safety
+    ///
+    /// `t` must be a live boxed term.
+    unsafe fn head_word(t: Eterm) -> Eterm {
+        // SAFETY: the caller guarantees `t` is boxed, so its first word is its header.
+        unsafe { *prelude::boxed_val(t) }
+    }
+
+    /// The number of slots a HAMT node header carries: 16 for the full head array, else one per
+    /// set bitmap bit.
+    fn slot_count(hdr: Eterm) -> usize {
+        if prelude::map_header_type(hdr) as usize == prelude::MAP_HEADER_TAG_HAMT_HEAD_ARRAY {
+            16
+        } else {
+            prelude::map_header_val(hdr).count_ones() as usize
+        }
+    }
+
+    /// Structural (`=:=` plus interior-shape) equality of two maps — see the section header for
+    /// what it covers and why it stands in for a byte comparison.
+    fn same_map(a: Eterm, b: Eterm) -> bool {
+        let atoms = no_atoms();
+        // SAFETY: both are live maps (every caller produced them from a writer that succeeded).
+        let (ha, hb) = unsafe { (head_word(a), head_word(b)) };
+        if ha.raw() != hb.raw() {
+            return false;
+        }
+        if prelude::is_flatmap_header(ha) {
+            // SAFETY: both are live flat maps.
+            let (ka, va) = unsafe { prelude::flatmap_parts(a) };
+            let (kb, vb) = unsafe { prelude::flatmap_parts(b) };
+            return ka.len() == kb.len()
+                && ka.iter().zip(kb).all(|(x, y)| prelude::eq(*x, *y, &atoms))
+                && va.iter().zip(vb).all(|(x, y)| prelude::eq(*x, *y, &atoms));
+        }
+        prelude::is_map_header(ha) && same_node(a, b, true)
+    }
+
+    /// [`same_map`]'s node arm: a head (`is_head`, whose `size` word precedes the slots) or an
+    /// inner node. Both sides must have the same header word (type + bitmap / full array).
+    fn same_node(a: Eterm, b: Eterm, is_head: bool) -> bool {
+        // SAFETY: both are live HAMT nodes of the same kind.
+        let (ha, hb) = unsafe { (head_word(a), head_word(b)) };
+        if ha.raw() != hb.raw() {
+            return false;
+        }
+        let (pa, pb) = (prelude::boxed_val(a), prelude::boxed_val(b));
+        let slots = if is_head { 2 } else { 1 };
+        if is_head {
+            // SAFETY: a head node's word 1 is its `size` (the map's key count).
+            let (sa, sb) = unsafe { (*pa.add(1), *pb.add(1)) };
+            if sa.raw() != sb.raw() {
+                return false;
+            }
+        }
+        (0..slot_count(ha)).all(|i| {
+            // SAFETY: slot `i` lies inside both nodes' payloads (`slot_count` set bits).
+            let (ca, cb) = unsafe { (*pa.add(slots + i), *pb.add(slots + i)) };
+            same_slot(ca, cb)
+        })
+    }
+
+    /// [`same_map`]'s slot arm: a leaf cons cell, a collision tuple or an inner node.
+    fn same_slot(a: Eterm, b: Eterm) -> bool {
+        let atoms = no_atoms();
+        if prelude::is_list(a) {
+            if !prelude::is_list(b) {
+                return false;
+            }
+            // SAFETY: a leaf is a header-less two-word `[Key, Value]` cons cell.
+            return unsafe {
+                prelude::eq(prelude::car(a), prelude::car(b), &atoms)
+                    && prelude::eq(prelude::cdr(a), prelude::cdr(b), &atoms)
+            };
+        }
+        if !prelude::is_boxed_term(a) || !prelude::is_boxed_term(b) {
+            return false;
+        }
+        // SAFETY: both are boxed, so word 0 is a header.
+        let (ha, hb) = unsafe { (head_word(a), head_word(b)) };
+        if ha.raw() != hb.raw() {
+            return false;
+        }
+        if prelude::is_map_header(ha) {
+            return same_node(a, b, false);
+        }
+        if prelude::is_arity_value(ha) {
+            // A collision node: a tuple of `[Key, Value]` cons cells in `cmp` order.
+            let cells = prelude::arityval(ha);
+            return (0..cells).all(|i| {
+                // SAFETY: `i < arityval`, so element `i` is inside both tuple payloads.
+                let (ca, cb) =
+                    unsafe { (prelude::tuple_element(a, i), prelude::tuple_element(b, i)) };
+                same_slot(ca, cb)
+            });
+        }
+        false
+    }
+
+    /// Assert that `enif_make_map_put` on `(map, key, value)` is indistinguishable from the
+    /// `write_map` rebuild it used to produce, and return the put's result.
+    #[track_caller]
+    fn assert_put_agrees(env: &NifEnv, map: Eterm, key: Eterm, value: Eterm) -> Eterm {
+        let mut out = n(make_small(SENTINEL));
+        // SAFETY: `env` is live for the whole call and `out` is a live local.
+        let code = unsafe { enif_make_map_put(env.as_ptr(), n(map), n(key), n(value), &mut out) };
+        assert_eq!(code, 1, "a put on a well-formed map succeeds");
+        assert_agrees(env, t(out), rebuild(env, map, key, value));
+        t(out)
+    }
+
+    /// Assert that `enif_make_map_update` on a **present** key is indistinguishable from the
+    /// rebuild; returns the update's result.
+    #[track_caller]
+    fn assert_update_agrees(env: &NifEnv, map: Eterm, key: Eterm, value: Eterm) -> Eterm {
+        let mut out = n(make_small(SENTINEL));
+        // SAFETY: `env` is live for the whole call and `out` is a live local.
+        let code =
+            unsafe { enif_make_map_update(env.as_ptr(), n(map), n(key), n(value), &mut out) };
+        assert_eq!(code, 1, "the key is present");
+        assert_agrees(env, t(out), rebuild(env, map, key, value));
+        t(out)
+    }
+
+    /// The one equivalence assertion both writers share.
+    #[track_caller]
+    fn assert_agrees(env: &NifEnv, cow: Eterm, rebuilt: Eterm) {
+        let atoms = no_atoms();
+        assert!(!prelude::is_non_value(cow), "the out term is a real map");
+        assert_eq!(
+            prelude::map_size(cow, &atoms),
+            prelude::map_size(rebuilt, &atoms),
+            "the same key count"
+        );
+        assert!(
+            prelude::eq(cow, rebuilt, &atoms),
+            "the maps are `=:=`-equal"
+        );
+        assert!(same_map(cow, rebuilt), "the maps have the same interior");
+        // The storage order is the serializer's order, so comparing it pair-by-pair is this
+        // crate's stand-in for `term_to_binary` byte equality (no `beam_codec` dependency here).
+        let from_cow = prelude::map_pairs_storage_order(cow).expect("a map");
+        let from_rebuild = prelude::map_pairs_storage_order(rebuilt).expect("a map");
+        assert_eq!(from_cow.len(), from_rebuild.len(), "the same pair count");
+        for (cow_pair, rebuilt_pair) in from_cow.iter().zip(&from_rebuild) {
+            assert!(
+                prelude::eq(cow_pair.0, rebuilt_pair.0, &atoms),
+                "the same key at the same storage position"
+            );
+            assert!(
+                prelude::eq(cow_pair.1, rebuilt_pair.1, &atoms),
+                "the same value at the same storage position"
+            );
+        }
+        // And the count the C's `enif_get_map_size` answers agrees as well.
+        assert_eq!(size_of(env, cow), size_of(env, rebuilt));
+    }
+
+    #[test]
+    fn a_put_agrees_with_the_write_map_rebuild_at_every_size() {
+        // 0/1: the empty flat map and a one-pair map; 31: the largest insert below the limit;
+        // 32: the flat→HAMT conversion (`FlatConvert`); 33/34: HAMT inserts just above the
+        // limit; 250: a wide HAMT (the Θ(log n) claim's regime).
+        for pairs in [0i64, 1, 31, 32, 33, 34, 250] {
+            let mut host = MapHost::with_heap(1 << 18);
+            let env = NifEnv::new(&mut host);
+            let map = map_of(&env, pairs);
+            assert_eq!(
+                size_of(&env, map),
+                pairs as usize,
+                "the source map has `pairs` pairs"
+            );
+
+            // One **absent** key: the insert arm (and, at 32 pairs, the flat→HAMT conversion).
+            let inserted = assert_put_agrees(&env, map, make_small(pairs + 1), make_small(999));
+            // The comparator is discriminating: the result really is a *different* map.
+            assert!(!same_map(map, inserted), "the insert changed the map");
+            assert_eq!(
+                size_of(&env, inserted),
+                pairs as usize + 1,
+                "an absent key grows the map by one"
+            );
+            assert_eq!(
+                prelude::signed_value(value_of(&env, inserted, make_small(pairs + 1))),
+                999
+            );
+
+            // One **present** key: the replace arm (the flat arm reuses the source keys tuple).
+            if pairs > 0 {
+                let key = pairs / 2;
+                let replaced = assert_put_agrees(&env, map, make_small(key), make_small(-7));
+                assert!(!same_map(map, replaced), "the replace changed the map");
+                assert_eq!(
+                    size_of(&env, replaced),
+                    pairs as usize,
+                    "a present key leaves the size alone"
+                );
+                assert_eq!(
+                    prelude::signed_value(value_of(&env, replaced, make_small(key))),
+                    -7
+                );
+                // The input map is untouched — the write went to the fresh reservation, and the
+                // sharing is one-way (the result reads `map`'s off-path nodes).
+                assert_eq!(
+                    prelude::signed_value(value_of(&env, map, make_small(key))),
+                    key * 100,
+                    "`map_in` is never mutated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_update_agrees_with_the_rebuild_and_writes_nothing_for_an_absent_key() {
+        for pairs in [1i64, 31, 32, 33, 34, 250] {
+            let mut host = MapHost::with_heap(1 << 18);
+            let env = NifEnv::new(&mut host);
+            let map = map_of(&env, pairs);
+
+            // A present key: the same answer the rebuild gives.
+            let key = pairs / 2;
+            let updated = assert_update_agrees(&env, map, make_small(key), make_small(-7));
+            assert_eq!(size_of(&env, updated), pairs as usize);
+            assert_eq!(
+                prelude::signed_value(value_of(&env, updated, make_small(key))),
+                -7
+            );
+
+            // An absent key: `0`, and neither `*map_out` nor the input map is touched
+            // (`erts_maps_update` refuses before anything is built).
+            let mut out = n(make_small(SENTINEL));
+            // SAFETY: `env` is live and `out` is a live local.
+            let code = unsafe {
+                enif_make_map_update(
+                    env.as_ptr(),
+                    n(map),
+                    n(make_small(pairs + 1)),
+                    n(make_small(9)),
+                    &mut out,
+                )
+            };
+            assert_eq!(code, 0, "a missing key is refused");
+            assert_eq!(
+                t(out),
+                make_small(SENTINEL),
+                "a refused update writes nothing into `*map_out`"
+            );
+            assert_eq!(
+                size_of(&env, map),
+                pairs as usize,
+                "the input map is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_map_is_refused_without_writing_anything() {
+        let mut host = MapHost::with_heap(1 << 12);
+        let env = NifEnv::new(&mut host);
+        let map = map_of(&env, 2);
+        // Corrupt the flat map's `size` word so it disagrees with its keys tuple's arity — the
+        // one shape `flat_pair_count` refuses, and the shape a forged/corrupt term presents.
+        // No builder in this crate produces it, so the writer's typed `TermError::BadMap` is the
+        // only guard: it must answer the C's `0` and write nothing, never panic and never fall
+        // back to a rebuild.
+        let head = prelude::boxed_val(map);
+        // SAFETY: `map` is a live 2-pair flat map, whose head block is
+        // `[arityval, k0, k1, head, size, keys, v0, v1]`; word 1 of the head is that raw `size`
+        // word, and this test owns the whole arena.
+        unsafe { *head.add(1) = Eterm::from_raw(3) };
+
+        let mut out = n(make_small(SENTINEL));
+        // SAFETY: `env` is live for both calls and `out` is a live local.
+        let code = unsafe {
+            enif_make_map_put(
+                env.as_ptr(),
+                n(map),
+                n(make_small(0)),
+                n(make_small(1)),
+                &mut out,
+            )
+        };
+        assert_eq!(code, 0, "a forged map is refused");
+        assert_eq!(t(out), make_small(SENTINEL), "and nothing is written");
+
+        // SAFETY: as above.
+        let code = unsafe {
+            enif_make_map_update(
+                env.as_ptr(),
+                n(map),
+                n(make_small(0)),
+                n(make_small(1)),
+                &mut out,
+            )
+        };
+        assert_eq!(code, 0, "the update slot refuses it too");
+        assert_eq!(t(out), make_small(SENTINEL), "and nothing is written");
     }
 }

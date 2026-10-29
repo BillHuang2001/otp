@@ -37,7 +37,9 @@ const WORD: usize = core::mem::size_of::<Eterm>();
 
 /// A `runtime` + a caller-owned `ProcessTable` holding one default process, plus the pid —
 /// the `for_process` shape, i.e. the one where the copy-out (and its retry) is ON.
-fn process_table(rt: &mut crate::runtime::Runtime) -> (ProcessTable, beam_process::ProcessId) {
+pub(super) fn process_table(
+    rt: &mut crate::runtime::Runtime,
+) -> (ProcessTable, beam_process::ProcessId) {
     let signals = SignalAtoms::from_table(rt.code_server_atoms_mut());
     let mut table = ProcessTable::new(signals);
     let pid = table.spawn_default().expect("a default process");

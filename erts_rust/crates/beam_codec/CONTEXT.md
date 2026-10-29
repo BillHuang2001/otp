@@ -110,7 +110,12 @@ Re-exported at the crate root and via `beam_codec::prelude::*`.
   (default `V2`). `pub struct FunIdentity { module: Atom, uniq: [u8; 16], old_index: u32, old_uniq:
   u32, creator: FunPid, function: Option<Atom> }` (+ `new`/`named`/`with_function`) — the
   `ErlFunEntry` fields a `make_fun3` fun lacks but `NEW_FUN_EXT` needs; `function` is
-  introspection-only and never encoded. Convenience: `encode_term` (with `131`) / `encode_term_body`
+  introspection-only and never encoded. `pub trait FunIdentityResolver { fn resolve(&mut self,
+  fun: Eterm) -> Result<Option<FunIdentity>>; }` (+ a blanket impl for
+  `FnMut(Eterm) -> Result<Option<FunIdentity>>`) is the **per-fun** identity seam, installed with
+  `Encoder::with_fun_identity_resolver`: consulted once for every `FunKind::Local` fun and
+  authoritative (no fallback to the single slot), so a term holding **two different lambdas**
+  encodes each fun from its own identity. Convenience: `encode_term` (with `131`) / `encode_term_body`
   (without), both **uncompressed**, plus `encode_term_compressed`, `encode_term_body_compressed`,
   `encode_term_local(term, atoms, hash)` and `encode_term_with_minor_version`.
   Per-format detail (flavours, floats, integer widths, internal ids, funs, records, map order):
@@ -208,6 +213,14 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
 - **This crate does not own the term layout — `beam_term` does.** The decoder writes straight into
   the caller's `Heap` + `AtomTable` (no trait, no intermediate value tree), adding only the wire
   rules plus the checks ERTS applies at the same seam.
+- **One identity slot by default, a per-fun resolver when a term needs it.** The single
+  `with_fun_identity` slot stays the default because it keeps every existing image and signature
+  byte-for-byte unchanged and is exactly right for the common case (one closure, or the same
+  closure several times). The resolver is a **separate, optional** seam rather than a second
+  meaning for the slot, and it is authoritative when installed — a silent fallback would let one
+  fun's identity be written into a different fun, which is the one failure mode (a wrong image) the
+  codec exists to prevent. The wire layout is untouched: `NEW_FUN_EXT`'s fields and order are
+  unchanged, only the identity that feeds them moves per fun.
 - **Decode canonicalizes, encode does not.** A decoded map is rebuilt through the canonical ERTS
   constructor, so it re-encodes byte-identically; the encoder never deduplicates, re-canonicalizes or
   sorts a map unless `[deterministic]` is asked, because ERTS emits the representation's own order.
@@ -250,8 +263,11 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
   warm per decode, image 101 bytes — counts, never timings), per-tag suites (`tag_coverage`'s 41-row
   coverage + 66-row exact-`BeamError` tables, `tag_space_audit`'s exhaustive 256-row disposition
   sweep + no-panic `[131,byte]` sweep, and the roundtrip/scalar/legacy/record/map/`COMPRESSED`
-  families) — plus `interop`, the live differential harness. Inventory and per-suite roles:
-  [`tests/CONTEXT.md`](./tests/CONTEXT.md).
+  families) — plus `interop`, the live differential harness. `local_fun_encode.rs` carries the
+  local-fun identity evidence: the pure round-trip, the single-fun oracle identity, and
+  `two_different_local_funs_encode_byte_exactly_like_the_oracle` (a rebuilt two-lambda list image
+  vs the oracle's own `term_to_binary([F1, F2])`, byte for byte, through the per-fun resolver).
+  Inventory and per-suite roles: [`tests/CONTEXT.md`](./tests/CONTEXT.md).
 - Oracle-dependent cases resolve `$ERTS_ORACLE` else `erl` on `$PATH` and **skip loudly** (a stderr
   note, never a silent pass).
 - `examples/etf_attrib.rs` — the manually-run codec-**alone** attribution binary; only

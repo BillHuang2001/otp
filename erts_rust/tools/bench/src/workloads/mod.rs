@@ -34,6 +34,8 @@ pub mod bbmustache;
 pub mod binary_append;
 pub mod copy_bound;
 pub mod cowboy;
+pub mod cowboy_serve;
+pub mod cowboy_setup;
 pub mod elixir_compiler;
 pub mod emqx;
 pub mod erlc_compiler;

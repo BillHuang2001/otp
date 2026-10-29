@@ -38,9 +38,11 @@
 //! reason is **copied into the receiving process's own heap when the signal is enqueued** (see
 //! below), so the queue is an in-heap sub-rootset exactly like the mailbox / the process
 //! dictionary / the saved BIF arguments. The DOWN's user tag is the `erlang:monitor/3`
-//! `{tag, Tag}` option (`None` ⇒ the `'DOWN'` atom) and is carried verbatim — it must be
-//! heap-independent, i.e. an immediate or a literal-area term (see `monitor.rs`). A remote
-//! (external-pid) or port signal is
+//! `{tag, Tag}` option (`None` ⇒ the `'DOWN'` atom) and is always a **receiver-heap** word or
+//! an immediate: the enqueue site materialises a fragment-resident tag on the receiver's own
+//! heap by growing the nursery in place (never by collecting), because this queue relocates
+//! both the reason and the tag at every collection (see `crate::tag` and `monitor.rs`). A
+//! remote (external-pid) or port signal is
 //! *not* queued: it is materialised straight into the mailbox, because it carries no
 //! `trap_exit` policy decision to defer.
 //!

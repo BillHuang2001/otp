@@ -288,6 +288,10 @@ pub mod packet;
 // latched close that closes the descriptor, kept out of this (already grown) source half. Its
 // own module doc is `src/drivers/inet/peer_close.rs`.
 mod peer_close;
+// The `{send_timeout, …}`/`{send_timeout_close, …}` timer — the C's `desc->busy_on_send` one-shot
+// (`tcp_inet_send_timeout`, `inet_drv.c:12458`), split out of this (already grown) source half.
+// Its own module doc is `src/drivers/inet/send_timeout.rs`.
+mod send_timeout;
 mod stat;
 mod sys;
 mod udp;
@@ -813,6 +817,14 @@ pub struct TcpInetDriver {
     /// or one entry per round in practice; it is a `Vec` rather than an `Option` so the drain has
     /// one shape whatever a later tier does. `{active, true}` and `{active, false}` never record.
     active_spends: Vec<ActiveSpend>,
+    /// The `{send_timeout, …}`/`{send_timeout_close, …}` one-shot — the C's `desc->busy_on_send`
+    /// and its multi-timer (`tcp_inet_send_timeout`, `inet_drv.c:12458`).
+    ///
+    /// Armed by [`TcpInetDriver::note_send_stall`] when a command's bytes are still on the output
+    /// queue after the write attempt, cancelled when the queue drains, and fired by
+    /// [`TcpInetDriver::send_timeout_fired`] from [`Driver::timeout`]. The state machine and the
+    /// measured oracle rows are `src/drivers/inet/send_timeout.rs`.
+    send_timeout: send_timeout::SendTimeout,
 }
 
 impl TcpInetDriver {
@@ -846,6 +858,7 @@ impl TcpInetDriver {
             caller_stripped: false,
             out_framed: false,
             active_spends: Vec::new(),
+            send_timeout: send_timeout::SendTimeout::new(),
         }
     }
 
@@ -902,6 +915,7 @@ impl TcpInetDriver {
             out_framed: false,
             // Nothing has been delivered on a brand-new socket yet, so no grant is spent.
             active_spends: Vec::new(),
+            send_timeout: send_timeout::SendTimeout::new(),
         })
     }
 
@@ -1140,6 +1154,9 @@ impl TcpInetDriver {
         self.read_eof = false;
         self.peer_close = PeerClose::default();
         self.shutdown_wr_done = false;
+        // A fresh connection has no stalled command behind it, so no `{send_timeout, …}` deadline
+        // carries over from the socket this one replaces.
+        self.send_timeout.cancel();
         // The new connection's byte stream begins now: drop any partial frame buffered for the
         // socket this one replaces.
         self.pending_input.clear();
@@ -1202,6 +1219,11 @@ impl TcpInetDriver {
         // The descriptor half is `erl_inet_close`'s; the latch reset below is this floor's own
         // "start over" for a **port** teardown (the `close` verb, `Driver::stop`, `Drop`). A
         // prebound descriptor is not ours: nothing is closed and the state is kept.
+        //
+        // No `{send_timeout, …}` deadline can outlive the descriptor it was armed for
+        // (`cancel_multi_timer(&tcp_inet_send_timeout)` on the C's teardown), so the one-shot goes
+        // first — a `Fired` state included: the next socket starts its own.
+        self.send_timeout.cancel();
         if !self.close_descriptor() {
             return;
         }
@@ -1472,6 +1494,10 @@ impl TcpInetDriver {
         // second non-empty send is exactly that command.
         self.caller_stripped = false;
         self.out_framed = false;
+        // The queued output was just dropped, so the stall the `{send_timeout, …}` one-shot was
+        // armed for no longer exists — the C's `tcp_clear_output`/`cancel_multi_timer(
+        // &tcp_inet_send_timeout)` pairing (`inet_drv.c:12795`).
+        self.send_timeout.cancel();
         let released = self.deregister(ctx);
         // `tcp_recv_closed`/`tcp_recv_error`/`tcp_send_or_shutdown_error`'s passive
         // `tcp_desc_close` (`inet_drv.c:12825`, `:12873`, `:13670`).
@@ -2487,13 +2513,30 @@ impl Driver for TcpInetDriver {
     }
 
     fn timeout(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        // The port's single `TIMEOUT` task, armed from [`Driver::next_timeout`]: every due
-        // operation completes with `{error, timeout}`.
+        // The port's single `TIMEOUT` task, armed from [`Driver::next_timeout`], carries **both**
+        // deadlines: a stalled command's `{send_timeout, …}` one-shot and the queued async
+        // operations' `{error, timeout}` deadlines. Both are due-checked on every call, so two
+        // deadlines falling in the same wake-up both fire — the send error first, because a
+        // `{send_timeout_close, true}` may latch the port's failure, after which no delivery
+        // (the async replies included) would be accepted.
+        if self.send_timeout_fired(ctx)? {
+            return Ok(());
+        }
+        // Every due operation completes with `{error, timeout}`.
         self.async_timeout(ctx)
     }
 
     fn next_timeout(&self) -> Option<Instant> {
-        self.async_ops.next_deadline()
+        // The port's one `TIMEOUT` task, re-pointed to the earlier of the two deadlines
+        // (`Port::refresh_timeout` mirrors this answer after every driver interaction, so a
+        // `None` here would *clear* a deadline still owed an answer).
+        match (
+            self.async_ops.next_deadline(),
+            self.send_timeout.next_deadline(),
+        ) {
+            (Some(op), Some(send)) => Some(op.min(send)),
+            (op, send) => op.or(send),
+        }
     }
 
     fn has_pending_async(&self) -> bool {
@@ -2741,6 +2784,12 @@ mod stat_tests;
 #[cfg(test)]
 #[path = "tcp_shutdown_tests.rs"]
 mod tcp_shutdown_tests;
+// The `{send_timeout, …}`/`{send_timeout_close, …}` rows: the one-shot's deadline arithmetic, the
+// port-timer arbitration with a queued async operation, and the observable answers over a real
+// stalled loopback write — the measured `escript` table included.
+#[cfg(test)]
+#[path = "send_timeout_tests.rs"]
+mod send_timeout_tests;
 #[cfg(test)]
 #[path = "shutdown_contract_tests.rs"]
 mod shutdown_contract_tests;

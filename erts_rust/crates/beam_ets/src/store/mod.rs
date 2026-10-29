@@ -816,10 +816,10 @@ impl TermStore {
             None => {
                 let mut cells = 0usize;
                 let mut src = term;
-                while is_list(src) {
+                while crate::shape::cons_cell(src).is_some() {
                     cells += 1;
-                    // SAFETY: `src` is a live `TAG_PRIMARY_LIST` cons cell (a 2-word
-                    // `[CAR, CDR]`), so its second word is the tail term.
+                    // SAFETY: `cons_cell` established a live `TAG_PRIMARY_LIST` cons cell
+                    // (a 2-word `[CAR, CDR]`), so its second word is the tail term.
                     src = unsafe { cdr(src) };
                 }
                 cells
@@ -837,8 +837,9 @@ impl TermStore {
         let mut cell = p;
         let mut src = term;
         let mut used = 0usize;
-        while used < cells && is_list(src) {
-            // SAFETY: `src` is a live cons cell — both of its words are readable.
+        while used < cells && crate::shape::cons_cell(src).is_some() {
+            // SAFETY: `cons_cell` established a live cons cell — both of its words are
+            // readable.
             let (head, next) = unsafe { (car(src), cdr(src)) };
             src = next;
             let head = self.copy_elem(head)?;
@@ -908,7 +909,14 @@ impl TermStore {
             // only one it shares. See [`is_shareable_literal`].
             return Ok(term);
         }
-        if is_list(term) {
+        // The **shape** predicate, not `is_list`: the C bit trick `!(x & 0x2)` also
+        // answers true for a `TAG_PRIMARY_HEADER` word, so a header-shaped (or
+        // null-cell) word must never reach a `car`. `cons_cell` establishes a
+        // `TAG_PRIMARY_LIST` tag **and** a non-null cell pointer, and the spine walk
+        // below re-checks each cell the same way; liveness/reachability of the cells is
+        // the caller's contract (the object being inserted is a live term on a caller
+        // heap, and `is_header` rejected a bare header word above).
+        if crate::shape::cons_cell(term).is_some() {
             return self.copy_spine(term);
         }
         if is_boxed(term) {
@@ -916,8 +924,8 @@ impl TermStore {
             let hdr = unsafe { *boxed_val(term) };
             return self.copy_boxed(term, hdr);
         }
-        // Unreachable for a well-formed term: `is_immediate`, `is_header`, `is_list`
-        // and `is_boxed` partition the four primary-tag patterns. Kept as a total,
+        // Unreachable for a well-formed term: `is_immediate`, `is_header`, a
+        // cons-shaped word and `is_boxed` partition the four primary-tag patterns. Kept as a total,
         // non-panicking fallback rather than an `unreachable!()`.
         Err(crate::error::badarg())
     }
@@ -1065,7 +1073,12 @@ impl TermStore {
             let off = 1 + arity + i;
             // SAFETY: slot `off` lies inside the source node's `words` words.
             let slot = unsafe { *src.add(off) };
-            let slot = if is_list(slot) {
+            // A non-leaf slot is a `[Key, Value]` cons cell or a sub-node/collision
+            // tuple. The **shape** predicate decides which (not `is_list`, which a
+            // header word also passes): a cons-shaped slot is deep-copied by
+            // `copy_term`, which re-checks every word it copies, so a header-shaped
+            // slot is a typed `badarg` rather than a read.
+            let slot = if crate::shape::cons_cell(slot).is_some() {
                 self.copy_elem(slot)?
             } else if is_boxed_term(slot) {
                 // SAFETY: a non-leaf slot is a live sub-node or collision tuple.

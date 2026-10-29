@@ -1,17 +1,28 @@
-# bench — measured results (m19)
+# bench — measured results (m19 full suite; m23 is the newest, §10)
 
 This is the definitive summary of the **full-suite** measurement session (`m19`, 2026-10-23/24) for the
 `erts_rust` benchmark driver — the session every §2/§3 figure and every external-target row comes from.
-Every number here comes from the committed raw artifacts under `results/m19-*`; regenerate with the
+The narrower later sessions are carried as §9 and §10, and the per-row currency list at the end of this
+preamble says which record each row is read through; `m23` (§10, `cowboy`) is the newest of them.
+Every number here comes from the committed raw artifacts under `results/` — `results/m19-*` unless the
+per-row currency list names a later session for that row; regenerate with the
 Runbook (§7) rather than quoting a stale copy.
 Raw JSON is authoritative — this file never edits a metric value.
 
 Later, **narrower** sessions also exist and are archived under `results/`; they are additional measurement pairs, never replacements for an m19 §2/§3 row.
+
 `m21` is the GC/allocator workstream's before-record (`results/m21-xrun-gc-*`, `results/m21-xrun-ratios.txt`) plus the two eunit rows (`jsone`, `bbmustache`), which are carried as §9.
 `m22` is that workstream's after-record: six matched rounds over `baseline,gc_bound,gc_class,list_walk,slice`, each row read through `results/m22-vs-m21.txt` (its headline diff), `results/m22-xrun-ratios.txt`, `results/m22-load-record.md` and `results/m22-memory.md`.
 §2/§3 do **not** restate m21's or m22's numbers.
+
 `m21` and `m22` share the OTP 29.1.2 / erts-17.1.1 oracle, unlike m19's 29.1.1 / erts-17.1, so they are mutually diffable only with each other and never against a row above.
 `m23` is the **newest** session and a different kind of record: the startup round's *binary A/B on four sides* (`old` / HEAD / HEAD-with-`BEAM_RT_TIER=baseline` / the oracle), read through `results/m23-boot-wall.json`, `results/m23-slice-wall.json`, `results/m23-bench-{old,new}-r{1,2,3}.json` and the differential sweep `results/m23-sweep-merged.json`; its own section is at the end of this file, and its **final state** block (`### m23 final state`) is the one to quote — `results/m23-final-{ab-boot,ab-slice,tiers}.json`, `results/m23-final-slope.txt`, `results/m23-final-bench-{old,new}-r{1,2,3}.json` and `results/m23-final-sweep-merged.json`. Same oracle as m21/m22 (29.1.2 / erts-17.1.1).
+
+`m23` is the **newest** session and it is **narrower still**: one workload (`cowboy`) over three matched `--quick` rounds, one matched `--full` pair and one non-timing budget probe, carried as §10.
+
+**Which record is current, per row** (do not read a row through the wrong session):
+§2/§3 (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`, `binary_append`, `file_io`, `gc_class`) are **m19**; §4/§5 are the historical m17/m16 labels they carry; §6's compiler/tool targets are **m19**; §9 (`jsone`, `bbmustache`) is **m21**; **§10 (`cowboy`) is m23** — the only row m23 supersedes, replacing the retired m19 sys-only release-recipe reference (§6).
+
 
 ## 0. The two sides, named
 
@@ -38,6 +49,12 @@ in §2/§3 is transcribed from it), `m19-budgetprobe-all.json` + `.txt` and
 twelve matched single-side `--quick` passes), `m21-eunit-ratios.txt` (the derived audit table every §9
 figure is transcribed from), `m21-eunit-load.log`, and the non-timing `--runtime all` budget/ledger pass
 `m21-eunit-budgetprobe-all.{json,txt}`.
+
+§10's session (`m23`, the `cowboy` row only) is `results/m23-cowboy-{sys,rust}-r{1,2,3}.json` (six matched
+single-side `--quick` passes = three rounds), `results/m23-cowboy-full-{sys,rust}.json` (one matched
+`--full` pair), `results/m23-cowboy-ratios.txt` (the derived audit table every §10 figure is transcribed
+from), `results/m23-cowboy-load.log` (before/after load plus the port/stray-process check of every pass)
+and the non-timing `results/m23-cowboy-budgetprobe-all.{json,txt}`.
 
 Two passes in this session are **not timing sources** and are labelled so wherever they appear: the
 `--runtime all` budget-evaluation pass (`m19-budgetprobe-all-cowboy.json`; runtime-major, i.e. all `sys`
@@ -273,20 +290,26 @@ interpreter tier because its calibrated `N` exceeds `beam_rt`'s own 60 s `run` d
 rust-vs-rust row and is **never** a system-ERTS comparison. Re-run it with the §7 command 5 before
 quoting a tier figure.
 
-## 6. External targets (all sys-only — **no rust row exists for any of them**)
+## 6. External targets (the compiler/tool targets are sys-only; `cowboy` is **no longer** one of them)
 
-Every one of these is `Runtimes::SysOnly`. The Rust runtime cannot boot an OTP release, run
-`rebar3`/`mix`, or act as `erlc`/`elixirc`/a Cowboy release host, so each `--runtime sys` report carries
-exactly one row: these are **whole-program figures for the target's own toolchain**, not rust-vs-sys
-comparisons. Each target was measured **3 times**; the figure below is the **median of the 3 reps**, and
-**all 15 reps are `status: ok`** — no rep skipped, none failed. Full per-rep table:
+Every target in the table below **except `cowboy`** is `Runtimes::SysOnly`. The Rust runtime cannot run
+`rebar3`/`mix`, or act as `erlc`/`elixirc`, so each `--runtime sys` report carries exactly one row: these
+are **whole-program figures for the target's own toolchain**, not rust-vs-sys comparisons.
+**`cowboy` moved to `Runtimes::Both` in m23**: the row now stages one build and serves one harness
+(`cw_serve`) under *both* runtimes, so its cross-runtime record is **§10 (m23)** and the m19 row below is
+kept only as a **retired-recipe historical sys-side reference** — m19 started a relx *release* over
+`hello_world`, a code path the row no longer has, and m19's external passes were **unpinned** while every
+m23 pass is pinned. The 120 383.9 req/s figure is therefore **not comparable with any m23 figure** and must
+never be quoted as the current `cowboy` number.
+In the m19 external stage each target was measured **3 times**; the figure below is the **median of the
+3 reps**, and **all 15 m19 reps are `status: ok`** — no rep skipped, none failed. Full per-rep table:
 `results/m19-ext-notes.md` §1.
 
 | target | median of 3 reps | instrument |
 |---|---|---|
 | `erlc_compiler` | **9.831 files/s**, 7 619.8 loc/s, wall 6 102.9 ms, VmHWM 131 629 056 B (reps 9.842 / 9.831 / 9.704) | system `erlc` over **60 files / 46 503 LOC** of OTP stdlib + Elixir `lib/elixir/src` |
 | `elixir_compiler` | **3.414 files/s**, 2 118.1 loc/s, compiler startup 289.52 ms, wall 11 422.2 ms, VmHWM 204 984 320 B (reps 3.463 / 3.414 / 3.405) | installed system `elixirc` **1.20.4**; **per-file fallback in all 3 reps** (batch fails on checkout↔installed version skew) |
-| `cowboy` | **120 383.9 req/s**, 240 926 requests, **0 errors**, latency p50 **0.0633 ms** / p99 **0.1452 ms** / max 1.379 ms, build 41 764.3 ms, VmHWM 155 131 904 B (reps 124 029.7 / 118 779.4 / 120 383.9) | real `hello_world` relx release, in-process keep-alive load (16 connections) |
+| `cowboy` (**retired-recipe sys-side reference — see §10 for the current record**) | **120 383.9 req/s**, 240 926 requests, **0 errors**, latency p50 **0.0633 ms** / p99 **0.1452 ms** / max 1.379 ms, build 41 764.3 ms, VmHWM 155 131 904 B (reps 124 029.7 / 118 779.4 / 120 383.9) | real `hello_world` relx **release** (a code path the row no longer has), in-process keep-alive load (16 connections), **unpinned** |
 | `khepri` | **wall 83 596.0 ms**, **1 501 tests / 0 failures**, suite-internal 74.986 s, VmHWM 364 507 136 B | `rebar3 eunit` in a scratch copy; `rebar3` 3.27.3 via the Nix-store scan |
 | `plb` | **wall 68 266.1 ms**, build stage 22 920 ms, **8 timed kernels of 10**, `test_time_ms` min 187.19 / mean 1 469.70 / p50 929.15 / max 3 413.99 ms, `test_mem_bytes` 92 479 488 B, VmHWM 171 618 304 B | Programming-Language-Benchmarks via the `dotnet` tool, `--no-docker`, **elixir only** |
 | `emqx` | **`skipped(emqx-requires-otp-28)`** — no number exists to record | gate refuses before any build (see below) |
@@ -303,8 +326,15 @@ Caveats that travel with each of these rows:
   is a **whole-suite** figure (1 501 tests), not a per-test one.
 - **`cowboy`'s throughput is bounded by the fixed concurrency** (`16 / per-request latency`), so read
   req/s **together with** `latency_ms`: p50 0.063 ms and p99 0.145 ms are an order of magnitude tighter
-  than m17's contended pass (p99 3.03–3.59 ms, ~38 k req/s) and this row is the honest low-load reference.
-  The build git-fetches cowlib+ranch (network).
+  than m17's contended pass (p99 3.03–3.59 ms, ~38 k req/s) and this row is the honest low-load reference
+  **for that recipe**. The build git-fetches cowlib+ranch (network).
+- **That `cowboy` figure was produced by a recipe that no longer exists**: m19 started a relx release,
+  while the row now stages one build and serves one harness (`cw_serve`) through `cowboy_serve` under
+  **both** runtimes (it is `Runtimes::Both` as of m23). The 120 k req/s above is therefore a
+  **retired-recipe historical sys-side reference**, not a reproduction target and not comparable with
+  §10: the recipe differs (staged `make` + one `erlc` + `cw_serve` instead of a release), the boot cost
+  differs (`build_ms` ~12.4 s vs 41.8 s) and the pinning differs (m19's external passes were unpinned,
+  every m23 pass is `taskset -c 3`). **§10 is the current `cowboy` record.**
 - **`plb` drives `elixir` only** (`--no-docker`, no container runtime on this host), and **two kernels are
   excluded as untimed**: the tool reported `timeMS = 0` for **`spectral-norm/4000` and
   `spectral-norm/8000`** — its marker for a run it could not time (aborted at the input's declared
@@ -349,7 +379,8 @@ taskset -c 3 erts_rust/target/release/bench run --full --runtime rust --workload
 taskset -c 3 erts_rust/target/release/bench run --full --runtime sys  --workloads baseline \
     --out-file erts_rust/tools/bench/results/m19-full-baseline-sys.json
 
-# 3. three reps of each external target (sys-only, unpinned so they stay comparable with earlier sessions),
+# 3. three reps of each external target (the sys-only compiler/tool targets; unpinned so they stay
+#    comparable with earlier sessions — `cowboy` is no longer one of them, see step 8),
 #    one at a time, load logged before/after every pass
 for id in erlc_compiler elixir_compiler cowboy khepri plb; do
   for n in 1 2 3; do
@@ -387,6 +418,28 @@ done
 # then the budget/ledger pass (both sides in one report; NOT a timing source) and its verbatim block:
 taskset -c 3 erts_rust/target/release/bench run --quick --runtime all --workloads jsone,bbmustache \
     --out-file erts_rust/tools/bench/results/m21-eunit-budgetprobe-all.json
+
+# 8. the `cowboy` row (m23, §10) — three matched --quick rounds, side order alternating per round
+#    (this session: r1 sys→rust, r2 rust→sys, r3 sys→rust), one process at a time, load logged before
+#    AND after every pass. Each pass rebuilds cowboy from scratch in a ScratchDir (~12-13 s of `make`).
+R=erts_rust/tools/bench/results
+P="taskset -c 3 setsid -w erts_rust/target/release/bench run"
+$P --quick --runtime sys  --workloads cowboy --out-file $R/m23-cowboy-sys-r1.json  --verbose
+$P --quick --runtime rust --workloads cowboy --out-file $R/m23-cowboy-rust-r1.json --verbose
+$P --quick --runtime rust --workloads cowboy --out-file $R/m23-cowboy-rust-r2.json --verbose
+$P --quick --runtime sys  --workloads cowboy --out-file $R/m23-cowboy-sys-r2.json  --verbose
+$P --quick --runtime sys  --workloads cowboy --out-file $R/m23-cowboy-sys-r3.json  --verbose
+$P --quick --runtime rust --workloads cowboy --out-file $R/m23-cowboy-rust-r3.json --verbose
+# then the matched --full pair (16 connections / 5 s), order rust→sys
+$P --full --runtime rust --workloads cowboy --out-file $R/m23-cowboy-full-rust.json --verbose
+$P --full --runtime sys  --workloads cowboy --out-file $R/m23-cowboy-full-sys.json  --verbose
+# then the NON-TIMING budget pass (both sides in one report ⇒ the sys-only p99 row is judged):
+$P --quick --runtime all --workloads cowboy --out-file $R/m23-cowboy-budgetprobe-all.json
+#   sed -n '/^latency budgets/,$p' <log> > $R/m23-cowboy-budgetprobe-all.txt
+# Derive results/m23-cowboy-ratios.txt from the raw JSON (per round, per side; per-round ratios;
+# median-of-rounds) and record /proc/loadavg + the port-8080/stray-process check after EVERY pass
+# (results/m23-cowboy-load.log shape). NOTE: this workload's in-process load generator shares the
+# pinned core with the server — see §10 for what that means for the absolute figures.
 ```
 
 The standing warnings, unchanged:
@@ -457,12 +510,26 @@ Archive `out/` copies into `results/` with **only** the mechanical normalisation
   applies: re-derive `n_rust` from the measured cost before changing anything there.
 - **No self-hosted build (contract A.9).** `erlc_compiler` and `elixir_compiler` are `Runtimes::SysOnly`
   and shell out to the system `erlc`/`elixirc`; nothing in the driver runs a compiler **under** `beam_rt`.
+- **`cowboy` is measured on both sides now, and the gap is the row's headline (§10, `m23`).**
+  Ten rows (six matched `--quick` passes, the `--full` pair and the two `--runtime all` rows) are **all
+  `ok`**, **0 transport errors**, **0 `=ERROR REPORT====` blocks**, port 8080 free and no stray runtime
+  process after every pass. Throughput `sys/rust` = **8.388×** over the three matched `--quick` rounds
+  (8.388 / 8.353 / 8.568; median absolute sys **48 930.9** req/s vs rust **5 833.4** req/s) and **9.094×**
+  on the single `--full` pair (sys 245 250 requests vs rust 26 969). Request tail `rust/sys` = **7.852×**
+  at p99 (sys 0.2730 ms vs rust 2.1867 ms). Peak RSS **2.132×**. Both stage times are ~1.0× (same `make`,
+  same `erlc`), so the whole gap is **runtime**, not staging.
+  **Who owns it:** the throughput/tail gap is the runtime's — an HTTP connection is a long-lived process
+  (receive loop, `gen_tcp`/`inet` BIFs, per-request process spawn) driving the engine tier, `beam_io`'s
+  poller and `beam_bifs`' inet surface; **nothing in this crate can move it** (the driver only measures).
+  It is a **pinned-pass** figure — see §10's pinning caveat — and it is **not** the retired m19 120 k req/s
+  release-recipe row (§6).
 - **Honesty caveats that travel with every figure here:** the host is shared, so absolute wall times are
   host-load-sensitive even in m19's quiet band and only a binary A/B supports a "changed since" claim;
   cross-runtime ratios come from the matched rounds (§3) and are the load-robust reading; every per-unit
   case but `file_io/write_read` is dearer on rust; `foreign`/`binary_append` per-call figures are
-  `N`-sensitive; `baseline`'s compute loop is native-floor dominated; the external targets are whole-program
-  figures for their own toolchains, sys-only.
+  `N`-sensitive; `baseline`'s compute loop is native-floor dominated; the compiler/tool targets are
+  whole-program figures for their own toolchains and sys-only, while `cowboy` — the one external target
+  measured on both sides — is §10.
 
 **History:** `m17-*` (its six matched rounds at 1-min load 3–92, its binary A/B, its external rows) and
 `m16-*` (the tier control, the low-load external and `plb`/`emqx` rows) remain committed as the regression

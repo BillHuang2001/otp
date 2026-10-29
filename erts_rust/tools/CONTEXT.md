@@ -1,11 +1,12 @@
 # Tooling (`tools/`) — Differential Gate & Benchmark Driver
 
 ## Intent
-The two in-repo tooling crates that make the Rust ERTS rewrite **verifiable** and **measurable**:
+The three in-repo tooling crates that make the Rust ERTS rewrite **verifiable** and **measurable**:
 - `differential/` — the **differential-test compatibility gate** (Stage 0, Part II §H; the safety net for everything else, per Part I §G.7 "no compatibility regressions"). For a case it runs the real system ERTS (the **oracle**) **and** the Rust runtime (`beam_rt`), then compares the observable results.
+- `suites/` — the **real-suite driver**: third-party (Khepri) and OTP `stdlib` suites under both runtimes, per-module/per-case pass counts for both sides.
 - `bench/` — the **benchmark driver** (Part I §G.7/§I success metrics: startup latency, p99 tail latency, throughput on named benchmarks, memory footprint). It drives the external target projects named in `../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` and **always** records the system-ERTS baseline.
 
-Neither tool modifies the runtime or the external repos — both are pure drivers/observers.
+None of the three tools modifies the runtime or the external repos — they are pure drivers/observers.
 
 ## API Surface (CLI)
 Both crates ship a **library + a binary**: the library exists so `cargo test` can assert the harness itself (against the oracle / against fixture binaries), and the binary is what a human or CI drives. `--help` must be usable on every subcommand.
@@ -26,7 +27,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `bench compare <a.json> <b.json> [--json]` — diff two result sets.
 - Exit codes: `0` run completed (per-workload `skipped(reason)` is not fatal); `2` usage/env error. A workload that *errors* is recorded `failed` in JSON.
 
-## Shared Conventions (binding on both crates)
+## Shared Conventions (binding on all three crates)
 - **Runtime resolution — documented, overridable, no baked absolute paths:**
   - **Oracle** = `$ERTS_ORACLE` if set, else `erl` resolved on `PATH`. Missing ⇒ loud env error (exit 2).
   - **Rust runtime** = `$BEAM_RT` if set, else the workspace-relative `target/{release,debug}/beam_rt` (relative to `../..`). If neither exists ⇒ cases report `unsupported`.
@@ -67,6 +68,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
   measured via `beam_rt`'s `examples/perf_bif.rs`.
 
 ## Routing Table
+- `suites/` → real third-party / OTP test-suite driver: runs Khepri's 44 eunit modules and OTP `stdlib`'s `common_test` suites per case under **both** the system ERTS and the Rust runtime with the identical `-pa`/`-eval`, and records per-module/per-case pass counts for both sides (`RESULTS.md` + `results/`); upstreams are read-only, staged into `$TMPDIR`
 - `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module`/`ModuleEnv` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`; `ModuleEnv` additionally carries an explicit spawn environment, through which the compiled dir reaches the code path), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 3469 cases), JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`, Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX, `erlc` compiler), system-ERTS baseline, cross-runtime (`--runtime all`) comparison, result store + `compare`
 

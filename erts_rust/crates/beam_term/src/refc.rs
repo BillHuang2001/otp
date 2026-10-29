@@ -66,6 +66,49 @@
 //!   root at `hp + 3`, as written by [`write_refc_binary`]; `beam_gc` must move/copy
 //!   all 8 words together and fix up `orig` to the new `BinRef` address.
 //!
+//! # Sub-binary windows ([`write_sub_binary`]) and `binary:referenced_byte_size/1`
+//!
+//! [`write_sub_binary`] is this crate's port of `erts_build_sub_bitstring`
+//! (`erl_bits.c:2637-2665`), the one place that decides **which arm** a window takes:
+//!
+//! * `bit_size <= ERL_ONHEAP_BITS_LIMIT` — a fresh `ErlHeapBits` holding a *shifted copy*
+//!   of the window bits (the C's `HEAP_BITSTRING`, whose `copy_binary_to_buffer` re-aligns
+//!   MSB-first when the source offset is not byte aligned, `erl_bits.h:541-557`);
+//! * otherwise — the 8-word `[BinRef][ErlSubBits]` pair over the **parent's payload**,
+//!   `start` = the parent's bit offset + `bit_offset` (the C's `erts_make_sub_bitstring`
+//!   convention, `erl_bits.c:2714-2745`), so the payload — and the referenced size — stays
+//!   reachable from the child.
+//!
+//! [`sub_binary_words`] answers the same decision's reservation without writing (the C's
+//! `erts_extracted_bitstring_size`), and [`refc_payload`] is the one call a consumer needs
+//! to look a refc binary's payload up in its off-heap table.
+//!
+//! ## Why the referenced size cannot live in the term
+//!
+//! The frozen representation has no room for a parent capacity: `BinRef` is
+//! `ERL_BIN_REF_SIZE` = 3 words, its header `_make_header(2, BIN_REF_SUBTAG)` — arity 2,
+//! exactly `[val, next]` (`erl_bits.h:135-147`); a fourth word would move
+//! `HEADER_BIN_REF`/`ERL_REFC_BITS_SIZE` (8 → 9) and with them
+//! [`crate::layout::object_words`], the copier's price (`beam_gc`), `size_object`, message
+//! sizing and `max_heap_size` accounting, and the shape would no longer be bit-identical to
+//! the oracle's (workspace `CONTEXT.md` §2). `ErlSubBits`' only spare bits are the two low
+//! bits of `base_flags`, and both are spoken for (`_MUTABLE` = match context, `_VOLATILE` =
+//! the data may move) by the base pointer's alignment scheme (`erl_bits.h:60-95`).
+//!
+//! The capacity is a property of the **payload** — the C's off-heap `Binary.orig_size`
+//! (`erl_bits.h:75`), whose frozen analogue is `beam_alloc::RefcBinary`'s header — so this
+//! crate only hands back the payload key.
+//!
+//! So `binary:referenced_byte_size/1` (`erl_bif_binary.c:2691-2717`) is, for a **refc
+//! window** — including a plain refc binary, a window with `start == 0` — the payload's
+//! allocated size, never the window's (the oracle's `1025` for a 510-byte part of a
+//! 1025-byte binary; `2050` for an `erl_eval`-built one whose payload was allocated at its
+//! grown width while `byte_size` is 1025). `RefcBinary::capacity()` is today's closest
+//! figure — `orig_size` exactly when the payload was allocated at the width the C would have
+//! asked for, differing after a growth-then-trim. An **`ErlHeapBits`** instead answers its
+//! own bytes and a **match context** its own window's, because its `orig` is not a `BinRef`
+//! (the C's `br == NULL`).
+//!
 //! # `unsafe` contract
 //!
 //! Every function is `unsafe`: an `Eterm` being a live, well-formed term (and the
@@ -73,12 +116,17 @@
 //! heap word has no safe form. Each documents, under `# Safety`, that invariant and
 //! the lifetime of any borrowed slice.
 
-use crate::bitstring::{sub_bits_parts, ERL_SUB_BITS_FLAG_MASK};
-use crate::boxed::{
-    boxed_val, is_bin_ref, is_boxed_term, make_boxed, ERL_BIN_REF_SIZE, ERL_SUB_BITS_SIZE,
-    HEADER_BIN_REF, HEADER_SUB_BITS,
+use crate::bitstring::{
+    sub_bits_parts, ERL_SUB_BITS_FLAG_MASK, SUB_BITS_BASE_WORD, SUB_BITS_END_WORD,
+    SUB_BITS_ORIG_WORD, SUB_BITS_START_WORD,
 };
+use crate::boxed::{
+    arityval, boxed_val, header_subtag, is_bin_ref, is_boxed_term, make_boxed, ERL_BIN_REF_SIZE,
+    ERL_SUB_BITS_SIZE, HEADER_BIN_REF, HEADER_SUB_BITS,
+};
+use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
+use crate::tag::HEAP_BITS_SUBTAG;
 
 /// `ERL_BIN_REF_SIZE` (`erl_bits.h:144`): the words in a `BinRef`
 /// (`[thing_word, val, next]`).
@@ -294,10 +342,293 @@ pub unsafe fn refc_bytes<'a>(t: Eterm) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(base.add(first_byte), last_byte - first_byte) }
 }
 
+/// The largest window the **heap** arm builds, in bytes: one
+/// `ERL_ONHEAP_BITS_LIMIT`-bit `ErlHeapBits` payload.
+const MAX_HEAP_WINDOW_BYTES: usize = crate::bitstring::bit_count_to_bytes(ERL_ONHEAP_BITS_LIMIT);
+
+/// A windowable parent, decoded once by [`parent_window`]: `base`/`start`/`size` are the
+/// frozen `ERTS_GET_BITSTRING_REF` triple (the parent's bit `i` is bit `start + i` of the
+/// storage at `base`), and `payload` is `Some((val, next))` only for a **normal** refc
+/// window — no flag bits, `orig` a live `BinRef` — the only shape a child may inherit.
+struct ParentWindow {
+    base: *const u8,
+    start: usize,
+    size: usize,
+    payload: Option<(*mut Eterm, *mut Eterm)>,
+}
+
+/// Decodes `parent` into the frozen bitstring triple, validating its shape: an `ErlHeapBits`
+/// header must price **exactly** the words its `size` word needs
+/// (`arityval(hdr) == heap_bits_size_words(size) - 1`), so a size word contradicting its
+/// header is a typed refusal rather than a read of storage the block does not own.
+///
+/// # Safety
+///
+/// `parent` must be a live boxed term (for a `SUB_BITS` one, also a live `orig` slot).
+unsafe fn parent_window(parent: Eterm) -> TermResult<ParentWindow> {
+    if !is_boxed_term(parent) {
+        return Err(TermError::BadBitstring);
+    }
+    // SAFETY: `parent` is a live boxed block, whose word 0 is its header word.
+    let p = boxed_val(parent);
+    let hdr = unsafe { *p };
+    if hdr == HEADER_SUB_BITS {
+        // SAFETY: the header fixes the block at the 5-word `ErlSubBits` layout, so words
+        // 1..4 are live (`erl_bits.h:60-82`).
+        let base_flags = unsafe { *p.add(SUB_BITS_BASE_WORD) }.raw();
+        let start = unsafe { *p.add(SUB_BITS_START_WORD) }.raw();
+        let orig = unsafe { *p.add(SUB_BITS_ORIG_WORD) };
+        // `end < start` is a malformed window (`bitstring_size` would wrap).
+        let size = unsafe { *p.add(SUB_BITS_END_WORD) }
+            .raw()
+            .checked_sub(start)
+            .ok_or(TermError::BadBitstring)?;
+        // Only a *normal* sub-bits (`erl_sub_bits_is_normal`, `erl_bits.h:104`) may be
+        // inherited: its flags say the context or its data may change under us (`MUTABLE` =
+        // match context, `VOLATILE` = writable), which this crate cannot reproduce.
+        let payload = if base_flags & ERL_SUB_BITS_FLAG_MASK != 0 {
+            None
+        } else {
+            // SAFETY: `orig` is a live term; `is_bin_ref` tests only a boxed header.
+            if unsafe { is_bin_ref(orig) } {
+                // SAFETY: `is_bin_ref` proved `orig` is a live 3-word `BinRef`.
+                let (val, next) = unsafe { bin_ref_parts(orig) };
+                if val.is_null() {
+                    return Err(TermError::BadBitstring);
+                }
+                Some((val, next))
+            } else {
+                None
+            }
+        };
+        Ok(ParentWindow {
+            base: (base_flags & !ERL_SUB_BITS_FLAG_MASK) as *const u8,
+            start,
+            size,
+            payload,
+        })
+    } else if header_subtag(hdr) == HEAP_BITS_SUBTAG as u32 {
+        // SAFETY: the header says `ErlHeapBits`, so word 1 is the bit-size word.
+        let size = unsafe { *p.add(1) }.raw();
+        // `heap_bits_size_words` is overflow-free and always >= 2, so the subtraction
+        // cannot wrap; a mismatch means the block does not own the words it claims.
+        if arityval(hdr) != crate::bitstring::heap_bits_size_words(size) - 1 {
+            return Err(TermError::BadBitstring);
+        }
+        Ok(ParentWindow {
+            // SAFETY: the arity check proved the block is `2 + ceil(n_bytes/8)` words, so
+            // `p + 2` is the first payload byte of a live block.
+            base: unsafe { p.add(crate::boxed::ERL_HEAP_BITS_SIZE) }.cast::<u8>(),
+            start: 0,
+            size,
+            payload: None,
+        })
+    } else {
+        // Not a bitstring at all (a tuple, a float, an immediate handled above, …).
+        Err(TermError::BadBitstring)
+    }
+}
+
+/// The words a [`write_sub_binary`] of `bit_size` bits needs, given a validated parent.
+fn window_words(window: &ParentWindow, bit_size: usize) -> TermResult<usize> {
+    if bit_size <= ERL_ONHEAP_BITS_LIMIT {
+        Ok(crate::bitstring::heap_bits_size_words(bit_size))
+    } else if window.payload.is_some() {
+        Ok(ERL_REFC_BITS_SIZE)
+    } else {
+        // Above the on-heap limit only a refc parent can be windowed: an `ErlHeapBits`
+        // parent (or a match context, or a flagged window) has no payload to share.
+        Err(TermError::BadBitstring)
+    }
+}
+
+/// How many words [`write_sub_binary`] will write for a `bit_size`-bit window of
+/// `parent`: [`crate::bitstring::heap_bits_size_words`]`(bit_size)` for the heap arm,
+/// else [`ERL_REFC_BITS_SIZE`] (8).
+///
+/// Reproduces `erts_extracted_bitstring_size` (`erl_bits.h:585-594`) for this crate's
+/// 8-word pair — the C reserves `ERL_SUB_BITS_SIZE` (5) because it *reuses* the parent's
+/// `BinRef`; this layer writes the whole pair.
+///
+/// The parent's shape is validated exactly as [`write_sub_binary`] validates it, so the two
+/// can never disagree about the arm; the window's **bounds** need `bit_offset`, so the
+/// writer's refusal is the authoritative one.
+///
+/// # Safety
+///
+/// As [`parent_window`]: `parent` must be a live boxed term.
+///
+/// # Errors
+///
+/// [`TermError::BadBitstring`] when `parent` is not a well-formed bitstring, or when the
+/// window would exceed [`ERL_ONHEAP_BITS_LIMIT`] but `parent` is not a refc binary to share.
+pub unsafe fn sub_binary_words(parent: Eterm, bit_size: usize) -> TermResult<usize> {
+    // SAFETY: the caller guarantees `parent` is a live boxed term.
+    let window = unsafe { parent_window(parent) }?;
+    window_words(&window, bit_size)
+}
+
+/// Builds a sub-binary window of `bit_size` bits at `bit_offset` of `parent` at `hp`,
+/// returning the tagged root — the crate's port of `erts_build_sub_bitstring`
+/// (`erl_bits.c:2637-2665`).
+///
+/// The arm is chosen on the **window's** bit size, exactly as the C chooses it:
+///
+/// * `bit_size <= ERL_ONHEAP_BITS_LIMIT` ⇒ a fresh `ErlHeapBits` at `hp` holding a copy of
+///   the window's bits, re-aligned MSB-first when the source offset is not byte aligned,
+///   written by [`crate::bitstring::write_heap_bits`] so the header, the zero-filled padding
+///   and the zeroed trailing bits are that writer's, not a second implementation's.
+/// * otherwise ⇒ the 8-word `[BinRef][ErlSubBits]` pair ([`write_refc_binary`]) over the
+///   parent's payload: `val`/`next` are the parent's, `base` is its data base, `start` is its
+///   bit offset + `bit_offset`, `end` is `start + bit_size` (`erl_bits.c:2714-2745`).
+///
+/// The child's `orig` is its **own** `BinRef` (how [`write_refc_binary`] shapes a pair, and
+/// what `beam_gc`'s copier fixes up), not the parent's word: two pairs naming one payload is
+/// the frozen convention and `BinRef.val` is the identity consumers key on. A host that
+/// refcounts rather than sweeping by reachability must retain the payload first, and must not
+/// treat the child's `BinRef` as a *new* intrusive chain node (its `next` is the parent's).
+///
+/// # Safety
+///
+/// `hp` must point at the words `sub_binary_words(parent, bit_size)` reports —
+/// exclusively-owned, writable and unmoved while the returned term is used; `parent` must be
+/// a live boxed term; and the payload behind a refc parent must stay alive and unmoved (the
+/// caller's retain).
+///
+/// # Errors
+///
+/// [`TermError::BadBitstring`] when `parent` is not a well-formed bitstring, when
+/// `bit_offset + bit_size` overflows or exceeds the parent's bit size, or when the window
+/// exceeds [`ERL_ONHEAP_BITS_LIMIT`] and `parent` is not a refc binary to share. Nothing is
+/// written on any of those paths.
+pub unsafe fn write_sub_binary(
+    hp: *mut Eterm,
+    parent: Eterm,
+    bit_offset: usize,
+    bit_size: usize,
+) -> TermResult<Eterm> {
+    // SAFETY: the caller guarantees `parent` is a live boxed term.
+    let window = unsafe { parent_window(parent) }?;
+    // The window must fit the parent: checked, so no wrapping add can produce an
+    // in-range-looking offset.
+    let end = bit_offset
+        .checked_add(bit_size)
+        .ok_or(TermError::BadBitstring)?;
+    if end > window.size {
+        return Err(TermError::BadBitstring);
+    }
+    let words = window_words(&window, bit_size)?;
+    let src_bit = window
+        .start
+        .checked_add(bit_offset)
+        .ok_or(TermError::BadBitstring)?;
+    if words == ERL_REFC_BITS_SIZE {
+        // `window_words` proved the parent is a normal refc window over a live payload.
+        let (val, next) = window.payload.ok_or(TermError::BadBitstring)?;
+        // SAFETY: the caller reserved `ERL_REFC_BITS_SIZE` (8) exclusively-owned words at
+        // `hp`; `val` is the live payload's first data byte (word-aligned, per the
+        // `beam_alloc` payload contract) and `next` its chain link; `window.base` is that
+        // payload's data base, and `src_bit .. src_bit + bit_size` is inside the parent's
+        // window, hence inside the payload.
+        return Ok(unsafe {
+            write_refc_binary(hp, val, next, window.base, src_bit, bit_size)
+        });
+    }
+    let n_bytes = crate::bitstring::bit_count_to_bytes(bit_size);
+    // `bit_size <= ERL_ONHEAP_BITS_LIMIT` here (the heap arm), so the buffer cannot overflow.
+    debug_assert!(n_bytes <= MAX_HEAP_WINDOW_BYTES);
+    let mut buf = [0u8; MAX_HEAP_WINDOW_BYTES];
+    // SAFETY: `buf` is a `MAX_HEAP_WINDOW_BYTES` (64)-byte destination, `n_bytes <= 64`,
+    // and `window.base` covers the parent's bits `window.start .. window.start + window.size`,
+    // of which `src_bit .. src_bit + bit_size` are read (and `src_bit + bit_size <=
+    // window.start + window.size` by the bounds check above).
+    unsafe { copy_window_bits(buf.as_mut_ptr(), window.base, src_bit, bit_size) };
+    // SAFETY: the caller reserved `words = heap_bits_size_words(bit_size)` words at `hp`,
+    // and `buf[..n_bytes]` holds exactly `bit_size` bits MSB-first.
+    unsafe { crate::bitstring::write_heap_bits(hp, &buf[..n_bytes], bit_size) }
+}
+
+/// Copies `size` bits starting at bit `src_bit` of `src` to bit 0 of `dst`, MSB-first.
+///
+/// The C's `copy_binary_to_buffer(dst, 0, src, src_bit, size)` (`erl_bits.h:541-557`): a
+/// plain `memcpy` when the source offset is byte aligned, else the `erts_copy_bits_fwd`
+/// shift. Bits of the last destination byte beyond `size` are left unspecified —
+/// [`crate::bitstring::write_heap_bits`] masks them.
+///
+/// # Safety
+///
+/// `dst` must point at `ceil(size / 8)` writable bytes, and `src` at the storage holding
+/// bits `src_bit .. src_bit + size` (the byte containing the last bit included).
+unsafe fn copy_window_bits(dst: *mut u8, src: *const u8, src_bit: usize, size: usize) {
+    let n_bytes = crate::bitstring::bit_count_to_bytes(size);
+    // SAFETY: the caller guarantees `src` covers `src_bit .. src_bit + size`, so the byte
+    // holding bit `src_bit` is inside it and `n_bytes` destination bytes are writable.
+    let sb = unsafe { src.add(src_bit >> 3) };
+    let off = src_bit & 7;
+    if off == 0 {
+        if n_bytes > 0 {
+            // SAFETY: `n_bytes <= ceil(size/8)` source bytes from `sb` are the window's own
+            // bytes and `dst` is a disjoint, writable buffer of that length.
+            unsafe { core::ptr::copy_nonoverlapping(sb, dst, n_bytes) };
+        }
+        return;
+    }
+    for i in 0..n_bytes {
+        // SAFETY: destination byte `i` holds window bits `8i .. 8i + 8`, all of which live
+        // in source byte `i` (its low `8 - off` bits, shifted up) plus, when the window
+        // reaches into it, source byte `i + 1` (its high `off` bits). `8 * (i + 1) <
+        // size + off` is exactly "the window reaches into byte `i + 1`" — the C's
+        // `soffs + n > 8` guard — so the second read never leaves the window's bytes.
+        let hi = u16::from(unsafe { *sb.add(i) });
+        let lo = if 8 * (i + 1) < size + off {
+            u16::from(unsafe { *sb.add(i + 1) })
+        } else {
+            0
+        };
+        // SAFETY: `dst` has `n_bytes > i` writable bytes (the caller's contract).
+        unsafe { *dst.add(i) = ((hi << off) | (lo >> (8 - off))) as u8 };
+    }
+}
+
+/// The off-heap payload a refc binary references: the `BinRef.val` word — the key a
+/// consumer looks up in its off-heap table to read the payload (and its allocated size).
+///
+/// The C's `br` half of `ERTS_GET_BITSTRING_REF` (`erl_bits.c:117`): `Ok` exactly when `t`
+/// is an `ErlSubBits` whose `orig` is a live `BinRef` — a window built by
+/// [`write_refc_binary`]/[`write_sub_binary`] **or** a plain refc binary (the same thing with
+/// `start == 0`), the arm `binary:referenced_byte_size/1` answers with `(br->val)->orig_size`
+/// (`erl_bif_binary.c:2691-2717`). Flag bits are *not* consulted: the C tests `orig` alone.
+/// `Err(TermError::BadBitstring)` is the C's `br == NULL` (an on-heap `ErlHeapBits`, a match
+/// context, or a non-bitstring) — never a guessed pointer; the module docs say why this
+/// crate cannot answer the size itself.
+///
+/// # Safety
+///
+/// `t` must be a live boxed term, and the payload a returned pointer names (kept alive by
+/// `t`, per the frozen `BinRef.val == RefcBinary::data_ptr()` contract) must stay alive
+/// while the caller uses the pointer.
+pub unsafe fn refc_payload(t: Eterm) -> TermResult<*mut Eterm> {
+    // SAFETY: the caller guarantees `t` is a live boxed term; `is_refc_binary`
+    // dereferences only its header and, for an `ErlSubBits`, its live `orig` slot.
+    if !unsafe { is_refc_binary(t) } {
+        return Err(TermError::BadBitstring);
+    }
+    // SAFETY: `is_refc_binary` just proved `t` is a live 5-word `ErlSubBits`, so word 4
+    // (`orig`) is initialised and is a live `BinRef`.
+    let orig = unsafe { *boxed_val(t).add(SUB_BITS_ORIG_WORD) };
+    // SAFETY: `orig` is a live `BinRef`, so [`bin_ref_parts`] reads two initialised words.
+    let (val, _next) = unsafe { bin_ref_parts(orig) };
+    if val.is_null() {
+        return Err(TermError::BadBitstring);
+    }
+    Ok(val)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bitstring::{bit_at, bitstring_parts, write_sub_bits};
+    use core::mem::size_of;
     use crate::boxed::{arityval, is_bitstring, make_header};
     use crate::heap::Heap;
     use crate::immediate::{make_small, NIL};
@@ -461,5 +792,209 @@ mod tests {
         // A plain tuple is not a bitstring at all.
         let tup = heap.tuple(&[make_small(1)]).unwrap();
         assert!(!unsafe { is_refc_binary(tup) });
+    }
+    // -----------------------------------------------------------------------
+    // Sub-binary windows (`write_sub_binary` / `sub_binary_words`)
+    // -----------------------------------------------------------------------
+    // The public-surface matrix lives in `tests/refc_window.rs`; these pin the unit-level
+    // properties the integration file cannot see.
+
+    /// A word-aligned payload buffer ([`write_refc_binary`]'s base-alignment contract).
+    #[repr(align(8))]
+    struct Payload<const N: usize>([u8; N]);
+
+    /// A deterministic payload whose bytes never repeat a neighbour (so an unshifted or
+    /// off-by-one-byte copy cannot pass by luck).
+    fn payload<const N: usize>() -> Payload<N> {
+        let mut bytes = [0u8; N];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(0x5B);
+        }
+        Payload(bytes)
+    }
+
+    /// Builds a refc binary over `payload` at bits `offset..offset + size`.
+    fn refc_parent(heap: &mut Heap, payload: &[u8], offset: usize, size: usize) -> Eterm {
+        // SAFETY: 8 words reserved; `payload` outlives every use of the term here and its
+        // pointer is word aligned (the `Payload` attribute).
+        unsafe {
+            let hp = heap.alloc_words(ERL_REFC_BITS_SIZE).unwrap();
+            write_refc_binary(
+                hp,
+                payload.as_ptr() as *mut Eterm,
+                core::ptr::null_mut(),
+                payload.as_ptr(),
+                offset,
+                size,
+            )
+        }
+    }
+
+    /// The first `n` bits of a bitstring term.
+    fn bits(t: Eterm, n: usize) -> Vec<bool> {
+        (0..n).map(|i| unsafe { bit_at(t, i) }).collect()
+    }
+
+    #[test]
+    fn heap_arm_copies_a_window_and_zeroes_its_tail() {
+        let payload = payload::<64>();
+        let mut heap = Heap::new(4096);
+        let parent = refc_parent(&mut heap, &payload.0, 0, 64 * 8);
+        let parent_bits = bits(parent, 64 * 8);
+        // Byte-aligned and non-byte-aligned offsets, odd and even sizes, all at or below
+        // `ERL_ONHEAP_BITS_LIMIT` — so all the heap arm.
+        for (off, size) in [(0usize, 0usize), (0, 512), (3, 21), (7, 505), (37, 129), (509, 3)]
+        {
+            let used = heap.used();
+            // SAFETY: `parent` is a live refc binary; the reservation is the reported count.
+            let words = unsafe { sub_binary_words(parent, size) }.unwrap();
+            assert_eq!(words, crate::bitstring::heap_bits_size_words(size));
+            let hp = unsafe { heap.alloc_words(words) }.unwrap();
+            let child = unsafe { write_sub_binary(hp, parent, off, size) }.unwrap();
+            assert_eq!(heap.used() - used, words, "writer used what it reserved");
+            // An `ErlHeapBits` header (never a pair) whose arity prices exactly its words.
+            assert_eq!(
+                unsafe { *boxed_val(child) },
+                make_header(words - 1, HEAP_BITS_SUBTAG)
+            );
+            assert!(!unsafe { is_refc_binary(child) });
+            assert_eq!(bits(child, size), parent_bits[off..off + size].to_vec());
+            // The bits past the window are zero: the last byte's low bits and the rest of
+            // the block's payload bytes.
+            let (base, _, _) = unsafe { bitstring_parts(child) };
+            let n_bytes = crate::bitstring::bit_count_to_bytes(size);
+            for i in n_bytes..(words - 2) * 8 {
+                // SAFETY: the block's data words are `(words - 2) * 8` bytes wide.
+                assert_eq!(unsafe { *base.add(i) }, 0, "padding byte {i}");
+            }
+            if size % 8 != 0 {
+                // SAFETY: `base` covers the `n_bytes` payload bytes just written.
+                assert_eq!(
+                    unsafe { *base.add(n_bytes - 1) } & (0xFFu8 >> (size % 8)),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refc_arm_shares_the_parent_payload() {
+        let payload = payload::<128>();
+        let mut heap = Heap::new(512);
+        // A window that does not start at the payload base, so `start` is inherited.
+        let parent = refc_parent(&mut heap, &payload.0, 40, 1000);
+        let (off, size) = (400usize, 600usize);
+        // SAFETY: `parent` is a live refc binary.
+        let words = unsafe { sub_binary_words(parent, size) }.unwrap();
+        assert_eq!(words, ERL_REFC_BITS_SIZE);
+        let used = heap.used();
+        let hp = unsafe { heap.alloc_words(words) }.unwrap();
+        let child = unsafe { write_sub_binary(hp, parent, off, size) }.unwrap();
+        assert_eq!(heap.used() - used, ERL_REFC_BITS_SIZE);
+
+        assert!(unsafe { is_refc_binary(child) });
+        assert_eq!(bits(child, size), bits(parent, 1000)[off..].to_vec());
+        // `start` is the parent's start + the offset (the C's `erts_make_sub_bitstring`
+        // convention) and `end` is `start + size`.
+        assert_eq!(unsafe { refc_offset(child) }, 40 + off);
+        assert_eq!(unsafe { refc_size(child) }, size);
+        // The child names the very same payload, so the referenced size stays reachable.
+        let (child_val, child_next) = unsafe { bin_ref_parts(sub_bits_parts(child).3) };
+        let (parent_val, parent_next) = unsafe { bin_ref_parts(sub_bits_parts(parent).3) };
+        assert_eq!(child_val, payload.0.as_ptr() as *mut Eterm);
+        assert_eq!((child_val, child_next), (parent_val, parent_next));
+        assert_eq!(unsafe { refc_payload(child) }.unwrap(), child_val);
+    }
+
+    #[test]
+    fn threshold_boundary_picks_the_arm_on_the_window_size() {
+        let payload = payload::<128>();
+        let mut heap = Heap::new(512);
+        let parent = refc_parent(&mut heap, &payload.0, 0, 1024);
+        // SAFETY: `parent` is a live refc binary.
+        let heap_words = unsafe { sub_binary_words(parent, ERL_ONHEAP_BITS_LIMIT) }.unwrap();
+        // A 512-bit `ErlHeapBits`: 2 head words plus 64 / `size_of::<Eterm>()` data words.
+        assert_eq!(MAX_HEAP_WINDOW_BYTES, 64);
+        assert_eq!(heap_words, 2 + MAX_HEAP_WINDOW_BYTES / size_of::<Eterm>());
+        let hp = unsafe { heap.alloc_words(heap_words) }.unwrap();
+        let at_limit = unsafe { write_sub_binary(hp, parent, 0, ERL_ONHEAP_BITS_LIMIT) }.unwrap();
+        assert!(!unsafe { is_refc_binary(at_limit) });
+
+        // ... and one bit more is the refc arm (pinned end to end by
+        // `tests/refc_window.rs`).
+        assert_eq!(
+            unsafe { sub_binary_words(parent, ERL_ONHEAP_BITS_LIMIT + 1) },
+            Ok(ERL_REFC_BITS_SIZE)
+        );
+    }
+
+    #[test]
+    fn windows_refuse_malformed_parents_and_out_of_range_spans() {
+        let payload = payload::<128>();
+        let mut heap = Heap::new(256);
+        let parent = refc_parent(&mut heap, &payload.0, 0, 1024);
+        let tup = heap.tuple(&[make_small(1)]).unwrap();
+        // A non-bitstring parent.
+        for bad in [make_small(1), NIL, tup] {
+            assert_eq!(
+                unsafe { write_sub_binary(heap.alloc_words(10).unwrap(), bad, 0, 8) },
+                Err(TermError::BadBitstring)
+            );
+            assert_eq!(
+                unsafe { sub_binary_words(bad, 8) },
+                Err(TermError::BadBitstring)
+            );
+        }
+        // A heap parent whose size word contradicts its header arity: a 3-word block
+        // claiming 512 bits (which needs 10 words).
+        // SAFETY: 3 words reserved, then only the size word is rewritten.
+        let lying = unsafe {
+            let hp = heap.alloc_words(crate::bitstring::heap_bits_size_words(16)).unwrap();
+            let t = crate::bitstring::write_heap_bits(hp, &[1, 2], 16).unwrap();
+            *hp.add(1) = Eterm::from_raw(ERL_ONHEAP_BITS_LIMIT);
+            t
+        };
+        assert_eq!(
+            unsafe { write_sub_binary(heap.alloc_words(10).unwrap(), lying, 0, 8) },
+            Err(TermError::BadBitstring)
+        );
+        // Spans past the end of the parent, plus two that would wrap `usize`.
+        for (off, size) in [(1024, 1), (1000, 100), (usize::MAX, 1), (usize::MAX - 7, 8)] {
+            // SAFETY: a refc-arm reservation, never written on the refusal path.
+            let hp = unsafe { heap.alloc_words(ERL_REFC_BITS_SIZE) }.unwrap();
+            assert_eq!(
+                unsafe { write_sub_binary(hp, parent, off, size) },
+                Err(TermError::BadBitstring),
+                "{off}+{size} past a 1024-bit parent"
+            );
+        }
+        // A match-context parent (`ERL_SUB_BITS_FLAG_MUTABLE`, `orig` not a `BinRef`) cannot
+        // be shared above the limit, but the heap arm copies its bits.
+        // SAFETY: 5 words for the `ErlSubBits`; `base_flags` packs a live data base.
+        let ctx = unsafe {
+            let hp = heap.alloc_words(sub_bits_size_words()).unwrap();
+            write_sub_bits(
+                hp,
+                Eterm::from_raw(
+                    payload.0.as_ptr() as usize | crate::bitstring::ERL_SUB_BITS_FLAG_MUTABLE,
+                ),
+                Eterm::from_raw(0),
+                Eterm::from_raw(1024),
+                NIL,
+            )
+        };
+        assert_eq!(
+            unsafe { sub_binary_words(ctx, ERL_ONHEAP_BITS_LIMIT + 1) },
+            Err(TermError::BadBitstring)
+        );
+        // SAFETY: 10 words is the 512-bit heap-arm reservation.
+        let copied = unsafe { write_sub_binary(heap.alloc_words(10).unwrap(), ctx, 8, 512) }.unwrap();
+        assert!(!unsafe { is_refc_binary(copied) });
+        assert_eq!(bits(copied, 512), bits(ctx, 520)[8..].to_vec());
+        // An `ErlHeapBits` parent cannot be shared above the limit either.
+        assert_eq!(
+            unsafe { sub_binary_words(copied, ERL_ONHEAP_BITS_LIMIT + 1) },
+            Err(TermError::BadBitstring)
+        );
     }
 }

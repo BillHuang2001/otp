@@ -71,6 +71,16 @@
 //! never a silent drop; the asymmetry is reported in this suite's docs rather than
 //! papered over.
 //!
+//! # The recorded reason is ERTS's **exit value**, not the bare raise
+//!
+//! [`Runtime::process_exit`] records what a dying process's observers see, so an uncaught
+//! `error`-class raise (and an uncaught `throw`) yields the pair `{Reason, Stacktrace}`
+//! (`src/runner/reason.rs`'s `signalled_reason`) while an `exit`-class raise yields the bare
+//! reason. The gap this suite classifies is therefore the pair's **head**: the oracle's own
+//! shape is `{'unsupported: …', [{remote_send,bang_named,3,[{file,"remote_send.erl"},
+//! {line,41}]}]}`. Every comparison goes through [`ExitValue`] — never a raw `Eterm`, whose
+//! `Debug` prints an address that differs between two runs of one program.
+//!
 //! # The live half
 //!
 //! [`a_compiled_bang_delivers_a_remote_name_destination_to_a_real_peer`] starts a real
@@ -98,6 +108,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use beam_engine::terms;
 use beam_rt::Runtime;
 use beam_term::prelude::*;
 
@@ -146,27 +157,131 @@ fn runtime_with_fixture() -> Runtime {
     rt
 }
 
+/// A fixture process's recorded **exit value** — ERTS's term, not the bare raise reason.
+///
+/// An uncaught `error`-class raise (and an uncaught `throw`) dies with
+/// `{Reason, Stacktrace}` while an `exit`-class raise dies with the bare reason, and
+/// [`Runtime::process_exit`] records exactly that term (`src/runner/reason.rs`'s
+/// `signalled_reason`). The capability gap this suite classifies is the **reason** half, so
+/// every comparison goes through [`ExitValue::render`] rather than the raw term — a raw
+/// `Eterm` would only ever compare equal to itself.
+#[derive(Clone, Copy)]
+struct ExitValue {
+    /// What [`Runtime::process_exit`] recorded for the process.
+    term: Eterm,
+}
+
+/// Deliberately address-free: the derived form would print `Eterm(<address>)`, which differs
+/// between two runs of the same program — [`ExitValue::render`]/[`frame_texts`] are how this
+/// suite prints one.
+impl std::fmt::Debug for ExitValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExitValue(<render or frame_texts it>)")
+    }
+}
+
+impl ExitValue {
+    /// Whether the recorded term is the `{Reason, Stacktrace}` shape (an `error`/`throw`
+    /// death) rather than a bare reason (an `exit` death): the `2`-tuple whose second
+    /// element is a list, which is the same rule the two-VM fixture's `reason_shape/1` uses.
+    fn is_pair(self) -> bool {
+        matches!(terms::tuple_arity(self.term), Ok(2))
+            && terms::tuple_element(self.term, 1).is_ok_and(|trace| terms::list_elements(trace).is_ok())
+    }
+
+    /// The half the assertions classify: the pair's `Reason`, or the whole term.
+    fn reason(self) -> Eterm {
+        if self.is_pair() {
+            terms::tuple_element(self.term, 0).expect("the reason slot of a checked pair")
+        } else {
+            self.term
+        }
+    }
+
+    /// The stacktrace half of the pair, when the death recorded one.
+    fn stacktrace(self) -> Option<Vec<Eterm>> {
+        if !self.is_pair() {
+            return None;
+        }
+        terms::list_elements(terms::tuple_element(self.term, 1).expect("the stacktrace slot"))
+            .ok()
+    }
+
+    /// The reason rendered the way this suite has always compared it: an **atom by its
+    /// name** (so `unsupported: …` compares as text), anything else structurally through the
+    /// runtime's own `~w` printer — never the raw `Eterm` word (`Eterm(<address>)` differs
+    /// between two runs of the same program and cannot be compared).
+    fn render(self, rt: &mut Runtime) -> String {
+        let reason = self.reason();
+        match rt.atom_name_of(reason) {
+            Some(name) => name.to_string(),
+            None => rt
+                .format_term_w(reason, None)
+                .unwrap_or_else(|error| format!("unprintable reason ({error})")),
+        }
+    }
+}
+
 /// A fixture function run to completion as a **scheduled process**.
 ///
-/// `Ok(value)` when the process returned normally (its result term, if any);
-/// `Err(reason)` when it raised, with `reason` the reason atom's name (or a `Debug`
-/// rendering when the reason is not a bare atom).
+/// `Ok(value)` when the process returned normally (its result term, if any); `Err(exit)`
+/// when it raised, with `exit` the process's recorded [`ExitValue`].
 fn run_fixture(
     rt: &mut Runtime,
     function: &str,
     args: Vec<beam_term::Eterm>,
-) -> Result<Option<beam_term::Eterm>, String> {
+) -> Result<Option<beam_term::Eterm>, ExitValue> {
     let pid = rt
         .spawn_process("remote_send", function, args)
         .unwrap_or_else(|error| panic!("spawn remote_send:{function} failed: {error:?}"));
     rt.run_scheduler().expect("the pass drains the queue");
     match rt.process_exit(pid) {
-        Some(reason) => Err(rt
-            .atom_name_of(reason)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{reason:?}"))),
+        Some(term) => Err(ExitValue { term }),
         None => Ok(rt.process_result(pid)),
     }
+}
+
+/// Whether a stacktrace item names `module:function/arity` — the trace's own identity check,
+/// used to pin *which* frame a death recorded without comparing the trace's text.
+fn frame_names(rt: &Runtime, frame: Eterm, module: &str, function: &str) -> bool {
+    let name = |index: usize| {
+        terms::tuple_element(frame, index)
+            .ok()
+            .and_then(|term| rt.atom_name_of(term))
+    };
+    name(0) == Some(module)
+        && name(1) == Some(function)
+        && terms::tuple_element(frame, 2).ok() == Some(make_small(3))
+}
+
+/// The `{file, Name}` a stacktrace item's location pins, decoded from its charlist — decoded
+/// rather than matched as text, because the `~w` printer renders a loader-built filename
+/// charlist as an integer list.
+fn frame_file(rt: &Runtime, frame: Eterm) -> Option<String> {
+    let location = terms::tuple_element(frame, 3).ok()?;
+    let head = *terms::list_elements(location).ok()?.first()?;
+    if terms::tuple_element(head, 0).ok().and_then(|tag| rt.atom_name_of(tag)) != Some("file") {
+        return None;
+    }
+    let chars = terms::list_elements(terms::tuple_element(head, 1).ok()?).ok()?;
+    let bytes = chars
+        .iter()
+        .map(|char| u8::try_from(signed_value(*char)).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The [`ExitValue`]'s trace items (or the whole term, when it is not a pair) rendered by the
+/// runtime's own `~w`, for failure diagnostics — a raw `Eterm` would print an address.
+fn frame_texts(rt: &mut Runtime, exit: ExitValue) -> Vec<String> {
+    let items = exit.stacktrace().unwrap_or_else(|| vec![exit.term]);
+    items
+        .into_iter()
+        .map(|item| {
+            rt.format_term_w(item, None)
+                .unwrap_or_else(|error| format!("unprintable frame ({error})"))
+        })
+        .collect()
 }
 
 /// Runs the built `beam_rt` binary with `args` and returns its exit code, stdout and
@@ -450,13 +565,66 @@ fn the_compiled_bang_the_bif_and_the_eval_send_agree_on_a_remote_name_pair() {
         .expect_err("the compiled `{foo, other@nohost} ! hi` is a capability gap");
     let bif = run_fixture(&mut rt, "bif_named", vec![name, node, hi])
         .expect_err("the `erlang:send({foo, other@nohost}, hi)` BIF is the same gap");
+
+    // The recorded term is ERTS's **exit value**, not the bare raise reason: an uncaught
+    // `error`-class raise dies with `{Reason, Stacktrace}`, so the capability gap's atom is
+    // the pair's HEAD — the oracle's
+    // `{'unsupported: …', [{remote_send,bang_named,3,[…]}]}`.
+    for (route, exit, dying) in [
+        ("the compiled `!`", bang, "bang_named"),
+        ("the `erlang:send/2` BIF", bif, "bif_named"),
+    ] {
+        let rendered = frame_texts(&mut rt, exit);
+        assert!(
+            exit.is_pair(),
+            "an uncaught error-class raise signals `{{Reason, Stacktrace}}` ({route} route), \
+             but the recorded exit value is not that pair — its stacktrace half reads {rendered:?}"
+        );
+        let frames = exit
+            .stacktrace()
+            .unwrap_or_else(|| panic!("the {route} exit value carries a readable stacktrace"));
+        assert!(
+            !frames.is_empty(),
+            "the {route} exit value's trace is non-empty, got {rendered:?}"
+        );
+        for frame in &frames {
+            assert!(
+                matches!(terms::tuple_arity(*frame), Ok(4)),
+                "a stacktrace item is `{{Module, Function, Arity, Location}}`, got {rendered:?}"
+            );
+        }
+        assert!(
+            frames.iter().any(|frame| frame_names(&rt, *frame, "remote_send", dying)),
+            "the {route} exit value's trace names the dying `remote_send:{dying}/3` frame, got \
+             {rendered:?}"
+        );
+        // …and it names it as the **innermost** item, which is the oracle's exact shape:
+        // `{'unsupported: …', [{remote_send,bang_named,3,[{file,"remote_send.erl"},{line,…}]}]}`.
+        assert!(
+            frame_names(&rt, frames[0], "remote_send", dying),
+            "the {route} exit value's head trace item is the dying frame, got {rendered:?}"
+        );
+        assert!(
+            frame_file(&rt, frames[0]).as_deref() == Some("remote_send.erl"),
+            "the dying frame keeps its source position, got {rendered:?}"
+        );
+    }
+    // The reason half is the same term on both routes — the classifier's one answer — and
+    // it is what the two routes are compared on.
     assert_eq!(
-        bang, bif,
+        bang.reason(),
+        bif.reason(),
         "the compiled `!` and the `erlang:send/2` BIF must classify one destination identically"
     );
+    let bang_reason = bang.render(&mut rt);
+    let bif_reason = bif.render(&mut rt);
+    assert_eq!(
+        bang_reason, bif_reason,
+        "the compiled `!` and the `erlang:send/2` BIF must render one classification identically"
+    );
     assert!(
-        bang.starts_with("unsupported") && bang.contains("other@nohost"),
-        "both reasons are the capability gap naming the unreachable node, got {bang:?}"
+        bang_reason.starts_with("unsupported") && bang_reason.contains("other@nohost"),
+        "both reasons are the capability gap naming the unreachable node, got {bang_reason:?}"
     );
 
     // The `-eval` route reaches the same classifier (it calls the very same
@@ -567,8 +735,8 @@ fn a_same_node_pair_with_an_unregistered_name_is_accepted_and_dropped() {
 struct LiveOutcome {
     /// The peer's `GOT …` line, when it printed one.
     got: Option<String>,
-    /// The runtime's own answer for the compiled send (a reason name, or `None` on a
-    /// successful transmission).
+    /// The runtime's own answer for the compiled send — the recorded exit value's **reason**
+    /// rendered as text (`None` on a successful transmission).
     refused: Option<String>,
     /// The peer's spawn command (for failure diagnostics).
     command: String,
@@ -648,7 +816,7 @@ fn run_live_session(oracle: &Path, peer_node: &str, peer_name: &str, distributed
     let args = vec![rt.intern(peer_name), rt.intern(&peer_full), make_small(4242)];
     let refused = match run_fixture(&mut rt, "bang_named", args) {
         Ok(_) => None,
-        Err(reason) => Some(reason),
+        Err(exit) => Some(exit.render(&mut rt)),
     };
 
     // The peer's own OTP node is what decodes and routes the `DOP_REG_SEND`, so the

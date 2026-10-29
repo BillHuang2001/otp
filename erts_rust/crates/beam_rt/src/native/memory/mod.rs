@@ -87,7 +87,7 @@
 //! | `stack_size` | the Erlang stack's word count |
 //! | `reductions` | this process's real reduction counter |
 //! | `garbage_collection` | the oracle's five-item proplist (see below) |
-//! | `min_heap_size` / `min_bin_vheap_size` / `fullsweep_after` | the emulator's heap policy |
+//! | `min_heap_size` / `min_bin_vheap_size` / `fullsweep_after` | the process's **own** stored figure when `erlang:process_flag/2` set it, else its heap policy's (see below) |
 //! | `max_heap_size` | the process flag **map** |
 //! | `message_queue_data` | `on_heap` — this runtime's real *current* placement (the queue is heap-resident; see the divergence note below) |
 //! | `trace` | the process's **live** ERTS tracee-flag **bitmask**, as an integer (`0` while it is untraced) — see below |
@@ -190,13 +190,22 @@
 //! The key order is [`beam_gc::GARBAGE_COLLECTION_KEYS`]; `max_heap_size` is the flag
 //! **map** here (`size` is the raw word bound, 0 = unlimited), unlike the bare integer
 //! `erlang:system_info(garbage_collection)` reports. `min_heap_size` / `min_bin_vheap_size` /
-//! `fullsweep_after` come from the **emulator's** heap-size options — the
-//! `+hms`/`+hmbs`/`+hmax*`-configured policy the process was seeded with
-//! ([`crate::info::effective_policy`]), so `+hms 1000 +hmbs 5000` reports 1598 / 6772 — and
-//! `minor_gcs` is the collector's live `minor_since_major` counter (`Collector::minor_gcs()`),
+//! `fullsweep_after` are the same three figures the process's `process_info` items report —
+//! the per-process heap-sizing flags `erlang:process_flag/2` recorded, else the heap-size
+//! options the process was born with (the `+hms`/`+hmbs`-configured policy,
+//! [`crate::info::effective_policy`], so `+hms 1000 +hmbs 5000` reports 1598 / 6772, and a
+//! `spawn_opt` child the option it was given) — and `minor_gcs` is the collector's live
+//! `minor_since_major` counter (`Collector::minor_gcs()`),
 //! i.e. minors **since the last fullsweep** — it resets to `0` on every fullsweep, so it is never
 //! a collection total; the monotone totals are `Runtime::gc_stats().collections`.
 //! Nothing here is hardcoded from the oracle.
+//!
+//! The three heap-sizing flags are the **runtime's own bookkeeping** and are shared with the
+//! items above and with `process_flag/2`
+//! ([`Runtime::heap_flags`](crate::Runtime)): the C reads `p->min_heap_size` /
+//! `p->min_vheap_size` / `p->max_gen_gcs`, which `process_flag/2` writes, so the item and the
+//! flag cannot disagree. The value is bookkeeping only — nothing sizes a heap from it yet (see
+//! [`crate::runtime::HeapSizingFlags`]).
 //!
 //! The two heap-size items are **oracle figures**, not this runtime's own bookkeeping:
 //! `heap_size` is the nursery the policy installs (`beam_gc::HeapPolicy::initial_heap_words`,
@@ -242,6 +251,7 @@ use beam_term::{make_small, Atom, Eterm, NIL};
 
 use super::RuntimeContext;
 use crate::config::MaxHeapSetting;
+use crate::runtime::HeapSizingFlag;
 
 mod binary;
 pub(crate) mod last_calls;
@@ -545,6 +555,14 @@ struct Snapshot {
     /// items are answered from here, so `process_info(Child, min_heap_size)` is the
     /// *child's* figure, never the emulator's.
     policy: beam_gc::HeapPolicy,
+    /// The **target process's own** heap-sizing flags, as `erlang:process_flag/2` last stored
+    /// them ([`Runtime::heap_flags`](crate::Runtime)) — the C's `p->min_heap_size` /
+    /// `p->min_vheap_size` / `p->max_gen_gcs`.
+    ///
+    /// [`HeapSizingFlags::report`](crate::runtime::HeapSizingFlags::report) folds them over
+    /// `policy`, so a pid that never called `process_flag/2` reports the figure it was born
+    /// with while one that did reports its own stored value.
+    heap_flags: crate::runtime::HeapSizingFlags,
     /// The target process's **own** `max_heap_size` setting — the four-key flag map
     /// `process_info(Pid, max_heap_size)` and the `garbage_collection` item render.
     ///
@@ -1003,9 +1021,24 @@ impl RuntimeContext<'_> {
             "stack_size" => make_small(snapshot.stack_size as i64),
             "reductions" => make_small(snapshot.reductions as i64),
             "garbage_collection" => self.garbage_collection(snapshot)?,
-            "min_heap_size" => make_small(snapshot.policy.min_heap_words as i64),
-            "min_bin_vheap_size" => make_small(snapshot.policy.min_bin_vheap_words as i64),
-            "fullsweep_after" => make_small(i64::from(snapshot.policy.fullsweep_after)),
+            // The three heap-sizing flags: the process's own `process_flag/2` value when it set
+            // one, else its birth policy's figure (the C's `p->min_heap_size` /
+            // `p->min_vheap_size` / `p->max_gen_gcs`, `erl_bif_info.c`).
+            "min_heap_size" => make_small(
+                snapshot
+                    .heap_flags
+                    .report(HeapSizingFlag::MinHeapSize, &snapshot.policy) as i64,
+            ),
+            "min_bin_vheap_size" => make_small(
+                snapshot
+                    .heap_flags
+                    .report(HeapSizingFlag::MinBinVheapSize, &snapshot.policy) as i64,
+            ),
+            "fullsweep_after" => make_small(
+                snapshot
+                    .heap_flags
+                    .report(HeapSizingFlag::FullsweepAfter, &snapshot.policy) as i64,
+            ),
             "max_heap_size" => {
                 let setting = snapshot.max_heap;
                 self.max_heap_size_map(setting)?
@@ -1205,7 +1238,10 @@ impl RuntimeContext<'_> {
         for watcher in snapshot.monitored_by.iter().rev() {
             list = scratch.cons(*watcher, list)?;
         }
-        match self.rehome_container_result(list) {
+        // `None`: the list stands on a local **scratch** region, never on the call's pooled BIF
+        // heap, so the copy-out's "nothing to move" question cannot be answered from a pool and
+        // the result is always copied onto a destination that outlives this function.
+        match self.rehome_container_result(list, None) {
             Some(copied) => Ok(copied),
             // Unreachable in practice: a refusal means the copier rejected a graph this runtime
             // just built, or a destination that could not be grown. The scratch words are freed
@@ -1274,7 +1310,10 @@ impl RuntimeContext<'_> {
         for linked in snapshot.links.iter().rev() {
             list = scratch.cons(*linked, list)?;
         }
-        match self.rehome_container_result(list) {
+        // `None`: the list stands on a local **scratch** region, never on the call's pooled BIF
+        // heap, so the copy-out's "nothing to move" question cannot be answered from a pool and
+        // the result is always copied onto a destination that outlives this function.
+        match self.rehome_container_result(list, None) {
             Some(copied) => Ok(copied),
             // Unreachable in practice: a refusal means the copier rejected a graph this runtime
             // just built, or a destination that could not be grown. The scratch words are freed
@@ -1296,12 +1335,24 @@ impl RuntimeContext<'_> {
     /// [`beam_gc::GARBAGE_COLLECTION_KEYS`] order.
     fn garbage_collection(&mut self, snapshot: &Snapshot) -> Result<Eterm> {
         let policy = &snapshot.policy;
-        let info = HeapInfo::new(
+        let mut info = HeapInfo::new(
             policy,
             snapshot.minor_gcs,
             snapshot.heap_size,
             snapshot.total_heap_size,
         );
+        // The three heap-sizing flags come from the process's `process_flag/2` store when it
+        // set one (the C reads them off the same PCB fields the flag writes,
+        // `erl_bif_info.c:2082-2093`), so this item and `process_info(P, Flag)` always agree.
+        info.min_heap_size = snapshot
+            .heap_flags
+            .report(HeapSizingFlag::MinHeapSize, policy);
+        info.min_bin_vheap_size = snapshot
+            .heap_flags
+            .report(HeapSizingFlag::MinBinVheapSize, policy);
+        info.fullsweep_after = snapshot
+            .heap_flags
+            .report(HeapSizingFlag::FullsweepAfter, policy) as u32;
         let max_heap = snapshot.max_heap;
         let mut entries = Vec::with_capacity(5);
         for (key, value) in info.items() {
@@ -1511,6 +1562,9 @@ impl RuntimeContext<'_> {
             reductions: process.reductions(),
             minor_gcs: process.collector().minor_gcs(),
             policy: process.collector().policy().clone(),
+            // Read out of the runtime's per-pid store (the one `process_flag/2` writes), never
+            // off the collector: the value is bookkeeping, not a GC-policy input yet.
+            heap_flags: self.runtime.heap_sizing_flags(pid).unwrap_or_default(),
             // The setting lives on the process itself (the PCB is what the collection doors
             // enforce); `max_heap_was_set` distinguishes an **explicit** `#{size => 0}`
             // ("no upper bound") from a process that never set one and still reports the

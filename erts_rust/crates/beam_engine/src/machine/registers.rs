@@ -435,14 +435,25 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // belongs to the run that raised, not to this one).
         self.pending_function_clause_args = None;
         self.raise_function_clause_args = None;
+        // The `{error_info, Map}` latches ride the same protocol: a fresh run begins
+        // with neither armed, so a cooked trace in the new run can never grow a
+        // location tail an earlier run's raise arrived carrying (the map belongs to
+        // the run that raised it).
+        self.pending_error_info = None;
+        self.raise_error_info = None;
         // The supplied-trace latches ride the same two-latch protocol: a fresh run
         // begins with neither armed, so a raise in the new run can never render the
         // trace an earlier run's raise arrived carrying (the term belongs to the run
         // that raised it).
         self.pending_supplied_trace = None;
         self.pending_supplied_term = None;
+        self.pending_supplied_term_verbatim = false;
         self.raise_supplied_trace = None;
         self.raise_supplied_term = None;
+        // The verbatim-echo marker describes the raise that is *in flight*, so a
+        // fresh run begins without one: a cooked trace in the new run must never be
+        // the word an earlier run's `erlang:raise/3` supplied.
+        self.raise_supplied_term_verbatim = false;
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).

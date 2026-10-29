@@ -394,6 +394,22 @@ pub struct Runtime {
     /// the measurement [`Runtime::bif_nested_heap_words`]' self-tuning is derived from, and the
     /// figure that says how much of a nested region's capacity was actually bought.
     pub(crate) bif_nested_peak_words: usize,
+    /// The largest number of words one **outermost** registered BIF call has ever handed out of its
+    /// region at once (`used() - mark` at the call's tail), and therefore the reservation
+    /// [`RuntimeContext::take_bif_frontier`](crate::context::RuntimeContext::take_bif_frontier)
+    /// makes before the next one — `crate::context::calls::frontier`'s learned half.
+    ///
+    /// It is a **per-call demand**, not a region high-water mark: [`Runtime::bif_nested_peak_words`]
+    /// already tracks the latter for region sizing, and using it here would ratchet the reservation
+    /// toward a whole region's capacity because `peak_used()` includes the words a *previous*,
+    /// non-rewinding caller still owns below this call's mark.
+    ///
+    /// It never shrinks (a `max`), so the cost of learning is the one growth step that follows it.
+    pub(crate) bif_frontier_need_outer: usize,
+    /// [`Runtime::bif_frontier_need_outer`] for a **nested** call (one that found the pool holding
+    /// another call's region). Kept apart so a large outermost demand does not inflate every nested
+    /// region's reservation, which is the retention the depth-aware sizing exists to avoid.
+    pub(crate) bif_frontier_need_nested: usize,
     /// How many pooled BIF heaps are **out on loan** right now.
     ///
     /// It is the runtime's current **nested-call depth**: [`Runtime::take_bif_heap`] adds one per
@@ -902,6 +918,34 @@ pub struct Runtime {
     /// Keyed by the whole [`ProcessId`] and only ever `insert`/`remove`d, so it probes with the
     /// crate's own [`FastHashSet`] over [`crate::hasher`].
     pub(crate) max_heap_kill: FastHashSet<ProcessId>,
+    /// The three heap-sizing flags `erlang:process_flag/2` sets per process —
+    /// `min_heap_size`, `min_bin_vheap_size` and `fullsweep_after` (`bif.c:2114-2145`).
+    ///
+    /// `beam_process::ProcessFlags` carries no field for any of them, so — like
+    /// [`Runtime::async_dist`] and [`Runtime::monitor_nodes`] — the runtime keeps the values in
+    /// its own per-pid map. It is the **one** source of truth every reader shares: the
+    /// `beam_bifs` `process_flag/2` bridge ([`crate::context::process_bridge`]), which answers
+    /// the *previous* value, and `erlang:process_info/2`'s `min_heap_size` /
+    /// `min_bin_vheap_size` / `fullsweep_after` items **and** its `garbage_collection` map
+    /// ([`crate::native::memory`]), so the write and the readback can never disagree.
+    ///
+    /// A pid with **no entry** (or `None` for one of the three, see [`HeapSizingFlags`]) reports
+    /// its own heap policy's figure — the value it was born with, i.e. the emulator's
+    /// `+hms`/`+hmbs` defaults or the `spawn_opt` `{min_heap_size, …}` /
+    /// `{min_bin_vheap_size, …}` / `{fullsweep_after, …}` option it was given.
+    ///
+    /// **The values are bookkeeping only.** `process_flag/2` answers them back and
+    /// `process_info` reports them exactly as the oracle does, but nothing sizes a heap from
+    /// them: honouring `min_heap_size`/`min_bin_vheap_size`/`fullsweep_after` is the
+    /// `beam_gc` policy seam's job (a collection/growth decision), and this runtime's collector
+    /// still runs on the process's birth policy. See [`HeapSizingFlags`].
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `get`/`entry`d (never iterated), so it
+    /// probes with the crate's own [`FastHashMap`] over [`crate::hasher`], like
+    /// [`Runtime::mailboxes`]. A stale entry for a terminated pid is harmless (its serial is
+    /// bumped when the slot is reused), and the scheduler pass prunes them anyway
+    /// ([`Runtime::prune_gc_requests`](crate::runtime::Runtime::prune_gc_requests)).
+    pub(crate) heap_flags: FastHashMap<ProcessId, HeapSizingFlags>,
     /// The `{monitor_nodes, Options}` registrations of every process — the C's
     /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
     ///
@@ -1180,6 +1224,15 @@ pub struct Runtime {
     /// Owned by the `Runtime` (not a `thread_local!`) because several runtimes can live in one
     /// thread.
     prim_tty_handles: HashMap<u64, i32>,
+    /// The live `prim_buffer` byte queues (contract A.7) — each entry maps the reference id
+    /// minted by `prim_buffer:new/0` (`src/native/prim_buffer.rs`) to its queue.
+    ///
+    /// The handle is the oracle's opaque NIF resource (`#Ref<…>`-shaped and unobservable); a
+    /// term whose id is not in this table is the C's `enif_get_resource` failure (`badarg`).
+    /// `prim_file`'s descriptors also own a queue here (keyed by the **descriptor id**, so a
+    /// `prim_file:close/1` removes both halves at once). Owned by the `Runtime` (not a
+    /// `thread_local!`) because several runtimes can live in one thread.
+    buffers: HashMap<u64, crate::native::prim_buffer::PrimBuffer>,
     /// The **native `file_server_2` service** and its live io-devices (contract A.9) — see
     /// [`crate::native::file_server`].
     ///
@@ -1257,6 +1310,93 @@ pub(crate) struct NodeMonitorLatch {
     /// starts `true` and therefore emits no `nodeup`, and a `nodedown` can only follow a
     /// `nodeup`.
     pub saw_connected: bool,
+}
+
+/// Which of the three heap-sizing flags a write names — the first argument of the
+/// `erlang:process_flag(min_heap_size | min_bin_vheap_size | fullsweep_after, N)` triple
+/// (`bif.c:2104-2145`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeapSizingFlag {
+    /// `min_heap_size` — the C's `p->min_heap_size` (`erl_process.h:1031`).
+    MinHeapSize,
+    /// `min_bin_vheap_size` — the C's `p->min_vheap_size`.
+    MinBinVheapSize,
+    /// `fullsweep_after` — the C's `p->max_gen_gcs`, a **16-bit** field.
+    FullsweepAfter,
+}
+
+/// The per-process values of the three heap-sizing flags — one entry of
+/// [`Runtime::heap_flags`], the runtime's own record of what
+/// `erlang:process_flag(min_heap_size | min_bin_vheap_size | fullsweep_after, N)` stored.
+///
+/// `None` means "never set through `process_flag/2`": the process then reports the figure of its
+/// own heap policy ([`HeapSizingFlags::report`]), which is what `spawn_opt`'s three heap options
+/// and the emulator's `+hms`/`+hmbs`/`max_gen_gcs` defaults put there.
+///
+/// # Bookkeeping only — not a GC-policy input
+///
+/// The C stores these on the PCB and the collector reads them back: `HEAP_SIZE` sizing uses
+/// `min_heap_size`, the binary virtual heap uses `min_vheap_size`, and the fullsweep cadence
+/// uses `max_gen_gcs`. This runtime's collector runs on the process's **birth** policy
+/// ([`beam_gc::HeapPolicy`]), so a value recorded here is **not** honoured by any collection or
+/// growth decision — it is the answer to `process_flag/2`'s "previous value" and to
+/// `process_info(P, Flag)` and nothing else. Adopting it means teaching `beam_gc`'s policy seam
+/// to re-read these three per process (the collector would have to take a fresh
+/// [`beam_gc::HeapPolicy`] after the write); until then this is deliberately a **flag whose
+/// value is observable but has no effect**, which is honest — an omission, never a wrong size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HeapSizingFlags {
+    /// `min_heap_size` as stored: already floored at the emulator's grain and rounded through
+    /// the growth table by the writer, so it is a fixed point of `beam_gc::next_heap_size`.
+    pub(crate) min_heap_size: Option<usize>,
+    /// `min_bin_vheap_size` as stored, with the same floor-and-round rule.
+    pub(crate) min_bin_vheap_size: Option<usize>,
+    /// `fullsweep_after` as stored — the C's 16-bit `max_gen_gcs`, so a request above `65535`
+    /// was truncated by the writer exactly as the C truncates it (measured on the oracle:
+    /// `100000` ⇒ `34464`, `65536` ⇒ `0`).
+    pub(crate) fullsweep_after: Option<u16>,
+}
+
+impl HeapSizingFlags {
+    /// The value `flag` stores, or `None` when it was never set for this process.
+    pub(crate) fn get(&self, flag: HeapSizingFlag) -> Option<usize> {
+        match flag {
+            HeapSizingFlag::MinHeapSize => self.min_heap_size,
+            HeapSizingFlag::MinBinVheapSize => self.min_bin_vheap_size,
+            HeapSizingFlag::FullsweepAfter => self.fullsweep_after.map(usize::from),
+        }
+    }
+
+    /// Records `value` as `flag`'s new stored figure.
+    ///
+    /// `value` is the **stored** form — the writer applies the C's per-flag rule before calling
+    /// this ([`crate::context::process_bridge`]): the floor-and-round of `min_heap_size` /
+    /// `min_bin_vheap_size`, and the raw request of `fullsweep_after`, which narrows to the C's
+    /// `Uint16` field here.
+    pub(crate) fn set(&mut self, flag: HeapSizingFlag, value: usize) {
+        match flag {
+            HeapSizingFlag::MinHeapSize => self.min_heap_size = Some(value),
+            HeapSizingFlag::MinBinVheapSize => self.min_bin_vheap_size = Some(value),
+            // `BIF_P->max_gen_gcs = i` into a `Uint16` (`bif.c:2110`): the truncation the
+            // oracle shows on readback is the field width's, so it is applied where the value
+            // is stored rather than where it is written.
+            HeapSizingFlag::FullsweepAfter => self.fullsweep_after = Some(value as u16),
+        }
+    }
+
+    /// The figure `flag` reports for a process whose heap policy is `policy` — the stored
+    /// override when one was set, else the policy's own (the process's birth/default value, so
+    /// a `spawn_opt` child reports the option it was given and a `+hms` run its grain).
+    pub(crate) fn report(&self, flag: HeapSizingFlag, policy: &HeapPolicy) -> usize {
+        match self.get(flag) {
+            Some(value) => value,
+            None => match flag {
+                HeapSizingFlag::MinHeapSize => policy.min_heap_words,
+                HeapSizingFlag::MinBinVheapSize => policy.min_bin_vheap_words,
+                HeapSizingFlag::FullsweepAfter => policy.fullsweep_after as usize,
+            },
+        }
+    }
 }
 
 /// Diffs every `monitor_node/2` subscription against the node set that is **established now**,
@@ -1612,6 +1752,8 @@ impl Runtime {
             bif_heap_words: heap_words,
             bif_nested_heap_words: NESTED_BIF_HEAP_SEED_WORDS.min(heap_words),
             bif_nested_peak_words: 0,
+            bif_frontier_need_outer: 0,
+            bif_frontier_need_nested: 0,
             bif_heaps_taken: 0,
             scheduler: Scheduler::new(),
             runner_state: RunnerState::default(),
@@ -1660,6 +1802,7 @@ impl Runtime {
             async_dist: FastHashSet::default(),
             max_heap_set: FastHashSet::default(),
             max_heap_kill: FastHashSet::default(),
+            heap_flags: FastHashMap::default(),
             monitor_nodes: FastHashMap::default(),
             parents: FastHashMap::default(),
             saved_calls: FastHashMap::default(),
@@ -1682,6 +1825,7 @@ impl Runtime {
             perf_map,
             open_files: HashMap::new(),
             prim_tty_handles: HashMap::new(),
+            buffers: HashMap::new(),
             file_services,
             net_kernel,
             boot_script_id: None,
@@ -2229,8 +2373,8 @@ impl Runtime {
     }
 
     /// The **provenance** of `term` as a reference this runtime minted, or `None` when the
-    /// term was not minted here (a reference decoded from an external term, or one received
-    /// in a message as a *copy*).
+    /// term was not minted here (a reference decoded from an external term, or one naming a
+    /// node that is not this one).
     ///
     /// * `Some(Some(reference))` — a monitor or alias reference: [`Runtime::references`]
     ///   records the [`MonitorRef`] the term stands for, which is the only reference shape
@@ -2244,10 +2388,26 @@ impl Runtime {
     /// ([`crate::context::alias`]), the runtime's reference predicates
     /// ([`Runtime::is_known_local_reference`]) and the timer BIFs — it replaces the
     /// hand-spelled `timers.is_timer_ref(t) || references.contains_key(&t)` copies.
+    ///
+    /// # A copy is the same reference
+    ///
+    /// A reference's identity is its **id** word (the workspace's ONE reference-id space,
+    /// `beam_common::next_ref_id`), not the address of its term, so a *copy* — a reference
+    /// round-tripped through ETS, sent in a message, stored in a term — is the same reference.
+    /// **Timer** references honour that here: [`Timers::is_timer_ref`] falls back to its
+    /// id-keyed index after a word miss, so `erlang:cancel_timer/1,2` and
+    /// `erlang:read_timer/1,2` accept a copy (the oracle's `inet_gethost_native.erl` stores
+    /// its `start_timer/3` reference in an ETS row and cancels the copy it reads back).
+    /// [`Runtime::references`] is still word-keyed, so a copied **monitor**/**alias**
+    /// reference stays unknown here; widening that is a separate change (it would also need
+    /// the alias/monitor tables to be id-keyed).
     pub(crate) fn local_reference(&self, term: Eterm) -> Option<Option<MonitorRef>> {
         if let Some(entry) = self.references.get(&term) {
             return Some(*entry);
         }
+        // Word first, then identity — `Timers::is_timer_ref` is the ONE place that knows both
+        // halves, and it is written only by the timer bookkeeping, so a reference this runtime
+        // did not mint for a timer (a dead NIF resource included) stays unknown.
         if self.timers.is_timer_ref(term) {
             return Some(None);
         }
@@ -2255,8 +2415,11 @@ impl Runtime {
     }
 
     /// Whether `term` is a reference **this runtime minted** — the predicate
-    /// `erlang:cancel_timer/1,2`, `erts_internal:group_leader/3` and the send path share
-    /// (see [`Runtime::local_reference`]).
+    /// `erlang:cancel_timer/1,2`, `erlang:read_timer/1,2`, `erts_internal:group_leader/3`
+    /// and the send path share (see [`Runtime::local_reference`]).
+    ///
+    /// A copy of a **timer** reference answers `true`; a copy of a monitor/alias reference
+    /// does not yet (see [`Runtime::local_reference`]).
     pub(crate) fn is_known_local_reference(&self, term: Eterm) -> bool {
         self.local_reference(term).is_some()
     }
@@ -2364,6 +2527,18 @@ impl Runtime {
     /// own docs and [`crate::native::prim_tty`].
     pub(crate) fn prim_tty_handles_mut(&mut self) -> &mut HashMap<u64, i32> {
         &mut self.prim_tty_handles
+    }
+    /// The live `prim_buffer` byte-queue table (contract A.7), keyed by the reference id the
+    /// buffer handle term carries — and, for a `prim_file` descriptor, by the descriptor's own
+    /// id so `prim_file:close/1` retires both the host file and its read buffer.
+    ///
+    /// `prim_buffer:new/0` inserts the minted handle's queue and every other stub looks it up (a
+    /// miss is the C's `enif_get_resource` failure, `badarg`). See the field's own docs and
+    /// [`crate::native::prim_buffer`].
+    pub(crate) fn buffers_mut(
+        &mut self,
+    ) -> &mut HashMap<u64, crate::native::prim_buffer::PrimBuffer> {
+        &mut self.buffers
     }
 
     /// Rewinds the **scratch** heap [`Runtime::info_heap`] to its base for the next
@@ -3591,6 +3766,25 @@ impl Runtime {
     /// each one.
     pub(crate) fn note_max_heap_kill(&mut self, pid: ProcessId) -> bool {
         self.max_heap_kill.insert(pid)
+    }
+    /// The heap-sizing flags `pid` has set through `erlang:process_flag/2`, or `None` when it
+    /// never set any — see [`Runtime::heap_flags`] and [`HeapSizingFlags`].
+    ///
+    /// A reader that needs one figure calls [`HeapSizingFlags::report`] with the process's own
+    /// policy, which is what falls back to the birth/default value.
+    pub(crate) fn heap_sizing_flags(&self, pid: ProcessId) -> Option<HeapSizingFlags> {
+        self.heap_flags.get(&pid).copied()
+    }
+    /// Records `value` as `pid`'s stored figure for `flag` — `erlang:process_flag/2`'s write
+    /// (`bif.c:2114-2145`). See [`Runtime::heap_flags`] for why this is bookkeeping only, and
+    /// [`HeapSizingFlags::set`] for the stored form the caller must supply.
+    pub(crate) fn set_heap_sizing_flag(
+        &mut self,
+        pid: ProcessId,
+        flag: HeapSizingFlag,
+        value: usize,
+    ) {
+        self.heap_flags.entry(pid).or_default().set(flag, value);
     }
     /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
     /// bitmask `key`, answering the **previous** reference count — the C's
@@ -5435,13 +5629,11 @@ impl Runtime {
             }
             Err(error) => {
                 let payloads = self.source_payloads(action_pid, &[]);
-                // The stabilization answers the *stabilized error*; the body's own `Err` is
-                // what this method returns, so fold it back into the failing arm. A genuine
-                // `SystemLimit` from the copy replaces it (never a dangling term).
-                match self.stabilize_error_live_reason(error, &payloads) {
-                    Ok(error) => Err(error),
-                    Err(failure) => Err(failure),
-                }
+                // The stabilization answers the *stabilized error* (or the body's own error with
+                // its opaque reason payload dropped when that copy is refused — a diagnostic
+                // degradation, never a replacement of the body's error by a `system_limit`; see
+                // `Runtime::stabilize_error_live_reason`).
+                Err(self.stabilize_error_live_reason(error, &payloads))
             }
         };
         // Step 6: the child exits `normal` — the reason a process that returns exits with — so a

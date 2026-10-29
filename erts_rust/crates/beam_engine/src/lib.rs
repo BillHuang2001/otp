@@ -119,10 +119,18 @@ mod supplied_stacktrace;
 #[allow(unsafe_code)]
 pub mod terms;
 pub use context::{
-    BifOutcome, ContextHeapStats, ExecutionContext, FunOutcome, HeapMark, HeapReclaim, HeapRewind,
-    Mailbox, MinimalContext, TraceEvent,
+    BifOutcome, ContextHeapStats, ExecutionContext, FunOutcome, HeapMark, HeapReclaim,
+    HeapRewind, Mailbox, MinimalContext, TraceEvent,
 };
 pub use error::{bad_register, blocked, suspended, unknown_label, unsupported};
+/// The two halves of the synthesized BIF head item's **shape rule**, re-exported so a
+/// host can render the same `[{error_info, …}]` extension on a route that has no
+/// compiled module: the closed `format_error/2` table
+/// ([`format_module`](families::exceptions::bif_frame::format_module), C's
+/// `save_stacktrace` table) and the raise-BIF exclusion
+/// ([`is_non_bif_raise`](families::exceptions::bif_frame::is_non_bif_raise)). One
+/// definition, so the compiled and `-eval` routes cannot drift.
+pub use families::exceptions::bif_frame::{format_module, is_non_bif_raise};
 pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
 pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};
 pub use supplied_stacktrace::encode_supplied_stacktrace;

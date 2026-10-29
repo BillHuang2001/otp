@@ -30,10 +30,17 @@
 //! Part II §H; the legacy `erts/emulator/beam/copy.c` and `erl_message.c` are the ground-truth
 //! behaviour.
 //!
-//! `unsafe` is confined to `copy.rs` and `preflight.rs` (the raw word read/write of the copy loop
-//! and the two raw-word reads the refc-binary pricing needs) and the narrow `layout.rs` accessors;
-//! `share.rs`, `fragment.rs`, `message.rs`, `mailbox.rs`, `off_heap.rs`, `node.rs` and `error.rs` are
-//! safe Rust.
+//! `unsafe` is confined to `copy.rs` and `preflight.rs` (the raw word read/write of the copy loop,
+//! the checked bitstring readers' dispatch, and the raw-word reads the refc-binary pricing needs),
+//! `share.rs` (the one fix-up write, restated from the loop) and the narrow `layout.rs` accessors;
+//! `fragment.rs`, `message.rs`, `mailbox.rs`, `off_heap.rs`, `node.rs` and `error.rs` are safe Rust
+//! outside their `#[cfg(test)]` modules.
+//!
+//! Every read of a sub-binary header, an `orig` back-pointer or a refc payload word goes through
+//! `beam_term::bitstring`'s shape-validating readers (`try_sub_bits_parts` / `try_bitstring_parts`),
+//! so a corrupt block is a typed `BadArg` instead of an arbitrary-address read. The audit table of
+//! every such site, and the one class of read that is unchecked by design (a heap bitstring's
+//! header-arity extent), is the crate `CONTEXT.md` §*Sub-binary / refc read sites*.
 //!
 //! # Allocation-failure classification
 //!

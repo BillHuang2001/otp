@@ -62,6 +62,7 @@ pub mod key;
 pub mod kind;
 pub mod ordered_interior;
 pub mod select;
+mod shape;
 pub mod stats;
 pub mod store;
 pub mod table;

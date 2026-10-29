@@ -250,34 +250,49 @@ fn insert_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `binary:referenced_byte_size(Binary)` (`erl_bif_binary.c:2691`) — the size of
 /// the whole binary the argument references.
 ///
-/// Every binary this runtime builds is on-heap and whole (`binary:part/3` copies;
-/// there is no off-heap `BinRef`/`SubBits` producer), so the size is the
-/// argument's own **byte size** — the C's `br == NULL` branch, `BYTE_SIZE(size)`,
-/// which truncates a partial trailing byte exactly like `size/1`. Verified against
-/// the oracle for a runtime-built on-heap binary
-/// (`binary:referenced_byte_size(list_to_binary([1,2,3]))` ⇒ `3`) and for a large
-/// one off the 64-byte on-heap limit
-/// (`binary:referenced_byte_size(binary:copy(<<1>>, 100000))` ⇒ `100000`).
+/// Reproduces the C's two arms exactly (`ERTS_GET_BITSTRING_REF`):
 ///
-/// Two documented divergences, both properties of terms this runtime cannot
-/// produce rather than wrong answers for one it can:
+/// * **`br != NULL`** — an off-heap `[BinRef][ErlSubBits]` window: the answer is
+///   `(br->val)->orig_size`, the *parent payload's* width, not the window's
+///   ([`access::refc_payload_bytes`] reads it from the payload header; `:2711`).
+///   This is why `binary:referenced_byte_size` of a 65-byte window over a 512-byte
+///   binary is `512` in the oracle. Such terms reach this BIF from the **engine**,
+///   which does build real refc binaries — `bs_create_bin` for any payload above
+///   `ERL_ONHEAP_BINARY_LIMIT` (`beam_engine/src/families/bitstrings/raw.rs`) and a
+///   matched-out `/binary` tail — so this arm is live, not hypothetical;
+/// * **`br == NULL`** — an on-heap `ErlHeapBits` (every binary *this crate* builds,
+///   `crate::bits`) or a match context: the argument's own **byte size**,
+///   `BYTE_SIZE(size)`, which truncates a partial trailing byte exactly like
+///   `size/1`. Verified against the oracle for a runtime-built on-heap binary
+///   (`binary:referenced_byte_size(list_to_binary([1,2,3]))` ⇒ `3`) and for a large
+///   one off the 64-byte on-heap limit
+///   (`binary:referenced_byte_size(binary:copy(<<1>>, 100000))` ⇒ `100000`).
 ///
-/// * a **sub-binary** — the oracle reports the size of the whole binary it points
-///   into (`binary:referenced_byte_size(binary:part(binary:copy(<<1>>,100),10,5))`
-///   ⇒ `100`), which M1 does not model (`binary:part/3` copies, so that argument is
-///   an ordinary 5-byte binary here);
-/// * a **literal-area** binary — the `<<1,2,3>>` of a compiled module reports the
-///   literal chunk's allocated size in the oracle (`256`); this runtime materializes
-///   no such literal.
+/// This crate's own window producers now feed the first arm: `binary:part/2,3` and
+/// `erlang:binary_part/2,3` mint a real `[BinRef][ErlSubBits]` window over a refc
+/// parent above 64 bytes ([`crate::binary::part_slice`] →
+/// [`access::make_sub_binary`]), so a part of a large *refc* binary answers the parent
+/// payload's width exactly as the oracle does. Two residuals stay on the *producer*
+/// side and are documented at [`crate::binary::part_slice`]: a window that is itself
+/// ≤ 64 bytes is an on-heap copy (the C's own `ERL_ONHEAP_BITS_LIMIT` arm, so it
+/// agrees), and a >64-byte part of an **on-heap** parent (`ErlHeapBits`, which is
+/// every binary this crate builds) is still a copy, because there is no payload to
+/// share. A **literal-area** binary (`<<1,2,3>>` of a compiled module) is likewise
+/// unmodelled: the oracle reports the literal chunk's allocated width (`256`), this
+/// runtime materializes no such literal.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when the argument is not a
 /// bitstring (`binary:referenced_byte_size([1,2])`).
-fn referenced_byte_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+pub(crate) fn referenced_byte_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if !bits::is_bitstring(term) {
         return Err(badarg());
+    }
+    // The C's `br != NULL` arm: the parent payload's `orig_size`.
+    if let Some(payload) = access::refc_payload_bytes(term) {
+        return ctx.int(payload as i64);
     }
     ctx.int((bits::bit_size(term)? / 8) as i64)
 }

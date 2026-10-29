@@ -39,10 +39,34 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
 - Guard truth is an internal `Value::Bool`, so it never requires `true`/`false` interned.
   A term-valued body boolean (`true`/`false`) **does** need them interned; so does `EXIT`
   for the body-`FAIL_TERM` path.
-- `unsafe` only in the term-word readers (`mod.rs` tuple/list accessors, `pattern.rs`,
-  `expr/{mod,guard}.rs`), each with a `// SAFETY:` rationale. A bignum result is built
-  only through `beam_term`'s `write_big`/`big_parts`/`big_size_words` (heap-agnostic
-  writers) — never a local term-layout writer.
+- `unsafe` only in the term-word readers — `mod.rs` (`tuple_elements` and the
+  `list_elements` walk), `pattern.rs`, `expr/{mod,guard,arith}.rs` and `exec.rs`'s
+  `eq_body_raw` — each with a `// SAFETY:` rationale. A bignum result is built only through
+  `beam_term`'s `write_big`/`big_parts`/`big_size_words` (heap-agnostic writers) — never a
+  local term-layout writer.
+
+## Word-shape gate on every list read (`crate::shape::cons_cell`)
+`select` reads the caller's raw spec words, so it must decide *what shape* a word has before touching the memory it names.
+That decision is `crate::shape::cons_cell(term) -> Option<*mut Eterm>` in `src/shape.rs` (`pub(crate)`, crate-level — not `select/mod.rs`): `Some(cell)` only for a word whose primary tag is `PrimaryTag::List` **and** whose masked `list_val` pointer is non-null.
+Each call site then reads `*cell` (CAR) and `*cell.add(1)` (CDR) in its own `// SAFETY:` block and states that liveness/reachability is the caller's contract — the shape test cannot validate it.
+- `mod.rs::list_elements` — the spec clause-list walk; a non-cons word ends it as `None` (⇒ `compile`'s `badarg`).
+- `pattern.rs::decode` — the head's cons branch, after the up-front `is_term_word` rejection.
+- `pattern.rs::matches` — a cons-pattern head against a non-cons **object** is a non-match, never a read.
+- `expr/mod.rs::decode` — the guards/body cons branch, after the same up-front rejection.
+- `expr/mod.rs::eval`'s `Hd`/`Tl`/`Length` — a non-cons operand is the C guard failure ⇒ `badarg`.
+- `exec.rs::eq_body_raw` — the raw `{const, X}` body subterm tree (the C `db_match_eq_body`).
+
+**Both decoders reject a non-term word up front.** `pattern::decode` and `expr::decode` return `badarg` for a word failing `beam_term::tag::is_term_word` (`!is_header`) before any shape test, so a header word in the head, the guards list or the body — at any nesting depth — is the oracle's `badarg` for a malformed spec instead of a dereference.
+
+**`classify`'s `unsafe` needs no non-term guard.** `beam_term::ops::class` answers `TermClass::NonValue` for a `TAG_PRIMARY_HEADER` word **with no dereference** and classifies every immediate from the word's bits alone; it dereferences only a `TAG_PRIMARY_BOXED` word, so only a boxed word's liveness is the caller's contract (and both decoders have already rejected a non-term).
+
+**Why `is_list` alone is not enough.** `beam_term::list::is_list` is the C bit trick `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) != 0`, i.e. `!(x & 0x2)`, which is **also** true for every `TAG_PRIMARY_HEADER` word (primary tag `0`) — a word that is not a term at all, so a stale/foreign caller-heap word passing it reached a `car` dereference (a measured SIGSEGV).
+
+**No observable behaviour changed.** A header word is never a value, so no Erlang-representable term changes classification: `ets:select(T, [])` ⇒ `[]`, `select_count`/`select_delete`/`select_replace(T, [])` ⇒ `0`, a non-list spec is still `badarg`, and `match_spec_run` still requires the compiled handle.
+No differential case was added for that reason; the existing 191-case differential battery stays green.
+
+**Residual — the ownership rule upstream is the real fix.** A word whose low two bits happen to be `01` but which does not point at a live cell is indistinguishable from a cons cell by any word-local test (ERTS's C has the same hole).
+A stored match-spec word must therefore stay rooted, or be copied into storage its owner controls, for as long as it is used: `crates/beam_bifs/src/ets/specs.rs` stores the caller's raw spec `Eterm` unrooted in its registry and hands it back at `match_spec_run/2`, and that ownership fix belongs to `beam_bifs`, not this crate.
 
 ## Ownership / aliasing contract (no term is ever copied except by `binary_part`)
 **`compile` copies nothing.** It stores the caller's raw `Eterm` words verbatim, so the
@@ -75,8 +99,9 @@ i.e. an interior-stored key word aliasing `TermStore` storage. `resume` re-reads
 **range bound** (`continuation.rs:313-318` → `ordered_interior/node.rs:526-531`
 `cmp_arith(entry.key, key, atoms)`), so a resumed continuation whose anchor object was
 deleted (its words returned to `TermStore`'s per-size free lists and reused) dereferences
-reclaimed memory — a list/tuple anchor key reaches `beam_term::list::car` on a freed cons
-cell. The identity check (`:429-431`) compares only `table_id` + `name`; nothing validates
+reclaimed memory — a list/tuple anchor key reaches a cons-cell read through
+`crate::shape::cons_cell` on a freed cell, which the shape test cannot refuse. The identity
+check (`:429-431`) compares only `table_id` + `name`; nothing validates
 a still-resolvable anchor. The continuation is **not** dropped at the end of the call:
 `beam_bifs` stores it in `TableRegistry.continuations: HashMap<u64, Continuation>`
 (`beam_bifs/src/ets.rs:355-357`, `insert_continuation` `:533-555`) and `Clone`s it per
@@ -204,7 +229,10 @@ RAII-scoped hooks that restore the default on drop (`beam_bifs/src/ets/{arith,se
 - Unit/module tests live with the sibling test files; the select layer's evidence is
   `../.../tests/select.rs`, `tests/match_spec_run.rs`, `tests/ets_select.rs`,
   `tests/ets_bignum_guard_oracle.rs`, `tests/ets_continuation.rs`, `tests/ets_replace.rs`,
-  and the differential group
+  `tests/select_word_classification.rs` (the word-shape gate: header-word specs and the
+  header word nested in each of the three clause positions, a `match_spec_run` object list
+  holding one, `key_of` on one, and a 4 020-word deterministic SplitMix64 sweep of raw words
+  reinterpreted as `Eterm` — every probed word a typed `badarg`, never a read), and the differential group
   `tests/differential/battery/{matchspec,replace,continuation}.rs` (compared line-by-line
   against the live `erl`).
 - **Coverage:** the differential `matchspec` group pins the extended guard/body set
@@ -297,11 +325,13 @@ changes are owed there (report, do not apply):
    strings are recorded above for whoever picks it up.
 
 ## Routing Table
-- `mod.rs` → `MatchSpec`/`MatchClause`/`compile`/`SelectPredicate` + term-decode helpers (`atom_name`, `var_index`, `tuple_elements`, `list_elements`)
+- `mod.rs` → `MatchSpec`/`MatchClause`/`compile`/`SelectPredicate` + term-decode helpers (`atom_name`, `var_index`, `tuple_elements`, `list_elements` — the last walking through `crate::shape::cons_cell`)
 - `pattern.rs` → `Pattern` + head decode/match
 - `expr/mod.rs` → `Expr`/`CmpOp`/`TypeTest`/`ArithOp`/`Value` + `ArithHook` + `decode`/`decode_tuple`/`decode_call`/`eval`/`eval_term`/`value_bool`/`classify`
 - `expr/guard.rs` → the guard-BIF helpers (incl. `abs_of`/`bnot`/`integral_of`/`ceil_floor`/`float_to_integer`/`f64_magnitude_limbs`/`write_big_term`/`ceil_floor`/`max_min`/`binary_part2,3`/`is_record3`/`is_function2`/`is_integer3`/`node0,1`/`xor` + `map_get`/`map_size`/`is_map_key`/`tuple_size`/`byte_size`/`bit_size`/`float`/`trunc`/`round` + map construction) + the `SelfHook`/`set_self_hook` seam
 - `exec.rs` → `impl Table` select/match/delete/replace/count + `run_clauses`/`guards_hold`/`spec_for_pattern`/`BodyKind` + the static `select_replace` body check (`static_keeps_key`/`clause_keeps_key`, the `db_match_keeps_key` mirror)
 - `run.rs` → `match_spec_run` (raw-spec list runner)
 - `continuation.rs` → `MatchContinuation` + its private `Cursor` (`Begin`/`Anchor(key)` for an `ordered_set`/`Position(ordinal)` for the hash kinds) + the limit/continue forms (`traverse`/`traverse_ordered`/`traverse_positional`/`resume`)
+- `../shape.rs` → the crate-level word-shape predicate `cons_cell(term) -> Option<*mut Eterm>` every list read here is gated on (`PrimaryTag::List` **and** a non-null cell pointer; `is_list` alone also accepts every header word) + its unit tests
+- `../../tests/select_word_classification.rs` → the word-classification suite (header-shaped specs and a header word in each of the three clause positions, `match_spec_run` over an object list holding one, `key_of`, and the deterministic raw-word sweep — each a typed error)
 - `../../../beam_bifs/src/{match_spec.rs,ets/{matches,reverse,specs,extra}.rs}` → the BIF bridges over this layer (they delegate to `compile`/`match_spec_run`/`Table::*`; no duplicated matcher)

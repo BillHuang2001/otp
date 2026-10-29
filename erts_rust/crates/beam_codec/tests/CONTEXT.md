@@ -52,6 +52,12 @@ The crate-level Intent / API Surface / Constraints / Known Issues are [`../CONTE
   arity, the no-gate fallback, `NEW_FUN_EXT`/non-`safe` never asking, a `COMPRESSED` image still
   gated, plus a live `binary_to_term/2 [safe]` oracle cross-check.
 - `export_arity_oracle.rs` — the `EXPORT_EXT` arity truncation against a live oracle.
+- `local_fun_encode.rs` — the local (`make_fun3`) fun's `NEW_FUN_EXT` identity: the typed gap with
+  no identity, the pure round-trip of a supplied identity, the single-fun byte identity against a
+  compiled fixture (`lfun`), and `two_different_local_funs_encode_byte_exactly_like_the_oracle` —
+  the **per-fun** `FunIdentityResolver` encoding a rebuilt two-lambda list (indices 1 and 2, two
+  distinct identities) byte-identically to the oracle's own `term_to_binary([F1, F2])`, plus each
+  fun's own single-identity image.
 **Deterministic attribution**
 - `alloc_count.rs` over `attrib_support/` (a thread-local counting `#[global_allocator]`) pins the
   **exact** allocations for the `copy_bound` bench payload: **1** per encode, **26** fresh / **3**

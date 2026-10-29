@@ -524,6 +524,193 @@ pub(crate) fn bitstring_bit_size(term: Eterm) -> Result<usize> {
     Ok(unsafe { beam_term::bitstring_size(term) })
 }
 
+/// The size, in **bytes**, of the whole off-heap payload an `ErlSubBits` window
+/// references — the C's `(br->val)->orig_size` (`Binary.orig_size`,
+/// `../../erts/emulator/beam/erl_binary.h:75`), which is the *requested* payload
+/// width and not the physical allocation: `erts_bin_nrml_alloc(size)` and
+/// `erts_bin_realloc(binp, size)` both record exactly `size`, so an allocator's
+/// rounding is invisible to the BIF
+/// (`erl_bif_binary.c:2711`, `binary:referenced_byte_size/1`).
+///
+/// The frozen analogue is [`beam_alloc::payload_capacity`], the payload header's
+/// `capacity` word ("the writable capacity in bytes — the append ceiling"): for a
+/// `RefcBinary::new(&bytes)` payload it *is* `bytes.len()`, and for an append
+/// accumulator it is the width the C's growth rule tests against
+/// (`erl_bits.c:1969`: `if (refc_binary->orig_size < used_size)`), never the
+/// allocator's `reserved` slack.
+///
+/// `None` is the C's `br == NULL`: an on-heap `ErlHeapBits` (every binary this crate
+/// *builds*), or an `ErlSubBits` whose `orig` slot is **not** a `BinRef` — a match
+/// context (`erl_bits.c:117`, `ERTS_GET_BITSTRING_REF`). Both answer their own bit
+/// size, which is the caller's fallback.
+///
+/// # Safety of the read
+///
+/// The caller must hold a live `term` (a BIF argument is live for the call), which
+/// keeps the payload it names alive by the same reachability convention
+/// [`binary_bytes`] above relies on to read the payload's *bytes*: `BinRef.val` is
+/// the payload's first data byte (the frozen contract
+/// `BinRef.val == RefcBinary::data_ptr()`), so `payload_capacity` reads only the
+/// control header word `HEADER_SIZE` bytes before it, and the window's own
+/// `offset_bits..end` cannot exceed that payload.
+pub(crate) fn refc_payload_bytes(term: Eterm) -> Option<usize> {
+    // SAFETY: `is_refc_binary` dereferences only the boxed thing's header and, for an
+    // `ErlSubBits`, its live `orig` slot; `term` is a live term.
+    if !unsafe { beam_term::refc::is_refc_binary(term) } {
+        return None;
+    }
+    // SAFETY: `is_refc_binary` just proved `term` is a 5-word `ErlSubBits`, so word
+    // 4 (`orig`) is initialised.
+    let (_base, _start, _end, orig) = unsafe { beam_term::bitstring::sub_bits_parts(term) };
+    // SAFETY: `orig` is a live `BinRef` (that is what `is_refc_binary` tested), so
+    // [`beam_term::refc::bin_ref_parts`] reads two initialised words of it.
+    let (val, _next) = unsafe { beam_term::refc::bin_ref_parts(orig) };
+    if val.is_null() {
+        return None;
+    }
+    // SAFETY: `val` is that live payload's first data byte, kept alive by `term`, and
+    // `payload_capacity` reads only the header's `capacity` word from it.
+    Some(unsafe { beam_alloc::payload_capacity(val.cast::<u8>()) })
+}
+
+/// Builds the **sub-binary window** `parent[bit_offset .. bit_offset + bit_size]` on
+/// `heap` — the crate's one producer of a `binary:part/2,3` /
+/// `erlang:binary_part/2,3` result.
+///
+/// The layout and the arm choice are `beam_term::refc`'s (a port of
+/// `erts_build_sub_bitstring`, `../../erts/emulator/beam/erl_bits.c:2637-2665`), so
+/// this wrapper adds only the heap reservation and the crate's error mapping:
+/// `sub_binary_words` reports the words the writer needs (validating the parent's
+/// shape by the same rule the writer uses, so the two cannot disagree), and
+/// `write_sub_binary` writes them. Two arms, chosen on the **window's** bit size:
+///
+/// * `bit_size <= ERL_ONHEAP_BITS_LIMIT` (512 bits / 64 bytes) ⇒ a fresh
+///   `ErlHeapBits` at `hp` holding a shifted copy of the window's bits — the same
+///   block [`make_heap_bitstring`] writes, so `binary:referenced_byte_size/1` of the
+///   result is its own byte count (the oracle's answer for this arm too: C makes
+///   the same choice, `erts_extracted_bitstring_size`, and copies as well).
+/// * above it, over a parent **with an off-heap payload** ⇒ the 8-word
+///   `[BinRef][ErlSubBits]` pair naming the parent's payload with
+///   `start = parent_start + bit_offset`, so not a byte is copied and
+///   `binary:referenced_byte_size/1` answers the parent payload's width
+///   ([`refc_payload_bytes`], the C's `(br->val)->orig_size`).
+///
+/// The one shape the builder **refuses** is a window above the limit whose parent
+/// has no payload to share (`ErlHeapBits` — including every binary this crate itself
+/// builds, which stay on-heap by placement policy): there is no window to mint, so
+/// the refusal surfaces as [`BeamError::BadArg`] and the caller must keep copying
+/// (`crate::binary::part_slice` gates that arm before calling, and answers the copy
+/// there). Every other refusal (a malformed parent, a range outside it) is a bug in
+/// the caller, which validates the range first through [`crate::iolist::part_range`]
+/// — the crate's one spelling of `erts_binary_part`'s rule.
+///
+/// # Placement and lifetime
+///
+/// `heap` is the BIF context's destination heap ([`BifContext::heap`]): the
+/// runtime's pooled, never-reset, **unscanned** arena, so the pair written here is
+/// the exact class of write [`make_heap_bitstring`] already performs on it, and the
+/// host copies the result onto the process heap (or the `-eval` store) before the
+/// arena is rewound.
+///
+/// The child's `BinRef.val` names the **parent's** payload, which the window keeps
+/// alive only by the reachability convention the rest of this module relies on: the
+/// parent is a live BIF argument for the whole call, and the payload behind it is
+/// retained by whoever owns it (the engine's `RefcBinary` reservoir / the process's
+/// off-heap store) until the host's result copy-out, which reads the window and
+/// re-materializes it. Nothing here allocates or frees a payload, so this function
+/// cannot create a dangling pointer — but it also cannot extend the payload's life
+/// past the call (see `crate::binary`'s module doc, *The window and the host's
+/// result copy-out*).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] on either refusal above, and whatever the heap reports when
+/// the reservation cannot be satisfied.
+///
+/// [`BifContext::heap`]: crate::BifContext::heap
+pub(crate) fn make_sub_binary(
+    heap: &mut Heap,
+    parent: Eterm,
+    bit_offset: usize,
+    bit_size: usize,
+) -> Result<Eterm> {
+    // SAFETY: `parent` is a live bitstring term (the caller's validated BIF
+    // argument), so `sub_binary_words` dereferences only its header — and, for an
+    // `ErlSubBits`, its own live `orig` slot. It applies the identical shape
+    // validation `write_sub_binary` applies, so the word count returned is exactly
+    // what that writer expects at `hp`.
+    let words = unsafe { beam_term::refc::sub_binary_words(parent, bit_size) }
+        .map_err(|_| BeamError::BadArg)?;
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
+    let hp = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `hp` addresses exactly the `words` words `sub_binary_words` reported —
+    // exclusively owned and never moved (the arena is pointer-stable), which is the
+    // writer's first obligation. `parent` is still that live term, and the range
+    // `bit_offset .. bit_offset + bit_size` is inside its window: the caller validated
+    // the byte range with `iolist::part_range` against the parent's byte size, and the
+    // writer re-checks the bit range and refuses (writing nothing) rather than
+    // overrunning. The payload behind a refc parent is the live one the parent names
+    // and is read-only here, so the second obligation (alive and unmoved) holds for
+    // the whole call.
+    unsafe { beam_term::refc::write_sub_binary(hp, parent, bit_offset, bit_size) }
+        .map_err(|_| BeamError::BadArg)
+}
+
+/// Test-only: writes the off-heap `[BinRef][ErlSubBits]` pair for the window
+/// `offset_bits .. offset_bits + size_bits` over `payload` — the shape the engine's
+/// `bs_create_bin` writes for a payload above `ERL_ONHEAP_BINARY_LIMIT`, and the shape
+/// [`make_sub_binary`]'s window arm produces on top of a parent that already has a
+/// payload.
+///
+/// It lives **here** rather than in a test suite because writing the pair needs
+/// `unsafe`, and `crate::access` is one of this crate's two `#[allow(unsafe_code)]`
+/// modules: `crate::binary`'s in-module suite can therefore mint a real refc parent
+/// without a third allowance or a public term-construction helper.
+///
+/// `payload` owns the storage the pair points into and must outlive every use of the
+/// returned term.
+#[cfg(test)]
+pub(crate) fn test_refc_binary(
+    heap: &mut Heap,
+    payload: &beam_alloc::RefcBinary,
+    offset_bits: usize,
+    size_bits: usize,
+) -> Eterm {
+    let base = payload.data_ptr();
+    // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
+    // writable words — exactly the pair `write_refc_binary` fully writes.
+    let hp = unsafe { heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
+        .expect("the 8-word pair fits");
+    // SAFETY: `hp` is that reserved pair; `base` is the first byte of `payload`'s
+    // live, `UNIT_SIZE`-aligned data area (kept alive by the caller), which covers
+    // bits `offset_bits..offset_bits + size_bits`.
+    unsafe {
+        beam_term::refc::write_refc_binary(
+            hp,
+            base.cast::<Eterm>(),
+            core::ptr::null_mut(),
+            base,
+            offset_bits,
+            size_bits,
+        )
+    }
+}
+
+/// Test-only: [`test_refc_binary`] plus the payload it needs, minted over `bytes`
+/// (the caller keeps the payload alive) — the term a `binary:copy/2` above
+/// `ERL_ONHEAP_BINARY_LIMIT` would be if this crate could allocate off-heap.
+#[cfg(test)]
+pub(crate) fn test_refc_window(
+    heap: &mut Heap,
+    bytes: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+) -> (Eterm, beam_alloc::RefcBinary) {
+    let payload = beam_alloc::RefcBinary::new(bytes).expect("the off-heap payload allocates");
+    let root = test_refc_binary(heap, &payload, offset_bits, size_bits);
+    (root, payload)
+}
+
 /// Copies the bytes of a byte-aligned bitstring (a *binary*) out of the term.
 ///
 /// **Both** frozen bitstring representations are handled, through the LCA reader
@@ -754,22 +941,28 @@ pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
 /// and places a hash map's keys by `erts_map_hash`, collapsing duplicate keys
 /// **last value wins** in both cases.
 ///
-/// The atom table passed to `write_map` is a **fresh empty one**. The builder
-/// consults it only to name atoms in a *tie-break* (`compare::cmp_atoms`, reached
-/// from `cmp`/`eq` for keys whose hashes collide); an unknown name falls back to the
-/// raw atom index, so the result stays deterministic and — because distinct atoms
-/// have distinct indices — never merges two distinct keys. The same substitution
-/// (`beam_abi`'s driver host `map_term`) is used there for the same reason: taking
-/// `ctx.atoms()` alongside `ctx.heap()` would need two simultaneous borrows of
-/// [`BifContext`](crate::context::BifContext).
+/// `atoms` is the caller's **live** namespace — the same table [`map_put_cow`] is
+/// handed — and it decides only the ordering *tie-break* of a **compound** key's atom
+/// elements: a flat map's keys are ordered by `erts_cmp_flatmap_keys`, which compares
+/// two *atom* keys by raw atom index but recurses into `compare::cmp` for everything
+/// else, so a compound key's atom elements reach `compare::cmp_atoms`, which orders two
+/// *named* atoms by name. A fresh (or empty) table would leave every name unknown there
+/// and fall back to the raw atom index — the wrong order, because ERTS compares atoms by
+/// **name** (`erts_cmp_atoms`, `erts/emulator/beam/erl_utils.h:193-220`: an `ord0` fast
+/// path, then `sys_memcmp` on the name, then the length). Distinct atoms have distinct
+/// names *and* indices, so a rebuild never merges two distinct keys either way; only the
+/// stored order — hence the `MAP_EXT` bytes — differs.
 ///
 /// # Errors
 ///
 /// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
 /// fit the block, and the builder's own `TermError` (reconciled to
 /// [`BeamError::BadArg`]) for a malformed key.
-pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
-    let atoms = AtomTable::new();
+pub(crate) fn make_map(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    pairs: &[(Eterm, Eterm)],
+) -> Result<Eterm> {
     let words = beam_term::map::map_words_capacity(pairs.len());
     // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
     let p = unsafe { heap.alloc_words(words)? };
@@ -777,7 +970,118 @@ pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eter
     // it needs (the reservation is a documented upper bound, so trailing words may
     // stay unwritten) and returns a boxed root into the same block, which stays live
     // and unmoved for as long as `heap` does, which the caller keeps alive.
-    Ok(unsafe { beam_term::map::write_map(p, pairs, &atoms)? })
+    Ok(unsafe { beam_term::map::write_map(p, pairs, atoms)? })
+}
+
+/// The words [`map_put_cow`] must reserve for a put of `key` into `map`.
+///
+/// A **flat** map's hash path holds no collision node, so the size-only capacity bound
+/// is exact ([`beam_term::map::map_put_cow_words_capacity`]). A **hash** map's path may
+/// cross a collision node, whose cell count the map's size cannot bound, so the figure
+/// comes from the writer's own read-only, plan-sharing descent
+/// ([`beam_term::map::map_put_cow_words_required`]) — the same descent that refuses a
+/// map the writer rejects, so a refusal here precedes any reservation.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-map or a malformed map interior (the writer's
+/// `BadMap`) — the class the pair walk of the rebuild path reported for the same input.
+pub(crate) fn map_put_cow_words(map: Eterm, key: Eterm) -> Result<usize> {
+    let size = map_size(map)?;
+    if size > beam_term::map::MAP_SMALL_MAP_LIMIT {
+        Ok(beam_term::map::map_put_cow_words_required(map, key)?)
+    } else {
+        Ok(beam_term::map::map_put_cow_words_capacity(size))
+    }
+}
+
+/// The words [`map_remove_cow`] must reserve — [`map_put_cow_words`]'s rule on the
+/// remove side (`0` for an absent key, which writes nothing).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-map or a malformed map interior.
+pub(crate) fn map_remove_cow_words(map: Eterm, key: Eterm) -> Result<usize> {
+    let size = map_size(map)?;
+    if size > beam_term::map::MAP_SMALL_MAP_LIMIT {
+        Ok(beam_term::map::map_remove_cow_words_required(map, key)?)
+    } else {
+        Ok(beam_term::map::map_remove_cow_words_capacity(size))
+    }
+}
+
+/// The map that binds `key` to `value`, written by copying **only the nodes on `key`'s
+/// hash path** ([`beam_term::map::map_put_cow`] — the C's `erts_maps_put` and its HAMT
+/// twin `erts_hashmap_insert_down`); every off-path subtree is shared with `map` by
+/// word.
+///
+/// A put that finds the stored value word already identical writes nothing and returns
+/// **`map` itself** (the writer's `Nothing` arm, the C's `found_key: if (*vs == value)
+/// { … return map; }`).
+///
+/// `atoms` is the **live** namespace: it decides the flat-map key order of a *fresh*
+/// keys tuple (only through a compound key's atom elements, `cmp_flatmap_keys` → `cmp`)
+/// and a hash-collision node's cell order; atom keys themselves compare by raw index on
+/// either route.
+///
+/// # Errors
+///
+/// The writer's `BadMap` (reconciled to [`BeamError::BadArg`]) for a malformed map
+/// interior, and [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
+/// fit the reservation.
+///
+/// # Why the unsafe block is sound here
+///
+/// `heap` is a BIF working arena: a heap **distinct** from the source map's storage (a
+/// process heap, or an earlier region of this same arena), so no node is ever relocated
+/// in place, and its bump pointer lies past every word handed out so far, so the
+/// reservation cannot overlap a live term of the caller's call. It is sound for the
+/// arena to be shorter-lived than the source map because the caller copies the result
+/// onto the process heap before the arena is rewound, and that copy walks every
+/// reachable node — the off-path subtrees shared with `map` included. `map` is a live
+/// map term this crate's builders produced (the crate's universal term invariant, as
+/// for every other accessor here), and the writer validates its interior before
+/// writing.
+pub(crate) fn map_put_cow(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    map: Eterm,
+    key: Eterm,
+    value: Eterm,
+) -> Result<Eterm> {
+    let words = map_put_cow_words(map, key)?;
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words of the
+    // arena, whose bump pointer is past every live term — see the arena reasoning above.
+    let hp = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `hp` addresses the `map_put_cow_words_required`/`_capacity` extent for
+    // this map and key, in a heap that outlives the result's use; `map` is a live map
+    // this crate's builders produced, and the writer validates its interior (`BadMap`)
+    // before writing.
+    unsafe { beam_term::map::map_put_cow(hp, map, key, value, atoms) }.map_err(Into::into)
+}
+
+/// `map` without `key`, written by copying only the nodes on `key`'s hash path
+/// ([`beam_term::map::map_remove_cow`] — the C's `hashmap_delete`).
+///
+/// `Ok(None)` iff the key is absent: nothing is written then and the caller answers its
+/// input map, which is what `maps:remove/2` and `maps:take/2` do.
+///
+/// # Errors
+///
+/// As [`map_put_cow`].
+///
+/// The same arena reasoning as [`map_put_cow`], with [`map_remove_cow_words`]'s extent.
+pub(crate) fn map_remove_cow(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    map: Eterm,
+    key: Eterm,
+) -> Result<Option<Eterm>> {
+    let words = map_remove_cow_words(map, key)?;
+    // SAFETY: as in `map_put_cow`.
+    let hp = unsafe { heap.alloc_words(words)? };
+    // SAFETY: as in `map_put_cow`.
+    unsafe { beam_term::map::map_remove_cow(hp, map, key, atoms) }.map_err(Into::into)
 }
 
 /// The `(key, value)` pairs of **any** map — flat map or HAMT — in the order the map
@@ -1355,37 +1659,10 @@ mod tests {
         (1..=n).map(|i| (i % 256) as u8).collect()
     }
 
-    /// Builds the off-heap `[BinRef][ErlSubBits]` pair the engine's `bs_create_bin`
-    /// writes for a payload above `ERL_ONHEAP_BINARY_LIMIT` (64) bytes, and returns
-    /// the boxed root.
-    ///
-    /// `payload` owns the storage the pair points into and must outlive every use of
-    /// the returned term.
-    fn refc_binary(
-        heap: &mut Heap,
-        payload: &RefcBinary,
-        offset_bits: usize,
-        size_bits: usize,
-    ) -> Eterm {
-        let base = payload.data_ptr();
-        // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
-        // writable words — exactly the pair `write_refc_binary` fully writes.
-        let hp = unsafe { heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
-            .expect("the 8-word pair fits");
-        // SAFETY: `hp` is that reserved pair; `base` is the first byte of `payload`'s
-        // live, `UNIT_SIZE`-aligned data area (kept alive by the caller), which covers
-        // bits `offset_bits..offset_bits + size_bits`.
-        unsafe {
-            beam_term::refc::write_refc_binary(
-                hp,
-                base.cast::<Eterm>(),
-                core::ptr::null_mut(),
-                base,
-                offset_bits,
-                size_bits,
-            )
-        }
-    }
+    /// The module-level off-heap pair writer, named for this suite's call sites
+    /// (it lives in `crate::access` because only this module and
+    /// `crate::calendar::localtime` carry `#[allow(unsafe_code)]`).
+    use super::test_refc_binary as refc_binary;
 
     #[test]
     fn binary_bytes_reads_an_off_heap_refc_binary() {

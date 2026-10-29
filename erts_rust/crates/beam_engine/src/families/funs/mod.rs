@@ -125,7 +125,7 @@ use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm, NIL};
 
 use crate::context::{BifOutcome, ExecutionContext, FunOutcome, RootSet};
 use crate::error;
-use crate::families::exceptions::callee;
+use crate::families::exceptions::{bif_frame, callee};
 use crate::machine::{namespace_atom, Continuation, Machine};
 use crate::operand::{
     operand_slack_words, read_operand, read_operand_slack, read_operands_slack, write_operand,
@@ -525,6 +525,91 @@ fn call_fun(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
+    match call_fun_target(machine, module, source, arity, ctx)? {
+        // The seam's target: the caller's return address goes into the live frame
+        // (the local `Instr::Call` discipline; the same shape the `Instr::Apply`
+        // enter branch uses) and the driver re-binds the module context.
+        CallFunOutcome::Enter {
+            context,
+            func: target_func,
+            pc: target_pc,
+        } => {
+            machine.set_continuation(Continuation::Address {
+                func,
+                pc: pc + 1,
+                context: machine.current_context(),
+            })?;
+            Ok(Some(Step::Enter {
+                context,
+                func: target_func,
+                pc: target_pc,
+            }))
+        }
+        CallFunOutcome::Value(result) => {
+            machine.set_x(0, result)?;
+            Ok(Some(Step::Next))
+        }
+        // The application could not complete without waiting: the instruction was
+        // not applied, so the machine parks on it and the host's resume re-consults
+        // the seam (which must CONTINUE the pending application, not restart it —
+        // an evaluator body is not re-execution idempotent).
+        CallFunOutcome::Suspend => Ok(Some(Step::Suspend { func, pc })),
+        CallFunOutcome::Raised(step) => Ok(Some(step)),
+    }
+}
+/// `erlang:apply(Fun, Args)`'s closure application, sharing [`call_fun_target`]'s
+/// classification and both seams.
+///
+/// C's `apply_fun` (`../../erts/emulator/beam/beam_common.c:1734-1763`) walks `Args`
+/// into `reg[0..arity]`, stores the fun at `reg[arity]` and then hands **that
+/// register shape** to `call_fun` — so by the time this is called the fun is already
+/// at `x(arity)` and the arguments at `x(0..arity)`. The only difference from
+/// `call_fun`'s own instruction forms is the **frame discipline**, which the caller
+/// (the `call_ext*` arm, through its [`ImportFrame`](crate::interpreter::ImportFrame))
+/// owns: `apply/2` is a `call_ext*` target, so `call_ext` stores a continuation,
+/// `call_ext_only` stores none and `call_ext_last` pops first.
+pub(crate) fn apply_fun_target(
+    machine: &mut Machine,
+    module: &Module,
+    arity: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<CallFunOutcome> {
+    call_fun_target(machine, module, FunSource::Register(arity), arity, ctx)
+}
+/// The outcome of a closure application, **before** any instruction's frame
+/// discipline is applied.
+///
+/// `call_fun`/`call_fun2` and the `call_ext*`-encoded `erlang:apply/2` reach the
+/// same target classification and the same two seams (the in-machine closure seam
+/// [`ExecutionContext::resolve_local_fun`] and the outcome-aware
+/// [`ExecutionContext::apply_fun_outcome`]); only their continuation/frame handling
+/// differs, which is why the shared part answers this instead of a [`Step`].
+pub(crate) enum CallFunOutcome {
+    /// The closure names code in this machine: its free variables are already copied
+    /// into `x(arity..)`. The caller enters `(context, func, pc)`, storing **its own**
+    /// return address first when its form has one to store.
+    Enter { context: u32, func: u32, pc: u32 },
+    /// The closure seam's value fallback produced this value (the caller stores it in
+    /// `x(0)`).
+    Value(Eterm),
+    /// The application could not complete without waiting and applied **nothing**, so
+    /// the caller parks on its own instruction.
+    Suspend,
+    /// The raise landed in a live catch frame; the landing's registers (`x(0)` =
+    /// `THE_NON_VALUE`, `x(1..=3)`) must not be clobbered.
+    Raised(Step),
+}
+/// The shared classification + dispatch of a closure application ([`call_fun`],
+/// [`apply_fun_target`]): the target's shape is checked against the call's arity, the
+/// in-machine closure seam is consulted, and the outcome-aware fallback is the
+/// value/suspend route.
+fn call_fun_target(
+    machine: &mut Machine,
+    module: &Module,
+    source: FunSource<'_>,
+    arity: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<CallFunOutcome> {
     let fun = source.read(machine, ctx)?;
     if !terms::is_fun(fun) {
         // Only raise the structured reason when the running module can actually
@@ -532,7 +617,7 @@ fn call_fun(
         // comment: `beam_rt` seeds `badfun`, so the real runtime always takes this
         // path, while an atom-poor test module reaches the `apply_fun` fallback).
         if namespace_atom(ctx, module, "badfun").is_some() {
-            return raise_badfun(machine, module, &source, ctx).map(Some);
+            return raise_badfun(machine, module, &source, ctx).map(CallFunOutcome::Raised);
         }
     } else if terms::fun_arity(fun)? != arity {
         // The arity test is **unconditional**: a mismatched-arity closure must never
@@ -541,7 +626,7 @@ fn call_fun(
         // error). When the module cannot name `badarity` the raise builder reports
         // its own typed `unsupported` — a degraded *diagnostic*, never a skipped
         // check.
-        return raise_badarity(machine, module, &source, arity, ctx).map(Some);
+        return raise_badarity(machine, module, &source, arity, ctx).map(CallFunOutcome::Raised);
     }
     // The seam's operands are read from the machine's own **root set** immediately
     // before the consultation (`x(arity)` for the target, `x(0..arity)` for the
@@ -570,19 +655,11 @@ fn call_fun(
                 .module_context(context)
                 .ok_or_else(|| error::unsupported("call_fun: unknown module context"))?;
             let (target_func, target_pc) = handle.labels.resolve(label)?;
-            // The caller's return address, stored in the live frame (the local
-            // `Instr::Call` discipline; the same shape the `Instr::Apply` enter
-            // branch uses).
-            machine.set_continuation(Continuation::Address {
-                func,
-                pc: pc + 1,
-                context: machine.current_context(),
-            })?;
-            Ok(Some(Step::Enter {
+            Ok(CallFunOutcome::Enter {
                 context,
                 func: target_func,
                 pc: target_pc,
-            }))
+            })
         }
         // The host cannot run this closure in-machine: the outcome-aware apply
         // fallback (whose default forwards to the value-returning `apply_fun`, so a
@@ -605,21 +682,20 @@ fn call_fun(
             let fun = source.read(machine, ctx)?;
             let args = register_args(machine, arity)?;
             match ctx.apply_fun_outcome(fun, &args) {
-                Ok(FunOutcome::Return(result)) => {
-                    machine.set_x(0, result)?;
-                    Ok(Some(Step::Next))
-                }
+                Ok(FunOutcome::Return(result)) => Ok(CallFunOutcome::Value(result)),
                 // The application could not complete without waiting: the instruction was
                 // not applied, so the machine parks on it and the host's resume
                 // re-consults the seam (which must CONTINUE the pending application, not
                 // restart it — an evaluator body is not re-execution idempotent).
-                Ok(FunOutcome::Suspend) => Ok(Some(Step::Suspend { func, pc })),
+                Ok(FunOutcome::Suspend) => Ok(CallFunOutcome::Suspend),
                 // A raise inside the applied closure must route through the
                 // catch-aware funnel, not escape the caller's `try`/`catch`.
-                Err(e) => Ok(Some(fun_apply_error(machine, module, &source, arity, e, ctx)?)),
+                Err(e) => {
+                    fun_apply_error(machine, module, &source, arity, e, ctx).map(CallFunOutcome::Raised)
+                }
             }
         }
-        Err(e) => Ok(Some(fun_apply_error(machine, module, &source, arity, e, ctx)?)),
+        Err(e) => fun_apply_error(machine, module, &source, arity, e, ctx).map(CallFunOutcome::Raised),
     }
 }
 
@@ -645,6 +721,19 @@ fn call_fun(
 /// prints are deliberately not fabricated.
 ///
 /// Every other error keeps the catch-aware funnel unchanged.
+///
+/// **No BIF head item is armed here, deliberately.** This funnel carries a
+/// *closure application* failure, not a BIF failure: the applied value is a fun, and
+/// the site has no BIF `(module, function, arity)` identity to name — a fun's
+/// identity is `{Fun, Args}` (`lambda_head_item`) or a *code* frame with a real
+/// `[{file,_},{line,_}]` location, never a `{Module, Function, ArgList, […]}` item. A
+/// fun that wraps a BIF (`(fun erlang:hd/1)(1)`) is dispatched by the host's own
+/// closure seam (`RuntimeContext::apply_non_local_fun` → `call_bif`), so the BIF
+/// identity exists only on the far side of a seam this module cannot see through, and
+/// synthesizing one from the fun term would equally "name" `lists:max/1` — an Erlang
+/// frame whose oracle item carries a file/line location, which no BIF head item may
+/// imitate. The `apply`/`apply_target` route, which *does* know the BIF MFA, arms the
+/// head (see [`apply_target`]).
 fn fun_apply_error(
     machine: &mut Machine,
     module: &Module,
@@ -867,7 +956,26 @@ pub(crate) fn apply_target(
             let function_term = machine
                 .x(arity + 1)
                 .ok_or_else(|| error::bad_register(arity + 1))?;
-            let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;
+            // The `undef` head takes precedence: it names a callee that does not exist
+            // (`Location` `[]`), and the failing dispatch never happened. Only when the
+            // target **did** resolve to a BIF and that BIF failed does the oracle cook
+            // the BIF head item — the BIF's own declared arity and its real arguments,
+            // which are the registers `x(0..arity)` this site marshalled (measured:
+            // `apply(erlang,hd,[1])` cooks `{erlang,hd,[1],[{error_info,#{module =>
+            // erl_erts_errors}}]}`, while `apply(erlang,error,[foo])` keeps the caller
+            // frame — the [`bif_frame::is_non_bif_raise`] gate).
+            let head = match callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)? {
+                Some(item) => Some(item),
+                None => bif_frame::bif_head_item_regs(
+                    machine,
+                    ctx,
+                    module,
+                    &module_name,
+                    &function_name,
+                    arity,
+                    &e,
+                )?,
+            };
             Ok(ApplyTarget::Raised(
                 machine.raise_bif_error_with_head(module, e, head, ctx)?,
             ))

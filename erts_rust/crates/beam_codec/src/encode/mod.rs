@@ -250,6 +250,72 @@ impl FunIdentity {
     }
 }
 
+/// The **per-fun** `NEW_FUN_EXT` (`112`) identity resolver seam.
+///
+/// [`Encoder::with_fun_identity`] carries **one** [`FunIdentity`] per encoder, which
+/// is exactly right for a term whose local (`make_fun3`) funs all share it — a bare
+/// fun, one closure in a list/tuple/map, the same closure twice, even a
+/// self-recursive named fun (its `env` entry is the fun itself, so one identity
+/// still covers every occurrence). It cannot express a term holding **two different
+/// lambdas** — `[fun() -> ok end, fun(X) -> {X, X} end]`, or the everyday
+/// `f() -> G = fun() -> ok end, fun() -> G end` whose outer closure captures the
+/// inner one — because each fun needs *its own* module/`uniq`/`old_index`/
+/// `old_uniq`/creator on the wire, and one slot would write the outer identity into
+/// the inner fun's fields: one wrong byte of a silently wrong image.
+///
+/// A resolver is asked once for **every** `FunKind::Local` fun the encoder is about
+/// to write, at exactly the point the C encoder reads that fun's own `ErlFunEntry`
+/// (`external.c:3966-3993`), so each fun is built from its own identity. The
+/// `arity`/`index`/`num_free`/environment still come from the **term** (the local-fun
+/// emitter's split is unchanged): only the five fields the term does not carry are
+/// resolved.
+///
+/// # Answers
+///
+/// * `Ok(Some(identity))` — write that identity into this fun's `NEW_FUN_EXT`.
+/// * `Ok(None)` — the host cannot attribute this fun (its defining module is not
+///   loaded, or it is a runtime-synthesized `-eval` closure). The encoder reports
+///   the typed [`crate::error::unsupported_local_fun`] for it rather than invent the
+///   missing fields.
+/// * `Err(e)` — propagated unchanged.
+///
+/// # Precedence
+///
+/// An installed resolver is **authoritative**: it decides for every local fun, and
+/// a single [`Encoder::with_fun_identity`] is not consulted as a fallback (falling
+/// back would risk writing one identity into a different fun). Install one or the
+/// other, not both.
+///
+/// A closure works directly — the blanket impl below turns any
+/// `FnMut(Eterm) -> Result<Option<FunIdentity>>` into a resolver:
+///
+/// ```ignore
+/// let mut resolve = |fun: Eterm| Ok(lookup(fun));
+/// let mut encoder = Encoder::new(&atoms).with_fun_identity_resolver(&mut resolve);
+/// ```
+///
+/// The seam belongs to the **host**, like every other optional seam in this crate:
+/// the codec owns the wire rule, the runtime owns the lambda tables.
+pub trait FunIdentityResolver {
+    /// The identity to write for the local (`make_fun3`) fun `fun`, or `None` when
+    /// it cannot be attributed (see the trait docs).
+    ///
+    /// # Errors
+    ///
+    /// Reports a resolution failure as a [`beam_common::BeamError`]; the encoder
+    /// propagates it and writes no further bytes.
+    fn resolve(&mut self, fun: Eterm) -> Result<Option<FunIdentity>>;
+}
+
+impl<F> FunIdentityResolver for F
+where
+    F: FnMut(Eterm) -> Result<Option<FunIdentity>>,
+{
+    fn resolve(&mut self, fun: Eterm) -> Result<Option<FunIdentity>> {
+        self(fun)
+    }
+}
+
 /// Incremental external term format encoder.
 ///
 /// Holds a borrowed atom table (the sole source of atom names) and an output
@@ -277,7 +343,15 @@ pub struct Encoder<'a> {
     /// used to encode a [`FunKind::Local`](crate::term::FunKind) fun as
     /// `NEW_FUN_EXT`. `None` — the default — keeps such a fun
     /// [`crate::error::unsupported_local_fun`] (the identity cannot be invented).
+    ///
+    /// Consulted only when no [`Encoder::with_fun_identity_resolver`] is installed
+    /// (a resolver is authoritative — see [`FunIdentityResolver`]).
     fun_identity: Option<FunIdentity>,
+    /// The per-fun identity resolver installed via
+    /// [`Encoder::with_fun_identity_resolver`]: the one slot that can express a term
+    /// holding **several different** local funs (see [`FunIdentityResolver`]).
+    /// `None` — the default — leaves `fun_identity` to answer for every local fun.
+    fun_identity_resolver: Option<&'a mut dyn FunIdentityResolver>,
     /// The `term_to_binary/2` `deterministic` option (`DFLAG_DETERMINISTIC`): when
     /// set, a map's pairs are emitted sorted by **full term order** on the key
     /// rather than in the map's stored order (see [`Encoder::set_deterministic`]).
@@ -322,6 +396,7 @@ impl<'a> Encoder<'a> {
             atom_cache: None,
             local_node: None,
             fun_identity: None,
+            fun_identity_resolver: None,
             deterministic: false,
             local_ext: false,
         }
@@ -510,8 +585,40 @@ impl<'a> Encoder<'a> {
     ///
     /// The default is `None`, so every existing signature and every un-flavoured
     /// [`encode_term`] is byte-for-byte unchanged.
+    ///
+    /// This slot is **one identity for the whole encoder**, so it covers every local
+    /// fun a term contains only when they all share it (a bare fun, one closure in a
+    /// list/tuple/map, the same closure twice, a self-recursive named fun). A term
+    /// with two *different* lambdas needs [`Encoder::with_fun_identity_resolver`],
+    /// which answers per fun; when one is installed it is authoritative and this slot
+    /// is not consulted.
     pub fn with_fun_identity(mut self, identity: FunIdentity) -> Self {
         self.fun_identity = Some(identity);
+        self
+    }
+
+    /// Installs a **per-fun** [`FunIdentityResolver`] — the seam that encodes a term
+    /// holding several **different** local (`make_fun3`) funs, which one
+    /// [`Encoder::with_fun_identity`] slot cannot express (see
+    /// [`FunIdentityResolver`] for the everyday shapes and the answers).
+    ///
+    /// The resolver is consulted once for every `FunKind::Local` fun in the term, in
+    /// the encoder's own descent order (list elements, tuple elements, map keys and
+    /// values, a fun's environment), and is **authoritative**: it decides for every
+    /// local fun, so an also-installed [`Encoder::with_fun_identity`] is not used as
+    /// a fallback. `Ok(None)` for a fun keeps that fun the typed
+    /// [`crate::error::unsupported_local_fun`] — never a fabricated identity, never a
+    /// wrong image.
+    ///
+    /// The wire layout is untouched: `NEW_FUN_EXT`'s fields and their order are the
+    /// ones the local-fun emitter already writes; only **which** identity feeds them
+    /// changes. Without a resolver every existing signature and every image stays
+    /// byte-for-byte unchanged.
+    pub fn with_fun_identity_resolver(
+        mut self,
+        resolver: &'a mut dyn FunIdentityResolver,
+    ) -> Encoder<'a> {
+        self.fun_identity_resolver = Some(resolver);
         self
     }
 

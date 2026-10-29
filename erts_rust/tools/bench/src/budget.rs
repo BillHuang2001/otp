@@ -623,13 +623,17 @@ pub const BUDGETS: &[Budget] = &[
         metric: "latency_ms",
         stat: Stat::P99,
         limit: Limit::AtMost(5.0),
-        rationale: "The request-tail budget on the I/O-bound target, recorded at 0.11-0.16 ms \
-                    p99 while serving ~119-124k req/s through a real Cowboy release across the \
-                    three m19 external reps (m17's contended pass read 3.03-3.59 ms at ~38k \
+        rationale: "The request-tail budget on the I/O-bound target: the row's own recipe (one \
+                    staged build, one `cw_serve` harness) reads 0.27-0.29 ms p99 across the three \
+                    matched m23 rounds (median 0.2730 at ~48.9k sys req/s) and 0.53 ms p99 on the \
+                    single m23 --full pass, while the retired m19 release route read 0.11-0.16 ms \
+                    p99 at ~119-124k req/s unpinned (m17's contended pass read 3.03-3.59 ms at ~38k \
                     req/s): 5 ms leaves room for a loaded host yet still flags a real latency \
                     regression; it reads the summary the cowboy row actually records \
-                    (`latency_ms` — there is no separate p99 metric) and it is sys-only because \
-                    the Rust runtime cannot boot an OTP release.",
+                    (`latency_ms` — there is no separate p99 metric), and it stays sys-only \
+                    because the row serves the same harness under **both** runtimes but only the \
+                    sys side has a calibrated tail: a rust tail must not fail a run that has no \
+                    limit tuned for it.",
     },
     Budget {
         workload: "list_walk",
