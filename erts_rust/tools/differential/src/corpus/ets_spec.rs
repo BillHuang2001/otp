@@ -70,8 +70,106 @@
 //!   `specs/match_spec_run_self_body_returns_the_calling_pid`, which asserts the relation
 //!   `=:= [self()]` (plus the pid shape) because a pid is per-VM. The literal-atom spelling
 //!   (`self` alone in a body, which is *not* a call) is a shared observation.
+//!
+//! # The stored-handle-across-a-collection family (`specs/stored_match_spec_*`)
+//!
+//! `ets:match_spec_compile/1` answers an **opaque handle** whose payload lives off the caller's
+//! heap, while the handle itself is an ordinary term a process can store, send and keep live
+//! across a collection. That combination is the shape a case has to reach: a *stored* handle
+//! that survives a **copying** collection (so the collector must relocate or track the handle
+//! instead of dropping it), and a handle handed to **another process** and run there. Neither
+//! is observable from `-eval`'s tree walker — the walker neither compiles nor runs real
+//! bytecode, and its own term storage does not exercise the engine's GC root set — so all
+//! three cases are **module-run** cases: the embedded `diff_spec_store` module is compiled
+//! with the system `erlc` and executed through the runtime's `run` action, i.e. real bytecode
+//! on an engine machine in both runtimes. The spec is a guard-plus-arithmetic projection
+//! (`'$1' > 0` → `'$1' + 100`) over the integer object `100`, so every golden is the
+//! order-stable integer **`200`** — the right answer only when the stored handle still runs
+//! the same matcher after the collection.
+//!
+//! `survive/0` keeps the handle in a variable (a register/stack root across the `gc_bif`),
+//! `survive_two/0` stores it in the process dictionary and forces **two** collections with
+//! garbage built in between (a stored handle must survive more than one relocation), and
+//! `cross_process/0` sends it to a spawned process that runs it and replies. Every receive is
+//! bounded (`receive … after 5000 -> timeout end`), so a lost or corrupted handle shows up as
+//! a visible `timeout` answer — a mismatch — and never as a hang.
 
-use super::{Case, CaseKind, Contract, Golden, Probe};
+use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
+
+/// The embedded module for the three stored-handle cases (`specs/stored_match_spec_*`).
+///
+/// Every function returns an integer (the shape a module-run golden pins) after running a
+/// **stored** `ets:match_spec_compile/1` handle across a forced collection:
+///
+/// * `spec/0` — the one spec all three cases store: it matches the bare object `'$1'`, guards
+///   it with `'$1' > 0` and projects `'$1' + 100`, so the object `100` yields exactly `200`;
+/// * `survive/0` — the handle is a **variable** live across `erlang:garbage_collect/1` (a
+///   register/stack root of the `gc_bif`), then run;
+/// * `survive_two/0` — the handle is stored in the **process dictionary**, garbage is built and
+///   the process collects **twice** before the handle is fetched back and run;
+/// * `cross_process/0` — the handle is sent to a spawned process, which runs it there and
+///   replies; both receives are bounded, so a lost handle answers the visible atom `timeout`.
+const DIFF_SPEC_STORE_SOURCE: &str = "-module(diff_spec_store).\n\
+     -export([survive/0, survive_two/0, cross_process/0]).\n\
+     spec() ->\n\
+         ets:match_spec_compile([{'$1', [{'>', '$1', 0}], [{'+', '$1', 100}]}]).\n\
+     survive() ->\n\
+         S = spec(),\n\
+         true = erlang:garbage_collect(self()),\n\
+         [Stored] = ets:match_spec_run([100], S),\n\
+         Stored.\n\
+     survive_two() ->\n\
+         put(stored_spec, spec()),\n\
+         _ = lists:seq(1, 2000),\n\
+         true = erlang:garbage_collect(self()),\n\
+         _ = lists:seq(1, 2000),\n\
+         true = erlang:garbage_collect(self()),\n\
+         [Stored] = ets:match_spec_run([100], get(stored_spec)),\n\
+         Stored.\n\
+     cross_process() ->\n\
+         Self = self(),\n\
+         Pid = spawn(fun() ->\n\
+             receive\n\
+                 {spec, Sp} -> erlang:send(Self, {res, ets:match_spec_run([100], Sp)})\n\
+             after 5000 -> ok\n\
+             end\n\
+         end),\n\
+         erlang:send(Pid, {spec, spec()}),\n\
+         receive\n\
+             {res, Answer} -> hd(Answer)\n\
+         after 5000 -> timeout\n\
+         end.\n";
+
+/// One **module-run** case of the stored-handle family: the embedded [`DIFF_SPEC_STORE_SOURCE`]
+/// is compiled with the system `erlc` and the named 0-arity function is applied by both
+/// runtimes (`beam_rt run <dir>/diff_spec_store.beam diff_spec_store:<function>/0` on the Rust
+/// side, `-pa <dir>` + `-eval` on the oracle's), so the spec really runs as bytecode on an
+/// engine machine. The golden is the oracle's integer line (`200`).
+fn stored_spec_case(id: &'static str, description: &'static str, function: &'static str) -> Case {
+    Case {
+        id,
+        description,
+        // A.2 for the `erlc`-compiled `.beam`, A.1 for the value the matcher must still
+        // produce after the collection, A.7 for the `ets:match_spec_*` surface itself.
+        contracts: &[
+            Contract::BeamAsm,
+            Contract::LanguageSemantics,
+            Contract::OtpApps,
+        ],
+        kind: CaseKind::Module(ModuleRun {
+            source: DIFF_SPEC_STORE_SOURCE,
+            module: "diff_spec_store",
+            function,
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some("200"),
+            exit_code: 0,
+        },
+    }
+}
 
 /// The A.7 `ets` match-spec / `select` / `info` cases.
 pub(crate) fn group() -> Vec<Case> {
@@ -644,5 +742,137 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- `specs/`: a *stored* handle across a garbage collection --------------------------
+        //
+        // `match_spec_compile/1` answers an opaque handle over an off-heap compiled matcher;
+        // the handle is an ordinary term that a process stores, sends and keeps live across a
+        // collection. All three cases run as **compiled bytecode** (module-run) because that
+        // is the tier whose GC root set and matcher relocation the handle exercises — the
+        // `-eval` tree walker would exercise neither. The spec guards and projects the bare
+        // object (`'$1' > 0` → `'$1' + 100`), so the object `100` answers the order-stable
+        // integer `200`.
+        stored_spec_case(
+            "specs/stored_match_spec_survives_a_collection",
+            "a compiled match spec kept in a variable still runs after a forced collection",
+            "survive",
+        ),
+        stored_spec_case(
+            "specs/stored_match_spec_survives_two_collections",
+            "a compiled match spec stored in the process dictionary still runs after two collections",
+            "survive_two",
+        ),
+        stored_spec_case(
+            "specs/stored_match_spec_passed_to_another_process",
+            "a compiled match spec sent to another process runs there after the hand-off",
+            "cross_process",
+        ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{group, CaseKind, Contract, DIFF_SPEC_STORE_SOURCE};
+
+    /// The family's ids, in the order [`group`] emits them, with the function each applies.
+    const STORED_SPEC_CASES: [(&str, &str); 3] = [
+        ("specs/stored_match_spec_survives_a_collection", "survive"),
+        (
+            "specs/stored_match_spec_survives_two_collections",
+            "survive_two",
+        ),
+        (
+            "specs/stored_match_spec_passed_to_another_process",
+            "cross_process",
+        ),
+    ];
+
+    /// Each stored-handle case must be a **module-run** case over the embedded module, never an
+    /// `-eval` expression: the compiled route is the tier whose GC root set and matcher
+    /// relocation the stored handle exercises, so an `Eval` rewrite would silently drop what
+    /// the family exists to pin.
+    #[test]
+    fn the_stored_spec_family_is_bytecode_not_the_eval_walker() {
+        let cases = group();
+        for (id, function) in STORED_SPEC_CASES {
+            let case = cases
+                .iter()
+                .find(|case| case.id == id)
+                .unwrap_or_else(|| panic!("case {id} is missing"));
+            let CaseKind::Module(run) = &case.kind else {
+                panic!("case {id} must be a module-run case (real bytecode), not -eval");
+            };
+            assert_eq!(run.module, "diff_spec_store", "case {id}");
+            assert_eq!(run.source, DIFF_SPEC_STORE_SOURCE, "case {id}");
+            assert_eq!(run.function, function, "case {id}");
+            assert_eq!(run.arity, 0, "case {id}");
+            assert!(run.args.is_empty(), "case {id}");
+            assert_eq!(run.nif, None, "case {id}");
+            assert!(
+                case.contracts.contains(&Contract::BeamAsm)
+                    && case.contracts.contains(&Contract::LanguageSemantics)
+                    && case.contracts.contains(&Contract::OtpApps),
+                "case {id} must evidence .beam + A.1 + A.7"
+            );
+        }
+        // Every id is emitted exactly once.
+        for (id, _) in STORED_SPEC_CASES {
+            assert_eq!(
+                cases.iter().filter(|case| case.id == id).count(),
+                1,
+                "case {id} must be registered once"
+            );
+        }
+    }
+
+    /// The golden is the oracle's order-stable integer `200` — never a pid, a reference, a
+    /// timeout or a map image, all of which would either be per-VM or encode a divergence.
+    #[test]
+    fn every_stored_spec_golden_is_the_integer_200() {
+        for case in group() {
+            if !STORED_SPEC_CASES.iter().any(|(id, _)| *id == case.id) {
+                continue;
+            }
+            let golden = case
+                .golden
+                .stdout
+                .unwrap_or_else(|| panic!("case {} has no golden", case.id));
+            assert_eq!(golden, "200", "case {}: golden", case.id);
+            assert_eq!(golden.parse::<i64>(), Ok(200), "case {}", case.id);
+            assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
+        }
+    }
+
+    /// The module must really compile the spec, store it, collect (twice in the two-collection
+    /// row, with garbage built in between), and hand it to a second process — and it must bound
+    /// **every** receive, so a lost handle shows up as the visible atom `timeout` rather than
+    /// hanging the case.
+    #[test]
+    fn the_compiled_module_stores_collects_and_bounds_every_receive() {
+        let source = DIFF_SPEC_STORE_SOURCE;
+        assert!(source.contains("-module(diff_spec_store)."));
+        assert!(source.contains("-export([survive/0, survive_two/0, cross_process/0])."));
+        // The compiled handle comes from `match_spec_compile/1` and is *run* by
+        // `match_spec_run/2` (a raw clause list would be `badarg`).
+        assert!(source.contains("ets:match_spec_compile([{'$1',"));
+        // One run per route: the variable root, the process dictionary, and the spawned
+        // process that received the handle.
+        assert_eq!(source.matches("ets:match_spec_run([100]").count(), 3);
+        // A forced collection in every function, and two of them in the two-collection row.
+        assert_eq!(source.matches("erlang:garbage_collect(self())").count(), 3);
+        assert!(source.contains("put(stored_spec, spec())"));
+        assert!(source.contains("get(stored_spec)"));
+        // The cross-process shape: a spawned process runs the handle it was sent.
+        assert!(source.contains("spawn(fun() ->"));
+        assert!(source.contains("erlang:send(Pid, {spec, spec()})"));
+        // No unbounded receive: one `after 5000 ->` bound per `receive`.
+        assert_eq!(
+            source.matches("receive").count(),
+            source.matches("after 5000 ->").count(),
+            "every receive must carry a 5000 ms bound"
+        );
+        assert!(!source.contains("after infinity"));
+        // Nothing is printed from the module (a module-run case pins the applied function's
+        // `~w` line, so an `io:format` here would corrupt the observable).
+        assert!(!source.contains("io:format"));
+    }
 }
