@@ -437,8 +437,8 @@ pub struct TableRegistry {
     /// takes its table through [`TableRegistry::take`] (which keeps the profile) and
     /// puts it back with [`restore_table`], so a later `ets:info/1,2` still sees the
     /// creation-time profile. Only a *permanent* removal drops the entry —
-    /// [`TableRegistry::remove`] (which drops it) and the explicit
-    /// [`TableRegistry::forget_profile`] `ets:delete/1` calls.
+    /// [`TableRegistry::remove`] (which drops it) — or the narrower
+    /// [`TableRegistry::forget_profile`].
     profiles: HashMap<u64, resolve::TableProfile>,
 }
 
@@ -470,9 +470,13 @@ impl TableRegistry {
     /// **Continuations are not touched.** A continuation is an immutable value —
     /// the `beam_ets` traversal state plus the table identity it was issued against
     /// — exactly as in the oracle, where resuming one is repeatable and an
-    /// intervening table operation does not destroy it. A continuation of a table
-    /// that *has* gone away stays registered but can no longer resolve its table,
-    /// so resuming it is `badarg` (see [`resume_continuation`]).
+    /// intervening table operation does not destroy it, including the take/restore
+    /// round trip every table-taking BIF performs.
+    ///
+    /// A *permanent* removal is the one thing that takes a continuation with its
+    /// table ([`TableRegistry::remove`], and `ets:delete/1` through it), so no
+    /// registry slot ever keeps a continuation whose table — and therefore whose
+    /// `beam_ets` term store — is gone (see [`TableRegistry::drop_continuations`]).
     pub fn insert(&mut self, handle: u64, table: Table) -> Option<Table> {
         self.tables.insert(handle, table)
     }
@@ -495,14 +499,32 @@ impl TableRegistry {
     /// Removes and returns the table stored under `handle`, if any, dropping every
     /// continuation that belonged to it **and its [`resolve::TableProfile`]**.
     ///
-    /// This is the *permanent* removal (a whole-table delete): the profile is gone
-    /// with the table. A caller that only borrows the table and puts it back must
-    /// use [`TableRegistry::take`] instead, which keeps the profile so a later
-    /// `ets:info/1,2` still reports the creation-time `write_concurrency` form.
+    /// This is the *permanent* removal (a whole-table delete): the profile and the
+    /// continuations are gone with the table
+    /// ([`TableRegistry::drop_continuations`]). A caller that only borrows the table
+    /// and puts it back must use [`TableRegistry::take`] instead, which keeps the
+    /// profile so a later `ets:info/1,2` still reports the creation-time
+    /// `write_concurrency` form and leaves the continuations intact.
     pub fn remove(&mut self, handle: u64) -> Option<Table> {
-        self.continuations.retain(|_, cont| cont.table != handle);
+        self.drop_continuations(handle);
         self.profiles.remove(&handle);
         self.tables.remove(&handle)
+    }
+
+    /// Drops every live continuation issued against `handle`, keeping the table
+    /// itself (and its [`resolve::TableProfile`]) where it is.
+    ///
+    /// A continuation is an immutable value, so no table *operation* may invalidate
+    /// one — but a permanent removal of the table must, and this is that half. It is
+    /// an **ownership** rule, not a semantic one: resuming such a continuation is
+    /// `badarg` either way (its table resolves to nothing), so dropping the entry
+    /// changes no answer. What it does change is what a registry slot may point at:
+    /// an `ordered_set` continuation anchors on the **last key the previous chunk
+    /// yielded** ([`MatchContinuation`]'s `Cursor::Anchor`), i.e. on a word of the
+    /// table's own `beam_ets` term store — keeping the entry after that store has
+    /// been freed would leave a long-lived slot holding a word no store owns.
+    fn drop_continuations(&mut self, handle: u64) {
+        self.continuations.retain(|_, cont| cont.table != handle);
     }
 
     /// Removes and returns the table stored under `handle`, if any, keeping its
@@ -511,8 +533,9 @@ impl TableRegistry {
     /// This is the take half of every table-taking BIF's borrow-and-restore round
     /// trip ([`take_table_gated`] → [`restore_table`]): the profile must survive so
     /// the table's `ets:info/1,2` rendering is unchanged after e.g. an `insert/2`.
-    /// The profile is dropped only by [`TableRegistry::remove`] or an explicit
-    /// [`TableRegistry::forget_profile`] (the whole-table `ets:delete/1`).
+    /// The profile is dropped only by [`TableRegistry::remove`]
+    /// (the whole-table `ets:delete/1`) or the narrower
+    /// [`TableRegistry::forget_profile`].
     ///
     /// **Continuations are not touched** (they are immutable values — see
     /// [`TableRegistry::insert`]): a take/restore round trip is invisible to them,
@@ -523,11 +546,13 @@ impl TableRegistry {
     }
 
     /// Drops the [`resolve::TableProfile`] recorded for `handle`, if any, leaving the
-    /// table itself in place.
+    /// table itself (and its continuations) in place.
     ///
-    /// `ets:delete/1` is the only permanent table removal that goes through the
-    /// borrow-and-restore path ([`take_table_gated`], which keeps the profile), so it
-    /// calls this to make sure a deleted handle leaves no lingering profile behind.
+    /// `ets:delete/1` — the only permanent table removal that goes through the
+    /// borrow-and-restore path ([`take_table_gated`], which keeps the profile) —
+    /// performs the *whole* removal through [`TableRegistry::remove`], which drops
+    /// the profile and the table's continuations together; this is the narrower
+    /// primitive for a caller that must drop only the profile.
     pub fn forget_profile(&mut self, handle: u64) {
         self.profiles.remove(&handle);
     }
@@ -979,9 +1004,12 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// that leaves the table in place.
 ///
 /// This is the only table-taking BIF that never restores its table, so it is also
-/// the only one that drops the creation-time [`resolve::TableProfile`]
-/// ([`TableRegistry::forget_profile`]): every other taker uses [`take_table_gated`],
-/// which keeps the profile for the restore.
+/// the only one that performs the registry's **permanent** removal
+/// ([`TableRegistry::remove`]): the creation-time [`resolve::TableProfile`] and
+/// every live continuation of the table
+/// ([`TableRegistry::drop_continuations`]) go with it. Every other taker uses
+/// [`take_table_gated`] and [`restore_table`], which keep the profile and leave the
+/// continuations intact.
 fn delete_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
@@ -991,7 +1019,10 @@ fn delete_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         None
     };
     let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-    tables.forget_profile(handle);
+    // The table itself is already taken, so this drops the profile and the
+    // continuations — the two slots that would otherwise outlive the table's term
+    // store (`Table::drop` frees it with the local `table` below).
+    let _ = tables.remove(handle);
     if let Some(name) = name {
         tables.remove_name(name);
     }
@@ -1867,8 +1898,10 @@ pub(super) fn take_table(ctx: &mut BifContext<'_>, handle: u64) -> Result<Table>
 /// BIF and put back with [`restore_table`], so its creation-time
 /// [`resolve::TableProfile`] must survive the round trip (else `ets:info/1,2` would
 /// report `write_concurrency = false` / `decentralized_counters = false` for every
-/// table that had ever been touched). Only `ets:delete/1`, the one non-restoring
-/// caller, drops the profile explicitly ([`TableRegistry::forget_profile`]).
+/// table that had ever been touched), and its continuations must survive too (see
+/// [`TableRegistry::insert`]). Only `ets:delete/1`, the one non-restoring caller,
+/// performs the permanent removal ([`TableRegistry::remove`]), which drops the
+/// profile **and** the table's continuations.
 pub(in crate::ets) fn take_table_gated(
     ctx: &mut BifContext<'_>,
     handle: u64,
@@ -3842,6 +3875,127 @@ mod tests {
             Some(END_OF_TABLE),
             "the traversal finishes after key z"
         );
+    }
+
+    /// **A continuation's registry slot outlives every table *operation*, and only
+    /// the table's permanent removal takes it away.**
+    ///
+    /// Three things in one place:
+    ///
+    /// * the traversal is compiled from the registry's **own copy** of the spec: the
+    ///   guard's float is built on a scratch heap, which is invalidated (every word
+    ///   `nil`, the float rewritten as a different number) between the minting chunk
+    ///   and the resume, and the resume still reads `0.5`;
+    /// * a table-taking BIF borrows the table ([`take_table_gated`]) and puts it back
+    ///   ([`restore_table`]), so a continuation issued before it stays registered
+    ///   **and** stays resumable — an immutable value the oracle also keeps across an
+    ///   intervening `ets:insert/2` (and resuming it twice repeats the chunk);
+    /// * `ets:delete/1` performs the registry's permanent removal
+    ///   ([`TableRegistry::remove`]), so the entries go with the table. That is the
+    ///   ownership half, not a semantic one: an `ordered_set` continuation anchors on
+    ///   the key its previous chunk last yielded ([`MatchContinuation`]'s
+    ///   `Cursor::Anchor`), a word of the table's **own** `beam_ets` term store, which
+    ///   `ets:delete/1` frees — a slot surviving it would name words nothing owns.
+    ///   Resuming a dropped one is still `badarg`, exactly as it was while the entry
+    ///   lingers unresolvable, which is why this pin asserts the *slot* rather than an
+    ///   answer.
+    #[test]
+    fn a_table_operation_keeps_the_continuation_slot_and_a_delete_drops_it() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        // The caller's heap: the spec lives here and nowhere else.
+        let mut scratch = Heap::new(4096).expect("scratch heap");
+        let spec = {
+            let mut caller =
+                BifContext::new(&mut scratch, &atoms, ProcessId::new(1, 0));
+            value_above_spec(&mut caller, 0.5)
+        };
+        assert!(
+            scratch.used() > 0,
+            "the spec must occupy the compiling caller's heap"
+        );
+        let mut heap = Heap::new(65536).expect("test heap");
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_ordered_table(&mut ctx, "mytab");
+        // The registry key, distinct from the on-heap ref thing the BIFs take.
+        let table_id = ref_thing_id(handle).expect("a table handle");
+        for (key, value) in [("a", 1), ("b", 2), ("c", 3), ("p", 4)] {
+            let object = pair(&mut ctx, key, value);
+            insert_2(&mut ctx, &[handle, object]).expect("insert");
+        }
+        let two = ctx.int(2).expect("fits");
+        let chunk = select_3(&mut ctx, &[handle, spec, two]).expect("ets:select/3");
+        assert_eq!(small_ints(tuple_element(chunk, 0)), vec![1, 2]);
+        let cont_id = ref_thing_id(tuple_element(chunk, 1)).expect("a continuation");
+        assert_eq!(
+            ctx.tables().expect("a registry").continuation_table(cont_id),
+            Some(table_id),
+            "a minted continuation is registered against the table it walks"
+        );
+
+        // The compiling caller's heap is gone — every word it handed out is `nil`,
+        // and the guard's float now reads `1000.0`. A traversal that kept the caller's
+        // words instead of the registry's copy would select nothing from here on.
+        invalidate_caller_heap(&mut scratch, 0.5, 1000.0);
+
+        // A table-taking BIF borrows and restores the table, so the entry (and the
+        // traversal it names) must be untouched.
+        let object = pair(&mut ctx, "q", 5);
+        insert_2(&mut ctx, &[handle, object]).expect("insert");
+        assert!(
+            ctx.tables()
+                .expect("a registry")
+                .continuation(cont_id)
+                .is_some(),
+            "an intervening table operation must not drop the continuation entry"
+        );
+        let cont = make_ref_thing(ctx.heap(), cont_id).expect("the rebuilt continuation fits");
+        let chunk = select_1(&mut ctx, &[cont]).expect("ets:select/1");
+        assert_eq!(
+            small_ints(tuple_element(chunk, 0)),
+            vec![3, 4],
+            "the traversal resumes where the first chunk stopped"
+        );
+        // A continuation is an immutable value: resuming it again repeats the chunk.
+        let cont = make_ref_thing(ctx.heap(), cont_id).expect("the rebuilt continuation fits");
+        let chunk = select_1(&mut ctx, &[cont]).expect("ets:select/1");
+        assert_eq!(small_ints(tuple_element(chunk, 0)), vec![3, 4]);
+
+        // `ets:delete/1` frees the table's term store, so every entry for that table
+        // goes with the table — not just the one this test names.
+        assert!(is_true(
+            &atoms,
+            delete_1(&mut ctx, &[handle]).expect("delete/1")
+        ));
+        assert!(
+            !ctx.tables().expect("a registry").contains(table_id),
+            "the table itself is gone"
+        );
+        assert!(
+            ctx.tables()
+                .expect("a registry")
+                .continuations
+                .values()
+                .all(|cont| cont.table != table_id),
+            "ets:delete/1 must drop the table's continuation entries: an ordered_set \
+             continuation anchors on a key word of the table's own term store, which \
+             the delete frees"
+        );
+        assert!(
+            ctx.tables()
+                .expect("a registry")
+                .continuation(cont_id)
+                .is_none(),
+            "the dropped continuation must not resolve"
+        );
+        // The answer is unchanged — the stale handle was `badarg` before the slot was
+        // dropped too, so this is an ownership pin, not a behaviour change.
+        let cont = make_ref_thing(ctx.heap(), cont_id).expect("the rebuilt continuation fits");
+        assert!(matches!(
+            select_1(&mut ctx, &[cont]),
+            Err(BeamError::BadArg)
+        ));
     }
 
     /// **A `/3` call releases its input copy unless a continuation names it.**
