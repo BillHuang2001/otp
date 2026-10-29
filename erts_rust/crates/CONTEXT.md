@@ -381,9 +381,9 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   killing a non-trapping link or being trapped with its real reason, the full `DOP_EXIT2` trapping/`kill`
   matrix, and three peer-node-loss `noconnection` cases: a non-trapping link dies, a trapping link gets
   `'EXIT'` with `noconnection`, a monitor gets `'DOWN'` with `noconnection`), `tests/dist_two_rust.rs` (two
-  `beam_rt` VMs, **12 cases** — the same inbound families over two `beam_rt` VMs), `tests/dist_two_vm_wire.rs`
+  `beam_rt` VMs, **15 cases** — the same inbound families over two `beam_rt` VMs), `tests/dist_two_vm_wire.rs`
   (1 hermetic byte-level case pinning opcode 21, the watched-first argument order and the negotiated `DFLAG`
-  set). All are `#[ignore]`d (two VMs each, ~86 s in total for 24 + 12 + 1 cases): run them with
+  set). All are `#[ignore]`d (two VMs each, ~86 s in total for 27 + 15 + 1 cases): run them with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test dist_two_vm
   --test dist_two_rust --test dist_two_vm_wire -- --ignored --test-threads=1`. A `beam_rt` node cannot render
   a remote identifier (`pid_to_list/1`, `~p` of an external pid/ref is a typed gap), so the rust↔rust legs
