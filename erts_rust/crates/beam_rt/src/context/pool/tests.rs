@@ -581,10 +581,14 @@ fn a_table_less_container_workload_that_would_exhaust_a_fixed_pool_now_completes
 }
 
 /// A registered BIF that allocates words on the pooled heap and returns a **container the copier
-/// refuses** (`make_header(0, 0)` is the C ABI's non-value, a bare header word).
+/// refuses**: a real three-word tuple whose second element is `make_header(0, 0)`, the C ABI's
+/// non-value (a bare header word, not a term).
+///
+/// The **root** deliberately stands on the pool: that is what keeps the copy-out's "nothing to
+/// move" short-circuit out of the way ([`super::super::calls::dest::pool_holds`] answers `true`),
+/// so the copier really runs — and refuses — and the refusal is what leaves the pool un-rewound.
 fn refused_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    let _pooled = ctx.heap().tuple(&[make_small(1), make_small(2)])?;
-    Ok(make_header(0, 0))
+    ctx.heap().tuple(&[make_small(1), make_header(0, 0)])
 }
 
 /// **A refused copy leaves the pool exactly where the call left it** — the table-less half of
@@ -602,17 +606,22 @@ fn a_refused_copy_leaves_the_pooled_bif_heap_unrewound() {
     }
     let retired_before = rt.eval_heap_retired.len();
     let capacity_before = rt.eval_heap.capacity();
-    let (result, used) = {
+    let (result, used, still_on_the_pool) = {
         let mut ctx = RuntimeContext::new(&mut rt);
         let result = ctx
             .call_bif("pool_fixture", "refused", 0, &[])
             .expect("the fixture BIF returns");
-        (result, ctx.runtime.bif_heaps.last().expect("a region").used())
+        let heap = ctx.runtime.bif_heaps.last().expect("a region");
+        let held = crate::context::calls::dest::pool_holds(ctx.runtime, heap, result);
+        (result, heap.used(), held)
     };
-    assert_eq!(
-        result.raw(),
-        make_header(0, 0).raw(),
-        "the un-re-homed result is handed to the caller unchanged"
+    assert!(
+        still_on_the_pool,
+        "the un-re-homed result is handed to the caller still standing on the pool"
+    );
+    assert!(
+        still_on_the_pool && used == 3,
+        "the result is the container the BIF built, still inside the call's own three words"
     );
     assert_eq!(
         used, 3,
@@ -629,7 +638,8 @@ fn a_refused_copy_leaves_the_pooled_bif_heap_unrewound() {
 ///
 /// [`RuntimeContext::take_bif_frontier`](super::super::calls::RuntimeContext::take_bif_frontier)
 /// has two branches: the ordinary one hands back the region the pool popped, and the retirement
-/// one — taken when that region has less than `capacity()/16` free words — puts it back and
+/// one — taken when that region can no longer serve the reservation
+/// [`frontier::need`](super::super::calls::frontier::need) asks for — puts it back and
 /// continues in a fresh region **twice as wide**. The rewind leaves the first branch as the only
 /// one an ordinary container workload ever sees, so this case drives the second through the one
 /// **refused** copy: [`refused_result`] builds a three-word tuple on `ctx.heap()` and answers with
@@ -641,9 +651,11 @@ fn a_refused_copy_leaves_the_pooled_bif_heap_unrewound() {
 /// `context::tests` dictionary case builds.
 ///
 /// The retirement is arithmetic, not luck: three words per refused call (a `{1,2}` tuple: a
-/// header plus two elements) against a [`REGION_WORDS`] region whose free-word floor is
-/// `REGION_WORDS / 16 = 128`, so the 642nd call — the first to start with fewer than 128 free
-/// words (`2048 - 1923 = 125`) — retires the region and continues on a 4096-word frontier.
+/// header plus two elements) against a [`REGION_WORDS`] region whose reservation is a quarter of
+/// itself (`512` words), so the 514th call — the first to start with fewer than `512` free words
+/// (`2048 - 1539 = 509`) — retires the region and continues on a 4096-word frontier. The figures
+/// are **derived in the test** from [`frontier::need`](super::super::calls::frontier::need) and
+/// the fixture's own three words per call, never typed in.
 /// Nothing is relocated: the retired region goes back to the pool **as it is** — neither rewound
 /// nor freed, and outside the reach of the store move (`src/runtime/reclaim/compact.rs` evacuates
 /// only `eval_heap`/`eval_heap_retired`) — so the words its callers still own stay valid and at
@@ -672,28 +684,48 @@ fn an_exhausted_pooled_region_is_retired_and_replaced_by_a_wider_frontier() {
             pool_shape(&rt)
         );
     }
+    // THE PIN IS DERIVED, NEVER RE-TYPED: the taker hands the popped region back only when it can
+    // still serve `frontier::need` free words — the entitlement (a quarter of the region, capped in
+    // absolute words) raised to whatever a call at this depth has already demanded. Every refused
+    // call below hands out exactly `WORDS_PER_CALL` words and learns exactly that, so the learned
+    // figure stays below the entitlement and the boundary is arithmetic:
+    //
+    //   * a call is served while `used <= capacity - need`;
+    //   * the region's `used` at the start of call `k` is `(k - 1) * WORDS_PER_CALL`,
+    //     so `served = ceil((capacity - need) / WORDS_PER_CALL) + 1` calls fit (the one that starts
+    //     at `used == 0` included);
+    //   * the next call starts below the reservation, retires the region and runs on a fresh one.
+    let need = crate::context::calls::frontier::need(&rt, REGION_WORDS);
+    const WORDS_PER_CALL: usize = 3;
+    let served = (REGION_WORDS - need) / WORDS_PER_CALL + 1;
     assert_eq!(
-        calls, 642,
-        "the retirement lands on the first call that starts below the `capacity()/16` floor"
+        calls,
+        served + 1,
+        "the retirement lands on the first call that starts with fewer than {need} free words \
+         (the reservoir's own reservation), not before it"
+    );
+    assert!(
+        REGION_WORDS - WORDS_PER_CALL * (served - 1) >= need
+            && REGION_WORDS - WORDS_PER_CALL * served < need,
+        "the boundary is exact: the last served call started with {} free words (>= {need}), the \
+         retiring one with {} (< {need})",
+        REGION_WORDS - WORDS_PER_CALL * (served - 1),
+        REGION_WORDS - WORDS_PER_CALL * served
     );
     assert_eq!(
         pool_shape(&rt),
-        vec![(REGION_WORDS, 1_923), (REGION_WORDS * 2, 3)],
-        "the exhausted region is RETIRED with every word its callers still own (641 calls × 3 \
-         words) and the next call runs on a fresh, twice-as-wide frontier"
+        vec![
+            (REGION_WORDS, WORDS_PER_CALL * served),
+            (REGION_WORDS * 2, WORDS_PER_CALL)
+        ],
+        "the exhausted region is RETIRED with every word its callers still own ({served} calls × \
+         {WORDS_PER_CALL} words) and the next call runs on a fresh, twice-as-wide frontier"
     );
-    // The floor is `capacity() / 16` free words — 128 here — and the boundary is exact: the 641st
-    // call started with exactly 128 free words and was served from the region, the 642nd with 125.
-    assert!(
-        REGION_WORDS - 1_920 >= REGION_WORDS / 16 && REGION_WORDS - 1_923 < REGION_WORDS / 16,
-        "the retirement happened at the free-word floor and not before it"
-    );
-    assert_eq!(
-        rt.eval_heap.used(),
-        0,
-        "every copy was refused, so the store received nothing: the words really accumulated on \
-         the pool"
-    );
+    // The copy-out moved nothing here — which is what the loop's own exit proves: a successful
+    // copy-out would have licensed the rewind and the region could never fill. Nothing is asserted
+    // about `Runtime::eval_heap` itself: on the table-less route the returned container is also
+    // **stabilized** by an independent door (`Runtime::stabilize_term`'s store), so a store figure
+    // cannot tell a copy-out from that stabilization.
 
     // The rotation moved: the next refused call allocates on the fresh frontier, and the retired
     // region is left exactly as it was.
@@ -705,7 +737,10 @@ fn an_exhausted_pooled_region_is_retired_and_replaced_by_a_wider_frontier() {
     }
     assert_eq!(
         pool_shape(&rt),
-        vec![(REGION_WORDS, 1_923), (REGION_WORDS * 2, 6)],
+        vec![
+            (REGION_WORDS, WORDS_PER_CALL * served),
+            (REGION_WORDS * 2, WORDS_PER_CALL * 2)
+        ],
         "the frontier serves the next call; the retired region keeps its words untouched"
     );
 }

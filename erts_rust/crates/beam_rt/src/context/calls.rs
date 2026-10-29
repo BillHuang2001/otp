@@ -1245,7 +1245,7 @@ impl<'a> RuntimeContext<'a> {
                     notes::note_alias_copy();
                     #[cfg(test)]
                     notes::note_alias_copy_pool(mark, heap.used());
-                    match self.rehome_container_result(term) {
+                    match self.rehome_container_result(term, None) {
                         Some(copied) => {
                             perf_counters::bump(|c| &mut c.rehomed);
                             result = Ok(copied);
@@ -1291,7 +1291,7 @@ impl<'a> RuntimeContext<'a> {
                 } else if move_container {
                     // The copy first and, only once it succeeded, the rewind: a refused copy leaves
                     // both the result and the pool exactly as they were.
-                    if let Some(copied) = self.rehome_container_result(term) {
+                    if let Some(copied) = self.rehome_container_result(term, Some(heap)) {
                         perf_counters::bump(|c| &mut c.rehomed);
                         result = Ok(copied);
                         rewind = safe_to_rewind;
@@ -1686,7 +1686,7 @@ impl<'a> RuntimeContext<'a> {
             // An immediate or a frozen literal names nothing on the scratch region.
             return term;
         }
-        match self.rehome_container_result(term) {
+        match self.rehome_container_result(term, None) {
             Some(copied) => copied,
             None => {
                 self.runtime.taint_info_scratch();
@@ -1713,13 +1713,25 @@ impl<'a> RuntimeContext<'a> {
     ///   is *stabilized* rather than grown for
     ///   ([`Self::move_result_into_process_heap`]'s `refuse ⇒ stabilize, never dangle` rule).
     ///
+    /// `pool` is the **pooled region this call allocated from**, when the caller can vouch for it:
+    /// the `-eval` store arm uses it to answer "is there anything to move at all?"
+    /// ([`super::calls::dest::pool_holds`]) — a result on no pooled region predates the call, so
+    /// handing it through is sound and keeps its term identity observable. `None` means the result
+    /// may have come from a region the caller cannot vouch for (the aliased-ETS `TermStore`, the
+    /// `system_info` scratch region), and that arm always copies. The process arm ignores it: its
+    /// containment test is the copier's own classification.
+    ///
     /// `None` on every route means the copy was refused for a reason capacity cannot fix, so the
     /// caller leaves the pool un-rewound and the result on it.
-    pub(crate) fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
+    pub(crate) fn rehome_container_result(
+        &mut self,
+        term: Eterm,
+        pool: Option<&beam_alloc::Heap>,
+    ) -> Option<Eterm> {
         if self.mailbox_table.is_some() {
             self.move_result_into_process_heap(term)
         } else {
-            self.move_result_into_runtime_store(term)
+            self.move_result_into_runtime_store(term, pool)
         }
     }
 
@@ -1994,7 +2006,7 @@ impl<'a> RuntimeContext<'a> {
             // self-contained copy on the runtime's pointer-stable store, so this call can license
             // its pool rewind exactly as on the non-exempt route — `refuse ⇒ stabilize, never
             // dangle`.
-            return self.move_result_into_runtime_store(term);
+            return self.move_result_into_runtime_store(term, None);
         }
         outcome
     }

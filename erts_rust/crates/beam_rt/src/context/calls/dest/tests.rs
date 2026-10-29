@@ -116,7 +116,8 @@ fn a_result_on_another_region_is_still_copied() {
     // The copy is a real list word — never a mis-sized block.
     assert!(beam_term::prelude::is_list(copied));
 }
-/// A3 — the **store** arm (`-eval`/`-s`/`-run`) on both sides.
+/// A3 — the **store** arm (`-eval`/`-s`/`-run`) on both sides, with an **unknown origin**
+/// (`pool == None`: the aliased-ETS `TermStore`, the `system_info` scratch region).
 ///
 /// The destination here is the runtime's long-lived store, not a scanned process heap, so the
 /// containment test is the store's own block. A term already in it is handed through (the
@@ -134,28 +135,82 @@ fn the_store_arm_hands_through_what_it_already_holds_and_copies_what_it_does_not
     {
         let mut ctx = RuntimeContext::new(&mut rt);
         assert_eq!(
-            ctx.move_result_into_runtime_store(held),
+            ctx.move_result_into_runtime_store(held, None),
             Some(held),
             "a result the store already holds is handed through as the same word"
         );
-        assert_eq!(
-            rt.eval_heap.used(),
-            store_used,
-            "no fresh store word was written for a term it already held"
-        );
     }
+    assert_eq!(
+        rt.eval_heap.used(),
+        store_used,
+        "no fresh store word was written for a term it already held"
+    );
     let copied = {
         let mut ctx = RuntimeContext::new(&mut rt);
-        ctx.move_result_into_runtime_store(elsewhere)
+        ctx.move_result_into_runtime_store(elsewhere, None)
             .expect("a foreign container is copied into the store")
     };
     assert_ne!(
         copied, elsewhere,
-        "a container outside the store is still copied into it"
+        "an unknown-origin result outside the store is still copied into it"
     );
     assert_eq!(
         rt.eval_heap.used(),
         store_used + 8,
         "the four cells (eight words) landed in the store"
     );
+}
+/// A3 — the **store** arm with a **known** pooled region: the copy has exactly one job (move the
+/// result off the region the call allocated from and the tail is about to rewind), so a root
+/// standing on **no** pooled region has nothing to move and is handed through — while a root still
+/// on the pool is copied into the store.
+///
+/// The hand-through arm is what keeps a no-op container BIF's term identity observable on the
+/// `-eval`/`-s`/`-run` route: the evaluator's own containers stand on the engine **arena**, which is
+/// pointer-stable and never reset, so `erts_debug:same(maps:put(a,V,M), M)` answers `true` there
+/// exactly as on the oracle.
+#[test]
+fn the_store_arm_hands_through_a_result_that_is_on_no_pooled_region() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    // The call's own pooled region, and a term the call really built on it — the shape the rewind
+    // would free.
+    let mut pool = beam_alloc::Heap::new(32).expect("a pooled region");
+    let on_pool = int_list(&mut pool, 4).expect("four cells fit the pool");
+    // A region the rewind cannot touch (the stand-in for the engine arena / a literal area).
+    let mut stable = beam_alloc::Heap::new(32).expect("a stable region");
+    let elsewhere = int_list(&mut stable, 4).expect("four cells fit");
+    let store_used = rt.eval_heap.used();
+    let copied = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.move_result_into_runtime_store(on_pool, Some(&pool))
+            .expect("a result on the pool is moved into the store")
+    };
+    assert_ne!(copied, on_pool, "a result on the pool is copied, never handed through");
+    assert_eq!(
+        rt.eval_heap.used(),
+        store_used + 8,
+        "the four cells (eight words) landed in the store"
+    );
+    let handed = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.move_result_into_runtime_store(elsewhere, Some(&pool))
+            .expect("the hand-through arm answers a term")
+    };
+    assert_eq!(
+        handed, elsewhere,
+        "a result on no pooled region has nothing to move and is handed through unchanged"
+    );
+    assert_eq!(
+        rt.eval_heap.used(),
+        store_used + 8,
+        "the hand-through arm wrote no store word"
+    );
+    // The pool's own words must still be recognisable as being on the pool, i.e. the predicate is
+    // a region test and not "everything is safe now".
+    assert!(
+        crate::context::calls::dest::pool_holds(&rt, &pool, on_pool),
+        "the pool half of the test still sees the term the call built"
+    );
+    assert!(!crate::context::calls::dest::pool_holds(&rt, &pool, elsewhere));
 }

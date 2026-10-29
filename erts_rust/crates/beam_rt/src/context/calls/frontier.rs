@@ -125,8 +125,12 @@ pub(super) const BIF_FRONTIER_HEADROOM_DIVISOR: usize = 4;
 ///
 /// `capacity` is the region the pool just handed over, so the entitlement scales with what the
 /// runtime actually reserved (see [`BIF_FRONTIER_HEADROOM_DIVISOR`]).
+///
+/// `pub(crate)` because the pool's own tests derive their expected retirement point from it
+/// (`crate::context::pool::tests`) instead of re-typing the arithmetic: an assertion about *when*
+/// the frontier moves must read the same rule the taker applies.
 #[inline]
-pub(super) fn need(runtime: &Runtime, capacity: usize) -> usize {
+pub(crate) fn need(runtime: &Runtime, capacity: usize) -> usize {
     let learned = if runtime.bif_heaps_taken <= 1 {
         runtime.bif_frontier_need_outer
     } else {
@@ -137,7 +141,7 @@ pub(super) fn need(runtime: &Runtime, capacity: usize) -> usize {
 /// The reservation one call is guaranteed **before** anything has been learned — the
 /// capacity-relative, absolutely capped half of [`need`].
 #[inline]
-pub(super) fn entitlement(capacity: usize) -> usize {
+pub(crate) fn entitlement(capacity: usize) -> usize {
     (capacity / BIF_FRONTIER_HEADROOM_DIVISOR).min(BIF_FRONTIER_MAX_WORDS)
 }
 /// Learns that the call currently holding a region at the runtime's nesting depth needed `words`

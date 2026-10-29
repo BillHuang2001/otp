@@ -34,40 +34,55 @@
 //! [`super::RuntimeContext::copy_result_fresh`] copied it anyway — so the two words named two
 //! structurally equal but distinct objects.
 //!
-//! # The rule
+//! # The rule — one question per route: *does this result still have to move?*
 //!
-//! A result whose **root object already lives on the destination region of the same kind the
-//! copy-out would put it on** is handed through **unchanged**, and no copy runs. "The
-//! destination" here is the region the caller's collector really scans (the process route) or the
-//! region the runtime's long-lived store really owns (the `-eval` route). Handing such a word
-//! through is sound because:
+//! The copy-out exists for exactly one reason: to move a result **off** the pooled BIF region the
+//! call allocated from, because the tail rewinds that region to this call's `mark` and every word
+//! above `mark` becomes garbage. So each route asks its destination a question about the word, and
+//! a result that still has nothing to move is handed through **unchanged** with no copy:
 //!
-//! * the word is **already** collectable / lifetime-managed by the destination — the copy exists
-//!   solely to move a result *into* that region, and it is already there;
-//! * a container the BIF built on its own pooled frontier cannot reach this arm — the pooled
-//!   region is neither scanned by a process collector nor part of the `-eval` store, so the
-//!   containment test sends it to the copy exactly as before;
-//! * the pool rewind the tail licenses on a successful move stays sound: the handed-through word
-//!   is not on the pooled region and the call's own words `[mark, used)` are reclaimed only when
-//!   nothing above them lives, which the rewind's own rule already requires.
+//! * **process route** ([`process_holds`]) — is the root already on a region this process's
+//!   collector **scans**? Then it is already collectable (the copy's other job) and already
+//!   outside the pool;
+//! * **table-less route** ([`store_holds`], [`pool_holds`]) — no process scans anything here, so
+//!   the rewind is the only thing that matters, and the word is handed through when it is already
+//!   in the runtime's own `-eval` store **or** when it lies on **no pooled region at all**: the
+//!   whole graph it reaches then predates this call, so not one word of it can be a word the
+//!   rewind frees.
 //!
-//! # Why the test is a real containment test, not a heuristic
+//! # Why handing the word through is sound
 //!
-//! A result can be a **mixed-heap** container: a map on the destination whose values were built
-//! on the pool, or (on the `-eval` route) a container whose children the evaluator nested from an
-//! earlier call's words. The predicate is therefore
-//! [`Geometry::word_is_scanned`](super::gc::Geometry::word_is_scanned) — the **same**
-//! classification the copier and the GC valve use to decide `Target::Foreign` vs in-place — for
-//! the process route, and [`term_in_heap_block`](super::gc::term_in_heap_block) (the exact block
-//! test [`Geometry`](super::gc::Geometry) hoists) over the store's live and retired regions for
-//! the `-eval` route. Neither is re-derived here: both are `super::gc`'s definitions.
+//! The workspace law is that a raw `Eterm` in a long-lived slot roots nothing and that a
+//! pointer-stable, never-scanned store must not hold a container whose children live on a scanned
+//! heap. Both destinations this module names satisfy the law for the words it hands them:
 //!
-//! A mixed-heap container whose **root** is already on the destination is still handed through,
-//! and that is the correct answer: every child it can reach is either already on a region the
-//! destination's owner keeps alive (the store's own words, another scanned space) or an immediate
-//! or literal. A container holding a **reference** never reaches this arm — the tail's
-//! `graph_holds_reference` check runs first on the process route, and keeps the conservative
-//! "never copy, never rewind" answer it always had.
+//! * the **process heap** is the region that process's collector scans, relocates and roots — a
+//!   term standing on it is exactly as rooted as one the copier would have written there, and the
+//!   predicate is the copier's **own** classification
+//!   ([`Geometry::word_is_scanned`](super::gc::Geometry::word_is_scanned)), i.e. the very answer
+//!   the copier's `Target::Foreign` decision reads, so a term in a retired nursery space or in the
+//!   mature generation counts as "on it" for the same reason the copier does;
+//! * the **`-eval` store** ([`Runtime::eval_heap`](crate::runtime::Runtime) plus every region a
+//!   growth step retired) is pointer-stable and never reset — a word in it stays valid for the
+//!   rest of the run, whether or not the rewind runs;
+//! * and the arena/literal words the [`pool_holds`] arm hands through are pointer-stable too: the
+//!   engine's arena is never moved and a literal region is frozen at load time.
+//!
+//! A **mixed-heap** container never needs a different answer, and it is not classified by a tag
+//! heuristic: the pool is a region, so "the root is on no pooled region" is decided with the exact
+//! block test [`term_in_heap_block`](super::gc::term_in_heap_block) the GC hoists into
+//! [`Geometry`](super::gc::Geometry). Two structural facts make it airtight: (a) every word a
+//! returned container reaches either **predates the call** — so it cannot be a word this call
+//! allocated into `[mark, used)` — or the root is in the pool, which is the copied arm; and (b) a
+//! container holding a **reference** never reaches either arm — the tail's `graph_holds_reference`
+//! check runs first on the process route and keeps its conservative "never copy, never rewind"
+//! answer, because a reference's identity *is* its address.
+//!
+//! The information only a caller has — *which* region this call allocated from — is a parameter
+//! (`Option<&Heap>`): `None` means "this result came from somewhere the caller cannot vouch for"
+//! (the aliased-ETS table's own `TermStore`, or the `system_info` scratch region), and that arm
+//! always copies.
+use beam_alloc::Heap;
 use beam_term::Eterm;
 
 /// Whether `term`'s root object already lives on a region `process`'s collector **scans** — the
@@ -90,7 +105,8 @@ pub(super) fn process_holds(process: &beam_process::Process, term: Eterm) -> boo
 }
 
 /// Whether `term`'s root object already lives inside the `-eval`/single-pass **store** — the
-/// table-less route's destination-containment test.
+/// table-less route's *first* positive answer (its companion is [`pool_holds`], which covers a
+/// result that is on no pooled region at all, and therefore has nothing to move either).
 ///
 /// The store is [`Runtime::eval_heap`](crate::runtime::Runtime) plus every region
 /// [`Runtime::grow_eval_heap`](crate::runtime::Runtime::grow_eval_heap) retired (a replaced region
@@ -98,10 +114,30 @@ pub(super) fn process_holds(process: &beam_process::Process, term: Eterm) -> boo
 /// live region's), which is exactly the word range
 /// [`Runtime::for_each_off_heap_region`](crate::runtime::Runtime) already publishes.
 #[inline]
-pub(super) fn store_holds(runtime: &crate::runtime::Runtime, term: Eterm) -> bool {
+pub(crate) fn store_holds(runtime: &crate::runtime::Runtime, term: Eterm) -> bool {
     super::super::gc::term_in_heap_block(&runtime.eval_heap, term)
         || runtime
             .eval_heap_retired
+            .iter()
+            .any(|heap| super::super::gc::term_in_heap_block(heap, term))
+}
+
+/// Whether any **pooled BIF region** could hold `term`'s root — the table-less route's
+/// "is there anything to move?" test, given the region this call allocated from.
+///
+/// `pool` is the region the caller's call is bumping (the one the tail is about to rewind), and
+/// the runtime's idle [`bif_heaps`](crate::runtime::Runtime) are consulted too: a region that was
+/// handed back to the pool can be **lent out again** and rewound from a later `mark`, so a word
+/// standing on one is no safer than a word on the current region.
+///
+/// `false` therefore means "no pooled region contains this word", which is the strongest form of
+/// the answer this module can give: whatever the root reaches predates the call (see the module
+/// docs), so the rewind cannot invalidate it and there is nothing to copy.
+#[inline]
+pub(crate) fn pool_holds(runtime: &crate::runtime::Runtime, pool: &Heap, term: Eterm) -> bool {
+    super::super::gc::term_in_heap_block(pool, term)
+        || runtime
+            .bif_heaps
             .iter()
             .any(|heap| super::super::gc::term_in_heap_block(heap, term))
 }
