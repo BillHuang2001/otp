@@ -293,6 +293,23 @@ const PEER_LINK_DEATH_SPEC: &str = "two_vm:peer_link_death/1";
 const PEER_LINK_DEATH_PLAIN_SPEC: &str = "two_vm:peer_link_death_plain/1";
 const PEER_MONITORS_SPEC: &str = "two_vm:peer_monitors/1";
 const PEER_EXIT2_SPEC: &str = "two_vm:peer_exit2/1";
+/// The responders of the **signalled-exit-value** family (a process that dies of an uncaught
+/// `error` signals ERTS's exit value `{Reason, Stacktrace}`, so the reason a `DOP_EXIT` /
+/// `DOP_MONITOR_P_EXIT` carries is that pair rather than a bare atom): the peer monitors our
+/// error-dying victim, the peer links it, and — the other direction — we monitor a victim the
+/// peer hosts.
+const PEER_MONITORS_ERROR_SPEC: &str = "two_vm:peer_monitors_error/1";
+const PEER_LINKS_ERROR_SPEC: &str = "two_vm:peer_links_error/1";
+const MONITORS_PEER_ERROR_SPEC: &str = "two_vm:monitors_peer_error/1";
+/// The **shape** both nodes must print for one error death's exit value: the outer arity, the
+/// reason head, and a first frame naming the function that died (`two_vm:error_victim/0`) with a
+/// source position. Never the term — a stacktrace's `{file, …}` names a scratch directory and the
+/// two runtimes may build a different number of frames (`fixture.rs`'s `reason_shape/1`).
+const EXIT_VALUE_SHAPE: &str = "{pair,boom,two_vm,error_victim,0,true}";
+/// The full transcript line a `shape` assertion expects: the peer's own prefix plus the shape.
+fn shape_line(prefix: &str) -> String {
+    format!("{prefix}{EXIT_VALUE_SHAPE}")
+}
 
 /// The responders of the **peer-node-loss** family (the peer's whole *node* goes away while a
 /// relationship with one of its processes stands): a monitor, a trapping link, a non-trapping
@@ -1457,6 +1474,135 @@ fn a_real_erl_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason
         &pair.runtime,
         &["SAW_DOWN_TIMEOUT", "NOMONITOR"],
         "the peer's monitor fired and its DOWN reached us",
+    );
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+
+/// **A process that dies of an uncaught `error` signals ERTS's exit value, not its bare
+/// reason** — and here that value crosses the wire: the peer's monitor of our victim gets a
+/// `{'DOWN', …}` whose reason is `{boom, Stacktrace}` (`DOP_MONITOR_P_EXIT`), and the peer
+/// forwards the tuple back so both sides' view of one death is printed.
+///
+/// `MONITORED_BY 1 [true]` makes the case non-vacuous: our node really recorded the peer's
+/// `DOP_MONITOR_P` against the victim before it died.
+///
+/// The assertion is the **shape**, never the term: a stacktrace's `{file, …}` names a scratch
+/// directory and the two runtimes may build a different number of frames, so what is compared
+/// is the contract `{Reason, [{Module, Function, Arity, Location}]}` — outer arity 2, the
+/// reason head (`boom`), and a first frame naming the function that died (`error_victim/0`)
+/// with a source position. A bare `boom` would print `{bare,boom}` and fail here, which is
+/// exactly the regression this case exists to catch.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_monitor_of_our_error_dying_process_gets_the_exit_value() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "inbound_monitor_error",
+        PEER_MONITORS_ERROR_SPEC,
+        "actor_monitor_error",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("MONITORED_BY ", "MONITORED_BY 1 [true]");
+    pair.runtime_equals("DOWN_SIZE ", "DOWN_SIZE 5");
+    pair.runtime_equals("DOWN_OBJ ", "DOWN_OBJ true");
+    pair.runtime_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.actor_equals("MONITORING ", "MONITORING true");
+    // The peer's own decoded view of the reason our node encoded: the other half of the claim.
+    pair.actor_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.assert_absent(
+        &pair.runtime,
+        &["SAW_DOWN_TIMEOUT", "NOMONITOR"],
+        "the peer's monitor fired and its DOWN reached us",
+    );
+    pair.assert_absent(
+        &pair.actor,
+        &["PEER_DOWN_TIMEOUT"],
+        "the peer's monitor fired",
+    );
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+
+/// The **link** half of the same claim: the peer traps exits and links our error-dying victim,
+/// so the `{'EXIT', Pid, R}` our node routes in `DOP_EXIT` carries the exit value. Our own local
+/// monitor of the same victim reads the death back independently, so one death is asserted from
+/// both nodes.
+///
+/// `LINKS 1 [true]` is the non-vacuous half on our side (the arm really was recorded against the
+/// victim), and the shape assertion is `EXIT_VALUE_SHAPE` on both transcripts — a bare `boom`
+/// prints `{bare,boom}`.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peer_traps_our_error_dying_victims_exit_value() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "inbound_link_error",
+        PEER_LINKS_ERROR_SPEC,
+        "actor_link_error",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("LINKS ", "LINKS 1 [true]");
+    pair.runtime_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    pair.actor_equals("EXIT_SHAPE ", &shape_line("EXIT_SHAPE "));
+    pair.assert_absent(
+        &pair.runtime,
+        &["DOWN_TIMEOUT", "NOLINK"],
+        "the victim's local monitor fired",
+    );
+    pair.assert_absent(
+        &pair.actor,
+        &["EXIT_TIMEOUT", "NOLINK"],
+        "the peer trapped the link exit",
+    );
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+
+/// The **inbound** direction: the peer hosts a process that dies of an uncaught `error`, we
+/// monitor it, and the exit value arrives as a `DOP_MONITOR_P_EXIT` this runtime has to decode.
+///
+/// `DOWN_MATCH ref=bound pid=true` binds our own reference and the pid in the `'DOWN'` clause, so
+/// the tuple really is the monitor's answer for the process we armed. The peer's own witness
+/// (`spawn_monitor`) is printed as the same shape, so the two nodes' readings of one death are
+/// compared rather than trusting either alone.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn our_monitor_of_a_real_erl_error_dying_process_receives_the_exit_value() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "rv_monitor_error",
+        MONITORS_PEER_ERROR_SPEC,
+        "actor_host_error",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("DOWN_MATCH ref=bound pid=true", "DOWN_MATCH ref=bound pid=true");
+    pair.runtime_equals("REASON_SHAPE ", &shape_line("REASON_SHAPE "));
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_HOSTED ", "VICTIM_HOSTED true");
+    pair.actor_equals("PEER_MONITORED_BY ", "PEER_MONITORED_BY true");
+    pair.actor_equals("WITNESS_SHAPE ", &shape_line("WITNESS_SHAPE "));
+    pair.assert_absent(
+        &pair.runtime,
+        &["DOWN_TIMEOUT"],
+        "the peer's DOP_MONITOR_P_EXIT reached our monitor",
     );
     pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
     pair.actor_equals("BYE ", "BYE done");
