@@ -115,7 +115,8 @@ use beam_term::{
 /// The atoms these cases name (all pre-seeded: no `AtomInterner` seam is installed, so
 /// an unseeded name would not resolve). The order is deliberately **not** alphabetical:
 /// `none` is seeded ahead of `a` and `b`, so an atom's index order and its name order
-/// disagree — which is what makes the compound-key note in the module docs observable.
+/// disagree — the one fixture in which the module docs' *One atom namespace* rule is
+/// observable at all (a table whose two orders agree would hide it).
 const ATOMS: [&str; 12] = [
     "true", "false", "ok", "error", "none", "a", "b", "zz", "badmap", "badkey", "x", "y",
 ];
