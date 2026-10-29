@@ -81,11 +81,13 @@
 //!
 //! * the bare atom `priority` is accepted and **ignored** (the C sets `ERTS_ML_FLG_PRIO_ML`,
 //!   which has no observable effect here),
-//! * `{tag, Tag}` supplies the `{'DOWN', …}` head atom, honoured for an **immediate**
-//!   (atom/integer/pid/port) or a **module-literal** tag — `beam_process`'s
-//!   `is_heap_independent` acceptance rule, because a monitor record is a plain value the
-//!   collector never scans — while a **heap-resident** tag (built on a process heap, neither
-//!   immediate nor literal) is that crate's typed `error::unsupported_tag`, and
+//! * `{tag, Tag}` supplies the `{'DOWN', …}` head atom, honoured for **every** term shape a
+//!   local target's monitor can carry: `beam_process`'s `monitor_tag_slot` takes ownership of
+//!   the tag at monitor-creation time — a heap-independent one (an immediate or a literal-area
+//!   term, `is_heap_independent`) is stored verbatim, any other is copied into the monitor's own
+//!   heap fragment — so no tag can be relocated out from under the monitor by a later
+//!   collection (a tag on a **remote** external-pid target is the typed gap: the
+//!   `DOP_MONITOR_P` control signal carries no tag field), and
 //! * `{alias, Mode}` makes the monitor's own reference double as a **reference alias**
 //!   (`explicit_unalias` / `demonitor` / `reply_demonitor`), so a message sent to it is
 //!   delivered to the watcher.
@@ -102,6 +104,9 @@
 //! monitor. An `{alias, Mode}` option on a **port** monitor is likewise
 //! `beam_process`'s typed `error::unsupported_port_monitor_alias()` (a port alias's reply
 //! site has no port table), and one on a remote target is the Milestone-1 distribution gap.
+//! A `{tag, Tag}` option on a **remote** pid target is `beam_process`'s typed `unsupported`
+//! for the same reason: `DOP_MONITOR_P` carries no tag field, so the peer could only ever
+//! build a plain `'DOWN'` head.
 
 use std::rc::Rc;
 
@@ -410,9 +415,11 @@ impl RuntimeContext<'_> {
     /// * the bare atom `priority` is accepted and **ignored** (the C sets
     ///   `ERTS_ML_FLG_PRIO_ML`, whose only effect is on the priority signal queue, which this
     ///   runtime does not model);
-    /// * `{tag, Tag}` supplies the user tag (acceptance is checked downstream, by
-    ///   `beam_process`'s `check_tag`: an **immediate** or **module-literal** tag passes, a
-    ///   **heap-resident** one stays that crate's typed `error::unsupported_tag`);
+    /// * `{tag, Tag}` supplies the user tag, forwarded to `beam_process`, which takes ownership
+    ///   of it at monitor-creation time: a heap-independent tag (an immediate, or a term in a
+    ///   literal area) is stored verbatim and any other shape is copied into the monitor's own
+    ///   fragment, so every term shape is accepted for a local target (a remote one is the
+    ///   typed gap, since `DOP_MONITOR_P` carries no tag);
     /// * `{alias, Mode}` selects the reference alias's expiry rule from the atoms
     ///   `explicit_unalias` / `demonitor` / `reply_demonitor`;
     /// * **everything else** — another atom, a tuple of another arity, a non-tuple element, a
@@ -998,17 +1005,23 @@ mod tests {
         call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1");
 
         // A **heap-resident** tag — a tuple built here, neither an immediate nor a
-        // module-literal — is the typed `beam_process` capability gap: a monitor record is a
-        // plain value the collector never scans.
+        // module-literal — is accepted too: the monitor takes ownership of it at creation
+        // time, copying a non-heap-independent term into the monitor's own fragment.
         let heap_tag = make_tuple(&mut runtime, &[x, x]);
         let tag_option = make_tuple(&mut runtime, &[tag, heap_tag]);
         let options = make_list(&mut runtime, &[tag_option]);
-        let error = call(&mut runtime, "erlang", "monitor", &[process, pid.to_eterm(), options])
-            .expect_err("a heap-resident tag is not expressible");
+        let reference = call(&mut runtime, "erlang", "monitor", &[process, pid.to_eterm(), options])
+            .unwrap_or_else(|error| panic!("erlang:monitor/3 with a heap-resident tag: {error}"));
         assert!(
-            crate::error::unsupported_reason(&error).is_some(),
-            "a non-immediate tag is a capability gap: {error}"
+            is_reference(&mut runtime, reference),
+            "a heap-resident tag answers a reference"
         );
+        assert_eq!(monitor_count(&runtime, pid), 1, "the monitor is recorded");
+        assert_eq!(
+            call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1"),
+            atom(&mut runtime, "true")
+        );
+        assert_eq!(monitor_count(&runtime, pid), 0, "the monitor is removed");
 
         // An `{alias, Mode}` whose `Mode` is not one of the three atoms — an unknown atom, or a
         // plain (monitor) reference — is the oracle's `badarg`.
