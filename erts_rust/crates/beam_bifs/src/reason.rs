@@ -53,6 +53,11 @@
 //! Both [`exit_reason_from_term`] and [`reason_term_from_exit_reason`] are part of
 //! the crate's public API (re-exported from the crate root) — the documented
 //! `beam_process`/`beam_rt` handoff, not crate-internal helpers.
+//!
+//! The **other** half of a BIF frame's `error_info` payload — the `cause` the
+//! oracle packs beside `module` — is modelled next door, by
+//! `crate::error_cause::error_cause`; this module owns only the
+//! `erlang:error/2,3` argument/`error_info` payload.
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Result};
 use beam_term::{atom_val, is_atom, make_atom, AtomTable, Eterm};

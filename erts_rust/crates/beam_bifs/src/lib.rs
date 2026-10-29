@@ -84,6 +84,7 @@ mod context;
 mod convert;
 mod dict;
 mod error;
+mod error_cause;
 mod erts_internal;
 mod ets;
 mod fun_info;
@@ -125,6 +126,7 @@ pub use crate::context::{
     RuntimeHooks, SendHook, SendOptions, SendOutcome, StdoutSink,
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
+pub use crate::error_cause::{error_cause, ErrorCause};
 pub use crate::ets::TableRegistry;
 pub use crate::hook_sets::{
     needs_dict_hook, needs_export_gate, needs_fun_caller, needs_local_fun_identity,
@@ -144,12 +146,13 @@ pub use crate::zlib::serves_local_call;
 ///
 /// `use beam_bifs::prelude::*;` brings the [`BifRegistry`] seam, the
 /// [`BifContext`] and its sinks, the raise builders, the reason-term mapping, the
-/// [`ErrorMeta`] payload of `erlang:error/2,3` and [`TableRegistry`] into scope.
+/// [`ErrorMeta`] payload of `erlang:error/2,3`, the [`ErrorCause`] provider of a
+/// failed BIF's `error_info` `cause` and [`TableRegistry`] into scope.
 pub mod prelude {
     pub use crate::{
-        default_registry, error_meta, exit_reason_from_term, raise_error, raise_exit, raise_throw,
-        reason_term_from_exit_reason, serves_local_call, AtomInterner, BifContext, BifFn, ErrorMeta,
-        BifRegistry, BytesSink,
+        default_registry, error_cause, error_meta, exit_reason_from_term, raise_error, raise_exit,
+        raise_throw, reason_term_from_exit_reason, serves_local_call, AtomInterner, BifContext,
+        BifFn, ErrorCause, ErrorMeta, BifRegistry, BytesSink,
         DictHook, FunCaller, LocalFunIdentity, LocalNode, MemoryHook, ModuleInfo, NifLoadError,
         NifLoader, NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
         RecordDefinitionView, RecordFieldView, RecordSource, RuntimeHooks, SendHook, SendOptions,
