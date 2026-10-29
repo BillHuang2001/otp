@@ -100,6 +100,10 @@
 //! * **`passive_recv_on_an_empty_socket_times_out`** — the degenerate end of the same lattice:
 //!   with nothing queued and nothing sent, `gen_tcp:recv(A, 2, 300)` answers `{error, timeout}`
 //!   on both runtimes (the driver arms, the caller's bound elapses, the socket stays open).
+//! * **`tcp_accept_ownership_follows_the_acceptor`** — the accepted connection belongs to the process
+//!   that called `gen_tcp:accept/1`, not to the listener's owner: the acceptor and, after
+//!   `inet:tcp_controlling_process/2`, the third process each see `port_info(S, connected)` name
+//!   *themselves* (both pids reduced to `=:= self()`), so the golden carries no volatile pid.
 //!
 //! Ids are `inet_control/<snake_case_name>`; the contract is A.4 ([`Contract::DriverAbi`]) plus
 //! A.7 ([`Contract::OtpApps`]) wherever the observation is the `gen_udp`/`gen_tcp`/`inet`
@@ -596,6 +600,48 @@ pub(crate) fn group() -> Vec<Case> {
              {Rc, Cls} end",
             "ok {{error,timeout},ok}",
         ),
+        // --- accept ownership: the accepting process, not the listener's owner ----------------
+        case(
+            "inet_control/tcp_accept_ownership_follows_the_acceptor",
+            "a connection accepted by a process that does not own the listener is owned by the \
+             accepting process — erlang:port_info(S,connected) names it, never the listener's \
+             owner — and inet:tcp_controlling_process/2 then hands the socket on to a third \
+             process, whose port_info(S,connected) names it in turn",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                               {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             Parent = self(), \
+             Acceptor = spawn(fun() -> \
+                 {ok, S} = gen_tcp:accept(L), \
+                 Self = self(), \
+                 At = case erlang:port_info(S, connected) of \
+                          {connected, Who} -> {connected, Who =:= Self}; \
+                          Other -> Other \
+                      end, \
+                 Next = spawn(fun() -> \
+                     receive {took, S2, From} -> \
+                         Obs = case erlang:port_info(S2, connected) of \
+                                   {connected, Who2} -> {connected, Who2 =:= self()}; \
+                                   Other2 -> Other2 \
+                               end, \
+                         erlang:send(From, {moved, Obs}), \
+                         (catch gen_tcp:close(S2)) \
+                     after 2000 -> ok end \
+                 end), \
+                 Moved = gen_tcp:controlling_process(S, Next), \
+                 erlang:send(Next, {took, S, self()}), \
+                 Got = receive {moved, Obs2} -> Obs2 after 2000 -> timeout end, \
+                 erlang:send(Parent, {accepted, At, Moved, Got}) \
+             end), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]), \
+             Res = receive {accepted, At2, Moved2, Got2} -> {At2, Moved2, Got2} \
+                   after 5000 -> timeout end, \
+             ok = gen_tcp:close(Cl), \
+             ok = gen_tcp:close(L), \
+             {is_pid(Acceptor), Res} end",
+            "ok {true,{{connected,true},ok,{connected,true}}}",
+        ),
     ]
 }
 #[cfg(test)]
@@ -609,7 +655,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_inet_control_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 18, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 19, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
