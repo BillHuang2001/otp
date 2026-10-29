@@ -579,6 +579,6 @@ file.
   ```
   and the same expression through `differential compare` must go from `[MISMATCH]` to `[AGREE]`
   (that route compares the two sides' ETF images, so it is a pre-check, not the golden's source).
-  Landing the case means adding it to `errors_extra.rs`'s `group()`, its `IDS` table (and the
-  lifted `[&str; 8]` size) and re-adding the per-case shape test; no allowlist or `GAPS.md` change
-  is involved, because an agreeing case is not a gap.
+  Landing the case means adding it to `errors_extra.rs`'s `group()`, its `IDS` table (whose
+  `[&str; 7]` size goes back to `[&str; 8]`) and re-adding the per-case shape test; no allowlist
+  or `GAPS.md` change is involved, because an agreeing case is not a gap.
