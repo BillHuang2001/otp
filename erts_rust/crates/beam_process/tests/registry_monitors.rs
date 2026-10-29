@@ -326,7 +326,7 @@ fn monitor_of_a_dead_pid_is_born_down() {
     assert!(watcher_process.monitored_by().is_empty());
     let payload = f.sole_payload(watcher);
     assert!(
-        payload_is_down_for(payload, reference, down),
+        payload_is_monitor_down_for(payload, reference),
         "the DOWN carries the fresh reference"
     );
     assert_pid_down(payload, down, process, dead.to_eterm(), noproc);
@@ -347,7 +347,7 @@ fn monitor_of_a_dead_pid_is_born_down() {
         .last()
         .expect("two messages")
         .payload();
-    assert!(payload_is_down_for(payload, reference, down));
+    assert!(payload_is_monitor_down_for(payload, reference));
     assert_pid_down(payload, down, process, never.to_eterm(), noproc);
 }
 
@@ -358,7 +358,6 @@ fn monitor_of_a_dead_pid_is_born_down() {
 #[test]
 fn demonitor_flush_removes_only_the_matching_down() {
     let mut f = Fixture::new();
-    let down = f.atom("DOWN");
     let watcher = f.table.spawn_default().expect("watcher");
 
     // Two monitors on two non-live pids: each queues its own immediate noproc DOWN.
@@ -384,11 +383,11 @@ fn demonitor_flush_removes_only_the_matching_down() {
     );
     let remaining = f.sole_payload(watcher);
     assert!(
-        payload_is_down_for(remaining, first, down),
+        payload_is_monitor_down_for(remaining, first),
         "the surviving DOWN is the first monitor's"
     );
     assert!(
-        !payload_is_down_for(remaining, second, down),
+        !payload_is_monitor_down_for(remaining, second),
         "the flushed DOWN is gone"
     );
 
@@ -533,7 +532,7 @@ fn monitor_named_of_an_unregistered_name_is_born_down() {
     assert_eq!(watcher_process.mailbox().len(), 1);
     assert!(watcher_process.monitors().is_empty(), "nothing was recorded");
     let payload = f.sole_payload(watcher);
-    assert!(payload_is_down_for(payload, reference, down));
+    assert!(payload_is_monitor_down_for(payload, reference));
     // SAFETY: the payload is the live 5-tuple the table built on the watcher's heap.
     unsafe {
         assert_eq!(tuple_size(payload), 5);
@@ -642,7 +641,7 @@ fn oracle_monitor_of_a_dead_pid_is_born_down_with_noproc() {
     let len_after = f.table.get(watcher).expect("watcher").mailbox().len();
     assert_eq!(len_after - len_before, 1, "exactly one message was queued");
     let payload = f.sole_payload(watcher);
-    assert!(payload_is_down_for(payload, reference, down));
+    assert!(payload_is_monitor_down_for(payload, reference));
     assert_pid_down(payload, down, process, dead.to_eterm(), noproc);
 }
 
@@ -662,7 +661,6 @@ fn oracle_monitor_of_an_unregistered_name_targets_the_name_node_pair() {
 
     // The Rust side: an unregistered name is born down with the `{Name, Node}` target.
     let mut f = Fixture::new();
-    let down = f.atom("DOWN");
     let name = f.atom("nm1");
     let node = f.atom("nonode@nohost");
     let noproc = f.atom_term("noproc");
@@ -672,7 +670,7 @@ fn oracle_monitor_of_an_unregistered_name_targets_the_name_node_pair() {
         .monitor_named(watcher, name, node, MonitorKind::Process)
         .expect("an unregistered name is not an error");
     let payload = f.sole_payload(watcher);
-    assert!(payload_is_down_for(payload, reference, down));
+    assert!(payload_is_monitor_down_for(payload, reference));
     // SAFETY: the payload is the live 5-tuple the table built on the watcher's heap.
     unsafe {
         let target_term = tuple_element(payload, 3);
@@ -932,7 +930,6 @@ fn oracle_a_targets_death_resolves_the_watchers_outgoing_monitor() {
     // The Rust side of the same statement: the outgoing `[{process,T}]` record is resolved when
     // the target dies, while the DOWN it produced is still queued.
     let mut f = Fixture::new();
-    let down = f.atom("DOWN");
     let watcher = f.table.spawn_default().expect("watcher");
     let target = f.table.spawn_default().expect("target");
     let reference = f
@@ -952,7 +949,7 @@ fn oracle_a_targets_death_resolves_the_watchers_outgoing_monitor() {
 
     let payload = f.sole_payload(watcher);
     assert!(
-        payload_is_down_for(payload, reference, down),
+        payload_is_monitor_down_for(payload, reference),
         "the DOWN is still delivered"
     );
     assert!(

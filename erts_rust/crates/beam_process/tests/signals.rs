@@ -625,7 +625,6 @@ fn a_targets_death_resolves_the_watchers_outgoing_monitor() {
     // The target's death therefore resolves **both** halves: the DOWN is still delivered, but the
     // watcher no longer lists the monitor and `[info]` reports it gone.
     let (mut table, mut names) = table_with_names();
-    let down_atom = names.intern("DOWN");
     let watcher = table.spawn_default().expect("watcher");
     let target = table.spawn_default().expect("target");
     let reference = table
@@ -642,7 +641,7 @@ fn a_targets_death_resolves_the_watchers_outgoing_monitor() {
 
     // The DOWN is still delivered …
     let down = sole_payload(&table, watcher);
-    assert!(payload_is_down_for(down, reference, down_atom));
+    assert!(payload_is_monitor_down_for(down, reference));
     // … and the outgoing half is gone with it.
     assert!(
         table.get(watcher).expect("watcher").monitors().is_empty(),
