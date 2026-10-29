@@ -1,7 +1,7 @@
 # `beam_term::map` — the incremental (path-copying) map writer
 
 ## Intent
-The map child modules: the destination-heap, path-copying update writer (`cow.rs`) that makes one
+The map child modules: the destination-heap, path-copying update writer (the `cow/` cluster) that makes one
 `maps:put/3`, `maps:remove/2` or `#{K := V}` cost Θ(log n) words instead of Θ(n), its unit tests
 (`cow/tests.rs`), and the relocated in-module unit tests of the flat-map/HAMT builder (`tests.rs`).
 The builder itself (`write_map`, `map_words_capacity`, the readers, the from-scratch `map_put`/`map_remove`)
@@ -18,16 +18,16 @@ Ground truth for every arm: `../../../../erts/emulator/beam/erl_map.c` —
 
 ```rust
 pub unsafe fn map_put_cow(hp: *mut Eterm, map: Eterm, key: Eterm, value: Eterm, atoms: &AtomTable)
-    -> TermResult<Eterm>;                                        // cow.rs:1366
+    -> TermResult<Eterm>;                                        // cow/mod.rs:261
 pub unsafe fn map_remove_cow(hp: *mut Eterm, map: Eterm, key: Eterm, atoms: &AtomTable)
-    -> TermResult<Option<Eterm>>;                                // cow.rs:1390  (`None` = absent, writes nothing)
-pub fn map_put_cow_words_capacity(size: usize) -> usize;         // cow.rs:151
-pub fn map_remove_cow_words_capacity(size: usize) -> usize;      // cow.rs:167
-pub fn map_put_cow_words_required(map: Eterm, key: Eterm) -> TermResult<usize>;     // cow.rs:189
-pub fn map_remove_cow_words_required(map: Eterm, key: Eterm) -> TermResult<usize>;  // cow.rs:197
+    -> TermResult<Option<Eterm>>;                                // cow/mod.rs:285  (`None` = absent, writes nothing)
+pub fn map_put_cow_words_capacity(size: usize) -> usize;         // cow/words.rs:58
+pub fn map_remove_cow_words_capacity(size: usize) -> usize;      // cow/words.rs:74
+pub fn map_put_cow_words_required(map: Eterm, key: Eterm) -> TermResult<usize>;     // cow/words.rs:104
+pub fn map_remove_cow_words_required(map: Eterm, key: Eterm) -> TermResult<usize>;  // cow/words.rs:112
 ```
 
-### Put arms (`plan_put` → `PutAction`, `cow.rs:452`)
+### Put arms (`plan_put` → `PutAction`, `cow/put.rs:109`)
 | arm | when | words written |
 |---|---|---|
 | `Nothing` | the stored value **word** is already the new value word (flat: `values[i] == v`; HAMT: `cval == v`, `erl_map.c:2523-2525`) | `0` — the input map word is returned |
@@ -39,12 +39,12 @@ pub fn map_remove_cow_words_required(map: Eterm, key: Eterm) -> TermResult<usize
 The HAMT arm reproduces the C exactly: head array / head bitmap / inner bitmap slot arithmetic
 (`slot = popcount(bitmap & (bit - 1))`), insertion into an unoccupied nibble, leaf-with-same-key
 (`update_size = 0`, head `size` unchanged), leaf-with-a-different-key ⇒ `insert_subnodes`' divergence
-chain (`push_divergence`, `cow.rs:674`), collision-node insert (`c+1` cells) and replace (`c` cells),
+chain (`push_divergence`, `cow/put.rs:331`), collision-node insert (`c+1` cells) and replace (`c` cells),
 and the head-bitmap → `MAP_HEADER_HAMT_HEAD_ARRAY` upgrade when `hval | bp == 0xffff` (same 18-word
 layout, pure header rewrite). Inserting a key adds 1 to the head's raw `size` word; replacing a value
 does not.
 
-### Remove arms (`plan_remove` → `DelAction`/`Res`, `cow.rs:910-1030`)
+### Remove arms (`plan_remove` → `DelAction`/`Res`, `cow/remove.rs:48-150`)
 The C's `res == THE_NON_VALUE` state machine, modelled as `Res { Removed, Leaf(Eterm), Node(Eterm) }`:
 flat removal writes `flatmap_size_words(n - 1)` in the surviving key order (removal preserves the
 canonical order, so no re-sort); the HAMT spine copies with the bitmap change matrix (n=1 keep/remove,
@@ -59,7 +59,7 @@ storage order then `cmp_flatmap_keys`). An absent key answers `None` and writes 
 | put | `flatmap_size_words(size + 1) ≤ 70` | `map_words_capacity(33) = 711` | **293** |
 | remove | `flatmap_size_words(size - 1) ≤ 68` | `flatmap_size_words(31) = 66` | **288** |
 
-Derivation of the HAMT figures (`cow.rs:130-141`): at most 16 nodes lie on a hash path (levels
+Derivation of the HAMT figures (`cow/words.rs:35-48`): at most 16 nodes lie on a hash path (levels
 `0..=15`) and the widest node is 18 words (head array, or head bitmap with all 16 slots), so the spine
 is ≤ 288; a put adds the leaf's 2-word cons cell (290) and a divergence chain that hangs off the
 level-15 node and ends in a two-cell collision node adds 3 more ⇒ **293**
@@ -93,11 +93,13 @@ exact on every arm **except** the flat→HAMT conversion, where it is `write_map
   typed rejections (`TermError::BadMap` for a malformed node/child) happen before any write, and (c) the
   `debug_assert!(out.written() == plan.words)` a real invariant. Keep it: no arm may write while still
   able to reach a fallible check.
-- Files ~1000 lines: `cow.rs` is 1403 lines (the arm tables, the bounds and their derivations, and the
-  writer share one narrative); split by arm family (flat / put / remove) before growing it further.
+- Files ~1000 lines, one responsibility each: the writer is the `cow/` cluster — `cow/mod.rs` (296 lines:
+  the staging cursor and the two entry points), `cow/words.rs` (115: the word figures and their
+  derivation), `cow/node.rs` (106: node classification), `cow/put.rs` (557: the put arm), `cow/remove.rs`
+  (481: the remove arm). Grow a new arm as a new child module rather than into an existing one.
 
 ## Test Strategy
-- `cow/tests.rs` (670 lines, 24 cases) — unit level, over-sized `Vec<Eterm>` with a `SENTINEL` tail:
+- `cow/tests.rs` (677 lines, 24 cases) — unit level, over-sized `Vec<Eterm>` with a `SENTINEL` tail:
   empty/1-pair, the canonical flatmap header word (a wrong inner header field is invisible to readers, so
   it is pinned explicitly), keys-tuple reuse on the flat replace arm, the zero-write arms
   (same value word, absent remove), front/middle/end flat insertion, `31→32`, `32→33`, HAMT
@@ -134,9 +136,18 @@ exact on every arm **except** the flat→HAMT conversion, where it is `write_map
   deep equality would cost more than the write it saves.
 
 ## Routing Table
-- `cow.rs` → the incremental writer: the word bounds and their derivation, `plan_put`/`plan_flat_put`/
-  `plan_hamt_put`/`push_divergence`, `plan_remove`/`plan_flat_remove`/`plan_hamt_remove`, the `Out`
-  cursor, `map_put_cow`/`map_remove_cow`
+- `cow/mod.rs` → the cluster root: the module doc (what is copied, what is shared, the two word figures,
+  the semantics worth pinning), the `Out` staging cursor, the two public entry points
+  `map_put_cow`/`map_remove_cow`, and the re-exports the parent `src/map.rs` publishes
+- `cow/words.rs` → the word accounting: `map_put_cow_words_capacity`/`map_remove_cow_words_capacity`
+  (size-only bounds), `map_put_cow_words_required`/`map_remove_cow_words_required` (path-derived exact
+  figures), the spine-bound constants and their derivation
+- `cow/node.rs` → HAMT node classification and slot arithmetic: `Child`/`classify_child`, `node_layout`,
+  `slot_of`, `bitmap_header` (the C's `primary_tag` dispatch and the bitmap slot map)
+- `cow/put.rs` → the put arm: `plan_put`/`plan_flat_put`/`plan_hamt_put`/`push_divergence` (the read-only
+  plan) and `put_frame`/`exec_put` (the writer)
+- `cow/remove.rs` → the remove arm: `Res`/`DelFrame`/`DelSpec`/`plan_remove`/`plan_flat_remove`/
+  `plan_hamt_remove` (the read-only plan) and `put_del_frame`/`exec_remove` (the writer)
 - `cow/tests.rs` → the writer's unit suite (arm-by-arm, sentinel-guarded)
 - `tests.rs` → the relocated in-module unit tests of the builder (`write_map`, the readers, the
   from-scratch `map_put`/`map_remove`) — the parent `src/map.rs` owns `#[cfg(test)] mod tests;`

@@ -18,15 +18,22 @@
 //
 // %CopyrightEnd%
 
-//! Unit tests for the path-copying map writers (`src/map/cow.rs`): every arm of
+//! Unit tests for the path-copying map writers (`src/map/cow/`): every arm of
 //! the C's put/delete state machine, cross-checked against a `write_map` rebuild
 //! of the same pair set — element for element, in canonical *and* storage order —
 //! and pinned on the word figures the capacity/required pair reports.
 
 use super::*;
-use crate::boxed::{is_flatmap, is_hashmap};
+use crate::boxed::{boxed_val, is_flatmap, is_hashmap, map_header_type, map_header_val};
+use crate::compare::eq;
+use crate::error::TermError;
+use crate::ihash::{erts_map_hash, hashmap_nibble};
 use crate::immediate::make_small;
-use crate::map::{map_get, map_pairs, map_pairs_storage_order, map_words_capacity};
+use crate::map::{
+    map_get, map_pairs, map_pairs_storage_order, map_size, map_words_capacity, write_map,
+    HAMT_MAX_LEVEL, MAP_SMALL_MAP_LIMIT,
+};
+use crate::tag::{MAP_HEADER_TAG_HAMT_HEAD_ARRAY, MAP_HEADER_TAG_HAMT_HEAD_BITMAP};
 
 /// A permanently-invalid marker word: nothing may write past the reservation.
 const SENTINEL: Eterm = Eterm::from_raw(0xDEAD_BEEF);

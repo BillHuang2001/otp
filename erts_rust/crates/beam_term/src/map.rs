@@ -77,7 +77,7 @@
 //! [`write_map`] rebuilds a whole map — Θ(n) work and Θ(n) fresh words — which is
 //! what a from-scratch builder needs, but not what one `maps:put/3` should cost.
 //! The *incremental* writers [`map_put_cow`] / [`map_remove_cow`] (implemented in
-//! `src/map/cow.rs`) reproduce the C's path-copying shape (C `erts_maps_put`,
+//! `src/map/cow/`) reproduce the C's path-copying shape (C `erts_maps_put`,
 //! `erts_hashmap_insert`/`_down`/`_up` and `hashmap_delete`): they copy **only the
 //! nodes on the hash path** into `hp` and *share every off-path subtree, keys tuple
 //! and collision cell by word*, because terms are immutable and never relocated in
@@ -760,7 +760,7 @@ fn node_subtag(header: Eterm) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Incremental (path-copying) update — see `src/map/cow.rs`
+// Incremental (path-copying) update — see `src/map/cow/`
 // ---------------------------------------------------------------------------
 
 mod cow;
