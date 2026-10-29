@@ -180,6 +180,14 @@ const SHAPE_ONLY_KEYS: &[&str] = &[
     "run_queues",
     "scheduling_statistics",
     "total_scheduling_statistics",
+    // The static-NIF roster. Its *size* is a build property of the release: this tree
+    // (`30.0-rc0` / erts-17.1) declares 556 `bif.tab` rows, an OTP-29 oracle answers 553 —
+    // the same list without `erlang:pid_to_binary/1`, `erlang:port_to_binary/1` and
+    // `erlang:ref_to_binary/1` (our roster minus those three rows IS the oracle's list,
+    // element for element). Comparing the rows would therefore compare two releases'
+    // tables, so only the **shape** is compared: a non-empty list of
+    // `{Module, Function, Arity}` 3-tuples in the roster's own (reversed-`bif.tab`) order.
+    "snifs",
 ];
 
 /// Keys the oracle accepts that this runtime answers with an honest capability gap.
@@ -206,14 +214,13 @@ const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "loaded",
     // ERTS *C-emulator internals* with no counterpart here (see `src/info/unsupported.rs`):
     // the C toolchain's build flags, the ethread library, the constant-pool/jump-table
-    // loader switches, the static NIF table and its taints, the emulator argument vector,
+    // loader switches, the NIF taints, the emulator argument vector,
     // the scheduler distribution maps, the `BIG_ARITY_MAX` cap and the thread-progress dump.
     "compile_info",
     "ethread_info",
     "ethread_used_tse",
     "constant_pool_support",
     "beam_jump_table",
-    "snifs",
     "taints",
     "emu_args",
     "reader_groups_map",
@@ -864,10 +871,13 @@ fn the_oracle_shapes_and_values_match() {
         // legitimately follows *this* runtime's scheduler count / growth table /
         // configured dirty-scheduler pools (the C omits a `dirty_cpu`/`dirty_io` row whose
         // total is 0, so a default runtime reports the single `normal` row).
+        // `snifs` joins them: its row count is the *release's* `bif.tab` size (556 here,
+        // 553 on an OTP-29 oracle), so the arity is compared against this tree's roster
+        // instead — `the_snifs_roster_is_this_tree_s_own_table` below.
         if theirs.arity != 0
             && !matches!(
                 *key,
-                "scheduler_bindings" | "heap_sizes" | "all_schedulers_state"
+                "scheduler_bindings" | "heap_sizes" | "all_schedulers_state" | "snifs"
             )
         {
             assert_eq!(
@@ -914,6 +924,117 @@ fn self_derived_counts_stay_shaped_like_the_oracle_even_thinned() {
         }
         other => panic!("scheduler_bindings must be a tuple, got {other:?}"),
     }
+}
+
+/// `system_info(snifs)` — this tree's static-NIF roster, and exactly *how* it differs from
+/// a live oracle's.
+///
+/// The key is compared **shape-only** by `the_oracle_shapes_and_values_match` because the
+/// roster is the *release's* `bif.tab`: this tree (`30.0-rc0` / erts-17.1) declares 556
+/// rows, an OTP-29 oracle answers 553. This test pins both sides and proves the difference
+/// is exactly the three rows OTP 30 added:
+///
+/// * our answer is a non-empty list of `{Module, Function, Arity}` 3-tuples
+///   (atom / atom / small-int) in the roster's own order, whose head is the roster's last
+///   `bif.tab` row (`build_snifs_term`, `erl_bif_info.c:2764-2772`, conses the table upward
+///   onto the tail — so the oracle's list is the table reversed);
+/// * the oracle's rows are our rows minus `erlang:pid_to_binary/1`,
+///   `erlang:port_to_binary/1` and `erlang:ref_to_binary/1`, **element for element and in
+///   the same order** (a printed `~p` comparison, with the oracle's quoted operator atoms
+///   unquoted so the two spellings line up).
+#[test]
+fn the_snifs_roster_is_this_tree_s_own_table() {
+    /// The `bif.tab` rows OTP 30 declares that an OTP-29 oracle does not.
+    const OTP30_ONLY_ROWS: [(&str, &str, u32); 3] = [
+        ("erlang", "pid_to_binary", 1),
+        ("erlang", "port_to_binary", 1),
+        ("erlang", "ref_to_binary", 1),
+    ];
+
+    // -- our side: the shape the oracle prints, and the roster itself ---------------
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    rt.boot().expect("boot");
+    let ours = match system_info_value("snifs", &rt).expect("snifs") {
+        InfoValue::List(rows) => rows,
+        other => panic!("snifs must be a list, got {other:?}"),
+    };
+    assert!(!ours.is_empty(), "the static-NIF roster is never empty");
+    for row in &ours {
+        match row {
+            InfoValue::Tupled(fields) => {
+                assert_eq!(fields.len(), 3, "every row is a 3-tuple: {row:?}");
+                assert!(matches!(fields[0], InfoValue::Atom(_)), "{row:?}");
+                assert!(matches!(fields[1], InfoValue::Atom(_)), "{row:?}");
+                assert!(
+                    matches!(fields[2], InfoValue::Int(arity) if arity >= 0),
+                    "{row:?}"
+                );
+            }
+            other => panic!("a snifs element must be a 3-tuple, got {other:?}"),
+        }
+    }
+    let roster: Vec<beam_bifs::Snif> = beam_bifs::snifs().collect();
+    assert_eq!(ours.len(), roster.len(), "our answer is our own roster");
+    let head = roster.first().expect("a non-empty roster");
+    assert_eq!(
+        ours.first(),
+        Some(&InfoValue::Tupled(vec![
+            InfoValue::Atom(head.module),
+            InfoValue::Atom(head.function),
+            InfoValue::Int(i64::from(head.arity)),
+        ])),
+        "the answer is the roster iterator's own order (the bif.tab order reversed)"
+    );
+
+    // -- the oracle's side ---------------------------------------------------------
+    let probe = "io:format(\"~p\", [erlang:system_info(snifs)]), halt(0).";
+    let Some(oracle) = oracle_run(&[], &[], probe) else {
+        eprintln!("SKIP the_snifs_roster_is_this_tree_s_own_table: no system `erl`");
+        return;
+    };
+    // `~p` writes a list of tuples; `normalize` drops the line-wrap whitespace and the
+    // quotes around an operator-atom function name (`'+'` here, `+` in our rendering).
+    let oracle_rows = normalize(&oracle.replace('\'', ""));
+    let ours_rows: Vec<String> = roster
+        .iter()
+        .filter(|snif| {
+            !OTP30_ONLY_ROWS.iter().any(|(module, function, arity)| {
+                snif.module == *module && snif.function == *function && snif.arity == *arity
+            })
+        })
+        .map(|snif| format!("{{{},{},{}}}", snif.module, snif.function, snif.arity))
+        .collect();
+    let ours_text = format!("[{}]", ours_rows.join(","));
+
+    // Each extra row is really ours, and really absent from an OTP-29 oracle's roster.
+    for (module, function, arity) in OTP30_ONLY_ROWS {
+        assert!(
+            roster.iter().any(|snif| snif.module == module
+                && snif.function == function
+                && snif.arity == arity),
+            "this tree declares {module}:{function}/{arity}"
+        );
+        assert!(
+            !oracle_rows.contains(&format!("{{{module},{function},{arity}}}")),
+            "an OTP-29 oracle has no {module}:{function}/{arity}"
+        );
+    }
+    // A row is a flat 3-tuple, so the `{` count is the oracle's roster size.
+    let oracle_count = oracle_rows.matches('{').count();
+    eprintln!(
+        "snifs: ours={} oracle={} difference=the OTP-30-only rows {OTP30_ONLY_ROWS:?}",
+        roster.len(),
+        oracle_count,
+    );
+    assert_eq!(
+        oracle_count,
+        roster.len() - OTP30_ONLY_ROWS.len(),
+        "the two rosters differ by exactly the OTP-30-only rows"
+    );
+    assert_eq!(
+        ours_text, oracle_rows,
+        "our roster minus the OTP-30-only rows must BE the oracle's list, in its order"
+    );
 }
 
 #[test]

@@ -96,6 +96,20 @@ impl RuntimeContext<'_> {
     /// everything the store already held stays valid (see [`Runtime::grow_eval_heap`]).
     pub(super) fn move_result_into_runtime_store(&mut self, term: Eterm) -> Option<Eterm> {
         let RuntimeContext { runtime, .. } = self;
+        // THE DESTINATION-CONTAINMENT SHORT-CIRCUIT (store arm, [`super::calls::dest`]): the
+        // result's root object already lives in this store (the live `eval_heap` region, or one a
+        // growth step retired), so copying it would only replace a live, store-owned object with a
+        // structural twin. Hand the word through unchanged — which is what keeps a no-op container
+        // BIF's term identity observable (`erts_debug:same(maps:put(a,V,M), M)` on the
+        // `-eval`/`-s`/`-run` route).
+        //
+        // The escape-store descent gate is opened exactly as on the copy path below: the store is
+        // outside every process's scanned heap, so a handed-through container must keep the
+        // over-approximate "an escaped store may hold roots" latch set just the same.
+        if super::calls::dest::store_holds(runtime, term) {
+            runtime.note_escaped_store_roots(term);
+            return Some(term);
+        }
         let needed = match copy_result_fresh(
             &mut runtime.eval_heap,
             &mut runtime.eval_off_heap,

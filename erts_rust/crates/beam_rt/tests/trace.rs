@@ -145,16 +145,24 @@ fn an_untraced_pid_reports_empty_flags() {
     assert_eq!(pair_value(info, 1), how_false);
 }
 
-/// `erlang:trace(P, false)` clears the tracee, and `trace_info` reports it untraced again.
+/// Clearing removes **the flags the call names**, and a flag list with no flag at all removes
+/// nothing — the C's `ref->flags &= ~mask` (`../../erts/emulator/beam/erl_bif_trace.c:866-867`).
+///
+/// `erlang:trace(P, false)` is the `/2` wrapper's `erts_internal:trace(P, false, [])`, so its
+/// mask is empty and an already-traced process **stays traced** (it only counts it). Oracle
+/// (OTP 29.1.2 / erts-17.1.1): `erlang:trace(P, true, [call]), erlang:trace(P, false, [])` ⇒ `1`
+/// with `{flags,[call]}`, while `erlang:trace(P, false, [call])` ⇒ `1` with `{flags,[]}`.
 #[test]
-fn trace_false_clears_the_tracee() {
+fn trace_false_clears_only_the_named_flags() {
     let mut rt = runtime();
     let the_pid = rt.self_pid().to_eterm();
     let how_true = rt.intern("true");
     let how_false = rt.intern("false");
     let item_flags = rt.intern("flags");
     let item_traced = rt.intern("traced");
+    let call = rt.intern("call");
     let flags_list = rt.eval("[call]").expect("[call]");
+    let clear_call = rt.eval("[call]").expect("[call]");
 
     let mut sink = NullSink;
     let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
@@ -164,12 +172,29 @@ fn trace_false_clears_the_tracee() {
         .expect("trace/3");
     assert_eq!(signed_value(count), 1);
 
-    // `erlang:trace(self(), false)` (the /2 wrapper) clears it and still counts the tracee.
+    // The `/2` wrapper's empty flag list clears nothing, and still counts the tracee.
     let count = ctx
         .call_bif("erlang", "trace", 2, &[the_pid, how_false])
         .expect("trace/2");
     assert_eq!(signed_value(count), 1, "the tracee was still affected");
+    let info = ctx
+        .call_bif("erlang", "trace_info", 2, &[the_pid, item_flags])
+        .expect("trace_info(flags)");
+    assert_eq!(
+        elems(pair_value(info, 1)),
+        vec![call],
+        "an empty mask clears no flag"
+    );
+    let info = ctx
+        .call_bif("erlang", "trace_info", 2, &[the_pid, item_traced])
+        .expect("trace_info(traced)");
+    assert_eq!(pair_value(info, 1), how_true, "still traced");
 
+    // Naming the flag is what clears it.
+    let count = ctx
+        .call_bif("erlang", "trace", 3, &[the_pid, how_false, clear_call])
+        .expect("trace/3 false [call]");
+    assert_eq!(signed_value(count), 1);
     let info = ctx
         .call_bif("erlang", "trace_info", 2, &[the_pid, item_flags])
         .expect("trace_info(flags)");
