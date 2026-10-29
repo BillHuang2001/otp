@@ -1,0 +1,20 @@
+[package]
+name = "suites"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+description = "Runs real third-party and OTP test suites (eunit and common_test) under both the system ERTS and the Rust runtime, and records per-module pass counts."
+
+# This crate is deliberately **dependency-free** and a **standalone workspace**: it lives
+# under `erts_rust/tools/` (so it belongs to this repo's tooling node) but must not be added
+# to `erts_rust/Cargo.toml`'s member list by this deliverable, and it needs nothing from the
+# crates.io registry. See CONTEXT.md §Notes for Agents (and the one-line workspace change a
+# parent agent can make to fold it into `cargo build --workspace`).
+[workspace]
+
+[dependencies]
+
+[[bin]]
+name = "suites"
+path = "src/main.rs"
