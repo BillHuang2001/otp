@@ -561,7 +561,7 @@ static TABLE: OnceLock<FlagTable> = OnceLock::new();
 /// probe instead of fourteen table walks. A key no table lists answers `0`, which keeps
 /// all fourteen predicates `false` — exactly what their `binary_search`es answered.
 #[inline]
-pub(crate) fn flags(module: &str, function: &str, arity: u32) -> u16 {
+pub fn flags(module: &str, function: &str, arity: u32) -> u16 {
     TABLE
         .get_or_init(FlagTable::build)
         .lookup(module, function, arity)

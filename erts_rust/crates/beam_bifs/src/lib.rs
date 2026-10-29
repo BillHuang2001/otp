@@ -82,7 +82,7 @@ mod error;
 mod erts_internal;
 mod ets;
 mod fun_info;
-mod hook_flags;
+pub mod hook_flags;
 pub mod hook_sets;
 mod io;
 mod io_ts;
