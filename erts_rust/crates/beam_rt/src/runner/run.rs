@@ -1708,14 +1708,15 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // handles on this pid's scan state; the copy's source payloads are the union of
                 // the two (`Runtime::source_payloads`), so a reason like `exit(<<big/binary>>)`
                 // resolves either kind rather than tripping the valve over a payload the empty
-                // source table could not resolve. A reason that *genuinely* cannot be copied is
-                // the honest `error:system_limit` (it is propagated, never stored dangling),
-                // while the documented off-heap capability gap keeps the original term and
-                // freezes the heaps — see `Runtime::try_stabilize_escaped_with`.
+                // source table could not resolve. A reason the copier **refuses** is a
+                // *diagnostic* failure, not the process's error: the raise keeps its class,
+                // reason and stacktrace and loses only the opaque payload, so one un-copyable
+                // child reason can never abort the whole run (see
+                // `Runtime::stabilize_error_live_reason`, which is total).
                 let error = {
                     let payloads =
                         self.runtime.source_payloads(pid, engine.machine.refc_binaries());
-                    self.runtime.stabilize_error_live_reason(error, &payloads)?
+                    self.runtime.stabilize_error_live_reason(error, &payloads)
                 };
                 // The exit reason is now **derived from the stabilized error**, so it inherits the
                 // runtime-lifetime term: an atom reason interns the atom, a structured reason

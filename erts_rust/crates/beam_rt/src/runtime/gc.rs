@@ -1005,8 +1005,8 @@ impl Runtime {
     /// [`Raise::live_reason`](beam_common::Raise::live_reason) slot — the payload convention
     /// [`crate::error::live_reason_term`] recovers. The term was built on whichever heap the
     /// raising code was running on: a scheduled process's own young heap, or the pooled BIF
-    /// region (which is rewound after every call). **Neither outlives the raise**: the runner
-    /// terminates the process (its heap dies with it) and the pooled region is rewound, so a
+    /// region (which a later call's rewind reclaims). **Neither outlives the raise**: the runner
+    /// terminates the process (its heap dies with it) and the pooled region is recycled, so a
     /// raw slot read later is a use-after-free — observed as an allocator abort for a boxed
     /// binary, a null-deref panic for a cons list, or a silently degraded rendering.
     ///
@@ -1017,37 +1017,110 @@ impl Runtime {
     /// `reported_reason`, the crash dump) then consumes a safe term without knowing about
     /// this move.
     ///
-    /// It is exactly [`Runtime::try_stabilize_escaped_with`] applied to the slot's payload, so
-    /// the two failure classes stay as documented there: a genuine [`BeamError::SystemLimit`]
-    /// propagates (never a dangling term), while the off-heap capability gap keeps the original
-    /// term and freezes every process heap ([`Runtime::disable_gc`]). An error with no live
-    /// reason — a non-raise, or a raise whose reason **is** an atom (the authoritative one;
-    /// [`crate::error::live_reason_term`] answers `None` for both) — is returned untouched: no
-    /// copy, no allocation, no valve.
+    /// It is [`Runtime::try_stabilize_escaped_with`] applied to the slot's payload. An error
+    /// with no live reason — a non-raise, or a raise whose reason **is** an atom (the
+    /// authoritative one; [`crate::error::live_reason_term`] answers `None` for both) — is
+    /// returned untouched: no copy, no allocation, no valve.
     ///
-    /// # Errors
+    /// # A refusal here is a *diagnostic* failure, and degrades — it never aborts the run
     ///
-    /// [`BeamError::SystemLimit`] when the reason genuinely does not fit the arena; the
-    /// original error is then **not** returned as if it were safe.
+    /// This method is **total**: it cannot fail. It used to propagate
+    /// [`BeamError::SystemLimit`] when the payload could not be copied, and that turned an
+    /// ordinary child termination into `beam_rt: system_limit` for the **whole run** (exit 1)
+    /// — the "spurious limit on a call the oracle serves" class this crate forbids, on a step
+    /// whose only observable effect is how a death is *rendered*. Measured shape (D1,
+    /// `binary_module_SUITE:error_info/1` in a spawned `ct_runner` case process): the raise's
+    /// reason graph no longer named live memory — it walked at ~5.9e14 priced words — and the
+    /// refusal killed the run instead of one process.
+    ///
+    /// A refusal now **keeps the raise's class, reason, stacktrace and stacktrace head** and
+    /// **drops the opaque payload only** ([`Runtime::degrade_live_reason`]), which is exactly
+    /// the no-payload path every rendering site already handles
+    /// ([`crate::error::live_reason_term`] answers `None`, `crate::runner::exit_reason` interns
+    /// the class reason, `crate::report` renders `{Reason, Stacktrace}` from it). So **no value
+    /// and no exception a BIF, a call or a process observes changes** — the payload feeds only
+    /// the human-readable rendering of an already-terminating process.
+    ///
+    /// # Never read a term you cannot price
+    ///
+    /// The graph is **priced first**, bounded by what the escape store could hold at all
+    /// ([`beam_term::size_object_bounded`] against `eval_heap.available()`): a graph that does
+    /// not price within that budget — too large, cyclic, or not a term graph this crate can
+    /// walk — is degraded without ever being handed to the copier. A graph that prices is then
+    /// copied, and a copy refusal degrades the same way.
+    ///
+    /// Both refusal classes **degrade**, and they cannot be told apart at this site: the
+    /// copier's refusal is a destination-capacity figure derived from a walk over a graph the
+    /// *producer* built (upstream, and possibly no longer live), so a "genuinely too large
+    /// reason" and an "unpriceable graph" arrive here as the same
+    /// [`BeamError::SystemLimit`]/[`beam_term::TermError`] and both mean the same thing for
+    /// this call: the term cannot reach the runtime-lifetime store. Every other escape store
+    /// keeps the strict rule ([`Runtime::try_stabilize_escaped_with`] still propagates a
+    /// genuine [`BeamError::SystemLimit`] and still trips the valve for the off-heap capability
+    /// gap); **only this diagnostic step degrades**, and it records the degradation through
+    /// [`crate::debug_trace`] (silent unless `BEAM_RT_BOOT_TRACE` is set) instead of hiding it.
+    ///
+    /// One shape is therefore rendered bare where it used to be rendered structurally: a
+    /// reason whose **source occupancy** exceeds the store's capacity — e.g. a large
+    /// literal-area subterm, whose copy the copier would share for free. It is a rendering
+    /// difference on a process that is already dying, never a value.
     pub(crate) fn stabilize_error_live_reason(
         &mut self,
         error: BeamError,
         src: &SourcePayloads,
-    ) -> Result<BeamError> {
+    ) -> BeamError {
         let Some(term) = crate::error::live_reason_term(&error) else {
-            return Ok(error);
+            return error;
         };
-        let term = self.try_stabilize_escaped_with(term, src)?;
+        // The price gate: the store's own free words are the exact budget the copy below is
+        // gated by, so a graph that does not price within them cannot reach the store either
+        // way — and a graph that does not price *at all* (cyclic, over budget, not a walkable
+        // term) must never be handed to a copier.
+        let capacity = self.eval_heap.available();
+        if let Err(refusal) = beam_term::size_object_bounded(term, capacity) {
+            return self.degrade_live_reason(error, &format_args!("price refused: {refusal}"));
+        }
+        let term = match self.try_stabilize_escaped_with(term, src) {
+            Ok(copy) => copy,
+            Err(refusal) => {
+                return self.degrade_live_reason(error, &format_args!("copy refused: {refusal}"))
+            }
+        };
         match error {
             // Rebuild the raise around the stabilized term: class, reason, stacktrace and
             // stacktrace head are preserved, only the opaque payload is replaced.
-            BeamError::Raise(raise) => Ok(BeamError::Raise(
+            BeamError::Raise(raise) => BeamError::Raise(
                 raise.with_live_reason(beam_common::LiveReason::new(term)),
-            )),
+            ),
             // Unreachable — `live_reason_term` only answers `Some` for a `Raise` — but a
             // fallback that returns the error unchanged is still the honest answer, never a
             // panic on runtime data.
-            other => Ok(other),
+            other => other,
+        }
+    }
+
+    /// Drops a raise's opaque [`live_reason`](beam_common::Raise::live_reason) payload,
+    /// keeping everything observable, and records *why* through [`crate::debug_trace`].
+    ///
+    /// The degradation half of [`Runtime::stabilize_error_live_reason`]: a raise whose reason
+    /// term could not be priced or copied keeps its class, reason, stacktrace and stacktrace
+    /// head (and its `saved_args`/`error_info`/`supplied_trace` slots, untouched) and loses
+    /// only the payload, so [`crate::error::live_reason_term`] answers `None` afterwards and
+    /// every rendering site takes the bare-class-reason path it already handles. Nothing is
+    /// stored, so no valve is tripped and no unreadable word is kept.
+    ///
+    /// A non-`Raise` is returned unchanged (unreachable from the caller: the payload exists
+    /// only on a `Raise`), never a panic on runtime data.
+    fn degrade_live_reason(&self, error: BeamError, why: &dyn std::fmt::Display) -> BeamError {
+        crate::debug_trace::trace(format_args!(
+            "live reason degraded to the bare class reason: {why}"
+        ));
+        match error {
+            BeamError::Raise(raise) => BeamError::Raise(beam_common::Raise {
+                live_reason: None,
+                ..raise
+            }),
+            other => other,
         }
     }
 
@@ -1563,9 +1636,7 @@ mod tests {
         );
 
         // The escape boundary: the copy happens while the source heap still holds the term.
-        let error = rt
-            .stabilize_error_live_reason(error, &SourcePayloads::default())
-            .expect("the reason is small enough for the arena");
+        let error = rt.stabilize_error_live_reason(error, &SourcePayloads::default());
 
         // Now the source heap is recycled — rewound and overwritten, the way a reused region is.
         heap.reset();
@@ -1598,40 +1669,95 @@ mod tests {
 
         let mut rt = small_runtime();
         let atom_raise = BeamError::Raise(Raise::error(ExitReason::atom("badarg")));
-        let returned = rt
-            .stabilize_error_live_reason(atom_raise, &SourcePayloads::default())
-            .expect("there is nothing to copy");
+        let returned = rt.stabilize_error_live_reason(atom_raise, &SourcePayloads::default());
         assert_eq!(returned.as_atom(), Some("badarg"));
-        let returned = rt
-            .stabilize_error_live_reason(BeamError::BadArg, &SourcePayloads::default())
-            .expect("there is nothing to copy");
+        let returned = rt.stabilize_error_live_reason(BeamError::BadArg, &SourcePayloads::default());
         assert_eq!(returned.as_atom(), Some("badarg"));
         let stats = rt.gc_stats();
         assert!(!stats.disabled, "nothing was stored, so nothing was frozen");
         assert_eq!(stats.valve_trips, 0);
     }
 
-    /// **A reason that genuinely cannot be copied is the honest `system_limit`** — never a raise
-    /// carrying a dangling term, and never a valve trip (nothing was stored).
+    /// **A reason that cannot be copied DEGRADES — it never becomes the run's error.**
+    ///
+    /// The escape boundary is a *diagnostic* step: it decides how an already-terminating
+    /// process's raise is rendered afterwards. Propagating the copy's refusal (as
+    /// `error:system_limit`) turned one un-copyable child reason into the whole run's exit
+    /// (the measured D1 shape: `binary_module_SUITE:error_info/1` in a spawned `ct_runner`
+    /// case process, where the reason graph no longer named live memory). The refusal now
+    /// keeps the raise's class, reason and stacktrace, drops the opaque payload, and reports
+    /// nothing as `SystemLimit`.
+    ///
+    /// The test pins all four facts: the very error that used to raise now answers a
+    /// `Raise`, its class/reason/stacktrace survive verbatim, the payload is gone (so
+    /// [`crate::error::live_reason_term`] answers `None` — the documented no-copy rendering
+    /// path), and nothing was stored or frozen.
     #[test]
-    fn a_reason_that_cannot_be_copied_is_the_honest_system_limit() {
-        use beam_common::{ExitReason, LiveReason, Raise};
+    fn a_reason_that_cannot_be_copied_degrades_instead_of_aborting_the_run() {
+        use beam_common::{ExceptionClass, ExitReason, LiveReason, Raise};
 
         let mut rt = small_runtime();
         let big = oversized_term(&mut rt);
+        let stacktrace = beam_common::StackTrace::new();
         let error = BeamError::Raise(
-            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(big)),
+            Raise::error(ExitReason::Structured)
+                .with_live_reason(LiveReason::new(big))
+                .with_stacktrace(stacktrace.clone()),
+        );
+        let degraded = rt.stabilize_error_live_reason(error, &SourcePayloads::default());
+
+        // Not the run's error: the raise survives with its observable parts intact.
+        let BeamError::Raise(raise) = &degraded else {
+            panic!("a refused reason must stay the raise it was, got {degraded:?}");
+        };
+        assert_eq!(raise.class, ExceptionClass::Error, "the class is preserved");
+        assert_eq!(
+            raise.reason,
+            ExitReason::Structured,
+            "the reason is preserved"
+        );
+        assert_eq!(
+            raise.stacktrace, stacktrace,
+            "the stacktrace is preserved verbatim"
         );
         assert!(
-            matches!(
-                rt.stabilize_error_live_reason(error, &SourcePayloads::default()),
-                Err(BeamError::SystemLimit)
-            ),
-            "an un-copyable reason is reported honestly, not stored dangling"
+            crate::error::live_reason_term(&degraded).is_none(),
+            "the opaque payload is dropped, so every renderer takes the bare-class path"
         );
+        // Nothing was stored and nothing was frozen: no valve, no halt.
         let stats = rt.gc_stats();
-        assert!(!stats.disabled, "an honest failure trips no valve");
-        assert_eq!(stats.valve_trips, 0);
+        assert!(!stats.disabled, "a degraded reason must not freeze collection");
+        assert_eq!(stats.valve_trips, 0, "a degraded reason trips no valve");
+    }
+
+    /// The counterpart, and the guard against over-degrading: a reason that **does** fit the
+    /// store is still copied verbatim and keeps its payload (the happy path of the same
+    /// method, which must not have become lax).
+    #[test]
+    fn a_copyable_reason_keeps_its_stabilized_payload() {
+        use beam_common::{ExitReason, LiveReason, Raise};
+
+        let mut rt = small_runtime();
+        let badkey = rt.intern("badkey");
+        let mut heap = beam_term::heap::Heap::new(32);
+        let reason = heap
+            .tuple(&[badkey, make_small(7)])
+            .expect("the scratch tuple");
+        let error = BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(reason)),
+        );
+        let stabilized = rt.stabilize_error_live_reason(error, &SourcePayloads::default());
+        let term = crate::error::live_reason_term(&stabilized)
+            .expect("a copyable reason keeps its payload");
+        assert_ne!(term, reason, "the payload is the copy on the store");
+        assert_eq!(
+            rt.format_term_w(term, None)
+                .expect("a safe term renders")
+                .trim_end_matches('\n'),
+            "{badkey,7}",
+            "and it is the producer's value"
+        );
+        assert!(!rt.gc_stats().disabled, "a successful copy trips no valve");
     }
 
     /// **The valve accessors answer identically whether their set is empty or populated** — the

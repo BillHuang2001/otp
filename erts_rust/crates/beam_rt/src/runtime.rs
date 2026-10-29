@@ -5581,13 +5581,11 @@ impl Runtime {
             }
             Err(error) => {
                 let payloads = self.source_payloads(action_pid, &[]);
-                // The stabilization answers the *stabilized error*; the body's own `Err` is
-                // what this method returns, so fold it back into the failing arm. A genuine
-                // `SystemLimit` from the copy replaces it (never a dangling term).
-                match self.stabilize_error_live_reason(error, &payloads) {
-                    Ok(error) => Err(error),
-                    Err(failure) => Err(failure),
-                }
+                // The stabilization answers the *stabilized error* (or the body's own error with
+                // its opaque reason payload dropped when that copy is refused — a diagnostic
+                // degradation, never a replacement of the body's error by a `system_limit`; see
+                // `Runtime::stabilize_error_live_reason`).
+                Err(self.stabilize_error_live_reason(error, &payloads))
             }
         };
         // Step 6: the child exits `normal` — the reason a process that returns exits with — so a

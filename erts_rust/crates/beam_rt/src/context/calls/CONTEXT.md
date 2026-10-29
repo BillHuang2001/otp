@@ -282,3 +282,11 @@ caught reason names a region that was reused or relocated — and it surfaces he
 is the one place that copies a raise reason that outlived the process that built it. It is not a
 copy-out containment or frontier decision; the fix belongs with the producer of that reason
 (the exception machinery's catch-frame/reason materialization), not with this seam.
+**Resolved on the refusal side, open on the producer side.** `Runtime::stabilize_error_live_reason`
+is now **total**: a reason it cannot price or copy degrades to the raise's own class/reason/
+stacktrace with the opaque payload dropped (`Runtime::degrade_live_reason`, recorded through
+`crate::debug_trace`), so the D1 shape completes instead of aborting the run — `EXIT=0`, 20/20
+`CASE` rows, `DONE binary_module_SUITE`, with `error_info` reporting its own `EXC`. The rule and the
+two refusal classes are `../../../runtime/CONTEXT.md` *the raise's escape boundary*; the producer
+defect (a caught reason whose graph outlives the region that held it) is unchanged and still the
+real fix.
