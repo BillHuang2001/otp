@@ -1,9 +1,9 @@
-# bench — measured results (m19 full suite; m23 is the newest, §10)
+# bench — measured results (m19 full suite; `m23` is the newest — its startup round and §10's `cowboy` row)
 
 This is the definitive summary of the **full-suite** measurement session (`m19`, 2026-10-23/24) for the
 `erts_rust` benchmark driver — the session every §2/§3 figure and every external-target row comes from.
 The narrower later sessions are carried as §9 and §10, and the per-row currency list at the end of this
-preamble says which record each row is read through; `m23` (§10, `cowboy`) is the newest of them.
+preamble says which record each row is read through; `m23` — the startup round and §10's `cowboy` row — is the newest of them.
 Every number here comes from the committed raw artifacts under `results/` — `results/m19-*` unless the
 per-row currency list names a later session for that row; regenerate with the
 Runbook (§7) rather than quoting a stale copy.
@@ -16,9 +16,8 @@ Later, **narrower** sessions also exist and are archived under `results/`; they 
 §2/§3 do **not** restate m21's or m22's numbers.
 
 `m21` and `m22` share the OTP 29.1.2 / erts-17.1.1 oracle, unlike m19's 29.1.1 / erts-17.1, so they are mutually diffable only with each other and never against a row above.
-`m23` is the **newest** session and a different kind of record: the startup round's *binary A/B on four sides* (`old` / HEAD / HEAD-with-`BEAM_RT_TIER=baseline` / the oracle), read through `results/m23-boot-wall.json`, `results/m23-slice-wall.json`, `results/m23-bench-{old,new}-r{1,2,3}.json` and the differential sweep `results/m23-sweep-merged.json`; its own section is at the end of this file, and its **final state** block (`### m23 final state`) is the one to quote — `results/m23-final-{ab-boot,ab-slice,tiers}.json`, `results/m23-final-slope.txt`, `results/m23-final-bench-{old,new}-r{1,2,3}.json` and `results/m23-final-sweep-merged.json`. Same oracle as m21/m22 (29.1.2 / erts-17.1.1).
+`m23` is the **newest** session and it comes in two disjoint arms under one prefix. Its **startup arm** is a different kind of record: the startup round's *binary A/B on four sides* (`old` / HEAD / HEAD-with-`BEAM_RT_TIER=baseline` / the oracle), read through `results/m23-boot-wall.json`, `results/m23-slice-wall.json`, `results/m23-bench-{old,new}-r{1,2,3}.json` and the differential sweep `results/m23-sweep-merged.json`; its own section is at the end of this file, and its **final state** block (`### m23 final state`) is the one to quote — `results/m23-final-{ab-boot,ab-slice,tiers}.json`, `results/m23-final-slope.txt`, `results/m23-final-bench-{old,new}-r{1,2,3}.json` and `results/m23-final-sweep-merged.json`. Its **`cowboy` arm** is narrower still: one workload (`cowboy`) over three matched `--quick` rounds, one matched `--full` pair and one non-timing budget probe, carried as §10. Both arms share the m21/m22 oracle (29.1.2 / erts-17.1.1).
 
-`m23` is the **newest** session and it is **narrower still**: one workload (`cowboy`) over three matched `--quick` rounds, one matched `--full` pair and one non-timing budget probe, carried as §10.
 
 **Which record is current, per row** (do not read a row through the wrong session):
 §2/§3 (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`, `binary_append`, `file_io`, `gc_class`) are **m19**; §4/§5 are the historical m17/m16 labels they carry; §6's compiler/tool targets are **m19**; §9 (`jsone`, `bbmustache`) is **m21**; **§10 (`cowboy`) is m23** — the only row m23 supersedes, replacing the retired m19 sys-only release-recipe reference (§6).
@@ -618,6 +617,144 @@ cross-runtime row in the suite), p99 1.1265–1.2656; `bbmustache` p50 **1.0325 
   compiler's stderr quoted — never a skip; a count that disagrees with the intended one or with the other
   side ⇒ `failed(...)` with **no metric published**.
 
+## 10. `cowboy` — the two-sided row (m23, new record)
+
+The HTTP I/O-bound row, measured under **both** runtimes from **one** staged build and **one** harness, so
+the only variable between the two rows is which runtime executes the same `.beam`s. Both sides serve
+`examples/hello_world` on port 8080 through `cowboy_router:compile([{'_', [{"/", toppage_h, []}]}])` and
+announce readiness with `CW_READY`; the load is the crate's own in-process HTTP/1.1 keep-alive driver (no
+external `wrk`/`h2load`/`bombardier`, none of which exist on this host).
+
+**The two sides, named (m23).** Both are described by the `runtimes[]` row of the artifacts:
+
+| side | program | version |
+|---|---|---|
+| **sys** | the oracle `erl` on `PATH` (`/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl`) | **Erlang/OTP 29 / erts-17.1.1** (row reports `otp_release` `29`) |
+| **rust** | `erts_rust/target/release/beam_rt`, default execution tier (native baseline JIT, compiled lazily per function) | reports `otp_release` `30` |
+
+**The session.** Three matched `--quick` rounds (8 keep-alive connections / 2 000 ms window), the side order
+alternating per round (**r1 sys→rust, r2 rust→sys, r3 sys→rust**); one matched `--full` pair (16
+connections / 5 000 ms, order rust→sys); and one `--runtime all` budget pass, which is **not** a timing
+source. Every pass ran `taskset -c 3 setsid -w`, **one process at a time**, and recorded `/proc/loadavg`
+before *and* after itself plus a port-8080/stray-process check. Artifacts:
+`results/m23-cowboy-{sys,rust}-r{1,2,3}.json`, `results/m23-cowboy-full-{rust,sys}.json`,
+`results/m23-cowboy-ratios.txt` (the audit table every number below is transcribed from — **ratio = median
+of the three per-round ratios**, the plain ratio of medians is printed beside it),
+`results/m23-cowboy-load.log`, `results/m23-cowboy-budgetprobe-all.{json,txt}`.
+
+**The load band is loaded, not quiet.** The 16 `/proc/loadavg` readings of the eight timed passes span a
+1-min load of **3.38–5.38**, while the 5-min field never fell below **9.71** and peaked at **13.69** — i.e.
+the host was busy throughout and only partly draining. Consequences, stated with the numbers: the absolute
+req/s/latency figures are host-specific and are **not** constants; the per-round ratios are the reading.
+
+**Per-round figures, per side** (`--quick`; transcribed from `results/m23-cowboy-ratios.txt` §A):
+
+| round | side | `requests` | `requests_per_sec` | `latency` p50 | `latency` p99 | `errors` | peak RSS | `build_ms` | `compile_ms` | `ready_ms` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| r1 | sys | 97 919 | 48 930.9 | 0.1707 ms | 0.2723 ms | 0 | 68 550 656 B | 12 378.0 | 159.9 | 137.3 |
+| r1 | rust | 11 674 | 5 833.4 | 1.3342 ms | 2.1867 ms | 0 | 145 444 864 B | 12 414.5 | 153.0 | 163.0 |
+| r2 | sys | 97 897 | 48 921.2 | 0.1735 ms | 0.2730 ms | 0 | 67 928 064 B | 12 456.5 | 154.6 | 133.6 |
+| r2 | rust | 11 729 | 5 856.4 | 1.3286 ms | 2.1439 ms | 0 | 145 203 200 B | 13 424.9 | 153.1 | 162.7 |
+| r3 | sys | 98 838 | 49 388.9 | 0.1704 ms | 0.2915 ms | 0 | 68 059 136 B | 12 436.4 | 152.7 | 125.2 |
+| r3 | rust | 11 537 | 5 764.2 | 1.3478 ms | 2.2298 ms | 0 | 145 113 088 B | 12 389.7 | 152.0 | 163.0 |
+
+**The ratios, with the deterministic companion beside each** (median of the three per-round ratios; the
+request counts *are* the deterministic-ish companion here — the load window is fixed, so a count is bounded
+only by throughput):
+
+| quantity | sys (median) | rust (median) | ratio | per-round ratios | direction |
+|---|---|---|---|---|---|
+| `requests` (≈ deterministic) | 97 919 | 11 674 | **8.388** | 8.388 / 8.347 / 8.567 | sys/rust |
+| `requests_per_sec` | 48 930.9 | 5 833.4 | **8.388** | 8.388 / 8.353 / 8.568 | sys/rust |
+| `latency_ms` p50 | 0.1707 ms | 1.3342 ms | **7.818** | 7.818 / 7.656 / 7.908 | rust/sys |
+| `latency_ms` p99 | 0.2730 ms | 2.1867 ms | **7.852** | 8.031 / 7.852 / 7.649 | rust/sys |
+| `peak_memory_bytes` (VmHWM) | 68 059 136 B (68.06 MB) | 145 203 200 B (145.20 MB) | **2.132** | 2.122 / 2.138 / 2.132 | rust/sys |
+| `build_ms` (one staged `make`) | 12 436.4 | 12 414.5 | 1.0029 | 1.0029 / 1.0777 / 0.9963 | rust/sys |
+| `compile_ms` (one external `erlc`) | 154.6 | 153.0 | 0.9903 | 0.9573 / 0.9903 / 0.9954 | rust/sys |
+| `ready_ms` (boot → `CW_READY`) | 133.6 | 163.0 | **1.218** | 1.187 / 1.218 / 1.302 | rust/sys |
+
+So: **the Rust runtime serves ~8.4× fewer requests in the same window at ~7.8× the per-request cost**, and
+its boot-to-ready is **1.22×** the oracle's (163.0 ms vs 133.6 ms) — the smallest gap on this row. The two
+staging figures are ~1.0× by construction (same `make`, same `erlc`), which is exactly what makes them a
+useful control: **the whole gap is runtime execution, not the build.**
+
+**The `--full` pair** (16 connections / 5 000 ms, order rust→sys; `results/m23-cowboy-full-{rust,sys}.json`):
+
+| side | `requests` | `requests_per_sec` | p50 | p99 | `errors` | peak RSS | `build_ms` | `compile_ms` | `ready_ms` |
+|---|---|---|---|---|---|---|---|---|---|
+| sys | **245 250** | 49 028.3 | 0.3475 ms | 0.5313 ms | 0 | 67 936 256 B | 12 726.4 | 166.3 | 136.2 |
+| rust | **26 969** | 5 386.1 | 2.8859 ms | 4.9522 ms | 0 | 199 987 200 B | 13 476.5 | 170.7 | 186.6 |
+| ratio | 9.094 (sys/rust) | 9.103 (sys/rust) | 8.304 | 9.320 | — | 2.944 | 1.0589 | 1.0263 | 1.370 |
+
+Doubling the concurrency and lengthening the window to 5 s moves throughput and p50 by under 10 %
+(8.388×→9.094× and 7.818×→8.304×), while the peak-RSS ratio grows 2.132×→2.944× because twice as many
+sockets and buffers are live: the row is **concurrency-insensitive in direction**, and its RSS is not.
+**It is one pass per side — a single sample, not a median — so it carries no error bar**; the three-round
+`--quick` table above is the statistically meaningful one.
+
+**`errors` is 0 in all ten rows, and the keep-alive closes are not errors.** Cowboy's default
+`max_keepalive` closes a connection after 1 000 requests *on that connection*, announcing
+`Connection: close`; the request that receives it has completed, and the driver reconnects. So the row's
+close count scales with the request count (~97 closes for ~97.9 k sys requests, ~11 for ~11.7 k rust
+requests per `--quick` load run) and is reported in the row `notes` — **0 transport errors** means every
+response was complete, reconnects included. No `=ERROR REPORT====` block appeared on either server's stdout
+in any of the ten rows, and the server stderr tails were empty.
+
+**The latency budgets.** `results/m23-cowboy-budgetprobe-all.txt` is the verbatim verdict block of the
+non-timing `--runtime all` pass: **1 met / 0 exceeded / 10 not measured**. The one measurable row is the
+sys-side request tail, **`cowboy[sys] latency_ms p99 = 0.28 ms` against a 5 ms limit** (the row's real
+metric is `latency_ms`, read through its `p99` summary — there is no separate p99 metric). The ten
+`not measured` rows are honest silence: that pass selected only `cowboy`, and each names the workload it
+did not find. The limit was **not** re-tuned; only its rationale now also cites this session's figure.
+
+**What is *not* measured, and why:**
+- **No Rust-side latency budget exists** — deliberately. The p99 row is `runtime: Some(Sys)` because only
+  the sys side has a calibrated tail; inventing a Rust limit from a single session on a loaded shared host
+  would be a fabricated SLO. So the Rust tail (2.19 ms p99 `--quick`, 4.95 ms `--full`) is **reported, not
+  judged**. Adding one is a decision that needs a measured figure to tune against, not this session alone.
+- **No second `--full` rep**, so the `--full` row has no error bar (see above). Only `--quick` was
+  repeated three times.
+- **No binary A/B (rust-vs-rust)** in m23, so nothing here is a "changed since" claim: no m23-vs-earlier
+  difference is attributable to code.
+- The `deps-unavailable` and `load-no-responses` paths of the row were **not exercised** — cowlib/ranch
+  fetched fine and every load run produced responses on both sides.
+
+**The caveats that travel with these figures** (read them before quoting a number):
+- **The host is shared** (1-min load 3.38–5.38 over a 5-min band of 9.71–13.69): absolute req/s and latency
+  move with load, and the oracle's SMP VM loses more to contention than `beam_rt` does.
+- **This row's load generator runs in the same process tree as the server**, so `taskset -c 3` gives the
+  client and the server **one core between them**. That is the crate's matched-pass convention applied
+  honestly, but it means the *absolute* figures are pin-specific — they are **not** comparable with the
+  unpinned m19 release-route row (§6, 120 383.9 req/s, a different recipe anyway), and a pinned pass
+  costs the sys side far more than the rust side because the sys side is trying to use more than one core
+  while the rust side's native baseline tier runs **one scheduler**. Read the ratio, and read it as the
+  ratio *under this pin*.
+- **Throughput is bounded by the fixed concurrency** (`connections / per-request latency`), not by a
+  saturating client: the `--quick` window (8 connections) and the `--full` window (16) are different
+  operating points of the same server, which is why both are reported.
+- **The build git-fetches the dependencies** (cowlib 2.20.0 + ranch 1.8.1) into the `ScratchDir`, so
+  `build_ms` (~12.4 s) depends on the network and on `make`, on **both** sides equally.
+- **`latency_ms` percentiles cover at most 20 000 stored samples**: in `--quick` the sys side issues
+  ~97–99 k requests, so its percentiles are over the first 20 000 samples, while the rust side issues
+  ~11.5–11.7 k and every request is sampled. Stated, not hidden; the two distributions are single-mode and
+  eight times apart, so the truncation cannot create the gap.
+- **`latency_ms[max]` is a single worst sample**, an outlier statistic, not a distributional one — the sys
+  side's worst values (36.5 / 11.7 / 12.0 ms) are one-off stalls, which is why the per-round max ratio
+  swings 0.594 / 1.842 / 1.796 while p50 and p99 do not. Quote p50 and p99.
+
+**Reproduce it:**
+
+```sh
+erts_rust/scripts/cargo.sh build --release -p beam_rt -p bench --manifest-path erts_rust/Cargo.toml
+R=erts_rust/tools/bench/results
+P="taskset -c 3 setsid -w erts_rust/target/release/bench run"
+$P --quick --runtime sys  --workloads cowboy --out-file $R/m23-cowboy-sys-r1.json  --verbose
+$P --quick --runtime rust --workloads cowboy --out-file $R/m23-cowboy-rust-r1.json --verbose
+# ... r2 with the order reversed, r3 as r1; then:
+$P --full --runtime rust --workloads cowboy --out-file $R/m23-cowboy-full-rust.json --verbose
+$P --full --runtime sys  --workloads cowboy --out-file $R/m23-cowboy-full-sys.json  --verbose
+$P --quick --runtime all --workloads cowboy --out-file $R/m23-cowboy-budgetprobe-all.json
+```
 ## m23 — startup round: phase-scoped tier + shared per-image label maps + loader cost pass (2026-10-29)
 
 A **narrow, single-topic** session: it restates no §2/§3 row and supersedes none.
@@ -735,7 +872,8 @@ then take the count back down below the pre-round figure.
 
 ### Differential gate at this state (`m23-sweep-merged.json`, folded by `merge`, full corpus)
 
-`summary: total=3469 agree=3465 mismatch=0 unsupported=1 skipped=0 oracle_drift=3`;
+`summary: total=3524 agree=3520 mismatch=0 unsupported=1 skipped=0 oracle_drift=3` (the corpus at HEAD;
+the archived report folds the cases that existed at that state);
 ratchet `allowed=1 unauthorized=0 stale=0`; drift `allowed=3 unauthorized=0 stale=0` ⇒ **gate PASS**.
 The single `unsupported` is the recorded `wire/new_fun_ext_encode` gap; the three `oracle_drift` cases are
 the version goldens the host oracle answers with its `erts-17.1.1` patch string against this tree's frozen
@@ -815,8 +953,8 @@ counter is identical (`case_list_walk_elements` 50 000 000, `case_etf_roundtrip_
 The `ns_per_*` rows of these rounds are load-flagged (1-min load 29.2 → 85.8, `m23-final-bench-loads.txt`)
 and are **not** a finding.
 
-**Gate + tests at the final tree.** Full sweep **3469/3469 reports**:
-`summary: total=3469 agree=3465 mismatch=0 unsupported=1 skipped=0 oracle_drift=3`, ratchet
+**Gate + tests at the final tree.** Full sweep of the corpus at HEAD, a report for every id:
+`summary: total=3524 agree=3520 mismatch=0 unsupported=1 skipped=0 oracle_drift=3`, ratchet
 `allowed=1 unauthorized=0 stale=0`, drift `allowed=3 unauthorized=0 stale=0` ⇒ `gate.sh` **exit 0 (PASS)**
 (`m23-final-sweep-merged.json`, `m23-final-merge.log`, `m23-final-gate.log`; the 3 drift cases are the `erts`
 version goldens, which the report's per-contract split files under A.2/A.3/A.8/A.9, and the single

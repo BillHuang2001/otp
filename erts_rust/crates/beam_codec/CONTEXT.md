@@ -100,7 +100,8 @@ Re-exported at the crate root and via `beam_codec::prelude::*`.
   `set_atom_encoding`/`with_minor_version`, `with_atom_cache`, `with_local_node(node: Atom,
   creation: u32)`, `with_local_ext()`/`set_local_ext(bool)` (the `[local]`/ETS internal-node marker
   form), `with_deterministic()`/`set_deterministic(bool)` (full-term-order-sorted map keys),
-  `with_fun_identity`, `encode(Eterm) -> Result<()>`, `as_bytes`/`len`/`is_empty`,
+  `with_fun_identity`, `with_fun_identity_resolver(&'a mut dyn FunIdentityResolver)`,
+  `encode(Eterm) -> Result<()>`, `as_bytes`/`len`/`is_empty`,
   `finish() -> Vec<u8>`, `finish_compressed(level)`, `finish_local(hash: u32)`, plus the
   caller-owned-buffer trio `with_writer(atoms, Writer)` / `new_body_with(atoms, Writer)` /
   `take_writer() -> Writer` (see `scratch.rs`; `new`/`new_body` keep the `Writer` they always
@@ -290,15 +291,27 @@ here** — they belong to `beam_dist`/`beam_ets`, and a plain image is `BadArg`.
 - **A wire atom pays an atom-name table round trip on both directions, and neither is in this crate.** Decode: one `AtomTable::intern` per atom on the wire (6/op here) → `IndexShards::get` (`../beam_term/src/atom/store.rs:245`), which is **not** inlined into the decode loop and costs ≈ 110 cycles per lookup (FNV-1a + splitmix64 `shard_of` at `:278`, then a `HashMap<Arc<str>, Atom>` probe = SipHash + `memcmp`); it is 14–19 % of this row's cycles and the single largest codec-triggered cost. Encode: one `AtomTable::name` per atom (`:394`, an O(1) index into `names`) — cheap, ~9 cycles/atom, and the image already emits `SMALL_ATOM_UTF8_EXT` for names ≤ 255 bytes (`src/encode/mod.rs:796`, the C's `enc_atom` choice), so no byte-identity gap hides here.
 - **The codec never allocates the encode buffer when the caller lends it one.** `Encoder::with_writer`/`new_body_with` + `Encoder::take_writer` plus `Writer::from_vec` let a host recycle one buffer, and [`EncodeScratch`](src/scratch.rs) is the crate-owned holder for it (`writer`/`recycle`/`clear`); `beam_bifs` keeps one per thread, so the steady-state encode is **1** allocation for the whole `term_to_binary` (the `make_bin` copy into the context heap), and a caller that builds a fresh `Encoder` per call pays the `Writer` malloc/free instead.
   The decode side's counterpart is `beam_bifs`'s `DECODE_SCRATCH` (a memoized atom-table image), which is what keeps a warm decode at 1 allocation; the pins in `tests/alloc_count.rs` hold only on those two scratch-reusing routes.
-- **A `FunKind::Local` (`make_fun3`) fun encodes only with a caller-supplied `FunIdentity`** —
-  without one the encoder returns the typed `error::unsupported_local_fun`, never a mis-encoded
-  term. This is a **host** property, not a missing wire rule: a genuine module closure whose module
-  is loaded from a `.beam` encodes byte-identically (`tests/local_fun_encode.rs`), and so does
-  `erl_eval`'s own closure when the real `erl_eval` creates it. The one term no identity derivation
-  can rescue is a closure the **runtime synthesized itself** (no module declares its
-  `(uniq, index)`) — the `-eval` lambda behind the gate's single allowlisted `unsupported` case
-  `wire/new_fun_ext_encode`, whose identity/`num_free`/`env` are `erl_eval` internals only a full
-  `erl_eval`/`erl_parse` port could derive faithfully (fabricating them is forbidden).
+- **A `FunKind::Local` (`make_fun3`) fun encodes only with a caller-supplied identity** — the
+  single `FunIdentity` (`with_fun_identity`) or the per-fun `FunIdentityResolver`
+  (`with_fun_identity_resolver`) — and without one the encoder returns the typed
+  `error::unsupported_local_fun`, never a mis-encoded term. This is a **host** property, not a
+  missing wire rule: a genuine module closure whose module is loaded from a `.beam` encodes
+  byte-identically (`tests/local_fun_encode.rs`), and so does `erl_eval`'s own closure when the real
+  `erl_eval` creates it. The one term no identity derivation can rescue is a closure the **runtime
+  synthesized itself** (no module declares its `(uniq, index)`) — the `-eval` lambda behind the
+  gate's single allowlisted `unsupported` case `wire/new_fun_ext_encode`, whose
+  identity/`num_free`/`env` are `erl_eval` internals only a full `erl_eval`/`erl_parse` port could
+  derive faithfully (fabricating them is forbidden).
+- **The per-fun resolver is the installed route in `beam_bifs`.** `term_image`'s `encode_with`
+  wraps the context in `CtxFunIdentity` (a `beam_codec::FunIdentityResolver` newtype over the
+  `LocalFunIdentity` seam, `../beam_bifs/src/binconv.rs:1062-1075`) and installs it with
+  `Encoder::with_fun_identity_resolver`, so the encoder asks once per local fun and writes each
+  fun's own identity: a bare closure, a closure nested in a list/tuple/map, the same lambda twice
+  and a term holding **two different lambdas** all encode, and a fun the seam declines
+  (`Ok(None)`) keeps the whole image the typed `unsupported_local_fun`.
+  The resolver is consulted only for a `FunKind::Local` fun (`src/encode/fun.rs:84`), so a fun-free
+  image pays no traversal and no seam call; no `tools/differential` case covers the two-lambda
+  shape yet.
 - **The > 32-pair *flat*-map writer is crate-local** (`src/term/mod.rs::write_large_flatmap`) and
   stays outside `beam_term` because `beam_term::thing::write_flatmap` asserts
   `MAP_SMALL_MAP_LIMIT` and `beam_term::map::write_map` would produce a *hash* map (a different term

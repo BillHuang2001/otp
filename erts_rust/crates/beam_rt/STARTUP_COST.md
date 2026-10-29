@@ -4,7 +4,8 @@ The startup record: the retired-instruction floor of one `beam_rt -noshell -eval
 invocation, the paired delta each landed change bought, the current profile's self-time split, the
 boot's collection accounting with its mechanism, and the two cross-node asks — both answered, with
 what each answer is and what it is worth.
-The instrument is a **retired-instruction count**, never a wall time: the figures below are
+The instrument is a **retired-instruction count**, never a wall time (the footprint section is the
+one exception and names its own instrument): the figures below are
 `perf stat -e cpu_core/instructions/u` / `perf record -e cpu_core/instructions/u -c 500000
 --call-graph dwarf,8192` over `./target/release/beam_rt -noshell -eval 'halt().'`, pinned
 `taskset -c 3` on a P-core, with the two binaries alternated inside every round and each round's
@@ -321,6 +322,7 @@ The census is an **upper bound**, not a weighing: its instruction count is `beam
 `get_module_info(M, attributes|compile)` does **not** read a decoded table — it re-decodes the raw chunk through a fresh 8 192-word scratch `Heap` per call (`src/context/module_info.rs:281-289`).
 The per-module `AtomTable` fork is re-taken from the **merged** shared table at the end of the load, so the module pins no diverged shard copies of its own — the copies its literal appends made are dropped at load (`src/codeserver.rs:949`, `../beam_loader/CONTEXT.md:65`).
 The loader's side of that pricing — the IR ratio and the per-module literal arena — is `../beam_loader/CONTEXT.md`'s; `src/codeserver/CONTEXT.md` *Cost shape* holds the code-path derivation's cost.
+Per-route detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md), [`src/context/CONTEXT.md`](src/context/CONTEXT.md), [`src/runner/CONTEXT.md`](src/runner/CONTEXT.md), [`src/eval/CONTEXT.md`](src/eval/CONTEXT.md); the store/arena ceilings in [`src/context/pump/CONTEXT.md`](src/context/pump/CONTEXT.md).
 
 ## Measurement discipline
 
