@@ -124,6 +124,7 @@ mod decode_packet;
 mod dist;
 mod dist_extra;
 mod errors;
+mod errors_extra;
 mod etf;
 mod ets;
 mod ets_access;
@@ -658,6 +659,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(semantics::group());
     cases.extend(eval_route::group());
     cases.extend(errors::group());
+    cases.extend(errors_extra::group());
     cases.extend(nif::group());
     cases.extend(nif_so::group());
     cases.extend(nif_state::group());
