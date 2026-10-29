@@ -1,14 +1,14 @@
 # Test-suite parity sweep
 
-Generated at `1793254738` (Unix seconds) by `suites run --target khepri --jobs 4 --out erts_rust/tools/suites/results/khepri --verbose`.
+Generated at `1793255881` (Unix seconds) by `suites run --target khepri --jobs 4 --out erts_rust/tools/suites/results/khepri`.
 
 ## Environment
 
 - oracle: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` — `29/17.1.1`
 - rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt` — `30/17.1`
-- rust workspace commit: `66105291645cdc5a6dee225c586e2a708ae939d5`
+- rust workspace commit: `125ca3a9f3f7260dfc2400faff18117b67834558`
 - tier: `default`
-- loadavg before/after: `14.48 9.02 7.03 17/897 4` / `13.35 9.52 7.30 9/895 3602` on 16 logical CPUs
+- loadavg before/after: `38.75 42.77 30.63 4/964 12` / `31.68 40.27 30.41 5/889 3610` on 16 logical CPUs
 - the host is **shared**: only pass/fail counts are portable, never a wall time
 
 ### Target `khepri` (eunit)
@@ -17,8 +17,8 @@ Generated at `1793254738` (Unix seconds) by `suites run --target khepri --jobs 4
 - staged copy: `/tmp/erts-suites-stage/khepri/proj`
 - build: `/nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile` — ok (reused a completed build)
 - build detail: reused a completed `rebar3 as test compile` in the staged copy
-- tally: measured 43 · agree 12 · agree-fail-identical (excluded) 8 · divergence 3 · oracle-only-fail 0 · rust-gap 28 · not-run 0
-- totals: sys 1497/4 passed/failed · rust 285/8 passed/failed
+- tally: measured 43 · agree 12 · agree-fail-identical (excluded) 8 · divergence 2 · oracle-only-fail 0 · rust-gap 29 · not-run 0
+- totals: sys 1500/1 passed/failed · rust 285/8 passed/failed
 
 Notes:
 - drive (identical on both sides): `eunit:test('{module}',[verbose]), halt(0).` — the module name is substituted per row
@@ -37,7 +37,7 @@ Notes:
 | `advanced_tx_delete` | 39/0 | cancelled | rust-gap | **throw:{error, |
 | `advanced_tx_get` | 15/0 | cancelled | rust-gap | **throw:{error, |
 | `advanced_tx_put` | 43/0 | cancelled | rust-gap | **throw:{error, |
-| `app` | 33/3 | cancelled | divergence | app: start_with_default_settings_test: **error:{assert,[{module,app}, |
+| `app` | 36/0 | cancelled | rust-gap | *failed*: **error:{assertEqual, |
 | `async_option` | 20/0 | cancelled | rust-gap | **throw:{error, |
 | `bang_functions` | 85/0 | cancelled | rust-gap | **throw:{error, |
 | `cluster_SUITE` | no_tests | no_tests | agree-fail-identical | a common_test suite: it carries no eunit tests (0/0 would be a lie) |

@@ -1,24 +1,24 @@
 # Test-suite parity sweep
 
-Generated at `1793248490` (Unix seconds) by `suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib`.
+Generated at `1793256012` (Unix seconds) by `suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out erts_rust/tools/suites/results/stdlib`.
 
 ## Environment
 
 - oracle: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` — `29/17.1.1`
-- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A604/erts_rust/target/release/beam_rt` — `30/17.1`
-- rust workspace commit: `32732ba94bc9d89e8f67be6c472d5a6259af80c0`
+- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt` — `30/17.1`
+- rust workspace commit: `125ca3a9f3f7260dfc2400faff18117b67834558`
 - tier: `default`
-- loadavg before/after: `9.89 5.02 7.34 2/835 5` / `4.29 4.59 6.94 2/815 1101` on 16 logical CPUs
+- loadavg before/after: `27.19 39.03 30.12 2/882 4` / `22.19 32.24 28.68 3/935 1100` on 16 logical CPUs
 - the host is **shared**: only pass/fail counts are portable, never a wall time
 
 ### Target `stdlib` (ct)
 
-- source: `/home/bill/Source/otp/.genesis/workers/worker_T1_A604/lib/stdlib/test` (otp) at `32732ba94bc9`
-- staged copy: `/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src`
+- source: `/home/bill/Source/otp/.genesis/workers/worker_T1_A615/lib/stdlib/test` (otp) at `125ca3a9f3f7`
+- staged copy: `/tmp/erts-suites-stage/stdlib/src`
 - build: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …` — ok (reused a completed build)
 - build detail: compiled 8 suites + 6 helpers + runner with the oracle's erlc
-- tally: measured 214 · agree 167 · agree-fail-identical (excluded) 4 · divergence 31 · oracle-only-fail 0 · rust-gap 12 · not-run 0
-- totals: sys 209/5 passed/failed · rust 167/34 passed/failed
+- tally: measured 214 · agree 169 · agree-fail-identical (excluded) 4 · divergence 29 · oracle-only-fail 0 · rust-gap 12 · not-run 0
+- totals: sys 209/5 passed/failed · rust 169/32 passed/failed
 
 Notes:
 - drive (identical on both sides): `ct_runner:run('{suite}', {case_timeout_ms}, {suite_budget_ms}, "{data_root}"), halt(0).`
@@ -27,8 +27,8 @@ Notes:
 - per-case timeout: 10 s · suite budget: 300 s (the runner stops launching cases when the budget expires and prints `SUITE_DEADLINE <not-run>`, so the remaining cases are reported as *not measured*, never as failures)
 - binary_module_SUITE: 20 cases — sys 18/2 pass/fail, rust 4/3 pass/fail
 - dict_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail
-- lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 76/2 pass/fail
-- maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 19/13 pass/fail
+- lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 77/1 pass/fail
+- maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 20/12 pass/fail
 - proplists_SUITE: 4 cases — sys 4/0 pass/fail, rust 4/0 pass/fail
 - queue_SUITE: 7 cases — sys 7/0 pass/fail, rust 6/1 pass/fail
 - string_SUITE: 46 cases — sys 45/1 pass/fail, rust 45/1 pass/fail
@@ -69,7 +69,7 @@ Notes:
 | `lists_SUITE:droplast` | 1/0 | 1/0 | agree |  |
 | `lists_SUITE:dropwhile` | 1/0 | 1/0 | agree |  |
 | `lists_SUITE:enumerate` | 1/0 | 1/0 | agree |  |
-| `lists_SUITE:error_info` | 1/0 | 0/1 | divergence | {exception,error,'unsupported: erlang:system_info(snifs): this runtime publishes no static NIF table',{erlang,system_info,[...],...}} |
+| `lists_SUITE:error_info` | 1/0 | 1/0 | agree |  |
 | `lists_SUITE:filter_partition` | 1/0 | 1/0 | agree |  |
 | `lists_SUITE:flatten_1` | 1/0 | 1/0 | agree |  |
 | `lists_SUITE:flatten_1_e` | 1/0 | 1/0 | agree |  |
@@ -148,29 +148,29 @@ Notes:
 | `maps_SUITE:t_fold_3` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_foreach_2` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_from_keys` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_from_keys,1,...}} |
-| `maps_SUITE:t_from_keys_check_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,badarg},{maps_SUITE,count_nr_of_yields,2,...}} |
+| `maps_SUITE:t_from_keys_check_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}} |
 | `maps_SUITE:t_from_keys_kill_process` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_from_list_check_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,badarg},{maps_SUITE,count_nr_of_yields,2,...}} |
+| `maps_SUITE:t_from_list_check_trapping` | 1/0 | 0/1 | divergence | {exception,error,badarg,{erlang,trace_delivered,[...],...}} |
 | `maps_SUITE:t_from_list_kill_process` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_get_3` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_groups_from_list` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_intersect` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_intersect_with` | 1/0 | 0/1 | divergence | timeout |
+| `maps_SUITE:t_intersect` | 1/0 | 0/1 | divergence | timeout |
+| `maps_SUITE:t_intersect_with` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_iterator_1` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_iterator_2` | 1/0 | 0/1 | divergence | timeout |
 | `maps_SUITE:t_iterator_valid` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_keys_kill_process` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_keys_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,badarg},{maps_SUITE,count_nr_of_yields,2,...}} |
+| `maps_SUITE:t_keys_trapping` | 1/0 | 0/1 | divergence | timeout |
 | `maps_SUITE:t_map_2` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_merge_opt` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,false},{maps_SUITE,t_merge_opt,1,...}} |
+| `maps_SUITE:t_merge_opt` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_merge_opt,1,...}} |
 | `maps_SUITE:t_merge_with` | 1/0 | 0/1 | divergence | timeout |
 | `maps_SUITE:t_order_consistency` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_put_opt` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,false},{maps_SUITE,t_put_opt,1,...}} |
+| `maps_SUITE:t_put_opt` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_size_1` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_update_with_3` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_update_with_4` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_values_kill_process` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_values_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,badarg},{maps_SUITE,count_nr_of_yields,2,...}} |
+| `maps_SUITE:t_values_trapping` | 1/0 | 0/1 | divergence | timeout |
 | `maps_SUITE:t_with_2` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_with_2,1,...}} |
 | `maps_SUITE:t_without_2` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_without_2,1,...}} |
 | `proplists_SUITE:examples` | 1/0 | 1/0 | agree |  |
@@ -255,9 +255,9 @@ Recorded invocations (the two sides get the *same* `-pa` set and the *same* `-ev
 
 ```
 # ct binary_module_SUITE [sys]
-cd /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src"), halt(0).'
+cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/erts-suites-stage/stdlib/src"), halt(0).'
 # ct binary_module_SUITE [rust]
-cd /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A604/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src"), halt(0).'
+cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/erts-suites-stage/stdlib/src"), halt(0).'
 # erlc [build]
 /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …
 ```
