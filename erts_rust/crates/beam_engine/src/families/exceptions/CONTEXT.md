@@ -242,6 +242,12 @@ Pinned as a known divergent shape by
   `error::unsupported`; **never** a panic, a substituted atom, or a wrong result.
 - Term construction/inspection is only `beam_term` + the crate's `terms` builders;
   the **rooted** twins (`*_rooted`) are what the instruction bodies here call.
+- **Depth is heap-bounded here, never native-stack-bounded:** every walk in this module is an explicit loop over a slice/`Vec`
+  (`symbolic_stacktrace`'s `for` over `raise_snapshot`/`StackFrame`s, `carve`/`callee_head_item`'s `for 0..argc`, `write_list_at`'s cons loop,
+  `nearest_line`'s backward scan), and the argument list + `{error_info,Map}` map are stored into the item verbatim, never re-walked —
+  so a 100 000-frame trace grows the Rust heap, not the stack.
+  The native-recursive walks a deep trace/reason meets live in sibling crates: `beam_bifs`'s printer (`print.rs::render_chunk`, per nesting level *and* per list cell)
+  and `beam_term::compare::cmp_impl` (per tuple element / map pair; lists loop).
 - `try_case`/`catch_end` require the C landing convention `x(0) = THE_NON_VALUE`,
   `x(1) = reason`, `x(2) = trace`, `x(3) = class atom`; the handler opcode that runs
   next pops the frame — a raise *reads* the innermost frame but never pops it.
