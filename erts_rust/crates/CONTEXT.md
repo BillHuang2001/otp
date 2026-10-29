@@ -410,7 +410,8 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   one. Figures and caveats: `../tools/bench/RESULTS.md`.
 - **Dependency edges beyond the scaffold:** `beam_message → beam_gc`, `beam_dist → beam_alloc`,
   `beam_engine → beam_alloc` (directionally legal); `RefCount` lives in `beam_alloc` and is re-exported by
-  `beam_gc`.
+  `beam_gc`. `beam_engine`'s **dev-only** `beam_codec` edge exists to pin ETF bytes (wave 1 → wave 4, no
+  cycle).
 - **Term-carrying structured raise reasons** (coordinated across `beam_common`/`beam_engine`/`beam_bifs`):
   `Raise` carries an opaque `live_reason: Option<LiveReason>` slot whose payload convention is the live reason
   term as an `Eterm`; `beam_engine` populates it on every raise, `beam_bifs` attaches the true reason term
