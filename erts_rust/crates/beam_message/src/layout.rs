@@ -19,8 +19,9 @@
 // %CopyrightEnd%
 
 //! `pub(crate)` layout helpers for the copier: the beam_message-specific **identification** of
-//! off-heap containers, refc binaries, match contexts and external things, plus the M1 off-heap
-//! reference encoding.
+//! off-heap containers and external things, the **shape-validated** classification of a `SUB_BITS`
+//! term ([`classify_sub_bits`], the copier's one validation point — `copy.rs` and `preflight.rs`
+//! both route through it), plus the M1 off-heap reference encoding.
 //!
 //! Per-object word counts and per-object child-slot enumeration are **not** owned here. They are
 //! the lowest-common-ancestor walk published by `beam_term::layout` — the owner of the frozen term
@@ -67,36 +68,51 @@ pub(crate) fn is_off_heap_term(term: Eterm) -> bool {
     is_off_heap_container(unsafe { *boxed_val(term) })
 }
 
-/// Whether the compound term `term` is a full refc binary — the 8-word
-/// `[BinRef(3)][ErlSubBits(5)]` pair whose root is the `ErlSubBits` and whose `orig` slot points
-/// at the `BinRef`.
-///
-/// Distinct from the standalone MSO container ([`is_off_heap_term`], a bare `HEADER_BIN_REF`
-/// thing whose `val` is an MSO slot): this is the real off-heap binary payload handle.
-pub(crate) fn is_refc_binary_term(term: Eterm) -> bool {
-    // SAFETY: the copier only calls this on a live boxed word whose header is initialized.
-    unsafe { beam_term::refc::is_refc_binary(term) }
+/// The two shapes a `SUB_BITS` term can take at the copier's dispatch point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubBitsKind {
+    /// `orig` is a `BinRef`: a refc binary (or a window of one) whose payload is shared.
+    RefcBinary,
+    /// `orig` is an on-heap bitstring: an `ErlSubBits` match context, flattened on copy.
+    MatchContext,
 }
 
-/// Whether `term` is a `SUB_BITS` **match context** — an `ErlSubBits` that is *not* a refc binary
-/// (its `orig` is an on-heap bitstring rather than a `BinRef`).
+/// Classifies a `SUB_BITS` term after **validating** its shape — the copier's ONE `SUB_BITS`
+/// validation point.
 ///
-/// `copy_struct` **flattens** such a value into a fresh on-heap bitstring (`copy.c:849-863`)
-/// rather than copying the window's `base_flags`/`orig` pointers verbatim, which would leave the
-/// destination term pointing into the source process's heap (a dangling reference once the source
-/// is collected or read). A refc binary is handled separately by `copy_refc_binary` (it shares its
-/// off-heap payload and fixes `orig` up itself), so it is excluded here.
-pub(crate) fn is_match_context_term(term: Eterm) -> bool {
+/// `Ok(None)` when `term` is not a `HEADER_SUB_BITS` block, so the copier goes on to treat it as an
+/// ordinary boxed object. Otherwise the block's shape is proven **once** by the checked reader
+/// [`try_sub_bits_parts`] (a `start <= end` window, a non-null masked base, and an `orig` that is a
+/// `BinRef` with a non-null `val` or a well-formed on-heap bitstring), and only then is the `orig`
+/// slot classified: a boxed `BinRef` is a refc binary (whose payload `copy_refc_binary` shares),
+/// anything else is a match context (`copy_match_context` flattens it).
+///
+/// Both [`crate::copy`] and [`crate::preflight`] route through this function, so the price and the
+/// copy can never disagree about what a `SUB_BITS` is, and no site dereferences `orig` before the
+/// shape proof.
+///
+/// Distinct from the standalone MSO container ([`is_off_heap_term`], a bare `HEADER_BIN_REF` thing
+/// whose `val` is an MSO slot): neither kind here is that.
+pub(crate) fn classify_sub_bits(term: Eterm) -> Result<Option<SubBitsKind>> {
     if !is_boxed_term(term) {
-        return false;
+        return Ok(None);
     }
     // SAFETY: `term` is a boxed term, so its header word is a live term word.
     if unsafe { *boxed_val(term) } != HEADER_SUB_BITS {
-        return false;
+        return Ok(None);
     }
-    // SAFETY: the header fixed `term` at the 5-word `ErlSubBits` layout, so its `orig` slot is
-    // live; `is_refc_binary` reads it and dereferences only a boxed `BinRef`.
-    !unsafe { beam_term::refc::is_refc_binary(term) }
+    // SAFETY: the header fixes `term` at the 5-word `ErlSubBits` layout, so the block's words are
+    // readable; the reader validates the shape (window order, non-null base, a recognised `orig`)
+    // and reports a mis-shaped block as a typed error instead of reading it.
+    let (_base_flags, _start, _end, _orig) = unsafe { try_sub_bits_parts(term) }?;
+    // SAFETY: the shape proof above pinned word 0 at the canonical `HEADER_SUB_BITS` and word 4 at
+    // a recognised `orig`, so the test dereferences only a header word the proof made readable — a
+    // shape guarantee, not a provenance one.
+    Ok(Some(if unsafe { beam_term::refc::is_refc_binary(term) } {
+        SubBitsKind::RefcBinary
+    } else {
+        SubBitsKind::MatchContext
+    }))
 }
 
 /// Whether `header` is the head word of an external pid, port or reference (`ExternalThing`).
