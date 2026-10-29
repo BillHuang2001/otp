@@ -98,7 +98,7 @@ pub(super) fn process_holds(process: &beam_process::Process, term: Eterm) -> boo
 /// live region's), which is exactly the word range
 /// [`Runtime::for_each_off_heap_region`](crate::runtime::Runtime) already publishes.
 #[inline]
-pub(super) fn store_holds(runtime: &crate::runtime::Runtime, term: Eterm) -> bool {
+pub(crate) fn store_holds(runtime: &crate::runtime::Runtime, term: Eterm) -> bool {
     super::super::gc::term_in_heap_block(&runtime.eval_heap, term)
         || runtime
             .eval_heap_retired

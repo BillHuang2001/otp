@@ -138,12 +138,12 @@ fn the_store_arm_hands_through_what_it_already_holds_and_copies_what_it_does_not
             Some(held),
             "a result the store already holds is handed through as the same word"
         );
-        assert_eq!(
-            rt.eval_heap.used(),
-            store_used,
-            "no fresh store word was written for a term it already held"
-        );
     }
+    assert_eq!(
+        rt.eval_heap.used(),
+        store_used,
+        "no fresh store word was written for a term it already held"
+    );
     let copied = {
         let mut ctx = RuntimeContext::new(&mut rt);
         ctx.move_result_into_runtime_store(elsewhere)
