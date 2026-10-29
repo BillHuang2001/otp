@@ -203,7 +203,7 @@
 use std::collections::HashMap;
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_ets::{
     compile, key_of, MatchContinuation, OwnerId, Table, TableId, TableInfo, TableStats, TermStore,
 };
@@ -324,6 +324,17 @@ const SPEC_ID_BASE: u64 = 1 << 48;
 
 /// A live `ets:select/3` continuation: the traversal state plus the handle of the
 /// table it belongs to, so `ets:select/1` can find the table again.
+///
+/// **The state's terms are registry-owned.** A `/3` call deep-copies its input term
+/// into [`TableRegistry::spec_input_store`] and compiles/decodes the traversal from
+/// that copy, so the literal words inside `state` (the compiled `beam_ets` match
+/// program's `Pattern::Literal`/`Pattern::Map`/`Expr::Literal`) never point into a
+/// caller heap, a pooled BIF heap or a process heap — a resume in any process, after
+/// any collection and any time later, reads words that are still live.
+///
+/// What the state can *still* name is a `beam_ets` **table-store** word: an
+/// `ordered_set` resume anchor ([`MatchContinuation`]'s `Cursor::Anchor`), which the
+/// table's own store owns (see `./CONTEXT.md`).
 struct Continuation {
     /// The registry handle of the table the traversal runs against.
     table: u64,
@@ -360,6 +371,11 @@ pub struct TableRegistry {
     names: HashMap<Atom, u64>,
     /// The live `ets:select/3` continuations, keyed by the numeric id of the
     /// continuation ref thing handed to Erlang.
+    ///
+    /// A continuation is an immutable value carrying the compiled match program the
+    /// `/3` call built from **its own copy of the input term**
+    /// ([`TableRegistry::spec_input_store`]), so resuming one never reads a caller
+    /// heap and a live entry keeps that copy alive (see [`Continuation`]).
     continuations: HashMap<u64, Continuation>,
     /// The next continuation id to hand out.
     next_continuation: u64,
@@ -386,6 +402,30 @@ pub struct TableRegistry {
     spec_store: TermStore,
     /// The next compiled-spec id to hand out.
     next_spec: u64,
+    /// The term storage behind the **input term of a chunked `/3` traversal** — the
+    /// select/match family's [`select_3`], `select_reverse/3`, `ets:match/3` and
+    /// `ets:match_object/3`.
+    ///
+    /// Every one of those calls **deep-copies** its input term (the raw match-spec
+    /// list, or the `match`/`match_object` pattern) in here before it compiles or
+    /// decodes it, and runs the traversal from that store-owned copy
+    /// ([`TableRegistry::own_spec_input`]). That is what makes a minted continuation
+    /// sound: the [`Continuation::state`] a `/3` call stores carries the compiled
+    /// `beam_ets` match program, whose literal words (`Pattern::Literal`/
+    /// `Pattern::Map`, `Expr::Literal`) are the **store's** words, so a `/1` resume —
+    /// in any process, after any collection, however long after the `/3` call — never
+    /// dereferences a caller heap.
+    ///
+    /// Lifetime: a copy is retained **exactly while a continuation names it**. A `/3`
+    /// call that finishes its traversal inside the chunk keeps nothing
+    /// ([`TableRegistry::release_spec_input`] returns its words), so a repeating
+    /// `ets:select(T, MS, N)` over a table no larger than `N` does not grow this
+    /// store. A `/3` call that mints a continuation retains its copy for the
+    /// registry's lifetime — the same documented M1 retention class as
+    /// [`TableRegistry::spec_store`], because a continuation is an immutable value
+    /// with no release verb (no `ets` BIF frees one; `ets:delete/1` drops the
+    /// *entry*, not the words).
+    spec_input_store: TermStore,
     /// The creation-time [`resolve::TableProfile`] of each live table, keyed by its
     /// handle. A profile is recorded only for a table whose
     /// `ets:info(T, write_concurrency)` value the model cannot express — the
@@ -419,6 +459,7 @@ impl TableRegistry {
             specs: HashMap::new(),
             spec_store: TermStore::with_default_allocator(),
             next_spec: SPEC_ID_BASE,
+            spec_input_store: TermStore::with_default_allocator(),
             profiles: HashMap::new(),
         }
     }
@@ -674,6 +715,59 @@ impl TableRegistry {
     /// [`TableRegistry::insert_spec`]) — the `ets:is_compiled_ms/1` predicate.
     pub fn contains_spec(&self, handle: u64) -> bool {
         self.specs.contains_key(&handle)
+    }
+
+    /// Deep-copies the input term `raw` of a chunked `/3` traversal (a raw
+    /// match-spec list, or an `ets:match`/`ets:match_object` pattern) into
+    /// [`TableRegistry::spec_input_store`] and returns the **store-owned** root,
+    /// which is what the traversal must compile or decode.
+    ///
+    /// # Ownership
+    ///
+    /// A `/3` traversal that reaches its limit stores a `beam_ets`
+    /// [`MatchContinuation`] carrying the compiled program, whose literal words are
+    /// raw `Eterm`s. Compiling or decoding from the caller's term (`args[1]`) would
+    /// make those literals point into the **calling** heap (or the pooled BIF heap
+    /// of a reentrant call), and a `/1` resume — a different process, a collection,
+    /// any later time — would then read moved or reused words. Compiling from this
+    /// copy instead means every literal a continuation can name is a registry-owned,
+    /// never-relocating word, valid for the registry's lifetime.
+    ///
+    /// The words are retained until [`TableRegistry::release_spec_input`] returns
+    /// them, so the caller's rule is: keep the copy when a continuation was minted,
+    /// release it when the traversal finished inside the chunk.
+    ///
+    /// A construct the store refuses (see its *copied subset* docs: a bare header
+    /// word, a native record, a reserved subtag, a bare `BinRef`, a malformed
+    /// `ErbSubBits` — none of which Erlang code can construct) is an `Err`, and
+    /// nothing is stored: the caller raises `badarg` rather than compiling from a
+    /// partially-owning copy. An immediate (a small int, an atom, an internal
+    /// pid/port) copies to itself and consumes no words.
+    pub fn own_spec_input(&mut self, raw: Eterm) -> Result<Eterm> {
+        self.spec_input_store.copy(raw)
+    }
+
+    /// Returns the store-owned copy whose root [`TableRegistry::own_spec_input`]
+    /// produced, reporting the number of words reclaimed.
+    ///
+    /// The words go back onto the input store's free lists and are handed out again
+    /// only by a **later** copy needing a run of exactly the same size, so no live
+    /// term is ever invalidated. After this call `root` — and every interior pointer
+    /// into it — dangles and must not be read: the caller must be certain no
+    /// continuation names it.
+    ///
+    /// Freeing an immediate (or a root this store never handed out) is a harmless
+    /// no-op returning `0`.
+    pub fn release_spec_input(&mut self, root: Eterm) -> usize {
+        self.spec_input_store.free(root)
+    }
+
+    /// The number of words currently held by the `/3` input store
+    /// ([`TableRegistry::own_spec_input`] less
+    /// [`TableRegistry::release_spec_input`]) — the probe the release tests read.
+    #[cfg(test)]
+    pub(crate) fn spec_input_words(&self) -> usize {
+        self.spec_input_store.words()
     }
 
     /// Every live table as `(handle, named_table name)`, ascending by handle —
@@ -1500,22 +1594,45 @@ fn select_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// A reached limit yields a continuation, which [`select_1`] resumes; a traversal
 /// that finishes first yields the results with no continuation. `Limit` is a
 /// non-negative integer and `0` is `badarg` (the oracle raises it).
+///
+/// `MatchSpec` is deep-copied into the registry's input store and compiled **from
+/// that copy** ([`own_spec_input`]), so the literals the minted continuation's
+/// compiled program carries are registry-owned words: a resume never reads the
+/// caller's heap. The copy is retained exactly while a continuation names it
+/// ([`finish_chunk_with_input`]).
 fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let _eval = self_hook::SpecEval::install(ctx.self_pid());
     let handle = resolve::resolve_handle(ctx, args[0])?;
-    let spec = compile(args[1], ctx.atoms())?;
+    let owned = own_spec_input(ctx, args[1])?;
+    let spec = match compile(owned, ctx.atoms()) {
+        Ok(spec) => spec,
+        // A refused spec is `badarg`; the copy is dropped with nothing naming it.
+        Err(err) => return Err(released_input(ctx, owned, err)),
+    };
     // A non-integer or a negative limit is `badarg` here; `0` is rejected by
     // `select_limit` (matching the oracle).
-    let limit = element_pos(args[2])?;
+    let limit = match element_pos(args[2]) {
+        Ok(limit) => limit,
+        Err(err) => return Err(released_input(ctx, owned, err)),
+    };
 
-    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    let table = match take_table_gated(ctx, handle, resolve::Gate::Read) {
+        Ok(table) => table,
+        Err(err) => return Err(released_input(ctx, owned, err)),
+    };
     let outcome = {
         let (atoms, heap) = ctx.atom_and_heap();
         table.select_limit(&spec, limit, atoms, heap)
     };
-    restore_table(ctx, handle, table)?;
-    let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont, false)
+    if let Err(err) = restore_table(ctx, handle, table) {
+        return Err(released_input(ctx, owned, err));
+    }
+    let (results, cont) = match outcome {
+        Ok(chunk) => chunk,
+        // The traversal itself failed (a raising guard/body): nothing was minted.
+        Err(err) => return Err(released_input(ctx, owned, err)),
+    };
+    finish_chunk_with_input(ctx, handle, results, cont, false, owned)
 }
 
 /// `ets:select(Continuation)` — resumes a [`select_3`] (or `select_reverse/3`)
@@ -1649,6 +1766,73 @@ pub(super) fn finish_chunk(
 /// The `(results, continuation)` pair a chunked traversal step returns — the shape
 /// of every `beam_ets` `*_limit` / `*_continue` method.
 pub(super) type Traversal = (Vec<Eterm>, Option<MatchContinuation>);
+
+/// Deep-copies `raw` — the input term of a chunked `/3` traversal, i.e. a raw
+/// match-spec list or an `ets:match`/`ets:match_object` pattern — into the
+/// registry's input store and returns the **store-owned** root
+/// ([`TableRegistry::own_spec_input`]).
+///
+/// The `/3` paths compile (or, for `match`/`match_object`, decode) the traversal
+/// from this root instead of from `args[1]`, so every literal the compiled program
+/// carries is a registry-owned word: a continuation minted from it can be resumed
+/// in any process and after any collection without dereferencing the caller's heap.
+///
+/// A copy the store refuses is `badarg` — the oracle's `/3` forms either accept
+/// their spec/pattern or raise `badarg` — and a missing registry is the family's
+/// usual typed `unsupported_bif`.
+pub(super) fn own_spec_input(ctx: &mut BifContext<'_>, raw: Eterm) -> Result<Eterm> {
+    let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+    tables.own_spec_input(raw).map_err(|_| badarg())
+}
+
+/// Releases the `/3` input copy `owned` and hands `err` back unchanged — the rule
+/// for a `/3` call that fails **before** a chunk exists.
+///
+/// Nothing was minted on such a path, so no continuation can name the words and the
+/// copy would otherwise be retained for nothing. (A failure *after* the traversal —
+/// the chunk render itself — deliberately retains; see
+/// [`finish_chunk_with_input`].)
+fn released_input(ctx: &mut BifContext<'_>, owned: Eterm, err: BeamError) -> BeamError {
+    if let Some(tables) = ctx.tables() {
+        tables.release_spec_input(owned);
+    }
+    err
+}
+
+/// [`finish_chunk`] plus the **lifetime rule for the `/3` input copy** `owned`
+/// (`own_spec_input`'s root): the copy is released exactly when no continuation was
+/// minted, and retained otherwise.
+///
+/// With a continuation, the registry entry names the compiled program's literals —
+/// i.e. words of `owned` — so the copy must live as long as the registry (one
+/// retained copy per minting `/3` call, never reclaimed: the documented M1
+/// retention class, like the compiled-spec store). Without one nothing outlives the
+/// call, so the words go back to the store and a repeating
+/// `ets:select(T, MS, N)` over a table that always finishes in one chunk does not
+/// grow it.
+///
+/// The release runs **after** the chunk is rendered, because a produced result may
+/// itself be one of the copied literals. Two cases deliberately retain instead
+/// (retention only, never a dangle): a chunk carrying the table-alias witness
+/// (`BifContext::with_table_aliasing`), where the results are handed to the host
+/// uncopied and must stay valid until its copy-out; and a failed render, where
+/// [`finish_chunk`] may already have registered a continuation naming the words.
+pub(super) fn finish_chunk_with_input(
+    ctx: &mut BifContext<'_>,
+    table: u64,
+    results: Vec<Eterm>,
+    cont: Option<MatchContinuation>,
+    reverse: bool,
+    owned: Eterm,
+) -> Result<Eterm> {
+    let minted = cont.is_some();
+    let chunk = finish_chunk(ctx, table, results, cont, reverse)?;
+    if !minted && ctx.alias_table_storage().is_none() {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        tables.release_spec_input(owned);
+    }
+    Ok(chunk)
+}
 
 // ----------------------------------------------------------------- helpers
 
@@ -2051,7 +2235,9 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::NIL;
 
-    use crate::access::{is_reference, is_tuple, ref_thing_id, tuple_element, tuple_size};
+    use crate::access::{
+        float_bits, is_float, is_reference, is_tuple, ref_thing_id, tuple_element, tuple_size,
+    };
 
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
@@ -2102,6 +2288,8 @@ mod tests {
             "z",
             // The `{write_concurrency, auto}` option value.
             "auto",
+            // The match-spec guard operator the float-guard fixtures compare with.
+            ">",
         ]);
         atoms
     }
@@ -3491,5 +3679,264 @@ mod tests {
             select_1(&mut ctx, &[stale]),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// The spec `[{{'$1','$2'}, [{'>','$2',F}], ['$2']}]` — the objects whose
+    /// **value** is greater than the runtime-built float `value`, projected to their
+    /// values. The float is a heap term (`BifContext::make_float`), so the compiled
+    /// spec carries a boxed literal word — the shape a continuation must not keep
+    /// pointing at the caller's heap.
+    fn value_above_spec(ctx: &mut BifContext<'_>, value: f64) -> Eterm {
+        let v1 = ctx.atom("$1").expect("seeded");
+        let v2 = ctx.atom("$2").expect("seeded");
+        let gt = ctx.atom(">").expect("seeded");
+        let bound = ctx.make_float(value).expect("the float fits");
+        let head = ctx.tuple(&[v1, v2]).expect("fits");
+        let guard = ctx.tuple(&[gt, v2, bound]).expect("fits");
+        let guards = ctx.list(&[guard]).expect("fits");
+        let body = ctx.list(&[v2]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    /// The small integers of a proper list result, in order.
+    fn small_ints(term: Eterm) -> Vec<i64> {
+        proper_list(term)
+            .expect("a proper list")
+            .into_iter()
+            .map(signed_value)
+            .collect()
+    }
+
+    /// Invalidates every word `heap` handed out — what the words behind a raw
+    /// `Eterm` look like once the heap they live on has moved or been reused.
+    ///
+    /// Every word becomes the empty list, **except** the boxed float that carried
+    /// `value`, whose two words are rewritten as `replacement`. A stale read of a
+    /// guard's float then compares against a different number and silently selects a
+    /// different object set — a plausible wrong answer, which is the worst shape of
+    /// this bug (and what a raw-word continuation would do after a collection).
+    fn invalidate_caller_heap(heap: &mut Heap, value: f64, replacement: f64) {
+        // Locate the float *before* overwriting anything: `is_float`/`float_bits`
+        // read the live term graph.
+        let index = heap
+            .used_words_mut()
+            .iter()
+            .position(|word| is_float(*word) && float_bits(*word) == value.to_bits())
+            .expect("the runtime-built float must live on the caller heap");
+        let header = heap.used_words_mut()[index];
+        for word in heap.used_words_mut() {
+            *word = Eterm::nil();
+        }
+        let words = heap.used_words_mut();
+        words[index] = header;
+        words[index + 1] = Eterm::from_raw(replacement.to_bits() as usize);
+    }
+
+    /// **A `ets:select/3` continuation outlives the compiling call's heap.**
+    ///
+    /// The spec — whose guard holds a runtime-built boxed float — is built on a
+    /// scratch heap, the first chunk is drawn from it, and then every word that heap
+    /// handed out is invalidated (the float included, rewritten as a *different*
+    /// number). The resume runs from a fresh context over a fresh heap, i.e. a
+    /// different process after a collection: it must produce the oracle's chunk, which
+    /// is only possible because the traversal was compiled from the registry's own
+    /// copy of the spec (`own_spec_input`).
+    #[test]
+    fn a_select_continuation_survives_invalidation_of_the_compiling_callers_heap() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        let mut scratch = Heap::new(4096).expect("scratch heap");
+        let cont_id = {
+            let mut ctx =
+                BifContext::new(&mut scratch, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            let handle = new_ordered_table(&mut ctx, "mytab");
+            for (key, value) in [("a", 1), ("b", 2), ("c", 3), ("p", 4), ("q", 5), ("z", 6)] {
+                let object = pair(&mut ctx, key, value);
+                insert_2(&mut ctx, &[handle, object]).expect("insert");
+            }
+            let spec = value_above_spec(&mut ctx, 3.5);
+            let two = ctx.int(2).expect("fits");
+            let chunk = select_3(&mut ctx, &[handle, spec, two]).expect("ets:select/3");
+            // The first chunk is drawn while the caller heap is still live: the values
+            // of the two lowest objects above 3.5, i.e. 4 and 5.
+            assert_eq!(small_ints(tuple_element(chunk, 0)), vec![4, 5]);
+            ref_thing_id(tuple_element(chunk, 1)).expect("a continuation is a ref thing")
+        };
+        assert!(scratch.used() > 0, "the spec must occupy caller-heap words");
+        invalidate_caller_heap(&mut scratch, 3.5, 1000.0);
+
+        // Resume from a different process, on a different heap.
+        let mut heap = Heap::new(4096).expect("resume heap");
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(2, 0)).with_tables(&mut reg);
+        let cont = make_ref_thing(ctx.heap(), cont_id).expect("the rebuilt continuation fits");
+        let chunk = select_1(&mut ctx, &[cont]).expect("ets:select/1 in another process");
+        assert_eq!(
+            small_ints(tuple_element(chunk, 0)),
+            vec![6],
+            "the resumed guard must read the registry's copy of the float, not the \
+             invalidated caller heap"
+        );
+        assert_eq!(
+            atoms.name(atom_val(tuple_element(chunk, 1))),
+            Some(END_OF_TABLE),
+            "the traversal finishes after key z"
+        );
+    }
+
+    /// **A `/3` call releases its input copy unless a continuation names it.**
+    ///
+    /// The input store's live-word count is the witness: a traversal that finishes
+    /// inside its chunk leaves the store exactly as it found it (so a repeating
+    /// `ets:select(T, MS, N)` over a small table cannot grow it), while a call that
+    /// mints a continuation keeps its copy — and the resume it makes possible works.
+    #[test]
+    fn a_finished_chunk_releases_its_input_copy_and_a_minted_one_retains_it() {
+        let mut heap = Heap::new(65536).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+
+        /// The registry's live `/3` input-copy words.
+        fn input_words(ctx: &mut BifContext<'_>) -> usize {
+            ctx.tables()
+                .expect("a registry is installed")
+                .spec_input_words()
+        }
+
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_ordered_table(&mut ctx, "mytab");
+        for (key, value) in [("a", 1), ("b", 2), ("c", 3), ("p", 4)] {
+            let object = pair(&mut ctx, key, value);
+            insert_2(&mut ctx, &[handle, object]).expect("insert");
+        }
+        let baseline = input_words(&mut ctx);
+        // Four objects, a limit of nine: the walk finishes inside the chunk, so no
+        // continuation is minted and nothing outlives the call.
+        let spec = value_above_spec(&mut ctx, 0.5);
+        let nine = ctx.int(9).expect("fits");
+        let chunk = select_3(&mut ctx, &[handle, spec, nine]).expect("ets:select/3");
+        assert_eq!(small_ints(tuple_element(chunk, 0)), vec![1, 2, 3, 4]);
+        assert_eq!(
+            input_words(&mut ctx),
+            baseline,
+            "a finished /3 traversal must release its input copy"
+        );
+
+        // A limit of two mints a continuation, which names the (boxed) guard literal:
+        // the copy must therefore be retained.
+        let spec = value_above_spec(&mut ctx, 0.5);
+        let two = ctx.int(2).expect("fits");
+        let chunk = select_3(&mut ctx, &[handle, spec, two]).expect("ets:select/3");
+        let retained = input_words(&mut ctx);
+        assert!(
+            retained > baseline,
+            "a minted continuation must keep its input copy (retained {retained} words, \
+             baseline {baseline})"
+        );
+        assert_eq!(small_ints(tuple_element(chunk, 0)), vec![1, 2]);
+        // The resume reads that copy and adds none of its own.
+        let cont = tuple_element(chunk, 1);
+        let chunk = select_1(&mut ctx, &[cont]).expect("ets:select/1");
+        assert_eq!(small_ints(tuple_element(chunk, 0)), vec![3, 4]);
+        assert_eq!(
+            input_words(&mut ctx),
+            retained,
+            "resuming a continuation must not copy the spec again"
+        );
+    }
+
+    /// `$ERTS_ORACLE` if it names an existing file, else `erl` on `$PATH` — the same
+    /// resolution `tools/differential` and the crate's other oracle suites use.
+    fn resolve_oracle() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = std::path::PathBuf::from(&value);
+            if program.is_file() {
+                return Some(program);
+            }
+            eprintln!(
+                "[beam_bifs ets continuations] $ERTS_ORACLE='{}' is not an existing file — \
+                 treating it as no oracle.",
+                program.display()
+            );
+            return None;
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("erl"))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// The live `erl` re-derivation of the goldens the continuation-ownership tests
+    /// assert, for **both** fixtures: the `ets:select/3` one here and the
+    /// `ets:match_object/3` one in [`crate::ets::matches`]'s tests
+    /// (`a_match_object_continuation_survives_invalidation_of_the_patterns_heap`).
+    ///
+    /// Both specs are built at run time with a **computed** float (`3 + 0.5`,
+    /// `1 + 0.5`) so the literal is a heap term in the oracle too, and the
+    /// continuations are opaque: the oracle's is a compound term while this model's is
+    /// a ref thing (an M1 substitution), so the chunks — not the continuation shape —
+    /// are what is pinned.
+    ///
+    /// A run without `erl` prints the loud banner below and returns: it is a skip, not
+    /// a pass (this crate's `resolve_oracle` convention).
+    #[test]
+    fn the_continuation_ownership_goldens_cross_check_the_live_oracle() {
+        let Some(oracle) = resolve_oracle() else {
+            eprintln!();
+            eprintln!("=========== beam_bifs ets continuations: live oracle SKIPPED ===========");
+            eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or not");
+            eprintln!("executable, and no `erl` on $PATH).");
+            eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+            eprintln!("=======================================================================");
+            eprintln!();
+            return;
+        };
+        let eval = "T = ets:new(t, [ordered_set]), \
+                    true = ets:insert(T, [{a,1},{b,2},{c,3},{p,4},{q,5},{z,6}]), \
+                    F = 3 + 0.5, \
+                    MS = [{{'$1','$2'},[{'>','$2',F}],['$2']}], \
+                    {C1,K1} = ets:select(T, MS, 2), \
+                    {C2,K2} = ets:select(K1), \
+                    {A1,R1} = ets:select(T, MS, 9), \
+                    T2 = ets:new(t2, [ordered_set]), \
+                    true = ets:insert(T2, [{a,1.5},{b,2.5},{c,1.5},{z,3.5}]), \
+                    P = {'$1', 1 + 0.5}, \
+                    {M1,N1} = ets:match_object(T2, P, 1), \
+                    {M2,N2} = ets:match_object(N1), \
+                    M3 = ets:match_object(N2), \
+                    io:format(\"~w~n\", [{C1, erlang:is_tuple(K1), C2, K2, A1, R1, \
+                                          M1, erlang:is_tuple(N1), M2, erlang:is_tuple(N2), \
+                                          M3}]), \
+                    halt().";
+        let output = std::process::Command::new(&oracle)
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(eval)
+            .arg("-s")
+            .arg("init")
+            .arg("stop")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+        assert!(
+            output.status.success(),
+            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}",
+            oracle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).expect("the oracle printed UTF-8");
+        // `[4,5]`+cont · `[6]`+'$end_of_table' · the finished `[1,2,3,4]`... i.e.
+        // `[4,5,6]`+'$end_of_table' · `[{a,1.5}]`+cont · `[{c,1.5}]`+cont · the bare
+        // `'$end_of_table'`.
+        assert_eq!(
+            stdout.trim(),
+            "{[4,5],true,[6],'$end_of_table',[4,5,6],'$end_of_table',\
+             [{a,1.5}],true,[{c,1.5}],true,'$end_of_table'}",
+            "the live oracle disagrees with the continuation-ownership goldens"
+        );
     }
 }
