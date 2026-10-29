@@ -107,9 +107,9 @@
 //! re-check. Reading the spec term therefore needs `unsafe`; every block below
 //! carries a `// SAFETY:` rationale.
 //!
-//! **Every list read goes through the [`cons_cell`] shape predicate** (primary tag
-//! `TAG_PRIMARY_LIST` **and** a non-null cell pointer), never through
-//! `beam_term::list::is_list` alone: `is_list` mirrors the C bit trick
+//! **Every list read goes through the [`cons_cell`](crate::shape::cons_cell) shape
+//! predicate** (primary tag `TAG_PRIMARY_LIST` **and** a non-null cell pointer),
+//! never through `beam_term::list::is_list` alone: `is_list` mirrors the C bit trick
 //! `(x & (_TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) != 0`, i.e. `!(x & 0x2)`, which is
 //! **also** true for every `TAG_PRIMARY_HEADER` word — a word that is not a term at
 //! all — so a stale/foreign caller-heap word could pass it and reach a `car`
@@ -126,6 +126,7 @@ use beam_common::Result;
 use beam_term::prelude::*;
 
 use crate::error::badarg;
+use crate::shape::cons_cell;
 
 mod continuation;
 mod exec;
@@ -230,47 +231,11 @@ pub(super) fn tuple_elements(term: Eterm) -> Option<Vec<Eterm>> {
     Some((0..arity).map(|i| unsafe { tuple_element(term, i) }).collect())
 }
 
-/// The `[CAR, CDR]` cell pointer of a **cons-cell-shaped** word, or `None` when
-/// `term` is not shaped like a cons cell.
-///
-/// This is the shape predicate every list read in this module is gated on, and it
-/// is deliberately stricter than `beam_term::list::is_list`. `is_list` mirrors the
-/// C bit trick `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) != 0` — that is
-/// `!(x & 0x2)` — which is **also** true for every `TAG_PRIMARY_HEADER` word
-/// (primary tag `0`), a word that is not a term at all (`beam_term`'s own test
-/// `is_list_matches_only_list_and_header_patterns` asserts exactly that). A stale
-/// or foreign caller-heap word passing that trick and reaching a `car` read is the
-/// measured SIGSEGV this predicate exists to stop.
-///
-/// Accepts only a word whose [`primary_tag`] is [`PrimaryTag::List`] (so a
-/// `TAG_PRIMARY_HEADER` word, every immediate — `NIL` included, its primary tag is
-/// `IMMED1` — and every boxed word are rejected) **and** whose [`list_val`] is
-/// non-null. `list_val` masks `!TAG_PTR_MASK`, i.e. `!0x7`, so both the pointer tag
-/// and the `TAG_LITERAL_PTR` literal bit are cleared and the result is word-aligned;
-/// `make_list` only ever adds `TAG_PRIMARY_LIST` to the cell address, so a genuine
-/// cons word always survives both checks.
-///
-/// **No Erlang-representable term changes classification.** `is_list` is true only
-/// for `LIST` words plus header words, and a header word is never a value, so every
-/// word that was treated as a list before is still treated as one.
-///
-/// **This is a shape test, not a liveness or reachability test.** A word whose low
-/// two bits happen to be `01` but which does not point at a live cell cannot be
-/// distinguished from a real cons cell by any word-local test (ERTS's C has the
-/// same residual); liveness comes from the caller-owns-the-spec-term contract (see
-/// the module docs).
-pub(super) fn cons_cell(term: Eterm) -> Option<*mut Eterm> {
-    if primary_tag(term) != PrimaryTag::List {
-        return None;
-    }
-    let cell = list_val(term);
-    (!cell.is_null()).then_some(cell)
-}
-
 /// The elements of a proper list term, or `None` when `term` is not a proper list
 /// (a non-cons value, or an improper list).
 ///
-/// A `TAG_PRIMARY_HEADER` word, any immediate except `NIL` and the all-ones word
+/// The walk is gated on [`cons_cell`] (the crate-level shape predicate), so a
+/// `TAG_PRIMARY_HEADER` word, any immediate except `NIL` and the all-ones word
 /// all terminate the walk as "not a proper list" (`None`), which [`compile`] turns
 /// into the `badarg` the oracle raises.
 pub(super) fn list_elements(term: Eterm) -> Option<Vec<Eterm>> {
@@ -339,8 +304,9 @@ fn decode_clause(clause: Eterm, atoms: &AtomTable) -> Result<MatchClause> {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the word-shape gate ([`cons_cell`]) and the proper-list walk
-    //! ([`list_elements`]) that reads through it.
+    //! Unit tests for the proper-list walk ([`list_elements`]) that reads through
+    //! the crate-level shape gate ([`crate::shape::cons_cell`], whose own unit tests
+    //! live beside it).
     //!
     //! The helpers here are `pub(super)`, so these tests live in the module rather
     //! than in `tests/`; `tests/select_word_classification.rs` covers the same
@@ -444,27 +410,8 @@ mod tests {
         let word = Eterm::from_raw(TAG_PRIMARY_LIST);
         assert!(is_list(word), "the tag bit alone looks like a cons cell");
         assert!(list_val(word).is_null());
-        assert_eq!(cons_cell(word), None);
+        assert_eq!(crate::shape::cons_cell(word), None);
         assert_eq!(list_elements(word), None);
-    }
-
-    #[test]
-    fn cons_cell_agrees_with_the_primary_tag_over_the_sample_words() {
-        let mut words = header_words();
-        words.extend_from_slice(&[
-            make_small(7),
-            make_atom(Atom::from_raw(3)),
-            NIL,
-            Eterm::from_raw(0x2),
-            Eterm::from_raw(TAG_PRIMARY_LIST),
-            Eterm::from_raw(usize::MAX),
-            proper_list(&[make_small(1), make_small(2)]),
-            cons(make_small(1), make_small(2)),
-        ]);
-        for word in words {
-            let expected = (primary_tag(word) == PrimaryTag::List) && !list_val(word).is_null();
-            assert_eq!(cons_cell(word).is_some(), expected, "for {word:?}");
-        }
     }
 
     #[test]

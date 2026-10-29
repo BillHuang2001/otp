@@ -36,8 +36,12 @@ pub fn key_of(object: Eterm, keypos: usize) -> Result<Eterm> {
     if keypos == 0 {
         return Err(crate::error::badarg());
     }
-    // SAFETY: `is_tuple` only dereferences `object`'s header word when it is a
-    // boxed word; any live boxed term in the runtime has a valid, aligned header.
+    // SAFETY: `is_tuple` routes through `beam_term::boxed::is_boxed_term`, which
+    // rejects a header word (and every immediate) *before* dereferencing anything —
+    // `is_boxed`'s `(x & 1) == 0` bit trick is true for a `TAG_PRIMARY_HEADER` word
+    // too, and `is_boxed_term` is the predicate that closes that hole — and only
+    // then reads the boxed word and checks that it is an arityval header. So a
+    // header-shaped or immediate word is *rejected*, never read.
     if !unsafe { is_tuple(object) } {
         return Err(crate::error::badarg());
     }
@@ -63,10 +67,21 @@ pub fn is_valid_object(object: Eterm, keypos: usize) -> bool {
 /// # Safety
 ///
 /// `obj` must be a live tuple term (its boxed header word must be a valid,
-/// aligned arity value). The returned slice borrows storage owned by the
-/// table (or the original heap) and stays valid only for as long as that
-/// storage does — the caller must not outlive it.
+/// aligned arity value). A header word, an immediate, or a non-tuple boxed term
+/// violates this contract — in a dev build the `debug_assert!` below reports it,
+/// in release the resulting arity is garbage and the slice is unsound. The
+/// returned slice borrows storage owned by the table (or the original heap) and
+/// stays valid only for as long as that storage does — the caller must not
+/// outlive it.
 pub unsafe fn object_elements<'a>(obj: Eterm) -> &'a [Eterm] {
+    // Make the caller contract loud in dev builds (a `debug_assert!` costs nothing
+    // in release): `is_tuple` rejects a header word and every immediate through
+    // `beam_term::boxed::is_boxed_term` before dereferencing anything, so a
+    // non-tuple reports here instead of producing a bogus `arity`.
+    debug_assert!(
+        unsafe { is_tuple(obj) },
+        "object_elements: caller passed a non-tuple object"
+    );
     // SAFETY: the caller guarantees `obj` is a live tuple, so its header word is a
     // valid arity value.
     let arity = unsafe { tuple_size(obj) };

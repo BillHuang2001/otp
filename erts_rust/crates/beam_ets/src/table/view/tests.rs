@@ -1103,3 +1103,49 @@ fn a_read_view_does_not_block_a_later_write() {
     assert_eq!(seen, 1);
     assert_eq!(shared.with_read(|read| read.size()).expect("no poisoned lock"), 0);
 }
+/// `list_to_terms` walks through the crate-level shape gate
+/// (`crate::shape::cons_cell`: primary tag `TAG_PRIMARY_LIST` **and** a non-null
+/// cell pointer), not through `is_list` — whose `!(x & 0x2)` bit trick a
+/// `TAG_PRIMARY_HEADER` word also passes.
+///
+/// A header-shaped word is not a term, so it can never be a cons cell: at the root
+/// it takes the documented non-list branch (a one-element vector holding the term
+/// itself), and as an improper tail it is kept as the last element. Neither is a
+/// dereference — before the gate the root shape walked straight into a `car` of a
+/// bogus address.
+///
+/// Residual: the shape test is not a liveness test. A word whose low bits look like
+/// a cons pointer but which points at freed/foreign memory is unverifiable by any
+/// word-local test (the residual ERTS's C shares); the ownership rule upstream — the
+/// table copies every object into storage it owns — is the contract there, which is
+/// why this test only builds words that cannot be a cons pointer.
+#[test]
+fn list_to_terms_refuses_a_header_shaped_word_instead_of_reading_it() {
+    for header in [
+        make_arityval_zero(),
+        make_arityval(1),
+        make_header(1, FLOAT_SUBTAG),
+        make_header(1, MAP_SUBTAG),
+    ] {
+        let term = TableTerm::new(header);
+        assert!(!term.is_list(), "a header word is not a list: {header:?}");
+        let terms = term.list_to_terms();
+        assert_eq!(terms.len(), 1, "a non-list is one term: {header:?}");
+        assert_eq!(
+            terms[0].as_small_int(),
+            None,
+            "the single element is the header word itself, not a read value"
+        );
+    }
+
+    // A header word as the **tail** of a cons cell: the walk stops there and keeps
+    // it as the final element (the documented improper-tail branch).
+    let cell: &'static mut [Eterm; 2] =
+        Box::leak(Box::new([make_small(1), make_arityval(1)]));
+    let improper = TableTerm::new(make_list(cell.as_ptr()));
+    assert!(improper.is_list(), "a genuine cons cell is still a list");
+    let terms = improper.list_to_terms();
+    assert_eq!(terms.len(), 2, "the improper tail is kept, not dropped");
+    assert_eq!(terms[0].as_small_int(), Some(1));
+    assert_eq!(terms[1].as_small_int(), None, "the tail is the header word");
+}

@@ -41,13 +41,25 @@
 //! caller stores anywhere must stay rooted or be copied into its own storage, and
 //! the spec term passed to `compile`/`match_spec_run` must stay live for the call.
 //!
-//! ## What is deliberately NOT constructed here
+//! ## The nested positions that are now a typed `badarg`, not a read
 //!
-//! A header word in the **head-pattern** position, e.g. `[{HeaderWord, [], ['$_']}]`,
-//! still reaches `select::pattern::decode`'s own `is_list`-guarded walk, which is
-//! outside this hardening (the same is true of `select::expr` and of the store's
-//! copier). That shape is still a SIGSEGV today, so this file does not build it —
-//! asserting a crash is not a test. It is reported as a follow-up instead.
+//! A header word nested anywhere inside an otherwise well-formed spec is the
+//! `badarg` the oracle raises for a malformed spec. Three shapes are pinned below
+//! (plus the clause-position one); the **first two used to SIGSEGV**, because
+//! `pattern::decode` and `expr::decode` only had the `is_list`-guarded cons walk:
+//!
+//! * `[{HeaderWord, [], ['$_']}]` — the head pattern is a header word;
+//! * `[{[], HeaderWord, ['$_']}]` — the guards list is a header word;
+//! * `[{[], [], HeaderWord}]` — the body list is a header word.
+//!
+//! Both `decode`s now reject a non-term word (`beam_term::tag::is_term_word`) up
+//! front and recurse, so the check fires at every nesting depth, and every list
+//! read in the crate walks through `beam_ets::shape::cons_cell` (primary tag
+//! `TAG_PRIMARY_LIST` **and** a non-null cell pointer) rather than `is_list`.
+//!
+//! `pattern::matches`'s walk is covered too: an object whose **element** is a tuple
+//! holding a header word, matched against a list-pattern head, is a non-match (or a
+//! binding), never a dereference.
 
 use beam_alloc::Heap;
 use beam_common::BeamError;
@@ -57,7 +69,7 @@ use beam_term::prelude::*;
 /// The atoms the specs below reference.
 fn atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    for name in ["_", "$_", "true", "false"] {
+    for name in ["_", "$_", "$1", "true", "false"] {
         atoms.intern(name);
     }
     atoms
@@ -127,9 +139,9 @@ fn compile_treats_nil_as_an_empty_spec() {
 
 #[test]
 fn compile_refuses_a_header_word_inside_a_well_formed_clause() {
-    // Each of these crashed (SIGSEGV) before the shape gate landed: the spec list
-    // itself parses, and the header word is reached one level in, through
-    // `decode_clause`'s own `list_elements` calls.
+    // The three positions the hardening pass closed, plus the clause position: the
+    // spec list itself parses, and the header word is reached one level in. The
+    // head and guards shapes used to SIGSEGV.
     let atoms = atoms();
     let mut heap = Heap::new(1024).expect("test heap");
     let header = make_arityval(1);
@@ -144,6 +156,15 @@ fn compile_refuses_a_header_word_inside_a_well_formed_clause() {
         compile(spec, &atoms).is_ok(),
         "the control clause {{'_', [], ['$_']}} compiles"
     );
+
+    // The head pattern is a header word: previously a SIGSEGV (the head decode fell
+    // through to the `is_list`-guarded cons walk, and `!(x & 0x2)` is true for a
+    // header word). `pattern::decode` now rejects a non-term word up front.
+    let clause = heap
+        .tuple(&[header, NIL, body_list])
+        .expect("test heap has room");
+    let spec = heap.cons(clause, NIL).expect("test heap has room");
+    assert_bad_arg(compile(spec, &atoms), "a header word as the head pattern");
 
     // The guards list is a header word.
     let clause = heap
@@ -186,6 +207,70 @@ fn match_spec_run_refuses_a_header_shaped_spec() {
     assert_bad_arg(
         match_spec_run(input, Eterm::from_raw(usize::MAX), &atoms, &mut heap),
         "match_spec_run with the all-ones spec",
+    );
+}
+
+#[test]
+fn match_spec_run_walks_an_object_list_without_reading_a_header_word() {
+    // `pattern::matches`'s cons walk: the head is a **list pattern**
+    // (`['$1']` = `Cons(Bind(1), Literal([]))`) and the objects exercise a tuple that
+    // contains a header word, a list whose element *is* a header word, and a plain
+    // list. None of the three may be dereferenced through a header/shape mismatch:
+    // the tuple is refused by the cons-cell shape test, and the header word rides
+    // through the `Bind` (a binding reads nothing) and the `Literal([])` tail.
+    //
+    // Residual, unchanged: a word whose low bits look like a cons pointer but which
+    // points at freed/foreign memory is unverifiable by any word-local test — the
+    // ownership rule upstream (a stored word must stay rooted or be copied) is the
+    // contract there. This test therefore only builds words that *cannot* be a cons
+    // pointer.
+    let atoms = atoms();
+    let mut heap = Heap::new(1024).expect("test heap");
+    let header = make_arityval(1);
+    let bind1 = at(&atoms, "$1");
+    let whole_object = at(&atoms, "$_");
+
+    // The head pattern `['$1']`.
+    let head_nil = heap.cons(bind1, NIL).expect("test heap has room");
+    // `['$_']` body list.
+    let body_list = heap.cons(whole_object, NIL).expect("test heap has room");
+    let clause = heap.tuple(&[head_nil, NIL, body_list]).expect("test heap has room");
+    let spec = heap.cons(clause, NIL).expect("test heap has room");
+    compile(spec, &atoms).expect("the list-pattern head compiles");
+
+    // `{1, HeaderWord}` — a tuple containing a header word.
+    let tuple_with_header = heap
+        .tuple(&[make_small(1), header])
+        .expect("test heap has room");
+    // `[HeaderWord]` — a one-element list whose only element is a header word.
+    let list_with_header = heap.cons(header, NIL).expect("test heap has room");
+    // `[1, 2]` — a two-element list, so `['$1']` does not match it.
+    let two = heap.cons(make_small(2), NIL).expect("test heap has room");
+    let one_two = heap.cons(make_small(1), two).expect("test heap has room");
+
+    let (input, tuple_with_header, list_with_header) = {
+        // Built in reverse so every cons cell stays alive on `heap` for the run.
+        let rest = heap.cons(list_with_header, NIL).expect("test heap has room");
+        let rest = heap.cons(tuple_with_header, rest).expect("test heap has room");
+        let input = heap.cons(one_two, rest).expect("test heap has room");
+        (input, tuple_with_header, list_with_header)
+    };
+
+    let results = match_spec_run(input, spec, &atoms, &mut heap).expect("no crash, no error");
+    // `[1, 2]` has two elements, so the one-element list pattern does not match it;
+    // the tuple is not a cons at all; `[HeaderWord]` matches and its `'$_'` value is
+    // the element itself (a `'$_'` body aliases, it does not copy — so the raw word
+    // is identical).
+    assert_eq!(results.len(), 1, "only the one-element list matches: {results:?}");
+    assert_eq!(
+        results[0].raw(),
+        list_with_header.raw(),
+        "the matched object is the `[HeaderWord]` list itself"
+    );
+    assert_ne!(
+        results[0].raw(),
+        tuple_with_header.raw(),
+        "the tuple containing a header word never matched the list pattern"
     );
 }
 
