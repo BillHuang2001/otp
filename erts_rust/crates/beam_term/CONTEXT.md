@@ -299,4 +299,4 @@ Every `src/*.rs` file is a routing node; its item list is the module section abo
 - `../../../ERTS_RUST_REWRITE_EVALUATION.md` §A.1–A.3, §B; `../../../ERTS_RUST_REWRITE_DEEPDIVE.md` §A, §B.
 - `../../erts/emulator/beam/CONTEXT.md` — legacy core; its "Term Encoding (Eterm) Reference" section.
 - `../beam_abi/` — NIF/driver C ABI; transmutes `Eterm` ↔ `ERL_NIF_TERM`. `../beam_alloc/`, `../beam_gc/` — production heap/allocator + collector built on `heap.rs`.
-- Child nodes: `src/compare/CONTEXT.md`, `src/hashing/CONTEXT.md`, `src/size/CONTEXT.md`, `tests/CONTEXT.md`, `examples/CONTEXT.md`.
+- Child nodes: `src/bitstring/CONTEXT.md`, `src/compare/CONTEXT.md`, `src/hashing/CONTEXT.md`, `src/size/CONTEXT.md`, `tests/CONTEXT.md`, `examples/CONTEXT.md`.
