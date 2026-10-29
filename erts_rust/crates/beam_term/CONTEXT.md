@@ -222,7 +222,7 @@ Every `src/*.rs` file is a routing node; its item list is the module section abo
 - `src/size/` → the sizing walk's working memory and hasher (child node — `src/size/CONTEXT.md`)
 - `src/thing.rs` → heap-agnostic float/bignum/flatmap/external-pid/port/ref blocks (the codec forwards here)
 - `src/fun.rs` → the on-heap fun/export layout (`FunKind`, the three descriptors, the writers, `fun_local_key`)
-- `src/map.rs` → the Erlang map (flat-map/HAMT builder, `collapse_eq_runs`, the readers, `map_words_capacity`)
+- `src/map.rs` → the Erlang map (flat-map/HAMT builder, `collapse_eq_runs`, the readers, `map_words_capacity`); it has **no incremental update** — `map_put`/`map_remove` are full rebuilds (see Known Issues)
 - `src/record.rs` → native records (size fns, `write_record`, the `record_*` readers)
 - `src/number.rs` → `big_to_f64` + `number_as_f64`
 - `src/bitstring.rs` → `ErlHeapBits`/`ErlSubBits` writers+readers, `bitstring_parts`/`bit_at`, the float readers
