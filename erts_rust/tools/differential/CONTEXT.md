@@ -165,7 +165,8 @@ Non-corpus modules:
 - `src/test_support.rs` → `#[cfg(test)]`-only helpers (`Scratch` dir, compiler stubs) for the `module_build`/`nif_build` tests.
 
 Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-corpus-map` skill** (enabled at this node) — every group's id prefix, case count and the behaviours it pins, plus its pinning traps. The A-contract → file map, with the counts that are easy to get wrong:
-- A.1 → `terms.rs`, `semantics.rs`, `errors.rs`, `ordered_walk.rs`, `copypath.rs` (5: the process copy boundary's cons-chain fast path — see the `copypath` line in the routing table)
+- A.1 → `terms.rs`, `semantics.rs`, `errors.rs`, `ordered_walk.rs`
+- A.1 process copy boundary → `copypath.rs` (5: a 20 000-element cons chain, one of 200 000 (longer than the receiver's remaining heap words), 400 conses of distinct 4 KiB **refc binaries** (the fix-up worklist), a 10 000-cons **improper** chain with an atom tail, and a chain of mixed nested elements — each sent to a **spawned** process and echoed back, compared as `term_to_binary(Echo) =:= term_to_binary(L)`; golden `ok` of `true`, a corrupted copy answers `false`, a lost message `timeout`)
 - A.2 → `etf.rs` (90), `wire_ids.rs`
 - A.3 → `nif.rs`, `nif_so.rs` (46), `nif_res.rs` (30), `nif_abi.rs` (166), `nif_abi_extra.rs` (131), `nif_state.rs` (9), `nif_thread.rs` (8), `nif_a3.rs` (12)
 - A.4 → `driver_ports.rs`, `driver.rs`, `driver_c.rs` (54), `driver_abi.rs` (90), `driver_abi_extra.rs` (78)
