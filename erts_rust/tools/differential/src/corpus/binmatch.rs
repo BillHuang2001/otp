@@ -45,6 +45,32 @@
 //! **not expressible through an observable program** and is deliberately not pinned — see
 //! the note below.
 //!
+//! Also pinned here: **compiled UTF-32 bit-string construction and matching**, the
+//! `binary/utf32_*` cases. They are [`CaseKind::Module`] cases — the embedded
+//! [`UTF32_SOURCE`] module is `erlc`-compiled and run by both runtimes, so the engine's
+//! lowered `bs_create_bin`/`bs_match` UTF-32 arms are what they exercise; the `-eval`
+//! evaluator, which is what the `bits/construct_utf32_segments` and
+//! `bits/match_utf32_code_points` cases in [`super::bits`] cover, is not involved at all (a
+//! UTF-32 defect that lived in the *compiled* opcode path once survived exactly because its
+//! only coverage went through the tree-walker).
+//!
+//! A module-run golden is a plain **integer** line (the corpus-wide shape), so each function
+//! returns one integer that carries the bytes it produced: `pack/1` folds a four-byte
+//! construction into an integer most-significant byte first (`<<4660/utf32-little>>` is
+//! `<<52,18,0,0>>` ⇒ `873594880`; `<<4660/utf32>>` is `<<0,0,18,52>>` ⇒ `4660`), and the two
+//! comprehension cases read their twelve produced bytes with `binary:decode_unsigned/1`
+//! (`309485013573406512572731392` = `01 00 00 00 34 12 00 00 FF FF 10 00`). A wrong byte or a
+//! wrong byte *order* therefore changes the golden; nothing is softened to a length or a
+//! shape. The scalar-range case reports one bit per probed value (all four rejects plus an
+//! accepted `16#10FFFF` control), and the **native** cases pin an endian-*invariant*
+//! relation instead of a byte order, because `utf32-native` depends on the build host:
+//! `binary/utf32_native_construction` compares the native segment with the explicit
+//! little-/big-endian construction `erlang:system_info(endian)` calls for (⇒ `1` here), and
+//! `binary/utf32_native_match` round trips `16#20AC` through a native construction and a
+//! native match (⇒ `8364` on either endianness). The module keeps every literal subject and
+//! generator behind `id/1`, so the compiler cannot constant-fold a construction or a `case`
+//! match into a literal and leave the opcode path unexercised.
+//!
 //! # Deliberately NOT pinned (handoffs to the runtime nodes)
 //!
 //! Each of these produces a *plain value/reason* (not a capability-gap signal), so a case
@@ -59,9 +85,116 @@
 //!   element shared-binary list — still nine orders of magnitude short of the boundary —
 //!   already exceeds the Rust evaluator's memory.
 
-use super::{Case, CaseKind, Contract, Golden, Probe};
+use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
-/// The A.7 `binary` compiled-pattern cases.
+/// The module both runtimes execute for the compiled UTF-32 cases.
+///
+/// Every exported function returns **one integer** (the corpus-wide module-run golden
+/// shape), folding the bytes it produced into that integer most-*significant* byte first:
+/// `pack/1` over a four-byte construction, `binary:decode_unsigned/1` over the twelve bytes
+/// the comprehension cases produce. So a single wrong byte (or a wrong byte *order*) changes
+/// the golden, and the `utf32`-specific behaviour is what the integer carries.
+///
+/// `id/1` keeps every literal subject and generator **opaque**: the Erlang compiler must not
+/// constant-fold a construction or a `case` match into a literal, because the lowered
+/// `bs_create_bin`/`bs_match` arms are exactly what these cases exist to exercise.
+pub(crate) const UTF32_SOURCE: &str = "-module(diff_utf32).\n\
+     -export([little/1, big/1, native_relation/1, native_roundtrip/1,\n\
+     \x20        scalar_range/0, little_comprehension/0,\n\
+     \x20        little_binary_comprehension/0, little_match/0, big_match/0]).\n\
+     \n\
+     %% pack/1 folds a produced four-byte image into one integer, most significant byte\n\
+     %% first, so a golden pins the byte order exactly (the bytes 52,18,0,0 of\n\
+     %% <<4660/utf32-little>> pack to 873594880).\n\
+     pack(<<A, B, C, D>>) -> ((A * 256 + B) * 256 + C) * 256 + D.\n\
+     \n\
+     %% id/1 keeps a literal subject or generator opaque, so the compiler cannot\n\
+     %% constant-fold the construction/match away: the lowered opcodes are the point.\n\
+     id(X) -> X.\n\
+     \n\
+     little(E) -> pack(<<E/utf32-little>>).\n\
+     big(E) -> pack(<<E/utf32>>).\n\
+     \n\
+     native_relation(E) ->\n\
+     \x20   Native = <<E/utf32-native>>,\n\
+     \x20   Expected = case erlang:system_info(endian) of\n\
+     \x20                  little -> <<E/utf32-little>>;\n\
+     \x20                  big -> <<E/utf32>>\n\
+     \x20              end,\n\
+     \x20   flag(Native =:= Expected).\n\
+     \n\
+     native_roundtrip(E) ->\n\
+     \x20   case id(<<E/utf32-native>>) of\n\
+     \x20       <<X/utf32-native>> -> X\n\
+     \x20   end.\n\
+     \n\
+     flag(true) -> 1;\n\
+     flag(false) -> 0.\n\
+     \n\
+     %% One bit per value: 1 when the construction raised badarg, 0 when it produced a\n\
+     %% 32-bit segment, 2 when it silently produced something else (never expected).\n\
+     badarg_flag(V) ->\n\
+     \x20   try bit_size(<<V/utf32>>) of\n\
+     \x20       32 -> 0;\n\
+     \x20       _ -> 2\n\
+     \x20   catch error:_ -> 1 end.\n\
+     \n\
+     scalar_range() ->\n\
+     \x20   (badarg_flag(16#D800) bsl 4)\n\
+     \x20   bor (badarg_flag(16#DFFF) bsl 3)\n\
+     \x20   bor (badarg_flag(16#110000) bsl 2)\n\
+     \x20   bor (badarg_flag(-1) bsl 1)\n\
+     \x20   bor (1 - badarg_flag(16#10FFFF)).\n\
+     \n\
+     little_comprehension() ->\n\
+     \x20   binary:decode_unsigned(iolist_to_binary([<<X/utf32-little>> || X <- id([1, 4660, 16#10FFFF])])).\n\
+     \n\
+     little_binary_comprehension() ->\n\
+     \x20   binary:decode_unsigned(<< <<X/utf32-little>> || X <- id([1, 4660, 16#10FFFF]) >>).\n\
+     \n\
+     little_match() ->\n\
+     \x20   case id(<<172, 32, 0, 0>>) of\n\
+     \x20       <<X/utf32-little>> -> X\n\
+     \x20   end.\n\
+     \n\
+     big_match() ->\n\
+     \x20   case id(<<0, 0, 32, 172>>) of\n\
+     \x20       <<X/utf32>> -> X\n\
+     \x20   end.\n";
+
+/// Build one compiled UTF-32 module-run case over [`UTF32_SOURCE`]; `golden` is the oracle's
+/// own `~w` rendering of the returned integer.
+fn utf32_case(
+    id: &'static str,
+    description: &'static str,
+    function: &'static str,
+    arity: u32,
+    args: &'static [i64],
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        // A compiled `.beam` executes (A.2) *and* the language's bit-string semantics are
+        // what the case pins (A.1); the registry requires the `.beam` claim of a
+        // module-run case.
+        contracts: &[Contract::BeamAsm, Contract::LanguageSemantics],
+        kind: CaseKind::Module(ModuleRun {
+            source: UTF32_SOURCE,
+            module: "diff_utf32",
+            function,
+            arity,
+            args,
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The A.7 `binary` compiled-pattern cases, plus the compiled UTF-32 bit-string cases.
 pub(crate) fn group() -> Vec<Case> {
     vec![
         Case {
@@ -492,19 +625,110 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- compiled UTF-32 bit-string construction and matching (`binary/utf32_*`) --------
+        // These are `CaseKind::Module` cases: the module above is `erlc`-compiled and run by
+        // both runtimes, so the engine's lowered `bs_create_bin`/`bs_match` UTF-32 arms are
+        // exercised — not the `-eval` evaluator the `bits/` group covers. The golden is the
+        // oracle's `~w` rendering of the returned integer; `pack/1` folds the produced four
+        // bytes into it most-significant byte first, so `<<4660/utf32-little>>`
+        // (= `<<52,18,0,0>>`) is `873594880` and `<<4660/utf32>>` (= `<<0,0,18,52>>`) is
+        // `4660`.
+        utf32_case(
+            "binary/utf32_little_construction",
+            "a compiled <<E/utf32-little>> segment puts 16#1234 out as the bytes 52,18,0,0 (packed into 873594880)",
+            "little",
+            1,
+            &[0x1234],
+            "873594880",
+        ),
+        utf32_case(
+            "binary/utf32_big_construction",
+            "a compiled <<E/utf32>> (big-endian) segment puts 16#1234 out as the bytes 0,0,18,52 (packed back into 4660)",
+            "big",
+            1,
+            &[0x1234],
+            "4660",
+        ),
+        utf32_case(
+            "binary/utf32_native_construction",
+            "a compiled <<E/utf32-native>> segment equals the endian-appropriate explicit construction on this host (the relation is pinned, not a byte order)",
+            "native_relation",
+            1,
+            &[0x1234],
+            "1",
+        ),
+        utf32_case(
+            "binary/utf32_scalar_range_badarg",
+            "a compiled utf32 construction rejects the surrogates 16#D800/16#DFFF, the out-of-range 16#110000 and the negative -1 with badarg, and still accepts 16#10FFFF",
+            "scalar_range",
+            0,
+            &[],
+            "31",
+        ),
+        utf32_case(
+            "binary/utf32_little_comprehension",
+            "a compiled list comprehension of <<X/utf32-little>> over 1, 16#1234 and 16#10FFFF produces the 12-byte image 01 00 00 00 34 12 00 00 FF FF 10 00",
+            "little_comprehension",
+            0,
+            &[],
+            "309485013573406512572731392",
+        ),
+        utf32_case(
+            "binary/utf32_little_binary_comprehension",
+            "the same three segments through a compiled binary comprehension (the writable accumulator) produce the same 12-byte image as the list comprehension",
+            "little_binary_comprehension",
+            0,
+            &[],
+            "309485013573406512572731392",
+        ),
+        utf32_case(
+            "binary/utf32_little_match",
+            "a compiled case match <<X/utf32-little>> over the bytes 172,32,0,0 reads back 16#20AC",
+            "little_match",
+            0,
+            &[],
+            "8364",
+        ),
+        utf32_case(
+            "binary/utf32_big_match",
+            "a compiled case match <<X/utf32>> over the bytes 0,0,32,172 reads back 16#20AC",
+            "big_match",
+            0,
+            &[],
+            "8364",
+        ),
+        utf32_case(
+            "binary/utf32_native_match",
+            "a compiled <<E/utf32-native>> construction matched back with <<X/utf32-native>> round trips the code point on either endianness",
+            "native_roundtrip",
+            1,
+            &[0x20AC],
+            "8364",
+        ),
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    //! Invariants of the A.7 compiled-pattern group: every case is a `value` eval case that
-    //! observes the `binary` module through a golden the oracle printed, and **no** case ever
+    //! Invariants of the `binary` group: every *eval* case is a `value` case that observes the
+    //! `binary` module through a golden the oracle printed, every *module* case is a compiled
+    //! UTF-32 case whose integer golden is the byte image it produced, and **no** case ever
     //! renders a per-VM-start handle.
-    use super::{group, CaseKind, Contract, Golden, Probe};
+    use super::{group, CaseKind, Contract, Golden, Probe, UTF32_SOURCE};
 
     #[test]
-    fn every_case_is_a_binary_eval_case_exposing_the_otp_app_contract() {
+    fn every_eval_case_is_a_binary_case_exposing_the_otp_app_contract() {
+        let mut eval_cases = 0;
         for case in group() {
+            let CaseKind::Eval {
+                expr,
+                extra_argv,
+                probe,
+            } = case.kind
+            else {
+                continue;
+            };
+            eval_cases += 1;
             assert_eq!(case.contracts, &[Contract::OtpApps], "case {}", case.id);
             assert!(
                 case.id.starts_with("binary/"),
@@ -516,14 +740,6 @@ mod tests {
                 "case {} has no description",
                 case.id
             );
-            let CaseKind::Eval {
-                expr,
-                extra_argv,
-                probe,
-            } = case.kind
-            else {
-                panic!("case {}: an A.7 BIF case must be an eval case", case.id);
-            };
             assert_eq!(probe, Probe::Value, "case {}", case.id);
             assert!(
                 extra_argv.is_empty(),
@@ -532,6 +748,142 @@ mod tests {
             );
             assert!(!expr.is_empty() && !expr.contains('\n'), "case {}", case.id);
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
+        }
+        assert!(eval_cases > 0, "the group lost its eval cases");
+    }
+
+    #[test]
+    fn every_module_case_is_a_compiled_utf32_case_exposing_language_semantics() {
+        let mut module_cases = 0;
+        for case in group() {
+            let CaseKind::Module(run) = &case.kind else {
+                continue;
+            };
+            module_cases += 1;
+            assert!(
+                case.id.starts_with("binary/utf32_"),
+                "case {}: a module-run case here is a compiled UTF-32 case",
+                case.id
+            );
+            assert_eq!(
+                case.contracts,
+                &[Contract::BeamAsm, Contract::LanguageSemantics],
+                "case {}",
+                case.id
+            );
+            assert!(case.description.contains("compiled"), "case {}", case.id);
+            assert_eq!(run.module, "diff_utf32", "case {}", case.id);
+            assert_eq!(run.source, UTF32_SOURCE, "case {}", case.id);
+            assert!(run.nif.is_none(), "case {}", case.id);
+            assert_eq!(case.kind_label(), "module-run", "case {}", case.id);
+            assert_eq!(case.expr(), None, "case {}", case.id);
+            assert!(case.extra_argv().is_empty(), "case {}", case.id);
+            assert_eq!(
+                run.arity as usize,
+                run.args.len(),
+                "case {}: arity must match the argument count",
+                case.id
+            );
+            // A module-run golden is a plain integer line, and every UTF-32 case's integer is
+            // the byte image it produced (see `the_utf32_goldens_are_the_documented_byte_images`).
+            let golden = case.golden.stdout.expect("a golden");
+            assert!(
+                golden.chars().all(|c| c.is_ascii_digit()),
+                "case {}: the golden is a plain integer line, got {golden:?}",
+                case.id
+            );
+            assert_eq!(golden, golden.trim_start_matches('0'), "case {}", case.id);
+            assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
+        }
+        assert_eq!(module_cases, 9, "the compiled UTF-32 case count changed");
+    }
+
+    #[test]
+    fn the_utf32_goldens_are_the_documented_byte_images() {
+        // The integer goldens are the oracle's own `~w` lines, and each one is the produced
+        // bytes read most-significant byte first — so the byte order a case pins is checkable
+        // in arithmetic instead of by eye.
+        for (id, golden) in [
+            ("binary/utf32_little_construction", 873_594_880u128),
+            ("binary/utf32_big_construction", 4_660),
+            ("binary/utf32_native_construction", 1),
+            ("binary/utf32_scalar_range_badarg", 31),
+            (
+                "binary/utf32_little_comprehension",
+                309_485_013_573_406_512_572_731_392,
+            ),
+            (
+                "binary/utf32_little_binary_comprehension",
+                309_485_013_573_406_512_572_731_392,
+            ),
+            ("binary/utf32_little_match", 8_364),
+            ("binary/utf32_big_match", 8_364),
+            ("binary/utf32_native_match", 8_364),
+        ] {
+            let case = group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .expect("registered");
+            assert_eq!(
+                case.golden.stdout.and_then(|g| g.parse::<u128>().ok()),
+                Some(golden),
+                "{id}"
+            );
+        }
+        // `<<4660/utf32-little>>` is `<<52,18,0,0>>`, i.e. `16#34120000`; the big-endian
+        // segment `<<0,0,18,52>>` packs back to the value itself.
+        assert_eq!(
+            873_594_880u128,
+            u128::from(u32::from_be_bytes([52, 18, 0, 0]))
+        );
+        assert_eq!(4_660u128, u128::from(u32::from_be_bytes([0, 0, 18, 52])));
+        assert_eq!(4_660u128, u128::from(0x1234u32));
+        // Both comprehension shapes produce the same twelve bytes — `1`, `16#1234` and
+        // `16#10FFFF`, each as a little-endian utf32 segment: 01 00 00 00 34 12 00 00 FF FF 10 00.
+        assert_eq!(
+            309_485_013_573_406_512_572_731_392u128,
+            u128::from_be_bytes([0, 0, 0, 0, 1, 0, 0, 0, 52, 18, 0, 0, 255, 255, 16, 0])
+        );
+        // `16#20AC` is the code point every match case reads back.
+        assert_eq!(8_364u128, u128::from(0x20ACu32));
+        // The scalar-range bitmask: the four rejects (16#D800, 16#DFFF, 16#110000, -1) plus the
+        // accepted `16#10FFFF` control.
+        assert_eq!(31u128, 0b1_1111);
+    }
+
+    #[test]
+    fn the_utf32_source_keeps_every_construction_and_match_shape() {
+        for shape in [
+            "<<E/utf32-little>>",
+            "<<E/utf32>>",
+            "<<E/utf32-native>>",
+            "<<X/utf32-little>>",
+            "<<X/utf32>>",
+            "<<X/utf32-native>>",
+            "[<<X/utf32-little>> || X <-",
+            "<< <<X/utf32-little>> || X <-",
+            "erlang:system_info(endian)",
+            "16#D800",
+            "16#DFFF",
+            "16#110000",
+            "badarg_flag(-1)",
+            "id([1, 4660, 16#10FFFF])",
+        ] {
+            assert!(UTF32_SOURCE.contains(shape), "the source lost {shape:?}");
+        }
+        // The literal subjects and generators stay behind `id/1`: the compiler must not
+        // constant-fold a construction or a `case` match into a literal, which would leave the
+        // lowered opcode path unexercised while the case stayed green.
+        assert!(UTF32_SOURCE.contains("id(X) -> X."));
+        for subject in [
+            "case id(<<E/utf32-native>>)",
+            "case id(<<172, 32, 0, 0>>)",
+            "case id(<<0, 0, 32, 172>>)",
+        ] {
+            assert!(
+                UTF32_SOURCE.contains(subject),
+                "the match subject is no longer opaque: {subject:?}"
+            );
         }
     }
 
