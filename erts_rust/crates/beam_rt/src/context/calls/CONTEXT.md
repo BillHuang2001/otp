@@ -258,3 +258,27 @@ Consequences for this module, which is why every arm below is stated as verified
 * **No arm of the copy-out can leave a term on a *freed* region** — the pool is immortal, so `rewind = false` (`calls.rs:996`, `:1052`) and the un-rehomed `None` arms (`:960-965`, `:997-1005`) are all "leaks a word", never "frees a live word".
 * **A NIF/floor result escapes on the pool by design and is sound for the same reason** (`try_call_nif`, `calls.rs:1620` take / `:1661` put, no copy-out, no rewind; the native floor returns before the copy-out cascade at `calls.rs:1735-1740`). The guarantee is the rewind-to-`mark` rule (`calls.rs:266`, `:1052`) plus retirement-not-free — *not* "the pool never moves", which is what `native/process.rs:1224-1230`'s doc claims.
 * **The dangerous class is therefore a raw `Eterm` held across a call and pointing into a process's young heap.** The rosters: `../CONTEXT.md`'s *Host-side term stores*, and the confirmed unstabilized writer is `seq_trace.rs:480` (`erlang:seq_trace(label, …)` stores `args[1]`) → `set_label` `seq_trace.rs:343-348` → `Token::label` `seq_trace.rs:175`; the field's own doc still cites the stale "no garbage collector" premise. `context/position.rs`'s five published `Eterm`s (`runtime.rs:649`, published/cleared at `position.rs:185`/`:187`) are the other raw window, undangled only by "a `Running` pid declines every collection" plus "no `?` between set and clear".
+
+## D1 (`binary_module_SUITE:error_info/1`) — the spawned child's `system_limit` is NOT the frontier
+Measured on this HEAD (and identically on the pre-frontier build `32732ba`): the recorded suites
+invocation (`ct_runner:run(binary_module_SUITE, 1000, 300000, "<stage>/src")`, 1 s case timeout)
+reproduces `EXIT=1` + `beam_rt: system_limit` in a *spawned* `ct_runner` case fun, so the
+BIF-frontier reservation change neither caused nor cured it — it is a pre-existing defect.
+The refusal is **not** the pooled region: `BEAM_RT_MEM_TRACE=1` on the failing run reports
+`bif_regions=1 bif_words=16777216 bif_peak_used_words=250957 bif_heaps_taken=0
+bif_nested_peak_words=0 eval_heap_words=16777216 eval_heap_retired_regions=0
+store_move_declines=0` — the pool never grew, never re-took a frontier and never retired a region,
+and the `-eval` store was neither grown nor moved.
+The failing call is `Runtime::stabilize_error_live_reason` (`src/runtime/gc.rs`, called from the
+runner's termination arm, `src/runner/run.rs`) — the raise's **escape boundary**: it copies the
+raise's `live_reason` word onto the runtime-lifetime store and the copy is refused as
+`Alloc(AllocFailure { requested: 5.9e14, kind: Message })`, which
+`crate::error::enforce_term_heap_limit` maps to `SystemLimit`. The `live_reason` there is the
+`{exception, Class, Reason, Frame}` tuple that `ct_runner:normalize/1` exits with, and
+`beam_term::size_object_bounded(term, 1 << 16)` already answers `TermGraphTooLarge`: the graph
+contains an object whose priced size is garbage (a bitstring/sub-bits or header word read from a
+region that no longer holds it). So the defect is a **rooting/lifetime** one — some term inside the
+caught reason names a region that was reused or relocated — and it surfaces here only because this
+is the one place that copies a raise reason that outlived the process that built it. It is not a
+copy-out containment or frontier decision; the fix belongs with the producer of that reason
+(the exception machinery's catch-frame/reason materialization), not with this seam.
