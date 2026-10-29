@@ -85,6 +85,13 @@ Two further entry points sweep the `-eval` route's escaped store (`Runtime::eval
 **The NIF-resource-term prune** (`gc/resources.rs`) drops the reference every resource term took at `enif_make_resource` once nothing reachable from the process's complete root set names it, so the resource type's destructor runs exactly once; the walk matches a word **or** a reference identity, because a `copy_struct` copy is a different word with the same id.
 Gates, per-slice cost, measured envelope and residuals: [`gc/CONTEXT.md`](gc/CONTEXT.md), [`../runner/CONTEXT.md`](../runner/CONTEXT.md), [`../../M1_GAPS_GC.md`](../../M1_GAPS_GC.md); pinning suite [`../../tests/nif_resource_gc.rs`](../../tests/nif_resource_gc.rs).
 
+## The Erlang stack on the runtime side (this crate's write surface)
+- **No Y slot is ever built here**: the engine materializes them, `push_frame_window`'s `self.stack.resize(y_base + y_count as usize, Eterm::default())` (`../../beam_engine/src/machine/frames.rs:239-251`), and `Eterm::default()` **is** `NIL` (`../../beam_term/src/eterm.rs:66-71`).
+- The only production writes into `Machine::stack` from this crate are the GC hand-off: `publish_roots_full` (`gc.rs:1089-1096`) pushes `roots.stack` + the live FR prefix into the **process** root set, and `scatter_roots_full` (`gc.rs:1136-1139`) copies the relocated words back into `roots.stack`/`roots.fr`.
+- Everything else is a read: `gather_off_heap_roots`/`for_each_parked_machine_root_mut`/`for_each_engine_census` (`runner/entry.rs:687-692`, `:770-789`, `:825-832`) and `publish_nested_roots` (`pump.rs:509-513`).
+- A fresh slice's stack is **empty, not pre-filled**: `Machine::new()` is `Vec::with_capacity(STACK_RESERVE_WORDS)` (256) and `Machine::reset` `clear`s it, which is what the nested-run pool's release contract relies on (`machine_pool.rs:86-101`).
+- No production path reads `Frame::continuation`; execution-position items go through `Machine::{current_function,current_location,current_stacktrace,catch_frame_depth}` (`position.rs:259-262`, `native/memory/mod.rs:808-811`, `:945`).
+
 ## Constraints
 * **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]`, with one `#![allow(unsafe_code)]` per marked module and a `// SAFETY:` rationale at each site — this node's `gc.rs`, `gc_walk.rs`, `gc/bin_vheap.rs`, `gc/valve_bounds.rs`, `calls.rs` and `../eval/reclaim.rs` + `../eval/reclaim/resource.rs`, plus `../nif.rs` and `../malloc.rs`; the glue otherwise uses only the safe peripheries of the lower crates.
 * **Return-based errors, no silent swallowing** ([`../../CONTEXT.md`](../../CONTEXT.md) §3): every fallible helper returns `beam_common::Result`; no `panic!`/`unwrap()` on runtime data.
