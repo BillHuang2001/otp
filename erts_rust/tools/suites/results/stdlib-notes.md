@@ -140,7 +140,9 @@ stderr: beam_rt: system_limit
 
 The abort is deterministic for a given build and reproduces by hand with the harness's own argv. It is
 **entry-count dependent**: `error_info_abort_probe:main({prefix, N})` (the suite's `error_info/1` list
-through `ct_runner:run_case/4`'s shape) is green up to `N = 69` and aborts at `N = 70` of the 73 entries.
+through `ct_runner:run_case/4`'s shape) completes with exit 0 up to `N = 69` and aborts at `N = 70` of
+the 73 entries (`N = 68`/`69` answer a ct exception result, not a passing case — the point is that the
+runtime survives them).
 The load-bearing ingredient is the ct hand-off — `spawn_monitor` child, `try`/`catch` around the case,
 `exit({ct_case_result, Result})` out of the child: the case's own logic passes in the main process, in a
 plain child, and when the value is merely returned, and dropping any single entry does not move the
