@@ -31,7 +31,7 @@
 //! | `ByteInt` (8/16/32/64 bits, both endiannesses, `unit > 1`, negative, bignum) | [`the_byte_field_stride_matches_the_generic_walk_on_every_width`] |
 //! | `Integer` (bit-granular, `dynamic` size, non-integer value) | [`the_integer_family_matches_the_generic_walk`] |
 //! | `Append` (`private_append` in place, `append`, a later position, a non-bitstring) | [`the_append_family_matches_the_generic_walk`] |
-//! | `Utf` (`utf8`/`utf16`/`utf32`, `-little`) | [`the_utf_family_matches_the_generic_walk`] |
+//! | `Utf` (`utf8`/`utf16`/`utf32`, `-big`/`-little`/`-native`) | [`the_utf_family_matches_the_generic_walk`] |
 //! | `Float` (`dynamic` width, a non-float value, a zero-width field) | [`the_float_family_matches_the_generic_walk`] |
 //! | `Binary` (`all`, an explicit size, a `unit` spelling, a non-bitstring) | [`the_binary_family_matches_the_generic_walk`] |
 //!
