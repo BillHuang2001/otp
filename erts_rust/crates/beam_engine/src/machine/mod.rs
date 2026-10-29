@@ -121,6 +121,8 @@ mod tests;
 #[cfg(test)]
 mod program_tests;
 #[cfg(test)]
+mod raise_reason_tests;
+#[cfg(test)]
 mod root_tests;
 #[cfg(test)]
 pub(crate) mod test_support;/// Process-state core: x-register file, Erlang stack and call-frame stack.

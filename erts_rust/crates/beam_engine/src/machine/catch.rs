@@ -498,6 +498,14 @@ impl Machine {
     ///
     /// A family body typically ends with `machine.throw(class, reason).map(Some)`
     /// (or, for a `{badmatch,V}`-style raise, [`Machine::throw_error`]).
+    ///
+    /// **The `reason`/`trace` words are landed verbatim.** A caught raise publishes
+    /// them raw in `x(1)`/`x(2)` (no copy, no re-home), and the engine adds no
+    /// region knowledge of its own: whether the word stays valid is the *producer's*
+    /// obligation — a machine-heap term is rooted by the landing itself, a
+    /// never-rewound pooled word or a literal is stable by the host's guarantee.
+    /// [`Machine::land_exception`] states the rule, its consumers and the one
+    /// allocating door between a BIF seam's word and the landing.
     pub(crate) fn throw_with_trace(
         &mut self,
         class: ExceptionClass,
@@ -652,6 +660,12 @@ impl Machine {
         // The trace the handler sees in `x(2)`: the term this raise supplied when it
         // supplied one (C's `c_p->ftrace = x(2)` after `raw_raise`), else the raise's
         // own raw-trace word.
+        //
+        // Nothing allocates between the raise's words and this landing (the unwind is
+        // two `truncate`s, `set_continuation` and `class_atom` are pure), so the words
+        // reach `x(1)`/`x(2)` exactly as the raise carried them — the raw-word landing
+        // rule whose soundness condition a *producer* owns
+        // ([`Machine::land_exception`] states it in full).
         let supplied = self.raise_supplied_term.take();
         self.land_exception(class_atom, reason, trace, supplied)?;
         // The handler's `(func, pc)` are indices into the *landing context's*
@@ -698,6 +712,15 @@ impl Machine {
     /// or any non-[`BeamError::Raise`] error is returned **unchanged**. When the
     /// derived trace is empty the raise is returned unchanged too, so a raise the
     /// module cannot name is never given an invented frame.
+    ///
+    /// **Frames only — the reason word is never touched.** An **uncaught** raise
+    /// carries its reason out in
+    /// [`Raise::live_reason`](beam_common::Raise::live_reason), and this funnel neither
+    /// re-homes nor substitutes that word (it decorates
+    /// [`stacktrace`](beam_common::Raise::stacktrace) alone), so the term a renderer
+    /// reads back is the term the raise held — the uncaught half of the raw-word
+    /// landing rule [`Machine::land_exception`] states. Pinned by
+    /// `raise_reason_tests::an_uncaught_raise_keeps_its_reason_word_through_the_uncaught_funnel`.
     ///
     /// **Engine diagnostics are deliberately excluded** ([`is_engine_diagnostic`]):
     /// a [`BeamError::Raise`] whose reason is the [`crate::error::unsupported`]
@@ -812,6 +835,80 @@ impl Machine {
     /// * `x(3) = class_atom` — `exception_tag[GET_EXC_CLASS(freason)]`, installed by
     ///   [`Machine::set_class_atom`]; the handler only has to move it to `x(0)`
     ///   (`try_case`) or compare it against `throw`/`error` (`catch_end`).
+    ///
+    /// # The raw-word landing rule (the raise-reason producer contract)
+    ///
+    /// Every word this writes is embedded **verbatim**: `reason` goes into `x(1)` and
+    /// `supplied_term.unwrap_or(trace)` into `x(2)` exactly as the raise carried them
+    /// — no copy, no re-home, no validation, no region knowledge. The engine cannot
+    /// tell one host region from another, so it never re-homes a word it was handed;
+    /// there is no copying seam here and none should be grown (this crate has no
+    /// `copy_struct`, and would have no way to arbitrate the pointers across crates).
+    ///
+    /// **Consumers.** `x(1)`/`x(2)` are read back by the handler opcodes
+    /// ([`Instr::TryCase`](beam_loader::Instr), `catch_end`), which embed the words in
+    /// a freshly carved tuple — `families::exceptions` re-reads `x(1)` **inside** its
+    /// one rooted reservation, so a collecting host relocates the reason as a root
+    /// rather than a stale Rust local; by [`Instr::BuildStacktrace`](beam_loader::Instr)
+    /// via `families::exceptions::stacktrace::symbolic_stacktrace` (which echoes a
+    /// cooked supplied trace verbatim and otherwise cooks the raise snapshot); and by
+    /// an **uncaught** raise, which carries the reason out of the machine in
+    /// [`Raise::live_reason`](beam_common::Raise::live_reason) and is decorated
+    /// frames-only by [`Machine::with_uncaught_frames`] — that funnel re-homes nothing
+    /// and substitutes nothing, so the word it hands on is the word the raise held.
+    ///
+    /// **Producers** (all of them reach this method through
+    /// [`Machine::throw_with_trace`]/[`Machine::throw_propagating`]):
+    ///
+    /// * an **instruction-level** raise — the exception family's
+    ///   `{badmatch,V}`/`{case_clause,V}`/`{badrecord,V}` builders (each written into a
+    ///   rooted reservation immediately before the throw), [`Instr::Raise`] /
+    ///   [`Instr::RawRaise`](beam_loader::Instr) (`x(1)`/`x(2)` as operands), the
+    ///   `func_info` failed-clause raise;
+    /// * the **BIF door** — `interpreter::bif::raise_error` over the `BeamError` that
+    ///   `ExecutionContext::call_bif`/`call_bif_outcome` returned, whose compound reason
+    ///   rides `Raise::live_reason` (the same opaque slot carries `error/2,3`'s
+    ///   argument list, its `{error_info,Map}` and `erlang:raise/3`'s trace term);
+    /// * [`Machine::raise_supplied`] — C's `raw_raise`, which stores the caught
+    ///   exception's trace object and publishes it as the handler's `x(2)`.
+    ///
+    /// **Soundness — a condition the producer owns, not this method.** The landed word
+    /// is a raw pointer word, so it stays valid only while the region it names does:
+    ///
+    /// 1. A **machine-heap** word (an instruction-level raise, or a BIF result the host
+    ///    copied onto the machine heap) is a root from the landing onward — it sits in
+    ///    `x(1)`/`x(2)`, inside the frozen [`RootSet`](crate::context::RootSet) — so
+    ///    every later collecting allocation relocates it in place. Nothing else in the
+    ///    machine may keep a raw copy of it.
+    /// 2. A word from a **region the host never rewinds or moves** while the machine
+    ///    holds it is equally sound, and is this workspace's shape for a BIF failure's
+    ///    reason graph: `beam_rt` sets its pool-rewind flag only inside its `Ok`-result
+    ///    arm (`beam_rt/src/context/calls.rs`, `call_registered`'s tail), so a failed
+    ///    call leaves its region untouched — `beam_rt/src/context/pool/CONTEXT.md`
+    ///    records the requirement, a raise may carry a live reason term
+    ///    (`beam_common::Raise::live_reason`) that points into that heap — and the word
+    ///    stays at its own address ("leak, never dangle"). An `Ok` container result is
+    ///    copied onto the process's scanned young heap before that rewind, so it
+    ///    arrives here as a machine-heap word (case 1). A literal-area word is stable
+    ///    for the same reason.
+    /// 3. The **one allocating door** the engine itself can run between the seam and
+    ///    this landing is the BIF call site's synthesized head item
+    ///    (`families::exceptions::bif_frame`), and it runs **before** the reason word is
+    ///    read out of the `BeamError`: its reservation relocates only what the frozen
+    ///    root set carries (its own reserve → read → write discipline re-reads every
+    ///    argument afterwards). This method itself crosses no allocating door at all —
+    ///    `unwind_to_frame`/`set_continuation`/`class_atom` are pure and the four
+    ///    `set_x` calls are register writes — which
+    ///    `raise_reason_tests::a_raise_through_the_bif_door_lands_without_crossing_an_allocating_door`
+    ///    pins.
+    ///
+    /// **What a host must not do.** Hand over an unrooted word from a heap it may
+    /// collect, rewind, reuse or move before the machine is done with it — and, in
+    /// particular, treat this landing as a copying boundary that stabilizes a
+    /// transient word for it. A host whose `call_bif` builds a result on a scratch
+    /// region owns re-homing that graph itself (the copy-out requirement); the engine
+    /// neither inspects nor repairs it. A violation is a dangling word read back by the
+    /// handler, never a typed error.
     fn land_exception(
         &mut self,
         class_atom: Eterm,
