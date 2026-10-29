@@ -504,20 +504,37 @@ fn the_append_family_matches_the_generic_walk() {
 // 4. utf8 / utf16 / utf32 and float
 // ---------------------------------------------------------------------------
 
-/// The three UTF segment kinds (and `utf16`/`utf32` little-endian) match the generic walk.
+/// The three UTF segment kinds — every endianness spelling — build the **oracle's
+/// bytes** on both routes.
+///
+/// The expected bytes are the system `erl`'s (OTP 29.1.2 / erts-17.1.1, a little-endian
+/// host) for the same segment; `native` resolves through `flag_bit` to this target's own
+/// order, so on a little-endian host it is `little`'s bytes.
 #[test]
 fn the_utf_family_matches_the_generic_walk() {
-    for (kind, little, value) in [
-        ("utf8", false, 0x41i64),
-        ("utf8", false, 0x20AC),
-        ("utf8", false, 0x1_F600),
-        ("utf16", false, 0x41),
-        ("utf16", true, 0x20AC),
-        ("utf32", false, 0x1_F600),
-        ("utf32", true, 0x1_F600),
-    ] {
-        let names = wide_tests::flag_names(little, false);
-        let module = case_module(&names);
+    let cases: &[(&str, &[&str], i64, &[u8])] = &[
+        ("utf8", &[], 0x41, &[0x41]),
+        ("utf8", &[], 0x20AC, &[0xE2, 0x82, 0xAC]),
+        ("utf8", &[], 0x1_F600, &[0xF0, 0x9F, 0x98, 0x80]),
+        ("utf16", &[], 0x41, &[0x00, 0x41]),
+        ("utf16", &["little"], 0x20AC, &[0xAC, 0x20]),
+        // A surrogate pair: each 16-bit code unit in the field's byte order.
+        ("utf16", &[], 0x1_F600, &[0xD8, 0x3D, 0xDE, 0x00]),
+        ("utf16", &["little"], 0x1_F600, &[0x3D, 0xD8, 0x00, 0xDE]),
+        ("utf16", &["native"], 0x20AC, expected_native(&[0x20, 0xAC], &[0xAC, 0x20])),
+        ("utf32", &[], 0x1_F600, &[0x00, 0x01, 0xF6, 0x00]),
+        ("utf32", &["big"], 0x1234, &[0x00, 0x00, 0x12, 0x34]),
+        ("utf32", &["little"], 0x1_F600, &[0x00, 0xF6, 0x01, 0x00]),
+        ("utf32", &["little"], 0x1234, &[0x34, 0x12, 0x00, 0x00]),
+        (
+            "utf32",
+            &["native"],
+            0x1_F600,
+            expected_native(&[0x00, 0x01, 0xF6, 0x00], &[0x00, 0xF6, 0x01, 0x00]),
+        ),
+    ];
+    for &(kind, names, value, expected) in cases {
+        let module = case_module(names);
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
         let build = |machine: &mut Machine, ctx: &mut MinimalContext, module: &Module| {
@@ -525,8 +542,19 @@ fn the_utf_family_matches_the_generic_walk() {
             seg(module, kind, 1, Operand::Integer(value), Operand::Integer(0))
         };
         let (bytes, nbits) = compare(&module, &mut machine, &mut ctx, &build);
-        assert!(nbits > 0, "{kind}: a code point writes at least one bit");
-        assert_eq!(bytes.len(), nbits.div_ceil(8), "{kind}: the byte count follows");
+        assert_eq!(nbits, expected.len() * 8, "{kind}/{names:?}: the field's bit count");
+        assert_eq!(bytes, expected, "{kind}/{names:?}: the oracle's bytes");
+    }
+}
+
+/// A `native` segment's bytes on **this** target: `big` on a big-endian host, `little`
+/// on this one. Both arms are spelled out so the little-endian expectation is a real
+/// claim rather than the big-endian one repeated.
+fn expected_native<'a>(big: &'a [u8], little: &'a [u8]) -> &'a [u8] {
+    if cfg!(target_endian = "little") {
+        little
+    } else {
+        big
     }
 }
 
