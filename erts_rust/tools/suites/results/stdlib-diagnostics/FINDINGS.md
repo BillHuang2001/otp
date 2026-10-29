@@ -42,7 +42,8 @@ EOF
 | # | smallest expression | oracle | rust | verdict |
 |---|---|---|---|---|
 | **D1** | `lists:foreach(fun(_) -> length(lists:duplicate(200000, x)) end, [1])` | returns `ok` | catchable `error:system_limit`; uncaught → `beam_rt: system_limit`, exit 1 | **still present** (wider: the plain process now fails too) |
-| **D1b** | `spawn_monitor(fun() -> binary_module_SUITE:error_info([]) end)` (`error_info_child_probe`) | `DOWN=normal`, 1370 lines | `DOWN={function_clause,[]}`, 622 lines; **runtime survives**, exit 0 | **changed class** (was: whole-runtime abort `beam_rt: system_limit` exit 1; now: child-level `function_clause`, runtime exits 0) |
+| **D1b** | `spawn_monitor(fun() -> binary_module_SUITE:error_info([]) end)` (`error_info_child_probe`) | `DOWN=normal`, 1370 lines, `main result={ok,ok}` | `DOWN=normal`, 1095 lines, `main result={ok,ok}`; runtime exits 0 | **fixed** (re-measured: the child-level `{function_clause,[]}` this row used to record is gone; only the line count differs) |
+| **D1c** | `error_info_abort_probe:main({prefix, 70})` — the first **70** of `error_info/1`'s 73 entries through `ct_runner:run_case/4`'s shape | `{ok,ok}`, exit 0 | `beam_rt: system_limit` on stderr, **exit 1** (69 entries: `{ok,ok}`, exit 0) | **still present** — this is the suite-path abort; see §D1 below |
 | **D2** | `C = binary:part(<<"z",(binary:copy(<<255>>,1024))/binary>>,1,510), {byte_size(C),binary:referenced_byte_size(C)}` | `{510,2050}` | `{510,510}` | **still present** |
 | **D3** | `erlang:trace(self(),true,[running,{tracer,self()}])` | `1` | `1` | **fixed** |
 | **D3** | set-wise: `trace(…,[running,{tracer,self()}])`, `trace(…,[call])`, `trace_info(self(),flags)` | `1 1 {flags,[running,call]}` | `1 1 {flags,[running,call]}` | **fixed** |
@@ -57,12 +58,13 @@ EOF
 | **D9** | `smallest(Args) -> apply(fun(X) -> X end, Args).` called as `smallest([a])` | `a` | `error:badarg` | **still present** (and wider than recorded) |
 | **D10** | `erts_debug:set_internal_state(available_internal_state,true)`, then `…(unicode_loop_limit,10)` | `false`, then `40000` + the `Process <0.10.0> enabled access …` warning report | `false`, then `beam_rt: unsupported: bif`, exit 3 | **changed class** (was a catchable `unsupported_bif`; now the CLI-level `unsupported` signal) |
 
-Counts: **4 fixed** (D3, D4, D5, D7) · **4 still present** (D1, D2, D8, D9) · **3 changed class**
-(D1b, D6, D10).
+Counts: **5 fixed** (D1b, D3, D4, D5, D7) · **5 still present** (D1, D1c, D2, D8, D9) · **2 changed
+class** (D6, D10). `D1c` is the row this document adds: the suite-level abort the sweep loses 13
+cases to, which is *not* the child-level `function_clause` D1b used to record.
 
 ## Notes per class
 
-### D1 / D1b — the `system_limit` abort
+### D1 / D1b / D1c — the `system_limit` abort
 
 The recorded fix ("need-aware per-depth BIF-region reservation") is **not observable from the
 suites' perspective**: `results/stdlib-diagnostics/bigterm_spawn_probe.erl` still aborts on its very
@@ -87,10 +89,12 @@ cons cells), the raise is a **catchable `error:system_limit`**, and an uncaught 
 runtime with `beam_rt: system_limit` + exit 1 — exactly the recorded signature. It is a plain
 `error`, not a typed capability gap.
 
-The suite-level path moved in the opposite (better) direction: `error_info_child_probe.erl` now
-returns `{ok,ok}` in the main process and lets the runtime exit **0**; only the child dies, with a
-`{function_clause,[]}` after 622 printed lines (oracle: `normal`, 1370 lines). The notes' count
-(`464` lines) does not match either side today, so use the probe's own numbers.
+The suite-level path moved in the opposite (better) direction: `error_info_child_probe.erl` returns
+`{ok,ok}` in the main process and lets the runtime exit **0**, and at the head measured below the
+spawned child *also* finishes (`DOWN=normal`, 1095 printed lines against the oracle's 1370). The
+`{function_clause,[]}` after 622 lines this section used to record no longer reproduces, so the
+child-level defect it described is gone; **the suite-level abort is not** — see §*D1 — the
+suite-path abort* below, which is the abort the sweep still loses 13 cases to.
 
 ### D2 — `binary:referenced_byte_size/1`
 
@@ -225,6 +229,7 @@ so it is recorded here rather than silently worked around.
 | `apply_args_probe.erl` | D9 | the `apply/2` argument-position matrix (each row guarded) |
 | `bigterm_spawn_probe.erl` | D1 | the notes' `lists:duplicate(1 bsl 21, x)` repro 5× plain, 5× in a `spawn_monitor` child, plus a deep-recursion/big-term loop and the `flat_size` threshold |
 | `error_info_child_probe.erl` | D1b | `binary_module_SUITE:error_info([])` in the main process and in a spawned child (needs the staged suite `ebin`) |
+| `error_info_abort_probe.erl` | D1c | `error_info/1`'s entry list through `ct_runner:run_case/4`'s shape: `{prefix, N}` (the 69→70 abort threshold) and `{one, Case}` (one lost case, alone in a fresh process) |
 | `maps_bif_loop_probe.erl` | D8 | `merge_with` / `intersect_with` / `iterator+next` reduced-size workloads, with a checksum and a no-callback control row |
 | `stacktrace_head_probe.erl` | D5 | stacktrace head from **compiled** code for `maps:with/2`, `maps:keys/1`, `maps:get/2`, `lists:reverse/1`, `binary:part/3` |
 | `matrix.sh` | shared | one-expression-per-line runner that prints both sides; used for the D2/D3/D4/D6/D7/D10 one-liners |
@@ -237,3 +242,134 @@ cd $TMPDIR/stdlib-diag/cwd   # a throwaway cwd
 <rt>  -noshell -pa $TMPDIR/stdlib-diag/ebin -eval '<probe>:main(), halt(0).'
 erl   -noshell -pa $TMPDIR/stdlib-diag/ebin -eval '<probe>:main(), halt(0).'
 ```
+
+## D1 — the suite-path abort: smallest reproduction
+
+Measured at branch head `f869e63416d9e8c77c918ee1b3e5728bba916b71` with
+`erts_rust/target/release/beam_rt` built from it (`cargo.sh build -p beam_rt --release`);
+host `loadavg` `16.21 12.66 14.93` (shared: no absolute time below is a claim).
+The staged suite beams are the shared `/tmp/erts-suites-stage/stdlib` ones, unchanged.
+
+**Probe: `error_info_abort_probe.erl`** (new, in this directory). It drives the suite's own
+code through the **same shape as `ct_runner:run_case/4`** — a `spawn_monitor`'d child, a
+`try`/`catch` around the case, and `exit({ct_case_result, Result})` — with two modes:
+`{prefix, N}` (the first `N` of `error_info/1`'s **73**-entry literal list through
+`error_info_lib:test_error_info(binary, Prefix)`) and `{one, Case}` (one named case, alone in a
+fresh OS process).
+
+### 1. It is still the same abort, and it is stable
+
+The harness's own invocation, run by hand (throwaway cwd):
+
+```
+beam_rt -noshell -pa <stage>/ebin -pa <stage>/ctl \
+        -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "<stage>/src"), halt(0).'
+```
+
+→ **exit 1**, stderr exactly `beam_rt: system_limit`, stdout stops after `CASE encode_decode OK`
+plus the first two `error_info` blocks (44 lines; the ~1100 lines the case really prints are lost
+with the port buffer when the runtime exits). Reproduced 2/2 runs at this head, and 6/6 with the
+same shape narrowed to `error_info` alone, so the abort is deterministic **for a given build**.
+
+### 2. Smallest reproduction: an entry-count threshold inside `error_info`
+
+`error_info_abort_probe:main({prefix, N})`, identical argv on both sides:
+
+| N (entries of `error_info`'s list) | oracle | rust |
+|---|---|---|
+| 68 | `{exception,exit,{test_case_failed,…}}`, exit 0 | same, exit 0 |
+| 69 | same, exit 0 | same, exit 0 |
+| **70** | `{ok,ok}`, exit 0 | **`beam_rt: system_limit`, exit 1** |
+| 73 (= `all`) | `{ok,ok}`, exit 0 | **`beam_rt: system_limit`, exit 1** |
+
+(`error_info_lib` fills every BIF the given list does not cover with `nyi` entries, which is why a
+*short* prefix still raises `{test_case_failed,…}` on both sides — that is the probe's control
+row.) The suite path is the N = 73 row. The threshold is **not** the reason term's size: a child
+that exits with `{x, lists:seq(1, 1000000)}` — three orders of magnitude more words — copies fine
+and the parent receives it. Nor is it a single offending entry: dropping any one entry (including
+entry #70, `{matches,[<<1:1>>,{bm,make_ref()}],…}`) leaves the abort in place.
+
+### 3. Which ingredient is load-bearing: the ct shape, not the spawn
+
+Same `binary_module_SUITE:error_info` call, one shape per OS process:
+
+| shape | rust |
+|---|---|
+| main process, plain | `ok`, exit 0 |
+| main process, inside `try/catch` | `ok`, exit 0 |
+| `spawn_monitor` child, plain (`error_info_child_probe`, D1b) | `DOWN=normal`, exit 0 |
+| child, value returned from the fun (no `exit/1`) | `DOWN=normal`, exit 0 |
+| child, `exit({ct_case_result, error_info(… )})` — no `catch` | `{ct_case_result,ok}`, exit 0 |
+| child, `try/catch` + `exit({ct_case_result, R})` where `R` is the **caught** result, `try` in a **called function** (ct_runner's exact shape) | **abort** — `beam_rt: system_limit` (exit 1) or SIGSEGV (exit 139) |
+| child, the same with the `try/catch` **inline** in the fun instead | passed 3/3 at this build |
+
+So the load-bearing ingredients are `spawn` **together with** the `catch`-and-`exit` hand-off: the
+child must *raise out* of itself with the structured result, i.e. the raise's reason has to cross
+the runtime's escape boundary. `error_info` alone in that same shape and in a fresh process
+**passes** (`{ok,ok}` on both sides — see the per-case table in §5), so the case's own logic is not
+the defect. The difference between the last two rows is one function boundary, which is itself the
+signal: the outcome flips with heap layout, and the two failure *manifests* (a refusal and a
+SIGSEGV) come from the same instruction.
+
+### 4. Mechanism: (b) — a failed escape-store copy of the raise's reason, not an escaping
+
+`system_limit`. No `catch` in the program can see it, because the runtime produces it *while
+handling* the raise:
+
+- `BEAM_RT_BOOT_TRACE=1` shows the child's raise last — class `Exit`, `reason: Structured`,
+  `live_reason: Some("<live reason>")` at `d1_variants_probe:normalize/1` (the `exit/1` that
+  `ct_runner`'s `normalize/1` performs) — immediately followed by
+  `round: … result=Err(SystemLimit)` and `call_bif … -> SystemLimit`, then
+  `beam_rt: system_limit`.
+- The stack of that round, from `gdb` on the SIGSEGV manifest of the same program:
+
+  ```
+  #0 beam_term::bitstring::bit_at            (crates/beam_term/src/bitstring.rs:339)
+  #1 beam_message::copy::copy_match_context  (crates/beam_message/src/copy.rs:365)
+  #2 beam_message::copy::try_copy_fast       (copy.rs:537)   ← copy_struct / copy_struct_simple
+  #5 beam_rt::runtime::Runtime::stabilize_term            (src/runtime.rs:2650)
+  #7 beam_rt::runtime::gc::stabilize_error_live_reason    (src/runtime/gc.rs:1034)
+  #8 beam_rt::runner::run                                 (src/runner/run.rs:1718)
+  ```
+
+  i.e. the arm whose comment reads "a reason that genuinely cannot be copied is the honest
+  `error:system_limit`". `crate::error::enforce_term_heap_limit` is the mapping pointed at by
+  `Runtime::stabilize_term`, and it turns **only** `AllocKind::Heap` (or message-heap exhaustion)
+  into `SystemLimit`; `beam_rt::cli`'s `EXIT_RUNTIME` (= 1) is what the shell then sees.
+- `copy_match_context` takes its bit count from `ErlSubBits`'s `start`/`end` words and dereferences
+  the **base pointer stored in the term** (`bitstring_parts`/`bit_at`) with no owning handle to
+  validate it — because the copy ran on the **empty**-source-table path (`stabilize_term`, not
+  `stabilize_term_with`: `src.is_empty()` in `Runtime::stabilize_term_with` short-circuits to it).
+  Garbage there yields an impossible window size (→ the destination reservation is refused → the
+  `system_limit` above) or an unmapped page (→ the SIGSEGV at the same instruction). Which payload
+  inside the reason is dead is **unknown** from the outside; what is established is that the reader
+  is unsound on that path, not that the term is genuinely too large.
+
+### 5. The 13 cases the sweep reports as `error` — each measured alone
+
+`error_info_abort_probe:main({one, Case})`, one process per row, both sides:
+
+| case | rust | oracle | would record as |
+|---|---|---|---|
+| `error_info` | `{ok,ok}` | `{ok,ok}` | **agree** |
+| `guard` | `{ok,{comment,"…"}}` | same | agree |
+| `hex_encoding` | `{ok,ok}` | `{ok,ok}` | agree |
+| `interesting` | `{case_exception,error,{badmatch,false},…}` | identical | agree-fail-identical |
+| `join` | `{ok,<<>>}` | same | agree |
+| `list_to_bin` | `{ok,ok}` | `{ok,ok}` | agree |
+| `longest_common_trap` | `{case_exception,error,unsupported_bif,{erts_debug,set_internal_state,[binary_loop_limit,10],[]}}` | `{ok,ok}` | rust-gap (typed) |
+| `parts` | `{ok,ok}` | `{ok,ok}` | agree |
+| `random_ref_comp` | **timeout** (60 s budget; log reached `Number of successes: 5287`) | `{ok,ok}` | rust-gap (too slow) |
+| `random_ref_fla_comp` | `{ok,ok}` | `{ok,ok}` | agree |
+| `random_ref_sr_comp` | **timeout** (60 s; `Number of successes: 7500`) | `{ok,ok}` | rust-gap (too slow) |
+| `referenced` | `{case_exception,error,{badmatch,1023},…}` | `{ok,ok}` | **divergence** (D2, `binary:referenced_byte_size/1`) |
+| `scope_return` | `{ok,ok}` | `{ok,ok}` | agree |
+
+Nine of the thirteen are measurable today and eight of those agree (the ninth, `interesting`, fails
+identically on both sides); the losses that remain are one typed gap, one D2 divergence and two
+cases too slow to finish (the sweep's own per-case budget is 10 s, so those two were never
+measurable *in the sweep* either — `random_ref_fla_comp` finishing in the same run shows the
+timeouts are workload cost, not a hang). So the report's "case missing from the rust runtime's
+output" is a property of **running the suite in one process**, not of the cases: the abort takes
+the process down at `error_info` and every later case loses its turn.
+
