@@ -47,8 +47,127 @@
 //! Case 3 pins the structured `error:{badmap, MapOrIter}` contract: an argument that is
 //! neither a map nor a walkable iterator is reported against the **original** argument,
 //! while a bad *fun* stays the plain `error:badarg`.
+//!
+//! # Why the map no-op *identity* is only pinnable from compiled code
+//!
+//! An update that changes nothing — `M#{a => 1}` where `M` already holds `a => 1`, or the
+//! exact form `M#{a := 1}` — must hand back the **source map's own term**, not an equal
+//! copy: `erts_debug:same/2` (raw `Eterm` word equality) answers `true` for it, while two
+//! value-equal maps that were built separately answer `false`. That identity is the one
+//! observable the writers can silently lose (a fresh map is still `=:=`-equal, so nothing
+//! else notices), which is exactly why it needs a case.
+//!
+//! It cannot be pinned through a BIF: a registered BIF's result is deep-copied into the
+//! caller's heap, so `erts_debug:same(maps:put(a, 1, M), M)` is `false` here and `true` on
+//! the oracle no matter how correct `maps:put/3` is (`divergences.md` §A.7 — the same reason
+//! the `maps`-result identity has no case at all). The pinnable shape is therefore the
+//! **compiled map-update syntax inside real bytecode**, and a `CaseKind::Module` case is the
+//! only route that gives *both* sides that: a `.beam` built by `erlc` and executed by an
+//! engine. A `-eval` `spawn(fun() -> … end)` would not do — the oracle *interprets* a fun
+//! created in `-eval` (`erl_eval`), and the `-eval` evaluator does not even accept the
+//! `M#{…}` update syntax, so neither side would run a compiled update.
+//!
+//! A module-run golden is an integer line, so each function reduces its ordered row list to
+//! a **bit mask** (`mask/1`: most significant bit = first row, `1` = a `true` row). The two
+//! cases are `maps/no_op_update_keeps_identity` (flat + 40-key HAMT, with changing rows that
+//! must answer `false`) and
+//! `maps/no_op_update_identity_at_the_map_boundaries` (the flat↔HAMT size boundary, mixed
+//! key types, a two-level no-op chain, and an equal-but-freshly-built value). The goldens are
+//! the oracle's own measured masks (`erl` 29.1.2 / erts-17.1.1).
 
-use super::{Case, CaseKind, Contract, Golden, Probe};
+use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
+
+/// The module both runtimes execute for the compiled map-update **no-op identity** cases.
+///
+/// Every exported function is arity 0 and returns the bit mask of its ordered row list
+/// (`mask/1`: most significant bit = the first row, `1` = a row that answered `true`). The
+/// updates run as **real lowered map opcodes** because this source is `erlc`-compiled and
+/// executed by an engine on both sides — not `-eval`-interpreted (see the module doc).
+const MAP_IDENTITY_SOURCE: &str = "-module(diff_maps_ident).\n\
+     -export([noop/0, boundary/0]).\n\
+     \n\
+     noop() ->\n\
+     \x20   M1 = #{a => 1},\n\
+     \x20   Flat = #{a => 1, b => 2},\n\
+     \x20   Big = maps:from_list([{I, I} || I <- lists:seq(1, 40)]),\n\
+     \x20   Rows = [erts_debug:same(M1#{a => 1}, M1),\n\
+     \x20           erts_debug:same(Flat#{a => 1}, Flat),\n\
+     \x20           erts_debug:same(Flat#{a := 1}, Flat),\n\
+     \x20           exact_retrieval(Flat),\n\
+     \x20           erts_debug:same(Big#{1 => 1}, Big),\n\
+     \x20           erts_debug:same(Big#{10 => 10}, Big),\n\
+     \x20           erts_debug:same(Big#{40 => 40}, Big),\n\
+     \x20           erts_debug:same(Big#{10 := 10}, Big),\n\
+     \x20           erts_debug:same(Flat, Flat),\n\
+     \x20           erts_debug:same(Flat#{a => 2}, Flat),\n\
+     \x20           erts_debug:same(Flat#{a := 2}, Flat),\n\
+     \x20           erts_debug:same(Flat#{zz => 9}, Flat),\n\
+     \x20           erts_debug:same(Big#{10 => 99}, Big),\n\
+     \x20           erts_debug:same(maps:from_list(maps:to_list(Flat)), Flat)],\n\
+     \x20   mask(Rows).\n\
+     \n\
+     boundary() ->\n\
+     \x20   B32 = maps:from_list([{I, I} || I <- lists:seq(1, 32)]),\n\
+     \x20   B33 = maps:from_list([{I, I} || I <- lists:seq(1, 33)]),\n\
+     \x20   B64 = maps:from_list([{I, I} || I <- lists:seq(1, 64)]),\n\
+     \x20   Mixed = #{1 => a, 2.0 => b, <<\"k\">> => c, {t, 1} => d, [] => e, \"li\" => f},\n\
+     \x20   Inner = #{a => 1},\n\
+     \x20   Nested = #{k => Inner, b => 2},\n\
+     \x20   Empty = #{},\n\
+     \x20   L = #{k => [1], j => 2},\n\
+     \x20   Upd = L#{k => lists:seq(1, 1)},\n\
+     \x20   Rows = [erts_debug:same(B32#{16 => 16}, B32),\n\
+     \x20           erts_debug:same(B32#{16 := 16}, B32),\n\
+     \x20           erts_debug:same(B33#{16 => 16}, B33),\n\
+     \x20           erts_debug:same(B33#{33 := 33}, B33),\n\
+     \x20           erts_debug:same(B64#{32 => 32}, B64),\n\
+     \x20           erts_debug:same(B64#{64 := 64}, B64),\n\
+     \x20           erts_debug:same(Mixed#{2.0 => b}, Mixed),\n\
+     \x20           erts_debug:same(Mixed#{<<\"k\">> := c}, Mixed),\n\
+     \x20           erts_debug:same(Nested#{k => Inner#{a => 1}}, Nested),\n\
+     \x20           erts_debug:same(Empty#{}, Empty),\n\
+     \x20           erts_debug:same(Upd, L),\n\
+     \x20           Upd =:= L,\n\
+     \x20           erts_debug:same(B33#{34 => 34}, B33),\n\
+     \x20           erts_debug:same(B64#{1 := 2}, B64),\n\
+     \x20           erts_debug:same(Empty#{a => 1}, Empty)],\n\
+     \x20   mask(Rows).\n\
+     \n\
+     exact_retrieval(#{a := 1}) -> true;\n\
+     exact_retrieval(_) -> false.\n\
+     \n\
+     mask(Bs) ->\n\
+     \x20   lists:foldl(fun(B, Acc) -> (Acc bsl 1) bor bit(B) end, 0, Bs).\n\
+     \n\
+     bit(true) -> 1;\n\
+     bit(false) -> 0.";
+
+/// Build one arity-0 module-run case over [`MAP_IDENTITY_SOURCE`]; `golden` is the oracle's
+/// own `~w` rendering of the returned bit mask.
+fn identity_case(
+    id: &'static str,
+    description: &'static str,
+    function: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::BeamAsm, Contract::LanguageSemantics],
+        kind: CaseKind::Module(ModuleRun {
+            source: MAP_IDENTITY_SOURCE,
+            module: "diff_maps_ident",
+            function,
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
 
 /// The A.7 `maps` fun-taking `MapOrIter` cases.
 pub(crate) fn group() -> Vec<Case> {
@@ -199,5 +318,37 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- A.1/A.2: the compiled map-update no-op identity (see the module doc) ----------
+        //
+        // Rows of `noop/0`, most significant bit first (all must be `true` except the five
+        // rows that must answer `false`): a 1-key and a 2-key flat map's `M#{a => 1}`, the
+        // exact `M#{a := 1}`, the exact *retrieval* pattern `#{a := 1} = M`, the 40-key HAMT's
+        // first/interior/last key and its exact form, `same(M, M)` — then the changing rows
+        // `M#{a => 2}`, `M#{a := 2}`, `M#{zz => 9}` (a new key), the HAMT's `M#{10 => 99}` and
+        // a value-equal rebuild `maps:from_list(maps:to_list(M))`, which must all answer
+        // `false`. The oracle's mask is `0b11111111100000` = 16352.
+        identity_case(
+            "maps/no_op_update_keeps_identity",
+            "a compiled map update that changes nothing (assoc and exact, flat and 40-key \
+             HAMT) returns the source map's own term, while every changing update returns a \
+             new one",
+            "noop",
+            "16352",
+        ),
+        // Rows of `boundary/0`, most significant bit first: the 32-key (last flat size) and
+        // 33-key (first HAMT size) maps' assoc and exact no-ops, a 64-key HAMT's, the mixed
+        // float/binary/tuple/list-keyed map's, a two-level `Nested#{k => Inner#{a => 1}}` chain
+        // (the inner no-op hands the outer one an identical value) and the empty `#{}` no-op —
+        // then `same(Upd, L)` on an equal-but-freshly-built value (`false`), the same pair's
+        // `=:=` (`true`), and the three changing rows (`false`). The oracle's mask is
+        // `0b111111111101000` = 32744.
+        identity_case(
+            "maps/no_op_update_identity_at_the_map_boundaries",
+            "the no-op identity holds across the 32/33-key flat↔HAMT boundary, a 64-key HAMT, \
+             mixed key types, a two-level no-op chain and the empty map, while an \
+             equal-but-freshly-built value is a different term",
+            "boundary",
+            "32744",
+        ),
     ]
 }
