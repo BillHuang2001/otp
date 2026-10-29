@@ -240,7 +240,7 @@ Every `src/*.rs` file is a routing node; its item list is the module section abo
 - `src/bitstring.rs` → `ErlHeapBits`/`ErlSubBits` writers+readers, `bitstring_parts`/`bit_at`, the float readers
 - `src/refc.rs` → off-heap (`refc`) binaries (the `BinRef`+`ErlSubBits` pair, the on-heap limits)
 - `src/error.rs` → `TermError`/`TermResult` + the `From<TermError> for BeamError` interop impl
-- `tests/` → the public-surface suites, allocation pins and live-`erl` cross-checks (child node, 22 files — `tests/CONTEXT.md`)
+- `tests/` → the public-surface suites, allocation pins and live-`erl` cross-checks (child node, 23 files — `tests/CONTEXT.md`)
 - `examples/` → the measurement binaries (child node — `examples/CONTEXT.md`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
