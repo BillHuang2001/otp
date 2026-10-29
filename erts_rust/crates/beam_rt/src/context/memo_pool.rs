@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn the_pool_is_bounded() {
         let pool = MemoPool::default();
-        let mut slots: Vec<MemoSlot> = (0..MEMO_POOL_DEPTH * 2)
+        let slots: Vec<MemoSlot> = (0..MEMO_POOL_DEPTH * 2)
             .map(|_| {
                 let mut slot = pool.slot();
                 // Materialize a memo through the `DerefMut` half, so every slot has one to give
