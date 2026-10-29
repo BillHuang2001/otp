@@ -61,15 +61,33 @@
 //! therefore the oracle's own observable behaviour, not an approximation, and it keeps this
 //! module `unsafe`-free (`posix_fadvise` is not reachable from `std`).
 //!
+//! # The descriptor argument: the oracle's decomposition, reproduced
+//!
+//! `advise/4` is `try #{handle := FRef} = get_fd_data(Fd), advise_nif(FRef, Offset, Length,
+//! Advise) catch error:badarg -> {error, badarg} end` (`prim_file.erl:274-280`) over
+//! `get_fd_data(#file_descriptor{data = Data}) -> #{owner := Owner} = Data, case self() of
+//! Owner -> Data; _ -> error(not_on_controlling_process) end` (`:499-504`), so the malformed
+//! shapes are raises the wrapper's `catch error:badarg` does **not** take. Measured on the
+//! host oracle (OTP 29.1.2 / erts-17.1.1), `prim_file:advise(Fd, 0, 10, normal)` with:
+//!
+//! * `42`, `foo`, `[]`, `#{}`, `{a,b}`, a 4-tuple, `{nope,prim_file,#{}}` ⇒
+//!   `error:function_clause` — the **clause head** of `get_fd_data/1` fails before any body
+//!   runs, so nothing is caught;
+//! * `{file_descriptor,prim_file,nope}`, `{file_descriptor,prim_file,#{}}`, and a live
+//!   descriptor's data map with `owner` (or `handle`) removed ⇒ `error:{badmatch, Data}`
+//!   (the `#{owner := Owner} = Data` match, then the wrapper's own `#{handle := FRef} = …`);
+//! * `{file_descriptor,prim_file,#{owner => self(), handle => make_ref()}}` ⇒ the value
+//!   `{error,badarg}`: `enif_get_resource` fails on the forged handle and the wrapper catches
+//!   that `badarg`.
+//!
+//! [`RuntimeContext::prim_advise`] reproduces that order exactly ([`RuntimeContext::
+//! advise_descriptor`]), so a program's `try … catch C:R:S` observes the oracle's own
+//! `(class, reason)` on every one of them. The **other** `prim_file` entries still answer the
+//! uniform `{error,badarg}` value for the first two families — that divergence is theirs
+//! (`../prim_file.rs` § "Documented divergences"), not this module's.
+//!
 //! # Documented divergences
 //!
-//! * **A term that is not a `#file_descriptor{}` is the value `{error,badarg}`.** The oracle
-//!   raises `function_clause` out of `get_fd_data/1` (measured: `advise(42,0,10,normal)`,
-//!   `advise(foo,…)` and `advise([],…)` all `{'EXIT',{function_clause,[{prim_file,
-//!   get_fd_data,"*",[]}, …]}}`, and a `Data` map without `owner` raises `{badmatch,…}`); this
-//!   runtime answers the single `{error,badarg}` value for all of them, which is the
-//!   uniform malformed-descriptor divergence of the whole `prim_file` floor
-//!   (`../prim_file.rs` § "Documented divergences").
 //! * **A closed descriptor is `{error,einval}`, NOT `{error,badarg}`.** `file_handle_wrapper`
 //!   tests the `efile` resource's state *before* it calls the operation: a resource in
 //!   `EFILE_STATE_CLOSED` answers `posix_error_to_tuple(env, EINVAL)` without reaching
@@ -112,19 +130,28 @@
 //! | `advise(Fd,0,10,foo)` / `advise(Fd,0,10,{normal})` / `advise(Fd,0,10,1)` / `advise(Fd,0,10,[])` | `{error,einval}` |
 //! | a `[read,directory]` fd / a `[read,write]` fd | `ok` |
 //! | after `close(Fd)`: `advise(Fd,0,10,normal)` / `advise(Fd,foo,10,normal)` / `advise(Fd,0,10,foo)` | `{error,einval}` |
-//! | `advise(42,0,10,normal)` / `advise(foo,…)` / `advise([],…)` | `{'EXIT',{function_clause,[{prim_file,get_fd_data,"*",[]},…]}}` |
-//! | `advise(#{},…)` / `advise(#{handle=>H},…)` / `advise(#{handle=>H,owner=>Other},…)` | a raise (`{badmatch,…}` / `not_on_controlling_process`) |
+//! | `advise(42,…)` / `advise(foo,…)` / `advise([],…)` / `advise(#{},…)` / `advise({a,b},…)` | `error:function_clause` (the `get_fd_data/1` clause head) |
+//! | `advise({file_descriptor,prim_file,nope},…)` / an empty data map / a live data map minus `owner` (or `handle`) | `error:{badmatch, Data}` |
+//! | `advise({file_descriptor,prim_file,#{owner=>self(),handle=>make_ref()}},…)` | `{error,badarg}` (the forged handle's `enif_get_resource` failure) |
 //! | an fd opened by **another** process | that process dies `{not_on_controlling_process,[{prim_file,get_fd_data,1,[]},{prim_file,advise,4,[]},…]}` |
 //!
 //! The stub itself is unobservable on the oracle (`prim_file:advise_nif/4` from outside is
 //! `{'EXIT',{undef,…}}` — it is not exported), so its matrix is the C's (`:859-887`) plus the
 //! wrapper's catch, which is what the two keys below implement.
 
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExitReason, LiveReason, Raise, Result};
+use beam_engine::terms;
 use beam_term::Eterm;
 
-use super::{number_arg, NumArg};
+use super::{number_arg, Descriptor, NumArg};
 use crate::context::RuntimeContext;
+use crate::error;
+use crate::native::prim::function_clause;
+
+/// The `#file_descriptor{}` record's tag atom (`prim_file.erl`'s
+/// `-record(file_descriptor, {module = ?MODULE, data})`), which the clause head of
+/// `get_fd_data/1` matches before its body runs.
+const FILE_DESCRIPTOR_TAG: &str = "file_descriptor";
 
 /// Every `{function, arity}` of `prim_file`'s **non-exported** NIF stubs this floor serves —
 /// the ONE source of truth behind [`serves_local_call`].
@@ -208,32 +235,48 @@ fn bignum_value(term: Eterm) -> Option<i64> {
 
 impl RuntimeContext<'_> {
     /// `prim_file:advise/4` — the exported wrapper's key, served directly by the floor
-    /// (`prim_file.erl:274-280`), answering the **post-`catch`** value.
+    /// (`prim_file.erl:274-280`), answering what the wrapper's `try … catch` answers.
     ///
     /// The wrapper is `try #{handle := FRef} = get_fd_data(Fd), advise_nif(FRef, Offset,
-    /// Length, Advise) catch error:badarg -> {error, badarg} end`, so:
+    /// Length, Advise) catch error:badarg -> {error, badarg} end` over
+    /// `get_fd_data(#file_descriptor{data = Data}) -> #{owner := Owner} = Data, case self() of
+    /// Owner -> Data; _ -> error(not_on_controlling_process) end` (`:499-504`), and the
+    /// argument is decomposed in exactly the order that Erlang evaluates it
+    /// ([`Self::advise_descriptor`]), so:
     ///
-    /// 1. a term that is not a `#file_descriptor{}` is the value `{error,badarg}` (the
-    ///    documented uniform malformed-descriptor divergence — the oracle raises
-    ///    `function_clause`);
-    /// 2. the recorded `owner` must be the caller, else the **raise**
+    /// 1. a term that is not a `#file_descriptor{}` fails the **clause head** of
+    ///    `get_fd_data/1` ⇒ the uncaught raise `error:function_clause` (the wrapper's
+    ///    `catch error:badarg` does not take it) — measured on the host oracle for `42`, `foo`,
+    ///    `[]`, `#{}`, `{a,b}`, a 4-tuple and `{nope,prim_file,#{}}`;
+    /// 2. a `#file_descriptor{}` whose `data` is not a map, or carries no `owner` ⇒ the
+    ///    `#{owner := Owner} = Data` **badmatch** ⇒ `error:{badmatch, Data}`, with the data
+    ///    term as the live reason;
+    /// 3. the recorded `owner` must be the caller, else the **raise**
     ///    `error:not_on_controlling_process` — `get_fd_data/1`'s own `error/1`
     ///    (`prim_file.erl:499-504`), which the wrapper's `catch error:badarg` does **not**
-    ///    catch, so it must stay a raise here too;
-    /// 3. a descriptor whose slot left the open-file table (a **closed** one) is
+    ///    catch either, so it must stay a raise here too;
+    /// 4. a `data` map carrying no `handle` ⇒ the wrapper's own `#{handle := FRef} = …`
+    ///    badmatch ⇒ `error:{badmatch, Data}`;
+    /// 5. a well-shaped descriptor whose handle is **not** one of this runtime's — a forged
+    ///    `#{owner => self(), handle => make_ref()}` — is the value `{error,badarg}`: the C's
+    ///    `enif_get_resource` fails on it and the wrapper catches that `badarg` (measured: the
+    ///    oracle answers exactly that value);
+    /// 6. a descriptor whose slot left the open-file table (a **closed** one) is
     ///    `{error,einval}`: the resource-state check precedes the operation
     ///    (`prim_file_nif.c:343-347`), measured on the oracle. This is the one entry where a
     ///    closed answer is worth stating explicitly, because the *next* check is the one that
     ///    would otherwise make it a `badarg`;
-    /// 4. then the C's matrix: a non-number `Offset`/`Length` ⇒ the value `{error,badarg}`
+    /// 7. then the C's matrix: a non-number `Offset`/`Length` ⇒ the value `{error,badarg}`
     ///    (the wrapper's catch of the NIF's `badarg` raise), a float / a bignum outside the
     ///    `int64` range / a negative ⇒ `{error,einval}`, an advise atom outside the six
     ///    ⇒ `{error,einval}` (a **fitting** bignum is a value to the C's `enif_get_int64`, so it
     ///    is `ok` — measured, and handled by [`advise_number`]);
-    /// 5. a valid triple ⇒ the atom `ok`.
+    /// 8. a valid triple ⇒ the atom `ok`.
     ///
     /// # Errors
     ///
+    /// `error:function_clause` for a non-`#file_descriptor{}` argument,
+    /// `error:{badmatch, Data}` for a descriptor whose data map lacks `owner`/`handle`,
     /// `error:not_on_controlling_process` for a descriptor another process opened, and
     /// [`BeamError::BadArg`] for a missing operand (unreachable through the dispatch, which
     /// passes `arity` arguments).
@@ -242,10 +285,11 @@ impl RuntimeContext<'_> {
         let offset = *args.get(1).ok_or(BeamError::BadArg)?;
         let length = *args.get(2).ok_or(BeamError::BadArg)?;
         let advise = *args.get(3).ok_or(BeamError::BadArg)?;
-        let Some(descriptor) = self.decode_descriptor(fd) else {
+        let Some(descriptor) = self.advise_descriptor(fd)? else {
+            // The handle names no descriptor of this runtime: the C's `enif_get_resource`
+            // failure, which the wrapper catches into the value.
             return self.error_tuple("badarg");
         };
-        self.check_owner(&descriptor)?;
         // The C's `file_handle_wrapper` state test, which runs **before** the operation and so
         // also precedes every argument check (`prim_file_nif.c:343-347`).
         if !self.runtime.open_files_mut().contains_key(&descriptor.id) {
@@ -257,6 +301,89 @@ impl RuntimeContext<'_> {
             // The NIF's `enif_make_badarg`, caught by the wrapper.
             AdviseOutcome::BadArg => self.error_tuple("badarg"),
         }
+    }
+
+    /// The descriptor argument decomposed the way `prim_file:advise/4` decomposes it — the
+    /// ordered checks of [`Self::prim_advise`]'s doc — with the oracle's own raises.
+    ///
+    /// `Ok(Some(_))` is a descriptor this runtime can act on; `Ok(None)` is a well-shaped
+    /// `#file_descriptor{}` whose handle is not one of ours — the C's `enif_get_resource`
+    /// failure, which the caller answers as the value `{error,badarg}`.
+    ///
+    /// The order is observable and therefore load-bearing: the owner test lives in
+    /// `get_fd_data/1`'s **body** while the `handle` match is the wrapper's own
+    /// (`prim_file.erl:276`), so a descriptor that is both another process's and handle-less
+    /// raises `not_on_controlling_process`, not `{badmatch, Data}`.
+    fn advise_descriptor(&mut self, fd: Eterm) -> Result<Option<Descriptor>> {
+        // 1. `get_fd_data(#file_descriptor{data = Data})`'s **clause head**: a 3-tuple whose
+        //    first element is the record's tag atom. Anything else never runs a body, so the
+        //    raise is the bare `error:function_clause` (with no reason term to carry).
+        let data = match (
+            terms::tuple_arity(fd),
+            terms::tuple_element(fd, 0),
+            terms::tuple_element(fd, 2),
+        ) {
+            (Ok(3), Ok(tag), Ok(data))
+                if self.atom_name(tag).as_deref() == Some(FILE_DESCRIPTOR_TAG) =>
+            {
+                data
+            }
+            _ => return Err(function_clause()),
+        };
+        // 2. `#{owner := Owner} = Data` (`prim_file.erl:500`): a non-map, or a map without
+        //    `owner`, is that match's failure.
+        let entries = match terms::map_entries(data) {
+            Ok(entries) => entries,
+            Err(_) => return Err(self.badmatch(data)),
+        };
+        let mut owner = None;
+        let mut has_handle = false;
+        for (key, value) in entries {
+            match self.atom_name(key).as_deref() {
+                Some("owner") => owner = Some(value),
+                Some("handle") => has_handle = true,
+                _ => {}
+            }
+        }
+        let Some(owner) = owner else {
+            return Err(self.badmatch(data));
+        };
+        // 3. `case self() of Owner -> Data; _ -> error(not_on_controlling_process) end` — the
+        //    comparison `super::RuntimeContext::check_owner` makes, taken from the map's own
+        //    `owner` because that helper wants a decoded descriptor this ordered decomposition
+        //    does not have yet.
+        if owner != self.pid().to_eterm() {
+            return Err(error::message("not_on_controlling_process"));
+        }
+        // 4. the wrapper's `#{handle := FRef} = get_fd_data(Fd)` (`prim_file.erl:276`).
+        if !has_handle {
+            return Err(self.badmatch(data));
+        }
+        // 5. the C's `enif_get_resource`: only a descriptor this runtime built carries its
+        //    private registry key, so anything else is a handle that names no open file.
+        Ok(self.decode_descriptor(fd))
+    }
+
+    /// The `error:{badmatch, Data}` raise `get_fd_data/1`'s `#{owner := Owner} = Data`
+    /// (`prim_file.erl:500`) and the wrapper's `#{handle := FRef} = …` (`:276`) produce, with
+    /// the data term attached to the live-reason slot — the same shape [`crate::native`]'s
+    /// `erts_internal` `{badmap, Term}` uses.
+    fn badmatch(&mut self, data: Eterm) -> BeamError {
+        let reason = match self.badmatch_reason(data) {
+            Ok(reason) => reason,
+            // A heap that cannot hold the two-word reason is a typed error, never a bare
+            // `badmatch` with the wrong (atom-only) reason.
+            Err(error) => return error,
+        };
+        BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(reason)),
+        )
+    }
+
+    /// The `{badmatch, Data}` reason term, built on the context's own heap.
+    fn badmatch_reason(&mut self, data: Eterm) -> Result<Eterm> {
+        let tag = self.atom("badmatch")?;
+        terms::make_tuple(self, &[tag, data])
     }
 
     /// `prim_file:advise_nif/4` — the **non-exported** NIF stub (`prim_file.erl:547-548`),
@@ -650,50 +777,217 @@ mod tests {
         );
     }
 
-    /// Oracle: `advise(42,0,10,normal)`/`advise(foo,…)`/`advise([],…)` raise
-    /// `function_clause` out of `get_fd_data/1`, and `#{}`/`#{handle=>_}`/
-    /// `#{handle=>_,owner=>Other}` raise too; this runtime answers the uniform
-    /// `{error,badarg}` value (`prim_file.rs` § "Documented divergences").
+    /// Oracle: `advise(42,…)` / `advise(foo,…)` / `advise([],…)` / `advise(#{},…)` /
+    /// `advise({a,b},…)` / a 4-tuple / `advise({nope,prim_file,#{}},…)` all **raise**
+    /// `error:function_clause` — the clause head of `get_fd_data/1` fails before any body runs,
+    /// so the wrapper's `catch error:badarg` never sees it. Measured on OTP 29.1.2.
     #[test]
-    fn a_term_that_is_not_a_descriptor_is_the_badarg_value() {
+    fn a_term_that_is_not_a_descriptor_raises_function_clause() {
         let mut runtime = runtime();
         let zero = beam_term::make_small(0);
         let ten = beam_term::make_small(10);
         let normal = atom(&mut runtime, "normal");
 
-        let not_a_descriptor = beam_term::make_small(42);
-        assert_eq!(
-            advise_error(&mut runtime, &[not_a_descriptor, zero, ten, normal]),
-            "badarg"
-        );
-        let foo = atom(&mut runtime, "foo");
-        assert_eq!(
-            advise_error(&mut runtime, &[foo, zero, ten, normal]),
-            "badarg"
-        );
-        let nil = list(&mut runtime, &[]);
-        assert_eq!(
-            advise_error(&mut runtime, &[nil, zero, ten, normal]),
-            "badarg"
-        );
-        // A map is not a descriptor at all, and a `{file_descriptor,prim_file,Map}` whose map
-        // lacks the runtime's own registry key is malformed for this floor.
         let empty_map = heap_term(&mut runtime, |context| {
             let atoms = context.runtime.code_server.atoms_handle();
             terms::make_map(context, &[], &atoms)
         });
-        assert_eq!(
-            advise_error(&mut runtime, &[empty_map, zero, ten, normal]),
-            "badarg"
-        );
         let tag = atom(&mut runtime, "file_descriptor");
         let module = atom(&mut runtime, "prim_file");
-        let half_descriptor =
-            heap_term(&mut runtime, |context| terms::make_tuple(context, &[tag, module, empty_map]));
+        let wrong_tag = atom(&mut runtime, "nope");
+        let pair = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[tag, module])
+        });
+        let five = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[tag, module, empty_map, empty_map, empty_map])
+        });
+        let wrong_tagged = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[wrong_tag, module, empty_map])
+        });
+
+        for term in [
+            beam_term::make_small(42),
+            atom(&mut runtime, "foo"),
+            list(&mut runtime, &[]),
+            empty_map,
+            pair,
+            five,
+            wrong_tagged,
+        ] {
+            let raised = call_advise(&mut runtime, &[term, zero, ten, normal])
+                .expect_err("not a descriptor is the clause head's failure");
+            assert_function_clause(&raised);
+        }
+    }
+
+    /// Oracle: `advise({file_descriptor,prim_file,nope},…)`, `advise({file_descriptor,
+    /// prim_file,#{}},…)`, `advise({file_descriptor,prim_file,#{owner=>self()}},…)` and a
+    /// **live** descriptor's data map with `owner` (or `handle`) removed each raise
+    /// `error:{badmatch, Data}` — `get_fd_data/1`'s `#{owner := Owner} = Data`
+    /// (`prim_file.erl:500`), then the wrapper's own `#{handle := FRef} = …` (`:276`) — with
+    /// the data term itself as the reason's second element. Measured on OTP 29.1.2.
+    #[test]
+    fn a_descriptor_whose_data_map_lacks_owner_or_handle_raises_badmatch() {
+        let mut runtime = runtime();
+        let zero = beam_term::make_small(0);
+        let ten = beam_term::make_small(10);
+        let normal = atom(&mut runtime, "normal");
+        let dir = advise_file("advise_badmatch");
+        let fd = open_read(&mut runtime, dir.path(), "x.txt");
+        let tag = element(fd, 0);
+        let module = element(fd, 1);
+        let nope = atom(&mut runtime, "nope");
+        let empty_map = heap_term(&mut runtime, |context| {
+            let atoms = context.runtime.code_server.atoms_handle();
+            terms::make_map(context, &[], &atoms)
+        });
+
+        // `data` is not a map at all: the `#{owner := Owner} = Data` match.
+        let not_a_map = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[tag, module, nope])
+        });
+        let raised = call_advise(&mut runtime, &[not_a_map, zero, ten, normal])
+            .expect_err("a non-map data is the owner match's failure");
+        assert_eq!(assert_badmatch(&runtime, &raised), nope);
+
+        // A map with no `owner` entry.
+        let empty_descriptor = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[tag, module, empty_map])
+        });
+        let raised = call_advise(&mut runtime, &[empty_descriptor, zero, ten, normal])
+            .expect_err("a data map without owner is the owner match's failure");
+        assert_eq!(assert_badmatch(&runtime, &raised), empty_map);
+
+        // The owner match passes (`owner => self()`), the wrapper's handle match does not.
+        let owner = owner_of(&runtime, fd);
+        let owner_only = descriptor_data_map(&mut runtime, &[(owner, "owner")]);
+        let raised = call_advise(&mut runtime, &[owner_only, zero, ten, normal])
+            .expect_err("a data map without handle is the wrapper's match failure");
+        let payload = assert_badmatch(&runtime, &raised);
+        assert!(has_entry(&runtime, payload, "owner"));
+        assert!(!has_entry(&runtime, payload, "handle"));
+
+        // A **live** descriptor's own data map with one required entry removed: the raise reads
+        // the map the caller passed, the runtime's registry key included.
+        let data = super::super::descriptor_data(fd).expect("a well-shaped descriptor");
+        let data_len = terms::map_entries(data).expect("a map").len();
+        for dropped in ["owner", "handle"] {
+            let entries: Vec<(Eterm, Eterm)> = terms::map_entries(data)
+                .expect("a map")
+                .into_iter()
+                .filter(|(key, _)| runtime.atom_name_of(*key) != Some(dropped))
+                .collect();
+            let descriptor = heap_term(&mut runtime, |context| {
+                let atoms = context.runtime.code_server.atoms_handle();
+                let map = terms::make_map(context, &entries, &atoms)?;
+                terms::make_tuple(context, &[tag, module, map])
+            });
+            let raised = call_advise(&mut runtime, &[descriptor, zero, ten, normal])
+                .expect_err("a live data map minus a required entry raises");
+            let payload = assert_badmatch(&runtime, &raised);
+            assert!(!has_entry(&runtime, payload, dropped), "{dropped}");
+            assert_eq!(
+                terms::map_entries(payload).expect("a map").len(),
+                data_len - 1
+            );
+        }
+    }
+
+    /// Oracle: a well-shaped `#file_descriptor{}` whose `handle` is not one of this runtime's —
+    /// the forged `{file_descriptor,prim_file,#{owner => self(), handle => make_ref()}}` — is
+    /// the **value** `{error,badarg}`: `enif_get_resource` fails on that handle and the
+    /// wrapper's `catch error:badarg` (`prim_file.erl:274-280`) takes it. Measured on
+    /// OTP 29.1.2 (`make_ref()` stands in for the forged handle; any non-resource is the same
+    /// `enif_get_resource` failure).
+    #[test]
+    fn a_handle_that_names_no_open_file_is_the_badarg_value() {
+        let mut runtime = runtime();
+        let zero = beam_term::make_small(0);
+        let ten = beam_term::make_small(10);
+        let normal = atom(&mut runtime, "normal");
+        let dir = advise_file("advise_forged");
+        let fd = open_read(&mut runtime, dir.path(), "x.txt");
+        let owner = owner_of(&runtime, fd);
+        let forged_handle = beam_term::make_small(7);
+
+        let forged = descriptor_data_map(
+            &mut runtime,
+            &[(owner, "owner"), (forged_handle, "handle")],
+        );
         assert_eq!(
-            advise_error(&mut runtime, &[half_descriptor, zero, ten, normal]),
+            advise_error(&mut runtime, &[forged, zero, ten, normal]),
             "badarg"
         );
+    }
+
+    /// The bare `error:function_clause` raise `get_fd_data/1`'s clause head produces: the reason
+    /// atom, and **no** live reason term (nothing ran, so no term was built).
+    fn assert_function_clause(raised: &BeamError) {
+        match raised {
+            BeamError::Raise(raise) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("function_clause"),
+                "the oracle's clause-head reason"
+            ),
+            other => panic!("expected the function_clause raise, got {other}"),
+        }
+        assert!(
+            error::live_reason_term(raised).is_none(),
+            "a clause head builds no reason term"
+        );
+    }
+
+    /// The `Data` payload of an `error:{badmatch, Data}` raise, asserted to be that shape (a
+    /// structured reason whose term is the two-element `{badmatch, Data}`).
+    fn assert_badmatch(runtime: &Runtime, raised: &BeamError) -> Eterm {
+        match raised {
+            BeamError::Raise(raise) => assert!(
+                raise.reason.as_atom().is_none(),
+                "a structured reason carries no reason atom: {raised}"
+            ),
+            other => panic!("expected a structured raise, got {other}"),
+        }
+        let reason = error::live_reason_term(raised).expect("the {badmatch, Data} reason term");
+        assert_eq!(terms::tuple_arity(reason).expect("a 2-tuple"), 2);
+        let tag = element(reason, 0);
+        assert_eq!(runtime.atom_name_of(tag), Some("badmatch"));
+        element(reason, 1)
+    }
+
+    /// Whether the map `map` carries an entry named `name`.
+    fn has_entry(runtime: &Runtime, map: Eterm, name: &str) -> bool {
+        terms::map_entries(map)
+            .expect("a map")
+            .iter()
+            .any(|(key, _)| runtime.atom_name_of(*key) == Some(name))
+    }
+
+    /// The `owner` entry of a live descriptor's data map — the calling process's own pid.
+    fn owner_of(runtime: &Runtime, fd: Eterm) -> Eterm {
+        let data = super::super::descriptor_data(fd).expect("a well-shaped descriptor");
+        for (key, value) in terms::map_entries(data).expect("a map") {
+            if runtime.atom_name_of(key) == Some("owner") {
+                return value;
+            }
+        }
+        panic!("the descriptor carries no owner");
+    }
+
+    /// A `{file_descriptor, prim_file, Map}` whose data map holds exactly `entries`
+    /// (`(value, key name)` pairs, in the given order).
+    fn descriptor_data_map(runtime: &mut Runtime, entries: &[(Eterm, &str)]) -> Eterm {
+        let mut pairs = Vec::with_capacity(entries.len());
+        for (value, name) in entries {
+            let key = atom(runtime, name);
+            pairs.push((key, *value));
+        }
+        let tag = atom(runtime, "file_descriptor");
+        let module = atom(runtime, "prim_file");
+        heap_term(runtime, |context| {
+            let atoms = context.runtime.code_server.atoms_handle();
+            let map = terms::make_map(context, &pairs, &atoms)?;
+            terms::make_tuple(context, &[tag, module, map])
+        })
     }
 
     /// Oracle: after `close(Fd)`, `advise(Fd,0,10,normal)`⇒`{error,einval}` — and so does
