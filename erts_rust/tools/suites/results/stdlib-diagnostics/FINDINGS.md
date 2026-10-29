@@ -1,8 +1,10 @@
-# stdlib divergence classes D1…D10 — re-checked against the current Rust runtime
+# stdlib divergence classes D1…D11 — re-checked against the current Rust runtime
 
 Re-verification of the ten root-cause classes recorded in `../stdlib-notes.md` §D, run
-against the **current** Rust runtime at the head of this branch. Measurement/diagnosis
-only: no runtime crate was touched.
+against the **current** Rust runtime at the head of this branch, plus the two rows this
+document adds: `D1c` (the suite-path abort) and `D11` (`erlang:apply/2`, the
+`queue_SUITE:oops` value disagreement). Measurement/diagnosis only: no runtime crate was
+touched.
 
 ## Environment and method
 
@@ -57,10 +59,14 @@ EOF
 | **D8** | `maps:to_list/1` (reference: a BIF that calls no Erlang fun) | reference | **4.8× / 4.3×** | reference row — shows the gap is callback-specific |
 | **D9** | `smallest(Args) -> apply(fun(X) -> X end, Args).` called as `smallest([a])` | `a` | `error:badarg` | **still present** (and wider than recorded) |
 | **D10** | `erts_debug:set_internal_state(available_internal_state,true)`, then `…(unicode_loop_limit,10)` | `false`, then `40000` + the `Process <0.10.0> enabled access …` warning report | `false`, then `beam_rt: unsupported: bif`, exit 3 | **changed class** (was a catchable `unsupported_bif`; now the CLI-level `unsupported` signal) |
+| **D11** | `f(As) -> apply(fun(X) -> X end, As).` called as `f([a])` — from a **compiled** module (`queue_oops_probe`) | `a` | `error:badarg` | **new row, still present** — `erlang:apply/2` is served by an `apply/3`-shaped floor; this is the `queue_SUITE:oops` value disagreement. See §*queue_SUITE:oops — the value disagreement* |
+| **D11** | `apply(erlang, self)` (two atoms, compiled) | `error:badarg` | the **calling process's pid** (`apply(M, F)` runs `M:F()`) | **still present** — the *wrong-value* half of the same class |
 
-Counts: **5 fixed** (D1b, D3, D4, D5, D7) · **5 still present** (D1, D1c, D2, D8, D9) · **2 changed
+Counts: **5 fixed** (D1b, D3, D4, D5, D7) · **6 still present** (D1, D1c, D2, D8, D9, D11) · **2 changed
 class** (D6, D10). `D1c` is the row this document adds: the suite-level abort the sweep loses 13
-cases to, which is *not* the child-level `function_clause` D1b used to record.
+cases to, which is *not* the child-level `function_clause` D1b used to record. `D11` is the row that
+turns the sweep's `queue_SUITE:oops` `{diff,…}` throw into a named runtime defect (§*queue_SUITE:oops*
+below); D9 is the same defect, and its mechanism note is corrected there.
 
 ## Notes per class
 
@@ -196,6 +202,18 @@ reason degrades from `{badarity,{Fun,Args}}` to plain `badarg`. That is exactly 
 the `-eval` evaluator happens to answer these correctly, which is why an `-eval`-only probe hides
 the bug.
 
+**Mechanism corrected (D11):** the "incoming argument register" reading above is wrong. `erlang:apply/2`
+is not *mis-read*, it is **not implemented at all** — every genuine `call_ext erlang:apply/2`
+reaches `beam_rt`'s native floor, which decodes it as the `apply/3` `(Module, Function, Args)` shape
+and calls `Module:Function()`. The rows that pass are rows the **compiler rewrote** into
+`call_fun`/`call` (the compiler does that whenever the *length* of the argument list is known at
+compile time — the fun itself need not be), so they never reach the floor; the rows that fail are
+the ones left as a real
+`erlang:apply/2`. It is therefore not "literal vs register" but "statically inlined vs actually
+called", and the arity-mismatch degradation follows from the same place (a `badarg` from the floor,
+never a `badarity` from the applied fun). Evidence and the smallest reproduction:
+§*queue_SUITE:oops — the value disagreement* below.
+
 ### D10 — `erts_debug:set_internal_state/2`
 
 The oracle's own behaviour has to be reproduced carefully: a bare
@@ -214,7 +232,15 @@ and then `beam_rt: unsupported: bif`, exit **3**. So the capability gap stands, 
 changed: the raise is now the CLI-level `unsupported` signal (not a catchable `unsupported_bif`),
 and the oracle's comparable value is `40000`, not a success message.
 
-## Extra observation (not one of D1…D10): `erts_debug:flat_size/1`
+### D11 — `erlang:apply/2`
+
+Not implemented: every genuine `call_ext erlang:apply/2` reaches the `beam_rt` native floor, which
+decodes it as `apply/3` and calls `Module:Function()`. The full evidence (the `queue_SUITE:oops`
+op-by-op attribution, the smallest reproduction, the wrong-value shape `apply(erlang, self)`, the
+owning crate and the fix seam) is §*queue_SUITE:oops — the value disagreement* below; the probe is
+`queue_oops_probe.erl`.
+
+## Extra observation (not one of D1…D11): `erts_debug:flat_size/1`
 
 `erts_debug:flat_size/1` raises a **catchable** `error:unsupported_bif` once its argument reaches
 **524288 (`1 bsl 19`)** list elements — 500000 elements answer `1000000`, 524288 answer
@@ -231,6 +257,7 @@ so it is recorded here rather than silently worked around.
 | `error_info_child_probe.erl` | D1b | `binary_module_SUITE:error_info([])` in the main process and in a spawned child (needs the staged suite `ebin`) |
 | `error_info_abort_probe.erl` | D1c | `error_info/1`'s entry list through `ct_runner:run_case/4`'s shape: `{prefix, N}` (the 69→70 abort threshold) and `{one, Case}` (one lost case, alone in a fresh process) |
 | `maps_bif_loop_probe.erl` | D8 | `merge_with` / `intersect_with` / `iterator+next` reduced-size workloads, with a checksum and a no-callback control row |
+| `queue_oops_probe.erl` | D11 | `erlang:apply/2` from **compiled** code: the smallest reproduction, the `queue_SUITE:call/2` shape, the two-atom `apply(M,F)` → `M:F()` shape, the arity-mismatch reason, the external-fun shape, and the compiler-rewritten control |
 | `stacktrace_head_probe.erl` | D5 | stacktrace head from **compiled** code for `maps:with/2`, `maps:keys/1`, `maps:get/2`, `lists:reverse/1`, `binary:part/3` |
 | `matrix.sh` | shared | one-expression-per-line runner that prints both sides; used for the D2/D3/D4/D6/D7/D10 one-liners |
 
@@ -373,3 +400,147 @@ timeouts are workload cost, not a hang). So the report's "case missing from the 
 output" is a property of **running the suite in one process**, not of the cases: the abort takes
 the process down at `error_info` and every later case loses its turn.
 
+
+## queue_SUITE:oops — the value disagreement
+
+`queue_SUITE:oops` (`../stdlib/report.json`, verdict `divergence`) is the **only** row of the
+committed stdlib sweep whose Rust detail is the suite's own model disagreement —
+`{exception,throw,{diff,[{value,…},{…}|…]},{queue_SUITE,emul,4,…}}` — where the other 28
+`divergence` rows are timeouts, doctest counts, `badmatch`es or typed `unsupported_bif`s. A
+`{diff,…}` throw is `queue_SUITE:emul/4`'s "the two models disagree" signal, i.e. the suite
+itself believes it has positive evidence of a wrong value, so it had to be separated into *a
+wrong `queue` result* (serious) versus *the suite catching a runtime error* (still a runtime
+defect, a different one).
+
+Measured at branch head `173e121ec6` with `erts_rust/target/release/beam_rt` built from it
+(`cargo.sh build -p beam_rt --release`); host `loadavg` `13.67 16.92 16.03` (shared — no
+duration below is a claim); oracle OTP `29.1.2` / erts `17.1.1` against this runtime's
+`system_info(version)` `"17.1"`. The staged suite beams are the shared
+`/tmp/erts-suites-stage/stdlib` ones, compiled by the oracle's `erlc`, unchanged; the Rust
+runtime needs no recompilation of the suite.
+
+**Answer: no `queue` value is ever wrong, and the suite's emulation is fair. The models do
+not diverge at all — the disagreement is the *first* op, and it is `erlang:apply/2`
+raising `badarg` for a legitimate call (class D11).**
+
+### 1. The first diverging op is op 1, with both models empty
+
+`queue_SUITE:oops/1` seeds `rand:seed(exsplus, {1,2,4})`, draws 3142 op indices and folds
+`emul/4` over them; each round prints `% Op % AsA % AsB :` before comparing. Same argv on
+both sides (`-noshell -pa <stage>/ebin -pa <stage>/ctl -eval 'R = (catch queue_SUITE:oops([])), …'`):
+
+| side | op lines (`^% `) | op 1 | RESULT |
+|---|---|---|---|
+| oracle | **3142** | `% peek % [{[],[]}] % [{[]}] :<empty> \|[]\| ` | `ok` |
+| rust | **1** | `% peek % [{[],[]}] % [{[]}] :` | `{diff,[{value,empty},{error,badarg},peek,[{[],[]}],[{[]}]]}` |
+
+Op 1 is `peek` on two **empty** queues: `XX = queue:peek({[],[]})` → `{value,empty}` and
+`YY` (the suite's emulation fun) → `{error,badarg}`, so `emul/4`'s `{Exception,Exception}`
+arm cannot match and it throws `{diff,…}`. There is no earlier op to bisect to — **the
+first op is the first divergence** — and no state has been built yet, so the "the two
+models' states (`QsA0`/`QsB0`) diverged on an earlier op" reading does not hold: `AsA=[{[],[]}]`
+and `AsB=[{[]}]` are simply the two empty-queue representations. The `queue` module itself
+agrees (`queue:peek/1` `empty`, `queue:len/1` `0`, `queue:is_queue/1` `true` on both sides).
+
+### 2. Attribution: patch `apply/2` out of the suite and the whole case passes
+
+An instrumented copy of `queue_SUITE` in `$TMPDIR` (module renamed so the stage beams stay
+pristine, compiled with the oracle's `erlc`, everything else untouched) changes exactly one
+line of `call/2` — `_ -> apply(Func, As)` becomes `_ -> dyn(Func, As)` with
+`dyn/2` spelling out `F()`, `F(A)`, `F(A,B)`, `F(A,B,C)`:
+
+* patched driver, **Rust**: **3142** op lines, `RESULT=ok` — every op agrees, `queue`,
+  `rand:uniform_s/2`, `chk/5` and `queue:to_list/1` included.
+* unpatched driver, **Rust**: 1 op line, `RESULT={diff,…}` (op 1, above).
+
+So the whole of `oops/1` is correct on this runtime except `erlang:apply/2`. (A first
+attempt patched the line to `apply(erlang, apply, [Func, As])`, which does **not** help: a
+nested `apply of apply/3` is unwrapped by the engine's `resolve_call_ext_apply`
+(`crates/beam_engine/src/interpreter/dispatch.rs`) straight back onto the host's `apply/2`.)
+
+### 3. Root cause: `erlang:apply/2` is served by an `apply/3`-shaped floor
+
+`apply(Fun, Args)` compiles (OTP's `erlc`) to `call_ext 2 erlang:apply,2`; the engine
+deliberately declines that arity and leaves it to the host —
+`crates/beam_engine/tests/call_ext_apply.rs:43-57` pins "must reach
+`call_bif("erlang","apply",2,[Fun,Args])`, the host's own `apply/2`" — and that same test records
+that the **engine** used to fabricate `Module:Function()` here and was fixed by handing the call to
+the host. The host then fabricates exactly that, i.e. the fabrication moved one layer down:
+
+* `crates/beam_rt/src/native.rs:414` — `("erlang", "apply", 2) => Some(self.apply_dynamic(args, false))`
+* `crates/beam_rt/src/native.rs:781` — `apply_dynamic` reads `args[0]` as the **module** and
+  `args[1]` as the **function**, and calls it with **zero** arguments.
+
+Consequences, all measured from a **compiled** module (`queue_oops_probe`; the `-eval`
+tree-walk evaluator has its own correct `apply_2` in `beam_rt/src/eval/mod.rs`, so an
+`-eval`-only probe hides everything here):
+
+| compiled expression | oracle | rust |
+|---|---|---|
+| `f(As) -> apply(fun(X) -> X end, As).` called `f([a])` | `a` | **`error:badarg`** |
+| `call(Func, As)` = `try apply(Func, As) of …` (the suite's shape), `call(fun(X)->X end, [a])` | `{value,a}` | **`{error,badarg}`** |
+| `apply(erlang, self)` | `error:badarg` | **`<0.35.4>` — it ran `erlang:self/0` and returned a pid** |
+| `apply(lists, reverse)` | `error:badarg` | **`error:undef`** — it ran `lists:reverse/0` |
+| `mismatch(F, As) -> apply(F, As)` with `fun() -> x end`, `[a]` | `error:{badarity,{Fun,[a]}}` | **`error:badarg`** |
+| `apply(fun lists:reverse/1, As)` with `As=[1,2]` | `error:{badarity,{fun lists:reverse/1,[1,2]}}` | **`error:badarg`** |
+| `known_length(F) -> apply(F, [a]).` — unknown fun, list of known **length** | `a` | `a` (the compiler rewrote it: `erlc -S` shows `{call_fun,1}`) |
+| `apply(fun(X) -> X end, [a])` — literal fun **and** list | `a` | `a` (same rewrite, `{call_fun,1}`) |
+
+The last two rows are the controls that explain why this survived: an `apply/2` whose argument
+list has a statically known **length** is rewritten by the compiler into `call_fun` (the fun may
+be unknown — `known_length/1` is the proof: `call_fun,1`, no `apply/2`), so only the genuinely
+dynamic ones reach the runtime — which is why the same defect looks like "works with literals,
+fails with parameters" and why it was recorded (wrongly) as a register/mis-read issue under D9. The floor's own unit test,
+`crates/beam_rt/src/native.rs:1790` `apply_of_two_arguments_calls_a_zero_arity_bif` ("`erlang:apply(erlang,
+self)` — a registered `erlang` BIF reached dynamically", asserting the result is a pid) asserts
+exactly the behaviour the oracle rejects with `badarg` — so it pins the defect rather than
+catching it.
+
+### 4. Owning crate and fix seam
+
+* **Owning crate: `beam_rt`** — the native floor (`crates/beam_rt/src/native.rs:414` and
+  `apply_dynamic` at `:781`). It is reached *by design*: the engine
+  (`crates/beam_engine/src/interpreter/dispatch.rs:803-825`) documents that `erlang:apply/2`
+  is not a `fixed_apply` shape and must stay "the host's own `erlang:apply/2`", and
+  `beam_bifs` is not involved either (`apply/2` is C's `i_apply_fun` instruction, not a SNIF;
+  the registry only answers the `erlang:is_builtin` special case).
+* **Correct shape:** a fun (or external fun) in `args[0]` applied to the proper list in
+  `args[1]` via `ExecutionContext::apply_fun` (the C's `apply_fun(c_p, x(0), x(1), reg)`);
+  anything else in `args[0]`, a non-list/improper `args[1]`, and any arity mismatch must raise
+  the oracle's reason — `badarg` for the first two, `badarity` for the mismatch.
+* **Do not just delete the arm:** the floor's own unit tests drive the two-atom reading —
+  `crates/beam_rt/src/native.rs:1795`, `:1811`, `:1821` call `("erlang","apply")` with
+  `[module, function]` (the first one is the pid test above); they must move to the explicit
+  `apply/3` form (`[module, function, []]`) and the pid test must be replaced by a `badarg`
+  assertion when the arm changes meaning.
+
+### 5. What class is this, stated plainly
+
+* **Not a wrong `queue` result**, and **not** the suite's emulation being unfair — §2 rules
+  both out; `queue_SUITE:oops`'s `divergence` verdict in `../stdlib/report.json` is correct
+  and must stay.
+* **A runtime defect whose error surface is `badarg`**, i.e. the *most* misleading kind: a
+  legal Erlang program gets a plain, catchable `error:badarg` that is indistinguishable from
+  a genuine argument error, instead of either the right answer or the runtime's documented
+  typed `unsupported` channel. If the differential corpus pinned a genuinely dynamic
+  `apply/2`, both tools would classify it as a `mismatch` (a plain Erlang `badarg` is an
+  observation, never one of the two `unsupported` signals) — see the coverage note below.
+* **And it does produce a wrong value** in the sibling shape: `apply(M, F)` with two atoms
+  *executes* `M:F/0` (`apply(erlang, self)` → a pid) where the oracle raises `badarg`. So the
+  class is wrong-result, not merely unimplemented — it is just that `queue_SUITE` sits on the
+  spurious-`badarg` side of it.
+* Blast radius outside this row: `lib/stdlib/test` contains 63 textual `apply(` sites (mixing
+  `apply/2` and `apply/3`), so several suites can reach the same defect; `queue_SUITE:oops`
+  is simply the one whose very first op is a dynamic `apply/2`.
+
+### 6. Why the differential gate did not catch it (out of this node's scope, reported)
+
+`tools/differential` has exactly one case naming `apply/2` —
+`bifs/apply_and_binary_list_conversions` (`corpus/bifs.rs:1514`), whose `erlang:apply(fun(X) ->
+X+1 end, [1])` agrees. It cannot see this defect for **two independent** reasons: it is an
+`Eval` case, so it runs in the `-eval` tree-walk evaluator (which has its own correct
+`apply_2`), and even as compiled code its fun *and* list are literals, so the compiler rewrites
+the call into `call_fun`. A gate case that pins `apply/2` needs **compiled** code (`CaseKind::
+Module`/`ModuleEnv`) with both operands arriving as parameters — i.e. exactly
+`queue_oops_probe:smallest/1`, plus the two-atom `apply(erlang, self)` shape for the
+wrong-value half. Adding it belongs to `tools/differential`, not to this node.

@@ -19,7 +19,7 @@ Every row names both sides (oracle = system `erl` on `$PATH`, rust = `../target/
 - Probes are plain `.erl`/`.sh` (no crate, no build step) so they can be run by hand against any runtime.
 
 ## Routing Table
-- `stdlib-diagnostics/` → hand-run probes re-checking the stdlib divergence classes D1…D10 against the current runtime, with `FINDINGS.md` as the verdict table.
+- `stdlib-diagnostics/` → hand-run probes re-checking the stdlib divergence classes D1…D11 against the current runtime, with `FINDINGS.md` as the verdict table (`D11` = the `erlang:apply/2` defect behind `queue_SUITE:oops`).
 - `khepri-diagnostics/` → hand-run probes behind `khepri-notes.md` (`process_flag/2`, `external_size`, iodata handling).
 - `stdlib/` → the stdlib sweep artifact (`report.json` + `summary.md`) and its `raw/` probe captures.
 - `khepri/` → the Khepri sweep artifact (`report.json` + `summary.md`).
