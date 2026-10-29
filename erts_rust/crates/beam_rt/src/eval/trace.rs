@@ -143,8 +143,31 @@ pub(super) fn cook_trace(
         Some(BeamError::Raise(raise)) => Some(raise),
         _ => None,
     };
-    if let Some(trace) = raise.and_then(supplied_trace_term) {
-        return Ok(trace);
+    if let Some(raise) = raise {
+        if raise.supplied_trace().is_some() {
+            // The raise's own frames were decoded from the supplied trace at the raise
+            // (`beam_bifs::convert::raise_3`), so a **valid** frame list is re-rendered
+            // through the engine's encoder — the oracle's normalisation, which gives a
+            // 3-tuple frame `{M,F,A}` the location slot the oracle gives it
+            // (`{M,F,A,[]}`) while a 4-tuple frame round-trips unchanged. An **empty**
+            // frame list (`[]`, the raise's "no trace" case) echoes the term itself.
+            if raise.stacktrace.is_empty() {
+                if let Some(trace) = supplied_trace_term(raise) {
+                    return Ok(trace);
+                }
+            } else {
+                let module = beam_loader::Module {
+                    atom_table: evaluator.ctx.runtime.code_server.atoms().fork(),
+                    ..beam_loader::Module::default()
+                };
+                let ctx: &mut dyn ExecutionContext = &mut *evaluator.ctx;
+                return term(beam_engine::encode_supplied_stacktrace(
+                    &module,
+                    ctx,
+                    &raise.stacktrace,
+                ));
+            }
+        }
     }
     let mut trace = match raise {
         Some(raise) => {
