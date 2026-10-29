@@ -374,7 +374,7 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   local process through `beam_process`'s route-free receipt primitives, so an inbound delivery emits no
   outbound `DOP_*`; `beam_dist`'s `LocalIdentity` is installed per drain on all three decode paths, so an
   inbound pid/port/reference for this node is the internal term and `Pid =:= self()` holds for a peer that
-  reflects a pid back. Evidence: `crates/beam_rt/tests/dist_two_vm.rs` (rust ↔ real `erl`, **24 cases**:
+  reflects a pid back. Evidence: `crates/beam_rt/tests/dist_two_vm.rs` (rust ↔ real `erl`, **27 cases**:
   link/unlink, monitor/demonitor with the peer-minted ref bound, `exit/2` kill vs `normal`, aliases both
   ways, identity round trip; plus the inbound half — a peer's link landing in the `links` item and clearing
   on unlink, the peer's monitor of our process getting a `'DOWN'` carrying the boxed reason, the peer's death
