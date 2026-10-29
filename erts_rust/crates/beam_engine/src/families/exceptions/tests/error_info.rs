@@ -188,7 +188,7 @@ fn raising_ctx(
 
 /// Run `run/0` of `module` on `Tier::Interpreter` **and** `Tier::BaselineJit` and
 /// hand back the cooked stacktrace — asserting tier agreement **first**.
-fn cooked_on_both_tiers(module: &Module, run_atom: Atom, ctx: &mut MinimalContext) -> Eterm {
+pub(super) fn cooked_on_both_tiers(module: &Module, run_atom: Atom, ctx: &mut MinimalContext) -> Eterm {
     let mut interpreter = Machine::new();
     let cooked = interpreter
         .run_export(module, run_atom, 0, &[], ctx)

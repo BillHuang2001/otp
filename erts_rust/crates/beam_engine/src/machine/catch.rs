@@ -281,6 +281,18 @@ impl Machine {
         std::mem::take(&mut self.raise_supplied_term_verbatim)
     }
 
+    /// The **read half** of [`Machine::take_raise_supplied_term_verbatim`]: whether
+    /// the raise in flight is a verbatim echo, **without** consuming the marker.
+    ///
+    /// `raw_raise`'s re-supply needs it ([`Machine::raise_supplied`]): C stores the
+    /// caught exception's trace **object** in `c_p->ftrace` again
+    /// (`../../erts/emulator/beam/beam_common.c:1148-1179`), so whether
+    /// `build_stacktrace` echoes it or cooks it is a property of that object
+    /// (`is_raised_exc`), not of the raise site — a re-raise therefore keeps it.
+    pub(crate) fn live_raise_supplied_term_verbatim(&self) -> bool {
+        self.raise_supplied_term_verbatim
+    }
+
     /// Whether the raise currently in flight **supplied** its trace — either as
     /// explicit symbolic frames or as a trace term — **without** consuming the
     /// latch.
@@ -827,18 +839,29 @@ impl Machine {
     /// [`Machine::with_uncaught_frames`]. No allocation happens between the two
     /// steps, so the term never leaves the frozen root set.
     ///
-    /// This is the **non-verbatim** arming of the term latch: `term` is the cooked
-    /// chain the raise preserves, which the uncaught funnel re-renders from the
-    /// snapshot. The one-shot verbatim marker is therefore cleared here, so a
-    /// `raw_raise` can never inherit a preceding `erlang:raise/3`'s echo.
+    /// `verbatim` says **what kind** of term it is, and it is the caller's assertion:
+    /// * `false` — `term` is the cooked chain the raise **preserves**, which the
+    ///   uncaught funnel re-renders from the snapshot (`raw_raise` over a
+    ///   raise the engine derived itself);
+    /// * `true` — `term` is C's **raised** trace object, `is_raised_exc` set, so
+    ///   `build_stacktrace` echoes it unchanged
+    ///   (`../../erts/emulator/beam/beam_common.c:1219-1223`). `raw_raise` keeps
+    ///   that property because it stores the caught exception's trace object back
+    ///   into `c_p->ftrace` (`:1164`), so the re-supplied term is the same object
+    ///   and `[]` stays distinguishable from "no trace supplied" — the caller reads
+    ///   the incoming marker through [`Machine::live_raise_supplied_term_verbatim`].
+    ///
+    /// Either way the marker is **written**, never inherited: a raise that supplies
+    /// a term always states which flavour it is.
     pub(crate) fn raise_supplied(
         &mut self,
         class: ExceptionClass,
         reason: Eterm,
         term: Eterm,
+        verbatim: bool,
     ) -> Result<Step> {
         self.pending_supplied_term = Some(term);
-        self.pending_supplied_term_verbatim = false;
+        self.pending_supplied_term_verbatim = verbatim;
         self.throw_with_trace(class, reason, term)
     }
 
