@@ -554,6 +554,14 @@ A.9's differential coverage is boot/version **observability** plus the in-proces
   dependents get `?`-interop for free instead of each writing a mapping (Prevent-Duplication). It is the
   "reconcile once `beam_common` lands" step `beam_term`'s own `CONTEXT.md` prescribes. (Owes a
   `../../CHANGE.md` note — flagged to the parent node, which owns the repo root.)
+- **A map update path-copies; only a from-scratch build goes through `write_map`.** `beam_term` owns the
+  only writer (`map_put_cow`/`map_remove_cow`, sharing off-path subtrees by word and reserving a
+  size-independent word bound), and every update entry point — `beam_bifs`'s `maps:put/update/remove/take`,
+  the engine's `put_map_assoc`/`put_map_exact`, `beam_abi`'s `enif_make_map_put`/`_update` — adopts it
+  above the flat limit (`MAP_SMALL_MAP_LIMIT = 32`, whose rebuild is bounded and cheap). The rule matters
+  because a rebuild is Θ(n) **per op**, which turns an n-keyed fold into Θ(n²); a map update must therefore
+  be Θ(log n) in n, and a new update site must call the COW writer rather than pair-walk + `write_map`.
+  `maps:merge/2`, `with/2`, `without/2`, `from_list/1` stay Θ(n+m) from-scratch builds by design.
 - **Engine depends only on `beam_loader`/`beam_alloc`.** It defines `ExecutionContext` (BIF dispatch /
   allocation / process state) and `Mailbox` (receive/message) as traits; `beam_rt` supplies the concrete
   implementations over `beam_bifs`/`beam_process`. This keeps the Stage-1 engine independent of the
