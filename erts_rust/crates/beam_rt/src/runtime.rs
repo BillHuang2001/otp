@@ -1182,6 +1182,15 @@ pub struct Runtime {
     /// Owned by the `Runtime` (not a `thread_local!`) because several runtimes can live in one
     /// thread.
     prim_tty_handles: HashMap<u64, i32>,
+    /// The live `prim_buffer` byte queues (contract A.7) — each entry maps the reference id
+    /// minted by `prim_buffer:new/0` (`src/native/prim_buffer.rs`) to its queue.
+    ///
+    /// The handle is the oracle's opaque NIF resource (`#Ref<…>`-shaped and unobservable); a
+    /// term whose id is not in this table is the C's `enif_get_resource` failure (`badarg`).
+    /// `prim_file`'s descriptors also own a queue here (keyed by the **descriptor id**, so a
+    /// `prim_file:close/1` removes both halves at once). Owned by the `Runtime` (not a
+    /// `thread_local!`) because several runtimes can live in one thread.
+    buffers: HashMap<u64, crate::native::prim_buffer::PrimBuffer>,
     /// The **native `file_server_2` service** and its live io-devices (contract A.9) — see
     /// [`crate::native::file_server`].
     ///
@@ -1685,6 +1694,7 @@ impl Runtime {
             perf_map,
             open_files: HashMap::new(),
             prim_tty_handles: HashMap::new(),
+            buffers: HashMap::new(),
             file_services,
             net_kernel,
             boot_script_id: None,
@@ -2386,6 +2396,18 @@ impl Runtime {
     /// own docs and [`crate::native::prim_tty`].
     pub(crate) fn prim_tty_handles_mut(&mut self) -> &mut HashMap<u64, i32> {
         &mut self.prim_tty_handles
+    }
+    /// The live `prim_buffer` byte-queue table (contract A.7), keyed by the reference id the
+    /// buffer handle term carries — and, for a `prim_file` descriptor, by the descriptor's own
+    /// id so `prim_file:close/1` retires both the host file and its read buffer.
+    ///
+    /// `prim_buffer:new/0` inserts the minted handle's queue and every other stub looks it up (a
+    /// miss is the C's `enif_get_resource` failure, `badarg`). See the field's own docs and
+    /// [`crate::native::prim_buffer`].
+    pub(crate) fn buffers_mut(
+        &mut self,
+    ) -> &mut HashMap<u64, crate::native::prim_buffer::PrimBuffer> {
+        &mut self.buffers
     }
 
     /// Rewinds the **scratch** heap [`Runtime::info_heap`] to its base for the next

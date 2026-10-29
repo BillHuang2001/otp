@@ -155,8 +155,6 @@
 //! * `allocate/3` — `posix_fallocate(2)`, the sibling facility of the now-served `advise/4`
 //!   hint: a real reservation of blocks is not something this runtime's `std`-only host can
 //!   make, so it stays a gap.
-//! * `read_line/1` — its Erlang body drives the `prim_buffer:*` resource NIFs, which this
-//!   runtime does not model.
 //! * `file_desc_to_ref/2` — adopting a raw `int` fd.
 //!
 //! **Deliberately unclaimed**, because the call falls through to the preloaded `.beam` and the
@@ -274,10 +272,9 @@ impl RuntimeContext<'_> {
             ))),
             ("list_dir", 1) => Some(self.prim_list_dir(args, true)),
             ("list_dir_all", 1) => Some(self.prim_list_dir(args, false)),
-            ("read_line", 1) => Some(Err(error::unsupported(
-                "prim_file:read_line/1: its Erlang body drives the prim_buffer:* resource NIFs, \
-                 which this runtime does not model",
-            ))),
+            // Served: `prim_file/readahead.rs` reproduces `read_line_1/4` over the descriptor's
+            // own read-ahead queue, which `read/2` and `position/2` respect.
+            ("read_line", 1) => Some(self.prim_read_line(args)),
             ("file_desc_to_ref", 2) => Some(Err(error::unsupported(
                 "prim_file:file_desc_to_ref/2: needs raw descriptor adoption/dup(2), which no \
                  safe std API exposes",

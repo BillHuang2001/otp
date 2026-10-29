@@ -630,9 +630,10 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
                 "NIF library already loaded (reload disallowed since OTP 20).".to_string(),
             ));
         }
-        // The built-in (statically linked) NIF libraries. ERTS resolves `prim_tty` from its
-        // static NIF table (`is_static_nif_module`, `erts/emulator/beam/erl_nif.c`), so
-        // `erlang:load_nif/2` must NOT touch the filesystem for it — the `dlopen` of a
+        // The built-in (statically linked) NIF libraries. ERTS resolves `prim_tty` and
+        // `prim_buffer` from its static NIF table (`is_static_nif_module`,
+        // `erts/emulator/beam/erl_nif.c`), so
+        // `erlang:load_nif/2` must NOT touch the filesystem for them — the `dlopen` of a
         // non-existent `prim_tty.so` is what `ok = prim_tty:load()` turns into a
         // `{case_clause,{error,{load_failed,…}}}`. Answer the oracle's `ok` instead.
         //
@@ -641,7 +642,9 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
         // Erlang wrappers (`load/0`, `init/1`, `writer/1`, …) in-machine and route them onto
         // the non-pumping nested `call_bif` path, where their `receive`s fold into the typed
         // `blocked()` gap. Every `prim_tty` NIF key is served from the native floor
-        // ([`crate::native::prim_tty`]) instead.
+        // ([`crate::native::prim_tty`]) instead — `prim_buffer`'s nine stubs are the same
+        // arrangement ([`crate::native::prim_buffer`]), and its three Erlang bodies
+        // (`read/2`, `read_iovec/2`, `wipe/1`) depend on `is_loaded` staying `false` too.
         //
         // `load_nif`'s first parameter is the CALLER's module name (the BIF reads
         // `current_module`), while the library name the oracle resolves is the `Path`
@@ -649,6 +652,8 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
         // both — the built-in check is by library name, exactly as ERTS's is.
         if crate::native::prim_tty::is_builtin_library(module)
             || crate::native::prim_tty::is_builtin_library(path)
+            || crate::native::prim_buffer::is_builtin_library(module)
+            || crate::native::prim_buffer::is_builtin_library(path)
         {
             return Ok(());
         }

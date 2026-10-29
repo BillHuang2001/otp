@@ -46,11 +46,16 @@
 //! # Semantics (the C's, measured against the oracle)
 //!
 //! The queue is the C's `ErlNifIOQueue` plus the 2 KiB **write accumulator** that coalesces small
-//! writes (`combine_small_writes`): a write whose total is under [`ACCUMULATOR_SIZE`] and would
-//! overflow the accumulator flushes it and starts a new one, a write of at least
-//! [`ACCUMULATOR_SIZE`] / 2 flushes and lands as its own queue elements, and every *read-side*
-//! operation flushes first. The chunk boundaries are observable through `peek_head/1` and
-//! therefore through `read_iovec/2`'s list shape, so they are modelled rather than flattened.
+//! writes (`combine_small_writes`): a write that would overflow the accumulator **and** is at
+//! least [`ACCUMULATOR_SIZE`] / 2 flushes it and lands as its own queue elements, a smaller one
+//! is combined into the accumulator (flushing it first when it is full), and every *read-side*
+//! operation (`size/1` excepted) flushes first. The chunk boundaries are observable through
+//! `peek_head/1` and therefore through `read_iovec/2`'s list shape, so they are modelled rather
+//! than flattened.
+//!
+//! Two of the nine stubs are **reads that dequeue**: `copying_read/2` (the C's `enif_ioq_deq`
+//! after its copy — `read/2`'s small-read arm) and `skip/2`. `peek_head/1` and
+//! `find_byte_index/2` only observe the queue.
 //!
 //! Every failure shape is the C's `enif_make_badarg` — a **raise** of `badarg`, never a value:
 //! `size(foo)`, `write(B, foo)` (an inspect-iovec failure: the argument must be a list of
@@ -134,7 +139,11 @@ impl PrimBuffer {
     }
 
     /// The number of queued bytes (`enif_ioq_size` plus the accumulator).
-    fn size(&self) -> usize {
+    ///
+    /// `pub(crate)` for the read-ahead seam: a `prim_file` descriptor's queue is drained by
+    /// `prim_file:read/2` and `prim_file:position/2` as well as by its own `read_line/1`
+    /// (`prim_file/readahead.rs`).
+    pub(crate) fn size(&self) -> usize {
         self.chunks.iter().map(Vec::len).sum::<usize>() + self.accumulated.len()
     }
 
@@ -148,7 +157,10 @@ impl PrimBuffer {
 
     /// `write_nif`'s body over an already-inspected iovec (`combine_small_writes` and its
     /// fall-through).
-    fn write_iovec(&mut self, parts: &[&[u8]]) {
+    ///
+    /// `pub(crate)` for the read-ahead seam (`prim_file/readahead.rs`): a line read appends
+    /// what the host returned to the descriptor's queue.
+    pub(crate) fn write_iovec(&mut self, parts: &[&[u8]]) {
         let total: usize = parts.iter().map(|part| part.len()).sum();
         let combined = if self.accumulated.len() + total >= ACCUMULATOR_SIZE {
             if total >= ACCUMULATOR_SIZE / 2 {
@@ -190,17 +202,27 @@ impl PrimBuffer {
         out
     }
 
-    /// `copying_read_nif`'s copy half: the first `count` bytes as a fresh buffer.
-    fn copying_read(&mut self, count: usize) -> Option<Vec<u8>> {
+    /// `copying_read_nif`'s body: the first `count` bytes as a fresh buffer, **removed** from the
+    /// queue (`enif_ioq_deq`) — `copying_read/2` is a read, not a peek, which is what
+    /// `prim_buffer.erl`'s `read/2` and `read_iovec/2` rely on for their buffers to advance.
+    ///
+    /// `pub(crate)` for the read-ahead seam (`prim_file/readahead.rs`), which drains the queue
+    /// the same way `read/2` does (`read_1/5`'s buffer arms, `prim_file.erl:180-191`).
+    pub(crate) fn copying_read(&mut self, count: usize) -> Option<Vec<u8>> {
         self.enqueue_accumulator();
         if self.size() < count {
             return None;
         }
-        Some(self.prefix(count))
+        let bytes = self.prefix(count);
+        self.skip_now(count);
+        Some(bytes)
     }
 
-    /// `erts_ioq_deq` — drop `count` bytes from the front.
-    fn skip(&mut self, count: usize) {
+    /// `erts_ioq_deq` — drop `count` bytes from the front of the **queue**.
+    ///
+    /// Every caller first flushes the write accumulator ([`PrimBuffer::enqueue_accumulator`]),
+    /// so the queue is the whole content (`skip_nif`/`copying_read_nif` do the same in the C).
+    fn skip_now(&mut self, count: usize) {
         let mut remaining = count;
         while remaining > 0 {
             let Some(front) = self.chunks.front_mut() else {
@@ -218,6 +240,15 @@ impl PrimBuffer {
         }
     }
 
+    /// `skip_nif`'s body: flush the accumulator, then drop `count` bytes from the front.
+    ///
+    /// `pub(crate)` for the read-ahead seam: `prim_file:position/2` wipes the descriptor's
+    /// queue with it (`position_1/3`'s `prim_buffer:wipe/1`, `prim_file.erl:330`).
+    pub(crate) fn skip(&mut self, count: usize) {
+        self.enqueue_accumulator();
+        self.skip_now(count);
+    }
+
     /// `peek_head_nif`: the head queue element, or `None` for an empty queue (the C's
     /// `enif_ioq_peek_head` failure ⇒ `badarg`).
     fn peek_head(&mut self) -> Option<&[u8]> {
@@ -226,7 +257,10 @@ impl PrimBuffer {
     }
 
     /// `find_nif`: the byte offset of the first `needle`, scanning the queue in order.
-    fn find_byte(&mut self, needle: u8) -> Option<usize> {
+    ///
+    /// `pub(crate)` for the read-ahead seam: `prim_file:read_line/1` asks the same question
+    /// (`prim_buffer:find_byte_index/2`, `prim_file.erl:211`).
+    pub(crate) fn find_byte(&mut self, needle: u8) -> Option<usize> {
         self.enqueue_accumulator();
         let mut offset = 0;
         for chunk in &self.chunks {
@@ -268,7 +302,7 @@ impl RuntimeContext<'_> {
         match (function, arity) {
             ("new", 0) => self.mint_prim_buffer(),
             ("size", 1) => {
-                let size = self.with_prim_buffer(args[0], |buffer| Ok(buffer.size()))??;
+                let size = self.with_prim_buffer(args[0], |buffer| buffer.size())?;
                 let size = i64::try_from(size).map_err(|_| {
                     beam_common::BeamError::Raise(beam_common::Raise::error(
                         beam_common::ExitReason::atom("system_limit"),
@@ -279,17 +313,18 @@ impl RuntimeContext<'_> {
             // `peek_head/1` — the head queue element as a binary. A **non-empty** queue is the
             // C's precondition; an empty one is `badarg`.
             ("peek_head", 1) => {
-                let head = self.with_prim_buffer(args[0], |buffer| buffer.peek_head().map(<[u8]>::to_vec))??;
+                let head = self.with_prim_buffer(args[0], |buffer| buffer.peek_head().map(<[u8]>::to_vec))?;
                 match head {
                     Some(bytes) => terms::make_heap_binary(self, &bytes),
                     None => Err(BeamError::BadArg),
                 }
             }
-            // `copying_read/2` — a **copy** of the first `Size` bytes. `Size` past the end is
-            // `badarg`; `Size = 0` is the empty binary.
+            // `copying_read/2` — a **copy** of the first `Size` bytes, dequeued (`read/2`'s
+            // small-read arm, so the buffer advances). `Size` past the end is `badarg`;
+            // `Size = 0` is the empty binary.
             ("copying_read", 2) => {
                 let count = buffer_count(args.get(1).copied())?;
-                let bytes = self.with_prim_buffer(args[0], |buffer| buffer.copying_read(count))??;
+                let bytes = self.with_prim_buffer(args[0], |buffer| buffer.copying_read(count))?;
                 match bytes {
                     Some(bytes) => terms::make_heap_binary(self, &bytes),
                     None => Err(BeamError::BadArg),
@@ -301,7 +336,7 @@ impl RuntimeContext<'_> {
                 let element = *args.get(1).ok_or(BeamError::BadArg)?;
                 let parts = iovec_parts(element)?;
                 let borrowed: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-                self.with_prim_buffer(args[0], |buffer| buffer.write_iovec(&borrowed))??;
+                self.with_prim_buffer(args[0], |buffer| buffer.write_iovec(&borrowed))?;
                 self.atom("ok")
             }
             // `skip/2` — drop `Size` bytes from the front, `ok`; past the end is `badarg`.
@@ -314,7 +349,7 @@ impl RuntimeContext<'_> {
                         buffer.skip(count);
                         true
                     }
-                })??;
+                })?;
                 if skipped {
                     self.atom("ok")
                 } else {
@@ -334,7 +369,7 @@ impl RuntimeContext<'_> {
                     return Err(BeamError::BadArg);
                 };
                 let found =
-                    self.with_prim_buffer(args[0], |buffer| buffer.find_byte(byte))??;
+                    self.with_prim_buffer(args[0], |buffer| buffer.find_byte(byte))?;
                 match found {
                     Some(index) => {
                         let index = i64::try_from(index).map(make_small).map_err(|_| {
@@ -358,7 +393,7 @@ impl RuntimeContext<'_> {
                             buffer.locked = true;
                             true
                         }
-                    })??;
+                    })?;
                 if acquired {
                     self.atom("acquired")
                 } else {
@@ -375,7 +410,7 @@ impl RuntimeContext<'_> {
                         } else {
                             false
                         }
-                    })??;
+                    })?;
                 if unlocked {
                     self.atom("ok")
                 } else {
@@ -408,15 +443,15 @@ impl RuntimeContext<'_> {
         &mut self,
         term: Eterm,
         body: impl FnOnce(&mut PrimBuffer) -> T,
-    ) -> Result<Result<T>> {
+    ) -> Result<T> {
         let id = MonitorRef::from_eterm(term)
             .map_err(|_| BeamError::BadArg)?
             .id();
-        let mut table = self.runtime.buffers_mut();
+        let table = self.runtime.buffers_mut();
         let Some(buffer) = table.get_mut(&id) else {
             return Err(BeamError::BadArg);
         };
-        Ok(Ok(body(buffer)))
+        Ok(body(buffer))
     }
 }
 
@@ -474,17 +509,18 @@ mod tests {
         assert_eq!(buffer.size(), 0);
     }
 
-    /// A small write coalesces into the accumulator, so a 4-byte write has a head only after
-    /// the read side flushes it.
+    /// A small write coalesces into the accumulator, so a 5-byte write has a head only after
+    /// the read side flushes it — and `copying_read` is a **read** (it dequeues, the C's
+    /// `enif_ioq_deq`), not a peek.
     #[test]
     fn a_small_write_is_visible_through_the_accumulator() {
         let mut buffer = buffer_of(&[b"line\n"]);
         assert_eq!(buffer.size(), 5);
         assert_eq!(buffer.peek_head(), Some(&b"line\n"[..]));
+        // A peek leaves the queue alone.
+        assert_eq!(buffer.size(), 5);
         assert_eq!(buffer.find_byte(b'\n'), Some(4));
         assert_eq!(buffer.copying_read(5), Some(b"line\n".to_vec()));
-        assert_eq!(buffer.size(), 5);
-        buffer.skip(5);
         assert_eq!(buffer.size(), 0);
         assert_eq!(buffer.peek_head(), None);
     }
@@ -500,11 +536,15 @@ mod tests {
         assert_eq!(buffer.peek_head(), Some(&b"abcdef"[..]));
     }
 
-    /// A write of at least `ACCUMULATOR_SIZE / 2` keeps its own queue element and flushes the
-    /// pending accumulator first, so the head is the earlier small write.
+    /// A write that fills the accumulator **and** is at least `ACCUMULATOR_SIZE / 2` keeps its
+    /// own queue element, flushing the pending accumulator first — the C's
+    /// `combine_small_writes` returns `0` only when *both* conditions hold, so the head is the
+    /// earlier small write.
     #[test]
     fn a_large_write_keeps_its_own_element() {
-        let big = vec![b'x'; ACCUMULATOR_SIZE / 2];
+        // 4 + 2044 == ACCUMULATOR_SIZE: the accumulator cannot take the newcomer, and 2044 is
+        // past `ACCUMULATOR_SIZE / 2`, so the write lands as its own queue element.
+        let big = vec![b'x'; ACCUMULATOR_SIZE - 4];
         let mut buffer = PrimBuffer::new();
         buffer.write_iovec(&[b"tiny"]);
         buffer.write_iovec(&[&big]);
@@ -512,6 +552,20 @@ mod tests {
         assert_eq!(buffer.peek_head(), Some(&b"tiny"[..]));
         buffer.skip(4);
         assert_eq!(buffer.peek_head(), Some(&big[..]));
+    }
+
+    /// A write that fills the accumulator but stays under `ACCUMULATOR_SIZE / 2` is *combined*
+    /// with what the accumulator already holds (the C's fall-through), so one head covers both.
+    #[test]
+    fn a_write_that_fills_the_accumulator_is_combined_when_it_is_small() {
+        let big = vec![b'x'; ACCUMULATOR_SIZE / 2];
+        let mut buffer = PrimBuffer::new();
+        buffer.write_iovec(&[b"tiny"]);
+        buffer.write_iovec(&[&big]);
+        assert_eq!(buffer.size(), 4 + big.len());
+        let head = buffer.peek_head().expect("the combined accumulator");
+        assert_eq!(head.len(), 4 + big.len());
+        assert_eq!(&head[..4], b"tiny");
     }
 
     /// A partial read across two chunks concatenates them, and leaves the remainder queued.
@@ -524,7 +578,7 @@ mod tests {
         assert_eq!(buffer.size(), 2 * big.len());
         let head = buffer.copying_read(4).expect("four bytes");
         assert_eq!(head, b"yyyy");
-        buffer.skip(4);
+        // `copying_read` already dequeued them.
         assert_eq!(buffer.size(), 2 * big.len() - 4);
         // The second chunk is intact after the first one was drained.
         let tail = buffer.copying_read(2 * big.len() - 4).expect("the rest");
