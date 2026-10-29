@@ -666,6 +666,12 @@ impl Runtime {
         if !self.max_heap_kill.is_empty() {
             self.max_heap_kill.retain(|pid| table.contains(*pid));
         }
+        // The three `process_flag/2` heap-sizing flags ([`Runtime::heap_flags`]) are read back
+        // by `process_info(P, …)`, which answers `undefined` for a pid the table no longer
+        // holds, so a dead pid's entry can be dropped without changing any answer.
+        if !self.heap_flags.is_empty() {
+            self.heap_flags.retain(|pid, _| table.contains(*pid));
+        }
     }
     /// Adds `reds` to the reductions `pid` has accumulated since its last
     /// **reduction/yield-boundary** collection, returning the new total.

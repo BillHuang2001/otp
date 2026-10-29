@@ -760,6 +760,77 @@ fn garbage_collection_matches_the_oracle_for_a_live_process() {
     }
 }
 
+/// The three heap-sizing flags are per-process state `erlang:process_flag/2` writes, and the
+/// **same** runtime store answers them back — as `process_info(P, Flag)` items *and* inside the
+/// `garbage_collection` proplist — for the pid that set them and for no other.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1, `pf_gc:run/0`): after `process_flag(min_heap_size, 1000)`
+/// ⇒ `1598`, `process_flag(min_bin_vheap_size, 100000)` ⇒ `121536` and
+/// `process_flag(fullsweep_after, 3)` ⇒ `3`, `garbage_collection` reports
+/// `{min_bin_vheap_size,121536}, {min_heap_size,1598}, {fullsweep_after,3}` — the same three
+/// figures the items report, because the C reads `p->min_heap_size` / `p->min_vheap_size` /
+/// `p->max_gen_gcs`, the very fields `process_flag/2` writes.
+#[test]
+fn process_flag_sets_the_heap_sizing_items_for_that_pid_only() {
+    let mut runtime = runtime();
+    let pid = root_pid(&mut runtime);
+    // `(flag, requested, the fresh-process value it answers, the readback)`.
+    let steps = [
+        ("min_heap_size", 1000_i64, 233_i64, 1598_i64),
+        ("min_bin_vheap_size", 100_000, 46_422, 121_536),
+        ("fullsweep_after", 3, 65_535, 3),
+    ];
+    for (name, requested, previous, stored) in steps {
+        let flag = atom(&mut runtime, name);
+        assert_eq!(
+            signed_value(
+                call(
+                    &mut runtime,
+                    "erlang",
+                    "process_flag",
+                    &[flag, make_small(requested)]
+                )
+                .expect("process_flag/2")
+            ),
+            previous,
+            "{name}: process_flag/2 answers the old value"
+        );
+        let (key, value) = pair(info(&mut runtime, pid, name).expect("the item"));
+        assert_eq!(runtime.atom_name_of(key), Some(name));
+        assert_eq!(signed_value(value), stored, "{name}: readback");
+    }
+    // A process that never set them reports the figures it was born with.
+    let sibling = runtime
+        .processes
+        .spawn(beam_gc::HeapPolicy::from_spawn_opts(0, 0, 65_535))
+        .expect("a sibling process");
+    for (name, expected) in [
+        ("min_heap_size", 233),
+        ("min_bin_vheap_size", 46_422),
+        ("fullsweep_after", 65_535),
+    ] {
+        let (_, value) = pair(info(&mut runtime, sibling.to_eterm(), name).expect("sibling item"));
+        assert_eq!(signed_value(value), expected, "sibling {name}");
+    }
+    // The `garbage_collection` proplist reads the same store, so the two cannot disagree.
+    let reply = info(&mut runtime, pid, "garbage_collection").expect("garbage_collection");
+    let (_, value) = pair(reply);
+    let entries: Vec<Eterm> = terms::list_elements(value).expect("a proplist");
+    for entry in entries {
+        let (key, value) = pair(entry);
+        let name = runtime.atom_name_of(key).expect("an item name");
+        let expected = match name {
+            "min_heap_size" => Some(1598),
+            "min_bin_vheap_size" => Some(121_536),
+            "fullsweep_after" => Some(3),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(signed_value(value), expected, "garbage_collection {name}");
+        }
+    }
+}
+
 #[test]
 fn max_heap_size_is_the_oracle_flag_map() {
     let mut runtime = runtime();
