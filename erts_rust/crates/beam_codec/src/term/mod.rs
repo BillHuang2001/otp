@@ -578,6 +578,32 @@ pub fn cons_tail(term: Eterm) -> Result<Eterm> {
     Ok(unsafe { beam_term::cdr(term) })
 }
 
+/// Builds a proper list of `items` on `heap` — `items[0]` is the head — and returns
+/// the list term.
+///
+/// A **test-only** counterpart of [`cons_head`]/[`cons_tail`], for the encoder suites
+/// that need a container holding several terms (the per-fun identity resolver's
+/// two-lambda shapes). It lives here because this subtree is the crate's one
+/// `unsafe`-allowed module (see the module docs).
+#[cfg(test)]
+pub(crate) fn make_list(heap: &mut Heap, items: &[Eterm]) -> Eterm {
+    use beam_term::prelude::{make_list as list_term, NIL};
+
+    let mut tail = NIL;
+    for &item in items.iter().rev() {
+        // SAFETY: `alloc_words(2)` returns two exclusively-owned, writable words —
+        // exactly one cons cell's header-less `[CAR, CDR]` block — and both are written
+        // before the term escapes.
+        let hp = unsafe { heap.alloc_words(2).expect("the caller's heap is large enough") };
+        unsafe {
+            *hp = item;
+            *hp.add(1) = tail;
+        }
+        tail = list_term(hp as *const Eterm);
+    }
+    tail
+}
+
 #[cfg(test)]
 mod tests {
     //! Raw-word unit tests: every block layout is asserted word-by-word against the
