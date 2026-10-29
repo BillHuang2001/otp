@@ -191,7 +191,66 @@ fn with_error_payloads(
 /// `badarg`. A table with no `error_info` atom can match no term, which is also
 /// `None` (correct, not a fallback).
 fn scan_error_info(ctx: &BifContext<'_>, options: Eterm) -> Option<Eterm> {
-    let err_info_atom = ctx.atoms().lookup("error_info")?;
+    scan_error_info_at(options, ctx.atoms())
+}
+
+/// The stacktrace-side payload of `erlang:error/2,3` — the caller's argument list and,
+/// for `error/3`, the `error_info` map the raise carries.
+///
+/// Built by [`error_meta`] from the same option rule [`scan_error_info`] applies. ERTS
+/// keeps the pair in the exception object (`{Reason, Args}` / `{Reason, Args, ErrorInfo}`,
+/// `error_2`/`error_3` in `../../erts/emulator/beam/bif.c:1448-1503`) and renders it into
+/// the **innermost** stacktrace item: the argument list in the item's `A` slot, the map as
+/// the last element of its `Location` list (`erts_build_mfa_item`,
+/// `../../erts/emulator/beam/utils.c:3430-3457`).
+///
+/// This is the host-facing **model** of that payload; the raise itself carries the two
+/// words on [`Raise::saved_args`](beam_common::Raise::saved_args) /
+/// [`Raise::error_info`](beam_common::Raise::error_info) (see [`with_error_payloads`]), and
+/// the engine's `families/exceptions/bif_frame.rs` renders them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorMeta {
+    /// The caller's argument list, **verbatim** — never validated, never coerced.
+    ///
+    /// ERTS stores whatever `error/2,3`'s second argument was, whatever its shape
+    /// (`error(foo, notalist)` keeps the atom `notalist`); the renderer is what degrades a
+    /// non-list to the plain arity (`is_list(args) || is_nil(args)` in `erts_build_mfa_item`),
+    /// not this rule.
+    pub args: Eterm,
+    /// The `error_info` map the raise carries, or `None` when the option list held no
+    /// conforming one (see [`error_meta`]).
+    pub error_info: Option<Eterm>,
+}
+
+/// [`ErrorMeta::args`] plus the `error_info` the C's `error/3` extracts from `options`
+/// (`../../erts/emulator/beam/bif.c:1462-1503`).
+///
+/// `options` is `None` for the `error/2` shape, which always carries `args` and never an
+/// `error_info`. The rule is [`scan_error_info`]'s: a proper, non-empty list whose every
+/// element is `{error_info, Map}` with `is_map(Map)` yields the **last** such map;
+/// everything else (empty list, improper list, any illegal element, a non-list) yields
+/// `None` — never `badarg`, because `args` and `options` are never validated.
+///
+/// `atoms` resolves the `error_info` name; a table that does not know it can never match,
+/// which is the same namespace every comparison in this crate reads.
+///
+/// Oracle-pinned (`tests/error_meta.rs`): `[]` ⇒ none, `[{error_info,#{}}]` ⇒ `#{}`,
+/// `[{error_info,#{a=>1}},{error_info,#{b=>2}}]` ⇒ `#{b=>2}` (last wins),
+/// `[{error_info,bogus}]` / `[{bogus,1}]` / `[bogus]` / `notalist` /
+/// `[{error_info,#{a=>1}}|tail]` / `[{error_info,#{a=>1}},bogus]` ⇒ none.
+#[must_use]
+pub fn error_meta(args: Eterm, options: Option<Eterm>, atoms: &AtomTable) -> ErrorMeta {
+    let error_info = match options {
+        None => None,
+        Some(options) => scan_error_info_at(options, atoms),
+    };
+    ErrorMeta { args, error_info }
+}
+
+/// [`scan_error_info`]'s rule, resolved against an [`AtomTable`] instead of a
+/// [`BifContext`] (the shape [`error_meta`] exposes to hosts).
+fn scan_error_info_at(options: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+    let err_info_atom = atoms.lookup("error_info")?;
     let mut error_info: Option<Eterm> = None;
     let mut list = options;
     while access::is_list(list) {
