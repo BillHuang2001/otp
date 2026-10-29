@@ -1,17 +1,17 @@
 {
   "schema": "suites/1",
-  "generated_at": 1793255881,
-  "run_command": "suites run --target khepri --jobs 4 --out erts_rust/tools/suites/results/khepri",
+  "generated_at": 1793263701,
+  "run_command": "suites run --target khepri --jobs 4 --out results/khepri",
   "host": {
-    "loadavg_before": "38.75 42.77 30.63 4/964 12",
-    "loadavg_after": "31.68 40.27 30.41 5/889 3610",
+    "loadavg_before": "9.06 10.67 10.47 97/1596 5",
+    "loadavg_after": "14.85 12.52 11.17 18/954 3603",
     "nproc": 16,
     "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
     "oracle_version": "29/17.1.1"
   },
   "rust": {
-    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt",
-    "sha": "125ca3a9f3f7260dfc2400faff18117b67834558",
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt",
+    "sha": "71ffbbb37971d0b193e0dc74b60b6c448874349e",
     "version": "30/17.1",
     "tier": null
   },
@@ -53,7 +53,7 @@
         {
           "side": "rust",
           "purpose": "eunit advanced_delete",
-          "command": "cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
+          "command": "cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
         },
         {
           "side": "build",
@@ -63,16 +63,16 @@
       ],
       "tally": {
         "measured": 43,
-        "agree": 12,
+        "agree": 20,
         "agree_fail_identical": 8,
         "divergence": 2,
         "oracle_only_fail": 0,
-        "rust_gap": 29,
+        "rust_gap": 21,
         "not_run": 0,
         "sys_passed": 1500,
         "sys_failed": 1,
-        "rust_passed": 285,
-        "rust_failed": 8
+        "rust_passed": 412,
+        "rust_failed": 1
       },
       "rows": [
         {
@@ -87,11 +87,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -108,11 +108,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -129,11 +129,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -150,11 +150,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "error",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "======================== EUnit ======================== module 'advanced_tx_delete' advanced_tx_delete:22: -delete_non_existing_node_test_/0-fun-4-...[0.097 s] ok advanced_tx_delete:30: -delete_non_existing_node_test_/0-fun-1-...[0.001 s] ok"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -171,11 +171,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -192,11 +192,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -213,13 +213,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 22,
-            "failed": 5,
+            "status": "pass",
+            "passed": 36,
+            "failed": 0,
             "skipped": 0,
-            "detail": "*failed*: **error:{assertEqual,"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -234,11 +234,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -255,11 +255,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -339,11 +339,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 3,
+            "status": "unsupported",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -381,13 +381,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 10,
-            "failed": 1,
+            "status": "pass",
+            "passed": 11,
+            "failed": 0,
             "skipped": 0,
-            "detail": "*failed*: **error:unsupported_local_fun"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -402,11 +402,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -423,11 +423,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -465,11 +465,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -486,13 +486,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 0,
+            "status": "pass",
+            "passed": 6,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -528,13 +528,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 21,
+            "status": "fail",
+            "passed": 26,
             "failed": 1,
             "skipped": 0,
-            "detail": "*failed*: **error:{assert,[{module,keep_while_conditions},"
+            "detail": "keep_while_conditions: delete_node_with_many_dependents: **error:{assert,[{module,keep_while_conditions},"
           },
-          "verdict": "rust-gap",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -549,11 +549,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -675,11 +675,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 2,
-            "failed": 1,
+            "status": "unsupported",
+            "passed": 0,
+            "failed": 0,
             "skipped": 0,
-            "detail": "*failed*: **throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -738,13 +738,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 5,
+            "status": "pass",
+            "passed": 13,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -801,13 +801,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 0,
+            "status": "pass",
+            "passed": 15,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -864,11 +864,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -885,11 +885,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -906,11 +906,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -927,13 +927,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 0,
+            "status": "pass",
+            "passed": 46,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -948,11 +948,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -969,11 +969,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 2,
+            "status": "unsupported",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -990,11 +990,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -1011,11 +1011,11 @@
             "detail": "stored_procs:165: -crashing_sproc_stacktrace_test_/0-fun-1- (Execute the stored procedure): **error:{assertMatch,"
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "divergence",
           "note": ""
@@ -1053,13 +1053,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 0,
+            "status": "pass",
+            "passed": 6,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -1074,11 +1074,11 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
+            "status": "unsupported",
             "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": "opcode: run: process blocked (no message available)"
           },
           "verdict": "rust-gap",
           "note": ""
@@ -1116,13 +1116,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "cancelled",
-            "passed": 0,
+            "status": "pass",
+            "passed": 33,
             "failed": 0,
             "skipped": 0,
-            "detail": "**throw:{error,"
+            "detail": ""
           },
-          "verdict": "rust-gap",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -1154,7 +1154,7 @@
         "jobs: 4 concurrent module runs (each in its own OS process and working directory)",
         "per-module working directory: `/tmp/erts-suites-stage/khepri/cwd` (khepri's tests create `_test.<name>` dirs relative to the cwd; both sides of a module share one)",
         "sys: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'`",
-        "rust: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A615/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'`"
+        "rust: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'`"
       ]
     }
   ]
