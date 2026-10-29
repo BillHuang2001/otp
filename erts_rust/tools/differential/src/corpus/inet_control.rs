@@ -102,7 +102,7 @@
 //!   on both runtimes (the driver arms, the caller's bound elapses, the socket stays open).
 //! * **`tcp_accept_ownership_follows_the_acceptor`** — the accepted connection belongs to the process
 //!   that called `gen_tcp:accept/1`, not to the listener's owner: the acceptor and, after
-//!   `inet:tcp_controlling_process/2`, the third process each see `port_info(S, connected)` name
+//!   `gen_tcp:controlling_process/2`, the third process each see `port_info(S, connected)` name
 //!   *themselves* (both pids reduced to `=:= self()`), so the golden carries no volatile pid.
 //!
 //! Ids are `inet_control/<snake_case_name>`; the contract is A.4 ([`Contract::DriverAbi`]) plus
@@ -605,7 +605,7 @@ pub(crate) fn group() -> Vec<Case> {
             "inet_control/tcp_accept_ownership_follows_the_acceptor",
             "a connection accepted by a process that does not own the listener is owned by the \
              accepting process — erlang:port_info(S,connected) names it, never the listener's \
-             owner — and inet:tcp_controlling_process/2 then hands the socket on to a third \
+             owner — and gen_tcp:controlling_process/2 then hands the socket on to a third \
              process, whose port_info(S,connected) names it in turn",
             &[Contract::DriverAbi, Contract::OtpApps],
             "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
