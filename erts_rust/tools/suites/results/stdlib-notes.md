@@ -103,9 +103,12 @@ The re-check covers the three suites that own every rust-side `TIMEOUT`:
 twice on purpose: `binary_module:copy` is §E's excluded row that D10 explains, and
 `longest_common_trap` is both one of D1c's 13 missing cases and the D10 gap that case needs.
 `<rt>` below means either binary. Class ids are the ones in
-`results/stdlib-diagnostics/FINDINGS.md`, which re-verifies each one: **5 fixed** (D1b, D3, D4, D5 — on
-the `try/catch` route — and D7), **6 still present** (D1, D1c, D2, D8, D9, D11) and **2 changed class**
-(D6, D10).
+`results/stdlib-diagnostics/FINDINGS.md`, which re-verifies each one against the current runtime: **5 fixed**
+(D1b, D3, D7, D9, D10), **5 still present** (D1, D2, D4 — `maps:put/3` identity on the compiled route — D8,
+D11), **1 partially present** (D5, the legacy-`catch` head frame only), **2 changed class** (D1c — the suite
+abort is gone, the raise reason is now the placeholder atom `'exit <structured reason>'` — and D6) and **2 new**
+(D12, a `utf32` segment ignoring `little`/`native`, and D12b, `unicode:characters_to_binary/3`'s latin1
+error split). `FINDINGS.md` is authoritative for every verdict below.
 
 ### D1 — the `system_limit` family — 16 rows, two mechanisms
 
@@ -240,8 +243,9 @@ Row: `maps_SUITE:doctests` (`{1,errors}`). The captured doctest transcript
      in call from prim_eval:arg_reg_alloc/0
 ```
 
-- compiled code: catchable `error:'unsupported: erlang:bump_reductions/1'`
-- through `-eval`: the CLI-level `beam_rt: unsupported: erlang:bump_reductions/1`, exit 3
+- compiled code: a catchable `error:unsupported_bif` (legacy `catch` sees `{'EXIT',{unsupported_bif,[…]}}`)
+- through `-eval`, uncaught: the CLI-level `beam_rt: unsupported: bif`, exit 3 — the suite never observes this,
+  because `setlimit`-style callers are compiled code and the reason is a real Erlang exception there
 - oracle: `true`
 
 A typed gap, never a wrong answer; the two manifestations differ by caller route (the doctest evaluator
@@ -269,7 +273,13 @@ accounting/preemption. A third timeout row, `maps_SUITE:t_intersect`, is not of 
 suite's heavy `check_map_combiners_same_small/large` workload (a fold over `gb_sets` intersections),
 which also agrees in the 120 s re-check.
 
-### D9 — `erlang:apply/2` is not implemented — 1 row
+### D9 — `erlang:apply/2` — served; the row agrees — 0 rows
+
+The value matrix now agrees (`apply_args_probe.erl`, `queue_oops_probe.erl`): a fun applied to a proper
+argument list, `badarg` for a non-fun / non-list and for `apply(erlang, self)`. The only residual is the
+arity-mismatch **reason**, which degrades `{badarity,{Fun,Args}}` to plain `badarg` (**Owner:** `beam_rt`,
+the native floor's arity check). `queue_SUITE:oops` is `pass`/`pass` = `agree` in `../stdlib/report.json`.
+The paragraphs below record the mechanism the fix addressed; `FINDINGS.md` §D9 carries the current matrix.
 
 Row: `queue_SUITE:oops`. The case drives 3 142 random `queue` operations and compares `queue:*` with the
 suite's own emulation model; it throws `{diff,[{value,empty},{error,badarg},peek,[{[],[]}],[{[]}]]}` —
@@ -305,7 +315,7 @@ semantics and must move with the fix). The engine and `beam_bifs` are correct by
 `crates/beam_engine/src/families/funs/call_ext_apply.rs` pins that arity 2 must reach the host's own
 `apply/2`.
 
-### D10 — `erts_debug:set_internal_state/2` is not served — 9 rows
+### D10 — `erts_debug:set_internal_state/2` — served (the xchg rule agrees) — 0 rows
 
 Rows: `unicode_SUITE:binaries_errors_limit`, `exceptions`, `latin1`, `random_lists`, `roundtrips`,
 `utf16_illegal_sequences_bif`, `utf8_illegal_sequences_bif` (all through `setlimit/1`) plus
@@ -319,11 +329,10 @@ erts_debug:set_internal_state(unicode_loop_limit,10)          → 40000   (previ
                                                               → error:unsupported_bif (rust, compiled)
 ```
 
-Through `-eval` the same second call leaves as the CLI-level `beam_rt: unsupported: bif` and exit 3,
-which is what `FINDINGS.md`'s one-liner observes; the suite records the catchable form, because
-`setlimit/1` is compiled code. **Owner:** `beam_bifs`/`beam_rt`. `binary_module_SUITE:copy` is this class
-and not a capability statement about copying: at the 10 s budget the oracle times out and the row records
-`agree-fail-identical`, while at 120 s the oracle passes and rust still stops on this gap (§E).
+Both sides answer the **previous** value for every limit (`unicode_loop_limit` `40000`, `binary_loop_limit` `0`,
+`re_loop_limit` `64000`), the gate-off call answers `undef` on both sides, and an uncaught `-eval` call no longer
+leaves through the CLI channel. **Owner:** `beam_bifs` (`src/runtime/erts_debug.rs`).
+`binary_module_SUITE:copy` is therefore no longer blocked by this class: at 120 s both sides pass it.
 
 ### D11 — `erlang:trace_delivered/1` rejects an exited pid — 1 row
 

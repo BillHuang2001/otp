@@ -1,266 +1,171 @@
-# Khepri divergence classes RC-A…RC-D — re-verified at HEAD
+# Khepri divergence classes RC-A…RC-F — current state
 
-Measurement/diagnosis only: nothing in this directory changes a runtime crate, and
-`/home/bill/Source/khepri` was never written (the staged copy
-`$TMPDIR/erts-suites-stage/khepri/proj` was used read-only).
+Measurement/diagnosis only: nothing in this directory changes a runtime crate, and `/home/bill/Source/khepri` is never written (the staged copy `$TMPDIR/erts-suites-stage/khepri/proj` is used read-only).
+Every row below is re-measured with the committed probes; the sweep row table is `results/khepri/report.json` (+ `summary.md`).
+Verdict vocabulary: `fixed` · `still present` · `changed class` (the same class, a different surviving shape).
+
+## Environment and method
+
+| item | value |
+|---|---|
+| sweep recorded here | `results/khepri/{report.json,summary.md}` — runtime commit `71ffbbb37971d0b193e0dc74b60b6c448874349e`, tier `default` |
+| rust runtime | `erts_rust/target/release/beam_rt` (release, same commit), `system_info(version)` → `30/17.1` |
+| oracle | system `erl`/`erlc` on `$PATH` — OTP `29.1.2`, erts `17.1.1` (the tree pins erts `17.1`, so the oracle's patch differs by design) |
+| khepri | `2ac09291bac7`, staged `rebar3 as test compile` **reused**, not rebuilt |
+| code path (both sides, identical) | 11 `-pa` entries: `aten cf cth_readable gen_batch_server horus khepri meck proper ra seshat` `*/ebin` + `_build/test/lib/khepri/test` |
+| drive (identical both sides) | `eunit:test('<module>',[verbose]), halt(0).` |
+| probes | `erlc -o $TMPDIR/kdiag/beams results/khepri-diagnostics/*.erl` (oracle `erlc`), then each side in its **own** throwaway cwd: `<runtime> -noshell -pa <beams> <khepri -pa…> -eval '<probe>:main(), halt(0).'` |
+| host | 16 logical CPUs, **shared**; 1-min loadavg observed 10.79–128 during this session (RC-D measured ABBA-ordered in a 10.8–15.1 window) |
+
+Only counts and same-host paired ratios are portable; the millisecond columns are host observations, never benchmark claims.
+The system `erl` prints **nothing** when a `-eval` expression raises (it exits 1 silently), so every probe wraps each expression in `try … catch`; a probe row that dies without a line is a crash, not a harness gap.
 
 ## Verdicts
 
 | # | Check (smallest expression) | Oracle (`erl`) | Rust (`beam_rt`) | Verdict |
 |---|---|---|---|---|
-| RC-A | `file:write(Fd, [<<"ab">> \| <<"cd">>])` on a `[write,raw,binary,read]` fd | `ok` | `ok` | **fixed** |
-| RC-A | `file:pwrite(Fd, 0, [<<"ab">> \| <<"cd">>])` / `file:pwrite(Fd, [{0, [<<"ab">> \| <<"cd">>]}])` | `ok` | `ok` | **fixed** |
-| RC-A | `dets:open_file(t, [{file, "dets_probe.dets"}])` + `insert/sync/lookup/close/reopen` | `{ok, t}`, 3 records, size 3, reopen `{ok, t}` | identical | **fixed** |
-| RC-A | md5 of the files those writes produce (`raw_probe.dat`, `dets_probe.dets`) | `827f51cc…`, `d9259f29…` | same two md5s (byte-identical) | **fixed** |
-| RC-B | `process_flag(min_heap_size, 233)` | `233` | `error:badarg` | **still present** |
-| RC-B | `process_flag(min_bin_vheap_size, 46422)` | `46422` | `error:badarg` | **still present** |
-| RC-B | `process_flag(fullsweep_after, 0)` | `65535` | `error:badarg` | **still present** |
-| RC-B | `process_flag(max_heap_size, #{size => 0})`, `save_calls`, `message_queue_data`, `priority` | previous value | same previous value | agree |
-| RC-B | `process_info(self(), trap_exit)` in the `-eval` process | `true` | `false` | **still present** (detail narrowed: the **initial state of the `-eval` process**, not the BIF) |
-| RC-B | `process_flag(trap_exit, true)` in the `-eval` process | `true` | `false` (follows from the row above) | **still present** |
+| RC-A | `file:write(Fd, [<<"ab">> \| <<"cd">>])`, both `pwrite` shapes, `dets` lifecycle | `ok` | `ok` | **fixed** |
+| RC-A | md5 of `raw_probe.dat` / `dets_probe.dets` (12 / 5 933 bytes) | `827f51cc…` / `d9259f29…` | same two md5s | **fixed** |
+| RC-B | `process_flag(min_heap_size, 233)` | `233` | `233` | **fixed** |
+| RC-B | `process_flag(min_bin_vheap_size, 46422)` | `46422` | `46422` | **fixed** |
+| RC-B | `process_flag(fullsweep_after, 0)` | `65535` | `65535` | **fixed** |
+| RC-B | `spawn_opt(Fun,[{min_heap_size,233}])` / `[{fullsweep_after,0}]` / `[{min_bin_vheap_size,46422}]` | `233` / `0` / `46422` | same | **fixed** |
+| RC-B | `ra_log_wal:init/1` flag preface (`process_info(self())`, one spawned process) | `[{trap_exit,false},{message_queue_data,on_heap},{min_bin_vheap_size,46422},{min_heap_size,233}]` | identical | **fixed** |
+| RC-B | `process_info(self(), trap_exit)` in the **`-eval` process** | `{ok,true}` | `{ok,false}` | **still present** |
+| RC-B | `process_flag(trap_exit, true)` in the `-eval` process | `true` | `false` | **still present** |
 | RC-B | `process_flag(trap_exit, true)` in a plain `spawn/1` process | `false` | `false` | agree |
-| RC-B | `spawn_opt(Fun, [{min_heap_size,233}])` / `[{fullsweep_after,0}]` / `[{min_bin_vheap_size,46422}]` | `233` / `0` / `46422` | same | agree |
-| RC-B (Khepri wall) | `ra_log_wal:init/1`'s flag preface (ra/src/ra_log_wal.erl:308-314) on one process | `[{trap_exit,false},{message_queue_data,on_heap},{min_bin_vheap_size,46422},{min_heap_size,233}]` | `error:badarg` at the third call (line 313) | **still present**, now the first wall |
-| RC-C | `erlang:external_size(fun() -> ok end)` (bare fun) | `87` | `87` | agree |
-| RC-C | `erlang:external_size({x, fun() -> ok end, y})` | `95` | `error:unsupported_local_fun` | **still present** |
-| RC-C | `term_to_binary({fun() -> ok end})` / `({x, fun() -> ok end})` / `([fun() -> ok end])` / `(#{k => fun() -> ok end})` | `89` / `92` / `93` / `95` bytes | `error:unsupported_local_fun` on all four | **still present** |
-| RC-C | `keep_while_conditions`-style row: `display_tree` eunit module | 11 passed / 0 failed | 10 passed / 1 failed (`machine_overview_test`, `error:unsupported_local_fun`) | **still present** |
-| RC-D | 2 500 keep-while dependents, one `#delete{path = [target]}` | 28 / 37 / 43 / 47 ms (4 runs) | 7 234 / 7 343 / 8 591 / 10 250 / 11 784 ms (5 runs) | **still present** (≈ 170–420×, same order of magnitude as the old record) |
-| RC-D | the module's own assertion `?assert(DeletionTime < 1000)` (test/keep_while_conditions.erl:800) | passes | **fails** (`keep_while_conditions` eunit: 21 passed / 1 failed, then context cancelled) | **still present** |
-| RC-D | deleted node set of that delete | 2 502 nodes | 2 502 nodes | agree (latency only) |
-| RC-D | 100-node dependency chain (`delete_node_with_dependency_chain/0`) | 2 ms | 50 ms (≈ 25×) | slower, assertion still passes |
-
-Nothing in RC-A…RC-D became *worse*; the only class that changed at all is RC-A (fixed) and
-RC-B's `trap_exit` entry (root cause narrowed to the eval process's birth flag, not the BIF).
-
-## What was run
-
-- Rust runtime: `erts_rust/target/release/beam_rt` built from this worktree at
-  `a56bef586b61fcf0a9b2b67c30f13ba112a8ad7d`
-  (`erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt --release`).
-- Oracle: the system `erl`/`erlc` on `$PATH` — OTP 29.1.2, erts `17.1.1` (the tree pins
-  OTP 30.0-rc0 / erts `17.1`, so the oracle's `erts` patch differs by design).
-- Probes: `erlc -o <dir> results/khepri-diagnostics/*.erl`, then each side run in its **own**
-  throwaway cwd:
-  `<runtime> -noshell -pa <dir> -eval '<probe>:main(), halt(0).'`
-  (own cwd matters for `dets_probe.erl`, which writes relative paths so the two files can be
-  compared with `cmp`/`md5sum`).
-- Khepri: staged build at `$TMPDIR/erts-suites-stage/khepri/proj`; code path = the 10
-  `_build/test/lib/*/ebin` plus `_build/test/lib/khepri/test` (11 `-pa` entries), identical on
-  both sides; eunit rows via `eunit:test(<module>, [verbose]), halt(0).`.
-- The host is shared and was loaded throughout (1-min loadavg 7–67 during this session);
-  **only counts and same-host ratios are portable** — the millisecond columns are host
-  observations, never benchmark claims. RC-D's ratio is far outside the noise band.
+| RC-C | `erlang:external_size(fun() -> ok end)` / `({x, fun() -> ok end, y})` / `([fun() -> ok end])` / `(#{k => fun() -> ok end})` | `87` / `95` / `93` / `95` | same | **fixed** |
+| RC-C | `term_to_binary` of the same five shapes (incl. a named `fun Fact/1`) | `95` / `89` / `92` / `93` / `95` | same | **fixed** |
+| RC-C | `term_to_binary({F1, F2})` / `external_size({F1, F2})` with **two different** lambdas | `175` / `175` | `error:unsupported_local_fun` | **still present** (changed class: only multi-closure terms) |
+| RC-C | a closure built by `erl_eval:exprs/2` | `138` | `138` | agree |
+| RC-C | `byte_size(term_to_binary(fun() -> ok end))` typed into the `-eval` walker | `138` | `beam_rt: unsupported: local_fun` (exit 3) | **still present** (changed class) |
+| RC-C | `display_tree` eunit module (in situ) | 11 passed / 0 failed | 11 passed / 0 failed | **fixed** |
+| RC-D | 2 500 keep-while dependents, one `#delete{path = [target]}` | 27/27/28/27 ms | 5 688/5 677/5 650/5 749 ms | **still present** (≈210×) |
+| RC-D | that delete's `?assert(DeletionTime < 1000)` (`test/keep_while_conditions.erl`) | passes | **fails** (`keep_while_conditions` 26/1) | **still present** |
+| RC-D | deleted node set of the same delete | 2 502 nodes | 2 502 nodes | agree (latency only) |
+| RC-D | 100-node dependency chain | 3/2/2/2 ms | 47/46/47/48 ms (≈23×) | slower, assertion passes |
+| **RC-E** | `eunit:test('simple_get',[verbose])` in the `-eval` process | `All 94 tests passed` | `beam_rt: unsupported: opcode: run: process blocked (no message available)`, exit 3 | **still present** — 20 sweep rows |
+| **RC-F** | `eunit:test('advanced_tx_delete',[verbose])` | 39 passed / 0 failed | **SIGSEGV** (exit 139, 3/3), no summary | **still present** — 1 sweep row |
 
 ## RC-A — fixed (iodata walk + on-disk bytes)
 
-`iodata_probe.erl` (unchanged) now prints `ok` / `ok` / `ok` / `ok` / `{ok, iodata_probe_tab}`
-on both runtimes — the improper-iolist write, both `pwrite` shapes and `dets:open_file/2`.
+`iodata_probe.erl` prints `ok` / `ok` / `ok` / `ok` / `{ok, iodata_probe_tab}` on both runtimes.
+`dets_probe.erl` extends that to the bytes: the raw writes produce a 12-byte `raw_probe.dat` with the same md5 on both sides, and `dets:open_file/insert/sync/lookup/info/close/reopen` produces a 5 933-byte `.dets` file with the same md5 on both sides.
+What to run to see it: `dets_probe:main()` each side in its own cwd, then `md5sum raw_probe.dat dets_probe.dets`.
 
-`dets_probe.erl` (new) extends that to the bytes and to the `dets` lifecycle:
+## RC-B — the three heap-sizing flags are fixed; the `-eval` process's birth `trap_exit` is still present
 
-| expression | oracle | rust |
-|---|---|---|
-| `file:open("raw_probe.dat", [write,raw,binary,read])` | `{ok, Fd}` | `{ok, Fd}` (fd descriptor map differs — see "side observations") |
-| `file:write(Fd, [<<"ab">> \| <<"cd">>])` | `ok` | `ok` |
-| `file:pwrite(Fd, 8, [<<"ef">> \| <<"gh">>])` | `ok` | `ok` |
-| `file:pwrite(Fd, [{0, [<<"AB">> \| <<"CD">>]}])` | `ok` | `ok` |
-| `file:position(Fd, eof)` / `file:read_file/1` | `12` / `<<"ABCD",0,0,0,0,"efgh">>` | identical |
-| `dets:open_file/insert/sync/lookup/info size/close` | `{ok,t}` / `ok` / `ok` / `[{k2,"two"}]` / `3` / `ok` | identical |
-| reopen the written file, `lookup(k1)`, close | `{ok,t}` / `[{k1,1}]` / `ok` | identical |
-| file size of the `dets` file | 5 933 bytes | 5 933 bytes |
-| `md5sum` of `raw_probe.dat` | `827f51cc021984df97cb6c8973af2198` | `827f51cc021984df97cb6c8973af2198` |
-| `md5sum` of `dets_probe.dets` | `d9259f291bac3a555d6afb4b8bc77af8` | `d9259f291bac3a555d6afb4b8bc77af8` |
+The fix in `crates/beam_rt/src/context/process_bridge.rs` serves `min_heap_size`, `min_bin_vheap_size` and `fullsweep_after` (old-value return; the 233 / 46 422 floors; no floor for `fullsweep_after`), and it is **bookkeeping only** — the values are recorded, not yet fed to a GC-policy input.
+Consequence: `ra_log_wal:init/1`'s flag preface completes, so RC-B is no longer a Khepri wall and 29 previously-blocked modules now run (the `app`, `conditions`, `projections`, `simple_tx_delete`, … rows are green or blocked by RC-E instead).
+The surviving shape is the `-eval` process's *birth* flag: on the oracle that process is born with `trap_exit = true`, on this runtime with the spawn default `false`, so `process_flag(trap_exit, true)` answers `false` (a plain `spawn/1` process agrees).
+Owning crate: **`beam_rt`** — the CLI/`-eval` bootstrap path under `crates/beam_rt/src/eval*/` never sets `trap_exit` on the evaluator process.
+What to run to see it: `trap_exit_probe:main()` / `process_flag_probe:main()` on both sides.
 
-So the `ra_log_ets` step of the Khepri fixture now gets through: the crash chain that used to
-be `dets:init/2 → dets_v9:init_file/17 → dets_utils:pwrite/3 → {case_clause,{error,badarg}}`
-is gone, and the next wall is RC-B (below).
+## RC-C — single-closure encodings are fixed; multi-closure terms and a walker-made closure are still present
 
-## RC-B — still present, and it is the Khepri wall
+Every single-fun shape now encodes byte-identically (bare fun, one fun inside a tuple/list/map, a named `fun Fact/1`, and a closure built by `erl_eval:exprs/2`), and `display_tree` agrees 11/0 in the sweep.
+The two surviving shapes are (a) a term containing **two different** lambdas — `term_to_binary({F1, F2})` and `external_size({F1, F2})` answer `175` on the oracle and `{error,unsupported_local_fun}` here, because the encoder carries **one** closure identity rather than one per fun — and (b) a closure created by the `-eval` tree-walker itself, which is not a compiled module fun at all (`beam_rt: unsupported: local_fun`).
+Owning crates: **`beam_bifs`** (`crates/beam_bifs/src/binconv.rs::term_encoder`) over **`beam_codec`**'s `Encoder` (a single `FunIdentity` slot) — the term walk must carry one identity per fun (or delegate the whole encoding to `beam_codec`).
+For (b) the seam is `crates/beam_rt/src/eval/` (the walker's closure term must become a `beam_codec`-encodable identity, as `erl_eval:exprs/2`'s already is).
+What to run to see it: `external_size_probe:main()` on both sides.
 
-`process_flag_probe.erl` (unchanged):
+## RC-D — still present (keep-while delete fan-out, performance)
 
-| expression | oracle | rust |
-|---|---|---|
-| `process_flag(min_heap_size, 233)` | `233` | `{'EXIT',{badarg,[{process_flag_probe,'-main/0-fun-0-',1,…}]}}` |
-| `process_flag(min_bin_vheap_size, 46422)` | `46422` | same `badarg` |
-| `process_flag(fullsweep_after, 0)` | `65535` | same `badarg` |
-| `process_flag(max_heap_size, #{size => 0})`, `save_calls 5`, `message_queue_data off_heap`, `priority high` | previous value | same previous value (the map's *printing order* differs — see "side observations") |
+`keep_while_fanout_probe:main/0` builds 2 500 dependents on one node and deletes it; measured ABBA (`sys,rust,rust,sys` ×2) so the load drift is paired out.
 
-Owning crate: **`beam_rt`** — `crates/beam_rt/src/context/process_bridge.rs::process_flag`
-matches `trap_exit`, `sensitive`, `async_dist`, `priority`, `save_calls`, `error_handler`,
-`message_queue_data`, `max_heap_size` and falls through to `_ => Ok(None)`, which the BIF layer
-turns into `badarg`, for the three heap-sizing flags (lines 306–461; the fallthrough is the
-`_ => Ok(None)` arm at 460). The state the flags would set lives in `beam_process`'s
-`ProcessFlags`/collector policy and `beam_gc`'s heap sizing, so a fix spans `beam_rt` +
-`beam_process`/`beam_gc`, not `beam_bifs`.
-
-`trap_exit`, narrowed: the divergence is **not** in the BIF. On the oracle the process that runs
-`-eval` is born with `trap_exit = true`, so the first `process_flag(trap_exit, true)` answers
-`true`; on this runtime the eval process is born with the spawn default `false`, so it answers
-`false`. A plain `spawn/1`ed process agrees (`false` / `false`), and `spawn_opt` birth options
-agree. Owning crate: **`beam_rt`** (the CLI/`-eval` bootstrap process is never given
-`trap_exit`; there is no `set_trap_exit` on that path anywhere under `crates/beam_rt/src/eval*`).
-
-### The Khepri wall: smallest failing expression
-
-`ra_wall_probe.erl` reproduces the fixture call exactly
-(`ra_system:start(ra_system:default_config()#{name => …, data_dir => …, wal_data_dir => …,
-wal_max_size_bytes => 16*1024, names => ra_system:derive_names(…)}`):
-
-- oracle: `application:ensure_all_started(ra)` → `{ok,[sasl,crypto,aten,gen_batch_server,seshat,ra]}`,
-  `ra_system:start/1` → `{ok, <0.106.0>}`.
-- rust: `ensure_all_started(ra)` also succeeds, then the `ra_log_wal` child dies with the
-  runtime's own crash report:
-
-```
-exception error: bad argument
-  in function  process_flag/2
-  in call from ra_log_wal:init/1 (…/lib/ra/src/ra_log_wal.erl:313)
-  in call from gen_batch_server:init_it/2 (…/gen_batch_server.erl:225)
-```
-
-`ra_log_wal:init/1` calls, in order, `process_flag(trap_exit,true)` (:308, agrees),
-`process_flag(message_queue_data,off_heap)` (:312, agrees),
-`process_flag(min_bin_vheap_size, MinBinVheapSize)` (:313, **badarg**),
-`process_flag(min_heap_size, MinHeapSize)` (:314, **badarg**).
-
-**Smallest failing expression: `process_flag(min_bin_vheap_size, 46422)`** (`min_heap_size`
-fails identically; there is no Erlang-level workaround for a BIF that raises `badarg`, so
-nothing behind this point can be measured). Owning crate: **`beam_rt`** as above.
-
-## RC-C — still present, unchanged class
-
-`external_size_probe.erl` (extended with the nested shapes the old record listed):
-
-| expression | oracle | rust |
-|---|---|---|
-| `erlang:external_size(fun() -> ok end)` | `87` | `87` |
-| `term_to_binary(fun Fact(0)->1; Fact(N)->N*Fact(N-1) end)` | `87` | `87` |
-| `erlang:external_size({x, fun() -> ok end, y})` | `95` | `error:unsupported_local_fun` |
-| `term_to_binary({x, fun() -> ok end, y})` | `95` | `error:unsupported_local_fun` |
-| `term_to_binary({fun() -> ok end})` | `89` | `error:unsupported_local_fun` |
-| `term_to_binary({x, fun() -> ok end})` | `92` | `error:unsupported_local_fun` |
-| `term_to_binary([fun() -> ok end])` / `erlang:external_size([fun() -> ok end])` | `93` / `93` | `error:unsupported_local_fun` |
-| `term_to_binary(#{k => fun() -> ok end})` | `95` | `error:unsupported_local_fun` |
-| `term_to_binary(an_atom)` (control) | `10` | `10` |
-
-(The old record's `78` bytes for the bare fun is stale — both sides answer `87` for the probe as
-committed now, so the bare-fun row is an *agreement* either way; the discriminating rows are the
-nested ones.)
-
-In situ: `display_tree` → oracle `All 11 tests passed`, rust `Failed: 1. Passed: 10.` with
-
-```
-exception error: unsupported_local_fun
- in function erlang:external_size/1
-   called as erlang:external_size({put_v,{put_v1,[baz,fizz],{p_sproc,#Fun<display_tree.0.…>,false},…},…})
- in call from khepri_machine:compute_command_size/1 (src/khepri_machine.erl:2994)
- in call from display_tree:machine_overview_test/0 (test/display_tree.erl:380)
-```
-
-Owning crates: **`beam_bifs`** — `crates/beam_bifs/src/binconv.rs::term_encoder` asks the
-identity hook for the *whole* term (`ctx.local_fun_identity(term)` at :1010) and installs it as
-`Encoder::with_fun_identity` only when that answer is `Some`; a tuple/list/map containing the fun
-answers `None`, so the nested encode reaches `beam_codec`'s `encode_fun` with
-`fun_identity == None` (`crates/beam_codec/src/encode/fun.rs:66`) and gets the typed
-`unsupported_local_fun`. `beam_codec`'s `Encoder` holds a single `FunIdentity`
-(`with_fun_identity`), so a fix needs a per-fun resolver in the encoder API plus the caller
-passing every fun — the `beam_rt` side already has a per-term resolver
-(`crates/beam_rt/src/context/fun_identity.rs`), it simply is not consulted for nested funs.
-
-## RC-D — still present (performance), assertion still fails
-
-`keep_while_fanout_probe.erl` (new) reproduces both latency tests of
-`test/keep_while_conditions.erl` standalone (they are pure `khepri_machine:init/1` +
-`khepri_machine:apply/3` work — no `ra` — which is why they can be measured even though the
-module's other rows are blocked). One target node (`[target]`), `2 500` keep-while dependents
-(`?MAX_SIBLINGS_PER_PATTERN * 5 div 2`), then a single `#delete{path = [target]}`:
-
-| run | oracle `delete` | rust `delete` | ratio |
+| scenario | oracle | rust | ratio |
 |---|---|---|---|
-| 1 | 47 ms | 8 591 ms | ≈ 183× |
-| 2 | 43 ms | 7 234 ms | ≈ 168× |
-| 3 | 37 ms | 7 343 ms | ≈ 198× |
-| 4 | 28 ms | 10 250 ms | ≈ 366× |
-| 5 | 37 ms | 11 784 ms | ≈ 318× |
+| `insert` of the 2 500 dependents | 9–12 ms | ≈2 139–2 197 ms | ≈200× |
+| `delete` of the parent (2 500 dependents) | 27/27/28/27 ms (10–11 µs each) | 5 688/5 677/5 650/5 749 ms (2 260–2 299 µs each) | **≈210×** |
+| `deleted_count` | 2 502 | 2 502 | agree |
+| 100-node dependency chain | 3/2/2/2 ms | 47/46/47/48 ms | ≈23× |
+| the suite's `?assert(DeletionTime < 1000)` | passes | **fails** (one row of `keep_while_conditions`; the sweep reads 26/1 vs the oracle's 27/0) | — |
 
-Deleted-node count is **2 502 on both sides** in every run — the *result* agrees, only the
-latency does not, so `?assert(DeletionTime < 1000)` at test/keep_while_conditions.erl:800 fails
-on rust (7–12 s > 1 s) and passes on the oracle (28–47 ms < 1 s). Old record was 240–330×; this
-re-measurement lands in the same band (≈170–420×, host loaded throughout), i.e. **not fixed and
-not materially changed**.
+The cost is per-dependent work in the keep-while sweep, not the delete's result set; the owning crate is **`beam_ets`** (the `keep_while` condition index walk) with the engine tier as a multiplier — the shape is a full scan per dependent, so the fix must be an index lookup, not a faster loop.
+What to run to see it: `keep_while_fanout_probe:main()` on both sides (`scaling/0` for the chain).
 
-Through the real module: `eunit:test(keep_while_conditions)` → oracle `All 27 tests passed`;
-rust `Failed: 1. Passed: 21.` with the failure at that line, then the remaining rows cancel on
-the RC-B fixture.
+## RC-E — the nested-run pump wall (new; 20 of the 21 rust-gap rows)
 
-Scaling (same probe, delete only), which is the extra evidence the old record lacked:
+Every blocked row carries the identical first divergence `opcode: run: process blocked (no message available)` — a typed `beam_rt` capability gap, not a wrong result.
+The block is **route-dependent**, which is the decisive experiment:
 
-| dependents | oracle delete | oracle µs/dependent | rust delete | rust µs/dependent |
-|---|---|---|---|---|
-| 250 | 2 ms | 8 | 113 ms | 452 |
-| 500 | 5 ms | 10 | 422 ms | 844 |
-| 1 000 | 14 ms | 14 | 1 601 ms | 1 601 |
-| 2 500 | 43 ms | 17 | 7 234 ms | 2 893 |
+| what is driven | oracle | rust |
+|---|---|---|
+| `eunit:test('simple_get',[verbose])` from the `-eval` process (the sweep's route) | `All 94 tests passed` | `beam_rt: unsupported: opcode: run: process blocked (no message available)`, exit 3, after 9 stdout `ok` lines |
+| `block_wall_probe:eunit_here(simple_get)` — same, explicit | `All 94 tests passed` | same block, exit 3 |
+| `block_wall_probe:eunit_spawned(simple_get)` — eunit driven from a **spawned** process | `All 94 tests passed` | `All 94 tests passed`, `ok`, exit 0 (≈8 s) |
+| `block_wall_probe:leak(30)` — 30 manual `test_ra_server_helpers` fixtures, no eunit | n/a | completes, `process_count` flat at 65 |
+| `block_wall_probe:eunit_gen(12)` — 12 generated fixtures | 12/12 | blocked at fixture 4/5/6/7 on three runs, passed on a fourth |
 
-The oracle's per-dependent cost is near-flat (8 → 17 µs); rust's rises ≈ 6.4× over a 10×
-increase in dependents, i.e. **super-linear**, on top of a ≈ 50–170× constant. The insertion
-loop that builds the 2 500 dependents shows the same shape (oracle 11–24 ms, rust 2 912–5 180 ms
-→ ≈ 120–470×), and the 100-node dependency chain is ≈ 25× (2 ms → 50 ms).
-Owning crate: **not attributable from this measurement** — no profile was taken, and the probe
-only shows the shape. Two components are visible in the numbers: a per-`khepri_machine:apply/3`
-constant (the chain case, consistent with the baseline-JIT per-instruction machinery in
-`beam_engine` that `BOTTLENECKS.md` already names for the `foreign/*` rows) and a super-linear
-term in the number of keep-while dependents (the Khepri tree sweep: `khepri_tree`'s
-keep-while-condition matching over per-pattern chunks — Erlang code running on `beam_engine`,
-not a single BIF). Narrowing it needs a profile, which is outside this provenance task.
+`each_test/1` (every generator run on its own) and `eunit_twice/1` complete, so no fixture is broken and nothing leaks — the block is the *pump*, and it is intermittent (the same command passes and fails across runs).
 
-## Currently-blocked Khepri module groups
+### Blocked process pair and what it waits for
 
-| group | rows | first failing test | smallest failing expression | owning crate |
-|---|---|---|---|---|
-| `ra`-fixture group (every module whose fixture calls `helpers:start_ra_system/1`) | the 29 rows `results/khepri-notes.md` lists as RC-A/RC-B blocked | the eunit `{setup, …}` context — `helpers:start_ra_system/1` (test/helpers.erl:59, `throw/1` at :75) | `process_flag(min_bin_vheap_size, 46422)` (reached via `ra_log_wal:init/1`, ra/src/ra_log_wal.erl:313) | `beam_rt` (`context/process_bridge.rs::process_flag` fallthrough) |
-| `display_tree` (RC-C) | 1 | `display_tree:machine_overview_test/0` (test/display_tree.erl:380) | `erlang:external_size({x, fun() -> ok end, y})` | `beam_bifs` (`binconv.rs::term_encoder`) + `beam_codec` (single-identity `Encoder`) |
-| `keep_while_conditions` (RC-D) | 1 | `keep_while_conditions:delete_node_with_many_dependents/0` (line 800, the `DeletionTime < 1000` assert) | the 2 500-dependent `#delete{path = [target]}` of `keep_while_fanout_probe.erl` | unknown without a profile — shape points at `beam_engine`'s baseline tier + Khepri's keep-while sweep |
+- **Blocked:** the `-eval` process (`ProcessId { number: 35, serial: 4 }` in the trace), running a nested machine; it is parked in a `receive` on the reply to a call it made into the store (`gen_statem:call`/`gen_server:call` through `khepri`/`ra`).
+- **Peer that owes the reply:** the store's own server processes. At the block every one of them is `Waiting`: `gen_statem:loop/3` (the ra server), `gen_server:loop/5` with a `send_after` armed (`khepri_machine`, `khepri_cluster`), `gen_batch_server:loop_wait/2` (`ra_log_wal`), `dets:req/2` + `dets:open_file_loop2/2`.
+- The pump's last round ran **0** slices (`result=Ok(27)` earlier, then `ran=0`), delivered **0** port messages, and `states` shows the run target as the only `Runnable` process — so the reply has nowhere to be produced *within the round*, and the pump folds the round to `blocked()` instead of waiting out the peer's timer.
 
-Verified for the first group by running representatives on both sides (rust fails the fixture,
-oracle is green): `simple_put` (rust cancelled in setup / oracle green), `simple_get`
-(rust `Failed: 0. Passed: 0.` + `*** context setup failed ***` / oracle `All 94 tests passed`),
-`advanced_put` (0/0 / 40), `triggers` (0/0 / 118). Every one carries the identical
-`ra_log_wal.erl:313` → `process_flag/2` → `badarg` signature, so the group is still one wall.
+### Owning crate and fix seam
 
-**Unknown, not "passing":** with `process_flag(min_bin_vheap_size, …)` raising `badarg` and no
-Erlang-level workaround for a BIF, nothing behind `ra_log_wal:init/1` can be measured — the
-~1 200 Khepri tests those modules would run are `unknown`.
+- Text: **`beam_engine`** — `crates/beam_engine/src/error.rs:146 pub fn blocked()` (single definition of the string).
+- Emitter: **`beam_rt`** — `crates/beam_rt/src/context/pump.rs::pump_once:571`, the `if ran == 0 { return Ok(None); }` arm at `:604` (and the `!self.may_pump_scheduler()` refusal at `:578`), reached from `run_export_blocking:268` / `run_label_blocking:356` → `pump_until_returned:130`.
+- The round it cannot advance: `crates/beam_rt/src/runtime/scheduler.rs::pump_scheduler_boot:309`, whose progress test is bound by `TimerWait::ImminentWithin(TIMER_PUMP_SLICE)` with `TIMER_PUMP_SLICE = 100 ms` (`scheduler.rs:74`).
+- Fix direction: treat a wake of the run target (a plain send into the nested machine's mailbox) as progress, and/or wait out the earliest deadline once (bounded) before folding to `blocked()`; the structural fix is to run the `-eval` program on a scheduler process instead of on a nested machine.
+- Measurement-side mitigation (this crate's scope): drive eunit from a **spawned** process in `src/khepri.rs` (`observe`/`drive`) — `eunit_spawned/1` proves that route is green.
+
+What to run to see it: `block_wall_probe:eunit_here(simple_get)` (blocks) vs `block_wall_probe:eunit_spawned(simple_get)` (green) with the khepri `-pa` set; `block_wall_khepri:fixtures(N)` and `block_wall_fixture.erl` give the checkpointed variants used to locate the fixture.
+
+The 20 rows it explains: `advanced_delete`, `advanced_get`, `advanced_put`, `advanced_tx_get`, `advanced_tx_put`, `async_option`, `bang_functions`, `db_info`, `export`, `export_erlang`, `favor_option`, `machine_code_called_from_ra`, `projections`, `simple_delete`, `simple_get`, `simple_put`, `simple_tx_get`, `simple_tx_misc`, `simple_tx_put`, `triggers` — plus `stored_procs`' rust cell, which carries the same text (that row is a divergence only because the oracle has one failure of its own, 12/1).
+One wall, not several: the landing points differ per module (fixture count, which `ra` call is parked) but the emitter, the round budget and the route dependency are identical.
+
+## RC-F — `advanced_tx_delete` dies by SIGSEGV on a stale compiled match spec (1 row)
+
+The row's rust status is `error`, not `unsupported`: **the runtime process dies by SIGSEGV** (exit 139, reproduced 3/3 full-module runs; the shell reports `Segmentation fault`, and `coredumpctl` holds a SIGSEGV core per run).
+stdout stops after the two passing tests at `advanced_tx_delete:22` and `:30`, so there is no eunit summary for the harness to parse (`src/eunit.rs::parse` → `Unknown` → `Status::Error` via `target::unclassified`).
+The crash happens in the **third** fixture, `delete_non_existing_node_using_legacy_ret_test_` (`test/advanced_tx_delete.erl:36`), whose setup passes `#{machine_version => MacVer}` → `test_ra_server_helpers:setup/2` → `meck:new(khepri_machine, [passthrough])` + `meck:expect(khepri_machine, version, fun() -> MacVer end)`.
+That fixture run **alone** passes, so the module-level run is the reliable repro.
+The core backtrace (`gdb <beam_rt> <core>`, symbols present):
+
+```
+#0 beam_term::list::car            crates/beam_term/src/list.rs:86
+#1 beam_ets::select::list_elements crates/beam_ets/src/select/mod.rs:227
+#2 beam_ets::select::compile       crates/beam_ets/src/select/mod.rs:242
+#3 beam_ets::select::run::match_spec_run  crates/beam_ets/src/select/run.rs:69
+#4 beam_bifs::ets::specs::match_spec_run_2 crates/beam_bifs/src/ets/specs.rs:165
+```
+
+Mechanism: `ets:match_spec_compile/1` stores the **raw spec term verbatim** as a bare `Eterm` in `TableRegistry::specs` (`crates/beam_bifs/src/ets.rs::insert_spec:614`, read back by `spec_raw:624`), i.e. a word that aliases the compiling process's heap — the documented M1 substitution (`crates/beam_bifs/src/ets/specs.rs:84-94`, "sound only for a same-process run on a never-relocating bump arena").
+`meck` compiles the spec once (`meck_args_matcher:new/1`, spec `[{{[]},[],['$_']}]`) and runs it much later from `meck_proc` state, so the read-back dereferences stale words: under one timing they decode as a non-list and the call answers `badarg`, under another the walk lands on a header-shaped word and `beam_term::list::car/1` dereferences it.
+The amplifier is `beam_ets`'s walk: `list_elements` uses the C bit trick (`is_list` ⇔ `x & 2 == 0`, which is **true for a `TAG_PRIMARY_HEADER` word**, `crates/beam_term/src/list.rs:52-70`) instead of a tagged-pointer check, so a garbage word is dereferenced rather than rejected.
+
+Two seams, both needed:
+
+- **`beam_bifs`** — `insert_spec`/`spec_raw` must not store a caller-heap alias: deep-copy the spec onto a runtime-owned heap (or store its ETF bytes and re-decode per run), so a handle is valid in any process and across collections.
+- **`beam_ets`** — `crates/beam_ets/src/select/mod.rs::list_elements:222` must require a non-nil **list word** (pointer tag checked, header words rejected) so a bad term is `badarg`, never a segfault; the same walk backs `ets:select/2`, so this hardens the whole select family.
+
+What to run to see it: `cd $CWD/advanced_tx_delete && $RT -noshell <khepri -pa…> -eval "eunit:test('advanced_tx_delete',[verbose]), halt(0)."` — expect exit 139; `coredumpctl list beam_rt` then `gdb $RT <core>` for the backtrace.
 
 ## Side observations (not RC classes, reported rather than acted on)
 
-1. **Small-map key order can differ** (`maps:to_list/1`, `maps:keys/1`, and therefore `~p` of a
-   map with atom keys). Observed: `maps:keys(maps:from_list([{b,1},{a,2},{c,3}]))` →
-   oracle `[c,b,a]`, rust `[b,a,c]`; likewise the previous-value map of
-   `process_flag(max_heap_size, #{size => 0})` prints as
-   `#{error_logger,… , include_shared_binaries,… , kill,… , size,…}` on the oracle and as
-   `#{kill,… , error_logger,… , include_shared_binaries,… , size,…}` on rust. Map iteration
-   order is **undefined by the language**, and both runtimes order small maps the same way —
-   by atom *index*: freshly created atoms agree exactly
-   (`[list_to_atom("zz"||I)]` → `[zz1,zz2,zz3]` on both, whatever order they are inserted in),
-   so the difference comes from the **atom-table insertion order the two runtimes assign while
-   loading a module's atoms**, not from map code. Owning crate: `beam_term` (atom table /
-   small-map interior). Not a contract violation; it is a false-mismatch risk for any
-   differential case that compares `~p` of an atom-keyed map, so it is worth a decision.
-2. The `file:open/2` port descriptor map differs in shape (`owner`/`fd_registry_id` keys and
-   `#Ref` values), which is an internal representation; every *documented* observable agrees.
-3. Nothing else in the probes disagreed.
+1. **Small-map key order can differ** (`maps:to_list/1`, `maps:keys/1`, and therefore `~p` of an atom-keyed map): the previous-value map of `process_flag(max_heap_size, #{size => 0})` prints `#{error_logger,… , include_shared_binaries,… , kill,… , size,…}` on the oracle and `#{kill,… , error_logger,… , include_shared_binaries,… , size,…}` here.
+   Map iteration order is undefined by the language and both runtimes order small maps by atom *index*, so the difference comes from the atom-table insertion order each runtime assigns while loading a module's atoms, not from map code (owning crate: `beam_term`).
+   It is a false-mismatch risk for any differential case that compares `~p` of an atom-keyed map.
+2. The `file:open/2` port descriptor map differs in shape (`owner`/`fd_registry_id` keys, `#Ref` values) — an internal representation; every *documented* observable agrees.
+3. The system `erl` exits 1 **silently** when a `-eval` expression raises, so a probe that dies mid-run without a line is an escape, not a missing observation; probes here catch their own expressions.
+4. Nothing else in the probes disagreed.
 
 ## Committed probes
 
-| file | class | run lines |
+| file | class | run line |
 |---|---|---|
-| `iodata_probe.erl` (kept) | RC-A | `beam_rt -noshell -pa . -eval 'iodata_probe:main(), halt(0).'` |
-| `dets_probe.erl` (new) | RC-A bytes | same form; run each side in its own cwd, then `cmp`/`md5sum` `raw_probe.dat` and `dets_probe.dets` |
-| `process_flag_probe.erl` (kept) | RC-B | `… -eval 'process_flag_probe:main(), halt(0).'` |
-| `trap_exit_probe.erl` (new) | RC-B `trap_exit`/`spawn_opt` | `… -eval 'trap_exit_probe:main(), halt(0).'` |
-| `ra_wall_probe.erl` (new) | the Khepri wall | `… <khepri -pa…> -pa . -eval 'ra_wall_probe:main(), halt(0).'` |
-| `external_size_probe.erl` (kept, extended) | RC-C | `… -eval 'external_size_probe:main(), halt(0).'` |
-| `keep_while_fanout_probe.erl` (new) | RC-D | `erlc -DTEST -I <staged khepri proj> -o <dir> …`; `… <khepri -pa…> -eval 'keep_while_fanout_probe:main(), halt(0).'` (also `scaling/0`) |
+| `iodata_probe.erl` | RC-A | `… -eval 'iodata_probe:main(), halt(0).'` |
+| `dets_probe.erl` | RC-A bytes | same form, own cwd each side, then `md5sum raw_probe.dat dets_probe.dets` |
+| `process_flag_probe.erl` | RC-B flags | `… -eval 'process_flag_probe:main(), halt(0).'` |
+| `trap_exit_probe.erl` | RC-B `trap_exit`/`spawn_opt` | `… -eval 'trap_exit_probe:main(), halt(0).'` |
+| `ra_wall_probe.erl` | RC-B in situ | `… <khepri -pa…> -pa <beams> -eval 'ra_wall_probe:main(), halt(0).'` |
+| `external_size_probe.erl` | RC-C | `… -eval 'external_size_probe:main(), halt(0).'` |
+| `keep_while_fanout_probe.erl` | RC-D | `erlc -DTEST -I <staged khepri proj> -o <beams> …`; `… <khepri -pa…> -eval 'keep_while_fanout_probe:main(), halt(0).'` (also `scaling/0`) |
+| `block_wall_probe.erl` | RC-E | `… <khepri -pa…> -eval 'block_wall_probe:eunit_here(simple_get), halt(0).'` vs `eunit_spawned(simple_get)`; also `main/0`, `leak/1`, `census/0`, `eunit_gen/1` |
+| `block_wall_khepri.erl` | RC-E | `… <khepri -pa…> -eval 'block_wall_khepri:fixtures(12), halt(0).'` (stderr checkpoints `ck/2`, so ordering is not read from buffered stdout) |
+| `block_wall_fixture.erl` | RC-E | 30 self-contained spawn/receive fixtures, `… -eval 'block_wall_fixture:main(), halt(0).'` |
+| — | RC-F | no probe: the repro is the module run itself (`eunit:test('advanced_tx_delete',[verbose])`), plus the core backtrace above |
