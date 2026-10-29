@@ -169,6 +169,10 @@ A flag's name is its switch with the leading `-`/`+` run removed (`--nope` → `
 A valueless flag is one occurrence with no values (`-noshell` ⇒ `{ok,[[]]}`); `-pa /a -pa /b` is two occurrences (`{ok,[["/a"],["/b"]]}`).
 The oracle additionally reports its own `root`/`bindir`/`progname`/`home` entries in this listing, none of which is an `InitArgs` occurrence here: the native `init:get_argument/1` floor answers `root`/`home`/`progname` from the runtime's own state (`../native/init.rs`) — where `progname` is a deliberate, invocation-dependent gap, each runtime reporting the basename **it** was invoked as — while `bindir` is not modelled.
 
+## The Start-instruction vector and the OTP `erlc` front end
+The `-s`/`-run` argument vector is ERTS's `run_args_to_start_instructions/2` (`erts/preloaded/src/init.erl:607-624`): the tokens are never applied one at a time, only ever as the one collected list (or as no argument at all) — `start.rs::instruction_args`.
+The OTP `erlc` C front end drives this runtime unchanged (A.6+A.9): `ERLC_EMULATOR=<beam_rt> erlc +deterministic -o <D> <src>` (argv `+S1 +sbtu +A0 +P 65536 +Q 1024 -noinput -mode minimal -boot no_dot_erlang -s erl_compile compile_cmdline -extra …`) exits 0 with a byte-identical artifact — `../../tests/erlc_emulator.rs`, `../../tests/cli_compact_flags.rs`, `../../tests/cli_plain_args.rs`.
+
 ## Exit codes (the stable external contract)
 | Code | Meaning | stderr |
 |---|---|---|
