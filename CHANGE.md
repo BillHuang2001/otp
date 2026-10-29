@@ -6,6 +6,71 @@ of *decisions and structural changes*, complementing `git log` (which holds ever
 
 Format: one entry per major change — date, area, what changed and why. Newest first.
 ---
+## 2026-10-30 — Real-workload round 2 (Cowboy HTTP, Khepri), path-copying map writes, a phase-scoped execution tier, per-image label maps, and the copy-path rework
+Scope: the milestone that made the runtime serve a **real HTTP application** (`cowboy`'s
+`hello_world`, 0 transport errors, now a two-sided benchmark row) and run Khepri's eunit modules, and
+that then took three independent cost structures out of the measured hot paths. The headline
+**architectural/algorithmic** changes are: (a) a map write is **path-copying** rather than a whole-map
+rebuild; (b) `binary:part/2,3` mints a **refc sub-binary window** instead of copying a payload slice;
+(c) the **execution tier is selected per runtime phase**, not once per process; (d) a module image's
+label map is **built once and shared** by every machine and run; (e) the BIF-result/ETS copy path
+short-circuits a reference-free root, memoises the hook probe per dispatch and **recycles its dispatch
+memo** across a runtime's contexts, and copies a list spine as one **plan-hinted contiguous run**;
+(f) every list read in `beam_ets` is gated by one **cons-cell shape predicate** instead of the C bit
+trick. Measured: `copy_bound` −21.22 % retired instructions (paired 6/6 disjoint rounds), boot wall
+0.910× / peak RSS 0.817× the oracle's.
+- **Area:** `erts_rust/crates/beam_term/src/map/cow/**` — **a data structure**
+- **Change:** `maps` writes are **incremental (path-copying)**: a `put`/`remove` allocates only the
+  nodes on the mutated path (one flat→HAMT conversion node, one interior node per level, one leaf),
+  sharing every untouched subtree with the source map, where the previous writer rebuilt the whole
+  map. Adopted by `maps:put/update/remove/take`, by `enif_make_map_put/_update` (the NIF ABI) and by
+  the engine's `put_map_exact` route for a hash-map source, so the three surfaces cannot drift. The
+  writer refuses a forged map interior (a shape-validated reader) rather than trusting a caller's
+  header, which is the invariant an incremental writer needs and a whole-map rebuild did not.
+- **Area:** `erts_rust/crates/beam_term/src/{binary,bitstring}/**`, `beam_bifs` — **a data model**
+- **Change:** `binary:part/2,3` and `erlang:binary_part/2,3` produce a real **refc sub-binary window**
+  (a `BinRef` + offset + bit-length over the parent payload) rather than a copied binary, so the
+  observable `referenced_byte_size/1` agrees with the oracle and a slice of a large binary costs no
+  allocation. Bitstring access splits into a **checked/unchecked reader seam**
+  (`try_sub_bits_parts`/`try_bitstring_parts`/`try_bit_at` validate the shape) that every caller whose
+  word is not a proven bitstring — including the message copier — now uses.
+- **Area:** `erts_rust/crates/beam_rt/src/{runner/tier.rs,runtime.rs}` — **the execution engine's policy**
+- **Change:** the execution tier is **phase-scoped**: a runtime boots on the interpreter and upgrades
+  **once, irreversibly** to the native baseline tier when the boot phase ends, because boot is
+  load-and-branch bound (one-shot module entry points, no hot loop) while the work that follows is not.
+  The rule replaces a single per-process choice and is what makes boot faster than the oracle's. It is
+  a policy over the existing IR seam — no tier gained an observable.
+- **Area:** `erts_rust/crates/beam_loader/src/{labels.rs,ir.rs}` — **a data structure**
+- **Change:** a lowered image owns **one** label map (`SharedLabelMap`: a `OnceLock<Arc<LabelMap>>`),
+  built lazily on first use and shared by every machine, every entry point and every run of that
+  module; the previous shape rebuilt it per machine (or per `run_*` entry for a synthetic module),
+  which was a per-run allocation plus a join cost on the start-up path.
+- **Area:** `erts_rust/crates/beam_rt/src/context/{calls.rs,memo_pool.rs}`, `beam_ets/src/store/**` — **an algorithm**
+- **Change:** four changes to the copy boundary, all measured together at −21.22 % instructions on
+  `copy_bound`: a **reference-free root** short-circuits the BIF-result reference walk; the dispatch
+  prologue's hook-flag probe is memoised per memo miss instead of per call; the `DispatchMemo` is
+  **recycled across the contexts of one runtime** (`Runtime::memo_pool`, `MEMO_POOL_DEPTH`), since a
+  context is built and dropped per slice; and `TermStore::copy_spine` copies a list's **whole spine as
+  one contiguous 2-word-cell run**, reserving the run up front (a recycled plan candidate makes the
+  cell count free) where a per-cell append paid a dependent load per element.
+- **Area:** `erts_rust/crates/beam_ets/src/shape.rs` + every list read — **a safety invariant**
+- **Change:** one crate-level **cons-cell shape predicate** (`cons_cell`: primary tag `List` **and** a
+  non-null cell pointer) gates every list dereference — `copy_term`'s cons branch, the hash-map slot
+  dispatch, `select` pattern matching and execution, `TableTerm`'s walk, the update path. The C bit
+  trick `!(x & 0x2)` also answers true for a `TAG_PRIMARY_HEADER` word, so `is_list` alone lets a
+  header-shaped or null-cell word reach a `car`; a shape-gated read is a typed `badarg` instead.
+- **Area:** `erts_rust/crates/beam_codec/src/encode/**`, `beam_bifs/src/binconv.rs` — **an API**
+- **Change:** the ETF encoder takes a **per-fun** `FunIdentityResolver` and consults it once for every
+  local (`make_fun3`) fun in its own descent order, replacing a single identity slot that was correct
+  only when every local fun in a term shared one identity. A term holding two different lambdas (the
+  everyday `f() -> G = fun() -> ok end, fun() -> G end`) now encodes each with its own
+  `old_index`/`old_uniq`/module; the host's recycled encode buffer and the local-wrapper route are
+  unchanged, and `Ok(None)` still yields the typed gap rather than a fabricated identity.
+- **Area:** `erts_rust/crates/beam_rt/src/atom_seed.rs` — **the atom index space**
+- **Change:** the runtime's shared atom table is **seeded from the tree's `atom.names`** in file order,
+  so the index of a common atom matches the oracle's instead of depending on boot order, and an
+  index-keyed comparison across the two runtimes (map key order, `ets` ordering, atom-sorted output)
+  is meaningful. `system_info(atom_count)`/`dist` identity stay the boot-time table's.
 ## 2026-10-28 — Real-world project compatibility (jsone, bbmustache), reference hashing, an io device protocol and crash reports, the refc-window bitstring subject, nursery carriage, and a COW atom store
 Scope: the milestone that took the runtime from "runs constructed fixtures" to **running two real
 Erlang projects' own eunit suites byte-identically** (`jsone` 90/90, `bbmustache` 79/79) and then

@@ -111,8 +111,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
   --all-targets` (**warning-free: 0 warnings**); test with `scripts/cargo.sh test --manifest-path
-  erts_rust/Cargo.toml --workspace --no-fail-fast`. The suite is green — **0 failed** (`14 559 passed /
-  85 ignored` across the 18 packages). No test is red on account of the host oracle: the tree's frozen
+  erts_rust/Cargo.toml --workspace --no-fail-fast`. The suite is green — **0 failed** (`15 124 passed /
+  97 ignored` across the 18 packages). No test is red on account of the host oracle: the tree's frozen
   values (`system_info(version)` `17.1`, `stdlib` `8.1`, the 248-row instruction roster) are asserted
   unconditionally, and only the *oracle* leg tolerates a different `erts` patch, so an `erts-17.1.1`
   host is green. Two caveats: `tools/differential/tests/cli.rs` carries four end-to-end ratchet tests
@@ -141,7 +141,17 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3469 agree=3465 mismatch=0
+- **Real-world projects run under this runtime** — the milestone's primary goal, each measured against
+  the oracle with the identical command line: `jsone` **90/90** and `bbmustache` **79/79** eunit tests
+  pass with byte-identical stdout/stderr (`tools/bench/RESULTS.md` §9); `cowboy` serves HTTP/1.1
+  (`GET /` → 200 with the 12-byte `text/plain` body, plus HEAD/404/keep-alive/206) with **0 transport
+  errors** and is the one two-sided benchmark row (§10; 8.39× to close, §B9 of `BOTTLENECKS.md`);
+  `khepri`'s eunit modules and eight OTP `stdlib` `common_test` suites are driven under **both** runtimes
+  with per-module/per-case counts (`tools/suites/RESULTS.md`, whose RC-*/D* classes are the remaining
+  divergences); `plb` runs 8 of 10 kernels and `elixirc` compiles through the `elixir` stage. The
+  remaining per-project limits are recorded as `Known Issues` in the owning crate's `CONTEXT.md` — the
+  largest is that `cowboy_websocket` can only answer 500 because a `crypto.so` load callback vetoes.
+- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3524 agree=3520 mismatch=0
   unsupported=1 skipped=0 oracle_drift=3`** with `ratchet: allowlist=known-gaps.txt allowed=1
   unauthorized=0 stale=0` and `drift: allowlist=known-drift.txt allowed=3 unauthorized=0 stale=0`
   → `gate.sh` exits 0. **No case disagrees.**
@@ -175,11 +185,13 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   crates), 33 of them undeclared table members. The census is re-derived from code and **pinned by
   `beam_bifs/tests/roster_audit.rs` + `tests/seam_census.rs`**, so it cannot drift again.
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
-  in `tools/bench/results/`) and in `BOTTLENECKS.md` §0, which names the **three non-interchangeable
+  in `tools/bench/results/`) and in `BOTTLENECKS.md` §0, which names the **non-interchangeable
   records** and says which one is current — read it there rather than duplicating numbers. The
   artifact-backed records are **m19** (the full suite behind `RESULTS.md` §2/§3 and the external
-  targets), **m21** (the GC before-record plus the eunit rows) and **m22** (the newest, the GC
-  after-record); a figure quoted without one of those artifacts behind it is not a record. Each record
+  targets), **m21**/**m22** (the GC before/after pair plus the eunit rows), **m23** (the startup round
+  plus the two-sided `cowboy` row, `RESULTS.md` §10) and **`r2-copybound-ab`** (the copy-path round's
+  `beam_rt`-vs-`beam_rt` paired A/B); a figure quoted without one of those artifacts behind it is not a
+  record. Each record
   names both sides (its own `sys` oracle and `beam_rt` at its default baseline-JIT tier) and its
   marginals use a **paired** estimator: each round samples the N-op and the 0-op pass back to back and
   takes the median paired difference, which replaced a non-interleaved schedule that had overstated
@@ -191,10 +203,13 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   hidden: the tier glue (`Machine::step_instruction_inner` / `enter_in_block` / `jit_step_one`),
   allocator churn and the GC root walk are the next levers, and a self-recursive BIF-free tail loop that
   never pre-empts grows its off-heap payload without a park (bounded by `BEAM_RT_TIER=interpreter`) —
-  see `BOTTLENECKS.md`. Measurable target projects: `cowboy`, `erlc`, `elixir`, `khepri`, `plb` and
-  `emqx`, whose per-target figures, `sys`/`rust` rows and skip reasons live in
-  `tools/bench/RESULTS.md` (the `emqx` checkout pins OTP 28, so its row skips honestly as
-  `skipped(emqx-requires-otp-28)`). The four `foreign/*` rows are **engine-tier**: per call they cross **0**
+  see `BOTTLENECKS.md`. Target projects: `cowboy` (the only two-sided HTTP row — the Rust runtime
+  serves `examples/hello_world` with 0 transport errors at 5 833 req/s against the oracle's 48 931
+  = **8.39×**, p50 1.334 ms vs 0.171 ms, peak RSS 145.2 MB vs 68.1 MB, boot→ready 163.0 ms vs
+  133.6 ms; `RESULTS.md` §10), `erlc`, `elixir`, `khepri`, `plb` and `jsone`/`bbmustache`, whose
+  per-target figures, `sys`/`rust` rows and skip reasons live in `tools/bench/RESULTS.md`. `emqx` is
+  **out of scope** (its checkout pins OTP 28 and the host lacks its native build prerequisites), so its
+  row skips honestly as `skipped(emqx-requires-otp-28)`. The four `foreign/*` rows are **engine-tier**: per call they cross **0**
   BIFs (`to_lower`, `capitalize_token`), **4** (`iolist_to_binary/1`, `encode`) and **16**
   (`bit_size/1`, `decode`), so ~90–100 % of each residual is the baseline tier's per-instruction
   machinery and `beam_bifs`/`beam_term`/`beam_alloc` cannot close it — the live per-frame split is

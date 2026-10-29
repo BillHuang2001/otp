@@ -16,7 +16,7 @@ entry says so explicitly — those are not cross-runtime ratios.
 
 ## 0. Which record is current (read this before quoting a number)
 
-Seven records exist and they are **not interchangeable**. They measure overlapping rows under
+Eight records exist and they are **not interchangeable**. They measure overlapping rows under
 very different host load, which is why the same workload can appear at several ratios.
 
 | record | where | when | 1-min load | authoritative for |
@@ -24,15 +24,17 @@ very different host load, which is why the same workload can appear at several r
 | **m19** | `tools/bench/results/m19-*` | 2026-10-23/24 | 0.54–4.53 | **the most recent full-suite record, and the one behind `RESULTS.md` §2/§3 and the external-target rows**: twelve matched single-side passes over the nine `Runtimes::Both` workloads, the `--full` `baseline` pair, the memory rows, and the three-rep external stage over five targets plus the `emqx` skip |
 | **m21** | `tools/bench/results/m21-*` | 2026-10-27 | 5.65–19.57 (eunit stage 9.59–14.62) | the GC/allocator workstream's **before**-record over `baseline,gc_bound,gc_class,list_walk,slice` (`m21-xrun-gc-*`), read through `m21-xrun-ratios.txt`, plus the two eunit rows (`jsone`, `bbmustache` — `RESULTS.md` §9) |
 | **m22** | `tools/bench/results/m22-*` | 2026-10-27 | mid-load, same band as m21 | **the newest session**: that workstream's **after**-record over the same five workloads, read through `m22-vs-m21.txt` / `m22-xrun-ratios.txt` |
-| **m23** | `tools/bench/results/m23-*`, read through `RESULTS.md` §`m23` | 2026-10-28/29 | 0.68 → 500 (per pass; the boot A/B that is quoted is at **46–54**, the per-tier instruction table at 130–137) | **the startup round**: the phase-scoped execution tier, the shared per-image label maps and the three loader/MD5 cost passes. Authoritative for **start-up wall/CPU/peak-RSS against the oracle** (boot and `slice`), the **per-tier boot instruction/cycle/task-clock** split, the steady-state `list_walk` instructions-per-element slope, and the workload peak-RSS rows of that round. **Not** authoritative for any cross-runtime throughput ratio (its `ns_per_*` rows are load-flagged) |
+| **m23** | `tools/bench/results/m23-*`, read through `RESULTS.md` §`m23` | 2026-10-28/29 | 0.68 → 500 (per pass; the boot A/B that is quoted is at **46–54**, the per-tier instruction table at 130–137) | **the startup round**: the phase-scoped execution tier, the shared per-image label maps and the three loader/MD5 cost passes. Authoritative for **start-up wall/CPU/peak-RSS against the oracle** (boot and `slice`), the **per-tier boot instruction/cycle/task-clock** split, the steady-state `list_walk` instructions-per-element slope, the workload peak-RSS rows of that round, and the **`cowboy` two-sided HTTP row** (`m23-cowboy-*`, `RESULTS.md` §10). **Not** authoritative for any *workload-plugin* cross-runtime ratio (its `ns_per_*` rows are load-flagged) — the `cowboy` row is the exception, and it is a `--quick` three-round median plus one `--full` pair |
+| **`r2-copybound`** | `tools/bench/results/r2-copybound-ab/` (README + 6 paired `base`/`head` `bench` reports and `perf stat` blocks) | 2026-10-29 | 17.71 → 6.84 (paired, alternating, so the drift cancels) | the copy-path round's **`beam_rt`-vs-`beam_rt` paired A/B**: `cpu_core/instructions/u` per whole `copy_bound` run 127.50 G → 100.45 G (**−21.22 %**, disjoint 6/6 rounds) and the per-case paired ratios (`send_recv` 0.608, `send_recv_plain` 0.648, `etf_roundtrip` 0.734, `ets_copy` 0.792). **Not** a cross-runtime record — both sides are this runtime |
 | **Q** (quiet) | `crates/beam_engine/MEASURED.md` §*Cross-runtime record and the binary A/B* | 2026-10-20 | **1.02–2.37** | the quietest per-row ratios for `list_walk`, `etf_roundtrip`, `ets_copy`, `send_recv`, `send_recv_plain`, `churn`, all four `foreign/*`; and the code-change A/B |
 | **m17** | `tools/bench/RESULTS.md` (session `m17`, 2026-10-18) | 2026-10-18 | 3 → 92 | start-up p50/p99, `slice`, the memory rows, `binary_append`'s last **full-record** figure, the external targets |
 | **fresh** | measured by hand while writing this file (§1.3), **no `out/` copy archived** | now | 161 → 181 | only what it says: one `binary_append` single round on a heavily loaded host — a hand measurement, not a record |
 
 **m19 is the most recent full-suite record and supersedes m17 for the rows it measures** (it is later);
 **`m21`/`m22` are later still but narrower**, covering only the GC workstream's row set, so they
-supersede m19 there and nowhere else; **m23 is the latest and covers start-up and memory only**;
-**Q stays authoritative for the quietest per-row ratios and the code-change A/B**.
+supersede m19 there and nowhere else; **m23 is the latest and covers start-up, memory and the
+`cowboy` two-sided row**; **`r2-copybound` supersedes m21/m22 for the four `copy_bound` rows' code-change
+A/B**; **Q stays authoritative for the quietest per-row ratios**.
 Concrete examples of the difference, all
 `rust`/`sys`:
 
@@ -146,6 +148,7 @@ owner's stated priority). "Gap" is the Q ratio unless the column says otherwise.
 | **B6** | start-up: boot p50/p99, `slice` | **0.91× / 0.84×** and **0.82× / 0.75× peak RSS** (m23 — *faster* than the oracle) | **closed by the boot phase + the load-path passes**; the residual is the load path's own user CPU | **landed** | yes — the remaining levers are named in §B6 |
 | **B7** | compiler throughput: root descent at every heap admission | **no cross-runtime ratio** (in-crate: 3.62 % → **44.50 %** of samples) | whole-graph unscanned-root walk (`beam_rt::context::gc_walk`) | **architectural** | yes — bound/incrementalise |
 | **B8** | `ets_copy` retained memory | rust peak RSS **90.30** vs sys **66.26 MiB**, linear in `N` | nursery grows and is never shrunk (`beam_rt` + `beam_gc`) | **architectural**, cross-crate | needs a new seam |
+| **B9** | the real-workload `cowboy` HTTP row | **8.39×** throughput (req/s) and **7.82×** p50 / **7.85×** p99 latency (m23); peak RSS **2.13×** | per-request engine-tier machinery on the baseline JIT — the same per-instruction tax B3/B4 measure, now confirmed on a real application; the byte-at-a-time socket write dominates the rest | **architectural** | yes — §B9 names the two orderings worth measuring first |
 
 **Defer (micro-optimisation)**: family-id baking, `jit_call_store`
 re-decode, `local_call_seam` boolean, block register-cache traffic (**no measurable effect**, §5), the
@@ -287,6 +290,16 @@ finite `limit` already terminates a cyclic graph (≥2 words/object), and `TermG
 stay distinguishable through the existing error-path `is_acyclic`.
 The registry's double copy is a `beam_bifs`/pool-rewind contract change — not expressible from
 `beam_rt`. The ≈2 % `send_recv` regression is unattributed and worth one profiling round.
+**The round-2 copy-path pass (`r2-copybound`, `beam_rt`-vs-`beam_rt`, paired, 6 alternating rounds,
+`tools/bench/results/r2-copybound-ab/`).** `cpu_core/instructions/u` per whole `copy_bound` run
+**127.50 G → 100.45 G = −21.22 %**, disjoint in 6/6 rounds, with the deterministic `case_*_ops`
+counters identical on both sides; per-case paired ratios `send_recv` **0.608** (−39.2 %),
+`send_recv_plain` **0.648** (−35.2 %), `etf_roundtrip` **0.734** (−26.3 %), `ets_copy` **0.792**
+(−20.8 %). The four levers, all landed: the BIF-result walk short-circuits a reference-free root, the
+dispatch prologue's hook probe is memoised per memo miss, the memo is recycled across a runtime's
+contexts (`MEMO_POOL_DEPTH`), and the ETS copy path copies a list spine as one plan-hinted run
+(`TermStore::copy_spine`). These are **code-change** figures: they move the rust side only, so the
+cross-runtime ratios in §2 are the new rust numerator over the unchanged `sys` one.
 
 ---
 
@@ -587,7 +600,35 @@ caller side.
 happen there. Cross-crate, architectural.
 
 ---
-
+### B9 — the real-workload `cowboy` row: the per-request engine tax, confirmed on an application
+**Workload and both sides** (m23, `RESULTS.md` §10; three `--quick` rounds with the side order
+alternating, plus one `--full` pair, every pass `taskset -c 3` one process at a time, 1-min load
+3.38–5.38 / 5-min 9.71–13.69). The same staged `cowboy` build and `hello_world` program under both
+runtimes, driven by the crate's own in-process HTTP/1.1 keep-alive client: **`sys` 97 919 requests /
+48 930.9 req/s** vs **`rust` 11 674 / 5 833.4 req/s** = **8.388×** (per-round 8.388 / 8.347 / 8.567);
+latency p50 **0.1707 → 1.3342 ms** (**7.818×**), p99 **0.2730 → 2.1867 ms** (**7.852×**); peak RSS
+(VmHWM) **68.06 → 145.20 MB** (**2.132×**); boot→ready **133.6 → 163.0 ms** (**1.218×**); `errors`
+**0** in all ten rows on both sides. Every response was complete — the closes are cowboy's own
+`Connection: close` at `max_keepalive`, not transport errors.
+**The staging control.** `build_ms` 12 436.4 vs 12 414.5 (**1.003×**) and `compile_ms` 154.6 vs 153.0
+(**0.990×**) — the same `make` and the same `erlc` on both sides — so **the whole gap is runtime
+execution**, not the build.
+**Mechanism.** The row is engine-tier the way B3/B4 describe: the request path is ordinary Erlang (a
+small number of BIF calls per request over a `gen_tcp` write), so ~the whole residual is the baseline
+JIT's per-instruction machinery, with the socket write path on top (the port command path issues one
+write per small iolist element rather than one `writev` per list).
+**Concurrency sensitivity.** The `--full` pair (16 connections, 5 s) moves throughput to **9.094×** and
+p50 to **8.304×** — direction unchanged — while the peak-RSS ratio grows to **2.944×**, i.e. the memory
+gap is a function of live sockets and buffers, not a constant. It is one pass per side: a single
+sample, no error bar.
+**Next steps, in the order worth measuring.** (a) price one request end-to-end in retired instructions
+and split it by opcode family before optimising anything — the 8.39× is a *product* of the B3/B4 rates
+and no single opcode is named yet; (b) the socket write path: batch a response iolist into one
+`writev` (`beam_io`'s port-command drain), the one lever whose size can be bounded without the engine;
+(c) only then the engine-tier levers B3/B4 already name.
+**Not a lever.** Anything below the engine (allocator, ETS interiors, ETF tags): the row crosses few
+BIFs per request, and the same ordering was measured on the `foreign/*` rows.
+---
 ## 4. Identified but not yet measured
 
 Do **not** present these as bottlenecks with numbers — they are per-slice constants, so they matter
