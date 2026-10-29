@@ -423,6 +423,55 @@ fn probe(what: &str, program: &Path, args: &[&str]) -> EvalProbe {
 }
 
 // ---------------------------------------------------------------------------------------
+// A compiled fixture's function, run under each runtime in turn
+// ---------------------------------------------------------------------------------------
+
+/// Runs `call` (a `module:function(args)` term source) as the `-eval` body
+/// `io:format("~1000p~n", [call])` under the built **`beam_rt`**, and answers the trimmed
+/// transcript.
+///
+/// `~1000p` is `~p` with a 1000-column line width, so a nested term prints on one line in both
+/// runtimes and a pinned golden stays a single readable literal.
+///
+/// `code_dir` is the fixture's own scratch directory — the **only** `-pa` either runtime gets, so
+/// nothing else on this repository's code path can shadow the fixture. A probe that exits non-zero
+/// or reports a capability gap **panics**: these are calls the native floor serves, so a gap is a
+/// defect rather than a skip. `what` labels the failure.
+#[allow(dead_code)]
+pub fn fixture_answer(what: &str, code_dir: &Path, call: &str) -> String {
+    let dir = code_dir.to_str().expect("an ASCII scratch path");
+    let expr = format!("io:format(\"~1000p~n\",[{call}]).");
+    let output = run_runtime(&["-noshell", "-pa", dir, "-eval", &expr]).unwrap_or_else(|| {
+        panic!("`{what}` could not be run to completion (killed at the probe bound)")
+    });
+    assert_eq!(
+        output.code, 0,
+        "`{what}` exited {}: {}",
+        output.code, output.stderr
+    );
+    assert!(
+        !output.stderr.contains("unsupported"),
+        "`{what}` is a served call, so this is not a capability gap: {}",
+        output.stderr
+    );
+    output.stdout.trim().to_string()
+}
+
+/// The same probe under the live **oracle**, or `None` after the loud skip naming `banner`.
+#[allow(dead_code)]
+pub fn fixture_oracle_answer(banner: &str, code_dir: &Path, call: &str) -> Option<String> {
+    let oracle = require_oracle(banner)?;
+    let expr = format!("io:format(\"~1000p~n\",[{call}]), halt(0).");
+    match oracle_eval(&oracle, Some(code_dir), &expr) {
+        Some(answer) => Some(answer),
+        None => {
+            eprintln!("warning: the oracle could not answer `{call}`");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // A fixture compiled at test time, and this runtime driven under it
 // ---------------------------------------------------------------------------------------
 

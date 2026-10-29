@@ -79,6 +79,9 @@
 //! grammar, descriptor shape and documented divergences are documented there.
 //! `advise/4`'s **local, non-exported** stub `advise_nif/4` is served there too (see "The
 //! `advise` and `sendfile` family" below), and so is the userspace `sendfile/8`.
+//! `read_line/1` is served next to them but *owns* a read-ahead queue rather than a host
+//! syscall: `read/2` and `position/2` respect that queue, so its ground truth and the one
+//! `r_buffer` divergence live in [`prim_file::readahead`](super::prim_file::readahead).
 //!
 //! # The `advise` and `sendfile` family (the descriptor-hint path)
 //!
@@ -3214,17 +3217,18 @@ mod tests {
     ///
     /// The oracle's own answers, verified live against OTP 29.1.1 / erts-17.1:
     /// `write_file_info/2`⇒`ok`, `allocate(Fd,0,10)`⇒`ok`,
-    /// `list_dir/1`⇒`{ok,[Names]}` in raw `readdir(3)` order, `read_line(Fd)`⇒`{ok,Line}`
+    /// `list_dir/1`⇒`{ok,[Names]}` in raw `readdir(3)` order
     /// and `file_desc_to_ref(1,[])`⇒`{ok,{file_descriptor,prim_file,#{…}}}`.
     ///
     /// `copy/2`, `write_file/3` and `delayed_close/1` are deliberately **not** claimed: the
     /// oracle answers `error:undef` for them (`{error,undef}` as the caught value), so claiming
     /// any of them would replace an agreeing answer with a non-agreeing one.
     ///
-    /// The keys that *did* become served are the pin's other half: `advise/4` and `sendfile/8`
-    /// are claims that answer an oracle **value** (`ok` / `{ok,N}`) rather than a capability
+    /// The keys that *did* become served are the pin's other half: `advise/4`, `sendfile/8` and
+    /// `read_line/1` are claims that answer an oracle **value** (`ok` / `{ok,N}` / `{ok,Line}`,
+    /// the line one carrying the read-ahead of `prim_file/readahead.rs`) rather than a capability
     /// gap, and their measured matrices are the sibling modules'
-    /// (`prim_file/{advise,sendfile}.rs`).
+    /// (`prim_file/{advise,sendfile}.rs`, `prim_file/readahead.rs`).
     #[test]
     fn the_unserved_prim_file_entries_are_typed_capability_gaps() {
         let mut runtime = runtime();
@@ -3236,7 +3240,6 @@ mod tests {
             ("write_file_info", &two[..]),
             ("write_file_info", &three[..]),
             ("allocate", &three[..]),
-            ("read_line", &one[..]),
             ("file_desc_to_ref", &two[..]),
         ] {
             let arity = args.len();

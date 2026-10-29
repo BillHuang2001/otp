@@ -188,3 +188,176 @@ impl RuntimeContext<'_> {
         self.ok_tuple(contents)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::test_support::scratch_dir;
+    use crate::native::test_support::runtime;
+    use beam_bifs::NullSink;
+    use beam_engine::terms;
+    use std::path::Path;
+    /// The descriptor id the queue-only tests register their queue under. A read-shaped
+    /// `prim_file:open/2` picks the id from the reference it mints, so the queue operations below
+    /// are exercised on a hand-picked key with the same shape (nothing about the queue is keyed by
+    /// anything but the id).
+    const ID: u64 = 7;
+    /// Runs `body` against a context whose read-ahead table holds one empty queue under [`ID`].
+    fn with_queue<T>(body: impl FnOnce(&mut RuntimeContext<'_>) -> T) -> T {
+        let mut rt = runtime();
+        rt.buffers_mut()
+            .insert(ID, crate::native::prim_buffer::PrimBuffer::new());
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut rt, &mut sink);
+        body(&mut context)
+    }
+    /// The bytes of the `{ok, Binary}` answer [`RuntimeContext::line_answer`] produces.
+    fn line_bytes(context: &mut RuntimeContext<'_>, line: &[u8]) -> Vec<u8> {
+        let answer = context.line_answer(line.to_vec()).expect("a line answer");
+        assert_eq!(terms::tuple_arity(answer).expect("a tuple"), 2);
+        let tag = terms::tuple_element(answer, 0).expect("an element");
+        assert_eq!(context.atom_name(tag).as_deref(), Some("ok"));
+        let contents = terms::tuple_element(answer, 1).expect("an element");
+        terms::binary_bytes(contents)
+            .expect("a binary")
+            .to_vec()
+    }
+    /// Opens `path` with the read shape (`[raw, binary, read]`) and returns its descriptor term.
+    fn open_read(context: &mut RuntimeContext<'_>, path: &Path) -> Eterm {
+        let name = context
+            .charlist(&path.to_string_lossy())
+            .expect("the path as a char list");
+        let modes: Vec<Eterm> = ["raw", "binary", "read"]
+            .iter()
+            .map(|mode| context.atom(mode).expect("a mode atom"))
+            .collect();
+        let modes = terms::make_list(context, &modes).expect("a mode list");
+        let answer = context
+            .prim_open(&[name, modes])
+            .expect("prim_file:open/2");
+        assert_eq!(terms::tuple_arity(answer).expect("a tuple"), 2);
+        let tag = terms::tuple_element(answer, 0).expect("an element");
+        assert_eq!(
+            context.atom_name(tag).as_deref(),
+            Some("ok"),
+            "open/2 answered {answer:?}"
+        );
+        terms::tuple_element(answer, 1).expect("the descriptor")
+    }
+    #[test]
+    fn the_queue_coalesces_appends_and_answers_a_copying_read() {
+        with_queue(|context| {
+            assert!(!context.has_readahead(ID + 1), "no queue ⇒ no read-ahead");
+            assert!(context.has_readahead(ID), "the write shape registers one");
+            assert_eq!(context.readahead_size(ID), 0);
+            context.append_readahead(ID, b"alpha");
+            context.append_readahead(ID, b"beta\n");
+            assert_eq!(context.readahead_size(ID), 10);
+            assert_eq!(context.find_in_readahead(ID, b'\n'), Some(9));
+            assert_eq!(
+                context.find_in_readahead(ID, b'z'),
+                None,
+                "a byte the queue does not hold"
+            );
+            // `copying_read(3)` drains the front only; the tail stays queued.
+            assert_eq!(context.take_readahead(ID, 3), b"alp".to_vec());
+            assert_eq!(context.readahead_size(ID), 7);
+            assert_eq!(context.find_in_readahead(ID, b'\n'), Some(6));
+            // A count past the end is unreachable from every caller and degrades to an empty
+            // payload rather than a fabricated one.
+            assert!(context.take_readahead(ID, 100).is_empty());
+        });
+    }
+    #[test]
+    fn wipe_readahead_empties_the_queue_without_touching_a_sibling() {
+        with_queue(|context| {
+            context.append_readahead(ID, b"alpha\nbeta\n");
+            context.wipe_readahead(ID);
+            assert_eq!(context.readahead_size(ID), 0);
+            assert_eq!(context.find_in_readahead(ID, b'\n'), None);
+            // Wiping an id with no queue is a no-op, never a panic or a fabricated entry.
+            context.wipe_readahead(ID + 1);
+            assert!(!context.has_readahead(ID + 1));
+        });
+    }
+    #[test]
+    fn a_crlf_terminator_answers_a_bare_newline() {
+        with_queue(|context| {
+            assert_eq!(line_bytes(context, b"alpha\r\n"), b"alpha\n".to_vec());
+            // A lone `\r` before the end is data, not a terminator.
+            assert_eq!(line_bytes(context, b"alpha\r"), b"alpha\r".to_vec());
+            assert_eq!(line_bytes(context, b"\r\n"), b"\n".to_vec());
+            // The final line of a file with no terminator is answered verbatim.
+            assert_eq!(line_bytes(context, b"gamma"), b"gamma".to_vec());
+        });
+    }
+    #[test]
+    fn a_line_longer_than_the_on_heap_binary_limit_is_still_a_binary() {
+        with_queue(|context| {
+            // 200 bytes: past `ERL_ONHEAP_BINARY_LIMIT` (64), so the answer must be an off-heap
+            // refc binary — the `make_binary` route, not a heap-binary writer.
+            let mut line = vec![b'x'; 199];
+            line.push(b'\n');
+            assert_eq!(line_bytes(context, &line), line);
+        });
+    }
+    #[test]
+    fn read_line_walks_a_three_line_file_and_an_unterminated_tail() {
+        let dir = scratch_dir("prim_file_readahead");
+        let path = dir.path().join("lines.txt");
+        std::fs::write(&path, b"alpha\nbeta\n\ngamma").expect("a scratch file");
+        let mut rt = runtime();
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut rt, &mut sink);
+        let fd = open_read(&mut context, &path);
+        let mut lines = Vec::new();
+        loop {
+            let answer = context.prim_read_line(&[fd]).expect("read_line/1");
+            if context.atom_name(answer).as_deref() == Some("eof") {
+                break;
+            }
+            let contents = terms::tuple_element(answer, 1).expect("an element");
+            lines.push(terms::binary_bytes(contents).expect("a binary").to_vec());
+            assert!(lines.len() <= 8, "read_line/1 never terminated");
+        }
+        assert_eq!(
+            lines,
+            vec![
+                b"alpha\n".to_vec(),
+                b"beta\n".to_vec(),
+                b"\n".to_vec(),
+                b"gamma".to_vec()
+            ],
+            "the four lines, terminators included, the unterminated tail last"
+        );
+        // A drained descriptor keeps answering `eof`, never a fabricated empty line.
+        let answer = context.prim_read_line(&[fd]).expect("read_line/1");
+        assert_eq!(context.atom_name(answer).as_deref(), Some("eof"));
+        // `position/2` wipes the queue, so a seek back to `bof` re-reads from the first line.
+        let bof = context.atom("bof").expect("bof");
+        let position = context
+            .prim_position(&[fd, bof])
+            .expect("prim_file:position/2");
+        assert_eq!(
+            terms::tuple_arity(position).expect("a tuple"),
+            2,
+            "position/2 answered {position:?}"
+        );
+        let pos_tag = terms::tuple_element(position, 0).expect("an element");
+        assert_eq!(context.atom_name(pos_tag).as_deref(), Some("ok"));
+        let answer = context.prim_read_line(&[fd]).expect("read_line/1");
+        let first = terms::tuple_element(answer, 1).expect("an element");
+        assert_eq!(
+            terms::binary_bytes(first).expect("a binary"),
+            b"alpha\n",
+            "the queue was wiped, so the line comes from the host file again"
+        );
+        // The chunk read to answer that line left the rest of the file queued, which is exactly
+        // the byte count `position(Fd, {cur, 0})` would shift back by.
+        let id = context.decode_descriptor(fd).expect("a descriptor").id;
+        assert_eq!(
+            context.readahead_size(id),
+            b"beta\n\ngamma".len(),
+            "one chunk read ahead, the answered line taken off the front"
+        );
+    }
+}
