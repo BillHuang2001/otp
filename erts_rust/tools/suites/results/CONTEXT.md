@@ -7,9 +7,10 @@ Every row names both sides (oracle = system `erl` on `$PATH`, rust = `../target/
 
 ## API Surface
 - `stdlib/report.json` + `stdlib/summary.md` — the OTP-`stdlib` sweep (`schema suites/1`); `report.json` is authoritative and `summary.md` is rendered from it.
-- `stdlib-notes.md` — analysis of that sweep: per-suite counts, the root-cause classes D1…D10, the exclusions (`agree-fail-identical`) and the harness caveats.
+- `stdlib-notes.md` — analysis of that sweep: per-suite counts, the root-cause classes D1…D11, the exclusions (`agree-fail-identical`) and the harness caveats.
 - `stdlib/raw/` — hand-captured probe output kept as evidence for `stdlib-notes.md` §D1/§D10; it is **not** part of the sweep artifact set.
-- `khepri/report.json` + `khepri/summary.md` + `khepri-notes.md` — the same three things for Khepri's 44 eunit modules (classes RC-A…RC-D).
+- `stdlib/recheck-120/report.json` + `summary.md` — the serial `--timeout 120 --jobs 1` re-check of the suites whose 10 s rows timed out; the record reads it together with the main artifact.
+- `khepri/report.json` + `khepri/summary.md` + `khepri-notes.md` — the same three things for Khepri's 51 candidate eunit modules (classes RC-B…RC-D).
 
 ## Constraints
 - **Counts and ratios only.** The host is shared, so a wall time here is never portable; a diagnostic may quote a same-host oracle/rust ratio and the operation counts behind it, never an absolute duration as a claim.
@@ -21,5 +22,5 @@ Every row names both sides (oracle = system `erl` on `$PATH`, rust = `../target/
 ## Routing Table
 - `stdlib-diagnostics/` → hand-run probes re-checking the stdlib divergence classes D1…D11 against the current runtime, with `FINDINGS.md` as the verdict table (`D11` = the `erlang:apply/2` defect behind `queue_SUITE:oops`).
 - `khepri-diagnostics/` → hand-run probes behind `khepri-notes.md` (`process_flag/2`, `external_size`, iodata handling).
-- `stdlib/` → the stdlib sweep artifact (`report.json` + `summary.md`) and its `raw/` probe captures.
+- `stdlib/` → the stdlib sweep artifact (`report.json` + `summary.md`), its `raw/` probe captures and the `recheck-120/` budget re-check.
 - `khepri/` → the Khepri sweep artifact (`report.json` + `summary.md`).

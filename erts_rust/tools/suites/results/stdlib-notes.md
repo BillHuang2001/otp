@@ -104,8 +104,8 @@ twice on purpose: `binary_module:copy` is §E's excluded row that D10 explains, 
 `longest_common_trap` is both one of D1c's 13 missing cases and the D10 gap that case needs.
 `<rt>` below means either binary. Class ids are the ones in
 `results/stdlib-diagnostics/FINDINGS.md`, which re-verifies each one: **5 fixed** (D1b, D3, D4, D5 — on
-the `try/catch` route — and D7), **5 still present** (D1, D1c, D2, D8, D9) and **2 changed class** (D6,
-D10).
+the `try/catch` route — and D7), **6 still present** (D1, D1c, D2, D8, D9, D11) and **2 changed class**
+(D6, D10).
 
 ### D1 — the `system_limit` family — 16 rows, two mechanisms
 
@@ -267,16 +267,23 @@ accounting/preemption. A third timeout row, `maps_SUITE:t_intersect`, is not of 
 suite's heavy `check_map_combiners_same_small/large` workload (a fold over `gb_sets` intersections),
 which also agrees in the 120 s re-check.
 
-### D9 — `apply/2` mis-reads a second argument that arrives in an incoming register — 1 row
+### D9 — `erlang:apply/2` is not implemented — 1 row
 
 Row: `queue_SUITE:oops`. The case drives 3 142 random `queue` operations and compares `queue:*` with the
 suite's own emulation model; it throws `{diff,[{value,empty},{error,badarg},peek,[{[],[]}],[{[]}]]}` —
-the `queue` side answers `empty`, the **model** side answers `{error,badarg}`. The model fun is applied
-by the suite's `call/2` helper, `call(Func, As) -> … apply(Func, As)`, i.e. exactly this class: the second
-argument of `apply/2` arriving in an incoming argument register. No `queue` function returns a wrong value
-here.
+the `queue` side answers `empty`, the **model** side answers `{error,badarg}`. The divergence is at op 1
+(the two queue states never disagree); the model side is the suite's own
+`call(Func, As) -> … apply(Func, As)` helper, so the failing call is `erlang:apply/2`.
+Patching that one `apply/2` in the suite's helper to a direct fun dispatch makes the Rust side run all
+3 142 ops to `ok`, which attributes the row to `apply/2` and to nothing in `queue`.
 
-Minimal probe module (compiled with the system `erlc` into `$TMPDIR`, nothing committed):
+`erlang:apply/2` is unimplemented: a genuine `call_ext erlang:apply/2` reaches `beam_rt`'s native floor,
+which decodes it as the `apply/3` `(Module, Function, Args)` shape
+(`crates/beam_rt/src/native.rs`, `apply_dynamic`), so the two operands are read as a module and a
+function name.
+
+Minimal probe module (compiled with the system `erlc` into `$TMPDIR`; the `-eval` evaluator has its own
+correct `apply/2` and cannot see this, so the probe must be compiled):
 
 ```erlang
 -module(m). -export([smallest/1]).
@@ -285,10 +292,16 @@ smallest(Args) -> apply(fun(X) -> X end, Args).
 
 - rust: `error:badarg` · oracle: `a`
 
-The full matrix (`apply_args_probe.erl`): a literal argument list, a body-bound list, `apply/3`,
-`F(Args)` and the `-eval` evaluator all agree; the argument list from a parameter, from a function-clause
-pattern, from `lists:foreach`, or an external fun all answer `badarg`, and an arity mismatch degrades
-`{badarity,{Fun,Args}}` to plain `badarg`. **Owner:** `beam_engine` (BIF/`apply` argument resolution).
+The matrix (`apply_args_probe.erl`, `queue_oops_probe.erl`): a literal argument list, `apply/3`, `F(Args)`
+and the `-eval` evaluator all agree — the compiler rewrites a literal-length argument list into
+`call_fun` (`erlc -S` shows `{call_fun,1}`), so only a *dynamically* built list reaches the floor.
+Wrong on the value side too, not just the error side: `apply(erlang, self)` answers a pid where the
+oracle raises `badarg` (it ran `erlang:self/0`), `apply(lists, reverse)` answers `undef`, and an arity
+mismatch degrades `{badarity,{Fun,Args}}` to plain `badarg`.
+**Owner:** `beam_rt` (the native `apply/2` floor; three of that floor's own unit tests pin the wrong
+semantics and must move with the fix). The engine and `beam_bifs` are correct by contract —
+`crates/beam_engine/src/families/funs/call_ext_apply.rs` pins that arity 2 must reach the host's own
+`apply/2`.
 
 ### D10 — `erts_debug:set_internal_state/2` is not served — 9 rows
 
