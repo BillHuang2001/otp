@@ -110,6 +110,14 @@ impl Collector {
         &self.policy
     }
 
+    /// The collector's heap-size policy, mutably — the seam the **live** heap-sizing-flag entry
+    /// points ([`Collector::set_min_heap_words`] and its two siblings, `src/flags.rs`) write
+    /// through. Nothing else in the crate mutates a policy after construction, so a sizing rule
+    /// can only ever observe a value the host installed.
+    pub(crate) fn policy_mut(&mut self) -> &mut HeapPolicy {
+        &mut self.policy
+    }
+
     /// The young (nursery) space the mutator allocates in.
     ///
     /// A [growth](Self::grow_nursery) retains the space it replaced, so this is the **current**

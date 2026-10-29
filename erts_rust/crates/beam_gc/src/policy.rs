@@ -463,6 +463,92 @@ impl HeapPolicy {
         }
     }
 
+    /// Sets the minimum heap size, in words, and reports the value it replaced — the
+    /// **live** form of [`min_heap_words`](Self::min_heap_words).
+    ///
+    /// This is the store half of `process_flag(min_heap_size, N)`
+    /// (`erts/emulator/beam/bif.c:2114-2144`): a **pure field write**. The C's arm reads
+    /// `old_value = make_small(BIF_P->min_heap_size)`, assigns `p->min_heap_size` and returns,
+    /// so a call runs **no collection**, allocates nothing, grows nothing, frees nothing and does
+    /// not touch `GEN_GCS` (`minor_gcs`). The new minimum therefore cannot enlarge the heap at the
+    /// call: a heap is only ever re-sized *by a collection*.
+    ///
+    /// # The verbatim-store contract
+    ///
+    /// The value is stored **exactly as given**. `process_flag/2`'s rounding —
+    /// `erts_next_heap_size(i, 0)`, plus the `H_MIN_SIZE` floor for a request below it
+    /// (`bif.c:2121-2126`) — belongs to the caller, so the value the caller reports back to the
+    /// program and the value that sizes the heap are the same number by construction. A store that
+    /// re-rounded here would publish two different minimums (the reported one and the effective
+    /// one).
+    ///
+    /// # What the field then does
+    ///
+    /// The floor reaches the heap through [`next_words`](Self::next_words) at the **next
+    /// collection**, never immediately: every sizing rule
+    /// ([`young_target_words`](Self::young_target_words),
+    /// [`young_minor_target_words`](Self::young_minor_target_words),
+    /// [`young_after_collection`](Self::young_after_collection),
+    /// [`young_after_fullsweep`](Self::young_after_fullsweep),
+    /// [`mature_after_fullsweep`](Self::mature_after_fullsweep)) passes through that one lookup,
+    /// so the collection that follows installs at least this capacity — exactly it for a live set
+    /// small enough to be floored (the oracle's `process_flag(min_heap_size, 100000)` reporting
+    /// `heap_size` 121536 on the next collection). A minimum above
+    /// [`max_heap_words`](Self::max_heap_words) is **clamped by that ceiling** — the ceiling wins,
+    /// exactly as in `next_words`.
+    pub fn set_min_heap_words(&mut self, words: usize) -> usize {
+        core::mem::replace(&mut self.min_heap_words, words)
+    }
+
+    /// Sets the minimum binary virtual heap size, in words, and reports the value it replaced —
+    /// the **live** form of [`min_bin_vheap_words`](Self::min_bin_vheap_words).
+    ///
+    /// The store half of `process_flag(min_bin_vheap_size, N)`
+    /// (`erts/emulator/beam/bif.c:2128-2142`): a **pure field write**, with the same
+    /// [verbatim-store contract](Self::set_min_heap_words) — `process_flag/2`'s
+    /// `erts_next_heap_size(i, 0)` / `BIN_VH_MIN_SIZE` rounding is the caller's.
+    ///
+    /// # What the field then does
+    ///
+    /// It is the **floor** of [`BinVheap`](crate::BinVheap)'s `next_vheap_size` rule
+    /// (`erl_gc.c:2955-2959`), so it lands at the next
+    /// [`BinVheap::record_collection`](crate::BinVheap::record_collection) — the C reads
+    /// `p->min_vheap_size` only there (`:2958`) and in the launch assignment
+    /// `p->bin_vheap_sz = p->min_vheap_size`, so a raise does **not** retroactively lift the
+    /// **current** budget (`:3288`). A live `bin_vheap_sz` above the new minimum simply stays
+    /// where it is until the next collection re-fits it.
+    pub fn set_min_bin_vheap_words(&mut self, words: usize) -> usize {
+        core::mem::replace(&mut self.min_bin_vheap_words, words)
+    }
+
+    /// Sets the fullsweep cadence — the number of minors before a fullsweep is forced — and
+    /// reports the value it replaced.
+    ///
+    /// The store half of `process_flag(fullsweep_after, N)`
+    /// (`erts/emulator/beam/bif.c:2101-2113`): a **pure field write**. The C assigns
+    /// `p->max_gen_gcs` (a `Uint16`, `erl_process.h:1145`) and returns the old value; no
+    /// collection runs and `GEN_GCS` is not reset, so a value at or below the live counter makes
+    /// the **very next** collection a fullsweep without touching the counter itself.
+    ///
+    /// # The verbatim-store contract
+    ///
+    /// The value is stored **exactly as given**. The C's `Uint16` narrowing is visible to the
+    /// program through the read-back (`process_flag(fullsweep_after, 100000)` reports 34464,
+    /// `70000` reports 4464), so a caller that reproduces that read-back narrows **before** it
+    /// calls; this store then adds no second truncation, which is what keeps the reported cadence
+    /// and the effective one the same number.
+    ///
+    /// # What the field then does
+    ///
+    /// [`fullsweep_due`](Self::fullsweep_due) reads it, and every
+    /// [`collect`](crate::Collector::collect) /
+    /// [`collect`](crate::GenImmixCollector::collect) consults that test first — so the change
+    /// lands at the next collection: `0` makes every collection a fullsweep (`0 >= 0`), and a
+    /// value `3` gives three minors and then a fullsweep.
+    pub fn set_fullsweep_after(&mut self, after: u32) -> u32 {
+        core::mem::replace(&mut self.fullsweep_after, after)
+    }
+
     /// A policy for a process started with the `spawn_opt` heap options
     /// `min_heap_size`, `min_bin_vheap_size` and `fullsweep_after` against the
     /// **unconfigured** emulator — the C defaults `H_MIN_SIZE` (`DEFAULT_MIN_HEAP_WORDS`,
