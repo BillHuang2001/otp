@@ -1,10 +1,5 @@
 %% Diagnostic probe for class D9 of `results/stdlib-notes.md` §D.
 %%
-%% Old observation (`queue_SUITE:oops`): the suite's own `emul/4` comparison threw
-%% `{diff,[{value,empty},{error,badarg},peek,[{[],[]}],[{[]}]]}` — `apply/2` answered
-%% `badarg` where the oracle applied the fun, i.e. "a register holding a fun is read
-%% where the argument list is expected" (`results/stdlib-notes.md` §D9).
-%%
 %% The shape in `queue_SUITE` is `call/2` (`lib/stdlib/test/queue_SUITE.erl`):
 %%
 %%     call(Func, As) ->
@@ -13,9 +8,20 @@
 %%                 _     -> apply(Func, As)
 %%             end of ...
 %%
-%% i.e. `apply/2` whose **second** argument is an incoming argument register.
 %% This probe sweeps both argument positions; every row is fully guarded so one
 %% failing shape never aborts the run.
+%%
+%% MECHANISM CORRECTED (class D11 — see `FINDINGS.md` §*queue_SUITE:oops — the value
+%% disagreement* and the `queue_oops_probe.erl` probe): the rows that pass here do NOT pass
+%% because of argument position. `erlang:apply/2` is unimplemented in this runtime: a genuine
+%% `call_ext erlang:apply/2` reaches the `beam_rt` native floor, which reads `args[0]` as a
+%% module and `args[1]` as a function and calls `M:F()`. What separates pass from fail is
+%% whether the **compiler** rewrote the call: when the argument list's length is statically
+%% known the call becomes `call_fun` (`erlc -S` proves it on `only_fun/1`), so it never
+%% reaches the floor; when the length is unknown it stays `erlang:apply/2` and raises
+%% `badarg`. So "fun param, literal args" passes and "literal fun, args param" fails for the
+%% length, not for the position — and `apply(erlang, self)` (two atoms) *runs* `erlang:self/0`
+%% where the oracle raises `badarg`.
 %%
 %% Erlc: `erlc -o . apply_args_probe.erl`
 %% Run:  `beam_rt -noshell -pa . -eval 'apply_args_probe:main(), halt(0).'`
@@ -46,7 +52,7 @@ main() ->
 
 %% --- the shapes -----------------------------------------------------------
 
-%% The smallest failing shape: the argument list arrives as an argument register.
+%% The smallest failing shape: the argument list's LENGTH is unknown at compile time.
 smallest(Args) ->
     apply(fun(X) -> X end, Args).
 
