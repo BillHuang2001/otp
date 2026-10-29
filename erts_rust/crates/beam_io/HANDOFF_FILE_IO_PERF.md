@@ -213,9 +213,9 @@ own `file:read_file_info(Name)` ⇒ `{error,enoent}` self-check passes (`rambenc
   in this crate is red on an unmodified tree").
 * `cargo test -p beam_io --no-fail-fast`: **fully green** — whole crate 1328 passed / 0 failed /
   2 ignored over 28 binaries (lib 1074 passed / 0 failed). No red target.
-* Differential: the corpus is **3469** cases; a **12-way** `differential run <id> --out-file` sweep
+* Differential: the corpus is **3524** cases; a **12-way** `differential run <id> --out-file` sweep
   over the `driver*`/`port*`/`file*`/`inet*`/`spawn*` cases included, folded with `differential
-  merge` and both committed allowlists, reports `total=3469 / agree=3465 / mismatch=0 /
+  merge` and both committed allowlists, reports `total=3524 / agree=3520 / mismatch=0 /
   unsupported=1 / skipped=0 / oracle_drift=3` with ratchet `allowed=1 / unauthorized=0 / stale=0`
   and drift `allowed=3 / unauthorized=0 / stale=0` — the three non-agreeing cases are the recorded
   host-oracle drift (an erts-17.1.1 oracle vs the tree's frozen `17.1`), no divergence.

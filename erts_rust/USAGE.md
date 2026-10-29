@@ -532,8 +532,8 @@ here). Every gap below is a **typed** error/`unsupported`, or an honest own-stat
 runtime does not return silently wrong results.
 
 * **A.1 language semantics** — real `erlc`-built code runs: the whole-OTP `.beam` census lowers with
-  zero unmodelled opcodes, and the gate's verdict is `total=3218 agree=3217 mismatch=0
-  unsupported=1 skipped=0` (§6). Gaps: a `receive … after T` whose delay is `infinity` or not a
+  zero unmodelled opcodes, and the gate's verdict is `total=3524 agree=3520 mismatch=0 unsupported=1
+  skipped=0 oracle_drift=3` (§6). Gaps: a `receive … after T` whose delay is `infinity` or not a
   statically positive integer parks; `lists`/`maps` of a non-list raise `badarg` where the oracle
   raises `function_clause`/`{bad_generator,_}`; `math:erf/1`/`erfc/1` are approximate.
 * **A.2 `.beam`/asm** — full chunk parse, loader, typed IR. Gap: there is **no old-code slot**, so
@@ -620,7 +620,8 @@ A **whole serial run is >100 minutes** (each CLI case boots a runtime). Do not r
 | `mismatch` | they disagreed — **always a defect**, never tolerated by the allowlist |
 | `unsupported` | `beam_rt` exited **3** (typed capability gap) — tolerated only if recorded |
 
-The corpus is **3218 cases** and the committed record is `agree=3217 mismatch=0 unsupported=1`.
+The corpus is **3524 cases** and the committed record is `agree=3520 mismatch=0 unsupported=1
+skipped=0 oracle_drift=3`.
 The single recorded gap is `wire/new_fun_ext_encode` (A.5): an `erl_eval` lambda's closure identity
 needs `erl_eval`/`erl_scan`/`erl_parse`, and it is deliberately left unclosable.
 
@@ -629,7 +630,7 @@ needs `erl_eval`/`erl_scan`/`erl_parse`, and it is deliberately left unclosable.
 ```sh
 $ erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p differential
 $ erts_rust/target/release/differential list 2>/dev/null | wc -l
-3218
+3524
 $ erts_rust/target/release/differential run etf/binary_to_term_roundtrip
 [AGREE] etf/binary_to_term_roundtrip (A.2)
     binary_to_term/1 inverts term_to_binary/1 for a mixed term
