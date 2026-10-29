@@ -247,7 +247,10 @@ so `gen_server:loop_hibernate/4` (`lib/stdlib/src/gen_server.erl:2338`) does not
   `BeamError` — is a typed `debug_trace` line, never a boot failure and never a panic.
   Pinned, at the CLI and against the live oracle, by `../tests/logger_default_handler.rs` (the whole
   rendered handler/primary state, every boot route, the duplicate refusal, `init:restart/0` and a log
-  event).
+  event's emitted report block).
+  The handler is asynchronous (`logger_olp`), so an event is written only once the handler process runs: `logger_std_h:filesync/1` is the flush that makes the emission observable.
+  The report case asserts through that flush — identical block on both runtimes, 10/10 measured.
+  Without it a `halt/0` racing the queued event drops the report (measured 0/10 here against the oracle's 9/10), so no case may byte-compare that unflushed tail; the crash case pins only the exit code and the action's own effect.
 - **The kernel application starts at directive 18 and stays up.** Directive 18's
   `application:start_boot/2` reaches `application_controller:start_boot_application/2`, whose
   `application:load(kernel)` returns `{error,{already_loaded,kernel}}` (the AC's own `init/2` loaded
