@@ -1,0 +1,1161 @@
+{
+  "schema": "suites/1",
+  "generated_at": 1793244680,
+  "run_command": "suites run --target khepri --jobs 4 --out erts_rust/tools/suites/results/khepri",
+  "host": {
+    "loadavg_before": "169.99 99.02 63.78 166/1773 3",
+    "loadavg_after": "91.59 90.88 63.41 13/1065 3601",
+    "nproc": 16,
+    "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
+    "oracle_version": "29/17.1.1"
+  },
+  "rust": {
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A596/erts_rust/target/release/beam_rt",
+    "sha": "ec44fa3f7fc7d8419ae32f11b23a06448b565ec7",
+    "version": "30/17.1",
+    "tier": null
+  },
+  "targets": [
+    {
+      "id": "khepri",
+      "kind": "eunit",
+      "source": {
+        "repo": "khepri",
+        "path": "/home/bill/Source/khepri",
+        "sha": "2ac09291bac7c2fee099380ec1e26d8c9452f776",
+        "staged": "/tmp/erts-suites-stage/khepri/proj"
+      },
+      "build": {
+        "command": "/nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile",
+        "ok": true,
+        "reused": true,
+        "detail": "reused a completed `rebar3 as test compile` in the staged copy"
+      },
+      "code_path": [
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin",
+        "/tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin"
+      ],
+      "invocations": [
+        {
+          "side": "sys",
+          "purpose": "eunit advanced_delete",
+          "command": "cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
+        },
+        {
+          "side": "rust",
+          "purpose": "eunit advanced_delete",
+          "command": "cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A596/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
+        },
+        {
+          "side": "build",
+          "purpose": "rebar3 as test compile",
+          "command": "cd <stage>/proj && /nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile"
+        }
+      ],
+      "tally": {
+        "measured": 43,
+        "agree": 12,
+        "agree_fail_identical": 8,
+        "divergence": 2,
+        "oracle_only_fail": 0,
+        "rust_gap": 29,
+        "not_run": 0,
+        "sys_passed": 1500,
+        "sys_failed": 1,
+        "rust_passed": 285,
+        "rust_failed": 8
+      },
+      "rows": [
+        {
+          "id": "advanced_delete",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 33,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "advanced_get",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 13,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "advanced_put",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 40,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "advanced_tx_delete",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 39,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "advanced_tx_get",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 15,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "advanced_tx_put",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 43,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "app",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 36,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 22,
+            "failed": 5,
+            "skipped": 0,
+            "detail": "*failed*: **error:{assertEqual,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "async_option",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 20,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "bang_functions",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 85,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "cluster_SUITE",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "a common_test suite: it carries no eunit tests (0/0 would be a lie)"
+        },
+        {
+          "id": "conditions",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 23,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 23,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "cth_log_redirect_any_domains",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "no eunit tests (common_test suite or helper module)"
+        },
+        {
+          "id": "db_info",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 24,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 3,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "delete_command",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 12,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 12,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "display_tree",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 11,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 10,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "*failed*: **error:unsupported_local_fun"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "export",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 56,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "export_erlang",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 63,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "export_helper",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "no eunit tests (common_test suite or helper module)"
+        },
+        {
+          "id": "favor_option",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 5,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "fence",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 6,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "helpers",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "no eunit tests (common_test suite or helper module)"
+        },
+        {
+          "id": "keep_while_conditions",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 27,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 21,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "*failed*: **error:{assert,[{module,keep_while_conditions},"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "machine_code_called_from_ra",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 15,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "mod_used_for_transactions",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "no eunit tests (common_test suite or helper module)"
+        },
+        {
+          "id": "non_versioned_commands",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 15,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 15,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "path_operations",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 51,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 51,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "pattern_tree",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 5,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 5,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "prefix_tree",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 4,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 4,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "projections",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 134,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 2,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "*failed*: **throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "prop_path_operations",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "no eunit tests (common_test suite or helper module)"
+        },
+        {
+          "id": "prop_state_machine",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "no eunit tests (common_test suite or helper module)"
+        },
+        {
+          "id": "protect_against_dups_option",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 13,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 5,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "put_command",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 19,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 19,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "queries",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 16,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 16,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "return_indirect_deletes_option",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 15,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "root_node",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 22,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 22,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "sigils",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 4,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 4,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "simple_delete",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 42,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "simple_get",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 94,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "simple_put",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 38,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "simple_tx_delete",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 46,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "simple_tx_get",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 106,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "simple_tx_misc",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 45,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 2,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "simple_tx_put",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 47,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "stored_procs",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "fail",
+            "passed": 12,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "stored_procs:165: -crashing_sproc_stacktrace_test_/0-fun-1- (Execute the stored procedure): **error:{assertMatch,"
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "test_ra_server_helpers",
+          "suite": null,
+          "kind": "notice",
+          "sys": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "no_tests",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree-fail-identical",
+          "note": "no eunit tests (common_test suite or helper module)"
+        },
+        {
+          "id": "timeout",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 6,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "triggers",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 118,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "tx_funs",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 42,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 42,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "tx_sprocs",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 33,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "cancelled",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "**throw:{error,"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "utils",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 7,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 7,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        }
+      ],
+      "notes": [
+        "drive (identical on both sides): `eunit:test('{module}',[verbose]), halt(0).` — the module name is substituted per row",
+        "`rebar3 as test compile` is used for the build only; the numbers come from running `eunit:test/2` directly on both runtimes",
+        "code path: 11 entries (every `_build/test/lib/*/ebin` plus `_build/test/lib/khepri/test`)",
+        "jobs: 4 concurrent module runs (each in its own OS process and working directory)",
+        "per-module working directory: `/tmp/erts-suites-stage/khepri/cwd` (khepri's tests create `_test.<name>` dirs relative to the cwd; both sides of a module share one)",
+        "sys: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'`",
+        "rust: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A596/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'`"
+      ]
+    }
+  ]
+}
