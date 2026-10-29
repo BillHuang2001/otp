@@ -48,31 +48,38 @@
 //! neither a map nor a walkable iterator is reported against the **original** argument,
 //! while a bad *fun* stays the plain `error:badarg`.
 //!
-//! # Why the map no-op *identity* is only pinnable from compiled code
+//! # The map no-op *identity* — compiled code and the registered BIFs
 //!
 //! An update that changes nothing — `M#{a => 1}` where `M` already holds `a => 1`, or the
 //! exact form `M#{a := 1}` — must hand back the **source map's own term**, not an equal
 //! copy: `erts_debug:same/2` (raw `Eterm` word equality) answers `true` for it, while two
 //! value-equal maps that were built separately answer `false`. That identity is the one
 //! observable the writers can silently lose (a fresh map is still `=:=`-equal, so nothing
-//! else notices), which is exactly why it needs a case.
+//! else notices), which is exactly why it needs cases.
 //!
-//! It cannot be pinned through a BIF: a registered BIF's result is deep-copied into the
-//! caller's heap, so `erts_debug:same(maps:put(a, 1, M), M)` is `false` here and `true` on
-//! the oracle no matter how correct `maps:put/3` is (`divergences.md` §A.7 — the same reason
-//! the `maps`-result identity has no case at all). The pinnable shape is therefore the
-//! **compiled map-update syntax inside real bytecode**, and a `CaseKind::Module` case is the
-//! only route that gives *both* sides that: a `.beam` built by `erlc` and executed by an
-//! engine. A `-eval` `spawn(fun() -> … end)` would not do — the oracle *interprets* a fun
-//! created in `-eval` (`erl_eval`), and the `-eval` evaluator does not even accept the
-//! `M#{…}` update syntax, so neither side would run a compiled update.
+//! Both routes now **agree**. The **compiled** map-update syntax is pinned by
+//! `maps/no_op_update_keeps_identity` (oracle mask `16352`: flat + 40-key HAMT, with changing rows
+//! that must answer `false`) and `maps/no_op_update_identity_at_the_map_boundaries` (oracle mask
+//! `32744`: the 32/33-key flat↔HAMT boundary, mixed key types, a two-level no-op chain, and an
+//! equal-but-freshly-built value). The **registered BIFs** agree as well — measured, not pinned by
+//! a case here: result admission keeps the argument's own word through a no-op
+//! (`crates/beam_rt/src/context/calls/dest.rs`'s destination-containment short-circuit), so the
+//! measured
+//! `[same(M,put(a,1,M)), same(M,update(a,1,M)), same(M,remove(zz,M)), same(M,merge(M,M)),
+//! same(M,Q), M =:= Q, same(M,with([a],M)), same(M,put(a,2,M))]` vector (with
+//! `Q = maps:from_list([{b,2},{a,1}])`) answers `[true,true,true,true,false,true,false,false]` on
+//! **both** sides. The one residual in the family is `maps:without/2`:
+//! `[same(M,without([],M)), same(M,without([zz],M))]` is `[true,true]` on the oracle and
+//! `[false,false]` here (the registered fast path rebuilds the map instead of returning its
+//! argument), so no case may pin it — the ledger entry is `divergences.md` §A.7.
+//!
+//! A `CaseKind::Module` case is the route for the compiled half: a `.beam` built by `erlc` and
+//! executed by an engine on both sides. A `-eval` `spawn(fun() -> … end)` would not do — the
+//! oracle *interprets* a fun created in `-eval` (`erl_eval`), and this runtime's `-eval` evaluator
+//! does not even accept the `M#{…}` update syntax, so neither side would run a compiled update.
 //!
 //! A module-run golden is an integer line, so each function reduces its ordered row list to
-//! a **bit mask** (`mask/1`: most significant bit = first row, `1` = a `true` row). The two
-//! cases are `maps/no_op_update_keeps_identity` (flat + 40-key HAMT, with changing rows that
-//! must answer `false`) and
-//! `maps/no_op_update_identity_at_the_map_boundaries` (the flat↔HAMT size boundary, mixed
-//! key types, a two-level no-op chain, and an equal-but-freshly-built value). The goldens are
+//! a **bit mask** (`mask/1`: most significant bit = first row, `1` = a `true` row). The goldens are
 //! the oracle's own measured masks (`erl` 29.1.2 / erts-17.1.1).
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
