@@ -137,9 +137,9 @@ Gaps whose owner is another crate, each with the exact API this crate adopts onc
   - `src/off_heap.rs` → `OffHeapTable` (MSO façade + refc-binary and node lists, `is_fully_empty`/`rollback`)
   - `src/node.rs` → `NodeEntry`
   - `src/error.rs` → copy-failure constructors + `is_message_heap_exhaustion`
-  - `src/layout.rs` → the M1 identification/encoding helpers + the `beam_term::layout` re-exports
+  - `src/layout.rs` → the M1 identification/encoding helpers, `classify_sub_bits`/`SubBitsKind` (the one `SUB_BITS` shape proof, shared by the copy and the price) + the `beam_term::layout` re-exports
   - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `tests/` → the twenty integration suites, one per contract area — per-file pinned claims in `tests/CONTEXT.md` (`copy`, `classes`, `guards`, `sizing`, `destination_pricing`, `single_pass`, `message_size`, `envelope_relocation`, `share`, `binary`, `external`, `fun`, `fragments`, `queue`, `alloc`, `traversals`, `counters`, `identity`, `perf`, `send_perf`)
+- `tests/` → the twenty-one integration suites, one per contract area — per-file pinned claims in `tests/CONTEXT.md` (`copy`, `classes`, `guards`, `sizing`, `destination_pricing`, `single_pass`, `checked_sub_bits`, `message_size`, `envelope_relocation`, `share`, `binary`, `external`, `fun`, `fragments`, `queue`, `alloc`, `traversals`, `counters`, `identity`, `perf`, `send_perf`)
 - `PERF.md` → the measured record (every figure, its regime and its repro command; `§2` the structural per-shape table, `§10` what remains by owner)
 - `../../../erts/emulator/beam/{copy.c,erl_message.h,erl_message.c,erl_node_tables.h,erl_gc.c}` → the authoritative copier, the message envelope/`ErlHeapFragment`/queue layout, `erts_ref_node_entry`/`erts_deref_node_entry`, and the MSO/`OffHeap` sweep rule (reference — read-only)
 - `../beam_gc/` → the collector + `MsoHandle`/`RefCount`/`OffHeap` this crate depends on (sibling — read-only, escalate writes to `..`)
