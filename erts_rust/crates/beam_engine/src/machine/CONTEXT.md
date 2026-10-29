@@ -145,3 +145,9 @@ No child directories — every entry is a file in this node.
 - `../interpreter/CONTEXT.md` → `step_instruction_with_entry` (also the JIT deopt target), the `LabelMap` and import table, the local-call seam's call sites; `../jit/CONTEXT.md` and `../jit/baseline/CONTEXT.md` → the native tiers' block ABI; `../families/exceptions/CONTEXT.md` → trace cooking from the family side.
 - `../../MEASURED.md` / `../../PERF.md` / `../../TEST_NOTES.md` → every measured figure, coverage count and test enumeration for this node.
 - `beam_rt/src/runner/CONTEXT.md` → the host's park/publish/resume side of the root-set contract.
+
+## Metadata-only raise markers
+Beside the one-shot latch pairs (`pending_supplied_term` / `pending_callee_head`) the machine carries `pending_supplied_term_verbatim` → `raise_supplied_term_verbatim`, armed immediately before the raise lands.
+The marker carries **no word**: it only says that the raise's supplied trace arrived as a *term* (`Raise::supplied_trace`), which is what lets `symbolic_stacktrace` echo it verbatim and what distinguishes a supplied `[]` from "nothing supplied".
+The term itself is a loose heap term parked by `Machine::with_roots` (`LOOSE_HEAP_TERMS`), so it is relocated by every collection like any other parked word.
+
