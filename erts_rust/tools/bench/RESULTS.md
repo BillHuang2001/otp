@@ -11,7 +11,7 @@ Later, **narrower** sessions also exist and are archived under `results/`; they 
 `m22` is that workstream's after-record: six matched rounds over `baseline,gc_bound,gc_class,list_walk,slice`, each row read through `results/m22-vs-m21.txt` (its headline diff), `results/m22-xrun-ratios.txt`, `results/m22-load-record.md` and `results/m22-memory.md`.
 §2/§3 do **not** restate m21's or m22's numbers.
 `m21` and `m22` share the OTP 29.1.2 / erts-17.1.1 oracle, unlike m19's 29.1.1 / erts-17.1, so they are mutually diffable only with each other and never against a row above.
-`m23` is the **newest** session and a different kind of record: the startup round's *binary A/B on four sides* (`old` / HEAD / HEAD-with-`BEAM_RT_TIER=baseline` / the oracle), read through `results/m23-boot-wall.json`, `results/m23-slice-wall.json`, `results/m23-bench-{old,new}-r{1,2,3}.json` and the differential sweep `results/m23-sweep-merged.json`; its own section is at the end of this file. Same oracle as m21/m22 (29.1.2 / erts-17.1.1).
+`m23` is the **newest** session and a different kind of record: the startup round's *binary A/B on four sides* (`old` / HEAD / HEAD-with-`BEAM_RT_TIER=baseline` / the oracle), read through `results/m23-boot-wall.json`, `results/m23-slice-wall.json`, `results/m23-bench-{old,new}-r{1,2,3}.json` and the differential sweep `results/m23-sweep-merged.json`; its own section is at the end of this file, and its **final state** block (`### m23 final state`) is the one to quote — `results/m23-final-{ab-boot,ab-slice,tiers}.json`, `results/m23-final-slope.txt`, `results/m23-final-bench-{old,new}-r{1,2,3}.json` and `results/m23-final-sweep-merged.json`. Same oracle as m21/m22 (29.1.2 / erts-17.1.1).
 
 ## 0. The two sides, named
 
@@ -691,3 +691,85 @@ and are flagged here as such: the per-boot instructions/cycles/task-clock table 
 the steady-state slope. The retained `perf stat` output is the slope's **5 M-element** point only
 (`m23-lw-perf-{old,new,newpin}.txt`, one `perf stat -x,` record per side at 5 000 walks × `LEN` 1 000, its
 `out` checksum 2 502 500 000).
+
+### m23 final state (the numbers to quote)
+
+The final verification session, at the final tree: two further changes landed after the mid-state block above
+and everything was re-measured. `new` = **final HEAD**, `sys` = the same oracle as the rest of the round
+(`erl` OTP 29.1.2 / erts-17.1.1), `pre-round` = source `2d0fe67808`. Provenance unchanged from the round: one
+process at a time, every sample pinned `taskset -c 3`, 1-min `/proc/loadavg` read before and after every
+round, wall from `perf_counter` around `fork`/`wait4`, **CPU = `ru_utime + ru_stime`** (the load-robust
+column), peak RSS from `ru_maxrss`. The mid-state tables above are the round's history; **where they
+disagree, the ones below are the figures to quote.**
+
+**Boot A/B — 21 interleaved rounds, 1-min load 48.6–54.0** (`m23-final-ab-boot.json`), p50 values:
+
+| side | wall p50 (ms) | CPU p50 (ms) | peak RSS p50 (MiB) |
+|---|---|---|---|
+| **new — final HEAD** | **122.8** | **116.1** | **48.51** |
+| `sys` — oracle | 133.7 | 128.1 | 59.37 |
+| `pre-round` — `2d0fe67808` | 156.6 | 147.2 | 58.97 |
+
+Paired per-round medians (one ratio per round, median over the 21): **new/sys wall 0.910, CPU 0.903, RSS
+0.817**; **pre-round/new wall 1.260, CPU 1.262, RSS 1.216**.
+
+**`slice` (`run slice.beam slice:fib/1 25`) — 15 rounds, 1-min load 46.2–48.6** (`m23-final-ab-slice.json`),
+every side printing `75025`:
+
+| side | wall p50 (ms) | CPU p50 (ms) | peak RSS p50 (MiB) |
+|---|---|---|---|
+| **new — final HEAD** | **123.6** | **119.7** | **48.57** |
+| `sys` — oracle | 148.9 | 143.3 | 64.52 |
+| `pre-round` | 152.2 | 148.3 | 59.00 |
+
+Paired medians: **new/sys wall 0.837, CPU 0.831, RSS 0.753**; **pre-round/new 1.240 / 1.240 / 1.214**.
+
+**Per-tier boot record — 5 interleaved rounds, 1-min load 130–137** (`m23-final-tiers.json`):
+
+| program | retired user instructions | cycles | task-clock p50 (ms) | CPU p50 (ms) | peak RSS p50 (MiB) |
+|---|---|---|---|---|---|
+| default (HEAD) | 1 073.6 M | 342.6 M | 117.5 | 119.1 | 48.53 |
+| `BEAM_RT_TIER=baseline` | 840.4 M | 385.2 M | 128.7 | 129.1 | 55.58 |
+| `BEAM_RT_TIER=interpreter` | 1 073.7 M | 345.1 M | 117.5 | 117.6 | 48.48 |
+| pre-round `2d0fe67808` | 1 083.7 M | 452.9 M | 148.3 | 149.8 | 58.84 |
+| system oracle | 787.9 M | 344.6 M | 126.6 | 122.7 | 59.45 |
+
+**Instructions are not a latency proxy here:** the default boot retires **1.36× the oracle's instructions**
+while spending **0.99× its cycles**. The two final passes are what take the boot from **1.193 G** (the
+mid-state figure above) to **1.0736 G**, of which the MD5 unroll alone is **−42.3 M (−3.77 %)**, with the
+digests proven byte-identical.
+
+**Steady state (final bullet).** `list_walk` instructions per walked element **347.9 (pre-round) → 349.9
+(final)** (two-point 1 M vs 5 M slope, `m23-final-slope.txt`), and the binary carrying only the round's first
+loader pass already reads **350.0** — so the final passes moved it **0.03 %** = parity. Every deterministic
+counter is identical (`case_list_walk_elements` 50 000 000, `case_etf_roundtrip_ops` 500 000,
+`case_ets_copy_ops` 250 000, `case_send_recv_ops` 90 000, `case_send_recv_plain_ops` 300 000), and
+`case_*_peak_rss_bytes` is **0.819–0.829×** of pre-round (`m23-final-bench-{old,new}-r{1,2,3}.json`).
+The `ns_per_*` rows of these rounds are load-flagged (1-min load 29.2 → 85.8, `m23-final-bench-loads.txt`)
+and are **not** a finding.
+
+**Gate + tests at the final tree.** Full sweep **3469/3469 reports**:
+`summary: total=3469 agree=3465 mismatch=0 unsupported=1 skipped=0 oracle_drift=3`, ratchet
+`allowed=1 unauthorized=0 stale=0`, drift `allowed=3 unauthorized=0 stale=0` ⇒ `gate.sh` **exit 0 (PASS)**
+(`m23-final-sweep-merged.json`, `m23-final-merge.log`, `m23-final-gate.log`; the 3 drift cases are the `erts`
+version goldens, which the report's per-contract split files under A.2/A.3/A.8/A.9, and the single
+`unsupported` is `wire/new_fun_ext_encode`). Crate suites **`beam_rt` 2960 passed / 0 failed / 62 ignored,
+`beam_engine` 2538 / 0 / 10, `beam_loader` 450 / 0 / 0, `beam_common` 62 / 0 / 2**;
+`cargo build --workspace --all-targets` **0 warnings**; smoke `run slice.beam slice:add/2 2 3` → `5`, and
+`-noshell -boot bootstrap/bin/start` → exit 0 with empty stdout/stderr.
+
+**What is not valid here.** No absolute wall time is a constant (shared host); only the paired ratios and the
+`sys`/`pre-round` columns are readable. The per-tier table ran at load 130–137 and is read for
+**instructions/cycles/RSS**, never for wall. The `ns_per_*` rows are withdrawn as findings (§3.3 applies
+unchanged), and nothing in this block is a cross-record comparison — the oracle is m21/m22's 29.1.2 /
+erts-17.1.1, not m19's 29.1.1.
+
+**Artifacts** (`results/m23-final-*`): `ab-boot.json` + `ab-slice.json` (the raw per-round wall/CPU/RSS
+sample sets behind both A/B tables), `tiers.json`, `bench-{old,new}-r{1,2,3}.json` (the rust-only
+non-regression rounds), `slope.txt` (the three paired slope points), `bench-loads.txt`,
+`sweep-merged.json` + `merge.log` + `gate.log`, and the pass/fail evidence
+`test-beam_{rt,engine,loader,common}.log` + `build-all-targets.log`.
+The six `m23-final-bench-*` reports carry the directory's path normalization (`runtimes[].program` →
+`erts_rust/target/release/beam_rt`, scratch prefixes → `$TMPDIR/…`), no metric value touched; the sweep
+report and `m23-final-merge.log` are **not** normalized, so their `rust` program still names the round's
+volatile worktree binary, which no longer exists.

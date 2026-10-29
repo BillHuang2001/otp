@@ -1,0 +1,13 @@
+run=1 side=old load_before=47.94
+  exit=0 load_after=39.29
+run=1 side=new load_before=39.29
+  exit=0 load_after=36.90
+run=2 side=old load_before=36.90
+  exit=0 load_after=32.53
+run=2 side=new load_before=32.53
+  exit=0 load_after=29.23
+run=3 side=old load_before=29.23
+  exit=0 load_after=55.38
+run=3 side=new load_before=55.38
+  exit=0 load_after=85.75
+BENCH_DONE

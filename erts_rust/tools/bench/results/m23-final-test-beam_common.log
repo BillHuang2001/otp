@@ -1,0 +1,77 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (erts_rust/target/debug/deps/beam_common-c6337e72db1222d0)
+
+running 57 tests
+test config::tests::feature_flag_builders ... ok
+test config::tests::feature_flag_defaults ... ok
+test config::tests::feature_flags_for_flavor ... ok
+test config::tests::flavor_default_parse_and_display ... ok
+test config::tests::log_level_ordering ... ok
+test config::tests::log_level_parse_and_display ... ok
+test config::tests::runtime_config_builders ... ok
+test config::tests::runtime_config_defaults ... ok
+test constants::tests::context_reds_is_the_frozen_erlang_value ... ok
+test error::tests::alloc_kind_names_are_stable ... ok
+test error::tests::as_atom_maps_reason_variants ... ok
+test error::tests::atom_name_conversions ... ok
+test error::tests::exception_class_names ... ok
+test error::tests::as_atom_maps_raises_by_reason ... ok
+test error::tests::exit_reason_display_and_atoms ... ok
+test error::tests::io_error_converts_and_is_the_source ... ok
+test error::tests::live_reason_round_trips_and_type_tests ... ok
+test error::tests::raise_builders_and_stacktrace ... ok
+test error::tests::raise_predicates_and_conversion ... ok
+test error::tests::structured_raise_with_live_reason_keeps_atom_behavior ... ok
+test error::tests::display_covers_every_variant ... ok
+test logging::tests::init_from_env_defaults_to_info_when_unset ... ok
+test logging::tests::level_defaults_to_info ... ok
+test logging::tests::macros_route_through_the_level ... ok
+test logging::tests::enabled_follows_the_configured_level ... ok
+test error::tests::raise_equality_ignores_live_reason_but_keeps_observable_parts ... ok
+test md5::tests::md5_throughput_microbench ... ignored, diagnostic: MD5 throughput loop for perf stat
+test md5::tests::finish_is_pure_and_repeatable ... ok
+test error::tests::raise_debug_hides_the_live_reason_and_display_is_unchanged ... ok
+test error::tests::raise_carries_live_reason_and_clone_preserves_it ... ok
+test md5::tests::constants_are_the_rfc_sizes ... ok
+test md5::tests::known_vectors ... ok
+test md5::tests::from_parts_round_trips_the_context_image ... ok
+test logging::tests::init_from_env_parses_the_variable ... ok
+test md5::tests::print_beam_digests ... ignored, diagnostic: prints the digest of every .beam under $MD5_BEAM_DIR
+test error::tests::stacktrace_display_and_frame_defaults ... ok
+test md5::tests::update_keeps_the_c_buffer_asymmetry ... ok
+test refid::tests::a_later_draw_exceeds_every_earlier_draw ... ok
+test md5::tests::streaming_splits_are_invariant ... ok
+test version::tests::constants_are_the_targeted_release ... ok
+test logging::tests::set_level_round_trips ... ok
+test version::tests::equivalent_spellings_parse_to_the_same_version ... ok
+test version::tests::new_builds_a_release_version ... ok
+test version::tests::parse_otp_version ... ok
+test version::tests::version_helpers_parse_the_constants ... ok
+test version::tests::parse_erts_version ... ok
+test version::tests::from_str_parses ... ok
+test md5::tests::pad_boundary_lengths_match_known_vectors ... ok
+test version::tests::prerelease_parse_and_display ... ok
+test version::tests::malformed_inputs_are_rejected ... ok
+test refid::tests::concurrent_draws_are_unique_and_advance_the_shared_counter_exactly ... ok
+test refid::tests::successive_draws_strictly_increase ... ok
+test md5::tests::digest_matches_the_streaming_context ... ok
+test version::tests::prerelease_rejects_malformed_tags ... ok
+test version::tests::display_normalizes_and_round_trips ... ok
+test version::tests::parse_error_reports_input_and_reason ... ok
+test md5::tests::rfc_1321_suite_vectors ... ok
+
+test result: ok. 55 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests beam_common
+
+running 7 tests
+test crates/beam_common/src/lib.rs - (line 78) ... ok
+test crates/beam_common/src/md5.rs - md5::Md5 (line 146) ... ok
+test crates/beam_common/src/refid.rs - refid::next_ref_id (line 92) ... ok
+test crates/beam_common/src/lib.rs - md5 (line 142) ... ok
+test crates/beam_common/src/md5.rs - md5::Md5::from_parts (line 275) ... ok
+test crates/beam_common/src/md5.rs - md5::digest (line 112) ... ok
+test crates/beam_common/src/lib.rs - (line 55) ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
