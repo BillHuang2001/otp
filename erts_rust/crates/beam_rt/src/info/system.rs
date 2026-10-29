@@ -61,6 +61,13 @@
 //! | `creation` | int |
 //! | `system_logger` | atom `logger`/`undefined` or a pid — the `system_logger` flag (atom `logger` until `erlang:system_flag(system_logger, _)` sets it) |
 //!
+//! `snifs` is here too: it reports a **build property of this emulator** — the static-NIF
+//! roster (`beam_bifs::snifs()`, this tree's generated `bif.tab` order), a list of
+//! `{Module, Function, Arity}` tuples. Its row count is release-scoped (556 rows for this
+//! tree's `30.0-rc0`, 553 on an OTP-29 oracle: the same list without
+//! `erlang:pid_to_binary/1`, `erlang:port_to_binary/1` and `erlang:ref_to_binary/1`), so it
+//! is compared **shape-only** against a live oracle — see [`snifs_roster`].
+//!
 //! # The emulator's own build/implementation flags
 //!
 //! `erl_bif_info.c` also answers a family of keys that report a **build or
@@ -190,8 +197,44 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "hipe_architecture" => Some(Ok(InfoValue::Atom("undefined"))),
         "literal_test" => Some(Ok(InfoValue::Atom("tag"))),
         "sequential_tracer" => Some(Ok(InfoValue::Tuple("sequential_tracer", "false"))),
+        // The static-NIF roster (see [`snifs_roster`]).
+        "snifs" => Some(Ok(snifs_roster())),
         _ => None,
     }
+}
+
+/// `system_info(snifs)` — the static-NIF roster as the oracle prints it.
+///
+/// Every element is the 3-tuple `{Module, Function, Arity}` (`Module`/`Function` atoms,
+/// `Arity` a small integer) of a declared `bif.tab` row. The rows and their order are
+/// **not** re-derived here: `beam_bifs::snifs()` is this tree's generated roster, already in
+/// `build_snifs_term`'s order — `erts/emulator/beam/erl_bif_info.c:2764-2772` walks the C
+/// `bif_table` upward and conses each row onto the tail, so the oracle's list is the table
+/// reversed, which is what `beam_bifs` hands back.
+///
+/// # Roster size is release-scoped, not a copied figure
+///
+/// This is a *build property* of the emulator, so its content is this tree's `bif.tab` and
+/// nothing else: 556 rows for OTP `30.0-rc0`/erts-17.1. An OTP-29 oracle answers 553 — the
+/// same list minus `erlang:pid_to_binary/1`, `erlang:port_to_binary/1` and
+/// `erlang:ref_to_binary/1` (measured: our roster with those three rows removed is the
+/// oracle's list element for element), which is why `tests/system_info_oracle.rs` compares
+/// this key **shape-only** rather than row for row.
+///
+/// The names come from [`super::snifs_atoms::SNIFS_ATOMS`], which the boot seed interns
+/// ([`super::info_atoms`]), so every atom resolves through the runtime's own table instead
+/// of being invented at materialization time.
+fn snifs_roster() -> InfoValue {
+    let rows = beam_bifs::snifs()
+        .map(|snif| {
+            InfoValue::Tupled(vec![
+                InfoValue::Atom(snif.module),
+                InfoValue::Atom(snif.function),
+                InfoValue::Int(i64::from(snif.arity)),
+            ])
+        })
+        .collect();
+    InfoValue::List(rows)
 }
 
 /// `system_info(endian)` — the target's byte order.
@@ -418,6 +461,59 @@ mod tests {
             try_value("creation", &rt).unwrap().unwrap(),
             InfoValue::Int(0)
         );
+    }
+
+    #[test]
+    fn snifs_is_the_rosters_own_rows_in_the_rosters_own_order() {
+        let rt = runtime();
+        let rows = match try_value("snifs", &rt).unwrap().unwrap() {
+            InfoValue::List(rows) => rows,
+            other => panic!("snifs must be a list, got {other:?}"),
+        };
+        let roster: Vec<beam_bifs::Snif> = beam_bifs::snifs().collect();
+        assert_eq!(rows.len(), roster.len(), "one row per declared bif.tab row");
+        assert!(rows.len() > 500, "the roster is the whole static-NIF table");
+        for (row, snif) in rows.iter().zip(roster.iter()) {
+            match row {
+                InfoValue::Tupled(fields) => assert_eq!(
+                    fields.as_slice(),
+                    [
+                        InfoValue::Atom(snif.module),
+                        InfoValue::Atom(snif.function),
+                        InfoValue::Int(i64::from(snif.arity)),
+                    ],
+                    "every element is {{Module, Function, Arity}} in roster order"
+                ),
+                other => panic!("snifs element must be a 3-tuple, got {other:?}"),
+            }
+        }
+        // `beam_bifs::snifs()` IS the oracle's order (`erl_bif_info.c:2764-2772` conses the
+        // `bif_table` rows upward onto the tail, so the list is the table reversed), so the
+        // answer preserves the iterator's order verbatim — head first.
+        let head = roster.first().expect("a non-empty roster");
+        assert_eq!(
+            rows.first(),
+            Some(&InfoValue::Tupled(vec![
+                InfoValue::Atom(head.module),
+                InfoValue::Atom(head.function),
+                InfoValue::Int(i64::from(head.arity)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn snifs_materializes_once_the_roster_atoms_are_seeded() {
+        // A missing name would be `TermNotFound`, so pin that seeding `info_atoms()` (what
+        // the boot does) materializes the whole roster.
+        let rt = runtime();
+        let mut heap = beam_alloc::Heap::new(262_144).expect("test heap");
+        let mut atoms = beam_term::AtomTable::new();
+        atoms.seed(super::super::info_atoms());
+        let value = try_value("snifs", &rt).unwrap().unwrap();
+        let list = value
+            .to_eterm(&mut heap, &atoms)
+            .expect("the roster materializes");
+        assert!(beam_term::is_list(list));
     }
 
     #[test]
