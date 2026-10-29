@@ -156,6 +156,7 @@ mod proc_signals;
 mod ram_file;
 mod re;
 mod records;
+mod sendfile;
 mod selfhost;
 mod selfhost_chain;
 mod semantics;
@@ -713,6 +714,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(ram_file::group());
     cases.extend(inet_control::group());
     cases.extend(inet_write::group());
+    cases.extend(sendfile::group());
     cases
 }
 
