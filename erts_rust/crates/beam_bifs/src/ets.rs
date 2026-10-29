@@ -1812,11 +1812,21 @@ fn released_input(ctx: &mut BifContext<'_>, owned: Eterm, err: BeamError) -> Bea
 /// grow it.
 ///
 /// The release runs **after** the chunk is rendered, because a produced result may
-/// itself be one of the copied literals. Two cases deliberately retain instead
-/// (retention only, never a dangle): a chunk carrying the table-alias witness
-/// (`BifContext::with_table_aliasing`), where the results are handed to the host
-/// uncopied and must stay valid until its copy-out; and a failed render, where
-/// [`finish_chunk`] may already have registered a continuation naming the words.
+/// itself be one of the copied literals. A **failed** render retains instead
+/// (retention only, never a dangle): [`finish_chunk`] may already have registered a
+/// continuation naming the words.
+///
+/// The release happens **with or without** the table-alias witness
+/// ([`BifContext::with_table_aliasing`]). Under the witness the chunk's objects are
+/// handed to the host uncopied, i.e. they may alias this store, and the words are
+/// still readable because [`TableRegistry::release_spec_input`] only puts their runs
+/// on the store's exact-size free lists — it unmaps and rewrites nothing
+/// (`beam_ets::TermStore::free`). Runs are handed out again only by a **later**
+/// `copy` into this store, i.e. a later dispatch: the host's copy-out runs in the
+/// same dispatch tail, before any table operation and before the BIF heap is
+/// rewound (`../beam_rt/src/context/calls.rs`: the aliased arm copies the container
+/// unconditionally, and a refused copy surfaces `SystemLimit` rather than the
+/// un-copied term).
 pub(super) fn finish_chunk_with_input(
     ctx: &mut BifContext<'_>,
     table: u64,
@@ -1827,7 +1837,7 @@ pub(super) fn finish_chunk_with_input(
 ) -> Result<Eterm> {
     let minted = cont.is_some();
     let chunk = finish_chunk(ctx, table, results, cont, reverse)?;
-    if !minted && ctx.alias_table_storage().is_none() {
+    if !minted {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         tables.release_spec_input(owned);
     }
@@ -2236,7 +2246,8 @@ mod tests {
     use beam_term::NIL;
 
     use crate::access::{
-        float_bits, is_float, is_reference, is_tuple, ref_thing_id, tuple_element, tuple_size,
+        float_bits, float_value, is_float, is_reference, is_tuple, ref_thing_id, tuple_element,
+        tuple_size,
     };
 
     fn seeded_atoms() -> AtomTable {
@@ -3699,6 +3710,54 @@ mod tests {
         ctx.list(&[clause]).expect("fits")
     }
 
+    /// The spec `[{{'$1','$2'}, [{'>','$2',F}], [F]}]` — every object whose
+    /// **value** is greater than the runtime-built float `value`, projected to that
+    /// very float.
+    ///
+    /// The projection is the point: each produced result *is* the boxed literal word
+    /// of the compiled spec, i.e. a word of the registry's `/3` input copy
+    /// ([`own_spec_input`]). A chunk built under the table-alias witness therefore
+    /// hands the host terms that alias that copy — the case
+    /// [`finish_chunk_with_input`] must keep readable while it releases the copy.
+    fn literal_projection_spec(ctx: &mut BifContext<'_>, value: f64) -> Eterm {
+        let v1 = ctx.atom("$1").expect("seeded");
+        let v2 = ctx.atom("$2").expect("seeded");
+        let gt = ctx.atom(">").expect("seeded");
+        let bound = ctx.make_float(value).expect("the float fits");
+        let head = ctx.tuple(&[v1, v2]).expect("fits");
+        let guard = ctx.tuple(&[gt, v2, bound]).expect("fits");
+        let guards = ctx.list(&[guard]).expect("fits");
+        let body = ctx.list(&[bound]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    /// Whether `term`'s boxed payload address lies inside `heap`'s live words.
+    ///
+    /// The aliasing probe: a boxed term's word is its payload address plus the
+    /// primary/pointer tag bits (`beam_term`), so masking the low three bits yields
+    /// the address the term dereferences.
+    fn points_into(term: Eterm, heap: &mut Heap) -> bool {
+        let address = term.raw() & !0b111;
+        let words = heap.used_words_mut();
+        let low = words.as_ptr() as usize;
+        let high = low + words.len() * core::mem::size_of::<Eterm>();
+        (low..high).contains(&address)
+    }
+
+    /// The boxed float terms of a proper list result, as `f64`s — the reading of a
+    /// chunk whose every object is a projected float literal.
+    fn floats(term: Eterm) -> Vec<f64> {
+        proper_list(term)
+            .expect("a proper list")
+            .into_iter()
+            .map(|item| {
+                assert!(is_float(item), "every projected object is the float literal");
+                float_value(item)
+            })
+            .collect()
+    }
+
     /// The small integers of a proper list result, in order.
     fn small_ints(term: Eterm) -> Vec<i64> {
         proper_list(term)
@@ -3844,6 +3903,258 @@ mod tests {
             input_words(&mut ctx),
             retained,
             "resuming a continuation must not copy the spec again"
+        );
+    }
+
+    /// **A finished `/3` chunk releases its input copy under the table-alias
+    /// witness too, and the handed-back chunk stays readable until the host's own
+    /// copy-out.**
+    ///
+    /// The witness is what the real runtime installs on every dispatch
+    /// (`BifContext::with_table_aliasing`): the `ets` copy-out helpers then hand the
+    /// table's own terms back uncopied and set the cell, so the projection below —
+    /// each result *is* the spec's boxed literal — returns words of the registry's
+    /// `/3` input copy. Releasing that copy (`finish_chunk_with_input`) only puts its
+    /// runs on the store's exact-size free lists, so:
+    ///
+    /// * the store's live-word baseline is restored (no leak on the common path: a
+    ///   repeating `ets:select(T, MS, N)` that always finishes in one chunk cannot
+    ///   grow it);
+    /// * the chunk still reads its golden values immediately after the call — which
+    ///   is what the host observes, since its copy-out runs in the same dispatch tail
+    ///   and a later `copy` into this store is what would reuse the runs;
+    /// * the witness was really set (an unset witness would prove nothing);
+    /// * and the host's copy (a deep copy onto another heap, taken before any other
+    ///   store copy) is correct **and** does not alias the handed-back store words —
+    ///   it is a fresh graph, so a later store copy cannot change it.
+    #[test]
+    fn a_finished_witness_chunk_releases_its_input_copy_and_stays_readable() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        let alias = std::cell::Cell::new(false);
+        let mut chunk_heap = Heap::new(65536).expect("chunk heap");
+        let (chunk, baseline, handle) = {
+            let mut ctx = BifContext::new(&mut chunk_heap, &atoms, ProcessId::new(1, 0))
+                .with_tables(&mut reg)
+                .with_table_aliasing(&alias);
+            let handle = new_ordered_table(&mut ctx, "mytab");
+            for (key, value) in [("a", 1), ("b", 2), ("c", 3), ("p", 4), ("q", 5), ("z", 6)] {
+                let object = pair(&mut ctx, key, value);
+                insert_2(&mut ctx, &[handle, object]).expect("insert");
+            }
+            let baseline = ctx.tables().expect("a registry").spec_input_words();
+            assert_eq!(baseline, 0, "the input store starts empty");
+            // Six objects, a limit of nine: the walk finishes inside the chunk, so no
+            // continuation is minted and nothing outlives the call.
+            let spec = literal_projection_spec(&mut ctx, 3.5);
+            let nine = ctx.int(9).expect("fits");
+            let chunk = select_3(&mut ctx, &[handle, spec, nine]).expect("ets:select/3");
+            (chunk, baseline, handle)
+        };
+
+        assert!(
+            alias.get(),
+            "the witness must have been set, i.e. the copy-out really took the \
+             aliased route — otherwise this test proves nothing about it"
+        );
+        let results = tuple_element(chunk, 0);
+        assert_eq!(
+            floats(results),
+            vec![3.5, 3.5, 3.5],
+            "the three objects above the bound, each projected to the spec's float"
+        );
+        assert_eq!(
+            atoms.name(atom_val(tuple_element(chunk, 1))),
+            Some(END_OF_TABLE),
+            "the traversal finishes after key z"
+        );
+        let projected = proper_list(results).expect("a proper list").remove(0);
+        assert!(
+            !points_into(projected, &mut chunk_heap),
+            "under the witness a produced literal is not copied onto the caller heap"
+        );
+        assert_eq!(
+            reg.spec_input_words(),
+            baseline,
+            "a finished /3 traversal must release its input copy even when the chunk \
+             carries the table-alias witness"
+        );
+
+        // The host's half of the contract: **one** deep copy out of the returned
+        // graph, taken here before any other copy into the input store.
+        let mut copy_heap = Heap::new(65536).expect("copy heap");
+        let copied = beam_message::copy_struct_simple(chunk, &mut copy_heap)
+            .expect("the host copies the handed-back chunk");
+        assert_eq!(
+            floats(tuple_element(copied, 0)),
+            vec![3.5, 3.5, 3.5],
+            "the copy out of an aliased chunk must be the chunk"
+        );
+        assert_eq!(
+            atoms.name(atom_val(tuple_element(copied, 1))),
+            Some(END_OF_TABLE)
+        );
+        let copied_literal = proper_list(tuple_element(copied, 0))
+            .expect("a proper list")
+            .remove(0);
+        assert!(
+            points_into(copied_literal, &mut copy_heap),
+            "the copy owns its own words"
+        );
+        assert_ne!(
+            copied_literal.raw(),
+            projected.raw(),
+            "the copy must not alias the handed-back store word"
+        );
+
+        // A later dispatch copies into the same store again, i.e. it may hand the
+        // released runs out for different terms. The copy taken above cannot notice:
+        // it is a graph of its own.
+        {
+            let mut ctx = BifContext::new(&mut chunk_heap, &atoms, ProcessId::new(1, 0))
+                .with_tables(&mut reg)
+                .with_table_aliasing(&alias);
+            let spec = literal_projection_spec(&mut ctx, 2.5);
+            let nine = ctx.int(9).expect("fits");
+            let later = select_3(&mut ctx, &[handle, spec, nine]).expect("ets:select/3");
+            assert_eq!(floats(tuple_element(later, 0)), vec![2.5; 4]);
+            assert_eq!(
+                ctx.tables().expect("a registry").spec_input_words(),
+                baseline,
+                "the later finished traversal releases its copy too"
+            );
+        }
+        assert_eq!(
+            floats(tuple_element(copied, 0)),
+            vec![3.5, 3.5, 3.5],
+            "the host's copy is independent of every later copy into the input store"
+        );
+    }
+
+    /// **A minted continuation retains its input copy under the witness, and the
+    /// resume reads it.**
+    ///
+    /// The counterpart of the release test above: with a continuation the registry
+    /// entry names the compiled program's literals, i.e. words of the input copy, so
+    /// the copy stays for the registry's lifetime. Every word of the compiling
+    /// caller's heap is invalidated afterwards — the resume still produces the
+    /// oracle's chunk, which is only possible because the literal it projects is the
+    /// store's copy.
+    #[test]
+    fn a_minted_witness_chunk_retains_its_input_copy_and_resumes() {
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        let alias = std::cell::Cell::new(false);
+        let mut scratch = Heap::new(65536).expect("scratch heap");
+        let (cont_id, baseline) = {
+            let mut ctx = BifContext::new(&mut scratch, &atoms, ProcessId::new(1, 0))
+                .with_tables(&mut reg)
+                .with_table_aliasing(&alias);
+            let handle = new_ordered_table(&mut ctx, "mytab");
+            for (key, value) in [("a", 1), ("b", 2), ("c", 3), ("p", 4)] {
+                let object = pair(&mut ctx, key, value);
+                insert_2(&mut ctx, &[handle, object]).expect("insert");
+            }
+            let baseline = ctx.tables().expect("a registry").spec_input_words();
+            let spec = literal_projection_spec(&mut ctx, 0.5);
+            let two = ctx.int(2).expect("fits");
+            let chunk = select_3(&mut ctx, &[handle, spec, two]).expect("ets:select/3");
+            assert_eq!(floats(tuple_element(chunk, 0)), vec![0.5, 0.5]);
+            let cont_id = ref_thing_id(tuple_element(chunk, 1)).expect("a continuation");
+            (cont_id, baseline)
+        };
+        assert!(
+            alias.get(),
+            "the witness must have been set by the minted chunk's copy-out"
+        );
+        let retained = reg.spec_input_words();
+        assert!(
+            retained > baseline,
+            "a minted continuation must keep its input copy under the witness \
+             (retained {retained} words, baseline {baseline})"
+        );
+
+        // Every word the compiling caller's heap handed out is invalidated: a resume
+        // that read the caller's spec would now see `[]` where the float was.
+        for word in scratch.used_words_mut() {
+            *word = Eterm::nil();
+        }
+
+        let mut heap = Heap::new(65536).expect("resume heap");
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(2, 0))
+            .with_tables(&mut reg)
+            .with_table_aliasing(&alias);
+        let cont = make_ref_thing(ctx.heap(), cont_id).expect("the rebuilt continuation fits");
+        let chunk = select_1(&mut ctx, &[cont]).expect("ets:select/1 in another process");
+        assert_eq!(
+            floats(tuple_element(chunk, 0)),
+            vec![0.5, 0.5],
+            "the resumed guard/projection must read the registry's copy of the float, \
+             not the invalidated caller heap"
+        );
+        assert_eq!(
+            reg.spec_input_words(),
+            retained,
+            "resuming a continuation must not copy the input term again"
+        );
+    }
+
+    /// The live `erl` re-derivation of the two witness fixtures' goldens: a
+    /// `/3` traversal that finishes in one chunk, projecting the spec's own computed
+    /// float, and a minted one plus its resume — on the same tables the two tests
+    /// above build.
+    ///
+    /// A run without `erl` prints the loud banner below and returns: it is a skip, not
+    /// a pass (this crate's `resolve_oracle` convention).
+    #[test]
+    fn the_witness_chunk_goldens_cross_check_the_live_oracle() {
+        let Some(oracle) = resolve_oracle() else {
+            eprintln!();
+            eprintln!("=========== beam_bifs ets witness chunks: live oracle SKIPPED ===========");
+            eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or not");
+            eprintln!("executable, and no `erl` on $PATH).");
+            eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+            eprintln!("=========================================================================");
+            eprintln!();
+            return;
+        };
+        let eval = "T = ets:new(t, [ordered_set]), \
+                    true = ets:insert(T, [{a,1},{b,2},{c,3},{p,4},{q,5},{z,6}]), \
+                    F = 3 + 0.5, \
+                    MS = [{{'$1','$2'},[{'>','$2',F}],[F]}], \
+                    {A1,R1} = ets:select(T, MS, 9), \
+                    T2 = ets:new(t2, [ordered_set]), \
+                    true = ets:insert(T2, [{a,1},{b,2},{c,3},{p,4}]), \
+                    G = 0 + 0.5, \
+                    MS2 = [{{'$1','$2'},[{'>','$2',G}],[G]}], \
+                    {C1,K1} = ets:select(T2, MS2, 2), \
+                    {C2,_} = ets:select(K1), \
+                    io:format(\"~w~n\", [{A1, R1, C1, erlang:is_tuple(K1), C2}]), \
+                    halt().";
+        let output = std::process::Command::new(&oracle)
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(eval)
+            .arg("-s")
+            .arg("init")
+            .arg("stop")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+        assert!(
+            output.status.success(),
+            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}",
+            oracle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).expect("the oracle printed UTF-8");
+        // the finished `[3.5,3.5,3.5]` + `'$end_of_table'` · the minted
+        // `[0.5,0.5]` + a continuation · the resumed `[0.5,0.5]`.
+        assert_eq!(
+            stdout.trim(),
+            "{[3.5,3.5,3.5],'$end_of_table',[0.5,0.5],true,[0.5,0.5]}",
+            "the live oracle disagrees with the witness-chunk goldens"
         );
     }
 
