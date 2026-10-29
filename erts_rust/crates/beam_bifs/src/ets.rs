@@ -106,7 +106,9 @@
 //! `ets:match_spec_compile/1` and `ets:match_spec_run/2` live in the child module
 //! [`specs`], which owns the opaque compiled-spec handle and the
 //! [`TableRegistry::insert_spec`]/[`TableRegistry::spec_raw`] registry entry that
-//! backs it.
+//! backs it. The entry is a **store-owned deep copy**: the registry's dedicated
+//! spec [`TermStore`] (`spec_store`) holds the spec's words for the registry's
+//! lifetime, so a handle is valid in any process and across any collection.
 //!
 //! # The table argument, the owner and access gating (see [`resolve`])
 //!
@@ -203,7 +205,7 @@ use std::collections::HashMap;
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_ets::{
-    compile, key_of, MatchContinuation, OwnerId, Table, TableId, TableInfo, TableStats,
+    compile, key_of, MatchContinuation, OwnerId, Table, TableId, TableInfo, TableStats, TermStore,
 };
 use beam_process::ProcessId;
 use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
@@ -339,7 +341,9 @@ struct Continuation {
 
 /// The runtime's ETS tables, keyed by the numeric id of the on-heap ref thing
 /// built by [`crate::access::make_ref_thing`].
-#[derive(Default)]
+///
+/// `Default` is hand-written (not derived) because the compiled-spec term store it
+/// carries has no `Default` of its own — it needs a registered allocator.
 pub struct TableRegistry {
     tables: HashMap<u64, Table>,
     /// The `named_table` name registry — the oracle's *meta name table*: the name
@@ -361,9 +365,25 @@ pub struct TableRegistry {
     next_continuation: u64,
     /// The live `ets:match_spec_compile/1` specs, keyed by the numeric id of the
     /// compiled-spec ref thing handed to Erlang. The value is the **raw** spec term
-    /// the caller compiled, which is what [`beam_ets::match_spec_run`] consumes (see
-    /// [`TableRegistry::insert_spec`] and the [`specs`] module docs).
+    /// the caller compiled — a *store-owned* word out of `spec_store`, which is what
+    /// [`beam_ets::match_spec_run`] consumes (see [`TableRegistry::insert_spec`] and
+    /// the [`specs`] module docs).
     specs: HashMap<u64, Eterm>,
+    /// The term storage behind [`TableRegistry::specs`]: one
+    /// [`TermStore`] bump arena of never-relocating, registry-owned words.
+    ///
+    /// [`TableRegistry::insert_spec`] **deep-copies** the caller's spec in here, so
+    /// no word of a compiled match spec ever aliases a caller heap, a pooled BIF
+    /// heap or a process heap: a handle stays valid in any process and across every
+    /// collection, for as long as the registry lives. The store is never `reset`,
+    /// `free`d or `relinquish`ed — no `ets` BIF releases a compiled spec — so a
+    /// runtime compiling specs in a loop grows it for its lifetime, a documented M1
+    /// retention leak that mirrors ERTS retaining compiled specs until GC.
+    ///
+    /// One store for the whole registry is the correct granularity: a `beam_ets::Table`
+    /// is deliberately *not* used here, because a table carries kind/keypos/access
+    /// semantics a spec does not have.
+    spec_store: TermStore,
     /// The next compiled-spec id to hand out.
     next_spec: u64,
     /// The creation-time [`resolve::TableProfile`] of each live table, keyed by its
@@ -382,6 +402,12 @@ pub struct TableRegistry {
     profiles: HashMap<u64, resolve::TableProfile>,
 }
 
+impl Default for TableRegistry {
+    fn default() -> TableRegistry {
+        TableRegistry::new()
+    }
+}
+
 impl TableRegistry {
     /// An empty registry.
     pub fn new() -> TableRegistry {
@@ -391,6 +417,7 @@ impl TableRegistry {
             continuations: HashMap::new(),
             next_continuation: CONTINUATION_ID_BASE,
             specs: HashMap::new(),
+            spec_store: TermStore::with_default_allocator(),
             next_spec: SPEC_ID_BASE,
             profiles: HashMap::new(),
         }
@@ -604,23 +631,41 @@ impl TableRegistry {
     /// The **raw** term is stored — not a compiled form — because
     /// [`beam_ets::match_spec_run`] takes the raw clause list and compiles it
     /// itself; the compile in `match_spec_compile/1` is what validates the spec.
-    /// See the [`specs`] module docs for the M1 substitution and its heap-lifetime
-    /// caveat.
+    /// See the [`specs`] module docs for that asymmetry.
+    ///
+    /// # Ownership
+    ///
+    /// The spec is **deep-copied into the registry's dedicated [`TermStore`]**
+    /// (`spec_store`) and only the store-owned root is recorded, so a raw `Eterm`
+    /// from the caller's heap — or from the pooled BIF heap of a reentrant call — is
+    /// never retained. A handle is therefore valid in any process and across any
+    /// collection, for the registry's lifetime: [`TableRegistry::spec_raw`] hands
+    /// back a stable, never-relocated word.
+    ///
+    /// A copy the store refuses (see its *copied subset* docs) returns the error and
+    /// records **nothing** — no handle is minted and no partial entry is left — so
+    /// the caller can raise `badarg` without a stale handle in the map.
     ///
     /// Unlike the oracle, which garbage-collects an unreferenced compiled spec, an
     /// entry is never reclaimed here (no `ets` BIF releases a compiled spec), so a
-    /// runtime that compiles specs in a loop grows this map for its lifetime — a
-    /// documented M1 leak, not a wrong result.
-    pub fn insert_spec(&mut self, raw: Eterm) -> u64 {
+    /// runtime that compiles specs in a loop grows this store for its lifetime — a
+    /// documented M1 retention leak, not a wrong result.
+    pub fn insert_spec(&mut self, raw: Eterm) -> Result<u64> {
+        let stored = self.spec_store.copy(raw)?;
         let handle = self.next_spec;
         self.next_spec += 1;
-        self.specs.insert(handle, raw);
-        handle
+        self.specs.insert(handle, stored);
+        Ok(handle)
     }
 
     /// The raw spec term registered under the compiled-spec `handle`, if any
     /// (`None` when the handle is unknown — the caller raises `badarg`, as for a
     /// forged reference).
+    ///
+    /// The word returned is the **store-owned** root [`TableRegistry::insert_spec`]
+    /// recorded, so it stays valid — in any process, across any collection — for as
+    /// long as the registry lives. Nothing here may `reset`/`free` the spec store
+    /// while a handle is live.
     pub fn spec_raw(&self, handle: u64) -> Option<Eterm> {
         self.specs.get(&handle).copied()
     }
