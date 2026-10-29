@@ -103,9 +103,12 @@ The re-check covers the three suites that own every rust-side `TIMEOUT`:
 twice on purpose: `binary_module:copy` is §E's excluded row that D10 explains, and
 `longest_common_trap` is both one of D1c's 13 missing cases and the D10 gap that case needs.
 `<rt>` below means either binary. Class ids are the ones in
-`results/stdlib-diagnostics/FINDINGS.md`, which re-verifies each one: **5 fixed** (D1b, D3, D4, D5 — on
-the `try/catch` route — and D7), **6 still present** (D1, D1c, D2, D8, D9, D11) and **2 changed class**
-(D6, D10).
+`results/stdlib-diagnostics/FINDINGS.md`, which re-verifies each one against the current runtime: **5 fixed**
+(D1b, D3, D7, D9, D10), **5 still present** (D1, D2, D4 — `maps:put/3` identity on the compiled route — D8,
+D11), **1 partially present** (D5, the legacy-`catch` head frame only), **2 changed class** (D1c — the suite
+abort is gone, the raise reason is now the placeholder atom `'exit <structured reason>'` — and D6) and **2 new**
+(D12, a `utf32` segment ignoring `little`/`native`, and D12b, `unicode:characters_to_binary/3`'s latin1
+error split). `FINDINGS.md` is authoritative for every verdict below.
 
 ### D1 — the `system_limit` family — 16 rows, two mechanisms
 
@@ -240,8 +243,9 @@ Row: `maps_SUITE:doctests` (`{1,errors}`). The captured doctest transcript
      in call from prim_eval:arg_reg_alloc/0
 ```
 
-- compiled code: catchable `error:'unsupported: erlang:bump_reductions/1'`
-- through `-eval`: the CLI-level `beam_rt: unsupported: erlang:bump_reductions/1`, exit 3
+- compiled code: a catchable `error:unsupported_bif` (legacy `catch` sees `{'EXIT',{unsupported_bif,[…]}}`)
+- through `-eval`, uncaught: the CLI-level `beam_rt: unsupported: bif`, exit 3 — the suite never observes this,
+  because `setlimit`-style callers are compiled code and the reason is a real Erlang exception there
 - oracle: `true`
 
 A typed gap, never a wrong answer; the two manifestations differ by caller route (the doctest evaluator
