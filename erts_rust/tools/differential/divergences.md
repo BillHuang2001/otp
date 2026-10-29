@@ -647,6 +647,39 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   is pinned by `maps/no_op_update_keeps_identity` and
   `maps/no_op_update_identity_at_the_map_boundaries` (both `[AGREE]`; oracle masks `16352` and
   `32744`). Owner: `beam_bifs` (`without_2`'s missing no-op early return).
+- **`iolist_to_binary/1`'s short-circuit does not preserve its argument's identity**: the C
+  BIF returns the argument itself when it is already a byte-aligned bitstring
+  (`erts/emulator/beam/erl_iolist.c:918-921`) and, for a list, returns the **head** when the
+  list is exactly one byte-aligned bitstring (`erl_iolist.c:881-886`, `BIF_RET(h)`) — so
+  `iolist_to_binary([B])` hands back `B`'s own word, no copy at all. This runtime implements
+  the bare-argument fast path but sends the `[B]` form through the iolist walk and builds a
+  fresh binary (`crates/beam_bifs/src/binary.rs::iolist_to_binary_1`). Measured (OTP 29.1.2 /
+  erts-17.1.1) with `Small = <<"hello">>` (a heap binary) and
+  `Big = binary:copy(<<"x">>, 512)` (a refc one), over
+  `F = fun(B) -> [same(B, iolist_to_binary([B])), same(B, iolist_to_binary(B)),
+  same(B, iolist_to_binary([B, <<>>])), same(B, list_to_binary([B])),
+  same(B, binary:list_to_bin([B])), iolist_to_binary([B]) =:= B,
+  byte_size(iolist_to_binary([B]))] end` — where `same/2` is `erts_debug:same/2` — the answer
+  is `[[true,true,false,true,true,true,5],[true,true,false,true,true,true,512]]` on the
+  **oracle** against
+  `[[false,true,false,false,false,true,5],[false,true,false,false,false,true,512]]` on
+  `beam_rt`. What **agrees**: the bare-argument shape `iolist_to_binary(B)` is the argument's
+  own word on both sides (row 1), the *values* agree everywhere (the bytes, the size and
+  `=:=` are identical — `iolist_to_binary([B]) =:= B` is `true` on both), an element that is
+  not the caller's own term immediately makes the answer `false` on both
+  (`[B, <<>>]`, `[[B]]`, `[[], B]`), and so does head identity across distinct words
+  (`same(B, iolist_to_binary([X]))` with `X = <<B/binary>>` is `false` on both, while
+  `same(X, iolist_to_binary([X]))` is `true` on the oracle against `false` here — the oracle
+  returns the **head's** word). `list_to_binary/1` and `binary:list_to_bin/1` reach the same
+  missing branch (`list_to_bitstring_bif` is shared in the `Unit = 8` form) and diverge
+  identically. A plain differing **value**, so a case pinning any of these cells would be a
+  `mismatch`, which no allowlist can cover; none may be written. Re-verified on this host by
+  running the expression above inside the `CASE_DRAFTS.md` `Probe::Value` wrapper on both
+  runtimes — `erl -noshell -eval 'try ((fun() -> … end)()) of V -> io:format("ok ~w~n",[V]),
+  halt(0) catch C:R -> io:format("exception ~w ~w~n",[C,R]), halt(1) end.'` and the same
+  argument to `erts_rust/target/debug/beam_rt -noshell -eval` — each printing one `ok …` line
+  and exiting `0`. Owner: `beam_bifs` (`iolist_to_binary_1`'s missing `[bitstring()]` head
+  short-circuit).
 ## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
 - `erl_ddll`'s refusal shapes all agree and are pinned: the missing-object / missing-directory /
   non-string-name `{error,{open_error,-10}}`, the not-loaded `{error,not_loaded}`, the

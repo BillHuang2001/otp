@@ -18,7 +18,11 @@
 //
 // %CopyrightEnd%
 
-//! Contract **A.7** — the `binary` module's compiled-pattern surface.
+//! Two contract surfaces live in this file: **A.7** — the `binary` module's
+//! compiled-pattern surface — and **A.2**/**A.1** — the compiled UTF-32 bit-string family
+//! (`binary/utf32_*`, described further down). Each case declares its own `contracts`, and
+//! the two families do not share them: the first is A.7 (OTP application contracts), the
+//! second is A.2 (a compiled `.beam` executes) plus A.1 (the bit-string semantics it pins).
 //!
 //! `binary:compile_pattern/1` returns an *opaque* handle whose tag encodes the search
 //! strategy the runtime chose (`{bm,_}` for a one-word pattern, `{ac,_}` for a multi-word
@@ -45,8 +49,9 @@
 //! **not expressible through an observable program** and is deliberately not pinned — see
 //! the note below.
 //!
-//! Also pinned here: **compiled UTF-32 bit-string construction and matching**, the
-//! `binary/utf32_*` cases. They are [`CaseKind::Module`] cases — the embedded
+//! The file's **other** contract surface — A.2/A.1, not A.7 — is **compiled UTF-32
+//! bit-string construction and matching**, the `binary/utf32_*` cases. They are
+//! [`CaseKind::Module`] cases — the embedded
 //! [`UTF32_SOURCE`] module is `erlc`-compiled and run by both runtimes, so the engine's
 //! lowered `bs_create_bin`/`bs_match` UTF-32 arms are what they exercise; the `-eval`
 //! evaluator, which is what the `bits/construct_utf32_segments` and
@@ -194,7 +199,8 @@ fn utf32_case(
     }
 }
 
-/// The A.7 `binary` compiled-pattern cases, plus the compiled UTF-32 bit-string cases.
+/// The file's two halves: the A.7 `binary` compiled-pattern cases and the A.2/A.1 compiled
+/// UTF-32 bit-string cases.
 pub(crate) fn group() -> Vec<Case> {
     vec![
         Case {
