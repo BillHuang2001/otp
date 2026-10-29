@@ -164,7 +164,7 @@ Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-c
 - A.2 → `etf.rs` (84), `wire_ids.rs`
 - A.3 → `nif.rs`, `nif_so.rs` (46), `nif_res.rs` (30), `nif_abi.rs` (166), `nif_abi_extra.rs` (131), `nif_state.rs` (9), `nif_thread.rs` (8), `nif_a3.rs` (12)
 - A.4 → `driver_ports.rs`, `driver.rs`, `driver_c.rs` (54), `driver_abi.rs` (90), `driver_abi_extra.rs` (78)
-- A.4 built-in drivers → `udp.rs` (32), `ram_file.rs` (21), `inet_control.rs` (18), `inet_write.rs` (23)
+- A.4 built-in drivers → `udp.rs` (32), `ram_file.rs` (21), `inet_control.rs` (19: the 18 control-surface rows plus `tcp_accept_ownership_follows_the_acceptor`), `inet_write.rs` (23), `sendfile.rs` (3: `file:sendfile/5` over an inet socket — the requested extent, the answer and the bytes the peer receives — and `prim_file:advise/4`'s `{error,badarg}` wrapper plus its hint matrix)
 - A.5 → `wire.rs`, `wire_extra.rs` (443), `dist.rs` (5), `dist_extra.rs` (21)
 - A.6 → `flags.rs`, `flags_apply.rs`
 - A.1/A.6 → `eval_route.rs` (22)
