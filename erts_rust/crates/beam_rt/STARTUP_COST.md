@@ -5,10 +5,11 @@ invocation, the paired delta each landed change bought, the current profile's se
 boot's collection accounting with its mechanism, and the two cross-node asks — both answered, with
 what each answer is and what it is worth.
 The instrument is a **retired-instruction count**, never a wall time: the figures below are
-`perf stat -e cpu_core/instructions/u` / `perf record -e cpu_core/instructions/u -c 2000000
---call-graph dwarf,16384` over `./target/release/beam_rt -noshell -eval 'halt().'`, pinned
-`taskset -c 2` on a P-core, with the two binaries alternated inside every round and each round's
+`perf stat -e cpu_core/instructions/u` / `perf record -e cpu_core/instructions/u -c 500000
+--call-graph dwarf,8192` over `./target/release/beam_rt -noshell -eval 'halt().'`, pinned
+`taskset -c 3` on a P-core, with the two binaries alternated inside every round and each round's
 `/proc/loadavg` recorded.
+A row that names its own pin and record period does so because that round measured at it.
 **Every number here is one host's** (a hybrid-CPU machine whose P-cores are 0–3, shared with other
 work): the deterministic counter is the signal, and a wall figure is quoted only where the effect
 is far above the host's own spread.
@@ -267,7 +268,7 @@ below it.
 ## Measurement discipline
 
 * **Count in the slash form, on a P-core.** The host is hybrid (P-cores 0–3), so
-  `taskset -c 2` and the **`cpu_core/instructions/u`** event (and `cpu_core/cycles/u`) — never a bare
+  `taskset -c 3` and the **`cpu_core/instructions/u`** event (and `cpu_core/cycles/u`) — never a bare
   `instructions:u`, and never the colon form `cpu_core/instructions:u`, which silently lands on
   `cpu_atom` and drifts ~10×.
 * **A stashed binary is never a control** — and neither is a from-source rebuild compared in **wall**
