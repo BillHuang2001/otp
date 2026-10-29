@@ -449,3 +449,125 @@ fn oracle_agrees_on_the_bytes_and_reports_the_parents_referenced_size() {
         "the oracle reports the parent's referenced size for a sub-binary"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `binary:referenced_byte_size/1` — the two C arms (`erl_bif_binary.c:2691-2717`)
+// ---------------------------------------------------------------------------
+/// The oracle matrix these pins reproduce, probed on OTP 29.1.2 / erts-17.1.1
+/// (`P = binary:copy(<<1>>,512)`, `Q = binary:copy(<<1>>,100)`):
+///
+/// ```text
+/// erl -noshell -pa /tmp/fx -eval 'fx2:run(), halt().'
+///   % tail(P)=502/rt=512 smalltail(P)=5/rt=5          (fx2:tail/1 = <<_:80,R/binary>>)
+///   % part 63/64/65/66: 63 64 512 512
+///   % part(P,511,1)=1 part(Q,0,65)=100 part(part(P,0,65),0,64)=64
+///   % copy(Q)=100 copy(Q,5)=500 copy(P)=512 same(copy(Q),Q)=false
+///   % append P,0 =1026 append 1,2,P=514 append P,Q=1224   (unpinned; see below)
+/// ```
+///
+/// The rule the first six figures reveal: a range of at most `ERL_ONHEAP_BINARY_LIMIT`
+/// (64) **bytes** is *copied* into an `ErlHeapBits` (so it reports its own size), and a
+/// larger one becomes a real `ErlSubBits` window over the parent payload (so it reports
+/// the **parent's** `orig_size`). `binary:copy/1,2` never shares
+/// (`erts_debug:same(binary:copy(Q),Q)` ⇒ `false`), so its 100 is the new payload's own
+/// width.
+///
+/// A live writable accumulator (`<<P/binary,0>>`) reports its grown allocation (1026)
+/// only while it is *unpinned*; `erts_pin_writable_binary` shrinks the payload back to
+/// its apparent size (`erl_bits.c:2050-2075`), so a value stored across a collection
+/// reports 513 instead.
+#[test]
+fn referenced_byte_size_answers_the_parent_payload_for_a_real_refc_window() {
+    let mut fx = Fixture::new();
+    // The C's `br != NULL` arm: an off-heap `[BinRef][ErlSubBits]` window answers the
+    // **parent payload's** width (`(br->val)->orig_size`), never the window's — this is
+    // the shape the oracle builds for `binary:part(Q,0,65)` (⇒ 100) and for a
+    // matched-out `/binary` tail (⇒ 512).
+    let payload = vec![7u8; 100];
+    let whole = fx.refc(&payload, 0, 100 * 8);
+    assert_eq!(
+        signed_value(fx.ok("binary", "referenced_byte_size", &[whole])),
+        100,
+        "a whole refc binary reports its payload's 100 bytes"
+    );
+    for window_bytes in [65usize, 66, 99, 40] {
+        let window = fx.refc(&payload, 0, window_bytes * 8);
+        assert_eq!(
+            signed_value(fx.ok("binary", "referenced_byte_size", &[window])),
+            100,
+            "a {window_bytes}-byte window over the 100-byte payload must report 100 \
+             (the C's orig_size, not the window)"
+        );
+        // ... and its bytes are still the window's own.
+        let bytes = fx.ok("binary", "copy", &[window, make_small(1)]);
+        assert_eq!(bytes_of(bytes), vec![7u8; window_bytes], "the window's bytes");
+    }
+    // A window that starts mid-byte answers the same payload width (the answer is a
+    // property of the payload, not of the window's alignment).
+    let nibbles = fx.refc(&payload, 4, 8);
+    assert_eq!(signed_value(fx.ok("binary", "referenced_byte_size", &[nibbles])), 100);
+    // The C's `br == NULL` arm: an on-heap `ErlHeapBits` answers its own byte size for
+    // every size, above the 64-byte limit too (this crate builds no window).
+    for n in [3usize, 63, 64, 65, 66, 100, 512] {
+        let heap_binary = fx.binary(&vec![1u8; n]);
+        assert_eq!(
+            signed_value(fx.ok("binary", "referenced_byte_size", &[heap_binary])),
+            n as i64,
+            "an on-heap binary of {n} bytes reports its own size"
+        );
+    }
+    // A **match context** (`ErlSubBits` whose `orig` is not a `BinRef`) keeps the
+    // `br == NULL` answer: the discriminator is `beam_term::refc::is_refc_binary` (the
+    // C's `*boxed_val(orig) == HEADER_BIN_REF`, `erl_bits.c:117`), not "is a sub bits".
+    // Such a term is built by the engine's match family, never by this crate, so it is
+    // not constructed here.
+    // The badarg arm: not a bitstring.
+    let list = fx.ints(&[1, 2]);
+    let list = fx.list(&list);
+    fx.badarg("binary", "referenced_byte_size", &[list]);
+}
+/// The `binary:copy` family's own figures, and the one place a *whole* binary past the
+/// 64-byte limit could report a different width: the crate keeps every binary it builds
+/// on the heap, so `copy/1`, `copy/2`, `list_to_bin/1` and `iolist_to_binary/1` all
+/// report the flattened length.
+///
+/// Oracle rows (same probe): `copy(Q)=100 copy(Q,5)=500 copy(P)=512`, and
+/// `binary:referenced_byte_size(binary:list_to_bin(binary_to_list(P)))` ⇒ `512`.
+#[test]
+fn whole_binaries_report_their_own_flattened_width() {
+    let mut fx = Fixture::new();
+    let one = fx.binary(&[1]);
+    let q = fx.ok("binary", "copy", &[one, make_small(100)]);
+    let p = fx.ok("binary", "copy", &[one, make_small(512)]);
+    for (label, term, expected) in [("copy(Q)", q, 100i64), ("copy(Q,5)", fx.ok("binary", "copy", &[q, make_small(5)]), 500), ("copy(P)", p, 512)] {
+        assert_eq!(bytes_of(term).len(), expected as usize, "{label} bytes");
+        assert_eq!(
+            signed_value(fx.ok("binary", "referenced_byte_size", &[term])),
+            expected,
+            "{label} reports its own flattened width"
+        );
+    }
+    // `binary:list_to_bin(binary_to_list(P))` ⇒ 512 on both sides: a flattened 512-byte
+    // on-heap binary is whole.
+    let listed = fx.ok("binary", "bin_to_list", &[p]);
+    let round_trip = fx.ok("binary", "list_to_bin", &[listed]);
+    assert_eq!(bytes_of(round_trip), vec![1u8; 512]);
+    assert_eq!(
+        signed_value(fx.ok("binary", "referenced_byte_size", &[round_trip])),
+        512,
+        "a 512-byte flattened binary reports 512"
+    );
+    // `iolist_to_binary([P, 0])` is `<<P/binary,0>>`'s byte image: 513 bytes, and the
+    // *pinned* oracle figure for that shape is 513 too (`erts_pin_writable_binary`
+    // shrinks a writable payload back to its apparent size, `erl_bits.c:2050-2075`;
+    // 1026 is only the unpinned allocation of the same expression).
+    let zero = make_small(0);
+    let iolist = fx.list(&[p, zero]);
+    let appended = fx.ok("erlang", "iolist_to_binary", &[iolist]);
+    assert_eq!(bytes_of(appended).len(), 513, "the appended byte image");
+    assert_eq!(
+        signed_value(fx.ok("binary", "referenced_byte_size", &[appended])),
+        513,
+        "a 513-byte flattened binary reports 513"
+    );
+}

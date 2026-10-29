@@ -34,6 +34,12 @@
 //! or must keep it on the synchronous call route — and the external-fun resolver delegates to
 //! that seam so both routes share one verdict. [`prefers_module_code_for_fun_apply`] is the same
 //! question asked about the **host fast path** for a key that applies a caller-supplied fun.
+//!
+//! [`RuntimeContext::apply_2`] is the `erlang:apply(Fun, Args)` entry point the
+//! runtime-native floor calls (C implements it as an instruction, `apply_fun`, so no
+//! `bif.tab` BIF exists for it); it decodes the argument list and then hands the
+//! application to the same [`RuntimeContext::apply_fun`] seam every other fun
+//! application uses.
 
 use std::sync::Arc;
 
@@ -507,6 +513,79 @@ impl RuntimeContext<'_> {
             return Ok(None);
         }
         self.resolve_external_call(&module, &function, arity)
+    }
+
+    /// `erlang:apply(Fun, Args)` — C's `apply_fun`
+    /// (`../../erts/emulator/beam/beam_common.c:1734-1765`).
+    ///
+    /// # Why the floor owns it
+    ///
+    /// `apply/2` and `apply/3` are the two names C implements as **instructions**
+    /// rather than SNIFs (`erts_is_builtin`'s hardcoded special case,
+    /// `../../erts/emulator/beam/beam_common.c:2364-2374`); `emu/ops.tab:872-874`
+    /// rewrites a `call_ext*` to them into `i_apply_fun`/`i_apply_fun_last`/
+    /// `i_apply_fun_only`. Neither appears in `bif.tab`, so `beam_bifs` has no
+    /// implementation, and the engine special-cases only the **arity-3** form
+    /// (`interpreter/dispatch.rs::resolve_call_ext_apply`). This host therefore serves
+    /// the arity-2 form, exactly as it serves the other runtime-owned operations.
+    ///
+    /// Only a **variable** argument list reaches this door: with a literal list the
+    /// compiler knows the arity and emits `apply`/`call_fun`, so `erlang:apply/2` is
+    /// never called at all.
+    ///
+    /// # The three failure classes, in C's order
+    ///
+    /// 1. **A malformed argument list** — a non-list or an improper list — is
+    ///    `error:badarg`. C walks the list into `reg[0..arity]` *before* it looks at
+    ///    the fun at all, so this arm wins over a non-fun first argument (measured on
+    ///    the oracle: `apply(erlang, self)` is `badarg`, never
+    ///    `{badfun,erlang}`).
+    /// 2. **More arguments than the x-register file can hold** is
+    ///    `error:system_limit` (`:1745-1751`: C stops at `MAX_REG-1` because
+    ///    `reg[arity]` must still take the fun). [`beam_engine::MAX_REGISTER`] is the
+    ///    one definition of that bound.
+    /// 3. **A first argument that is not a fun** is the C's `EXC_BADFUN`
+    ///    (`call_fun`'s `is_not_any_fun` arm, `:1610-1616`) with `fvalue = fun`, i.e.
+    ///    [`crate::error::bad_fun`] — the class and reason atom the oracle raises.
+    ///    `expand_error_value`'s `{badfun, Fun}` payload is the engine's to build (see
+    ///    that constructor's docs), and the innermost cooked frame the oracle shows for
+    ///    it is the **caller's**, which is also the engine's call.
+    ///
+    /// # The application itself
+    ///
+    /// Everything else is an ordinary fun application, and it goes through the **one**
+    /// fun-application seam this crate has ([`ExecutionContext::apply_fun`], implemented
+    /// by [`RuntimeContext`]) rather than a second dispatcher: a `make_fun3` closure, a
+    /// `NEW_FUN_EXT`-decoded one, an external `fun M:F/A`, the `-eval` evaluator's own
+    /// closure and a **served local key** closure (`zlib`'s `fun deflate_nif/4` in a
+    /// record) all keep working, and the same arity handling (`error:badarity`) applies.
+    ///
+    /// That seam runs the closure on a **fresh** machine, so a `receive` inside the
+    /// applied fun cannot suspend the *process*: on a pumping route the nested run
+    /// waits, and inside a scheduler slice it folds into the typed
+    /// [`beam_engine::error::blocked`] gap. Making it a real in-machine entry is an
+    /// engine-side change (`resolve_call_ext_apply`'s `import_arity != 3` refusal);
+    /// this crate cannot make it from here.
+    ///
+    /// # Errors
+    ///
+    /// The three classes above plus whatever the fun application reports
+    /// ([`BeamError::BadArity`] for a wrong argument count, the applied body's own
+    /// raise, and so on).
+    pub(crate) fn apply_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fun = *args.first().ok_or(BeamError::BadArg)?;
+        let list = *args.get(1).ok_or(BeamError::BadArg)?;
+        // C's argument-list walk (see the failure classes above): `list_elements`
+        // yields `BadArg` for a non-list and for an improper tail, which is exactly
+        // C's `is_not_nil(tmp)` arm.
+        let call_args = terms::list_elements(list)?;
+        if call_args.len() >= beam_engine::MAX_REGISTER as usize {
+            return Err(BeamError::SystemLimit);
+        }
+        if !terms::is_fun(fun) {
+            return Err(crate::error::bad_fun());
+        }
+        self.apply_fun(fun, &call_args)
     }
 }
 

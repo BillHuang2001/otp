@@ -227,6 +227,23 @@ pub fn describe(
         None => line,
     }
 }
+/// Creates a row's working directory, discarding anything a *previous* run left behind.
+///
+/// Real suites write data directories relative to the cwd (`khepri`'s `_test.<name>`,
+/// `stdlib`'s `data_dir` copies), so a stale tree from an earlier sweep makes fixtures
+/// fail on *both* sides and silently turns a green row into a red one.
+/// Both sides of one row still share the freshly created directory.
+pub fn fresh_dir(dir: &Path) -> std::result::Result<(), String> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("clear cwd {}: {e}", dir.display())),
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("create cwd {}: {e}", dir.display()))
+}
 /// Writes `text` to `path`, creating the parent directory.
 pub fn write_file(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -249,6 +266,18 @@ mod tests {
         let empty: Vec<u64> = Vec::new();
         assert!(par_map(4, &empty, |n: &u64| *n).is_empty());
         assert_eq!(par_map(8, &[7u64], |n| *n), vec![7]);
+    }
+    #[test]
+    fn fresh_dir_discards_a_previous_runs_state() {
+        let root = crate::runtime::tmp_root().join(format!("suites-fresh-{}", std::process::id()));
+        let dir = root.join("cwd").join("module");
+        std::fs::create_dir_all(dir.join("_test.leftover")).expect("mkdir");
+        std::fs::write(dir.join("_test.leftover/x"), "stale").expect("write");
+        fresh_dir(&dir).expect("fresh");
+        assert!(dir.is_dir(), "the directory is recreated");
+        assert!(!dir.join("_test.leftover").exists(), "stale state is gone");
+        fresh_dir(&dir).expect("a second call on an existing empty dir is fine");
+        let _ = remove_tree(&root);
     }
     #[test]
     fn copy_tree_skips_git_and_nests() {

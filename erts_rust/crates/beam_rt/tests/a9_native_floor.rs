@@ -49,6 +49,20 @@
 //! and [`agrees_on_the_booted_route`] (the built binary, after the boot script) are byte
 //! comparisons of the two answers, never hardcoded expectations.
 //!
+//! # Why maps are compared in a canonical order
+//!
+//! `~p` renders a **small** map in the map's *internal* key order, which ERTS does not keep stable
+//! across VMs. Measured on this host, with no code change: `kernel`'s injected `logger` handler
+//! configuration carries `#{single_line => false,legacy_header => true}`, which the oracle renders
+//! in that order on most runs and in the reverse order on the rest (5/40 standalone probes of
+//! `lists:sort(application:get_all_env(kernel))` differed only there), while this runtime's own
+//! rendering is invariant (12/12). Map iteration order is not part of the contract these tests
+//! pin, so both comparison helpers put every map literal's entries — at every nesting depth — into
+//! one fixed (sorted) order first ([`canonical_map_order`]); everything else, every key and every
+//! value included, is still compared byte for byte. The sibling
+//! [`logger_default_handler.rs`](logger_default_handler) suite avoids the same instability by
+//! rendering its maps as sorted `{Key, Value}` pairs.
+//!
 //! # The routes these values are measured on
 //!
 //! Every CLI action **but `-version`** drives a boot script before its own start instruction
@@ -163,6 +177,224 @@ fn unwrapped(text: &str) -> String {
     text.lines().map(str::trim_start).collect::<String>()
 }
 
+/// The canonical comparison form of a `~p` rendering: every **map literal's** entries re-ordered
+/// into sorted order, at every nesting depth, with everything else byte-identical.
+///
+/// `~p` renders a small map in the map's *internal* key order, which ERTS does not keep stable
+/// across VMs (see the module docs: the oracle alternates the two orders of `kernel`'s injected
+/// `#{single_line => …, legacy_header => …}` while this runtime's own rendering is invariant). Map
+/// iteration order is not part of the contract these tests pin, so the two renderings are taken to
+/// this form before being compared: every entry — and so every key and every value — is still
+/// compared byte for byte, in one fixed order. Nothing that *is* part of the contract moves: a
+/// tuple's or a list's element order is preserved (only maps are re-ordered), quoted strings and
+/// quoted atoms are copied verbatim (so a `"#{…}"` in a *value* is never mistaken for a map), and
+/// only the printer's own layout *around* a map entry — the line break and indentation it precedes
+/// one with — is trimmed, since that belongs to the entry's position rather than to its content.
+fn canonical_map_order(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            // A string or a quoted atom: copy it whole, `#{`, `,` and `}` inside included.
+            b'"' | b'\'' => {
+                let end = skip_quoted(bytes, index);
+                out.push_str(&text[index..end]);
+                index = end;
+            }
+            // A character literal (`$#`, `$}`, `$\n`, `$\x{1F}`): copy it whole.
+            b'$' => {
+                let end = skip_char_literal(bytes, index);
+                out.push_str(&text[index..end]);
+                index = end;
+            }
+            b'#' if bytes.get(index + 1) == Some(&b'{') => {
+                let Some(end) = map_end(bytes, index + 2) else {
+                    // Unterminated (never produced by a printer): copy the rest verbatim.
+                    out.push_str(&text[index..]);
+                    break;
+                };
+                let body = &text[index + 2..end - 1];
+                let mut entries: Vec<String> = map_entries(body)
+                    .into_iter()
+                    // The printer's layout around an entry (the line break and indentation it
+                    // puts before one) belongs to the entry's *position*, not to its content, so
+                    // it is trimmed away: that is what makes the form independent of the order
+                    // the entries are printed in.
+                    .map(|entry| canonical_map_order(entry.trim()))
+                    .collect();
+                entries.sort();
+                out.push_str("#{");
+                out.push_str(&entries.join(","));
+                out.push('}');
+                index = end;
+            }
+            _ => {
+                let character = text[index..].chars().next().expect("a character");
+                out.push(character);
+                index += character.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// The index just past the `}` matching the map whose body starts at `start`, or `None` when the
+/// braces are unbalanced. Quoted strings/atoms, character literals and nested brackets are skipped,
+/// so a `}` inside any of them cannot close the map.
+fn map_end(bytes: &[u8], start: usize) -> Option<usize> {
+    scan_top_level(bytes, start).1.map(|brace| brace + 1)
+}
+
+/// The comma-separated entries of a map body, split only at **top-level** commas (a `,` inside a
+/// nested tuple, list, binary or map stays part of its entry).
+fn map_entries(body: &str) -> Vec<&str> {
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+    let (commas, _) = scan_top_level(body.as_bytes(), 0);
+    let mut entries = Vec::with_capacity(commas.len() + 1);
+    let mut begin = 0;
+    for comma in commas {
+        entries.push(&body[begin..comma]);
+        begin = comma + 1;
+    }
+    entries.push(&body[begin..]);
+    entries
+}
+
+/// Scans from `start` for the **top-level** commas and for the `}` closing the enclosing map.
+///
+/// "Top level" means outside every quoted string/atom, character literal and nested `(…)`/`[…]`/
+/// `{…}`/`#{…}`/`<<…>>`, which is exactly what a `~p` rendering's map body needs: its entries hold
+/// commas of their own, but only their own brackets nest over them.
+fn scan_top_level(bytes: &[u8], start: usize) -> (Vec<usize>, Option<usize>) {
+    let mut commas = Vec::new();
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' => index = skip_quoted(bytes, index),
+            b'$' => index = skip_char_literal(bytes, index),
+            b'#' if bytes.get(index + 1) == Some(&b'{') => {
+                depth += 1;
+                index += 2;
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'<') => {
+                depth += 1;
+                index += 2;
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' if depth == 0 => return (commas, Some(index)),
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'>' if depth > 0 && bytes.get(index + 1) == Some(&b'>') => {
+                depth -= 1;
+                index += 2;
+            }
+            b',' if depth == 0 => {
+                commas.push(index);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    (commas, None)
+}
+
+/// The index just past the closing quote of the string or quoted atom starting at `start`, an
+/// escaped character (`\"`, `\\`) never counting as the close.
+fn skip_quoted(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            byte if byte == quote => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The index just past the character literal (`$a`, `$\\`, `$\n`, `$\x{1F}`) starting at `start`.
+fn skip_char_literal(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    if index >= bytes.len() {
+        return bytes.len();
+    }
+    if bytes[index] != b'\\' {
+        return (index + 1).min(bytes.len());
+    }
+    index += 1; // past the backslash
+    if index >= bytes.len() {
+        return bytes.len();
+    }
+    match bytes[index] {
+        b'x' if bytes.get(index + 1) == Some(&b'{') => {
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end] != b'}' {
+                end += 1;
+            }
+            (end + 1).min(bytes.len())
+        }
+        b'x' | b'^' => (index + 2).min(bytes.len()),
+        b'0'..=b'7' => (index + 3).min(bytes.len()),
+        _ => (index + 1).min(bytes.len()),
+    }
+}
+
+/// [`canonical_map_order`] re-orders **map entries and nothing else** — the one normalization the
+/// two comparison helpers apply, pinned on the shapes `~p` really produces.
+#[test]
+fn canonical_map_order_reorders_map_entries_and_nothing_else() {
+    // The measured flake, verbatim: the two orders ERTS alternates for `kernel`'s injected
+    // `logger` handler configuration, one level down in the environment list.
+    let reversed = "{[{handler,default,logger_std_h,#{formatter =>{logger_formatter,\
+                    #{legacy_header => true,single_line => false}},config => #{type => standard_io}}}]}";
+    let natural = "{[{handler,default,logger_std_h,#{config => #{type => standard_io},\
+                   formatter =>{logger_formatter,#{single_line => false,legacy_header => true}}}}]}";
+    assert_eq!(canonical_map_order(natural), canonical_map_order(reversed));
+    // A different key or a different value still differs — the values are compared, not dropped.
+    assert_ne!(
+        canonical_map_order("#{single_line => false,legacy_header => true}"),
+        canonical_map_order("#{single_line => true,legacy_header => true}")
+    );
+    assert_ne!(
+        canonical_map_order("#{single_line => false,legacy_header => true}"),
+        canonical_map_order("#{single_line => false}")
+    );
+    // Lists, tuples and binaries keep their order: only a `#{…}` is re-ordered.
+    assert_eq!(canonical_map_order("[{b,1},{a,2}]"), "[{b,1},{a,2}]");
+    assert_ne!(canonical_map_order("{b,a}"), canonical_map_order("{a,b}"));
+    assert_ne!(canonical_map_order("<<2,1>>"), canonical_map_order("<<1,2>>"));
+    // `#{`, `,` and `}` inside a string or a quoted atom are not a map; a character literal is
+    // one character. A nested map *is* canonicalized, and an entry holding a comma, a `=>` or a
+    // binary stays one entry.
+    assert_eq!(canonical_map_order("{\"#{b,a}\",'#{b,a}',b}"), "{\"#{b,a}\",'#{b,a}',b}");
+    assert_eq!(canonical_map_order("[$#,b]"), "[$#,b]");
+    assert_eq!(canonical_map_order("#{b => 1,a => 2}"), canonical_map_order("#{a => 2,b => 1}"));
+    assert_eq!(
+        canonical_map_order("#{x => {1,2},y => <<1,2>>}"),
+        canonical_map_order("#{y => <<1,2>>,x => {1,2}}")
+    );
+    // The printer's own line break and indentation move with an entry's *position*, so a map the
+    // printer broke across lines normalizes like the same map on one line.
+    assert_eq!(canonical_map_order("#{b => 1,\n  a => 2}"), "#{a => 2,b => 1}");
+    assert_eq!(
+        canonical_map_order("#{b => 1,\n  a => 2}"),
+        canonical_map_order("#{a => 2,\n  b => 1}")
+    );
+    // The empty map, and text holding no map at all, are untouched.
+    assert_eq!(canonical_map_order("#{}"), "#{}");
+    assert_eq!(canonical_map_order("{{ok,[]},undefined}"), "{{ok,[]},undefined}");
+}
+
 /// The error `call` raises, asserting it really raises.
 fn raise_of(call: &str) -> BeamError {
     let mut runtime = Runtime::with_defaults().expect("the default runtime");
@@ -171,8 +403,9 @@ fn raise_of(call: &str) -> BeamError {
         .expect_err(&format!("`{call}` must raise"))
 }
 
-/// Asserts this runtime renders `call` **exactly** as the live oracle does, and returns the
-/// rendering.
+/// Asserts this runtime renders `call` **exactly** as the live oracle does — up to the *internal
+/// key order* of a map in the term, which `~p` reads out and ERTS does not keep stable across VMs
+/// ([`canonical_map_order`]) — and returns the rendering.
 ///
 /// A missing oracle — or one that cannot answer — is a loud skip: the runtime's own rendering is
 /// still returned, so the caller's assertions still run instead of passing silently.
@@ -181,7 +414,11 @@ fn agrees_with_the_oracle(call: &str) -> String {
     let Some(expected) = oracle_renders(call) else {
         return rendered;
     };
-    assert_eq!(rendered, expected, "the oracle renders `{call}` differently");
+    assert_eq!(
+        canonical_map_order(&rendered),
+        canonical_map_order(&expected),
+        "the oracle renders `{call}` differently"
+    );
     rendered
 }
 
@@ -219,7 +456,9 @@ fn renders_booted(call: &str) -> String {
 }
 /// Asserts the **booted** route renders `call` exactly as the live oracle does, and returns the
 /// rendering. Line wrapping is undone on both sides ([`unwrapped`]), since a long term is broken
-/// across lines by whichever printer is closer to the width limit.
+/// across lines by whichever printer is closer to the width limit, and a map's *internal* key
+/// order is canonicalized on both sides ([`canonical_map_order`]), since `~p` reads that order out
+/// and ERTS does not keep it stable across VMs — every key and every value is still compared.
 ///
 /// A missing oracle — or one that cannot answer — is a loud skip: the runtime's own rendering is
 /// still returned, so the caller's assertions still run instead of passing silently.
@@ -229,8 +468,8 @@ fn agrees_on_the_booted_route(call: &str) -> String {
         return rendered;
     };
     assert_eq!(
-        unwrapped(&rendered),
-        unwrapped(&expected),
+        canonical_map_order(&unwrapped(&rendered)),
+        canonical_map_order(&unwrapped(&expected)),
         "the oracle renders `{call}` differently"
     );
     rendered

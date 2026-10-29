@@ -439,6 +439,10 @@ pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Resu
     let work: Vec<String> = suites.clone();
     let observed = target::par_map(opts.jobs, &work, |suite| {
         let cwd = cwd_root.join(suite);
+        if let Err(err) = target::fresh_dir(&cwd) {
+            let out = Outcome::bare(Status::Error, err);
+            return (suite.clone(), SideRun::failed(out.clone()), SideRun::failed(out));
+        }
         let sys = match oracle {
             Some(rt) => observe(rt, &code_path, suite, &stage_src, opts, &cwd),
             None => SideRun::failed(Outcome::bare(Status::NotRun, "oracle not selected")),

@@ -87,21 +87,27 @@ difference is the binary (`erl` vs `beam_rt`).
   OTP 30.0-rc0 / erts-17.1) — **never** the in-tree `erts/` C build.
 
 ## Status
-- Harness complete: 28 unit tests green, zero build warnings; both targets run end to end against a
+- Harness complete: 29 unit tests green, zero build warnings; both targets run end to end against a
   real oracle and a real `beam_rt`.
-- Measured numbers, the excluded-case rationale and the root-cause classes live in `RESULTS.md`
+- Both sweeps are measured at the current runtime (workspace commit `125ca3a9f3f7`, runtime sources
+  unchanged since): Khepri `1500/1` oracle vs `285/8` rust, stdlib `209/5` oracle vs `169/32` rust.
+  Measured numbers, the excluded-case rationale and the root-cause classes live in `RESULTS.md`
   (artifacts under `results/`); do not duplicate counts here. The per-row analysis — smallest failing
   expression per class, both sides' observations, owning crate — lives in
-  `results/{khepri,stdlib}-notes.md` next to the artifacts.
-- The sweeps surface **real runtime defects**, and one of them is not a typed gap: the rust side of
-  `binary_module_SUITE` dies mid-suite (`beam_rt: system_limit`). Recording that is this crate's job;
+  `results/{khepri,stdlib}-notes.md` next to the artifacts, and each class's current verdict in
+  `results/{khepri,stdlib}-diagnostics/FINDINGS.md`, which supersedes a notes section it re-checks.
+- Each row's cwd is cleared before it runs (`target::fresh_dir`): a staged `_test.*`/`data_dir` tree
+  left by an earlier sweep made fixtures fail on **both** sides, which silently reddened green rows.
+- The sweeps surface **real runtime defects**, and some are not a typed gap: the rust side of
+  `binary_module_SUITE` still dies mid-suite (`beam_rt: system_limit`) and `erlang:apply/2` is
+  unimplemented (`queue_SUITE:oops` sees a wrong model result). Recording that is this crate's job;
   fixing any of it belongs to the owning crate, not here.
 
 ## Routing Table
 - `data/` → the committed Erlang runner `ct_runner.erl` (embedded with `include_str!`).
-- `results/` → committed sweep artifacts (`report.json` + `summary.md` per target), the per-row
-  analysis (`khepri-notes.md`, `stdlib-notes.md`) and the diagnostics behind them — raw evidence
-  behind `RESULTS.md`.
+- `results/` → committed sweep artifacts (`report.json` + `summary.md` per target, plus the stdlib
+  `recheck-120/` budget re-check), the per-row analysis (`khepri-notes.md`, `stdlib-notes.md`) and the
+  diagnostics behind them — raw evidence behind `RESULTS.md`.
 - `src/` → the driver: `cli`/`run` (dispatch), `runtime`/`proc`/`target` (resolution, timed
   subprocesses, staging, `par_map`, the identical-invocation helper), `eunit` (summary parser),
   `khepri`/`stdlib` (the two targets), `report` (row/verdict model, JSON + Markdown), `json`.

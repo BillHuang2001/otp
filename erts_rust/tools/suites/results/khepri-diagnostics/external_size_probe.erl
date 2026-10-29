@@ -22,6 +22,19 @@ main() ->
          attempted(fun() -> byte_size(term_to_binary({x, Fun, y})) end)),
     show("term_to_binary(named fun)",
          attempted(fun() -> byte_size(term_to_binary(Named)) end)),
+    %% The nested shapes: the encoder's local-fun identity is installed for the
+    %% whole term only when the top-level term *is* the local fun, so these are
+    %% the discriminating cases.
+    show("term_to_binary({fun() -> ok end})",
+         attempted(fun() -> byte_size(term_to_binary({Fun})) end)),
+    show("term_to_binary({x, fun() -> ok end})",
+         attempted(fun() -> byte_size(term_to_binary({x, Fun})) end)),
+    show("term_to_binary([fun() -> ok end])",
+         attempted(fun() -> byte_size(term_to_binary([Fun])) end)),
+    show("term_to_binary(#{k => fun() -> ok end})",
+         attempted(fun() -> byte_size(term_to_binary(#{k => Fun})) end)),
+    show("erlang:external_size([fun() -> ok end])",
+         attempted(fun() -> erlang:external_size([Fun]) end)),
     show("term_to_binary(an atom)   %% control",
          attempted(fun() -> byte_size(term_to_binary(an_atom)) end)),
     ok.

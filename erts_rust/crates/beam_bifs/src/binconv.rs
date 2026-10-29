@@ -229,6 +229,7 @@
 use std::cell::RefCell;
 
 use beam_codec::compress::compress as zlib_compress;
+use beam_codec::error::{is_unsupported_local_fun, unsupported_local_fun};
 use beam_codec::{
     decode_term_with_options_and_gate_used, decode_term_with_options_used, AtomCache, DecodeOptions,
     Decoder, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
@@ -839,7 +840,7 @@ pub(crate) fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Re
 /// Encodes `term` as the `term_to_binary/2` image `options` select.
 ///
 /// Takes `ctx` mutably because the local-node identity, the local-node hash and the
-/// local-fun identity are read through the context (see [`term_encoder`]).
+/// local-fun identity are read through the context (see [`term_image`]).
 ///
 /// # Errors
 ///
@@ -867,7 +868,7 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
         let hash = ctx.local_node_hash().ok_or_else(unsupported_bif)?;
         // `finish_local` writes the uncompressed `[local]` image
         // `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]`, body included.
-        let image = term_encoder(ctx, term, options)?.finish_local(hash);
+        let image = term_image(ctx, term, options, Some(hash))?;
         return match options.compression {
             None => Ok(image),
             // `[local, compressed]`: the C deflates the **local body** — the wrapper
@@ -925,7 +926,7 @@ pub(crate) fn plain_image_of(
 ) -> Result<Vec<u8>> {
     if options.local {
         let hash = ctx.local_node_hash().ok_or_else(unsupported_bif)?;
-        return Ok(term_encoder(ctx, term, options)?.finish_local(hash));
+        return term_image(ctx, term, options, Some(hash));
     }
     encode_body(ctx, term, options)
 }
@@ -934,11 +935,11 @@ pub(crate) fn plain_image_of(
 ///
 /// Shared by `term_to_binary/1,2` (via [`encode_image`]) and by
 /// `erlang:external_size/1,2` (via [`plain_image_of`]), so both BIFs agree on the tag
-/// set and on what is encodable. It is [`term_encoder`] plus [`Encoder::finish`]; the
+/// set and on what is encodable. It is [`term_image`] plus [`Encoder::finish`]; the
 /// `local` option's `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE]` prologue is added by
 /// [`Encoder::finish_local`] in [`encode_image`]/[`plain_image_of`], not here.
 ///
-/// **The image is the encoder's own buffer, not a copy.** [`term_encoder`] builds an
+/// **The image is the encoder's own buffer, not a copy.** [`term_image`] builds an
 /// [`Encoder::new`] (which writes `VERSION_MAGIC` into the writer *before* the body)
 /// and [`Encoder::finish`] moves that buffer out, so one encode allocates the writer
 /// and nothing else — there is no `[push(VERSION_MAGIC)] + extend(body)` second
@@ -965,13 +966,11 @@ pub(crate) fn encode_body(
     term: Eterm,
     options: &T2bOptions,
 ) -> Result<Vec<u8>> {
-    Ok(term_encoder(ctx, term, options)?.finish())
+    term_image(ctx, term, options, None)
 }
-/// Builds the term encoder for `term` under `options`, over `ctx`'s atom table.
-///
-/// Factored out of [`encode_body`] so the `local` path can consume the encoder through
-/// [`Encoder::finish_local`] (the `LOCAL_EXT` wrapper) instead of [`Encoder::finish`]
-/// (the plain image).
+/// The finished image of `term` under `options`: the plain `[VERSION_MAGIC][body]`, or
+/// — when `hash` is `Some` — the `local` wrapper
+/// `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]` ([`Encoder::finish_local`]).
 ///
 /// It is an [`Encoder::new`], not an [`Encoder::new_body`]: the codec writes
 /// `VERSION_MAGIC` into its writer *before* the term body, so [`Encoder::finish`]
@@ -979,10 +978,32 @@ pub(crate) fn encode_body(
 /// would mean a second image-sized `Vec` (or an `O(n)` memmove), which is the one
 /// allocation this shape exists to avoid — the bytes are identical either way.
 ///
-/// The context's local node identity, its `local` node hash and the local-fun identity
-/// all borrow `ctx` mutably, while the encoder holds an immutable borrow of `ctx`'s
-/// atom table for its whole lifetime — so the mutably-read values are taken **first**
-/// and installed on the encoder afterwards.
+/// # The local-fun identity, and why it is verified and recovered
+///
+/// `beam_codec` carries **one** `NEW_FUN_EXT` identity per encoder
+/// ([`Encoder::with_fun_identity`]) and applies it to every `Local` (`make_fun3`) fun it
+/// meets anywhere in the term, while a `make_fun3` term inlines only its engine-internal
+/// descriptor (`[uniq: u64][index: u32]`) — no module, no module MD5, no
+/// `old_index`/`old_uniq`, no creator pid. Those are the runtime's to supply, through
+/// the [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam, which is consulted
+/// here for the **top-level** term by [`BifContext::local_fun_identity`] — so a bare
+/// fun encodes; and then:
+///
+/// * an installed identity is **verified** against every local fun the term contains
+///   ([`local_fun_identities`]). A term mixing two identities — a closure whose `env`
+///   captures *another* lambda is the everyday shape
+///   (`f() -> G = fun() -> ok end, fun() -> G end`) — cannot be expressed in one slot:
+///   the outer identity would be written into the captured fun's `old_index`, one wrong
+///   byte of a silently wrong image. It is refused as the codec's typed
+///   `unsupported_local_fun` instead.
+/// * when no identity was installed and the codec therefore reported
+///   `unsupported_local_fun` (a local fun *nested* in a list/tuple/map/`env`), the
+///   identity is **recovered** from the term itself and the encode retried — so
+///   `term_to_binary([fun() -> ok end])`, `#{k => F}` and `[F, F]` produce the oracle's
+///   image. A term whose local funs differ stays the typed gap.
+///
+/// Both walks run **only** for a term that holds a local fun, so the common fun-free
+/// image (the one `tests/binconv_alloc.rs` measures) pays nothing.
 ///
 /// * `options.deterministic` installs [`Encoder::with_deterministic`] (a map's pairs
 ///   are emitted in full Erlang term order on the key — the `DFLAG_DETERMINISTIC`
@@ -995,28 +1016,70 @@ pub(crate) fn encode_body(
 ///   [`BifContext::local_node`] identity (when resolvable) is installed, so an internal
 ///   id becomes the oracle's `NEW_PID_EXT`/`V4_PORT_EXT` (and an internal reference its
 ///   `NEWER_REFERENCE_EXT`).
-/// * The context's [`BifContext::local_fun_identity`] (when resolvable) is installed so
-///   a local (`make_fun3`) fun is written as its `NEW_FUN_EXT` image.
 ///
 /// # Errors
 ///
-/// Propagates the local-fun-identity hook's failure.
-fn term_encoder<'c>(
-    ctx: &'c mut BifContext<'_>,
+/// Propagates the local-fun-identity hook's failure, the codec's typed
+/// `unsupported_local_fun` for a term whose local funs one identity cannot express, and
+/// every other encoder error unchanged.
+fn term_image(
+    ctx: &mut BifContext<'_>,
     term: Eterm,
     options: &T2bOptions,
-) -> Result<Encoder<'c>> {
+    hash: Option<u32>,
+) -> Result<Vec<u8>> {
     let local = ctx.local_node();
     let identity = ctx.local_fun_identity(term)?;
+    if let Some(identity) = identity {
+        match local_fun_identities(ctx, term)? {
+            // The identity reaches every local fun in the image: install it.
+            LocalFunIdentities::One(seen) if seen == identity => {}
+            // A hook answered for a term that holds no local fun: the codec never
+            // reads the slot, so the identity is simply unused.
+            LocalFunIdentities::None => {}
+            LocalFunIdentities::One(_) | LocalFunIdentities::Unattributable => {
+                return Err(unsupported_local_fun());
+            }
+        }
+    }
+    match encode_with(ctx.atoms(), term, options, local, hash, identity) {
+        Ok(image) => Ok(image),
+        // The top-level term had no identity, but a nested local fun needs one: a single
+        // shared identity is expressible, anything else keeps the codec's typed gap.
+        Err(err) if identity.is_none() && is_unsupported_local_fun(&err) => {
+            match local_fun_identities(ctx, term)? {
+                LocalFunIdentities::One(identity) => {
+                    encode_with(ctx.atoms(), term, options, local, hash, Some(identity))
+                }
+                LocalFunIdentities::None | LocalFunIdentities::Unattributable => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+/// Builds an encoder over `atoms` and writes `term` through it, finishing into the
+/// image (`hash` selects the `local` wrapper — see [`term_image`]).
+///
+/// Takes the atom table rather than the context on purpose: a **failed** attempt must
+/// release the encoder's immutable borrow of it before [`term_image`] can consult the
+/// local-fun-identity seam again for the recovery walk.
+fn encode_with(
+    atoms: &AtomTable,
+    term: Eterm,
+    options: &T2bOptions,
+    local: Option<(Atom, u32)>,
+    hash: Option<u32>,
+    identity: Option<beam_codec::FunIdentity>,
+) -> Result<Vec<u8>> {
     // `Encoder::new` writes the version byte into the writer first, so finishing the
-    // encoder yields the whole image (see this function's docs); the selected minor
+    // encoder yields the whole image (see [`term_image`]'s docs); the selected minor
     // version reproduces `term_to_binary`'s tag set exactly.
     let minor_version = match options.minor_version {
         0 => MinorVersion::V0,
         1 => MinorVersion::V1,
         _ => MinorVersion::V2,
     };
-    let mut encoder = Encoder::new(ctx.atoms()).with_minor_version(minor_version);
+    let mut encoder = Encoder::new(atoms).with_minor_version(minor_version);
     if options.deterministic {
         encoder = encoder.with_deterministic();
     }
@@ -1031,7 +1094,96 @@ fn term_encoder<'c>(
         encoder = encoder.with_fun_identity(identity);
     }
     encoder.encode(term)?;
-    Ok(encoder)
+    Ok(match hash {
+        Some(hash) => encoder.finish_local(hash),
+        None => encoder.finish(),
+    })
+}
+/// What a term's `Local` (`make_fun3`) funs mean for the encoder's **one**
+/// `NEW_FUN_EXT` identity slot — see [`term_image`], and [`local_fun_identities`] for
+/// how it is derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalFunIdentities {
+    /// The term holds no local fun, so the encoder's slot is unused.
+    None,
+    /// Every local fun in the term carries this one identity, so installing it writes
+    /// each of them with its own `arity`/`num_free`/`index`/`env` (the encoder reads
+    /// those from the term) and its own `(module, uniq, old_index, old_uniq, creator)`.
+    One(beam_codec::FunIdentity),
+    /// The term holds a local fun the [`LocalFunIdentity`](crate::context::LocalFunIdentity)
+    /// seam cannot attribute, or two whose identities differ: one slot cannot express
+    /// them, so the image stays the codec's typed `unsupported_local_fun`.
+    Unattributable,
+}
+/// Classifies the local (`make_fun3`) funs `term` contains, for the one identity the
+/// encoder can carry.
+///
+/// Walks every position the encoder descends into — a list's elements (the cons spine
+/// iteratively, so a long list costs one work-stack slot rather than one per cell), a
+/// tuple's elements, a map's keys **and** values, and a fun's own `env` of **any** kind
+/// (an `Imported` fun's env is encoded element by element too) — asking the
+/// [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam for each local fun it
+/// meets. Every other term is a leaf the encoder writes without descending, so a local
+/// fun cannot hide anywhere else.
+///
+/// Only [`term_image`] calls it, and only for a term that already holds a local fun, so
+/// a fun-free image pays no extra traversal.
+///
+/// # Errors
+///
+/// Propagates the seam's own failure (a map that does not read as a map is likewise the
+/// codec's typed error path, never a silently skipped container).
+fn local_fun_identities(ctx: &mut BifContext<'_>, term: Eterm) -> Result<LocalFunIdentities> {
+    let mut stack = vec![term];
+    let mut found: Option<beam_codec::FunIdentity> = None;
+    while let Some(term) = stack.pop() {
+        if access::is_list(term) {
+            let mut tail = term;
+            while access::is_list(tail) {
+                stack.push(access::car(tail));
+                tail = access::cdr(tail);
+            }
+            // `[]` or the improper tail: a leaf, or a container the encoder reads as one.
+            stack.push(tail);
+            continue;
+        }
+        if access::is_tuple(term) {
+            for index in 0..access::tuple_size(term) {
+                stack.push(access::tuple_element(term, index));
+            }
+            continue;
+        }
+        if access::is_map(term) {
+            for (key, value) in access::map_pairs_storage_order(term)? {
+                stack.push(key);
+                stack.push(value);
+            }
+            continue;
+        }
+        if access::is_function(term) {
+            // A local fun's wire identity is the slot's business; an external fun's whole
+            // identity is the export it inlines, and an imported fun's is on its wire
+            // descriptor — neither reads the slot.
+            if beam_codec::term::fun_kind_term(term)? == beam_codec::term::FunKind::Local {
+                let Some(identity) = ctx.local_fun_identity(term)? else {
+                    return Ok(LocalFunIdentities::Unattributable);
+                };
+                match found {
+                    None => found = Some(identity),
+                    Some(seen) if seen == identity => {}
+                    Some(_) => return Ok(LocalFunIdentities::Unattributable),
+                }
+            }
+            for &free in beam_codec::term::fun_env(term)? {
+                stack.push(free);
+            }
+            continue;
+        }
+    }
+    Ok(match found {
+        None => LocalFunIdentities::None,
+        Some(identity) => LocalFunIdentities::One(identity),
+    })
 }
 /// The C's compressed-or-revert rule (`external.c:2250-2301`).
 ///
@@ -1052,7 +1204,7 @@ fn term_encoder<'c>(
 /// does not fit the 4-byte size field (unreachable in practice: the term would have
 /// to be larger than 4 GiB).
 fn compressed_image(image: Vec<u8>, level: u8) -> Result<Vec<u8>> {
-    // Every caller builds the image through `term_encoder`/`finish_local`, both of which
+    // Every caller builds the image through `term_image`/`finish_local`, both of which
     // begin with `VERSION_MAGIC`; a missing one would silently deflate a body that
     // still carries its version byte.
     debug_assert_eq!(
@@ -2874,18 +3026,68 @@ mod tests {
         }
     }
 
+    /// A [`LocalFunIdentity`](crate::context::LocalFunIdentity) test double with the
+    /// **runtime bridge's classification**: it answers only for a `Local` (`make_fun3`)
+    /// fun whose descriptor `index` it has an identity for, and `None` for anything else
+    /// — a container, an `EXPORT_EXT` fun, an unattributable lambda. That is the shape
+    /// the nested-fun recovery path ([`term_image`]) is reachable through: a hook that
+    /// answered for *every* term would already give the top-level slot an identity.
+    struct LocalFunTable {
+        /// `index` (the term's own descriptor word, the oracle's `new_index`) →
+        /// identity. Two lambdas of one module never share an `index`, so it identifies
+        /// a lambda in these tests as well as the real bridge's `(uniq, index)` pair.
+        table: Vec<(u32, beam_codec::FunIdentity)>,
+    }
+
+    impl LocalFunTable {
+        fn new(rows: &[(u32, beam_codec::FunIdentity)]) -> LocalFunTable {
+            LocalFunTable { table: rows.to_vec() }
+        }
+    }
+
+    impl crate::context::LocalFunIdentity for LocalFunTable {
+        fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
+            if !access::is_function(term)
+                || beam_codec::term::fun_kind_term(term)? != beam_codec::term::FunKind::Local
+            {
+                return Ok(None);
+            }
+            let index = beam_codec::term::fun_index(term)?;
+            Ok(self
+                .table
+                .iter()
+                .find(|(known, _)| *known == index)
+                .map(|(_, identity)| *identity))
+        }
+    }
+
     /// A local (`make_fun3`) fun term of `arity` with a zeroed 2-word descriptor
     /// (`[uniq][index]`) — the frozen `[thing_word, uniq, index, env…]` layout
     /// `beam_term::fun` writes. Returns the boxed storage (which must outlive the
     /// term) alongside the term; `beam_codec`'s `make_fun_local` is test-gated and
     /// this crate denies `unsafe_code`, so the words are built directly.
     fn local_fun(arity: u32) -> (Box<[Eterm]>, Eterm) {
-        let words: Box<[Eterm]> = vec![
-            Eterm::from_raw(beam_term::FUN_SUBTAG | ((arity as usize) << 8)),
-            Eterm::from_raw(0), // uniq  — the engine-internal descriptor
-            Eterm::from_raw(0), // index
-        ]
-        .into_boxed_slice();
+        local_fun_with(arity, 0, 0, &[])
+    }
+
+    /// [`local_fun`] with an explicit descriptor (`uniq`/`index`, the two words
+    /// `make_fun3` writes from the module's `FunT` entry) and `env` — the header's
+    /// `num_free` field is `env.len()`, exactly as `MAKE_FUN_HEADER` packs it
+    /// (`erl_term.h:417-424`).
+    fn local_fun_with(
+        arity: u32,
+        uniq: u64,
+        index: u32,
+        env: &[Eterm],
+    ) -> (Box<[Eterm]>, Eterm) {
+        let mut words: Vec<Eterm> = Vec::with_capacity(3 + env.len());
+        words.push(Eterm::from_raw(
+            beam_term::FUN_SUBTAG | ((arity as usize) << 8) | (env.len() << 16),
+        ));
+        words.push(Eterm::from_raw(uniq as usize));
+        words.push(Eterm::from_raw(index as usize));
+        words.extend_from_slice(env);
+        let words = words.into_boxed_slice();
         let term = beam_term::make_boxed(words.as_ptr());
         (words, term)
     }
@@ -2898,6 +3100,17 @@ mod tests {
             assert!(
                 beam_codec::error::is_unsupported_local_fun(&err),
                 "a local fun without an identity must report the local-fun reason, got {err:?}"
+            );
+
+            // The same holds for a local fun **nested** in a container: the recovery walk
+            // finds it, the (absent) seam cannot attribute it, and the image stays the
+            // typed gap rather than writing the fun as its bare descriptor.
+            let list = ctx.cons(fun, beam_term::NIL).expect("fits");
+            let err = term_to_binary_1(ctx, &[list]).expect_err("no identity => unsupported");
+            assert!(
+                beam_codec::error::is_unsupported_local_fun(&err),
+                "a nested local fun without an identity must report the local-fun reason, \
+                 got {err:?}"
             );
         });
     }
@@ -2918,6 +3131,149 @@ mod tests {
             text(term_to_binary_1(&mut ctx, &[fun]).expect("the identity makes it encodable"));
         assert_eq!(image[0], 131, "VERSION_MAGIC");
         assert_eq!(image[1], 112, "NEW_FUN_EXT");
+    }
+
+    #[test]
+    fn a_local_fun_image_is_the_exact_new_fun_ext_layout() {
+        // One `NEW_FUN_EXT` body, every field from its own source: `arity`/`num_free`/
+        // `index`/`env` from the **term** (descriptor word 2 is the module's `FunT`
+        // index, `index` on the wire) and `module`/`uniq`/`old_index`/`old_uniq`/
+        // `creator` from the identity (`external.c:3966-3993`). The oracle's own image
+        // for a compiled `fun() -> ok end` has this shape (a live cross-check pins the
+        // bytes: `tests/term_to_binary_local_fun.rs`).
+        let mut heap = heap();
+        let atoms = table();
+        let module = atoms.lookup("hello").expect("seeded");
+        let mut uniq = [0u8; 16];
+        for (i, byte) in uniq.iter_mut().enumerate() {
+            *byte = i as u8 + 1; // 1..=16
+        }
+        let creator = beam_codec::FunPid { node: module, number: 10, serial: 0, creation: 0 };
+        let identity = beam_codec::FunIdentity::new(module, uniq, 3, 9, creator);
+        let mut hook = FixedFunIdentity { identity };
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut hook);
+        // arity 1, descriptor `[uniq: 0xDEADBEEF][index: 0x01020304]`, one capture (11).
+        let eleven = ctx.int(11).expect("fits");
+        let (_storage, fun) = local_fun_with(1, 0xDEAD_BEEF, 0x0102_0304, &[eleven]);
+
+        let image = text(term_to_binary_1(&mut ctx, &[fun]).expect("encodable"));
+
+        let mut body = vec![1u8]; // arity
+        body.extend_from_slice(&uniq);
+        body.extend_from_slice(&0x0102_0304u32.to_be_bytes()); // index (term descriptor)
+        body.extend_from_slice(&1u32.to_be_bytes()); // num_free
+        body.extend_from_slice(&[119, 5, b'h', b'e', b'l', b'l', b'o']); // module atom
+        body.extend_from_slice(&[97, 3]); // old_index small
+        body.extend_from_slice(&[97, 9]); // old_uniq small
+        body.push(88); // NEW_PID_EXT creator
+        body.extend_from_slice(&[119, 5, b'h', b'e', b'l', b'l', b'o']);
+        body.extend_from_slice(&10u32.to_be_bytes()); // number
+        body.extend_from_slice(&0u32.to_be_bytes()); // serial
+        body.extend_from_slice(&0u32.to_be_bytes()); // creation
+        body.extend_from_slice(&[97, 11]); // env[0]
+        let size = 4 + body.len();
+        let mut expected = vec![131u8, 112];
+        expected.extend_from_slice(&(size as u32).to_be_bytes());
+        expected.extend_from_slice(&body);
+        assert_eq!(image, expected);
+        assert_eq!(image.len(), 64, "2 + 4 + the 58-byte body");
+    }
+
+    #[test]
+    fn a_nested_local_fun_takes_the_recovered_identity() {
+        // A `make_fun3` fun inside a list, a tuple or a map is written by the same
+        // encoder arm, so its `NEW_FUN_EXT` body is **byte-identical** to the bare fun's
+        // — which is what makes the single identity slot sound when every local fun in
+        // the term shares it (the oracle agrees: `term_to_binary([F])` embeds the very
+        // body `term_to_binary(F)` emits).
+        let mut heap = heap();
+        let atoms = table();
+        let module = atoms.lookup("hello").expect("seeded");
+        let creator = beam_codec::FunPid { node: module, number: 10, serial: 0, creation: 0 };
+        let identity = beam_codec::FunIdentity::new(module, [3u8; 16], 1, 5, creator);
+        let mut hook = LocalFunTable::new(&[(0, identity)]);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut hook);
+        let (storage, fun) = local_fun_with(0, 0xAABB_CCDD, 0, &[]);
+
+        let bare = text(term_to_binary_1(&mut ctx, &[fun]).expect("the seam attributes it"));
+        assert_eq!((bare[0], bare[1]), (131, 112), "VERSION_MAGIC + NEW_FUN_EXT");
+        let body = &bare[1..];
+
+        let list = ctx.cons(fun, beam_term::NIL).expect("fits");
+        let mut expected = vec![131u8, 108, 0, 0, 0, 1];
+        expected.extend_from_slice(body);
+        expected.push(106); // NIL_EXT tail
+        assert_eq!(text(term_to_binary_1(&mut ctx, &[list]).expect("nested list")), expected);
+
+        let tuple = ctx.tuple(&[fun, ctx.int(1).expect("fits")]).expect("fits");
+        // `SMALL_TUPLE_EXT` (104): a two-element tuple carries its size in one byte.
+        let mut expected = vec![131u8, 104, 2];
+        expected.extend_from_slice(body);
+        expected.extend_from_slice(&[97, 1]);
+        assert_eq!(text(term_to_binary_1(&mut ctx, &[tuple]).expect("nested tuple")), expected);
+
+        let key = ctx.atom("a").expect("seeded");
+        let map = access::make_flatmap(ctx.heap(), &[(key, fun)]).expect("representable");
+        let mut expected = vec![131u8, 116, 0, 0, 0, 1, 119, 1, b'a'];
+        expected.extend_from_slice(body);
+        assert_eq!(text(term_to_binary_1(&mut ctx, &[map]).expect("nested map")), expected);
+
+        // The **same** lambda twice is still one identity, so it is expressible.
+        let tail = ctx.cons(fun, beam_term::NIL).expect("fits");
+        let twice = ctx.cons(fun, tail).expect("fits");
+        let mut expected = vec![131u8, 108, 0, 0, 0, 2];
+        expected.extend_from_slice(body);
+        expected.extend_from_slice(body);
+        expected.push(106);
+        assert_eq!(text(term_to_binary_1(&mut ctx, &[twice]).expect("repeated fun")), expected);
+        drop(storage);
+    }
+
+    #[test]
+    fn two_identities_in_one_term_stay_the_typed_gap() {
+        // The encoder carries **one** `NEW_FUN_EXT` identity, so a term mixing two
+        // lambdas cannot be expressed: writing the first fun's identity into the second
+        // fun's `old_index`/`old_uniq`/module would be a silently wrong image (measured
+        // against the oracle: `f() -> G = fun() -> ok end, fun() -> G end` differs in
+        // exactly that one byte). It must stay typed, never wrong.
+        let mut heap = heap();
+        let atoms = table();
+        let module = atoms.lookup("hello").expect("seeded");
+        let creator = beam_codec::FunPid { node: module, number: 10, serial: 0, creation: 0 };
+        let inner = beam_codec::FunIdentity::new(module, [1u8; 16], 0, 4, creator);
+        let outer = beam_codec::FunIdentity::new(module, [1u8; 16], 2, 4, creator);
+        let mut hook = LocalFunTable::new(&[(0, inner), (2, outer)]);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut hook);
+
+        // `[inner, outer]` — the two-funs-in-a-list shape.
+        let (_storage_a, one) = local_fun_with(0, 0xAAAA, 0, &[]);
+        let (_storage_b, two) = local_fun_with(0, 0xBBBB, 2, &[]);
+        let tail = ctx.cons(two, beam_term::NIL).expect("fits");
+        let list = ctx.cons(one, tail).expect("fits");
+        let err = term_to_binary_1(&mut ctx, &[list]).expect_err("two identities => typed gap");
+        assert!(
+            beam_codec::error::is_unsupported_local_fun(&err),
+            "a mixed term must stay the local-fun gap, got {err:?}"
+        );
+
+        // The closure-capture shape: the **top-level** identity is attributable, and the
+        // captured lambda's is not its own — the case the verification walk exists for.
+        let (_storage_c, captured) = local_fun_with(0, 0xCCCC, 0, &[]);
+        let (_storage_d, outer_fun) = local_fun_with(0, 0xDDDD, 2, &[captured]);
+        let err = term_to_binary_1(&mut ctx, &[outer_fun]).expect_err("mixed env => typed gap");
+        assert!(
+            beam_codec::error::is_unsupported_local_fun(&err),
+            "an env holding another lambda must not take the outer identity, got {err:?}"
+        );
+
+        // A term whose only local funs share the installed identity is still encoded —
+        // the verification must not refuse the good case.
+        let (_storage_e, one_again) = local_fun_with(0, 0xAAAA, 0, &[]);
+        let ok = text(term_to_binary_1(&mut ctx, &[one_again]).expect("one identity"));
+        assert_eq!((ok[0], ok[1]), (131, 112));
     }
 
     #[test]

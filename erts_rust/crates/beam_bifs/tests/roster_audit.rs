@@ -129,7 +129,7 @@ const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("MEMORY_HOOK_BIFS", 2, 0),
     ("LOCAL_FUN_IDENTITY_BIFS", 12, 9),
     ("DICT_HOOK_BIFS", 7, 7),
-    ("PROCESS_HOOK_BIFS", 11, 11),
+    ("PROCESS_HOOK_BIFS", 12, 12),
     ("PORT_HOOK_BIFS", 8, 4),
     ("SEND_HOOK_BIFS", 4, 4),
     ("NIF_LOADER_BIFS", 1, 1),
@@ -139,7 +139,7 @@ const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("PERSISTENT_TERM_BIFS", 7, 7),
     ("FUN_CALLER_BIFS", 24, 0),
     ("LOCAL_NODE_BIFS", 6, 2),
-    ("RUNTIME_HOOKS_BIFS", 140, 140),
+    ("RUNTIME_HOOKS_BIFS", 139, 139),
 ];
 
 /// The declared entries per module, recomputed from the parsed table and pinned in
