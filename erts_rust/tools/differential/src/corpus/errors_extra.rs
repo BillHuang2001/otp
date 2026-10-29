@@ -43,6 +43,17 @@
 //!   `errors_extra/supplied_trace_unknown_module_frame_is_echoed_verbatim` pins the unknown
 //!   module, and `errors_extra/proc_lib_re_raise_keeps_the_crash_trace` the `proc_lib`-style
 //!   `catch Cls:Rsn:St -> erlang:raise(Cls,Rsn,St)` re-raise, whose echo is idempotent.
+//! * **The legacy `catch` route cooks the same innermost BIF item as its `try/catch` twin.**
+//!   `catch Expr` (the pre-`try` form) reaches the same raise builder as
+//!   `try Expr catch _:_:St`, so a failing BIF renders the same `{Module, Function, ArgList,
+//!   Location}` head item on both routes, `error_info` extension included.
+//!   `errors/legacy_catch_bif_head_item` pins the two routes **side by side** over three
+//!   measured failures — `hd(1)` (an `erlang` BIF, `#{module => erl_erts_errors}`),
+//!   `maps:with([a,b], (fun(X) -> X end)(a))` (a stdlib `badmap` raised from
+//!   `maps.erl`'s own `error_with_info/2`, `#{module => erl_stdlib_errors}`) and
+//!   `lists:reverse(a)` (a `function_clause` in an Erlang-**source** function, whose
+//!   `Location` carries **no** `error_info` at all) — and answers
+//!   `{[Legacy =:= Try, …], [projected item, …]}`.
 //!
 //! # Why each expression spawns a closure
 //!
@@ -63,6 +74,24 @@
 //! differ between the two sides while the pinned projections do not. The goldens are the
 //! oracle's own stdout lines, measured with the corpus probe wrapper on `erl` 29.1.2 /
 //! erts-17.1.1.
+//!
+//! # The measured location residual, and the `errors/` id
+//!
+//! The family added below keeps the plain `errors/` prefix of the `errors` group: it pins that
+//! group's own subject (the stacktrace-side image of a raise), not a new one, and the id names
+//! the family rather than the file.
+//!
+//! A BIF item cooked in compiled code carries **no** `{file,_}`/`{line,_}` position, while an
+//! item cooked by an Erlang-**source** function does (`maps:with/2` at `maps.erl:1303`,
+//! `lists:reverse/1` at `lists.erl:292`). This runtime omits the position on **every** item it
+//! cooks (`divergences.md` §A.1), so the family projects `Location` as its non-position entry
+//! names — `[element(1,P) || P <- Loc, is_tuple(P), element(1,P) =/= file, element(1,P) =/=
+//! line]` — with an `{error_info, Map}` entry rendered as `{error_info,
+//! lists:sort(maps:to_list(M))}`, so the extension's **pairs** (never a multi-key map's print
+//! order) are what is pinned. That projection is scope-limited to the parts both sides agree
+//! on, and `errors/legacy_catch_bif_head_item` reproduces the oracle's line exactly on **both**
+//! routes. One measured row is deliberately **excluded**: `maps:get(k, #{})`, whose item this
+//! runtime names `{erlang,map_get,…}` where the oracle names the `maps:get/2` alias.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -155,6 +184,22 @@ pub(super) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "errors/legacy_catch_bif_head_item",
+            description: "the legacy catch route cooks the same innermost BIF head item ({Module,Function,ArgList} plus the error_info extension) as its try/catch twin",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "(fun() -> Self = self(), spawn(fun() -> Proj = fun(St) -> I = hd(St), {element(1,I), element(2,I), element(3,I), [case P of {error_info, M} -> {error_info, lists:sort(maps:to_list(M))}; Q -> element(1, Q) end || P <- element(4,I), is_tuple(P), element(1,P) =/= file, element(1,P) =/= line]} end, Lg = fun(F) -> {'EXIT', {_, St}} = (catch F()), Proj(St) end, Tr = fun(F) -> try F() catch _:_:St -> Proj(St) end end, Rows = [fun() -> hd(1) end, fun() -> maps:with([a,b], (fun(X) -> X end)(a)) end, fun() -> lists:reverse(a) end], [R1,R2,R3] = [{Lg(F), Tr(F)} || F <- Rows], Self ! {[X =:= Y || {X,Y} <- [R1,R2,R3]], [X || {X,_} <- [R1,R2,R3]]} end), receive X -> X after 10000 -> timeout end end)()",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {[true,true,true],[{erlang,hd,[1],[{error_info,[{module,erl_erts_errors}]}]},{maps,with,[[a,b],a],[{error_info,[{module,erl_stdlib_errors}]}]},{lists,reverse,[a],[]}]}",
+                ),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -164,14 +209,20 @@ mod tests {
 
     /// The exact ids this group emits, in order — the size pin, and the spelling of every
     /// id, live here so a case cannot be added, retitled or dropped without this table.
-    const IDS: [&str; 6] = [
+    const IDS: [&str; 7] = [
         "errors_extra/error_3_option_matrix",
         "errors_extra/error_2_fills_the_caller_frame_with_the_argument_list",
         "errors_extra/error_3_appends_the_error_info_extension",
         "errors_extra/supplied_trace_is_echoed_verbatim",
         "errors_extra/supplied_trace_unknown_module_frame_is_echoed_verbatim",
         "errors_extra/proc_lib_re_raise_keeps_the_crash_trace",
+        "errors/legacy_catch_bif_head_item",
     ];
+
+    /// The two id prefixes this file may emit: the `errors_extra/` group it is named for, and the
+    /// plain `errors/` prefix of the two families that pin the `errors` group's own subject (the
+    /// stacktrace-side image of a raise). Pinned as a list so no third namespace can creep in.
+    const PREFIXES: [&str; 2] = ["errors_extra/", "errors/"];
 
     /// Every row is a caught form: the expression answers the observed term, so the probe
     /// prints `ok <term>` and the process exits `0` (an escaping raise would exit `1`).
@@ -220,15 +271,15 @@ mod tests {
         }
     }
 
-    /// The ids are unique and namespaced under the group's prefix.
+    /// The ids are unique and namespaced under one of the group's two prefixes.
     #[test]
     fn every_id_is_namespaced_and_unique() {
         let cases = group();
         let mut seen = std::collections::HashSet::new();
         for case in &cases {
             assert!(
-                case.id.starts_with("errors_extra/"),
-                "case {}: the id must be namespaced under errors_extra/",
+                PREFIXES.iter().any(|prefix| case.id.starts_with(prefix)),
+                "case {}: the id must be namespaced under one of {PREFIXES:?}",
                 case.id
             );
             assert!(seen.insert(case.id), "duplicate case id {}", case.id);
@@ -284,5 +335,42 @@ mod tests {
                 "the option matrix lost the row `{shape}`"
             );
         }
+    }
+
+    /// The legacy-`catch` family must keep **both** routes side by side and all three measured
+    /// failures: dropping the `try` twin (or a row) would leave the case green while pinning a
+    /// smaller rule, and dropping the position filter would pin the oracle's `{file,_}`/
+    /// `{line,_}` pairs, which this runtime never cooks.
+    #[test]
+    fn the_legacy_catch_family_keeps_both_routes_every_row_and_the_position_filter() {
+        let cases = group();
+        let case = cases
+            .iter()
+            .find(|case| case.id == "errors/legacy_catch_bif_head_item")
+            .expect("the legacy-catch case is present");
+        let CaseKind::Eval { expr, .. } = case.kind else {
+            panic!("the legacy-catch case must be an Eval case");
+        };
+        for shape in [
+            "Lg = fun(F) -> {'EXIT', {_, St}} = (catch F()), Proj(St) end",
+            "Tr = fun(F) -> try F() catch _:_:St -> Proj(St) end end",
+            "fun() -> hd(1) end",
+            "fun() -> maps:with([a,b], (fun(X) -> X end)(a)) end",
+            "fun() -> lists:reverse(a) end",
+            "element(1,P) =/= file",
+            "element(1,P) =/= line",
+            "lists:sort(maps:to_list(M))",
+        ] {
+            assert!(expr.contains(shape), "the legacy-catch case lost `{shape}`");
+        }
+        // Every row must still assert the two routes agree, and the projected item must be the
+        // one the oracle measured (never a route-specific form).
+        assert!(
+            case.golden.stdout.is_some_and(|line| line.starts_with(
+                "ok {[true,true,true],[{erlang,hd,[1],[{error_info,[{module,erl_erts_errors}]}]}"
+            )),
+            "the golden must assert the two routes agree on every row: {:?}",
+            case.golden.stdout
+        );
     }
 }
