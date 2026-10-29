@@ -487,3 +487,190 @@ fn a_float_key_is_not_an_integer_key() {
         );
     }
 }
+
+// -- destination registers that alias the source register -----------------
+
+/// A destination register that **aliases the source** must not disturb a later pair:
+/// the C's `i_get_map_elements` reads `map = $Src` into a local and descends that
+/// local for every key (`emu/map_instrs.tab:64-122`), so the whole instruction sees
+/// the map the source register held at entry.
+///
+/// This is not a corner case: `erlc` reuses the source register as the **first**
+/// pair's destination whenever the map is dead after the match — the shape
+/// `khepri_tree:gather_node_props/2` lowers to (`khepri_tree.erl:268`,
+/// `get_map_elements {f,36} {tr,{x,2},…} [{payload_version,x,2},{child_list_version,x,3}]`),
+/// pinned end to end by
+/// `../../../tests/maps.rs::a_destination_that_aliases_the_source_reads_the_original_map`.
+#[test]
+fn an_aliasing_destination_reads_the_original_map() {
+    for n in SIZES {
+        if n < 2 {
+            continue;
+        }
+        let (first, last) = (0i64, n as i64 - 1);
+        // Pair 1's destination is the source (the compiler's shape) …
+        assert_alias_row(n, &[(first, 0), (last, 1)]);
+        // … and pair 2's destination is, so a *later* pair still descends the map.
+        assert_alias_row(n, &[(first, 1), (last, 0)]);
+        // Three pairs with the alias in the middle: the pairs after it must still
+        // read the original map.
+        assert_alias_row(n, &[(first, 1), (n as i64 / 2, 0), (last, 2)]);
+    }
+}
+
+/// One row of [`an_aliasing_destination_reads_the_original_map`]: `pairs` gives
+/// `(key, destination register)` with the source in `x(0)` throughout, and every
+/// destination must end up holding **its own key's** value (a stale descent of a
+/// clobbered register would give the wrong one — or a `badarg`).
+fn assert_alias_row(n: usize, pairs: &[(i64, u32)]) {
+    let mut fixture = Fixture::new(&[]);
+    let code = with_fail_body(
+        vec![Instr::GetMapElements {
+            fail: Label(2),
+            source: Operand::X(0),
+            pairs: pairs
+                .iter()
+                .map(|(key, dst)| (Operand::Integer(*key), Operand::X(*dst)))
+                .collect(),
+        }],
+        Label(2),
+    );
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+    let atoms = &module.atom_table;
+    let mut ctx = MinimalContext::new();
+    let source = source_map(&mut ctx, n, atoms);
+    let (result, machine) = run(&mut ctx, &module, entry, &[source]);
+    assert_eq!(
+        machine.x(1).is_some() && machine.x(2).is_some(),
+        true,
+        "the destination registers exist"
+    );
+    for (key, dst) in pairs {
+        assert_eq!(
+            machine.x(*dst),
+            Some(value_of(*key)),
+            "n = {n}, pairs = {pairs:?}: x({dst}) must hold key {key}'s value, \
+             not an earlier pair's"
+        );
+    }
+    // The happy path returns `x(0)`, i.e. the value of the pair whose destination is
+    // the source register — or the untouched source when no destination aliases it.
+    let aliased = pairs
+        .iter()
+        .find(|(_, dst)| *dst == 0)
+        .map(|(key, _)| value_of(*key));
+    assert_eq!(
+        result.unwrap(),
+        aliased.unwrap_or(source),
+        "n = {n}, pairs = {pairs:?}: x(0) holds its own pair's value, never a stale word"
+    );
+}
+
+/// A **missing** key after a destination already wrote over the source register must
+/// still take the `fail` label — the descent reads the held map, not the clobbered
+/// register (which the retired re-read made a `badarg`).
+#[test]
+fn an_absent_key_after_an_aliasing_write_takes_the_fail_label() {
+    let absent = 999_999;
+    for n in SIZES {
+        if n == 0 {
+            continue;
+        }
+        let mut fixture = Fixture::new(&[]);
+        let code = with_fail_body(
+            vec![
+                // The source lives in `X(5)`, out of the fail body's reach (it writes
+                // `x(0)`), so the register is still observable after the jump.
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(5),
+                },
+                Instr::GetMapElements {
+                    fail: Label(2),
+                    source: Operand::X(5),
+                    pairs: vec![
+                        // Pair 1 is present and its destination IS the source register.
+                        (Operand::Integer(0), Operand::X(5)),
+                        // Pair 2's key is absent: `fail`, never a raise.
+                        (Operand::Integer(absent), Operand::X(1)),
+                    ],
+                },
+            ],
+            Label(2),
+        );
+        let entry = fixture.add_function("f", 1, code);
+        let module = fixture.finish();
+        let atoms = &module.atom_table;
+        let mut ctx = MinimalContext::new();
+        let source = source_map(&mut ctx, n, atoms);
+        let (result, machine) = run(&mut ctx, &module, entry, &[source]);
+        assert_eq!(
+            result.unwrap(),
+            make_small(99),
+            "n = {n}: an absent key jumps to the fail label, not a badarg"
+        );
+        assert_eq!(
+            machine.x(5),
+            Some(value_of(0)),
+            "n = {n}: the aliasing pair's own write is the only one to the source slot"
+        );
+        assert_eq!(
+            machine.x(1),
+            Some(NIL),
+            "n = {n}: the absent key's destination is never written"
+        );
+    }
+}
+
+/// A missing key mid-way through a multi-pair read leaves the **source operand's
+/// word** untouched: no destination aliases it, so the failure path writes nothing.
+#[test]
+fn an_absent_key_mid_way_leaves_the_source_word_unchanged() {
+    let absent = 999_999;
+    for n in SIZES {
+        if n < 2 {
+            continue;
+        }
+        let (first, last) = (0i64, n as i64 - 1);
+        let mut fixture = Fixture::new(&[]);
+        let code = with_fail_body(
+            vec![
+                // The source lives in `X(5)`, out of the fail body's reach.
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(5),
+                },
+                Instr::GetMapElements {
+                    fail: Label(2),
+                    source: Operand::X(5),
+                    pairs: vec![
+                        (Operand::Integer(first), Operand::X(1)),
+                        (Operand::Integer(absent), Operand::X(2)),
+                        (Operand::Integer(last), Operand::X(3)),
+                    ],
+                },
+            ],
+            Label(2),
+        );
+        let entry = fixture.add_function("f", 1, code);
+        let module = fixture.finish();
+        let atoms = &module.atom_table;
+        let mut ctx = MinimalContext::new();
+        let source = source_map(&mut ctx, n, atoms);
+        let (result, machine) = run(&mut ctx, &module, entry, &[source]);
+        assert_eq!(result.unwrap(), make_small(99), "n = {n}: the fail label");
+        assert_eq!(
+            machine.x(5),
+            Some(source),
+            "n = {n}: the source operand's word is unchanged by a failed read"
+        );
+        assert_eq!(machine.x(1), Some(value_of(first)), "n = {n}: pair 1 wrote");
+        assert_eq!(machine.x(2), Some(NIL), "n = {n}: the absent key wrote nothing");
+        assert_eq!(
+            machine.x(3),
+            Some(NIL),
+            "n = {n}: the pair after the failure never ran"
+        );
+    }
+}

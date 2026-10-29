@@ -70,12 +70,20 @@ use std::sync::Arc;
 use beam_common::{BeamError, ExceptionClass};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{load_file, Module};
-use beam_term::{cmp, make_atom, make_small, Atom, Eterm};
+use beam_term::{cmp, make_atom, make_small, Atom, Eterm, NIL};
 
 use support::ModuleHost;
 
 /// The committed oracle fixture (this crate owns it, unlike `slice.beam`).
 const MAPFX_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mapfx.beam");
+/// The committed `get_map_elements` source/destination-**alias** fixture
+/// (`mapalias.erl`): `erlc` reuses the source register as the first pair's
+/// destination whenever the map is dead after the match, which is the shape
+/// `khepri_tree:gather_node_props/2` emits (`khepri_tree.erl:268`).
+const MAPALIAS_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/mapalias.beam"
+);
 
 /// Resolve a name interned in the module's atom table.
 fn atom(module: &Module, name: &str) -> Atom {
@@ -517,4 +525,109 @@ fn exact_on_a_hashmap_source_updates_the_binding() {
         33
     );
     assert_eq!(entry(result, &module, "a"), Some(make_small(9)));
+}
+
+// ---------------------------------------------------------------------------
+// `get_map_elements` with a destination that ALIASES the source register
+// ---------------------------------------------------------------------------
+
+/// Load the alias fixture through `beam_loader::load_file`'s private table.
+fn load_alias() -> Module {
+    load_file(MAPALIAS_BEAM).expect("load mapalias.beam")
+}
+
+/// The fixture's `#node{}` value — a 10-element tuple
+/// `{node, Id, Props, Payload, ChildNodes, ChildListVersion, PayloadVersion,
+/// KeepWhile, Expiry, Meta}` whose `Props` map (element 2) carries the two
+/// versions the fixture's pattern reads.
+fn node_tuple(ctx: &mut dyn ExecutionContext, module: &Module) -> Eterm {
+    let props = flatmap(
+        ctx,
+        module,
+        &[("payload_version", 7), ("child_list_version", 9)],
+    );
+    let elements = [
+        make_atom(atom(module, "node")),
+        make_small(1),
+        props,
+        make_small(42),
+        NIL,
+        make_small(9),
+        make_small(7),
+        NIL,
+        make_small(0),
+        NIL,
+    ];
+    terms::make_tuple(ctx, &elements).expect("a #node{} tuple")
+}
+
+/// `erlc` reuses the register holding the map as the **first pair's destination**
+/// whenever the map is dead after the match:
+///
+/// ```text
+/// {get_map_elements,{f,1},
+///                   {tr,{x,1},{t_map,any,any}},
+///                   {list,[{atom,payload_version},{x,1},
+///                          {atom,child_list_version},{x,2}]}}
+/// ```
+///
+/// The instruction is atomic (`i_get_map_elements` reads `map = $Src` into a local
+/// before descending, `emu/map_instrs.tab:64`), so the second pair must still read
+/// the map the register held at entry — not the first pair's value.
+///
+/// Oracle-pinned: `mapalias:values/1` on this node answers `{7, 9, 42, []}`.
+#[test]
+fn a_destination_that_aliases_the_source_reads_the_original_map() {
+    let module = load_alias();
+    let mut ctx = MinimalContext::new();
+    let node = node_tuple(&mut ctx, &module);
+    let result = run(&mut ctx, &module, "values", &[node]).expect("values/1");
+    assert_eq!(terms::tuple_element(result, 0).unwrap(), make_small(7));
+    assert_eq!(
+        terms::tuple_element(result, 1).unwrap(),
+        make_small(9),
+        "the second pair must read the ORIGINAL map, not the first pair's value"
+    );
+    assert_eq!(terms::tuple_element(result, 2).unwrap(), make_small(42));
+    assert_eq!(terms::tuple_element(result, 3).unwrap(), NIL);
+}
+
+/// The same alias shape on a key that is absent: the instruction takes the
+/// function's `func_info` fail path (`error:function_clause`), never a `badarg`.
+///
+/// Oracle-pinned: `mapalias:missing/1` on this node raises `error:function_clause`.
+#[test]
+fn an_aliasing_read_of_an_absent_key_takes_the_clause_path() {
+    // Through the **seeded** host, as `beam_rt` loads it: `function_clause` is the
+    // `func_info` failure's reason atom and is a host load-time obligation (the
+    // private `beam_loader` table of a module without a head clause does not carry it).
+    let mut host = ModuleHost::new(".");
+    host.register("mapalias", MAPALIAS_BEAM);
+    let module = host
+        .load("mapalias")
+        .expect("load mapalias.beam through the seeded host");
+    let node = node_tuple(&mut host, &module);
+    let err = host.call("mapalias", "missing", &[node]).unwrap_err();
+    let raise = match &err {
+        BeamError::Raise(raise) => raise,
+        other => panic!("expected the clause raise, got {other:?}"),
+    };
+    assert_eq!(raise.class, ExceptionClass::Error);
+    let reason = live_reason(&err).expect("the clause raise carries its live reason term");
+    assert!(
+        cmp(
+            reason,
+            make_atom(atom(&module, "function_clause")),
+            &module.atom_table
+        )
+        .is_eq(),
+        "an absent key is the bare-atom clause failure the oracle raises, never badarg"
+    );
+    // The uncaught frames name the fixture's own clause, so the failure really is
+    // the failed head (a `badarg` would carry no such frame).
+    assert_eq!(
+        raise.stacktrace.frames.first().map(|f| f.function.as_str()),
+        Some("missing"),
+        "the clause failure names the failed head"
+    );
 }

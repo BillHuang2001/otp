@@ -48,8 +48,9 @@
 //!
 //! The work is split by responsibility: this file holds [`exec`] (the dispatch), the
 //! `position` scan the flat write arm needs and the failure paths shared by both
-//! halves; [`read`] holds the read side (`get_map_elements` / `has_map_fields`, one
-//! `map_get` descent per key); [`write`] holds the update side (`put_map_assoc` /
+//! halves; [`read`] holds the read side (`get_map_elements` / `has_map_fields`: the
+//! source operand is read **once** per instruction and every key descends that one
+//! held word, one `map_get` descent per key); [`write`] holds the update side (`put_map_assoc` /
 //! `put_map_exact`). The comprehensive unit suite (every opcode
 //! variant, both map layouts incl. the 32/33-key boundary, the failure paths and the
 //! dispatch contract) lives in the sibling `tests` module, whose `read_path` submodule
@@ -78,18 +79,25 @@
 //!
 //! # Semantics
 //!
-//! * `GetMapElements { fail, source, pairs }` — read `source`; if it is not a map
+//! * `GetMapElements { fail, source, pairs }` — read `source` **once**, before the
+//!   loop; if it is not a map
 //!   jump to `fail` (or raise `{badmap, Source}` when `fail` is
 //!   [`NO_FAIL`] — the reason the compiler's own `is_map` guard branch raises). For
-//!   each `(key, dst)` pair, descend the map once for `key`
-//!   ([`beam_term::map::map_get`], the source is never enumerated); **a missing key
+//!   each `(key, dst)` pair, descend that **held** word once for `key`
+//!   ([`beam_term::map::map_get`], the source is never enumerated), so a destination
+//!   that aliases the source register cannot change any later pair's answer — the C
+//!   holds `map = $Src` in a local for exactly this reason
+//!   (`emu/map_instrs.tab:64-122`); **a missing key
 //!   jumps to `fail`**, or —
 //!   when `fail` is [`NO_FAIL`] — raises the bare atom `function_clause` (the
 //!   engine-defined reason for this branchless failure, see below), otherwise the
 //!   value is written to `dst`. Partial writes before a failure are harmless (the
 //!   clause matcher restarts at `fail`).
-//! * `HasMapFields { fail, source, keys }` — every key must be present (one descent
-//!   per key; no writes), else jump
+//!   A `map_get` `TermError::BadMap` on a word that already passed the `is_map` check
+//!   is a malformed map **interior** and stays a typed `BeamError::BadArg`; "this
+//!   operand is not a map" is the entry check's outcome above, never that error.
+//! * `HasMapFields { fail, source, keys }` — read `source` once; every key must be
+//!   present (one descent of the held word per key; no writes), else jump
 //!   to `fail`, or raise the same bare `function_clause` when `fail` is
 //!   [`NO_FAIL`]. No writes.
 //! * `PutMapAssoc { fail, source, dst, live, pairs }` — build a **new** map =
