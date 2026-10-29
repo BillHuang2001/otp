@@ -89,16 +89,10 @@ difference is the binary (`erl` vs `beam_rt`).
 ## Status
 - Harness complete: 29 unit tests green, zero build warnings; both targets run end to end against a
   real oracle and a real `beam_rt`.
-- Both sweeps are measured at the current runtime (runtime source commit `71ffbbb379`, tier `default`;
-  no file under `erts_rust/crates` differs between it and HEAD): Khepri `1500/1` oracle vs `403/1` rust
-  (21 `agree` / 8 `agree-fail-identical` / 2 `divergence` / 20 `rust-gap`), stdlib at the 10 s budget
-  `209/5` oracle vs `177/37` rust (177 `agree` / 5 excluded / 32 `divergence`), and the 120 s re-check
-  `129/1` vs `114/16`.
-  Measured numbers, the excluded-case rationale and the root-cause classes live in `RESULTS.md`
-  (artifacts under `results/`); do not duplicate counts here. The per-row analysis — smallest failing
-  expression per class, both sides' observations, owning crate — lives in
-  `results/{khepri,stdlib}-notes.md` next to the artifacts, and each class's current verdict in
-  `results/{khepri,stdlib}-diagnostics/FINDINGS.md`, which supersedes a notes section it re-checks.
+- Both sweeps are measured at runtime source commit `71ffbbb379`, tier `default`, and no file under `erts_rust/crates` differs between that sha and HEAD.
+  `RESULTS.md` §1–§3 is the authoritative table set (both sides, per module and per suite, with each run's loadavg); its headline is Khepri `1500/1` oracle vs `403/1` rust, stdlib at the 10 s budget `209/5` vs `177/37`, and the 120 s re-check `129/1` vs `114/16`.
+- The per-row analysis — smallest failing expression per class, both sides' observations, owning crate — lives in `results/{khepri,stdlib}-notes.md` next to the artifacts, and each class's current verdict in `results/{khepri,stdlib}-diagnostics/FINDINGS.md`, which supersedes a notes section it re-checks.
+- A single Khepri sweep is a *sample* of an intermittently blocking runtime: two runs at the same commit read `412/1` and `403/1`, three rows swapping each way (`RESULTS.md` §2 *Run-to-run variance*).
 - Each row's cwd is cleared before it runs (`target::fresh_dir`): a staged `_test.*`/`data_dir` tree
   left by an earlier sweep made fixtures fail on **both** sides, which silently reddened green rows.
 - The sweeps surface **real runtime defects**, and some are not a typed gap: khepri's nested-run pump
