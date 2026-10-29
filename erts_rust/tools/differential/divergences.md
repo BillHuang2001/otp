@@ -309,9 +309,22 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `{ets,lookup,[nonexistent_tab,k],[{error_info,#{cause => id,module => erl_stdlib_errors}}]}` in
   the oracle against the one-key map here — the same for `erlang:register(a,1)` (`cause => none`,
   module `erl_erts_errors`), `erlang:start_timer(bad,self(),x)` (`cause => time`) and a bit-syntax
-  failure (`{Segment,Op,type,Value}`). Owner: the BIF layer — `crates/beam_bifs` must attach
-  `Raise::error_info`; the engine carve renders such a payload **verbatim** through
-  `pending_error_info`/`raise_error_info`, and no in-tree BIF sets one today.
+  failure (`{Segment,Op,type,Value}`). Measured exactly, from **compiled** code (a spawned closure,
+  `Probe::Value`, erts-17.1.1), for the `ets:lookup/2` row the oracle answers
+  `{error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{cause,id},{module,erl_stdlib_errors}]}]}`
+  and `beam_rt` answers the same item without the pair,
+  `{error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{module,erl_stdlib_errors}]}]}` — a
+  plain differing value, never the runtime's `unsupported` signal, so it is a **mismatch** class
+  no allowlist can cover and no case may pin it today. Owner: the host side of
+  `crates/beam_engine`'s defaulted `ExecutionContext::bif_error_cause` seam — the engine already
+  asks it per failed BIF and already sizes C's two-pair extension
+  (`families/exceptions/bif_frame.rs`), and `crates/beam_bifs::error_cause` already decides the
+  `ets` table-argument rows (`ets:lookup(unknown_atom_xyz, k)` ⇒ `Cause(id)`), so what is missing
+  is an implementation in `crates/beam_rt` (`context/execution.rs`, over the per-call `BifContext`)
+  mapping `Cause(v) ⇒ Some(v)` / `Undecided ⇒ None`. A BIF raising a `Raise::error_info` payload is
+  the other, unused half: the engine renders one **verbatim** through
+  `pending_error_info`/`raise_error_info`, and no in-tree BIF sets one today. Ready recipe once a
+  host answers the seam: `CASE_DRAFTS.md` §10 (`errors/ets_bad_table_cause`).
 - An Erlang-**source** extension loses the oracle's position: `lists:seq(1,2,0)` is
   `{lists,seq,[1,2,0],[{file,"lists.erl"},{line,541},{error_info,#{module => erl_stdlib_errors}}]}`
   in the oracle and a position-free location here, and `unicode:characters_to_binary(42)` likewise.

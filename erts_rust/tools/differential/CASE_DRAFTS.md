@@ -6,9 +6,10 @@ correction saying why no case is possible. A recipe whose gap the owning crate h
 lands in `src/corpus/**`, and `known-gaps.txt`/`GAPS.md` are refreshed in the same change (see
 `../CONTEXT.md` §"Notes for Agents"). A recipe for a gap that is still **open but closable** stays
 drafted here and deliberately **not** in `known-gaps.txt` — the allowlist records only genuinely
-unclosable gaps, and recording a closable one would defeat the ratchet. §8 is the one recipe
-open at this revision (closable, blocked on `beam_rt`) and §9 records a measured divergence, so no
-case can pin it; every other section is either landed or a recorded non-gap.
+unclosable gaps, and recording a closable one would defeat the ratchet. §8 and §10 are the two
+recipes open at this revision (both closable, each blocked on a named runtime seam) and §9 records
+a measured divergence, so no case can pin it; every other section is either landed or a recorded
+non-gap.
 
 At a glance: **§1**, **§2**, **§4b**, **§4c**, **§5a**, **§5b** and **§6** are **landed** — every
 one agrees in `beam_rt` and is pinned by the `src/corpus/**` groups (`zlib.rs`, `bifs.rs`,
@@ -16,9 +17,11 @@ one agrees in `beam_rt` and is pinned by the `src/corpus/**` groups (`zlib.rs`, 
 gaps but are not gaps at all. The only remaining zlib divergences are **§4a** (the repetitive-body
 wrapped size form) and **§4**'s large-body image-choice (the 100-byte raw-DEFLATE `zip/1` stream),
 both unpinnable and recorded in `divergences.md`, not drafts. §8 is `blocked-on-beam_rt` — the
-`system_info(snifs)` recipe is ready and lands the moment the key is served — and §9 is a
+`system_info(snifs)` recipe is ready and lands the moment the key is served — §9 is a
 `maps` no-op-identity **divergence**, not a case: no golden can pin it while the result-admission
-path deep-copies every BIF result.
+path deep-copies every BIF result, and §10 is `blocked-on-beam_rt`'s host impl of
+`ExecutionContext::bif_error_cause` — the `{cause,_}` error_info recipe is ready and lands the
+moment a host answers the seam.
 
 Three coverage facts worth knowing: the synthesized callee-head `undef` stacktrace
 head item `{Module,Function,ArgList,Location}` is pinned on **both** routes — the `-eval` form
@@ -503,3 +506,79 @@ Both lines are stored structure identity (`erts_debug:same/2`), not equality: th
 **Mechanism (the measured cause).** A registered BIF's result is always deep-copied into the caller's heap — `move_result_into_process_heap` → `copy_result_fresh` → `beam_message::copy_struct` (`crates/beam_rt/src/context/calls.rs`) — so a no-op BIF can never hand back the argument's word. Only the **inlined guard** BIFs keep it, and only from compiled code: there, measured `{erts_debug:same(M, element(1,{M})), erts_debug:same(M, hd([M])), erts_debug:same(M, lists:nth(1,[M])), erts_debug:same(M, M)}` is `{true,true,true,true}` on the oracle and `{true,true,false,true}` on `beam_rt` (`element/2` and `hd/1` compile to the `get_tuple_element`/`get_list` opcodes, while `lists:nth/2` is a registered BIF), unchanged under `BEAM_RT_TIER=interpreter` — so the tier is not the variable. On the `-eval` tree-walking route the same tuple is `{false,false,false,true}` here (the walker routes even those two through the result copy), which is the same mechanism seen on the other route.
 
 **Owner and why no case can pin it.** `crates/beam_bifs`'s `maps` no-op early returns are correct and are already pinned crate-side (`crates/beam_bifs/tests/maps_identity.rs`); the fix belongs to the result-admission path in `crates/beam_rt` (a BIF whose result is its own argument must be admitted without a copy), not to the BIF. A corpus case is impossible in the meantime: the only observable is a plain `false` (a `mismatch`-class value) rather than the runtime's documented `unsupported` signal, so pinning the oracle line would turn the gate red by design.
+
+## 10. `ets:lookup/2` of an undefined table — the `{cause,_}` error_info pair; owner `beam_engine` (`ExecutionContext::bif_error_cause`, needs a host impl in `beam_bifs`/`beam_rt`)
+
+**Status:** `blocked-on-beam_rt` — the **engine** half is already in place
+(`crates/beam_engine/src/families/exceptions/bif_frame.rs` asks `ExecutionContext::bif_error_cause`
+per failed BIF and already sizes C's two-pair extension, `EXTENSION_WORDS_WITH_CAUSE`), and
+`crates/beam_bifs/src/error_cause.rs::error_cause` *decides* the measured rows
+(`ets:lookup(unknown_atom_xyz, k)` ⇒ `ErrorCause::Cause(id)`, `ets:lookup(1, k)` ⇒ `type`,
+`erlang:register(a, 1)` ⇒ `none`), but **no host implements the seam**: the only implementations in
+the tree are the trait default `Ok(None)` (`crates/beam_engine/src/context.rs`) and a test double
+(`families/exceptions/bif_frame/tests.rs`). So a compiled raise renders C's **one-pair**
+`#{module => FormatModule}` map where the oracle renders the **two-pair** `#{cause => Fvalue, module
+=> FormatModule}` one. This is a **closable** gap, deliberately **not** recorded in
+`known-gaps.txt` (that allowlist holds only genuinely unclosable gaps); the recipe lands the moment
+a host answers the seam.
+
+```rust
+Case {
+    id: "errors/ets_bad_table_cause",
+    description: "a failing ets:lookup/2 item carries the two-pair {error_info,#{cause => id,module => erl_stdlib_errors}} extension",
+    contracts: &[Contract::LanguageSemantics],
+    kind: CaseKind::Eval {
+        expr: "(fun() -> Self = self(), spawn(fun() -> {Cls, Rsn, St} = try ets:lookup(unknown_atom_xyz, k) catch Cls0:Rsn0:St0 -> {Cls0, Rsn0, St0} end, I = hd(St), Self ! {Cls, Rsn, element(1,I), element(2,I), element(3,I), [case P of {error_info, M} -> {error_info, lists:sort(maps:to_list(M))}; Q -> element(1, Q) end || P <- element(4,I), is_tuple(P), element(1,P) =/= file, element(1,P) =/= line]} end), receive X -> X after 10000 -> timeout end end)()",
+        extra_argv: &[],
+        probe: Probe::Value,
+    },
+    golden: Golden {
+        stdout: Some(
+            "ok {error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{cause,id},{module,erl_stdlib_errors}]}]}",
+        ),
+        exit_code: 0,
+    },
+}
+```
+
+It belongs in `src/corpus/errors_extra.rs` — the group that pins the raise's stacktrace-side
+payload, whose `//!` doc already carries the "why the expression spawns a closure" rule (the
+`-eval` tree walker renders a caught raise from its own symbolic model and loses the extension, so
+the payload is observable only from **compiled** code). The id keeps the plain `errors/` prefix of
+the `errors` group: it pins that group's own subject, and the id names the family rather than the
+file.
+
+* **the oracle-recorded golden**: `ok {error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{cause,id},{module,erl_stdlib_errors}]}]}`,
+  exit `0` — re-measured on this host (OTP 29.1.2 / erts-17.1.1) with the `Probe::Value` wrapper
+  `erl -noshell -eval 'try (EXPR) of V -> io:format("ok ~w~n",[V]), halt(0) catch C:R -> io:format("exception ~w ~w~n",[C,R]), halt(1) end.'`
+  (not with `differential compare`, whose default `Probe::TermToBinary` wrapper prints the ETF
+  image instead of the `~w` line).
+* **the `beam_rt` side's current output**: `ok {error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{module,erl_stdlib_errors}]}]}`,
+  exit `0` — the projection of the same raise with the `cause` pair missing. Because both sides
+  produce a **plain differing observable** (not the runtime's `unsupported` signal), the case
+  classifies as a `mismatch`, which no allowlist can cover (`ratchet::classify` ratchets only
+  `Unsupported`/`Skipped`, and `suite_exit_code` returns `1` on any mismatch) — which is exactly
+  why it was demoted from `src/corpus/errors_extra.rs` to this recipe rather than recorded as a
+  gap.
+* **the projection is what makes the case pinnable**: only the item's shape is asserted — the
+  class/reason, the item's `M`/`F`/`A` slots and the extension's **sorted** pairs. The location's
+  `{file,_}`/`{line,_}` entries are dropped (this runtime cooks none: `divergences.md` §A.1) and
+  sorting the map's pairs means the host's atom-interning order cannot leak into the golden.
+* **the work the owning crate must do**: implement `ExecutionContext::bif_error_cause`
+  (`crates/beam_rt/src/context/execution.rs`, next to `foreign_record_definition`) over the
+  `BifContext` the runtime builds per BIF call (`crates/beam_rt/src/context/calls.rs`'s
+  `BifContext::new(heap, atoms, self_pid)` chain, with the table registry installed so the `ets`
+  half really decides), forwarding to `beam_bifs::error_cause` and mapping
+  `ErrorCause::Cause(v) ⇒ Ok(Some(v))`, `ErrorCause::Undecided ⇒ Ok(None)` (never an absence
+  claim). No `beam_engine` change is needed — the seam, the two-pair sizing and the rendered key
+  order are already there (`crates/beam_engine/src/CONTEXT.md` §"`bif_error_cause`").
+* repro once the seam is wired: build, then run the case and expect `[AGREE]` —
+  ```sh
+  erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt -p differential
+  erts_rust/target/debug/differential run errors/ets_bad_table_cause
+  ```
+  and the same expression through `differential compare` must go from `[MISMATCH]` to `[AGREE]`
+  (that route compares the two sides' ETF images, so it is a pre-check, not the golden's source).
+  Landing the case means adding it to `errors_extra.rs`'s `group()`, its `IDS` table (and the
+  lifted `[&str; 8]` size) and re-adding the per-case shape test; no allowlist or `GAPS.md` change
+  is involved, because an agreeing case is not a gap.
