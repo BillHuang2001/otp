@@ -29,6 +29,12 @@
 //! message `timer:apply_after/4` sends is really delivered to the receiving process, under an
 //! `after` guard so a lost message is an observation, not a hang).
 //!
+//! The **dynamic `apply/2`** matrix (`bifs/apply_2_*`) pins the call site the compiler does *not*
+//! rewrite into `apply/3`: a computed argument list, and the three raise shapes — `badfun`,
+//! `badarity` and the two-atom `(module, function)` form's `badarg` — by reason **shape** (never a
+//! `#Fun<…>` rendering), plus the `system_limit` arity ceiling (1022 accepted into the arity
+//! check, 1023 refused).
+//!
 //! The **code-store removal** surface (`erlang:delete_module/1`, `code:purge/1`,
 //! `code:soft_purge/1` and `erts_internal:purge_module/2`) is pinned only where the two runtimes
 //! agree — see the block comment above those cases for what is deliberately left unpinned (the
@@ -1526,6 +1532,111 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // ---------------------------------------------------------------------------------
+        // `apply/2`'s **dynamic** call site: the argument list is computed, so the shape cannot
+        // be the compiler's static `apply/3` rewrite. Each golden is the oracle's own line.
+        //
+        // The raise reasons are pinned by **shape**, never by rendering: a `#Fun<…>` image is not
+        // stable across runtimes (module/fun indices differ), so `badfun`'s payload is observed
+        // only through `is_function/1` and `badarity`'s pair as `{badarity, is_function(F), Args}`
+        // (`element(2, Reason)` is the `{Fun, Args}` pair, so the fun is its `element(1, …)`).
+        // `apply(erlang, self)` is the two-atom module+function form: the *compiler* rewrites it
+        // to `apply(erlang, self, [])` (whose answer is the caller's pid), but the `apply/2` BIF
+        // the `-eval` path reaches takes a fun only, so it raises `badarg` — measured on the
+        // oracle, not assumed.
+        //
+        // The arity ceiling is a hard boundary: a 1022-element argument list reaches the arity
+        // check (`badarity`), a 1023-element one is refused with `system_limit` before any call.
+        Case {
+            id: "bifs/apply_2_with_a_computed_argument_list",
+            description: "erlang:apply/2 on a fun with an argument list built at run time (a dynamic call site), not the static apply/3 rewrite",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin Args = lists:map(fun(Y) -> Y end, [1]), \
+                       apply(fun(X) -> X + 1 end, Args) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/apply_2_of_a_non_fun_is_badfun",
+            description: "erlang:apply/2 on a non-fun raises error:{badfun, NotAFun}, pinned as {element(1, Reason), is_function(element(2, Reason))}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `element(2, Reason)` really is the offending term, so this also proves the
+                // reason is a `badfun` pair and not a bare atom.
+                expr: "try apply(not_a_fun, [1]) \
+                       catch error:Reason -> {element(1, Reason), is_function(element(2, Reason))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {badfun,false}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/apply_2_of_a_wrong_arity_is_badarity",
+            description: "erlang:apply/2 whose computed argument list has the wrong length raises error:{badarity, {Fun, Args}}, pinned as {badarity, is_function(Fun), Args}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The second element of the reason is the `{Fun, Args}` pair: its `element(1, …)`
+                // is a fun, its `element(2, …)` the argument list the call was given.
+                expr: "try apply(fun lists:reverse/1, [1,2]) catch error:Reason -> \
+                       {element(1, Reason), is_function(element(1, element(2, Reason))), \
+                        element(2, element(2, Reason))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {badarity,true,[1,2]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/apply_2_module_function_form_is_badarg",
+            description: "erlang:apply/2's two-atom (module, function) form raises badarg on the -eval path, unlike its compile-time apply/3 rewrite",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Measured, never assumed: `apply(erlang, self, [])` answers the caller's pid
+                // (that pid is never pinned), while the two-atom call the `-eval` path reaches
+                // as `apply/2` raises `error:badarg` — no pid reaching the golden.
+                expr: "apply(erlang, self)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "bifs/apply_2_argument_ceiling_is_system_limit",
+            description: "erlang:apply/2's arity ceiling: a 1022-element argument list reaches the arity check (badarity) and a 1023-element one is refused with system_limit",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The list is built by a comprehension-shaped `fun` (one `lists:seq/2` per arm),
+                // so both probes cost ~1k terms. Distinct catch variable names per `try`: the
+                // oracle's `erl_eval` refuses to reuse one across two catch clauses.
+                expr: "begin Mk = fun(N) -> lists:seq(1, N) end, \
+                       Below = try apply(fun lists:reverse/1, Mk(1022)) \
+                               catch error:Rsn1 -> {element(1, Rsn1), \
+                                                    length(element(2, element(2, Rsn1)))} end, \
+                       Above = try apply(fun lists:reverse/1, Mk(1023)) \
+                               catch Cls2:Rsn2 -> {Cls2, Rsn2} end, \
+                       {Below, Above} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {{badarity,1022},{error,system_limit}}"),
+                exit_code: 0,
+            },
+        },
         Case {
             id: "bifs/io_lib_format_integer_char_string_float",
             description: "io_lib:format/2 with the ~b/~c/~s/~p integer/char/string/term controls and the ~.2f/~e/~10.3f float controls",
@@ -2496,6 +2607,26 @@ mod tests {
                 "ok {[2,1],2,{<<1,2>>,<<3>>},[1,2],<<1,2>>}",
             ),
             (
+                "bifs/apply_2_with_a_computed_argument_list",
+                "ok 2",
+            ),
+            (
+                "bifs/apply_2_of_a_non_fun_is_badfun",
+                "ok {badfun,false}",
+            ),
+            (
+                "bifs/apply_2_of_a_wrong_arity_is_badarity",
+                "ok {badarity,true,[1,2]}",
+            ),
+            (
+                "bifs/apply_2_module_function_form_is_badarg",
+                "exception error badarg",
+            ),
+            (
+                "bifs/apply_2_argument_ceiling_is_system_limit",
+                "ok {{badarity,1022},{error,system_limit}}",
+            ),
+            (
                 "bifs/io_lib_format_integer_char_string_float",
                 "ok {[49,48,32,97,32,[97,98]],<<123,49,44,50,125>>,[49,46,53,48],\
                  <<49,46,48,48,48,48,48,101,43,50>>,<<32,32,32,32,32,51,46,49,52,50>>}",
@@ -2519,6 +2650,70 @@ mod tests {
             expr.contains("lists:sort(maps:to_list("),
             "a multi-key map must be rendered sorted, got {expr}"
         );
+    }
+
+    /// The dynamic `apply/2` block: the raise **reasons** are pinned by shape, never by a
+    /// rendering (a `#Fun<…>` image differs between runtimes), and the arity ceiling is pinned at
+    /// its exact boundary — a 1022-element argument list reaches the arity check (`badarity`), a
+    /// 1023-element one is refused with `system_limit`.
+    #[test]
+    fn the_dynamic_apply_2_block_pins_reason_shapes_not_renderings() {
+        let cases: Vec<_> = group()
+            .into_iter()
+            .filter(|c| c.id.starts_with("bifs/apply_2_"))
+            .collect();
+        assert_eq!(cases.len(), 5, "the dynamic apply/2 matrix");
+        for case in &cases {
+            let expr = case.expr().expect("eval case");
+            let stdout = case.golden.stdout.expect("a golden");
+            for banned in ["#Fun<", "#Ref<", "#Port<", "#PID<"] {
+                assert!(
+                    !stdout.contains(banned) && !expr.contains(banned),
+                    "case {}: a golden/expression may not carry a runtime rendering: {stdout}",
+                    case.id
+                );
+            }
+            // Probe protocol: an `exception …` line exits 1, an `ok …` line exits 0.
+            let expected = i32::from(stdout.starts_with("exception "));
+            assert_eq!(case.golden.exit_code, expected, "case {}", case.id);
+            assert!(!expr.contains('\n'), "case {}: a single line", case.id);
+        }
+        let golden = |id: &str| {
+            cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+                .expect("a golden")
+        };
+        assert_eq!(
+            golden("bifs/apply_2_of_a_non_fun_is_badfun"),
+            "ok {badfun,false}"
+        );
+        assert_eq!(
+            golden("bifs/apply_2_of_a_wrong_arity_is_badarity"),
+            "ok {badarity,true,[1,2]}"
+        );
+        assert_eq!(
+            golden("bifs/apply_2_module_function_form_is_badarg"),
+            "exception error badarg"
+        );
+        assert_eq!(
+            golden("bifs/apply_2_argument_ceiling_is_system_limit"),
+            "ok {{badarity,1022},{error,system_limit}}"
+        );
+        // Both sides of the boundary are built in the expression itself, so the pinned 1022/1023
+        // pair cannot be silently replaced by a smaller probe.
+        let ceiling = cases
+            .iter()
+            .find(|c| c.id == "bifs/apply_2_argument_ceiling_is_system_limit")
+            .expect("registered")
+            .expr()
+            .expect("eval case");
+        for shape in ["Mk(1022)", "Mk(1023)"] {
+            assert!(ceiling.contains(shape), "missing `{shape}`: {ceiling}");
+        }
     }
 
     /// The debug-tool block: `erts_debug`'s constant/term-walk answers and the `erl_debugger`
