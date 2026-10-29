@@ -34,8 +34,8 @@
 //! `finish_loading/1`, `call_on_load_function/1`, `finish_after_on_load/2`,
 //! `has_prepared_code_on_load/1`), node/system introspection (`nodes/0,1,2`,
 //! `monitor_node/2,3`, `setnode/2`, `statistics/1`, `system_info/1`,
-//! `system_flag/2`, `system_profile/0,2`, `halt/2`, `make_ref/0`,
-//! `bump_reductions/1`), the tracing machinery (`trace_info/2`,
+//! `system_flag/2`, `system_profile/0,2`, `halt/2`, `make_ref/0`), the tracing
+//! machinery (`trace_info/2`,
 //! `trace_delivered/1`, `seq_trace/2`, `seq_trace_info/1`,
 //! `seq_trace_print/1,2`), the port data store (`port_get_data/1`,
 //! `port_set_data/2`) and the distribution layer (`dist_get_stat/1`,
@@ -48,7 +48,7 @@
 //!
 //! # One seam, one honest gap
 //!
-//! **73 of the 76** keys therefore resolve through the **single**
+//! **72 of the 75** keys therefore resolve through the **single**
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) dispatcher (via
 //! [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif)),
 //! which is handed the `(module, function, arity)` identity verbatim so the
@@ -74,11 +74,11 @@
 //! [`crate::RUNTIME_HOOKS_BIFS`]** — a seam-registered key is unreachable behind the
 //! runtime's native floor, while a real `BifFn` is reachable through the registry.
 //!
-//! # Roster (76 keys, all `bif.tab`-declared)
+//! # Roster (75 keys, all `bif.tab`-declared)
 //!
 //! `../../erts/emulator/beam/bif.tab` lines: 59, 66, 67, 81, 88, 96, 99, 106,
 //! 107, 108, 109, 112, 113, 114, 128, 141, 142, 144, 156, 159-167, 205, 212,
-//! 213, 218-223, 225, 228, 252-259, 265, 266, 268, 271, 277-279, 288,
+//! 213, 218-223, 225, 252-259, 265, 266, 268, 271, 277-279, 288,
 //! 470, 528, 529, 582, 596-600, 604, 605, 611, 668, 772-775, 814, 815, 846.
 
 use std::sync::OnceLock;
@@ -109,7 +109,6 @@ pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     runtime_bif!(reg, "erlang", alias, 1);
-    runtime_bif!(reg, "erlang", bump_reductions, 1);
     runtime_bif!(reg, "erlang", call_on_load_function, 1);
     runtime_bif!(reg, "erlang", cancel_timer, 1);
     runtime_bif!(reg, "erlang", cancel_timer, 2);
@@ -182,7 +181,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     runtime_bif!(reg, "erlang", unalias, 1);
     runtime_bif!(reg, "erlang", unlink, 1);
     // The three keys this family owns for real (see `REAL_BIFS`). They are
-    // registered on top of the seam roster above and keep `reg.len() == 76`
+    // registered on top of the seam roster above and keep `reg.len() == 75`
     // because they are *not* among the `runtime_bif!` keys.
     reg.register("erlang", "is_builtin", 3, is_builtin_3);
     reg.register("erlang", "term_to_iovec", 1, term_to_iovec_1);
@@ -587,10 +586,10 @@ mod tests {
     }
 
     #[test]
-    fn register_installs_all_seventy_six_keys() {
+    fn register_installs_all_seventy_five_keys() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
-        assert_eq!(reg.len(), 76, "the 76 runtime-coupled erlang keys");
+        assert_eq!(reg.len(), 75, "the 75 runtime-coupled erlang keys");
         // A spot-check across the families: process control, code loading, node
         // introspection, the timer wheel, the distribution layer.
         for (name, arity) in [
