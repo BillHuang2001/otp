@@ -174,7 +174,7 @@ Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-c
 - A.1/A.7 → `bits.rs` (37), `gc.rs` (39)
 - A.1/A.2/A.7 → `bitbin.rs` (6: the writable-append accumulator and the refc-subject bit-offset match shapes, plus the ETS copy-path payload round trip `ets_copy/large_payload_round_trip`)
 - A.9 → `boot.rs`, `boot_prereq.rs` (72), `boot_extra.rs` (275), `selfhost.rs` (26), `selfhost_chain.rs` (7)
-- A.2/A.7 module-run → `modules.rs` (71), `mexec.rs`, `mexec_extra.rs` (60)
+- A.2/A.7 module-run → `modules.rs` (75: the four `bif_head_item_*_in_compiled_code` rows pin the synthesized BIF head item — its shape, its identity bits, the `#{module => …}` extension, and the BIF-first pair with the caller frame — beside the existing `undef_head_item_*` rows), `mexec.rs`, `mexec_extra.rs` (60)
 - registry → `mod.rs` (`Case`/`CaseKind`/`PeerRun`/nonce/`expand_env` + the registry and its well-formedness tests)
 Each file's own module doc is still the per-case reference. Three traps stay here because each one manufactures a false `mismatch`: a probe must not bind `V`/`C`/`R` (the wrapper binds them); any expression whose body **binds a variable** (`Rec = …`) or contains a `case`/`<<…>>` pattern must be wrapped in an immediately-applied `fun` — `(fun() -> … end)()` — because the *oracle's* `erl_eval` cannot evaluate it inside the probe's `try` body and then fails **silently** (no stdout, exit `1`, which looks like a runtime crash); and no golden may be order-unstable (a multi-key atom-keyed map `~w`, a per-VM-start pid/port/ref/creation value, a temp-dir path).
 
