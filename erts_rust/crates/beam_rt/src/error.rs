@@ -51,6 +51,7 @@
 
 use beam_bifs::BifRegistry;
 use beam_common::{AllocKind, BeamError, ExitReason, LiveReason, Raise};
+use beam_engine::terms;
 use beam_term::{atom_val, is_atom, AtomTable, Eterm};
 
 /// Turns a **term-heap exhaustion** into the emulator's documented hard limit.
@@ -592,29 +593,113 @@ pub(crate) fn undef() -> BeamError {
 /// `try` observes as `{error, {badfun, Fun}}`. This constructor is the **first** half of
 /// that pair: class `error`, reason atom `badfun`.
 ///
-/// # Why the host reports only the first half
+/// # Which seams report the first half and which report the whole pair
 ///
-/// The offending fun lives in the engine's own register file (`x(arity)`) and reaches
-/// the closure-apply seams as a bare `Eterm`; the allocation that would build the
-/// `{badfun, Fun}` tuple can collect and move that word, so a tuple built here would
-/// hold a dangling one. The expansion therefore belongs to the engine, which owns a
-/// re-readable `FunSource` for exactly this purpose — `beam_engine`'s
-/// `families::funs::raise_badfun` (the C's `expand_error_value` step, wired at the same
-/// site that already builds `{badfun, Fun}` for a *non-fun* target).
+/// The **engine's** closure seams keep this first half: the offending fun lives in the
+/// engine's own register file (`x(arity)`), and the engine already owns a re-readable
+/// `FunSource` for exactly this purpose — `beam_engine`'s `families::funs::raise_badfun`
+/// (the C's `expand_error_value` step, wired at the same site that builds
+/// `{badfun, Fun}` for a *non-fun* target), which is what makes a compiled `apply/2`'s
+/// caught reason the oracle's `{badfun, Fun}`.
 ///
-/// **Residual, measured rather than hidden:** that engine-side expansion is not wired
-/// yet, so a catch observes `{error, badfun}` where the oracle gives
-/// `{error, {badfun, Fun}}`. The **class and the reason atom now agree with the oracle**
-/// — this arm used to answer [`BeamError::BadArg`], i.e. `error:badarg` on both counts.
-/// Note the C's `error_handler:undefined_lambda/3` route is a *different* arm and keeps
-/// [`BeamError::BadArg`]: an **unloadable** module is `error:undef` on the oracle, not
-/// `badfun`.
+/// A **host** seam that holds the fun as an ordinary term and can allocate builds the whole
+/// pair itself — [`bad_fun_with`] (and [`bad_arity_with`] for the sibling
+/// `EXC_BADARITY`) — which is how the runtime's own `erlang:apply/2` door and the `-eval`
+/// route report it. Note the C's `error_handler:undefined_lambda/3` route is a *different*
+/// arm and keeps [`BeamError::BadArg`]: an **unloadable** module is `error:undef` on the
+/// oracle, not `badfun`.
 ///
 /// The reason is backed by a `&'static str` on purpose: [`BeamError::as_atom`] returns
 /// `None` for an owned-`String` atom (`ExitReason::Atom`'s `static_str`), and that
-/// accessor is how a landing consumer recognises the reason.
+/// accessor is how a landing consumer recognises the reason. This constructor is therefore
+/// also the **degradation** [`bad_fun_with`] falls back to when the payload cannot be built.
 pub(crate) fn bad_fun() -> BeamError {
     beam_engine::error::bad_fun()
+}
+
+/// The full C `expand_error_value` `{badfun, Fun}` raise
+/// (`../../erts/emulator/beam/beam_common.c:750-772`), with the offending fun attached to
+/// the raise's live-reason slot.
+///
+/// This is [`bad_fun`]'s expanded twin for a seam that has both the fun as a term and a heap
+/// to build the payload on: an enclosing `try … catch C:R` observes `{error, {badfun, Fun}}`,
+/// exactly as the oracle does (`catch apply(notafun, [1])` ⇒
+/// `{'EXIT',{{badfun,notafun},…}}`).
+///
+/// # Rooting
+///
+/// The payload is a two-word tuple built through
+/// [`terms::make_tuple`](beam_engine::terms::make_tuple), which allocates through the
+/// **unrooted** [`ExecutionContext::alloc_words`](beam_engine::ExecutionContext::alloc_words)
+/// seam. That seam may *grow* the nursery but never *relocates* it (`src/context/gc.rs`:
+/// "handed no root set and so may not collect"), so the caller's `fun` word is still valid at
+/// the write. Nothing stores the tuple: it rides
+/// [`Raise::live_reason`](beam_common::Raise::live_reason), the same opaque slot `{badmap, M}`
+/// and `{badmatch, Data}` use, and [`crate::Runtime::stabilize_error_live_reason`] prices and
+/// copies it onto the runtime-lifetime store at the raise's **escape boundary**. A refusal
+/// there drops only the opaque payload — the class and the reason atom survive — and the
+/// engine's `catch_end` embeds the word verbatim while it is still live, so a *caught*
+/// `{badfun, Fun}` never depends on that copy.
+///
+/// # Degradation
+///
+/// A heap that cannot hold the two-word reason answers [`bad_fun`] instead: the same class
+/// and reason atom, without the payload — never a bare `badarg`, never a wrong term.
+pub(crate) fn bad_fun_with(ctx: &mut crate::context::RuntimeContext<'_>, fun: Eterm) -> BeamError {
+    match expand_reason(ctx, "badfun", fun) {
+        Ok(reason) => structured(reason),
+        Err(_) => bad_fun(),
+    }
+}
+
+/// The full C `expand_error_value` `{badarity, {Fun, Args}}` raise
+/// (`../../erts/emulator/beam/beam_common.c:750-772`), class `error`.
+///
+/// C's `EXC_BADARITY` raise site stores `fvalue = TUPLE2(Fun, Args)` (the fun and the
+/// **argument list** it was applied to, not a walk of its elements) and
+/// `expand_error_value` wraps that pair into `{badarity, {Fun, Args}}`, which is what an
+/// enclosing `try` observes — measured on the oracle:
+/// `catch apply(fun(X) -> X end, [1,2])` ⇒
+/// `{'EXIT',{{badarity,{#Fun<…>,[1,2]}},…}}`.
+///
+/// `args` is therefore the caller's **list term** (in `erlang:apply/2` it is the argument the
+/// BIF was given; on the `-eval` route it is the list the evaluator rebuilt from the
+/// application's arguments). The rooting and degradation rules are [`bad_fun_with`]'s:
+/// unrooted build, live-reason slot, and a fall back to [`BeamError::BadArity`] — the same
+/// class and reason atom — when the heap refuses.
+pub(crate) fn bad_arity_with(
+    ctx: &mut crate::context::RuntimeContext<'_>,
+    fun: Eterm,
+    args: Eterm,
+) -> BeamError {
+    let built = terms::make_tuple(ctx, &[fun, args])
+        .and_then(|pair| expand_reason(ctx, "badarity", pair));
+    match built {
+        Ok(reason) => structured(reason),
+        Err(_) => BeamError::BadArity,
+    }
+}
+
+/// One `expand_error_value` reason tuple: `{Tag, Payload}` on the context's own heap.
+///
+/// The tag is interned through [`RuntimeContext::atom`](crate::context::RuntimeContext), i.e.
+/// the runtime's **one** shared atom table (`badfun`/`badarity` are both in the boot seed, so
+/// in practice this is a lookup), never a fabricated index: an atom index is meaningful only
+/// against the table it is read with.
+fn expand_reason(
+    ctx: &mut crate::context::RuntimeContext<'_>,
+    tag: &str,
+    payload: Eterm,
+) -> beam_common::Result<Eterm> {
+    let tag = ctx.atom(tag)?;
+    terms::make_tuple(ctx, &[tag, payload])
+}
+
+/// A raise of class `error` whose reason is the live term `reason`
+/// ([`ExitReason::Structured`] + [`LiveReason`]) — the workspace's one convention for a
+/// compound reason.
+fn structured(reason: Eterm) -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(reason)))
 }
 
 /// The live **structured reason term** carried by a raise, when it has one.
