@@ -33,6 +33,9 @@ use crate::tag::{
     MAP_HEADER_TAG_HAMT_HEAD_ARRAY, MAP_HEADER_TAG_HAMT_HEAD_BITMAP,
     MAP_HEADER_TAG_HAMT_NODE_BITMAP,
 };
+use crate::tuple::tuple_size;
+
+use super::words::HAMT_COLLISION_CELLS_MIN;
 
 // ---------------------------------------------------------------------------
 // Node classification (the C's `primary_tag` dispatch)
@@ -70,6 +73,24 @@ pub(super) fn classify_child(t: Eterm) -> TermResult<Child> {
     } else {
         Err(TermError::BadMap)
     }
+}
+
+/// The cell count of a collision node, refused unless it holds at least
+/// [`HAMT_COLLISION_CELLS_MIN`] cells.
+///
+/// A collision node exists only for keys that share a whole `erts_map_hash`, so it
+/// holds two or more cells; the C states that as a debug-only `ASSERT(n >= 2)`
+/// (`erl_map.c:2570`), while here a one-cell node is a typed
+/// [`TermError::BadMap`] — the collapse arm of the delete's upward pass reads a
+/// *sibling* cell (`src.add(2)`), so the count has to be checked before it.
+pub(super) fn collision_cells(coll: Eterm) -> TermResult<usize> {
+    // SAFETY: `coll` is a live collision node (an arityval tuple of cons cells), so
+    // its header word is readable.
+    let cells = unsafe { tuple_size(coll) };
+    if cells < HAMT_COLLISION_CELLS_MIN {
+        return Err(TermError::BadMap);
+    }
+    Ok(cells)
 }
 
 /// The layout facts of a hash-map node header: `(slot-word offset, bitmap, is a

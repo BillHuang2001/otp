@@ -24,16 +24,24 @@
 //! and pinned on the word figures the capacity/required pair reports.
 
 use super::*;
-use crate::boxed::{boxed_val, is_flatmap, is_hashmap, map_header_type, map_header_val};
-use crate::compare::eq;
+use crate::boxed::{
+    boxed_val, is_flatmap, is_hashmap, is_map_header, make_arityval, make_boxed, map_header_type,
+    map_header_val,
+};
+use crate::compare::{cmp, eq};
 use crate::error::TermError;
 use crate::ihash::{erts_map_hash, hashmap_nibble};
 use crate::immediate::make_small;
+use crate::list::car;
 use crate::map::{
-    map_get, map_pairs, map_pairs_storage_order, map_size, map_words_capacity, write_map,
-    HAMT_MAX_LEVEL, MAP_SMALL_MAP_LIMIT,
+    make_map_header, map_get, map_pairs, map_pairs_storage_order, map_size, map_words_capacity,
+    write_map, HAMT_MAX_LEVEL, MAP_SMALL_MAP_LIMIT,
 };
-use crate::tag::{MAP_HEADER_TAG_HAMT_HEAD_ARRAY, MAP_HEADER_TAG_HAMT_HEAD_BITMAP};
+use crate::tag::{
+    MAP_HEADER_TAG_HAMT_HEAD_ARRAY, MAP_HEADER_TAG_HAMT_HEAD_BITMAP,
+    MAP_HEADER_TAG_HAMT_NODE_BITMAP,
+};
+use crate::tuple::{tuple_element, tuple_size};
 
 /// A permanently-invalid marker word: nothing may write past the reservation.
 const SENTINEL: Eterm = Eterm::from_raw(0xDEAD_BEEF);
@@ -675,3 +683,601 @@ fn a_flat_map_chain_of_puts_matches_one_rebuild() {
     assert_map(map, &pairs, &atoms);
     let _ = keep;
 }
+
+// ---------------------------------------------------------------------------
+// Hand-built hash maps: the collision-node arms
+//
+// A collision node exists only for keys that share **all** 64 bits of
+// `erts_map_hash` (`erl_map.c:2642-2646`), and `ihash_mix64` is a bijection over an
+// immediate's raw word (`src/ihash.rs`), so no two ordinary keys — small integers,
+// atoms, tuples — can be made to collide. These shapes are therefore **built by
+// hand**, word for word, in the frozen node layout of `src/map.rs`: a head bitmap
+// node whose slots hold a leaf cons cell, a nested bitmap node, or a collision node.
+// That is the only way to reach the writer's collision insert / replace / shrink /
+// collapse arms at all.
+// ---------------------------------------------------------------------------
+
+use super::words::{HAMT_PUT_COLLISION_CELLS_MAX, HAMT_REMOVE_COLLISION_CELLS_MAX};
+
+/// One subtree of a hand-built hash map.
+enum Hand {
+    /// A `[Key, Value]` cons cell.
+    Leaf(Eterm, Eterm),
+    /// A collision node: `[arityval(n)][cell term]…` plus the `n` two-word
+    /// `[Key, Value]` cons cells those slots point at, the cells in `cmp` order.
+    Collision(Vec<(Eterm, Eterm)>),
+    /// A bitmap node one level down: `(nibble, subtree)` per slot.
+    Node(Vec<(u32, Hand)>),
+}
+
+/// The words a hand-built subtree occupies (`level == 0` is the head node, which
+/// also carries the `size` word).
+fn hand_words(node: &Hand, level: usize) -> usize {
+    match node {
+        Hand::Leaf(..) => 2,
+        // The `n + 1` words of the tuple *plus* its `n` two-word cons cells — a
+        // collision node stores cell **terms**, not raw key/value pairs
+        // (`src/map.rs::serialize_node`, `TrieChild::Collision`).
+        Hand::Collision(cells) => 1 + 3 * cells.len(),
+        Hand::Node(slots) => {
+            let prefix = if level == 0 { 2 } else { 1 };
+            prefix
+                + slots.len()
+                + slots
+                    .iter()
+                    .map(|(_, child)| hand_words(child, level + 1))
+                    .sum::<usize>()
+        }
+    }
+}
+
+/// The number of keys a hand-built subtree holds (the head's `size` word).
+fn hand_size(node: &Hand) -> usize {
+    match node {
+        Hand::Leaf(..) => 1,
+        Hand::Collision(cells) => cells.len(),
+        Hand::Node(slots) => slots.iter().map(|(_, child)| hand_size(child)).sum(),
+    }
+}
+
+/// Every pair a hand-built subtree holds, in no meaningful order.
+fn hand_pairs(node: &Hand) -> Vec<(Eterm, Eterm)> {
+    match node {
+        Hand::Leaf(k, v) => vec![(*k, *v)],
+        Hand::Collision(cells) => cells.clone(),
+        Hand::Node(slots) => slots
+            .iter()
+            .flat_map(|(_, child)| hand_pairs(child))
+            .collect(),
+    }
+}
+
+/// The stored pair sequence of a hand-built subtree — slot order, and a collision
+/// node's cells in the order they sit in it (what `map_pairs_storage_order` walks).
+fn hand_storage_order(node: &Hand) -> Vec<(Eterm, Eterm)> {
+    match node {
+        Hand::Leaf(k, v) => vec![(*k, *v)],
+        Hand::Collision(cells) => cells.clone(),
+        Hand::Node(slots) => {
+            let mut order: Vec<&(u32, Hand)> = slots.iter().collect();
+            order.sort_by_key(|(nib, _)| *nib);
+            order
+                .into_iter()
+                .flat_map(|(_, child)| hand_storage_order(child))
+                .collect()
+        }
+    }
+}
+
+/// Writes the hand-built subtree `node` at `base + at` (node level `level`) and
+/// returns the term addressing it.
+///
+/// # Safety
+///
+/// `base + at` must address [`hand_words`]`(node, level)` exclusively-owned writable
+/// words, and the region must stay live and unmoved while the term is used.
+unsafe fn hand_write(base: *mut Eterm, at: usize, node: &Hand, level: usize) -> Eterm {
+    let here = base.wrapping_add(at);
+    match node {
+        Hand::Leaf(k, v) => {
+            // SAFETY: a leaf is two reserved words; both are written before the term
+            // escapes.
+            unsafe {
+                *here = *k;
+                *here.add(1) = *v;
+            }
+            make_list(here as *const Eterm)
+        }
+        Hand::Collision(cells) => {
+            // SAFETY: a collision node reserves `1 + 3 * cells.len()` words — the
+            // tuple, then its cell terms, then each cell's two cons-cell words. All
+            // of them are written before the term escapes.
+            unsafe {
+                *here = make_arityval(cells.len());
+                for (i, (k, v)) in cells.iter().enumerate() {
+                    let cell = here.add(1 + cells.len() + 2 * i);
+                    *cell = *k;
+                    *cell.add(1) = *v;
+                    *here.add(1 + i) = make_list(cell as *const Eterm);
+                }
+            }
+            make_boxed(here as *const Eterm)
+        }
+        Hand::Node(slots) => {
+            let mut order: Vec<&(u32, Hand)> = slots.iter().collect();
+            order.sort_by_key(|(nib, _)| *nib);
+            let prefix = if level == 0 { 2 } else { 1 };
+            let mut bitmap = 0u16;
+            // The children's payloads follow this node's own words, each child taking
+            // exactly `hand_words(child, level + 1)` of them.
+            let mut cur = at + prefix + order.len();
+            for (i, (nib, child)) in order.iter().enumerate() {
+                assert!(
+                    bitmap & (1 << nib) == 0,
+                    "hand-built slots need distinct nibbles"
+                );
+                bitmap |= 1u16 << nib;
+                // SAFETY: `cur` addresses the child's own reserved words, and the slot
+                // word at `at + prefix + i` lies below `cur`.
+                unsafe {
+                    let child_term = hand_write(base, cur, child, level + 1);
+                    *here.add(prefix + i) = child_term;
+                }
+                cur += hand_words(child, level + 1);
+            }
+            // SAFETY: the header (and the head's `size` word) are reserved words.
+            unsafe {
+                if level == 0 {
+                    *here =
+                        make_map_header(MAP_HEADER_TAG_HAMT_HEAD_BITMAP, 1, bitmap as usize);
+                    *here.add(1) = Eterm::from_raw(hand_size(node));
+                } else {
+                    *here = make_map_header(MAP_HEADER_TAG_HAMT_NODE_BITMAP, 0, bitmap as usize);
+                }
+            }
+            make_boxed(here as *const Eterm)
+        }
+    }
+}
+
+/// Builds the hand-built map `root` (a [`Hand::Node`] at level `0`) in an owned buffer.
+fn build_hand_map(root: &Hand) -> (Buf, Eterm) {
+    let mut buf = Buf::new(hand_words(root, 0));
+    let base = buf.base();
+    // SAFETY: the buffer reserved `hand_words(root, 0)` words plus a sentinel tail and
+    // outlives every use of the returned map.
+    let map = unsafe { hand_write(base, 0, root, 0) };
+    buf.check_tail();
+    (buf, map)
+}
+
+/// `count` distinct small ints, one per level-1 nibble `0..count`, whose level-0
+/// nibble is `nib0` — the level-1 fan-out of a hand-built trie node.
+fn fan_out(nib0: u32, count: usize) -> Vec<i64> {
+    let mut out: Vec<Option<i64>> = vec![None; count];
+    let mut found = 0usize;
+    for k in 1..200_000i64 {
+        let h = erts_map_hash(small(k));
+        if hashmap_nibble(h, 0) != nib0 {
+            continue;
+        }
+        let l1 = hashmap_nibble(h, 1) as usize;
+        if l1 < out.len() && out[l1].is_none() {
+            out[l1] = Some(k);
+            found += 1;
+            if found == out.len() {
+                break;
+            }
+        }
+    }
+    assert_eq!(found, out.len(), "a level-1 fan-out for head nibble {nib0}");
+    out.into_iter().map(|k| k.expect("filled")).collect()
+}
+
+/// `count` distinct small ints at or above `from`, all in head slot `nib0` (the cells
+/// of a hand-built collision node).
+fn slot_keys(nib0: u32, count: usize, from: i64) -> Vec<i64> {
+    (from..)
+        .filter(|k| hashmap_nibble(erts_map_hash(small(*k)), 0) == nib0)
+        .take(count)
+        .collect()
+}
+
+/// `pairs` with a 16-leaf level-1 fan-out in head slot 0 (`k => k * 10`), a second one
+/// in head slot 1, and whatever else the caller adds.
+fn fan_root(extra: Vec<(u32, Hand)>) -> Hand {
+    let mut slots = vec![(0u32, fan_node(fan_out(0, 16))), (1, fan_node(fan_out(1, 16)))];
+    slots.extend(extra);
+    Hand::Node(slots)
+}
+
+/// A level-1 bitmap node holding one leaf per level-1 nibble, `k => k * 10`.
+fn fan_node(keys: Vec<i64>) -> Hand {
+    Hand::Node(
+        keys.iter()
+            .enumerate()
+            .map(|(i, k)| (i as u32, Hand::Leaf(small(*k), small(k * 10))))
+            .collect(),
+    )
+}
+
+/// `cells` with `(key, value)` placed at its `compare::cmp` position — the order a
+/// collision node's cells are kept in.
+fn sorted_cells(
+    cells: &[(Eterm, Eterm)],
+    key: Eterm,
+    value: Eterm,
+    atoms: &AtomTable,
+) -> Vec<(Eterm, Eterm)> {
+    let mut out = cells.to_vec();
+    let at = out
+        .iter()
+        .position(|(k, _)| cmp(key, *k, atoms) == core::cmp::Ordering::Less)
+        .unwrap_or(out.len());
+    out.insert(at, (key, value));
+    out
+}
+
+/// The keys of the collision node in `map`'s head slot `nib`, in stored order.
+fn collision_cell_keys(map: Eterm, nib: u32) -> Vec<Eterm> {
+    let p = boxed_val(map) as *const Eterm;
+    // SAFETY: `map` is a live hash map whose head is a bitmap node, so `p` is its
+    // header word, `p + 2 …` its slot words, and the slot's child is a collision node.
+    unsafe {
+        assert!(is_map_header(*p), "the hand-built root is a hash-map head");
+        let bitmap = map_header_val(*p) as u16;
+        let slot = (bitmap & ((1u16 << nib) - 1)).count_ones() as usize;
+        let child = *p.add(2 + slot);
+        let cells = tuple_size(child);
+        (0..cells).map(|i| car(tuple_element(child, i))).collect()
+    }
+}
+
+/// Asserts `got` holds exactly `pairs` on the reader surface every consumer uses: the
+/// canonical `map_pairs` order, the size and every key's value.
+///
+/// The **storage** order is deliberately not compared with a `write_map` rebuild of
+/// `pairs`: a hand-built map holds a collision node where `write_map` builds a deeper
+/// trie (the cells' keys do not really collide), so the two differ in shape while
+/// agreeing on content. The collision cases pin the storage order against the
+/// hand-built expectation instead.
+fn assert_content(got: Eterm, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) {
+    let (rebuf, rebuilt) = build_map(pairs, atoms);
+    let want = map_pairs(rebuilt, atoms).unwrap();
+    assert_eq!(map_pairs(got, atoms).unwrap(), want, "map_pairs differs");
+    assert_eq!(map_size(got, atoms).unwrap(), want.len(), "map_size differs");
+    for (k, v) in &want {
+        assert_eq!(map_get(got, *k, atoms).unwrap(), Some(*v), "map_get differs");
+    }
+    let _ = rebuf;
+}
+
+#[test]
+fn collision_node_put_inserts_a_cell() {
+    let atoms = atoms();
+    let cells: Vec<(Eterm, Eterm)> = slot_keys(2, 3, 300_000)
+        .into_iter()
+        .map(|k| (small(k), small(k * 10)))
+        .collect();
+    let root = fan_root(vec![(2, Hand::Collision(cells.clone()))]);
+    let (_src, map) = build_hand_map(&root);
+    assert_eq!(map_size(map, &atoms).unwrap(), 35);
+
+    // A key of head slot 2 reaches the collision node (its level-0 nibble matches and
+    // the slot's child *is* the collision node).
+    let new_key = slot_keys(2, 1, 400_000)[0];
+    let added = (small(new_key), small(7));
+    let expected_cells = sorted_cells(&cells, added.0, added.1, &atoms);
+    // The plan's exact figure: the head (`2 + 3` slots), the node it copies is the
+    // collision node itself (`1 + 4` cells — the source's three plus the new one) and
+    // the new leaf's cons cell (`2`).
+    let required = map_put_cow_words_required(map, added.0).unwrap();
+    assert_eq!(required, (2 + 3) + (1 + 4) + 2);
+
+    let mut out = Buf::new(required);
+    // SAFETY: exactly the figure `map_put_cow_words_required` reported, in a heap that
+    // outlives the source map.
+    let got = unsafe { map_put_cow(out.base(), map, added.0, added.1, &atoms) }.unwrap();
+    out.check_tail();
+    assert_content(got, &with(&hand_pairs(&root), added.0, added.1, &atoms), &atoms);
+    assert_eq!(map_size(got, &atoms).unwrap(), 36);
+
+    // The cells stay in `cmp` order, and the stored order is the hand-built trie's with
+    // the new cell spliced in — the copied head keeps its slot order.
+    assert_eq!(
+        collision_cell_keys(got, 2),
+        expected_cells.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+    );
+    let mut want_order: Vec<(Eterm, Eterm)> = hand_storage_order(&root);
+    want_order.truncate(32); // the two 16-leaf fan-outs
+    want_order.extend(expected_cells);
+    assert_eq!(map_pairs_storage_order(got).unwrap(), want_order);
+}
+
+#[test]
+fn collision_node_put_replaces_a_value_without_a_size_change() {
+    let atoms = atoms();
+    let cells: Vec<(Eterm, Eterm)> = slot_keys(2, 3, 300_000)
+        .into_iter()
+        .map(|k| (small(k), small(k * 10)))
+        .collect();
+    let root = fan_root(vec![(2, Hand::Collision(cells.clone()))]);
+    let (_src, map) = build_hand_map(&root);
+
+    // A value replacement copies the head (`2 + 3`), the collision node (`1 + 3`
+    // cells) and the changed cell's fresh cons cell (`2`) — the cell itself is
+    // path-copied like the node, so the size stays unchanged.
+    let target = cells[1].0;
+    let required = map_put_cow_words_required(map, target).unwrap();
+    assert_eq!(required, (2 + 3) + (1 + 3) + 2);
+    let mut out = Buf::new(required);
+    // SAFETY: exactly the figure `map_put_cow_words_required` reported.
+    let got = unsafe { map_put_cow(out.base(), map, target, small(999), &atoms) }.unwrap();
+    out.check_tail();
+    assert_content(
+        got,
+        &with(&hand_pairs(&root), target, small(999), &atoms),
+        &atoms,
+    );
+    assert_eq!(map_size(got, &atoms).unwrap(), 35);
+    assert_eq!(
+        collision_cell_keys(got, 2),
+        cells.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        "a value replacement keeps every cell in place"
+    );
+
+    // The identical value word writes nothing at all.
+    let mut out = Buf::new(map_put_cow_words_capacity(35));
+    // SAFETY: the buffer reserved the capacity bound; this arm writes nothing.
+    let same = unsafe { map_put_cow(out.base(), map, cells[1].0, cells[1].1, &atoms) }.unwrap();
+    assert_eq!(same, map);
+    assert!(out.is_pristine());
+    // The figure carries no value, so it prices the *writing* put — a sound upper
+    // bound for the arm that turned out to write nothing.
+    assert_eq!(
+        map_put_cow_words_required(map, cells[1].0).unwrap(),
+        (2 + 3) + (1 + 3) + 2
+    );
+}
+
+#[test]
+fn collision_node_remove_shrinks_then_collapses_then_goes_flat() {
+    let atoms = atoms();
+    let cells: Vec<(Eterm, Eterm)> = slot_keys(2, 3, 300_000)
+        .into_iter()
+        .map(|k| (small(k), small(k * 10)))
+        .collect();
+    let root = fan_root(vec![(2, Hand::Collision(cells.clone()))]);
+    let (src, map) = build_hand_map(&root);
+    assert_eq!(map_size(map, &atoms).unwrap(), 35);
+    // Every result shares its source's storage, so the whole chain stays alive.
+    let mut chain: Vec<(Buf, Eterm)> = vec![(src, map)];
+
+    // 35 -> 34: a `CollisionShrink` — the head (`2 + 3` slots) and the collision node
+    // (`1 + 2` cells) are copied; a remove writes no cons cell.
+    let required = map_remove_cow_words_required(map, cells[0].0).unwrap();
+    assert_eq!(required, (2 + 3) + (1 + 2));
+    let mut out = Buf::new(required);
+    // SAFETY: exactly the figure `map_remove_cow_words_required` reported.
+    let shrunk = unsafe { map_remove_cow(out.base(), map, cells[0].0, &atoms) }
+        .unwrap()
+        .expect("the key is present");
+    out.check_tail();
+    assert_content(
+        shrunk,
+        &without(&hand_pairs(&root), cells[0].0, &atoms),
+        &atoms,
+    );
+    assert_eq!(map_size(shrunk, &atoms).unwrap(), 34);
+    assert_eq!(
+        collision_cell_keys(shrunk, 2),
+        cells[1..].iter().map(|(k, _)| *k).collect::<Vec<_>>()
+    );
+    chain.push((out, shrunk));
+
+    // 34 -> 33: the two remaining cells collapse — the survivor rises into the head's
+    // slot, so only the head is written (`2 + 3`) and the node itself costs nothing.
+    let current = chain[chain.len() - 1].1;
+    let required = map_remove_cow_words_required(current, cells[1].0).unwrap();
+    assert_eq!(required, 2 + 3);
+    let mut out = Buf::new(required);
+    // SAFETY: as above.
+    let collapsed = unsafe { map_remove_cow(out.base(), current, cells[1].0, &atoms) }
+        .unwrap()
+        .expect("the key is present");
+    out.check_tail();
+    assert_content(
+        collapsed,
+        &without(&without(&hand_pairs(&root), cells[0].0, &atoms), cells[1].0, &atoms),
+        &atoms,
+    );
+    assert_eq!(map_size(collapsed, &atoms).unwrap(), 33);
+    chain.push((out, collapsed));
+
+    // 33 -> 32: at most `MAP_SMALL_MAP_LIMIT` keys, so the result is a flat map again.
+    let current = chain[chain.len() - 1].1;
+    let (o, flat) = cow_remove(current, cells[2].0, &atoms);
+    let flat = flat.expect("the key is present");
+    assert!(unsafe { is_flatmap(flat) }, "32 pairs must be flat again");
+    assert_eq!(map_size(flat, &atoms).unwrap(), 32);
+    assert_content(
+        flat,
+        &without(
+            &without(&without(&hand_pairs(&root), cells[0].0, &atoms), cells[1].0, &atoms),
+            cells[2].0,
+            &atoms,
+        ),
+        &atoms,
+    );
+    chain.push((o, flat));
+    let _ = chain;
+}
+
+#[test]
+fn a_wide_collision_node_is_refused_before_any_write() {
+    let atoms = atoms();
+    let cells: Vec<(Eterm, Eterm)> = slot_keys(2, 20, 500_000)
+        .into_iter()
+        .map(|k| (small(k), small(k * 10)))
+        .collect();
+    let root = Hand::Node(vec![(2, Hand::Collision(cells.clone()))]);
+    let (_src, map) = build_hand_map(&root);
+    assert_eq!(map_size(map, &atoms).unwrap(), 20);
+
+    let key = cells[0].0;
+    // Both figures refuse the same map the writers refuse, so a `required` figure can
+    // never lead a caller into a reservation the write then exceeds.
+    assert_eq!(map_put_cow_words_required(map, key), Err(TermError::BadMap));
+    assert_eq!(
+        map_remove_cow_words_required(map, key),
+        Err(TermError::BadMap)
+    );
+
+    let mut out = Buf::new(map_put_cow_words_capacity(20));
+    // SAFETY: the buffer reserved the size-only capacity bound; the plan refuses before
+    // a word is written.
+    assert_eq!(
+        unsafe { map_put_cow(out.base(), map, key, small(1), &atoms) },
+        Err(TermError::BadMap)
+    );
+    assert!(out.is_pristine(), "a refused put writes nothing");
+    out.check_tail();
+
+    let mut out = Buf::new(map_remove_cow_words_capacity(20));
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { map_remove_cow(out.base(), map, key, &atoms) },
+        Err(TermError::BadMap)
+    );
+    assert!(out.is_pristine(), "a refused remove writes nothing");
+    out.check_tail();
+}
+
+#[test]
+fn the_collision_cell_limits_are_where_the_word_bounds_put_them() {
+    let atoms = atoms();
+    // The thresholds are derived from the *widest* spine, so a shallow hand-built map
+    // refuses at exactly the same count — that is what makes them a sound bound for
+    // every shape rather than for this one.
+    let at_limit = |cells: usize| {
+        let root = Hand::Node(vec![(
+            2,
+            Hand::Collision(
+                slot_keys(2, cells, 500_000)
+                    .into_iter()
+                    .map(|k| (small(k), small(k * 10)))
+                    .collect(),
+            ),
+        )]);
+        build_hand_map(&root)
+    };
+    let key_of = |map: Eterm| collision_cell_keys(map, 2)[0];
+
+    // Put: `HAMT_PUT_COLLISION_CELLS_MAX` cells fit; one more is refused. The key is
+    // absent from the node, so this is the insert arm.
+    let (_a, ok) = at_limit(HAMT_PUT_COLLISION_CELLS_MAX);
+    let fresh = slot_keys(2, 1, 900_000)[0];
+    let required = map_put_cow_words_required(ok, small(fresh)).unwrap();
+    // The head (`2 + 1` slot), the grown node (`1 + cells + 1`) and the new leaf.
+    assert_eq!(required, (2 + 1) + (1 + HAMT_PUT_COLLISION_CELLS_MAX + 1) + 2);
+    let mut out = Buf::new(required);
+    // SAFETY: exactly the figure `map_put_cow_words_required` reported.
+    assert!(unsafe { map_put_cow(out.base(), ok, small(fresh), small(1), &atoms) }.is_ok());
+    out.check_tail();
+    let (_b, too_wide) = at_limit(HAMT_PUT_COLLISION_CELLS_MAX + 1);
+    assert_eq!(
+        map_put_cow_words_required(too_wide, key_of(too_wide)),
+        Err(TermError::BadMap)
+    );
+
+    // Remove: `HAMT_REMOVE_COLLISION_CELLS_MAX` cells fit; one more is refused.
+    let (_c, ok) = at_limit(HAMT_REMOVE_COLLISION_CELLS_MAX);
+    assert!(map_remove_cow_words_required(ok, key_of(ok)).is_ok());
+    let (_d, too_wide) = at_limit(HAMT_REMOVE_COLLISION_CELLS_MAX + 1);
+    assert_eq!(
+        map_remove_cow_words_required(too_wide, key_of(too_wide)),
+        Err(TermError::BadMap)
+    );
+}
+
+#[test]
+fn a_one_cell_collision_node_is_refused() {
+    let atoms = atoms();
+    // A collision node exists only for keys sharing a whole `erts_map_hash`, so it holds
+    // two cells or more; a one-cell node is refused rather than read (its collapse arm
+    // would look for a sibling cell that is not there).
+    let mut buf = Buf::new(3 + 3);
+    let base = buf.base();
+    let key = slot_keys(2, 1, 500_000)[0];
+    // SAFETY: `buf` reserved the head (`2 + 1` slot) and a one-cell collision node
+    // (`1 + 1`, two words of a one-cell cons cell).
+    unsafe {
+        *base = make_map_header(MAP_HEADER_TAG_HAMT_HEAD_BITMAP, 1, 1 << 2);
+        *base.add(1) = Eterm::from_raw(1);
+        *base.add(2) = make_boxed(base.add(3));
+        *base.add(3) = make_arityval(1);
+        *base.add(4) = small(key);
+        *base.add(5) = small(1);
+    }
+    let map = make_boxed(base as *const Eterm);
+    assert_eq!(
+        map_put_cow_words_required(map, small(key)),
+        Err(TermError::BadMap)
+    );
+    assert_eq!(
+        map_remove_cow_words_required(map, small(key)),
+        Err(TermError::BadMap)
+    );
+    let mut out = Buf::new(map_put_cow_words_capacity(1));
+    // SAFETY: the buffer reserved the capacity bound; the plan refuses before a write.
+    assert_eq!(
+        unsafe { map_put_cow(out.base(), map, small(key), small(2), &atoms) },
+        Err(TermError::BadMap)
+    );
+    assert!(out.is_pristine());
+    out.check_tail();
+}
+
+#[test]
+fn a_flat_map_with_an_inconsistent_head_word_is_refused() {
+    let atoms = atoms();
+    let base_pairs = pairs_1_to(3);
+    let (src, map) = build_map(&base_pairs, &atoms);
+    let head = boxed_val(map) as *mut Eterm;
+    // The pair count lives in two places — the head's `size` word and the keys tuple's
+    // arity — and every builder writes both. A forged map where they disagree is
+    // refused (the reservation and the writer's extent must not be able to disagree),
+    // in *both* directions: an understated head word and an overstated one.
+    for forged in [1usize, 5] {
+        // SAFETY: `map` is a live flat map, so word 1 is its `size` word.
+        unsafe { *head.add(1) = Eterm::from_raw(forged) };
+        assert_eq!(
+            map_put_cow_words_required(map, small(9)),
+            Err(TermError::BadMap),
+            "head word {forged} vs a 3-pair keys tuple"
+        );
+        assert_eq!(
+            map_remove_cow_words_required(map, small(1)),
+            Err(TermError::BadMap)
+        );
+        let mut out = Buf::new(map_put_cow_words_capacity(3));
+        // SAFETY: the buffer reserved the capacity bound; the plan refuses before a
+        // write, so a forged extent cannot reach the reservation either.
+        assert_eq!(
+            unsafe { map_put_cow(out.base(), map, small(9), small(90), &atoms) },
+            Err(TermError::BadMap)
+        );
+        assert!(out.is_pristine());
+        out.check_tail();
+        let mut out = Buf::new(map_remove_cow_words_capacity(3));
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { map_remove_cow(out.base(), map, small(1), &atoms) },
+            Err(TermError::BadMap)
+        );
+        assert!(out.is_pristine());
+        out.check_tail();
+    }
+    let _ = src;
+}
+

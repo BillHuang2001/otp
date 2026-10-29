@@ -32,10 +32,11 @@ use crate::ihash::{erts_map_hash, hashmap_nibble};
 use crate::list::{car, is_list};
 use crate::map::{collect_pairs, map_size, HAMT_MAX_LEVEL, MAP_SMALL_MAP_LIMIT};
 use crate::thing::{flatmap_parts, flatmap_size_words, write_flatmap};
-use crate::tuple::{tuple_element, tuple_size};
+use crate::tuple::tuple_element;
 
-use super::node::{bitmap_header, classify_child, node_layout, slot_of, Child};
-use super::Out;
+use super::node::{bitmap_header, classify_child, collision_cells, node_layout, slot_of, Child};
+use super::words::{HAMT_COLLISION_CELLS_MIN, HAMT_REMOVE_COLLISION_CELLS_MAX};
+use super::{flat_pair_count, Out};
 
 // ---------------------------------------------------------------------------
 // Remove: plan
@@ -172,11 +173,14 @@ fn plan_flat_remove(
     key: Eterm,
     atoms: &AtomTable,
 ) -> TermResult<DelPlan> {
-    // SAFETY: `p` is a flat map's head word; word 1 is its raw pair count.
-    let n = unsafe { (*p.add(1)).raw() };
-    // SAFETY: `map` is a live flat map.
+    // The pair count comes from the **authority** — the keys tuple's own arity —
+    // cross-checked against the head word, so the plan and the writer cannot
+    // disagree (`flat_pair_count`).
+    // SAFETY: `p` is a flat map's head word (see `plan_remove`'s dispatch).
+    let n = unsafe { flat_pair_count(p)? };
+    // SAFETY: `map` is a live flat map, so its keys slice is `n` words long.
     let (keys, _) = unsafe { flatmap_parts(map) };
-    let n = n.min(keys.len());
+    debug_assert_eq!(keys.len(), n);
     for k in keys.iter().take(n) {
         if eq(*k, key, atoms) {
             let n_after = n - 1;
@@ -237,8 +241,14 @@ fn plan_hamt_remove(
                 break;
             }
             Child::Collision(coll) => {
-                // SAFETY: a collision slot holds a live arityval tuple of cons cells.
-                let cells = unsafe { tuple_size(coll) };
+                // A forged node holding more cells than the size-only reservation
+                // covers is refused here — before any store — instead of over-running
+                // the caller's region; `collision_cells` also refuses a one-cell node,
+                // whose collapse arm would read a sibling cell that is not there.
+                let cells = collision_cells(coll)?;
+                if cells > HAMT_REMOVE_COLLISION_CELLS_MAX {
+                    return Err(TermError::BadMap);
+                }
                 let src = boxed_val(coll) as *const Eterm;
                 let mut found = None;
                 for i in 0..cells {
@@ -278,7 +288,7 @@ fn plan_hamt_remove(
     for spec in specs.iter().rev() {
         match *spec {
             DelSpec::Collision { src, cells, slot } => {
-                if cells > 2 {
+                if cells > HAMT_COLLISION_CELLS_MIN {
                     // Collision nodes here are the innermost level, so the copied node
                     // drops one cell and stays a node.
                     frames.push(DelFrame::CollisionShrink {
@@ -287,12 +297,18 @@ fn plan_hamt_remove(
                         slot,
                     });
                     res = Res::Node;
-                } else {
+                } else if cells == HAMT_COLLISION_CELLS_MIN {
                     // Two cells: the surviving one rises into the parent.
                     // SAFETY: `src` holds `cells == 2` cell words at offsets 1 and 2.
                     let other = unsafe { *src.add(1 + (1 - slot)) };
                     frames.push(DelFrame::Collapse { other });
                     res = Res::Leaf;
+                } else {
+                    // A collision node with fewer than two cells reads a sibling cell
+                    // that is not there; the descent already refuses one
+                    // (`node::collision_cells`), so this branch is the belt to that
+                    // braces — a typed refusal either way, never a read past the node.
+                    return Err(TermError::BadMap);
                 }
             }
             DelSpec::Bitmap {

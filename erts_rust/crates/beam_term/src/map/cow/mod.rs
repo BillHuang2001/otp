@@ -60,15 +60,30 @@
 //! | remove | `flatmap_size_words(size - 1) <= 68` | `flatmap_size_words(31) = 66` | `288` |
 //!
 //! Derivation of the `size > 32` figures. At most `16` nodes lie on a hash path
-//! (levels `0..=15`) and the widest is `18` words, so the node spine is at most
-//! `288`; a put adds the leaf's `2`-word cons cell. A *divergence chain* can reach
-//! one node deeper: it hangs off the level-`15` node and ends in a two-cell
-//! collision node (`3` words) when the two keys agree on all 16 nibbles, i.e.
-//! `16 · 18 + 3 + 2 = 293`. A chain that starts at level `lvl <= 15` costs
-//! `lvl · 18 + (15 - lvl) · 2 + 3 + 2 = 16 · lvl + 35 <= 275` — always below the
-//! `290` spine-plus-cell figure, which is why only the collision case sets the
-//! bound. A remove never writes a cons cell and its flat-conversion arm writes
-//! `flatmap_size_words(32) = 68`, so `288` covers it.
+//! (levels `0..=15`) and each widest node is `18` words if every level is priced as
+//! a head, so the node spine is at most `288` (the true maximum is `273`: one
+//! `18`-word head plus fifteen `17`-word inner nodes); a put adds the leaf's
+//! `2`-word cons cell. A *divergence chain* can reach one node deeper: it hangs off
+//! the level-`15` node and ends in a two-cell collision node (`3` words) when the
+//! two keys agree on all 16 nibbles, i.e. `16 · 18 + 3 + 2 = 293`. A chain that
+//! starts at level `lvl <= 15` costs `lvl · 18 + (15 - lvl) · 2 + 3 + 2 = 16 · lvl +
+//! 35 <= 275` — always below the `290` spine-plus-cell figure, which is why only the
+//! collision case sets the bound. A remove never writes a cons cell and its
+//! flat-conversion arm writes `flatmap_size_words(32) = 68`, so `288` covers it.
+//!
+//! **What those figures are conditional on.** A collision node's cell count is not
+//! bounded by the path, so a *canonical* map is the only thing the size-only bound
+//! prices: a collision node needs `>= 2` keys sharing all `64` bits of
+//! [`erts_map_hash`](crate::ihash::erts_map_hash), and `ihash_mix64` is a bijection
+//! over an immediate's raw word, so no such pair is constructible from ordinary
+//! keys. A **hand-forged** map whose collision node is wider is refused with
+//! [`BadMap`](crate::error::TermError::BadMap) *before* a word is written: the
+//! figures the refusals are derived from are `276 + c` (a value replacement in a
+//! `c`-cell node), `277 + c` (an insert into one) and `273 + c` (a delete from one),
+//! against the named `293`/`288` maxima, i.e. `c <= 16` for a put and `c <= 15` for
+//! a remove (`words.rs`'s `HAMT_PUT_COLLISION_CELLS_MAX` /
+//! `HAMT_REMOVE_COLLISION_CELLS_MAX`). A one-cell collision node is refused as
+//! well.
 //!
 //! An over-estimate costs address space only; an under-estimate corrupts. The
 //! size-only bound is loose in exactly one place a *number* cannot express: a
@@ -77,7 +92,9 @@
 //! [`map_put_cow_words_required`] / [`map_remove_cow_words_required`] descend the
 //! path read-only (hashing and nibbles only, no `atoms`) and answer the exact word
 //! count, including `c + 1` words for an insert into a `c`-cell collision node and
-//! `c - 1` for a delete from one.
+//! `c - 1` for a delete from one. They share this plan, so they refuse exactly the
+//! maps the writers refuse — a `required` figure can never lead a caller into a
+//! reservation the write then exceeds.
 //!
 //! Every writer `debug_assert!`s that the words it wrote equal its plan's figure
 //! (the exactness half the tests lean on) — on every arm except the flat→HAMT
@@ -110,7 +127,8 @@ mod remove;
 mod words;
 
 use crate::atom::AtomTable;
-use crate::error::TermResult;
+use crate::boxed::{arityval, boxed_val, is_arity_value, is_boxed_term};
+use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::list::make_list;
 
@@ -121,6 +139,43 @@ pub use words::{
     map_put_cow_words_capacity, map_put_cow_words_required, map_remove_cow_words_capacity,
     map_remove_cow_words_required,
 };
+
+// ---------------------------------------------------------------------------
+// Flat maps: the pair count and its authority
+// ---------------------------------------------------------------------------
+
+/// The pair count of a flat map, taken from the **authority** and cross-checked
+/// against the head word's `size` field.
+///
+/// A flat map is the word block `[hdr][n][keys tuple][v0 … v(n-1)]`
+/// ([`write_flatmap`](crate::thing::write_flatmap)), so `n` appears twice: as the
+/// head's raw `size` word and as the keys tuple's arity. Both planners must size
+/// their reservation from the same figure the writer's extent comes from, so this
+/// reads the arity and refuses a map where the two disagree — a typed
+/// [`TermError::BadMap`], never a silent preference for one of them (preferring the
+/// head word could under-reserve the merge, preferring the tuple could read past the
+/// value sequence).
+///
+/// Every map this crate builds satisfies the equality by construction, so this is
+/// unreachable for a well-formed map.
+///
+/// # Safety
+///
+/// `p` must address a live flat map's head word; word 2 is then its keys tuple.
+pub(super) unsafe fn flat_pair_count(p: *const Eterm) -> TermResult<usize> {
+    // SAFETY: `p` is a flat map's head word: word 1 is its raw pair count and word 2
+    // its keys tuple term.
+    let (size, keys) = unsafe { ((*p.add(1)).raw(), *p.add(2)) };
+    if !is_boxed_term(keys) {
+        return Err(TermError::BadMap);
+    }
+    // SAFETY: `keys` is a live boxed term, so this is its header word.
+    let keys_header = unsafe { *boxed_val(keys) };
+    if !is_arity_value(keys_header) || arityval(keys_header) != size {
+        return Err(TermError::BadMap);
+    }
+    Ok(size)
+}
 
 // ---------------------------------------------------------------------------
 // Write cursor
@@ -250,8 +305,18 @@ impl Out {
 /// path crosses a hash collision node, the exact
 /// [`map_put_cow_words_required`]`(map, key)` — of a heap that outlives `map`.
 ///
+/// A `map` this writer refuses (a collision node wider than the size-only
+/// reservation covers, a collision node with fewer than two cells, or a flat map
+/// whose head word disagrees with its keys tuple) is the typed
+/// [`BadMap`](crate::error::TermError::BadMap) and writes nothing.
+///
 /// # Safety
 ///
+/// * `map` must be a **well-formed map produced by this crate's builders**
+///   ([`write_map`](crate::map::write_map), [`write_flatmap`](crate::thing::write_flatmap) or
+///   this writer): a malformed interior is a typed `BadMap`, never a wrong result,
+///   but the walk cannot validate the *extent* of a forged node — a word that is
+///   not part of the map must not be reachable from it.
 /// * `hp` must address that many *writable* words, in a region that is not the
 ///   source map's live storage (a node is never relocated in place).
 /// * The region must live at least as long as any use of the returned map: every
@@ -278,10 +343,13 @@ pub unsafe fn map_put_cow(
 /// [`map_remove_cow_words_capacity`]`(`[`map_size`](crate::map::map_size)`(map))` words — or, when
 /// `key`'s path crosses a hash collision node, the exact
 /// [`map_remove_cow_words_required`]`(map, key)` — of a heap that outlives `map`.
+/// A map this writer refuses answers [`BadMap`](crate::error::TermError::BadMap)
+/// and writes nothing, exactly like [`map_put_cow`].
 ///
 /// # Safety
 ///
-/// The same two preconditions [`map_put_cow`] states.
+/// The same preconditions [`map_put_cow`] states — including that `map` is a
+/// well-formed map produced by this crate's builders.
 pub unsafe fn map_remove_cow(
     hp: *mut Eterm,
     map: Eterm,

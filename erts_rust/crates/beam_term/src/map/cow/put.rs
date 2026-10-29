@@ -37,10 +37,11 @@ use crate::map::{
 };
 use crate::tag::{MAP_HEADER_TAG_FLATMAP_HEAD, MAP_HEADER_TAG_HAMT_NODE_BITMAP};
 use crate::thing::{flatmap_parts, flatmap_size_words, write_flatmap};
-use crate::tuple::{tuple_element, tuple_size};
+use crate::tuple::tuple_element;
 
-use super::node::{bitmap_header, classify_child, node_layout, slot_of, Child};
-use super::Out;
+use super::node::{bitmap_header, classify_child, collision_cells, node_layout, slot_of, Child};
+use super::words::HAMT_PUT_COLLISION_CELLS_MAX;
+use super::{flat_pair_count, Out};
 
 // ---------------------------------------------------------------------------
 // Put: plan
@@ -159,11 +160,14 @@ fn plan_flat_put(
     value: Option<Eterm>,
     atoms: &AtomTable,
 ) -> TermResult<PutPlan> {
-    // SAFETY: `p` is a flat map's head word; word 1 is its raw pair count.
-    let n = unsafe { (*p.add(1)).raw() };
-    // SAFETY: `map` is a live flat map.
+    // The pair count comes from the **authority** — the keys tuple's own arity —
+    // cross-checked against the head word, so the plan's reservation and the
+    // writer's extent cannot disagree (`flat_pair_count`).
+    // SAFETY: `p` is a flat map's head word (see `plan_put`'s dispatch).
+    let n = unsafe { flat_pair_count(p)? };
+    // SAFETY: `map` is a live flat map, so both slices are `n` words long.
     let (keys, values) = unsafe { flatmap_parts(map) };
-    let n = n.min(keys.len());
+    debug_assert_eq!(keys.len(), n);
     for i in 0..n {
         if eq(keys[i], key, atoms) {
             if let Some(v) = value {
@@ -268,8 +272,13 @@ fn plan_hamt_put(
                 break;
             }
             Child::Collision(coll) => {
-                // SAFETY: a collision slot holds a live arityval tuple of cons cells.
-                let cells = unsafe { tuple_size(coll) };
+                // A forged node holding more cells than the size-only reservation
+                // covers is refused here — before any store — instead of over-running
+                // the caller's region (`debug_assert!`s compile out in release).
+                let cells = collision_cells(coll)?;
+                if cells > HAMT_PUT_COLLISION_CELLS_MAX {
+                    return Err(TermError::BadMap);
+                }
                 let src = boxed_val(coll) as *const Eterm;
                 let mut slot = cells;
                 let mut found = false;
