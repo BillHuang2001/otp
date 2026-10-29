@@ -37,7 +37,7 @@ mod record;
 use beam_common::Result;
 use beam_term::prelude::{
     atom_val, is_atom, is_internal_pid, is_internal_port, is_list, is_nil, is_small, make_atom,
-    pid_number, pid_serial, port_number, signed_value,
+    pid_number, pid_serial, port_number, primary_tag, signed_value, BoxedTag, PrimaryTag,
 };
 use beam_term::{Atom, AtomTable, Eterm};
 
@@ -51,9 +51,9 @@ use crate::tag::{
     Tag,
 };
 use crate::term::{
-    big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
-    external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_kind_term, is_record,
-    map_pairs_storage_order, tuple_arity, tuple_element, FunPid,
+    big_parts, bit_count_to_bytes, bitstring_bytes, boxed_tag, cons_head, cons_tail,
+    external_pid_parts, external_port_parts, external_ref_parts, flatmap_parts, float_value,
+    fun_kind_term, map_pairs_storage_order, tuple_arity, tuple_element, FunPid,
 };
 use crate::writer::Writer;
 
@@ -294,9 +294,7 @@ pub struct Encoder<'a> {
 impl<'a> Encoder<'a> {
     /// Creates an encoder whose output begins with the version byte `131`.
     pub fn new(atoms: &'a AtomTable) -> Encoder<'a> {
-        let mut encoder = Encoder::new_body(atoms);
-        encoder.buf.u8(crate::VERSION_MAGIC);
-        encoder
+        Encoder::with_writer(atoms, Writer::with_capacity(DEFAULT_IMAGE_CAPACITY))
     }
 
     /// Creates an encoder for a body: **no** leading version byte.
@@ -304,9 +302,21 @@ impl<'a> Encoder<'a> {
     /// Used for the distribution payload that follows a distribution header and
     /// for ETS term blobs.
     pub fn new_body(atoms: &'a AtomTable) -> Encoder<'a> {
+        Encoder::new_body_with(atoms, Writer::with_capacity(DEFAULT_IMAGE_CAPACITY))
+    }
+
+    /// Creates a body encoder over a **caller-owned** writer: **no** leading version
+    /// byte, and the caller's buffer is appended to (and handed back through
+    /// [`Encoder::take_writer`]).
+    ///
+    /// Identical bytes to [`Encoder::new_body`] when the writer is empty — this is the
+    /// reusable-buffer form, for a host that keeps a per-thread
+    /// [`EncodeScratch`](crate::EncodeScratch). A non-empty writer simply continues at
+    /// its end (so a caller that wants a fresh image must clear it first).
+    pub fn new_body_with(atoms: &'a AtomTable, writer: Writer) -> Encoder<'a> {
         Encoder {
             atoms,
-            buf: Writer::with_capacity(DEFAULT_IMAGE_CAPACITY),
+            buf: writer,
             atom_encoding: AtomEncoding::Utf8,
             minor_version: MinorVersion::V2,
             atom_cache: None,
@@ -315,6 +325,17 @@ impl<'a> Encoder<'a> {
             deterministic: false,
             local_ext: false,
         }
+    }
+
+    /// Creates a **whole-image** encoder over a caller-owned writer: writes the
+    /// version byte `131` into it first, exactly as [`Encoder::new`] does.
+    ///
+    /// The reusable-buffer twin of [`Encoder::new`]: with an empty writer the bytes are
+    /// identical, and [`Encoder::take_writer`] hands the buffer (image included) back
+    /// so a host can recycle its allocation after copying the image out.
+    pub fn with_writer(atoms: &'a AtomTable, mut writer: Writer) -> Encoder<'a> {
+        writer.u8(crate::VERSION_MAGIC);
+        Encoder::new_body_with(atoms, writer)
     }
     /// Selects the atom tag family; defaults to [`AtomEncoding::Utf8`].
     ///
@@ -503,70 +524,41 @@ impl<'a> Encoder<'a> {
     /// from the term); a value beyond a wire bound yields `BeamError::SystemLimit`.
     /// The encoder never silently mis-encodes.
     pub fn encode(&mut self, term: Eterm) -> Result<()> {
-        // Classification order is deliberate (see the crate `CONTEXT.md`,
-        // "`src/encode.rs`"): immediates first, then each boxed family through its
-        // `Result`-returning accessor, which rejects the wrong type with `BadArg`.
+        // Tag-first dispatch, exactly the C's `switch (tag_val_def(obj))`
+        // (`external.c:3533`) in spirit: the 2-bit primary tag picks the family, and
+        // a boxed term reads its header subtag **once** ([`boxed_tag`]) instead of
+        // probing every family in turn. Each arm calls the same helper the old probe
+        // chain called, so the bytes cannot move.
+        match primary_tag(term) {
+            PrimaryTag::Immed1 => self.encode_immediate(term),
+            PrimaryTag::List => self.encode_list(term),
+            PrimaryTag::Boxed => self.encode_boxed(term),
+            // A bare header word is not a term: report it explicitly rather than
+            // emit a wrong encoding.
+            PrimaryTag::Header => Err(error::unsupported(Tag::Binary)),
+        }
+    }
+
+    /// Encodes an `IMMED1` term: a small integer, `NIL`, an atom, or an internal
+    /// pid/port immediate (the latter only with a node identity installed).
+    ///
+    /// `NIL` is tested **before** the atom arm: `[]` is the `NIL` immediate, which
+    /// the atom predicate also matches by tag family, and it must go on the wire as
+    /// `NIL_EXT` (`106`), never as an atom name.
+    fn encode_immediate(&mut self, term: Eterm) -> Result<()> {
         if is_small(term) {
             return self.encode_small(signed_value(term));
-        }
-        if is_atom(term) {
-            return self.encode_atom(term);
         }
         if is_nil(term) {
             self.buf.u8(NIL_EXT);
             return Ok(());
         }
-        if is_list(term) {
-            return self.encode_list(term);
-        }
-        // Funs come before the boxed-family probes: a fun header carries a distinct
-        // subtag, so the classification cannot overlap any other family.
-        if let Ok(kind) = fun_kind_term(term) {
-            return self.encode_fun(term, kind);
-        }
-        // Native records likewise: a record header carries its own subtag
-        // (`RECORD_SUBTAG`), so `is_record` cannot collide with the tuple probe
-        // below (`Tag::Record`, `external.c:4006-4036`).
-        if is_record(term) {
-            return self.encode_record(term);
-        }
-        if let Ok((negative, digits)) = big_parts(term) {
-            return self.encode_bignum(negative, digits);
-        }
-        if let Ok(value) = float_value(term) {
-            return self.encode_float(value);
-        }
-        if let Ok(arity) = tuple_arity(term) {
-            return self.encode_tuple(term, arity);
-        }
-        if let Ok((keys, values)) = flatmap_parts(term) {
-            return self.encode_map(keys, values);
-        }
-        // A > 32-key map is a *hash map* (HAMT), which `flatmap_parts` rejects. Its pairs
-        // come back in the map's **stored** (ascending HAMT node-slot pre-order) order; the
-        // C encoder walks that same tree through a LIFO work stack, i.e. in the *reverse*
-        // order, so `encode_hashmap_pairs` reverses before emitting. This probe matches only
-        // a genuine map, so it cannot shadow any term the flat path already handled (see
-        // §"Map key encode order").
-        if let Ok(pairs) = map_pairs_storage_order(term) {
-            return self.encode_hashmap_pairs(&pairs);
-        }
-        if let Ok((node, number, serial, creation)) = external_pid_parts(term) {
-            return self.encode_pid(node, number, serial, creation);
-        }
-        if let Ok((node, number, creation)) = external_port_parts(term) {
-            return self.encode_port(node, number, creation);
-        }
-        if let Ok((node, ids, creation)) = external_ref_parts(term) {
-            return self.encode_ref(node, ids, creation);
-        }
-        if let Ok((bytes, offset_bits, size_bits)) = bitstring_bytes(term) {
-            return self.encode_bitstring(bytes, offset_bits, size_bits);
+        if is_atom(term) {
+            return self.encode_atom(term);
         }
         // Internal pids/ports are 60-bit `Eterm` immediates (not boxed external id
-        // things) and an internal reference is the M1 `[header, node, serial, id]`
-        // block — none of them carry a node identity of their own, so the node field
-        // is either the `[local]` internal-node marker (which carries no identity at
+        // things). They carry no node identity of their own, so the node field is
+        // either the `[local]` internal-node marker (which carries no identity at
         // all) or the local node's sysname/creation, owned by the runtime and
         // supplied via [`Encoder::with_local_node`].
         if let Some(node) = self.internal_id_node() {
@@ -578,20 +570,114 @@ impl<'a> Encoder<'a> {
             if is_internal_port(term) {
                 return self.encode_internal_port(node, port_number(term));
             }
-            // An internal reference: `crate::term::internal_ref_id` is the safe
-            // frozen-layout probe (`beam_term`'s `is_internal_ref` is `unsafe`, and the
-            // crate confines `unsafe` to `crate::term`). It accepts exactly the M1
-            // 4-word block and returns a typed `BadArg` for every other term — a
-            // C-layout `ErtsORefThing` block included, whose id word does not exist —
-            // so it doubles as the predicate rather than risking a wrong id.
-            if let Ok(id) = crate::term::internal_ref_id(term) {
-                return self.encode_internal_ref(node, id);
+        }
+        Err(error::unsupported(Tag::Binary))
+    }
+
+    /// Encodes a **boxed** term by its header subtag (the C's `tag_val_def`).
+    ///
+    /// The subtag comes from [`boxed_tag`], which reads the header word once inside
+    /// the crate's one `unsafe` subtree; `None` (a reserved subtag) is the same
+    /// explicit "not a term I can represent" error as the old tail fallback.
+    ///
+    /// Every arm's *probe* error is folded into that fallback (as the old
+    /// `if let Ok(..)` chain did — a mismatched/corrupt block was never reported as
+    /// `badarg`), while the encode helper's own errors propagate unchanged.
+    fn encode_boxed(&mut self, term: Eterm) -> Result<()> {
+        let Some(tag) = boxed_tag(term) else {
+            return Err(error::unsupported(Tag::Binary));
+        };
+        match tag {
+            BoxedTag::ArityVal => match tuple_arity(term) {
+                Ok(arity) => self.encode_tuple(term, arity),
+                Err(_) => Err(error::unsupported(Tag::Binary)),
+            },
+            // A bignum's sign is its header subtag; `big_parts` re-checks it and
+            // reports `(negative, digits)`.
+            BoxedTag::PosBig | BoxedTag::NegBig => match big_parts(term) {
+                Ok((negative, digits)) => self.encode_bignum(negative, digits),
+                Err(_) => Err(error::unsupported(Tag::Binary)),
+            },
+            BoxedTag::Float => match float_value(term) {
+                Ok(value) => self.encode_float(value),
+                Err(_) => Err(error::unsupported(Tag::Binary)),
+            },
+            // A fun header carries a distinct subtag, so this cannot collide with any
+            // other family (the old chain's `fun_kind_term` probe).
+            BoxedTag::Fun => match fun_kind_term(term) {
+                Ok(kind) => self.encode_fun(term, kind),
+                Err(_) => Err(error::unsupported(Tag::Binary)),
+            },
+            // A record header carries its own subtag (`RECORD_SUBTAG`,
+            // `Tag::Record`, `external.c:4006-4036`).
+            BoxedTag::Record => self.encode_record(term),
+            // Heap bitstrings (`ErlHeapBits`), sub-bitstrings (`ErlSubBits`) and the
+            // off-heap `BinRef` pair. A bare `BinRef` root — and a corrupt on-heap
+            // block — is rejected by `bitstring_bytes`, which the old chain treated as
+            // "not a bitstring" and continued probing.
+            BoxedTag::HeapBits | BoxedTag::SubBits | BoxedTag::BinRef => {
+                match bitstring_bytes(term) {
+                    Ok((bytes, offset_bits, size_bits)) => {
+                        self.encode_bitstring(bytes, offset_bits, size_bits)
+                    }
+                    Err(_) => Err(error::unsupported(Tag::Binary)),
+                }
+            }
+            // A flat map (≤ `MAP_SMALL_MAP_LIMIT` pairs) and a hash map (HAMT) share
+            // the `MAP_SUBTAG`; the pair-count split lives in the two probes below.
+            BoxedTag::Map => self.encode_map_term(term),
+            BoxedTag::ExternalPid => match external_pid_parts(term) {
+                Ok((node, number, serial, creation)) => {
+                    self.encode_pid(node, number, serial, creation)
+                }
+                Err(_) => Err(error::unsupported(Tag::Binary)),
+            },
+            BoxedTag::ExternalPort => match external_port_parts(term) {
+                Ok((node, number, creation)) => self.encode_port(node, number, creation),
+                Err(_) => Err(error::unsupported(Tag::Binary)),
+            },
+            BoxedTag::ExternalRef => match external_ref_parts(term) {
+                Ok((node, ids, creation)) => self.encode_ref(node, ids, creation),
+                Err(_) => Err(error::unsupported(Tag::Binary)),
+            },
+            // The M1 internal-reference block (`[header, node, serial, id]`). An
+            // internal reference has no node identity of its own, so — exactly as
+            // before — it is only encodable with the `[local]` marker or the local
+            // node's sysname/creation installed.
+            BoxedTag::Ref => {
+                if let Some(node) = self.internal_id_node() {
+                    // `crate::term::internal_ref_id` is the safe frozen-layout probe
+                    // (`beam_term`'s `is_internal_ref` is `unsafe`, and the crate
+                    // confines `unsafe` to `crate::term`). It accepts exactly the M1
+                    // 4-word block and returns a typed error for every other term — a
+                    // C-layout `ErtsORefThing` block included, whose id word does not
+                    // exist — so it doubles as the predicate rather than risking a
+                    // wrong id.
+                    if let Ok(id) = crate::term::internal_ref_id(term) {
+                        return self.encode_internal_ref(node, id);
+                    }
+                }
+                Err(error::unsupported(Tag::Binary))
             }
         }
-        // Anything else is not a term the encoder can represent: report it explicitly
-        // rather than emit a wrong encoding. A bitstring in *either* representation —
-        // the on-heap `ErlHeapBits` block and the off-heap refc `BinRef` pair — is
-        // handled above through `bitstring_bytes`, so this path is never a bitstring.
+    }
+
+    /// Encodes a term whose header subtag is `MAP_SUBTAG`: a **flat** map when its
+    /// keys are stored inline, otherwise a **hash map** (HAMT).
+    ///
+    /// A > 32-key map is a *hash map*, which `flatmap_parts` rejects. Its pairs come
+    /// back in the map's **stored** (ascending HAMT node-slot pre-order) order; the C
+    /// encoder walks that same tree through a LIFO work stack, i.e. in the *reverse*
+    /// order, so `encode_hashmap_pairs` reverses before emitting. This probe matches
+    /// only a genuine map, so it cannot shadow any term the flat path already handled
+    /// (see §"Map key encode order").
+    fn encode_map_term(&mut self, term: Eterm) -> Result<()> {
+        if let Ok((keys, values)) = flatmap_parts(term) {
+            return self.encode_map(keys, values);
+        }
+        if let Ok(pairs) = map_pairs_storage_order(term) {
+            return self.encode_hashmap_pairs(&pairs);
+        }
         Err(error::unsupported(Tag::Binary))
     }
 
@@ -600,15 +686,14 @@ impl<'a> Encoder<'a> {
     /// signed 32-bit ⇒ `INTEGER_EXT`, otherwise a bignum.
     fn encode_small(&mut self, value: i64) -> Result<()> {
         if (0..=255).contains(&value) {
-            self.buf.u8(SMALL_INTEGER_EXT);
-            self.buf.u8(value as u8);
+            self.buf.head_u8(SMALL_INTEGER_EXT, value as u8);
             return Ok(());
         }
         if let Ok(int) = i32::try_from(value) {
-            self.buf.u8(INTEGER_EXT);
             // `(int as u32).to_be_bytes()` is exactly `int.to_be_bytes()` (two's
-            // complement big-endian), the `INTEGER_EXT` payload.
-            self.buf.u32be(int as u32);
+            // complement big-endian), the `INTEGER_EXT` payload — emitted together
+            // with the tag in one reservation.
+            self.buf.head_u32(INTEGER_EXT, int as u32);
             return Ok(());
         }
         // The magnitude becomes a one-`ErtsDigit` bignum block; the sign is carried
@@ -655,11 +740,12 @@ impl<'a> Encoder<'a> {
     /// [`float`] module).
     fn encode_float(&mut self, value: f64) -> Result<()> {
         if self.uses_new_floats() {
-            self.buf.u8(NEW_FLOAT_EXT);
-            self.buf.u64be(value.to_bits());
+            // The tag and its fixed eight IEEE-754 bytes in one reservation.
+            self.buf.head_bytes(NEW_FLOAT_EXT, &value.to_bits().to_be_bytes());
         } else {
-            self.buf.u8(FLOAT_EXT);
-            self.buf.bytes(&float::format_float_ext(value)?);
+            // The tag and the fixed 31-byte text field in one reservation.
+            self.buf
+                .head_bytes(FLOAT_EXT, &float::format_float_ext(value)?);
         }
         Ok(())
     }
@@ -680,8 +766,7 @@ impl<'a> Encoder<'a> {
             None => None,
         };
         if let Some(index) = cached {
-            self.buf.u8(ATOM_CACHE_REF_EXT);
-            self.buf.u8(index);
+            self.buf.head_u8(ATOM_CACHE_REF_EXT, index);
             return Ok(());
         }
 
@@ -708,13 +793,11 @@ impl<'a> Encoder<'a> {
     fn write_atom_utf8(&mut self, name: &str) {
         let bytes = name.as_bytes();
         if bytes.len() <= 255 {
-            self.buf.u8(SMALL_ATOM_UTF8_EXT);
-            self.buf.u8(bytes.len() as u8);
+            self.buf.head_u8(SMALL_ATOM_UTF8_EXT, bytes.len() as u8);
         } else {
             // At most 255 characters × 4 UTF-8 bytes ≤ 1020, so the 16-bit
             // length always fits.
-            self.buf.u8(ATOM_UTF8_EXT);
-            self.buf.u16be(bytes.len() as u16);
+            self.buf.head_u16(ATOM_UTF8_EXT, bytes.len() as u16);
         }
         self.buf.bytes(bytes);
     }
@@ -730,11 +813,9 @@ impl<'a> Encoder<'a> {
     fn write_atom_latin1_small_tags(&mut self, name: &str) -> Result<()> {
         let bytes = latin1_bytes(name).ok_or_else(|| error::unsupported(Tag::SmallAtom))?;
         if bytes.len() <= 255 {
-            self.buf.u8(SMALL_ATOM_EXT);
-            self.buf.u8(bytes.len() as u8);
+            self.buf.head_u8(SMALL_ATOM_EXT, bytes.len() as u8);
         } else {
-            self.buf.u8(ATOM_EXT);
-            self.buf.u16be(bytes.len() as u16);
+            self.buf.head_u16(ATOM_EXT, bytes.len() as u16);
         }
         self.buf.bytes(&bytes);
         Ok(())
@@ -748,10 +829,9 @@ impl<'a> Encoder<'a> {
     fn write_atom_latin1_wide_only(&mut self, name: &str) {
         match latin1_bytes(name) {
             Some(bytes) => {
-                self.buf.u8(ATOM_EXT);
                 // The name is ≤ 255 chars and Latin-1 is one byte per char, so the
                 // 16-bit length always fits.
-                self.buf.u16be(bytes.len() as u16);
+                self.buf.head_u16(ATOM_EXT, bytes.len() as u16);
                 self.buf.bytes(&bytes);
             }
             None => self.write_atom_utf8(name),
@@ -773,8 +853,7 @@ impl<'a> Encoder<'a> {
     fn encode_list(&mut self, term: Eterm) -> Result<()> {
         // Where the representation byte goes: the rewind point of the fallback.
         let start = self.buf.len();
-        self.buf.u8(STRING_EXT);
-        self.buf.u16be(0); // patched with the byte count on success
+        self.buf.head_u16(STRING_EXT, 0); // the count is patched on success
         let count_pos = start + 1;
 
         let mut count: u32 = 0;
@@ -804,9 +883,9 @@ impl<'a> Encoder<'a> {
 
         // Not a 16-bit `STRING_EXT`: drop the optimistic bytes and emit `LIST_EXT`.
         self.buf.truncate(start)?;
-        self.buf.u8(LIST_EXT);
-        let count_pos = self.buf.len();
-        self.buf.u32be(0); // patched with the cons-cell count at the end
+        // The element count sits at `start + 1` and is patched at the end.
+        let count_pos = start + 1;
+        self.buf.head_u32(LIST_EXT, 0);
         let mut count: u32 = 0;
         let mut cursor = term;
         loop {
@@ -827,14 +906,12 @@ impl<'a> Encoder<'a> {
     /// Encodes a tuple: `SMALL_TUPLE_EXT` up to arity 255, else `LARGE_TUPLE_EXT`.
     fn encode_tuple(&mut self, term: Eterm, arity: usize) -> Result<()> {
         if arity <= 255 {
-            self.buf.u8(SMALL_TUPLE_EXT);
-            self.buf.u8(arity as u8);
+            self.buf.head_u8(SMALL_TUPLE_EXT, arity as u8);
         } else {
             if arity > u32::MAX as usize {
                 return Err(error::system_limit());
             }
-            self.buf.u8(LARGE_TUPLE_EXT);
-            self.buf.u32be(arity as u32);
+            self.buf.head_u32(LARGE_TUPLE_EXT, arity as u32);
         }
         for index in 0..arity {
             let element = tuple_element(term, index)?;
@@ -911,8 +988,7 @@ impl<'a> Encoder<'a> {
         if n > MAX_ARITYVAL {
             return Err(error::system_limit());
         }
-        self.buf.u8(MAP_EXT);
-        self.buf.u32be(n as u32);
+        self.buf.head_u32(MAP_EXT, n as u32);
         Ok(())
     }
 
@@ -1035,11 +1111,9 @@ impl<'a> Encoder<'a> {
         let tail = size_bits % 8;
         let len_field = u32::try_from(n_bytes).map_err(|_| error::system_limit())?;
         if tail == 0 {
-            self.buf.u8(BINARY_EXT);
-            self.buf.u32be(len_field);
+            self.buf.head_u32(BINARY_EXT, len_field);
         } else {
-            self.buf.u8(BIT_BINARY_EXT);
-            self.buf.u32be(len_field);
+            self.buf.head_u32(BIT_BINARY_EXT, len_field);
             // `bits` is the number of significant bits in the last byte (`1..=8`).
             self.buf.u8(tail as u8);
         }
@@ -1065,6 +1139,15 @@ impl<'a> Encoder<'a> {
     /// Consumes the encoder, returning the written bytes.
     pub fn finish(self) -> Vec<u8> {
         self.buf.into_vec()
+    }
+    /// Consumes the encoder, returning its output **buffer** rather than a `Vec`.
+    ///
+    /// The successor to [`Encoder::finish`] for a caller that owns the buffer (see
+    /// [`Encoder::with_writer`]): the bytes are the same, but the [`Writer`] can be
+    /// emptied and reused ([`Writer::clear`]) once the host has copied the image out,
+    /// so a per-thread scratch allocation is paid once instead of once per encode.
+    pub fn take_writer(self) -> Writer {
+        self.buf
     }
 
     /// Consumes the encoder, producing a `COMPRESSED` (`80`) `term_to_binary` image

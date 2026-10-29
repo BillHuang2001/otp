@@ -90,6 +90,7 @@ pub(crate) mod io_route;
 pub(crate) mod ir_cache;
 mod memory_hook;
 mod machine_pool;
+pub(crate) mod memo_pool;
 mod module_info;
 mod node_hash;
 mod persistent_term;
@@ -112,10 +113,14 @@ pub(crate) mod test_support;
 mod tests;
 
 pub use self::runtime_context::RuntimeContext;
+pub(crate) use self::memo_pool::MemoPool;
 pub(crate) use self::position::InMachinePosition;
 pub(crate) use self::apply::LocalFunTarget;
 pub(crate) use self::bridges::{module_md5, PendingInterner};
 pub(crate) use self::fun_identity::fun_identity_for;pub(crate) use self::persistent_term::PersistentTermStore;
+// Referenced by this module's docs (the `dispatch` memo), not by code: keep the intra-doc
+// link target in scope without an unused-import warning.
+#[allow(unused_imports)]
 use self::dispatch::DispatchMemo;
 
 // `tests.rs` and `pump.rs`'s inline suite reach the items they assert on through `use

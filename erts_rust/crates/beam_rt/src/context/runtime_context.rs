@@ -36,7 +36,7 @@ use crate::runner::RunnerState;
 use crate::runtime::Runtime;
 
 use super::bridges::SharedSink;
-use super::dispatch::DispatchMemo;
+use super::memo_pool::MemoSlot;
 use super::gc;
 
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
@@ -140,8 +140,15 @@ pub struct RuntimeContext<'a> {
     /// [`crate::port::busy_wait`].
     pub(super) suspend_requested: bool,
     /// The memo of [`RuntimeContext::dispatch`] answers, so a hot call site pays the dispatch
-    /// prologue once instead of once per call (see [`DispatchMemo`] for the soundness argument).
-    pub(super) dispatch_memo: DispatchMemo,
+    /// prologue once instead of once per call (see
+    /// [`DispatchMemo`](super::dispatch::DispatchMemo) for the soundness argument).
+    ///
+    /// It is a [`MemoSlot`] rather than the bare memo because it is **recycled across
+    /// contexts of the same runtime**: a context that has just paid for a prologue hands its
+    /// memo back to the runtime's pool when it is dropped, and the next slice of the same
+    /// runtime starts with the answers already in hand. The freed-store rule is the memo's own
+    /// (every input is immutable for the life of the runtime); see [`super::memo_pool`].
+    pub(super) dispatch_memo: MemoSlot,
     /// A [`TableRegistry`] an **outer** [`BifContext`](beam_bifs::BifContext) lent for the
     /// duration of a nested call, which must be installed into every nested
     /// [`BifContext`](beam_bifs::BifContext) this context builds — in preference to
@@ -197,6 +204,7 @@ impl<'a> RuntimeContext<'a> {
     /// runtime's own process.
     pub fn new(runtime: &'a mut Runtime) -> RuntimeContext<'a> {
         let mailbox_pid = runtime.self_pid;
+        let dispatch_memo = runtime.memo_pool.slot();
         RuntimeContext {
             runtime,
             output: None,
@@ -207,7 +215,7 @@ impl<'a> RuntimeContext<'a> {
             engines: None,
             gc_armed: false,
             suspend_requested: false,
-            dispatch_memo: DispatchMemo::default(),
+            dispatch_memo,
             lent_tables: None,
             copy_out_hint: 0,
         }
@@ -216,6 +224,7 @@ impl<'a> RuntimeContext<'a> {
     /// A context over `runtime` whose program output goes to `sink`.
     pub fn with_output(runtime: &'a mut Runtime, sink: &'a mut dyn OutputSink) -> RuntimeContext<'a> {
         let mailbox_pid = runtime.self_pid;
+        let dispatch_memo = runtime.memo_pool.slot();
         RuntimeContext {
             runtime,
             output: Some(SharedSink::new(sink)),
@@ -226,7 +235,7 @@ impl<'a> RuntimeContext<'a> {
             engines: None,
             gc_armed: false,
             suspend_requested: false,
-            dispatch_memo: DispatchMemo::default(),
+            dispatch_memo,
             lent_tables: None,
             copy_out_hint: 0,
         }
@@ -252,6 +261,7 @@ impl<'a> RuntimeContext<'a> {
         table: &'a mut ProcessTable,
         pid: ProcessId,
     ) -> RuntimeContext<'a> {
+        let dispatch_memo = runtime.memo_pool.slot();
         RuntimeContext {
             runtime,
             output: None,
@@ -262,7 +272,7 @@ impl<'a> RuntimeContext<'a> {
             engines: None,
             gc_armed: false,
             suspend_requested: false,
-            dispatch_memo: DispatchMemo::default(),
+            dispatch_memo,
             lent_tables: None,
             copy_out_hint: 0,
         }

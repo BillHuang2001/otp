@@ -33,6 +33,12 @@
 //! `code:soft_purge/1` and `erts_internal:purge_module/2`) is pinned only where the two runtimes
 //! agree — see the block comment above those cases for what is deliberately left unpinned (the
 //! post-delete store shape, which honestly differs because this runtime has no old-code slot).
+//!
+//! A last block pins the **gated dispatch** keys: the BIFs whose dispatch consults one bit of a
+//! build-once flag word — the process dictionary's whole-dict forms (`get/0`, `get_keys/0,1`,
+//! `erase/0`), the `!` **BIF** beside the send instruction, `persistent_term:put_new/2`/`info/0`
+//! and the fun-taking `lists:foreach/2`/`ets:foldl/3`/`ets:foldr/3`. A bit that is too narrow to
+//! dispatch its seam turns into a visible gap or a degraded value, which those cases observe.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.7 cases: core BIFs plus the `lists` and `maps` stdlib surface (the `bifs/`, `lists/` and
@@ -2229,6 +2235,110 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // ---------------------------------------------------------------------------------
+        // The **hook-flag** surface: the gated `erlang`/stdlib keys whose BIF dispatch consults
+        // one bit of the runtime's build-once flag word — the process dictionary's whole-dict
+        // forms (`get/0`, `get_keys/0,1`, `erase/0`), the `!` **BIF** beside the send
+        // instruction, the `persistent_term` writer/query pair, and the fun-taking
+        // `lists`/`ets` folds. A flag that is too narrow lets a BIF dispatch without its seam,
+        // which surfaces as the runtime's typed `unsupported_bif` gap or a degraded value, so
+        // each case below is an observable only a correctly flagged dispatch produces. The
+        // `/1,2` dictionary forms (`put/2`, `get/1`, `erase/1`) are pinned by
+        // `bifs/process_dictionary_put_get_erase` and are not duplicated here.
+        // Every golden is the oracle's own single line, measured twice with identical output.
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "bifs/process_dictionary_whole_dict_forms",
+            description: "erlang:get/0, get_keys/0,1 and erase/0 answer the whole-dictionary forms",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The `-eval` process inherits a dictionary from `init`, so the whole-dict
+                // observables are asserted *relationally* only (membership, a one-element key
+                // list, `is_list/1`) and never rendered — no dictionary dump reaches a golden.
+                // `erase/0` comes last: it empties the dictionary, and the final `get_keys/0`
+                // proves that with the order-free `[]`.
+                expr: "begin erlang:put(differential_whole_dict_a, 1), \
+                       erlang:put(differential_whole_dict_b, 2), \
+                       Dict = erlang:get(), Keys = erlang:get_keys(), \
+                       Two = lists:sort(erlang:get_keys(2)), \
+                       {lists:member({differential_whole_dict_a, 1}, Dict), \
+                        lists:member({differential_whole_dict_b, 2}, Dict), \
+                        lists:member(differential_whole_dict_a, Keys), \
+                        lists:member(differential_whole_dict_b, Keys), \
+                        Two, is_list(erlang:erase()), erlang:get_keys()} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,true,true,[differential_whole_dict_b],true,[]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/send_bif_operator_form_delivers_to_self",
+            description: "the erlang:'!'/2 BIF (not the send instruction) delivers a message",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `self() ! v` compiles to the send *instruction*; `erlang:'!'(self(), v)` is the
+                // BIF call, the one spelling that reaches the `!` BIF. The bounded `receive`
+                // makes a lost message the visible answer `timeout` rather than a hang.
+                expr: "begin erlang:'!'(self(), v), \
+                       receive X -> X after 5000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok v"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/persistent_term_put_new_and_info_shape",
+            description: "persistent_term:put_new/2 answers ok for a fresh key and badarg for a set one; info/0 is a count/memory map",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `put_new/2` answers the atom `ok` — never a boolean — and since OTP 28.4
+                // refuses a key that is already set with `badarg`, so the second call is caught
+                // and its class+reason pair pinned. `info/0`'s counter *values* are a documented
+                // divergence, so only its shape is asserted: a map carrying an integer `count`.
+                expr: "begin Key = differential_persistent_term_hook_key, \
+                       First = persistent_term:put_new(Key, 1), \
+                       Second = try persistent_term:put_new(Key, 2) catch Cls:Rs -> {Cls, Rs} end, \
+                       Info = persistent_term:info(), \
+                       {First, Second, is_map(Info), is_integer(maps:get(count, Info))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,{error,badarg},true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/fun_caller_lists_foreach_and_ets_folds",
+            description: "lists:foreach/2 drives its fun and ets:foldl/3 and foldr/3 traverse an ordered_set in opposite directions",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The fun-taking keys of the fun-caller roster. `lists:foreach/2`'s fun is
+                // observed only through its side effect (the `ets:insert/2` it performs), and
+                // the two folds are accumulated as cons lists, so each list is the *reverse* of
+                // its traversal: their sorted forms are equal (both see all three elements) and
+                // `Left =:= lists:reverse(Right)` holds, while `hd/1` differs between them —
+                // which pins the fold *direction* without pinning an unstable element order.
+                expr: "begin T = ets:new(differential_fun_caller_table, [ordered_set, public]), \
+                       lists:foreach(fun(K) -> ets:insert(T, {K, K * 2}) end, [1,2,3]), \
+                       Left = ets:foldl(fun(E, Acc) -> [E | Acc] end, [], T), \
+                       Right = ets:foldr(fun(E, Acc) -> [E | Acc] end, [], T), \
+                       {lists:sort(Left) =:= lists:sort(Right), hd(Left), hd(Right), \
+                        length(Left), lists:sort(Left), Left =:= lists:reverse(Right)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,{3,6},{1,2},3,[{1,2},{2,4},{3,6}],true}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 #[cfg(test)]
@@ -2625,6 +2735,103 @@ mod tests {
                 expr.matches("delete_module").count() <= 1,
                 "case {}: a second delete_module/1 is not an agreeing observable: {expr}",
                 case.id
+            );
+        }
+    }
+
+    /// The hook-flag block: the gated keys whose dispatch reads one bit of the runtime's
+    /// build-once flag word. Each golden is the oracle's own single line (measured twice with
+    /// identical output), and the whole-dictionary forms are asserted relationally — no
+    /// dictionary dump and no map key order reaches a golden.
+    #[test]
+    fn the_hook_flag_families_pin_the_oracle_lines() {
+        let golden = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+                .expect("a golden")
+        };
+        for (id, stdout) in [
+            (
+                "bifs/process_dictionary_whole_dict_forms",
+                "ok {true,true,true,true,[differential_whole_dict_b],true,[]}",
+            ),
+            ("bifs/send_bif_operator_form_delivers_to_self", "ok v"),
+            (
+                "bifs/persistent_term_put_new_and_info_shape",
+                "ok {ok,{error,badarg},true,true}",
+            ),
+            (
+                "bifs/fun_caller_lists_foreach_and_ets_folds",
+                "ok {true,{3,6},{1,2},3,[{1,2},{2,4},{3,6}],true}",
+            ),
+        ] {
+            assert_eq!(golden(id), stdout, "case {id}");
+        }
+        let expr_of = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .expr()
+                .expect("eval case")
+        };
+
+        // The whole-dictionary case never renders the dictionary (the `-eval` process inherits
+        // entries from `init`): every whole-dict answer is reduced to membership, a one-element
+        // key list, `is_list/1` or the post-`erase/0` empty key list.
+        let dict = expr_of("bifs/process_dictionary_whole_dict_forms");
+        assert!(
+            dict.contains("lists:member(") && dict.contains("lists:sort(erlang:get_keys(2))"),
+            "the whole-dict case must assert its answers relationally: {dict}"
+        );
+        assert!(
+            dict.contains("Dict = erlang:get()") && !dict.contains(", erlang:get(),"),
+            "the whole dictionary must be bound, never rendered: {dict}"
+        );
+        assert!(
+            dict.matches("erlang:get_keys()").count() >= 2
+                && dict.contains("is_list(erlang:erase())"),
+            "the whole-dict case must pin the post-erase/0 key list and erase/0's shape: {dict}"
+        );
+
+        // The `persistent_term` case pins `info/0` by shape only (its counters are a documented
+        // divergence) and catches `put_new/2`'s refusal instead of letting it abort the case.
+        let pt = expr_of("bifs/persistent_term_put_new_and_info_shape");
+        assert!(
+            pt.contains("is_map(Info)")
+                && pt.contains("is_integer(maps:get(count, Info))")
+                && pt.contains("catch Cls:Rs"),
+            "persistent_term:info/0 is pinned by shape and put_new/2's refusal is caught: {pt}"
+        );
+
+        // The fun-caller case keeps both fold directions visible: each list is the reverse of its
+        // traversal, so the sorted forms are equal while `hd/1` distinguishes `foldl` from `foldr`.
+        let folds = expr_of("bifs/fun_caller_lists_foreach_and_ets_folds");
+        assert!(
+            folds.contains("lists:foreach(")
+                && folds.contains("ets:foldl(")
+                && folds.contains("ets:foldr(")
+                && folds.contains("hd(Left)")
+                && folds.contains("hd(Right)")
+                && folds.contains("Left =:= lists:reverse(Right)"),
+            "the fun-caller case must pin both fold directions and the foreach side effect: {folds}"
+        );
+
+        // None of the four constructs or renders a map literal, so no map key order can reach a
+        // golden (the one map here is `persistent_term:info/0`'s, asserted by shape).
+        for id in [
+            "bifs/process_dictionary_whole_dict_forms",
+            "bifs/send_bif_operator_form_delivers_to_self",
+            "bifs/persistent_term_put_new_and_info_shape",
+            "bifs/fun_caller_lists_foreach_and_ets_folds",
+        ] {
+            assert!(
+                !expr_of(id).contains("#{"),
+                "case {id}: a map literal of more than one key is order-unstable"
             );
         }
     }

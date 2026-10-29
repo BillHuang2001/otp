@@ -1,0 +1,14 @@
+# started on Thu Oct 29 10:53:40 2026
+
+
+ Performance counter stats for 'env BEAM_RT=/home/bill/Source/otp/.genesis/workers/worker_T1_A347/erts_rust/target/release/beam_rt /home/bill/Source/otp/.genesis/workers/worker_T1_A347/erts_rust/target/release/bench run --quick --runtime rust --workloads copy_bound --out-file /tmp/ab3/head1.json':
+
+     <not counted>      cpu_atom/instructions/u                                                 (0.00%)
+   100,430,712,225      cpu_core/instructions/u                                               
+
+       7.441101239 seconds time elapsed
+
+       6.697691000 seconds user
+       0.641445000 seconds sys
+
+

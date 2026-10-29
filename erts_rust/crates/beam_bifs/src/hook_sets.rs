@@ -28,7 +28,9 @@
 //! built and installed on the [`BifContext`] before it dispatches. Most of these
 //! seams have a small, fixed consumer set, so the gate is a list membership test.
 //! This module is the one authoritative home for those sets: a `&'static` table per
-//! seam plus an allocation-free `needs_*` predicate over it.
+//! seam plus a `needs_*` predicate over it, each a single bit test of the shared
+//! build-once flag table in the crate-private `hook_flags` module; that module holds
+//! the one hash-and-probe that answers all fourteen.
 //!
 //! The seams covered here, each with its consumer table:
 //!
@@ -122,10 +124,25 @@
 //!   **send** bridges need the running process — so each is built only for the keys
 //!   that actually read it.
 //!
-//! Every predicate is an allocation-free `binary_search` membership test over the
-//! `&'static` tables, so calling one on every dispatch is free.
+//! # The gates are bit tests
+//!
+//! Every predicate is `flags(module, function, arity) & FLAG != 0` — one bit of the
+//! `u16` the crate-private `hook_flags` module returns. That module builds its
+//! open-addressed table once, from exactly the fourteen `pub` tables below (one bit
+//! per table, OR-ed per key, the full key compared on every probe), so a host asking
+//! several of them about one key pays one probe rather than one table walk each, and
+//! a key in no table carries no bit (every predicate `false`, as before). What that
+//! replaced was a `binary_search` per predicate — about fifty non-inlined `memcmp`
+//! calls per registered-BIF dispatch, 4.62 % of a `copy_bound` run's cycles plus much
+//! of its 7.59 % `memcmp` share. `hook_flags`' tests pin the equivalence.
 //!
 //! [`BifContext::intern_atom`]: crate::context::BifContext::intern_atom
+
+use crate::hook_flags::{
+    flags, DICT, EXPORT_GATE, FUN_CALLER, LOCAL_FUN_IDENTITY, LOCAL_NODE, MEMORY, MODULE_INFO,
+    NIF_LOADER, PERSISTENT_TERM, PORT_HOOK, PROCESS_HOOK, RECORD_SOURCE, RUNTIME_HOOKS,
+    SEND_HOOK,
+};
 
 /// The registered BIFs that read the [`MemoryHook`] seam — the only consumers of
 /// [`BifContext::memory`](crate::context::BifContext::memory).
@@ -562,155 +579,142 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
 
 /// Whether `(module, function, arity)` is one of the [`MEMORY_HOOK_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & MEMORY != 0`.
+#[inline]
 #[must_use]
 pub fn needs_memory_hook(module: &str, function: &str, arity: u32) -> bool {
-    MEMORY_HOOK_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & MEMORY != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`LOCAL_FUN_IDENTITY_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & LOCAL_FUN_IDENTITY != 0`.
+#[inline]
 #[must_use]
 pub fn needs_local_fun_identity(module: &str, function: &str, arity: u32) -> bool {
-    LOCAL_FUN_IDENTITY_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & LOCAL_FUN_IDENTITY != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`DICT_HOOK_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & DICT != 0`.
+#[inline]
 #[must_use]
 pub fn needs_dict_hook(module: &str, function: &str, arity: u32) -> bool {
-    DICT_HOOK_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & DICT != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`PROCESS_HOOK_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & PROCESS_HOOK != 0`.
+#[inline]
 #[must_use]
 pub fn needs_process_hook(module: &str, function: &str, arity: u32) -> bool {
-    PROCESS_HOOK_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & PROCESS_HOOK != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`PORT_HOOK_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & PORT_HOOK != 0`.
+#[inline]
 #[must_use]
 pub fn needs_port_hook(module: &str, function: &str, arity: u32) -> bool {
-    PORT_HOOK_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & PORT_HOOK != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`SEND_HOOK_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & SEND_HOOK != 0`.
+#[inline]
 #[must_use]
 pub fn needs_send_hook(module: &str, function: &str, arity: u32) -> bool {
-    SEND_HOOK_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & SEND_HOOK != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`NIF_LOADER_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & NIF_LOADER != 0`.
+#[inline]
 #[must_use]
 pub fn needs_nif_loader(module: &str, function: &str, arity: u32) -> bool {
-    NIF_LOADER_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & NIF_LOADER != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`EXPORT_GATE_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & EXPORT_GATE != 0`.
+#[inline]
 #[must_use]
 pub fn needs_export_gate(module: &str, function: &str, arity: u32) -> bool {
-    EXPORT_GATE_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & EXPORT_GATE != 0
 }
 
-/// Whether `(module, function, arity)` is one of the [`RECORD_SOURCE_BIFS`].///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// Whether `(module, function, arity)` is one of the [`RECORD_SOURCE_BIFS`].
+///
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & RECORD_SOURCE != 0`.
+#[inline]
 #[must_use]
 pub fn needs_record_source(module: &str, function: &str, arity: u32) -> bool {
-    RECORD_SOURCE_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & RECORD_SOURCE != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`MODULE_INFO_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & MODULE_INFO != 0`.
+#[inline]
 #[must_use]
 pub fn needs_module_info(module: &str, function: &str, arity: u32) -> bool {
-    MODULE_INFO_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & MODULE_INFO != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`PERSISTENT_TERM_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & PERSISTENT_TERM != 0`.
+#[inline]
 #[must_use]
 pub fn needs_persistent_term(module: &str, function: &str, arity: u32) -> bool {
-    PERSISTENT_TERM_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & PERSISTENT_TERM != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`FUN_CALLER_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & FUN_CALLER != 0`.
+#[inline]
 #[must_use]
 pub fn needs_fun_caller(module: &str, function: &str, arity: u32) -> bool {
-    FUN_CALLER_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & FUN_CALLER != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`LOCAL_NODE_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & LOCAL_NODE != 0`.
+#[inline]
 #[must_use]
 pub fn needs_local_node(module: &str, function: &str, arity: u32) -> bool {
-    LOCAL_NODE_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & LOCAL_NODE != 0
 }
 
 /// Whether `(module, function, arity)` is one of the [`RUNTIME_HOOKS_BIFS`].
 ///
-/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
-/// call on every BIF dispatch.
+/// One bit test of the build-once flag table (`hook_flags::flags`), so it is safe
+/// to call on every BIF dispatch: `flags(..) & RUNTIME_HOOKS != 0`.
+#[inline]
 #[must_use]
 pub fn needs_runtime_hooks(module: &str, function: &str, arity: u32) -> bool {
-    RUNTIME_HOOKS_BIFS
-        .binary_search(&(module, function, arity))
-        .is_ok()
+    flags(module, function, arity) & RUNTIME_HOOKS != 0
 }
 
 #[cfg(test)]

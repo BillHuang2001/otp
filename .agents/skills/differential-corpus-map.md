@@ -6,7 +6,7 @@ description: The per-group inventory of the differential conformance corpus (`er
 Each group is a module `src/corpus/<group>.rs` exposing `group() -> Vec<Case>`, concatenated by
 `corpus::mod::build_corpus()`. A case id is `<prefix>/<name>`, where the prefix is a *subdivision*
 and NOT the file name (one file may emit several prefixes). Counts below are for the current corpus
-(3 469 cases total, one allowlisted gap, `wire/new_fun_ext_encode`, three recorded oracle drifts); re-derive them with
+(3 485 cases total, one allowlisted gap, `wire/new_fun_ext_encode`, three recorded oracle drifts); re-derive them with
 `erts_rust/target/release/differential list 2>/dev/null | grep -c '^<prefix>/'` rather than trusting
 this file, which drifts on every corpus round.
 ## A.1 — language semantics
@@ -26,15 +26,25 @@ this file, which drifts on every corpus round.
   (`bs_init_writable` + private append; pinned by byte count **and** md5), growth past the payload's
   reservation, a `bs_match` over a **refc** subject at a non-zero non-byte-aligned offset (integer and
   binary fields), its byte-aligned control, and one large-payload `ets` copy round trip.
+- `copypath.rs` (5 cases) — the **process copy boundary's** cons-chain fast path (`copy_cons_chain`'s one-flat-pass copy bounded by the receiver's remaining words, plus the per-thread fix-up worklist): a 20 000-element int chain, a 200 000-element one (longer than the receiver's remaining heap words), 400 conses of distinct 4 KiB refc binaries, a 10 000-cons improper chain with an atom tail, and a chain of mixed nested elements. Each is sent to a **spawned** process and **echoed back**, compared as `term_to_binary(Echo) =:= term_to_binary(L)` — never a one-way send, which pins only that the send did not raise; the golden is `true`, a corrupted copy answers `false`, a lost message `timeout`.
 ## A.2 — `.beam`/ETF images
-- `etf.rs` (84 cases) — `term_to_binary` bytes + `binary_to_term` round trips incl. local pid/ref
+- `etf.rs` (90 cases) — `term_to_binary` bytes + `binary_to_term` round trips incl. local pid/ref
   identity; the `[local]` `LOCAL_EXT` image with the per-VM 4-byte node hash masked
   (`etf/term_to_binary_local_masks_the_node_hash`, `…_replaces_the_local_node_atom`); the
   `{minor_version,0}` legacy `FLOAT_EXT` dialect pinned byte-exactly, standalone and nested; and the
   **`[compressed]` family** — whole images byte-for-byte (a 16 000-byte repetitive binary, a
   2000-character string, `{compressed,1}`, `{compressed,9}`), both sides of the encoder's savings
   **threshold** (a small body stays verbatim), the 32-bit big-endian uncompressed-size field, and
-  `binary_to_term(Image, [used])`'s consumed-byte count over a compressed image.
+  `binary_to_term(Image, [used])`'s consumed-byte count over a compressed image. It also pins the
+  encoder's hot-path fast paths: `etf/bench_payload_reencode_is_byte_identical` and
+  `etf/bench_payload_image_exact_bytes` (the exact 116-byte image of the 5-key bench flatmap —
+  sorted-key `MAP_EXT`, stable across repeated oracle runs),
+  `etf/scratch_reuse_after_a_larger_image_does_not_leak_bytes` (the reused thread-local encode
+  scratch leaves no stale bytes), `etf/atom_name_batch_reencodes_byte_identically` (an atom batch
+  stressing the open-addressed name→index probe: `a`/`aa`/`aaa`, same-first-8 and same-last-8 names,
+  254- and 255-byte names, `'Hello'` vs `hello`), `etf/atom_ext_and_small_atom_ext_agree` (both atom
+  tag forms must resolve to one name→index entry and re-encode alike) and
+  `etf/atom_utf8_names_reencode_byte_identically` (non-Latin-1 names).
 - `wire_ids.rs` (A.2/A.5) — local pid/port id images `NEW_PID_EXT`/`V4_PORT_EXT` + node identity
   `node/0,1`, `nodes/0,1`, `set_cookie/2`, and `wire_ids/internal_port_round_trip_identity` (a live
   port decoded back to the very port and re-encoded to the same image, both reduced to booleans so no
@@ -176,7 +186,13 @@ this file, which drifts on every corpus round.
   `flat_size/1`, the `interpreter_size`/`disassemble`/`lcnt_*` build constants and the whole
   `erl_debugger` support guard, `erts_internal:cmp_term/2`, `erlang:send/3`, `beam_lib:md5/1`, and the
   code-store removal surface (`erlang:delete_module/1`, `code:purge/1`/`code:soft_purge/1`,
-  `erts_internal:purge_module/2`).
+  `erts_internal:purge_module/2`). It also pins the hook-flag-gated BIF dispatch keys no other case
+  reached: `bifs/process_dictionary_whole_dict_forms` (dict `get/0`, `erase/0`, `get_keys/0,1`),
+  `bifs/send_bif_operator_form_delivers_to_self` (the `erlang:'!'/2` **BIF** spelling, not the send
+  instruction), `bifs/persistent_term_put_new_and_info_shape` (`put_new/2` answers `ok` for a fresh
+  key and `badarg` for an already-set one since OTP 28.4; `info/0` is pinned by shape only) and
+  `bifs/fun_caller_lists_foreach_and_ets_folds` (`lists:foreach/2`, `ets:foldl/3`, `ets:foldr/3`, the
+  fold direction pinned via `lists:reverse` + `hd/1`).
 - `ets.rs` — the plain `ets:*` surface + table types/options; `ets_access.rs` — the access-control
   matrix (the *denied* cells are a divergence, not pinned); `ets_spec.rs` (35) —
   `select`/`match`/`match_object` + continuations + delete/replace/count, `match_spec_*` incl. the
@@ -185,7 +201,12 @@ this file, which drifts on every corpus round.
   map *and* over every `maps:iterator/1,2` order incl. a custom 2-arity comparator, `maps:next/1`'s
   look-ahead and terminal `none`, the >32-key HAMT chunk boundary, the `{badmap, Arg}` refusal vs a
   bad fun's plain `badarg`.
-- `phash.rs`, `binmatch.rs`, `math_bifs.rs`, `printing.rs`.
+- `phash.rs`, `binmatch.rs`, `math_bifs.rs`, `printing.rs` — including
+  `phash/local_fun_to_list_and_external_size_agree`, a module-run case (embedded `fun_ident` module,
+  golden `791023`) pinning `erlang:fun_to_list/1` and `erlang:external_size/2` of a **compiled local
+  fun** (an `-eval` lambda has no module/index identity, so it cannot pin that seam), folding the
+  `#Fun<Mod.Idx.Uniq>` text (with `uniq` read from `fun_info/2`, never pinned) and both size arities
+  into one integer.
 - `re.rs` (141) — `re:run/2,3`, `re:compile/1,2`, `re:replace/3,4` + the run/compile options (promoted
   from the live-oracle source `crates/beam_bifs/src/re/oracle.rs`); payload-bearing `re:compile`/
   `re:inspect` results are projected payload-free *inside the expression*, and malformed patterns pin

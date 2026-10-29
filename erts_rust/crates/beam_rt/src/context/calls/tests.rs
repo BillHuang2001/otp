@@ -1678,3 +1678,188 @@ fn the_folded_visit_total_matches_the_per_visit_counter_on_every_exit() {
         "the reference-header early exit folds the local counter exactly once too"
     );
 }
+/// **A leaf root is declined before the walk starts** (`term_to_binary/1`'s result shape).
+///
+/// [`RuntimeContext::root_is_reference_free`] answers from the root's own header word, so a
+/// bitstring, a bignum, a float or an external pid/port — the shapes whose child enumeration
+/// yields nothing a reference can hide behind — costs the walk **no** worklist, no visit and no
+/// call at all. The counters are the assertion: a leaf root must leave `calls` **and** `visits` at
+/// zero (the walk is not merely short, it does not begin), which is why the test sits before the
+/// walk's own `note_walk_call`/`bump`.
+///
+/// The container control is the other half: a tuple root is never declined, and it walks its two
+/// leaf children like any other graph, so the whitelist cannot silently swallow a real graph.
+#[test]
+fn a_leaf_root_is_declined_before_the_walk_starts() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let binary =
+        beam_engine::terms::make_heap_binary(&mut ctx, b"twelve bytes").expect("an on-heap binary");
+    let float = beam_engine::terms::make_float(&mut ctx, 3.5).expect("a float");
+    for (shape, root) in [("an on-heap binary", binary), ("a float", float)] {
+        assert!(
+            RuntimeContext::root_is_reference_free(root),
+            "{shape}: the root shape alone proves its graph holds no reference"
+        );
+        notes::reset();
+        assert!(
+            !RuntimeContext::graph_holds_reference(root),
+            "{shape} holds no reference"
+        );
+        assert_eq!(
+            notes::walk_snapshot(),
+            notes::WalkCounts {
+                calls: 0,
+                visits: 0,
+                hash_inserts: 0,
+                spills: 0,
+            },
+            "{shape}: the root test answers, so the walk never starts"
+        );
+    }
+    // The control: a container root is never declined, and it still visits every object under it.
+    let tuple = beam_engine::terms::make_tuple(&mut ctx, &[binary, float]).expect("the tuple fits");
+    assert!(
+        !RuntimeContext::root_is_reference_free(tuple),
+        "a tuple may hold a reference, so the root test must not decline it"
+    );
+    notes::reset();
+    assert!(!RuntimeContext::graph_holds_reference(tuple));
+    assert_eq!(
+        notes::walk_snapshot().calls,
+        1,
+        "a container root still walks"
+    );
+    assert_eq!(
+        notes::walk_snapshot().visits,
+        3,
+        "the tuple and the two leaves it holds are each visited once"
+    );
+}
+/// **A container root is never declined, so a nested reference is still found.**
+///
+/// The whitelist in [`RuntimeContext::root_is_reference_free`] is positively enumerated: only the
+/// shapes whose children cannot be a reference answer `true`. A cons cell (whose car/cdr may be
+/// anything), a tuple, a record, a map and a **reference itself** all answer `false` and are
+/// walked, which is what keeps the copy-out's "never move a reference" rule intact — a skipped
+/// walk would move the reference and silently break every timer/monitor it names.
+#[test]
+fn a_container_root_is_never_declined_so_a_nested_reference_is_still_found() {
+    let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
+    // `internal_reference` writes over the heap's whole used prefix, so it must come first.
+    let reference = internal_reference(&mut heap, 9);
+    let tuple = heap.tuple(&[reference]).expect("the tuple fits");
+    let list = heap
+        .cons(reference, beam_term::prelude::NIL)
+        .expect("the cell fits");
+    assert!(
+        !RuntimeContext::root_is_reference_free(reference),
+        "a reference is exactly the shape the walk exists to find"
+    );
+    for (shape, root, visits) in [
+        ("a tuple", tuple, 2),
+        ("a cons cell", list, 2),
+    ] {
+        assert!(
+            !RuntimeContext::root_is_reference_free(root),
+            "{shape} may lead to a reference, so the root test must not decline it"
+        );
+        notes::reset();
+        assert!(
+            RuntimeContext::graph_holds_reference(root),
+            "{shape}: the nested reference is found"
+        );
+        assert_eq!(notes::walk_snapshot().calls, 1, "{shape} is walked");
+        assert_eq!(
+            notes::walk_snapshot().visits,
+            visits,
+            "{shape}: the root object and the reference block under it"
+        );
+    }
+}
+/// **A binary-rooted result is re-homed with no walk** — the `etf_roundtrip` half this change moves.
+///
+/// `term_to_binary/1` returns a binary (`etf_roundtrip/1`'s `B = term_to_binary(T)`), i.e. exactly
+/// the root shape the walk now declines. Three properties are pinned together, because the skip is
+/// only sound if the *copy-out* still happens: the walk never starts, the result is nevertheless a
+/// collectable copy on the process heap (the same bytes), and the pool is rewound to the call's own
+/// mark — a skipped walk must never turn into a skipped copy or a leaked pool window.
+#[test]
+fn a_binary_rooted_result_is_re_homed_with_no_walk() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    // Read through the context's own runtime handle: `ctx` mutably borrows `rt`.
+    let pool_used = |rt: &crate::runtime::Runtime| {
+        rt.bif_heaps
+            .last()
+            .expect("the pool keeps its region")
+            .used()
+    };
+    let pool_before = pool_used(ctx.runtime);
+    notes::reset();
+    let image = ctx
+        .call_bif("erlang", "term_to_binary", 1, &[make_small(7)])
+        .expect("term_to_binary/1 of a small integer");
+    assert_eq!(
+        notes::walk_snapshot(),
+        notes::WalkCounts {
+            calls: 0,
+            visits: 0,
+            hash_inserts: 0,
+            spills: 0,
+        },
+        "a binary root answers the root test, so the reference walk never runs"
+    );
+    assert_eq!(
+        notes::snapshot(),
+        (1, 0, 1),
+        "the copy-out still ran once on the empty-destination fast path"
+    );
+    assert_eq!(
+        beam_engine::terms::binary_bytes(image).expect("a binary result"),
+        &[131u8, 97, 7][..],
+        "the re-homed result carries the ETF image (VERSION_MAGIC, SMALL_INTEGER_EXT, 7)"
+    );
+    assert_eq!(
+        pool_used(ctx.runtime),
+        pool_before,
+        "a successful copy-out rewinds the pool to its own mark"
+    );
+}
+/// **The worklist's inline buffer is uninitialised but still LIFO across the spill boundary.**
+///
+/// [`Walklist`] used to fill its 64 inline slots with `Eterm::default()` (512 bytes of `NIL`) on
+/// every walk; it now hands out `MaybeUninit` slots and lets `len` alone decide which are live.
+/// This is the property that keeps the change honest: every pushed term comes back out in reverse
+/// push order — the last spill entry first, then the spill backwards, then the inline buffer — and
+/// an exhausted worklist answers `None` instead of reading a slot it never wrote.
+#[test]
+fn the_walk_worklist_keeps_lifo_order_across_the_inline_to_spill_boundary() {
+    let pushed = WALK_INLINE_ITEMS + 36;
+    let mut work = Walklist::new();
+    notes::reset();
+    for index in 0..pushed {
+        work.push(make_small(index as i64));
+    }
+    assert_eq!(
+        notes::walk_snapshot().spills,
+        36,
+        "only the entries past the inline buffer spill"
+    );
+    let mut popped = Vec::with_capacity(pushed);
+    while let Some(item) = work.pop() {
+        popped.push(item);
+    }
+    let expected: Vec<Eterm> = (0..pushed).rev().map(|index| make_small(index as i64)).collect();
+    assert_eq!(
+        popped, expected,
+        "every entry comes back in reverse push order: spill backwards, then the inline buffer"
+    );
+    assert!(
+        work.pop().is_none(),
+        "an exhausted worklist answers `None` rather than reading a stale slot"
+    );
+}

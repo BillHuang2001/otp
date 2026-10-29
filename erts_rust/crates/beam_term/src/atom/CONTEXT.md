@@ -8,11 +8,13 @@ own copy-on-write container:
 
 - **index → name** (which name does `Atom(i)` denote?) — `NameChunks`, a list of fixed-capacity
   `NameChunk`s. O(1) random access, and an append never renumbers an existing index.
-- **name → index** (which index does `"ok"` have?) — `IndexShards`, the map hash-sharded into
+- **name → index** (which index does `"ok"` have?) — `IndexShards`, the index hash-sharded into
   `INDEX_SHARDS` independent shards, so an append copies one shard (about `len / INDEX_SHARDS`
-  entries) instead of the whole bucket array. The shard array itself is the other half of that
-  trade — `8 · INDEX_SHARDS` B per non-empty table — so the shard count has an interior optimum;
-  the cost model below states it.
+  entries) instead of the whole slot array. Each shard is an open-addressed probe table keyed by
+  the name's probe **tag** (the high 32 bits of its hash), so one `hash_of` per lookup serves the
+  shard choice *and* the probe. The
+  shard array itself is the other half of that trade — `8 · INDEX_SHARDS` B per non-empty table —
+  so the shard count has an interior optimum; the cost model below states it.
 
 Each direction sits behind exactly one `Arc`, which is what makes `AtomTable::fork` two `Arc`
 clones (zero allocations) instead of a `Vec::clone` plus a `HashMap::clone` (the boot's largest
@@ -27,7 +29,7 @@ allocation pins can derive their budget instead of hard-coding a slack.
 - `pub const NAMES_PER_CHUNK: usize = 128` — names per `NameChunk`; also the `names%` modulus that
   turns an index into `(chunk, slot)`.
 - `pub const INDEX_SHARDS: usize = 1024` — the shard count; **must** be a power of two (a
-  `const` assertion pins it, because `shard_of` masks with `INDEX_SHARDS - 1`). Chosen by the
+  `const` assertion pins it, because `shard_of_hash` masks with `INDEX_SHARDS - 1`). Chosen by the
   boot measurement in the cost model, not by the copy granularity alone: the array it sizes grows
   with `INDEX_SHARDS`, the shard clone it avoids shrinks with it.
 - `NameChunk { names: Vec<Arc<str>> }` — `with_capacity()`, `push(Arc<str>)` (keeps a full chunk's
@@ -36,13 +38,28 @@ allocation pins can derive their budget instead of hard-coding a slack.
 - `NameChunks { chunks: Option<Arc<Vec<Arc<NameChunk>>>> }` — `new()`, `fork()`, `len()`,
   `get(index) -> Option<&str>`, `push(Arc<str>) -> u32` (**the only mutating path**, returns the
   index it took), `reserve_names(total)`; test-only `container_ptr()`/`name_arc(index)`.
-- `IndexShard { map: HashMap<Arc<str>, Atom> }` — one shard's map (`Clone` is required:
-  `IndexShards::insert` detaches a shared shard with `Arc::make_mut`).
+- `IndexShard` — one shard's **open-addressed, linear-probing** table: `slots: Vec<Option<Entry>>`
+  (`len()` a power of two, or `0`) + `len: usize`, where
+  `Entry { tag: u32, atom: Atom, name: Arc<str> }` is **24 B** (`Option<Entry>` too, via the `Arc`
+  pointer's niche). Empty state is `Vec::new()`, so a shard allocates nothing until its first insert
+  (which allocates the one slot buffer, `MIN_CAPACITY = 8`, i.e. 192 B); plain probing to the first
+  `None` is correct because there is no delete path. `Clone` is required
+  (`IndexShards::insert` detaches a shared shard with `Arc::make_mut`) and is a **deep** copy — one
+  fresh name string per entry plus one slot buffer, i.e. the same shape the `HashMap` had, which is
+  what the siblings' Θ(N) clone controls measure.
+  The `tag` is only a **filter** for the probe: the authoritative comparison is always the full byte
+  compare of `name`, so two names whose tags collide cost one extra compare and are never
+  confused (`a_tag_collision_between_two_names_is_slow_but_never_wrong`). The 24 B shape is pinned
+  by `const` assertions in `store.rs`.
 - `IndexShards` (`shards: Option<Arc<[Option<Arc<IndexShard>>; INDEX_SHARDS]>>`) — `new()`,
   `fork()`, `get(&str) -> Option<Atom>`, `insert(Arc<str>, Atom)` (**the only mutating path**),
-  `entries()` (Σ shard `map.len()`, O(`INDEX_SHARDS`), debug-only use); test-only `container_ptr()`.
-- `shard_of(&str) -> usize` — FNV-1a 64 over the name bytes, then the splitmix64 finalizer, masked
-  to the shard count.
+  `entries()` (Σ shard `len`, O(`INDEX_SHARDS`), debug-only use); test-only `container_ptr()`.
+- `hash_of(&str) -> u64` — FNV-1a 64 over the name bytes, then the splitmix64 finalizer.
+  `shard_of_hash(u64) -> usize` — the low bits masked to the shard count; `shard_of(&str)` is the
+  composition (test-only: the live paths reach it through `shard_of_hash` so they keep the hash).
+  `tag_of(u64) -> u32` — the hash's **high** 32 bits: the stored `Entry.tag` and the probe slot's
+  input. `probe_index(u32, mask) -> usize` — the tag masked to the shard's slot count (the low hash
+  bits are the shard's, so every entry of one shard shares them).
 
 ## Constraints
 - **Indices are the observable identity.** `chunks[i][j]` names `Atom(i * NAMES_PER_CHUNK + j)`,
@@ -54,7 +71,8 @@ allocation pins can derive their budget instead of hard-coding a slack.
   container the other side of a fork can see — that is the whole isolation guarantee.
 - **`shard_of` is a pure function of the name bytes** (no seed, no table state, no allocation), so
   a fork and its parent — and any number of fork generations — agree on where a name lives without
-  coordinating.
+  coordinating. The same holds for `hash_of`/`shard_of_hash`/`tag_of`/`probe_index`, which is what
+  lets the probe slot be a pure function too (a seeded hasher could not be).
 - `NAMES_PER_CHUNK` and `INDEX_SHARDS` are **tuning constants, not contracts**: `NAMES_PER_CHUNK`
   moves the copy granularity, `INDEX_SHARDS` the shard granularity, and no caller may depend on
   either value (the two `pub` constants exist only for the allocation-budget arithmetic).
@@ -68,8 +86,22 @@ allocation pins can derive their budget instead of hard-coding a slack.
   block), so the array's `8 · INDEX_SHARDS` bytes move bytes rather than allocation *count*;
   measured at **9 allocations** for a fork-then-intern at 300 atoms and **10** at 3 000
   (`../../../tests/intern_alloc.rs`, case (f), which pins the bound as flat — budget 11).
-- `get`/`len`/`insert` — one shard hash plus one map probe; `len` is O(1) (`split_last` of the
-  chunk list).
+- `get`/`len`/`insert` — **one** `hash_of` per call, serving both the shard mask (low bits via
+  `shard_of_hash`) and the in-shard probe tag/slot (high bits via `tag_of`), plus one probe. (A
+  `HashMap<Arc<str>, Atom>` could not reuse it: `RandomState`'s
+  SipHash is per-process seeded state, re-derived for every lookup, and it compares keys through an
+  `Arc<str>` deref. This was the single hottest symbol on `copy_bound/etf_roundtrip`.) `len` is
+  O(1) (`split_last` of the chunk list). The probe table grows at a 3/4 load factor (exact test
+  `4·len >= 3·cap`), doubling the power-of-two slot count and re-placing entries from their
+  **stored** tags — never by re-hashing a string.
+- **An entry is 24 B, not 32.** The stored hash is only ever a probe filter, so the entry keeps its
+  **high 32 bits** (`tag`) instead of all 64: `Entry { tag: u32, atom: Atom, name: Arc<str> }`, and
+  `Option<Entry>` inherits the same 24 B through the `Arc` niche. That makes `MIN_CAPACITY = 8` a
+  192 B slot buffer and a 16-slot boot shard 384 B — at or below the `HashMap` bucket array it
+  replaced (the 32 B entry measured 131 072 B of shard slots against 60 472 B of buckets at the boot
+  peak, worth ~+0.8 MiB peak RSS; the 24 B entry removes it). A tag collision is **slow, never
+  wrong**: the byte compare is authoritative, and the `const` size assertions in `store.rs` plus
+  `a_tag_collision_between_two_names_is_slow_but_never_wrong` pin both halves.
 - **The shard array is the second term of the trade.** A non-empty table's `shards` block is
   `8 · INDEX_SHARDS` B (8 KB at 1024), and it is *retained* by every table whose array has diverged
   from its parent — i.e. by every loaded module's `fork` on its first intern — as well as
@@ -88,7 +120,18 @@ allocation pins can derive their budget instead of hard-coding a slack.
   pointer identity are unchanged, and `system_info(atom_count)`, `maps:to_list`, `phash2`,
   `term_to_binary` and `code:all_loaded` are byte-identical to the oracle's.
 
+## Measured effect (the probe table, on `copy_bound/etf_roundtrip`)
+The decode side interns/looks up **6 names per op** (`beam_codec`'s `atom_term` → `AtomTable::lookup`), which is why this module was the second-largest block of that row.
+Pairs are `rt-before` vs `rt-after` (the same tree plus this module's probe table), release build, interleaved rounds, `taskset -c 5`; the host was shared and heavily loaded (loadavg 190–510), so the **retired-instruction** column is the evidence and the wall column is directional only.
+- Retired user instructions per op (`perf stat -e instructions:u`, median of 5 rounds, each `(N=20 000 − N=0)`): `etf_roundtrip` **20 466 → 18 998 (−7.2 %)**; `ets_copy` 19 201 → 18 990 (−1.1 %); `send_recv` **65 916 → 64 342 (−2.4 %)**; `send_recv_plain` 31 783 → 31 667 (−0.4 %).
+- Cross-check by callgrind `totals:` (deterministic, independent of `perf`'s counter group): `etf_roundtrip` 20 507 → 19 080 Ir/op (−7.0 %); `send_recv` 66 570 → 64 560 (−3.0 %). The two methods agree to 0.2–0.6 %.
+- Wall clock, same pairing (median `ns/op`): `etf_roundtrip` **−10.7 %** on a quiet host (loadavg 25→42) and −22.5 % under loadavg 194→292 (rounds spanning 1 453–4 408 ns/op — directional); `send_recv` −10.7 % / −9.9 %; `ets_copy` and `send_recv_plain` within the round-to-round swing.
+- The wall delta exceeds the instruction delta because the probe also touches less memory: one hash per lookup instead of two, no per-lookup seeded-state derivation, and a 24 B slot instead of a 400 B bucket array — a cycles win that retired instructions cannot show.
+- The 24 B entry left a **+496 KiB** boot peak-RSS residual (`beam_rt -noshell -eval 'halt().'`: 60 328 → 60 824 KiB, min of 9 interleaved runs) against the `HashMap` bucket array it replaced, down from +996 KiB at a 32 B entry. It is the one honest cost of the change; `MIN_CAPACITY` is the knob.
+- **Nothing renumbers.** A name's index is still `names.len()` at intern time and no path here touches it; `shard_of_hash`/`hash_of` are unchanged, so a name lives in the same shard as before, the shard-count memory balance and the fork/COW isolation are unchanged, and the tag is a filter over the same bytes. `system_info(atom_count)`, `atom_to_list` numbering, `maps:to_list` order, `phash2` and `term_to_binary` bytes are therefore identical — which is what the compatibility gate's `terms`/`atoms`/`codec`/`wire`/`system_info` families re-check.
+- Next lever (not taken): `hash_of` is byte-at-a-time FNV-1a. Its values are not observable (only shard/probe placement is), so a word-at-a-time mix would cut the remaining per-lookup cost — but it moves every name's shard, so it needs its own footprint measurement, not a drive-by change.
+
 ## Routing Table
 - `store.rs` → `NAMES_PER_CHUNK`, `INDEX_SHARDS`, `NameChunk`, `NameChunks`, `IndexShard`,
-  `IndexShards`, `shard_of`; consumed only by `../atom.rs` (`AtomTable`) and, for the two
-  constants, by `../../../tests/intern_alloc.rs`.
+  `IndexShards`, `hash_of`/`shard_of`/`shard_of_hash`/`tag_of`/`probe_index`; consumed only by
+  `../atom.rs` (`AtomTable`) and, for the two constants, by `../../../tests/intern_alloc.rs`.

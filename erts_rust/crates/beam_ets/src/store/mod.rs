@@ -115,6 +115,16 @@ const FREE_RUN_BUCKETS: usize = 32;
 /// unbounded number of buffers.
 const SPARE_RUN_BUFFERS: usize = 4;
 
+/// How many **intact** freed run lists the store keeps for replay.
+///
+/// A table that churns objects of one shape frees the previous object and copies
+/// the next one back to back, so keeping the freed list as it was lets the next
+/// copy re-write the *same* words in the *same* order ([`TermStore::plan`]) with
+/// no per-node bucket traffic at all. One list covers that alternating pair; a
+/// few more cover a burst (an `insert_list`, several objects freed by one
+/// delivery) without letting a mass deletion pin an unbounded number of them.
+const RECYCLABLE_LISTS: usize = 4;
+
 /// The hasher behind [`TermStore::tracked`].
 ///
 /// The keys are the store's **own** object roots: addresses it minted while
@@ -261,13 +271,29 @@ pub struct TermStore {
     /// bucketed by their exact word count. A long run is a big tuple/bignum, so this
     /// list holds very few entries and its scan stays off the hot path.
     large_free_runs: Vec<(usize, Vec<AllocSlice>)>,
-    /// The runs the [`TermStore::copy`] call currently in progress has allocated.
-    /// Drained when it completes (into `tracked`) or fails (back to `free_runs`).
-    pending: Vec<AllocSlice>,
-    /// Drained run-list buffers taken out of `tracked` by [`TermStore::free`] /
-    /// [`TermStore::relinquish`] and recycled as the next [`TermStore::copy`]'s
-    /// `pending`, so a per-op copy never regrows one from capacity 0 (6
-    /// reallocations per `ets:insert` on the copy-bound workload before this).
+    /// During a [`TermStore::copy`] call: the runs the object being built has
+    /// consumed, in allocation order — `plan[0..plan_used]` — followed by the
+    /// **unconsumed candidate suffix** when the copy started from a recycled run
+    /// list (`plan[plan_used..]`).
+    ///
+    /// Replaying a recycled list in order is what makes a same-shaped upsert
+    /// allocation-free: each node's run is already the exact fit it needs, so
+    /// `plan_used` just advances. A shape change buckets the suffix and switches
+    /// the rest of the copy to the free lists, so the replay is a pure fast path.
+    plan: Vec<AllocSlice>,
+    /// The length of `plan`'s consumed prefix; after any free-list allocation it
+    /// equals `plan.len()` (a push always closes the candidate suffix), so the
+    /// replay test is one compare per node and never rescans.
+    plan_used: usize,
+    /// Run lists of **freed** objects, kept intact and in order for the next
+    /// [`TermStore::copy`] to replay (see [`RECYCLABLE_LISTS`]). Their words are
+    /// already subtracted from `live_words`; they are neither live nor in
+    /// [`TermStore::free_runs`], and a copy that cannot replay one buckets it.
+    recyclable: Vec<Vec<AllocSlice>>,
+    /// Drained run-list buffers taken out of `tracked` by
+    /// [`TermStore::relinquish`] (whose runs must never be reused) and by a rolled
+    /// back copy, recycled as the next [`TermStore::copy`]'s `plan`, so a per-op
+    /// copy never regrows one from capacity 0.
     spare_runs: Vec<Vec<AllocSlice>>,
     /// The runs backing every live object, keyed by the root [`TermStore::copy`]
     /// returned for it — the handle [`TermStore::free`] is given. An object whose
@@ -283,7 +309,8 @@ pub struct TermStore {
 // across threads is a plain address reinterpretation with no thread-affine state
 // to rebind or invalidate. Every field is plain data — `StoreBlock { base:
 // NonNull<Eterm>, capacity, used }`, the block `Vec`, the `live_words` counter and
-// `free_runs`/`pending`/`tracked` (plain `Vec`s/maps of `AllocSlice`/`Eterm`) — and
+// `free_runs`/`large_free_runs`/`plan`/`recyclable`/`tracked` (plain
+// `Vec`s/maps of `AllocSlice`/`Eterm`) — and
 // none of them is thread-affine: no TLS handle, no file descriptor, no `Rc`, no
 // `Cell`. `base` points into a block allocated through the store's own
 // `AllocRef = Arc<dyn Allocator>`, and `beam_alloc::Allocator` is declared
@@ -325,7 +352,9 @@ impl TermStore {
             live_words: 0,
             free_runs: Vec::new(),
             large_free_runs: Vec::new(),
-            pending: Vec::new(),
+            plan: Vec::new(),
+            plan_used: 0,
+            recyclable: Vec::new(),
             spare_runs: Vec::new(),
             tracked: RunMap::default(),
         }
@@ -350,36 +379,39 @@ impl TermStore {
     /// [`beam_term::compare::cmp`] states (a `Eterm` is a raw machine word, so no
     /// safe function can re-check it).
     pub fn copy(&mut self, root: Eterm) -> Result<Eterm> {
-        debug_assert!(
-            self.pending.is_empty(),
-            "a previous `copy` left its runs pending"
+        debug_assert_eq!(
+            self.plan_used, 0,
+            "a previous `copy` left its run list unconsumed"
         );
-        // `pending` is a **recycled** buffer: prefer the one it already holds, else
-        // any spare the last `free`/`relinquish` pooled, else a fresh one. Clearing
-        // keeps the capacity an earlier copy grew, instead of regrowing the run list
-        // from 0 on every op.
-        if self.pending.capacity() == 0 {
-            self.pending = self.take_run_buffer();
-        }
-        self.pending.clear();
+        // Start from the most recently freed object's run list (if any), so a table
+        // churning one shape re-writes the very words it just released — the
+        // per-node bucket round trip disappears. `plan_used` stays 0: the list is a
+        // *candidate*, consumed in order by `alloc_words` only where the shape
+        // matches. Without a candidate, take a pooled empty buffer (keeping the
+        // capacity an earlier copy grew).
+        self.plan = match self.recyclable.pop() {
+            Some(runs) => runs,
+            None => self.take_run_buffer(),
+        };
         match self.copy_term(root) {
             Ok(copied) => {
-                if !self.pending.is_empty() {
+                // A smaller object leaves part of the candidate list unused; those
+                // runs belong to an already-freed object, so they simply go back to
+                // the free lists (never through the live accounting).
+                self.drop_plan_tail();
+                let runs = core::mem::take(&mut self.plan);
+                self.plan_used = 0;
+                if !runs.is_empty() {
                     // Only a boxed/list root can have consumed words, so this is
                     // exactly the "the object owns storage" case.
-                    let buffer = self.take_run_buffer();
-                    let runs = core::mem::replace(&mut self.pending, buffer);
                     self.tracked.insert(copied, runs);
                 }
                 Ok(copied)
             }
             Err(err) => {
                 // The partial copy is unreachable — its root was never handed to a
-                // caller — so return its runs instead of leaking them. `release_all`
-                // recycles the drained buffer, which `pending` takes straight back.
-                let runs = core::mem::take(&mut self.pending);
-                self.release_all(runs);
-                self.pending = self.take_run_buffer();
+                // caller — so its runs are returned instead of leaking them.
+                self.abort_plan();
                 Err(err)
             }
         }
@@ -404,9 +436,33 @@ impl TermStore {
     /// from its interior in the same step.
     pub fn free(&mut self, root: Eterm) -> usize {
         match self.tracked.remove(&root) {
-            Some(runs) => self.release_all(runs),
+            Some(runs) => self.retire(runs),
             None => 0,
         }
+    }
+
+    /// Reclaims a dead object's run list: subtracts its words from the live count
+    /// and keeps the list **intact** for the next copy to replay, or returns every
+    /// run to its free bucket once [`RECYCLABLE_LISTS`] lists are already held.
+    ///
+    /// Keeping a list intact costs no per-run work (one move), and a copy that
+    /// cannot use it pays only one size compare before bucketing it, so the pool
+    /// is never a place runs can get stuck.
+    fn retire(&mut self, mut runs: Vec<AllocSlice>) -> usize {
+        let words: usize = runs.iter().map(|run| run.words).sum();
+        self.live_words = self
+            .live_words
+            .checked_sub(words)
+            .expect("a retired run was counted live when it was handed out");
+        if self.recyclable.len() < RECYCLABLE_LISTS {
+            self.recyclable.push(runs);
+        } else {
+            for run in runs.drain(..) {
+                self.bucket_run(run);
+            }
+            self.recycle_run_buffer(runs);
+        }
+        words
     }
 
     /// Hands the storage of the object whose root [`copy`](TermStore::copy)
@@ -466,7 +522,9 @@ impl TermStore {
         self.live_words = 0;
         self.free_runs.clear();
         self.large_free_runs.clear();
-        self.pending.clear();
+        self.plan.clear();
+        self.plan_used = 0;
+        self.recyclable.clear();
         self.spare_runs.clear();
         self.tracked.clear();
     }
@@ -505,7 +563,27 @@ impl TermStore {
     /// A run returned by [`free`](TermStore::free) is preferred over bumping, but a
     /// run is only ever accepted when it is **exactly** `n` words long, so no live
     /// word is ever overwritten.
+    #[inline]
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        // Fast path: replay the next run of the recycled list. `plan_used <
+        // plan.len()` holds only while `plan` is still a *candidate* list (a
+        // free-list push always advances `plan_used` to the end), so this test runs
+        // at most once per node and never rescans.
+        if let Some(&run) = self.plan.get(self.plan_used) {
+            if run.words == n {
+                self.plan_used += 1;
+                self.live_words += n;
+                // SAFETY: `run` was handed out of one of this store's blocks by an
+                // earlier `copy` and then returned by `free`/`retire`, whose run
+                // lists are the only source of `plan` candidates — so no live term
+                // aliases it, and `base + offset` addresses live storage (blocks are
+                // freed only by `reset`/`Drop`, which drop every run list first).
+                return Ok(unsafe { self.run_addr(run) });
+            }
+            // The shapes diverged: this candidate list cannot serve the rest of the
+            // copy, so bucket what is left of it and allocate from the free lists.
+            self.drop_plan_tail();
+        }
         // Reuse path: a freed run of exactly `n` words. Only `free` puts runs here,
         // so the run is not live and cannot alias any term still in use.
         if let Some(run) = self.take_free_run(n) {
@@ -592,12 +670,50 @@ impl TermStore {
         run
     }
 
-    /// Counts a reserved run live and records it for the
+    /// Counts a reserved run live and records it as part of the
     /// [`copy`](TermStore::copy) in progress, so that a completed copy can hand the
-    /// run to [`free`](TermStore::free).
+    /// run list to [`free`](TermStore::free).
+    ///
+    /// The push always closes the candidate suffix (`plan_used` jumps to the end),
+    /// which is what keeps [`alloc_words`](TermStore::alloc_words)'s replay test
+    /// from ever re-examining a run it just pushed.
     fn commit(&mut self, run: AllocSlice) {
         self.live_words += run.words;
-        self.pending.push(run);
+        self.plan.push(run);
+        self.plan_used = self.plan.len();
+    }
+
+    /// Returns the still-unconsumed candidate suffix of [`plan`](TermStore::plan) to
+    /// its free buckets.
+    ///
+    /// Those runs belong to an object that was already freed (that is what put them
+    /// on the recyclable list), so they are *not* live and the live accounting must
+    /// not move: this is [`bucket_run`](TermStore::bucket_run), not `release`.
+    fn drop_plan_tail(&mut self) {
+        while self.plan.len() > self.plan_used {
+            let run = self
+                .plan
+                .pop()
+                .expect("the loop condition reads `plan.len()`");
+            self.bucket_run(run);
+        }
+    }
+
+    /// Rolls back a failed [`copy`](TermStore::copy): the consumed prefix is a
+    /// partial copy nothing references, so it is released (live accounting
+    /// included); the un-consumed suffix belongs to an already-dead object, so it is
+    /// only bucketed. The drained buffer is pooled for the next copy.
+    fn abort_plan(&mut self) {
+        let mut buffer = core::mem::take(&mut self.plan);
+        let used = core::mem::replace(&mut self.plan_used, 0);
+        for (i, run) in buffer.drain(..).enumerate() {
+            if i < used {
+                self.release(run);
+            } else {
+                self.bucket_run(run);
+            }
+        }
+        self.recycle_run_buffer(buffer);
     }
 
     /// Returns a committed run to the free lists, for reuse by a later
@@ -629,21 +745,8 @@ impl TermStore {
         }
     }
 
-    /// Returns **every** run of one object to the free lists in a single pass, and
-    /// recycles the drained list so the next [`copy`](TermStore::copy) can use its
-    /// buffer instead of allocating one. Reports the number of words reclaimed.
-    fn release_all(&mut self, mut runs: Vec<AllocSlice>) -> usize {
-        let mut words = 0;
-        for run in runs.drain(..) {
-            words += run.words;
-            self.release(run);
-        }
-        self.recycle_run_buffer(runs);
-        words
-    }
-
     /// The buffer the next [`copy`](TermStore::copy) records its runs in: a recycled
-    /// one when the store has a spare, else a fresh (empty) one.
+    /// (empty) one when the store has a spare, else a fresh one.
     fn take_run_buffer(&mut self) -> Vec<AllocSlice> {
         self.spare_runs.pop().unwrap_or_default()
     }
@@ -672,6 +775,116 @@ impl TermStore {
         unsafe { self.blocks[run.block].base.as_ptr().add(run.offset) }
     }
 
+    /// Copies a **child** term — the fast path almost every node actually needs.
+    ///
+    /// Most subterms of a real object are immediates (small ints, atoms, `NIL`),
+    /// whose "copy" is the word itself, and a full [`copy_term`](TermStore::copy_term)
+    /// call costs a stack frame plus six callee-saved register saves for that
+    /// answer. Inlining the immediate test at the child site keeps those words off
+    /// the call path entirely; only a boxed or cons-cell child recurses.
+    #[inline]
+    fn copy_elem(&mut self, term: Eterm) -> Result<Eterm> {
+        if is_immediate(term) {
+            // Small ints, atoms, `NIL`, catch terms and internal pid/ports carry
+            // their value in the word itself — nothing to copy.
+            return Ok(term);
+        }
+        self.copy_term(term)
+    }
+
+    /// Copies a **non-empty** proper-list spine as one contiguous run of 2-word
+    /// cells, filled in a single forward pass.
+    ///
+    /// A recycled candidate run sitting at the current plan position is, in the
+    /// steady state, exactly this spine's run from the previous copy of the same
+    /// object — the shape repeats, so the run is `2 * cells` words — and that makes
+    /// the cell count **free**: the run's own word count is the answer, so the walk
+    /// that used to count the cells before reserving them disappears entirely
+    /// (it was a second dependent-load pass over the whole spine, and the single
+    /// hottest loop in `ets_copy`'s insert).
+    ///
+    /// The hint is only ever a hint: a shorter spine stops the fill early and hands
+    /// the surplus words back to the free buckets, a longer one keeps walking with
+    /// the remaining terms copied as the tail. Both are the same two-pass result.
+    fn copy_spine(&mut self, term: Eterm) -> Result<Eterm> {
+        let hinted = match self.plan.get(self.plan_used) {
+            Some(&run) if run.words >= 2 && run.words % 2 == 0 => Some(run),
+            _ => None,
+        };
+        let cells = match hinted {
+            Some(run) => run.words / 2,
+            None => {
+                let mut cells = 0usize;
+                let mut src = term;
+                while is_list(src) {
+                    cells += 1;
+                    // SAFETY: `src` is a live `TAG_PRIMARY_LIST` cons cell (a 2-word
+                    // `[CAR, CDR]`), so its second word is the tail term.
+                    src = unsafe { cdr(src) };
+                }
+                cells
+            }
+        };
+        // The spine's words are reserved before any element is copied, which is sound
+        // because blocks are never moved — a nested copy cannot invalidate `p`.
+        let p = match hinted {
+            // SAFETY: a plan candidate names words inside one of this store's blocks
+            // (it came out of `alloc_words` and back through `free`), and a block is
+            // freed only by `reset`/`Drop`, which discard the plan first.
+            Some(run) => unsafe { self.run_addr(run) },
+            None => self.alloc_words(cells * 2)?,
+        };
+        let mut cell = p;
+        let mut src = term;
+        let mut used = 0usize;
+        while used < cells && is_list(src) {
+            // SAFETY: `src` is a live cons cell — both of its words are readable.
+            let (head, next) = unsafe { (car(src), cdr(src)) };
+            src = next;
+            let head = self.copy_elem(head)?;
+            // SAFETY: `cell` is the `used`-th of the reserved 2-word slots.
+            unsafe { *cell.add(CAR_OFFSET) = head };
+            used += 1;
+            if used < cells {
+                // SAFETY: slot `used` exists inside the run, so the next cell's
+                // address is inside it too.
+                let next_cell = unsafe { cell.add(2) };
+                // SAFETY: the CDR slot of this cell is inside the run.
+                unsafe { *cell.add(CDR_OFFSET) = make_list(next_cell) };
+                cell = next_cell;
+            }
+        }
+        if let Some(run) = hinted {
+            if used == cells {
+                self.plan_used += 1;
+                self.live_words += run.words;
+            } else {
+                // The hint overshot: keep exactly the `2 * used` words that hold the
+                // spine and hand the surplus back. `run` came from a freed object, so
+                // the surplus is dead storage — bucket it, do not release it.
+                let keep = AllocSlice {
+                    words: used * 2,
+                    ..run
+                };
+                let rest = AllocSlice {
+                    offset: run.offset + keep.words,
+                    words: run.words - keep.words,
+                    ..run
+                };
+                self.plan[self.plan_used] = keep;
+                self.bucket_run(rest);
+                self.plan_used += 1;
+                self.live_words += keep.words;
+            }
+        }
+        // The spine ends at an improper tail (`NIL`, a non-list term, or the rest of a
+        // longer list the hint did not cover); it is deep-copied and hung off the last
+        // cell.
+        let tail = self.copy_elem(src)?;
+        // SAFETY: the last cell's CDR slot is inside the run.
+        unsafe { *cell.add(CDR_OFFSET) = tail };
+        Ok(make_list(p as *const Eterm))
+    }
     /// The recursive core of [`TermStore::copy`].
     fn copy_term(&mut self, term: Eterm) -> Result<Eterm> {
         if is_immediate(term) {
@@ -696,17 +909,7 @@ impl TermStore {
             return Ok(term);
         }
         if is_list(term) {
-            // SAFETY: a `TAG_PRIMARY_LIST` word is a live, 2-word `[CAR, CDR]` cell.
-            let (car, cdr) = unsafe { (car(term), cdr(term)) };
-            let car = self.copy_term(car)?;
-            let cdr = self.copy_term(cdr)?;
-            let p = self.alloc_words(2)?;
-            // SAFETY: `p` addresses 2 freshly reserved, exclusively-owned words.
-            unsafe {
-                *p.add(CAR_OFFSET) = car;
-                *p.add(CDR_OFFSET) = cdr;
-            }
-            return Ok(make_list(p as *const Eterm));
+            return self.copy_spine(term);
         }
         if is_boxed(term) {
             // SAFETY: a boxed word points at a live, aligned header word.
@@ -735,7 +938,7 @@ impl TermStore {
                     // SAFETY: `term` is a live tuple of `arity` elements, so `i` is
                     // within its payload.
                     let elem = unsafe { tuple_element(term, i) };
-                    let elem = self.copy_term(elem)?;
+                    let elem = self.copy_elem(elem)?;
                     // SAFETY: element slot `1 + i` is inside the `arity + 1` words.
                     unsafe { *p.add(1 + i) = elem };
                 }
@@ -823,13 +1026,13 @@ impl TermStore {
         }
         // SAFETY: word `2` of a flat-map block is the keys tuple term.
         let keys = unsafe { *boxed_val(term).add(2) };
-        let keys = self.copy_term(keys)?;
+        let keys = self.copy_elem(keys)?;
         // SAFETY: the keys slot is inside the freshly reserved block.
         unsafe { *p.add(2) = keys };
         for i in 0..n {
             // SAFETY: value slot `3 + i` is inside the source's `n + 3` words.
             let value = unsafe { *boxed_val(term).add(3 + i) };
-            let value = self.copy_term(value)?;
+            let value = self.copy_elem(value)?;
             // SAFETY: the value slot is inside the reserved block.
             unsafe { *p.add(3 + i) = value };
         }
@@ -863,7 +1066,7 @@ impl TermStore {
             // SAFETY: slot `off` lies inside the source node's `words` words.
             let slot = unsafe { *src.add(off) };
             let slot = if is_list(slot) {
-                self.copy_term(slot)?
+                self.copy_elem(slot)?
             } else if is_boxed_term(slot) {
                 // SAFETY: a non-leaf slot is a live sub-node or collision tuple.
                 let shdr = unsafe { *boxed_val(slot) };
@@ -895,7 +1098,7 @@ impl TermStore {
         for i in 0..num_free {
             // SAFETY: `env[i]` lives at `1 + desc + i` inside the source fun block.
             let var = unsafe { *boxed_val(term).add(1 + desc + i) };
-            let var = self.copy_term(var)?;
+            let var = self.copy_elem(var)?;
             // SAFETY: the environment slot is inside the reserved block.
             unsafe { *p.add(1 + desc + i) = var };
         }

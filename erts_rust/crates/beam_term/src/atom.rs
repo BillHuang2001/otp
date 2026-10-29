@@ -235,7 +235,7 @@ impl AtomTable {
 
     /// Assert the table's structural invariant: exactly one index entry per interned name.
     ///
-    /// `O(store::INDEX_SHARDS)` (one `HashMap::len` per shard), so it is called only from the two
+    /// `O(store::INDEX_SHARDS)` (one entry count per shard), so it is called only from the two
     /// whole-table constructors — never from `intern`, whose hot path must stay O(1).
     #[inline]
     fn debug_check(&self) {
@@ -301,6 +301,11 @@ impl AtomTable {
     /// removal, renaming or reordering API. `intern` therefore bumps the generation
     /// (see [`AtomTable::generation`]) by exactly one for a newly interned name, and
     /// not at all for a name that is already present — no mutation can bypass the bump.
+    ///
+    /// Inlined because the already-present case *is* [`AtomTable::lookup`]: a warm decode
+    /// interns every atom it sees and takes the early return below on all of them, so the
+    /// probe must compile into the caller as one hash → shard → slot sequence.
+    #[inline]
     pub fn intern(&mut self, name: &str) -> Atom {
         if let Some(atom) = self.index.get(name) {
             return atom;
@@ -386,6 +391,11 @@ impl AtomTable {
     }
 
     /// Look up an already-interned name.
+    ///
+    /// The single hottest atom operation in the runtime — the ETF decode path calls it once per
+    /// atom reference — so it is `#[inline]`: the whole body is one [`store::hash_of`], one shard
+    /// mask and one probe, and a call frame around that costs more than the work.
+    #[inline]
     pub fn lookup(&self, name: &str) -> Option<Atom> {
         self.index.get(name)
     }

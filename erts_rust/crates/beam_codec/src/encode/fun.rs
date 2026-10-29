@@ -177,8 +177,10 @@ impl<'a> Encoder<'a> {
         self.buf.u32be(0); // placeholder, patched once the body is written
         // `arity`/`num_free` both fit their 8-bit header fields (the layout enforced
         // that when the term was built), so these casts cannot truncate.
-        self.buf.u8(arity as u8);
-        self.buf.bytes(uniq);
+        //
+        // `[arity][uniq]` is ONE reservation: the arity byte prefixes the 16-byte
+        // block and `head_bytes` inserts no length field between them.
+        self.buf.head_bytes(arity as u8, uniq);
         self.buf.u32be(index);
         self.buf.u32be(num_free as u32);
         self.encode_atom(make_atom(module))?;

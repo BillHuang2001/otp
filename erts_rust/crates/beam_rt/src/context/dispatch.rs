@@ -21,8 +21,9 @@
 //! The dispatch memo and the `uses_*` hook predicates.
 //!
 //! A registered BIF call pays a *prologue* before the implementation runs: one
-//! [`BifRegistry`](beam_bifs::BifRegistry) lookup plus one evaluation of each hook predicate
-//! over `beam_bifs`' `&'static` rosters. [`DispatchMemo`] caches that prologue's answer — the
+//! [`BifRegistry`](beam_bifs::BifRegistry) lookup plus **one**
+//! [`beam_bifs::hook_flags::flags`] probe, whose bits are the answer to every hook question at
+//! once. [`DispatchMemo`] caches that prologue's answer — the
 //! **resolved** implementation *and* the roster — per `(module, function, arity)` on the
 //! context, and [`DispatchHooks`] carries the per-key roster so `call_registered` selects its
 //! arm from one value and then invokes the memoized implementation directly (no second
@@ -33,8 +34,13 @@
 //! [`DispatchAnswer::bif`] *is* `BifRegistry::contains`, i.e. the registered-BIF leg of
 //! [`RuntimeContext::host_serves`], and [`DispatchHooks::fun_caller`] is the fun-applying
 //! verdict both of that seam's fun-apply branches need. So one memo lookup replaces a
-//! registry hash lookup **and** two `beam_bifs` `needs_fun_caller` `binary_search`es per
-//! external call.
+//! registry hash lookup **and** both of the seam's `needs_fun_caller` probes per external
+//! call.
+//!
+//! The twelve `RuntimeContext::uses_*` predicates survive as `#[cfg(test)]` **reference
+//! semantics**: they are the documented reading of one roster bit each, and `roster_tests`
+//! asserts the fetched roster against them key by key, so the one-probe fast path stays equal
+//! to a dozen independent calls (see [`DispatchHooks::of`]).
 
 use beam_bifs::BifFn;
 use beam_engine::terms;
@@ -104,13 +110,16 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
 ///
 /// One **bit** per `uses_*` predicate — i.e. per mutually-exclusive bridge arm plus the two
 /// build gates (`fun_identity`, `memory_hook`) — so [`RuntimeContext::call_registered`] can
-/// select its arm from one value instead of running ten `binary_search`es over
-/// [`beam_bifs`]' `&'static` rosters (each of which is a chain of `bcmp` calls across a crate
-/// boundary, and together the dominant cost of the dispatch prologue).
+/// select its arm from one value, and the whole roster is derived from **one** flag fetch
+/// rather than from a dozen independent probes of [`beam_bifs`]' `&'static` rosters.
 ///
-/// [`DispatchHooks::of`] is the **only** place the predicates are evaluated, and it calls the
-/// same `uses_*` functions the arms are documented against, so the roster can never drift from
-/// what `beam_bifs` routes through each seam. That is also why the twelfth bit
+/// [`DispatchHooks::of`] is the **only** place the roster is derived, and it derives it from
+/// **one** [`beam_bifs::hook_flags::flags`] probe — the same table every `beam_bifs` `needs_*`
+/// predicate is a bit test of — permuted into this type's layout by
+/// [`DispatchHooks::from_flags`]. So the roster cannot drift from what `beam_bifs` routes
+/// through each seam: the twelve `uses_*` predicates it replaced are still the documented
+/// reading of each bit, and `roster_tests` re-evaluates each of them key by key and pins
+/// `of(..) == from_flags(flags(..))`. That is also why the twelfth bit
 /// ([`Self::FUN_CALLER`]) belongs here rather than on its own: it is a `beam_bifs` roster
 /// question, paid once per memo miss, that **two** seam branches would otherwise re-ask per
 /// call.
@@ -132,9 +141,12 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
 ///
 /// # What keeps the roster honest
 ///
-/// * [`DispatchHooks::of`] evaluates the predicates into an array and destructures it
-///   **exhaustively**, so an arm added to (or removed from) the roster changes the array's
-///   length and fails to compile rather than silently missing a bit.
+/// * [`DispatchHooks::of`] is **one** [`beam_bifs::hook_flags::flags`] fetch plus
+///   [`DispatchHooks::from_flags`]'s permutation, and the permutation table carries its own
+///   compile-time guard ([`HOOK_FLAG_PERMUTATION`]: every mapped row distinct and in range, and
+///   the mapped rows exactly this type's twelve), so a seam cannot be dropped or aliased
+///   silently; the runtime half — which seam each row belongs to — is pinned key by key against
+///   the twelve `uses_*` predicates by `roster_tests`.
 /// * [`DispatchHooks::ALL`] lists every named bit and
 ///   [`DispatchHooks::ALL_MASK`] folds it; the `const` assertions right after this type prove
 ///   the bits are pairwise distinct and together fill the low `ALL.len()` bits, so no named bit
@@ -220,7 +232,12 @@ impl DispatchHooks {
     /// the one bit that is a verdict rather than an arm. See [`Self::FUN_CALLER`].
     const ANY_MASK: u16 = Self::ALL_MASK & !Self::FUN_CALLER;
 
-    /// The roster's bit when `on`, nothing otherwise — [`Self::of`]'s only setter.
+    /// The roster's bit when `on`, nothing otherwise — the reference roster the anti-drift test
+    /// (`roster_tests`) builds each `uses_*` predicate's answer with.
+    ///
+    /// Test-only: production code reaches this type through [`Self::from_flags`], whose
+    /// permutation table is the arm selector.
+    #[cfg(test)]
     const fn bit(bit: u16, on: bool) -> u16 {
         if on { bit } else { 0 }
     }
@@ -320,42 +337,68 @@ impl DispatchHooks {
         self.0 & Self::FUN_CALLER != 0
     }
 
-    /// The predicates for `(module, function, arity)`, evaluated once.
+    /// The predicates for `(module, function, arity)`, evaluated once — **one** flag fetch.
     ///
-    /// The roster array and its **exhaustive destructure** are the compile-time guard: adding or
-    /// removing a predicate changes the array's length, which fails to compile here instead of
-    /// silently leaving a new arm with no bit.
+    /// # One probe, not twelve
+    ///
+    /// Every `uses_*` predicate is a full [`beam_bifs::hook_flags::flags`] probe (a bounded-load
+    /// fingerprint plus an open-addressed lookup), so asking twelve of them about the *same* key
+    /// back to back re-probed that key twelve times — the reason `perf` still attributed ~4.7 %
+    /// of a `copy_bound` run's cycles to the probe path after the flag table itself landed. One
+    /// probe answers all fourteen `beam_bifs` questions in one `u16`, so this is now that probe
+    /// plus [`Self::from_flags`]'s pure bit permutation.
+    ///
+    /// # What keeps the roster honest
+    ///
+    /// The permutation is *derived* from the twelve predicates and checked mechanically, twice:
+    ///
+    /// * [`HOOK_FLAG_PERMUTATION`] is verified at **compile time** (every mapped row lands on a
+    ///   distinct in-range [`Self`] bit, and the mapped rows are exactly this type's twelve), so
+    ///   a mis-typed row fails to build rather than losing or aliasing a seam; and
+    /// * `roster_tests::the_one_flag_fetch_agrees_with_every_predicate` re-evaluates each
+    ///   `uses_*` predicate — the reference semantics this function is a fast path for — over a
+    ///   key set spanning all fourteen `beam_bifs` rosters, and
+    ///   `roster_tests::the_permutation_reproduces_the_one_flag_fetch` pins
+    ///   `of(..) == from_flags(beam_bifs::hook_flags::flags(..))` on the same key set.
+    ///
+    /// So the roster still cannot drift from what `beam_bifs` routes through each seam, and no
+    /// `beam_bifs` flag bit can be silently dropped.
+    ///
+    /// # The one deliberate superset
+    ///
+    /// [`Self::FUN_IDENTITY`] is **not** `beam_bifs`' `LOCAL_FUN_IDENTITY` flag alone: the three
+    /// `erlang:fun_info*` keys read the same seam without being in that roster, so
+    /// [`Self::reads_fun_identity_for_introspection`] is OR-ed in after the permutation. It is a
+    /// constant-key string comparison, not a table probe, so it costs the flag path nothing.
     pub(super) fn of(module: &str, function: &str, arity: u32) -> DispatchHooks {
-        let roster = [
-            RuntimeContext::uses_dict(module, function, arity),
-            RuntimeContext::uses_process_hook(module, function, arity),
-            RuntimeContext::uses_nif_loader(module, function, arity),
-            RuntimeContext::uses_record_source(module, function, arity),
-            RuntimeContext::uses_export_gate(module, function, arity),
-            RuntimeContext::uses_send_hook(module, function, arity),
-            RuntimeContext::uses_module_info(module, function, arity),
-            RuntimeContext::uses_persistent_term(module, function, arity),
-            RuntimeContext::uses_runtime_hooks(module, function, arity),
-            RuntimeContext::uses_fun_identity(module, function, arity),
-            RuntimeContext::uses_memory_hook(module, function, arity),
-            RuntimeContext::uses_fun_caller(module, function, arity),
-        ];
-        let [dict, process_hook, nif_loader, record_source, export_gate, send_hook, module_info, persistent_term, runtime_hooks, fun_identity, memory_hook, fun_caller] =
-            roster;
-        DispatchHooks(
-            Self::bit(Self::DICT, dict)
-                | Self::bit(Self::PROCESS_HOOK, process_hook)
-                | Self::bit(Self::NIF_LOADER, nif_loader)
-                | Self::bit(Self::RECORD_SOURCE, record_source)
-                | Self::bit(Self::EXPORT_GATE, export_gate)
-                | Self::bit(Self::SEND_HOOK, send_hook)
-                | Self::bit(Self::MODULE_INFO, module_info)
-                | Self::bit(Self::PERSISTENT_TERM, persistent_term)
-                | Self::bit(Self::RUNTIME_HOOKS, runtime_hooks)
-                | Self::bit(Self::FUN_IDENTITY, fun_identity)
-                | Self::bit(Self::MEMORY_HOOK, memory_hook)
-                | Self::bit(Self::FUN_CALLER, fun_caller),
-        )
+        let mut hooks = Self::from_flags(beam_bifs::hook_flags::flags(module, function, arity));
+        if RuntimeContext::reads_fun_identity_for_introspection(module, function, arity) {
+            hooks.0 |= Self::FUN_IDENTITY;
+        }
+        hooks
+    }
+    /// One [`beam_bifs::hook_flags::flags`] word permuted into this type's bit layout.
+    ///
+    /// The two words answer the same questions in different orders — this type groups the bits
+    /// by arm ([`Self::ALL`]'s declaration order), `beam_bifs` by seam declaration order — so the
+    /// mapping is [`HOOK_FLAG_PERMUTATION`], a shape-preserving fold: one shift-test and one
+    /// shift-or per source bit, unrolled and constant-folded by the compiler, and no branch.
+    ///
+    /// Two sources have no target: `beam_bifs`' `PORT_HOOK` and `LOCAL_NODE` select no arm in
+    /// [`RuntimeContext::call_registered`] (the port provider and the local-node identity are
+    /// installed for every call), so they are dropped here — deliberately, and named at the
+    /// table.
+    pub(super) const fn from_flags(flags: u16) -> DispatchHooks {
+        let mut out = 0u16;
+        let mut source = 0usize;
+        while source < HOOK_FLAG_BITS {
+            let target = HOOK_FLAG_PERMUTATION[source];
+            if target != UNMAPPED {
+                out |= ((flags >> source) & 1) << target;
+            }
+            source += 1;
+        }
+        DispatchHooks(out)
     }
 }
 
@@ -365,6 +408,79 @@ impl DispatchHooks {
 /// [`DispatchHooks::ANY_MASK`] exactly the eleven hook-arm bits.
 const _: () = assert!(DispatchHooks::ALL_MASK == (1 << DispatchHooks::ALL.len() as u16) - 1);
 const _: () = assert!(DispatchHooks::FUN_CALLER == 1 << (DispatchHooks::ALL.len() as u16 - 1));
+/// How many bits [`beam_bifs::hook_flags::flags`] answers: `MEMORY`, `LOCAL_FUN_IDENTITY`,
+/// `DICT`, `PROCESS_HOOK`, `PORT_HOOK`, `SEND_HOOK`, `NIF_LOADER`, `EXPORT_GATE`,
+/// `RECORD_SOURCE`, `MODULE_INFO`, `PERSISTENT_TERM`, `FUN_CALLER`, `LOCAL_NODE`,
+/// `RUNTIME_HOOKS` — that module's declaration order, which is the order
+/// [`HOOK_FLAG_PERMUTATION`] is indexed by.
+const HOOK_FLAG_BITS: usize = 14;
+/// A [`HOOK_FLAG_PERMUTATION`] row with no [`DispatchHooks`] bit — the two `beam_bifs` seams
+/// that install no arm ([`DispatchHooks::from_flags`] names them).
+const UNMAPPED: u8 = u8::MAX;
+/// Where each [`beam_bifs::hook_flags::flags`] bit lands in [`DispatchHooks`]: indexed by the
+/// **source** bit's position in `beam_bifs`' declaration order, holding the **target** bit's
+/// position in [`DispatchHooks::ALL`], or [`UNMAPPED`].
+///
+/// The source order is `beam_bifs`' (`hook_flags.rs`'s `MEMORY` … `RUNTIME_HOOKS`), and the
+/// target order is this type's, so the two rows in different places is the whole point of the
+/// table. The two [`UNMAPPED`] rows are the seams that are not arm selectors here: `PORT_HOOK`
+/// (the port provider is installed for every call) and `LOCAL_NODE` (the external-term identity
+/// likewise). Their dropping is not an oversight — it is asserted below and re-checked per key
+/// by `roster_tests`.
+const HOOK_FLAG_PERMUTATION: [u8; HOOK_FLAG_BITS] = [
+    10,       // MEMORY             -> DispatchHooks::MEMORY_HOOK
+    9,        // LOCAL_FUN_IDENTITY -> DispatchHooks::FUN_IDENTITY
+    0,        // DICT               -> DispatchHooks::DICT
+    1,        // PROCESS_HOOK       -> DispatchHooks::PROCESS_HOOK
+    UNMAPPED, // PORT_HOOK          -> (no arm)
+    5,        // SEND_HOOK          -> DispatchHooks::SEND_HOOK
+    2,        // NIF_LOADER         -> DispatchHooks::NIF_LOADER
+    4,        // EXPORT_GATE        -> DispatchHooks::EXPORT_GATE
+    3,        // RECORD_SOURCE      -> DispatchHooks::RECORD_SOURCE
+    6,        // MODULE_INFO        -> DispatchHooks::MODULE_INFO
+    7,        // PERSISTENT_TERM    -> DispatchHooks::PERSISTENT_TERM
+    11,       // FUN_CALLER         -> DispatchHooks::FUN_CALLER
+    UNMAPPED, // LOCAL_NODE         -> (no arm)
+    8,        // RUNTIME_HOOKS      -> DispatchHooks::RUNTIME_HOOKS
+];
+/// The permutation's compile-time guard: every mapped row lands on a **distinct**, in-range
+/// [`DispatchHooks`] bit and the mapped rows are **exactly** that type's twelve.
+///
+/// So a row added, removed, retyped out of range or aliased onto another seam fails the build
+/// instead of silently dropping or doubling a bridge arm — which is what
+/// [`DispatchHooks::from_flags`] would otherwise do with no type error at all. (Which *seam* each
+/// row belongs to is the runtime half: `roster_tests` pins it key by key against the twelve
+/// `uses_*` predicates.)
+const _: () = {
+    let mut source = 0;
+    let mut mapped = 0;
+    let mut seen = 0u16;
+    while source < HOOK_FLAG_BITS {
+        let target = HOOK_FLAG_PERMUTATION[source];
+        if target != UNMAPPED {
+            assert!(
+                (target as usize) < DispatchHooks::ALL.len(),
+                "a hook-flag row lands outside DispatchHooks' bits"
+            );
+            let bit = 1u16 << target;
+            assert!(
+                seen & bit == 0,
+                "two hook-flag bits alias one DispatchHooks bit"
+            );
+            seen |= bit;
+            mapped += 1;
+        }
+        source += 1;
+    }
+    assert!(
+        mapped == DispatchHooks::ALL.len(),
+        "the permutation must map exactly one hook-flag bit per DispatchHooks bit"
+    );
+    assert!(
+        seen == DispatchHooks::ALL_MASK,
+        "the permutation must reach every DispatchHooks bit"
+    );
+};
 
 /// The cachable part of a dispatch answer for one `(module, function, arity)` key.
 ///
@@ -391,15 +507,17 @@ pub(super) struct DispatchAnswer {
 /// The per-context memo of [`RuntimeContext::dispatch`] answers.
 ///
 /// The memoized answer is the **whole** prologue result — the resolved [`BifFn`] *and* the hook
-/// roster — so a hit skips both halves: the registry lookup and the eleven `needs_*`
-/// `binary_search`es.
+/// roster — so a hit skips both halves: the registry lookup and the one
+/// [`beam_bifs::hook_flags::flags`] probe the roster is permuted out of.
 ///
 /// # Why a cached answer can never go stale (the soundness argument)
 ///
 /// Every input the answer is built from is **immutable for the life of the runtime**:
 ///
-/// * the [`beam_bifs`] `needs_*` rosters are `&'static` tables (the `needs_*` predicates are
-///   pure `binary_search` membership tests over them);
+/// * the [`beam_bifs`] `needs_*` rosters are `&'static` tables and
+///   [`beam_bifs::hook_flags`] builds its one flag table from them exactly once
+///   ([`OnceLock`](std::sync::OnceLock)), so the flags a key answers are fixed for the run (the
+///   `needs_*` predicates are pure bit tests of that table);
 /// * [`Runtime::registry`] is a shared `Rc<BifRegistry>` built once at boot by
 ///   [`BifRegistry::with_core_bifs`](beam_bifs::BifRegistry::with_core_bifs) with no interior
 ///   mutability — `BifRegistry::register` takes `&mut self` and is boot-time only, and nothing
@@ -590,6 +708,7 @@ impl<'a> RuntimeContext<'a> {
     /// The set is [`beam_bifs::DICT_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs that
     /// read the [`DictHook`](beam_bifs::DictHook) seam — so this gate can never drift from
     /// what the registry actually routes through that seam.
+    #[cfg(test)]
     pub(super) fn uses_dict(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_dict_hook(module, function, arity)
     }
@@ -600,6 +719,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The set is [`beam_bifs::PROCESS_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs
     /// that read the [`ProcessHook`](beam_bifs::ProcessHook) seam.
+    #[cfg(test)]
     pub(super) fn uses_process_hook(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_process_hook(module, function, arity)
     }
@@ -657,6 +777,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The set is [`beam_bifs::NIF_LOADER_BIFS`] — `beam_bifs`' own roster of the BIFs that
     /// read the [`NifLoader`](beam_bifs::NifLoader) seam.
+    #[cfg(test)]
     pub(super) fn uses_nif_loader(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_nif_loader(module, function, arity)
     }
@@ -671,6 +792,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The set is [`beam_bifs::RECORD_SOURCE_BIFS`] — `beam_bifs`' own roster of the BIFs
     /// that read the [`RecordSource`](beam_bifs::RecordSource) seam.
+    #[cfg(test)]
     pub(super) fn uses_record_source(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_record_source(module, function, arity)
     }
@@ -688,6 +810,7 @@ impl<'a> RuntimeContext<'a> {
     /// that read the [`ExportGate`](beam_codec::ExportGate) seam (one key:
     /// `erlang:binary_to_term/2`; the `/1` form has no options, so it never asks — the codec
     /// consults the gate only under `[safe]`).
+    #[cfg(test)]
     pub(super) fn uses_export_gate(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_export_gate(module, function, arity)
     }
@@ -713,6 +836,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The set is [`beam_bifs::SEND_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs that
     /// read the [`SendHook`](beam_bifs::SendHook) seam.
+    #[cfg(test)]
     pub(super) fn uses_send_hook(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_send_hook(module, function, arity)
     }
@@ -727,6 +851,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The set is [`beam_bifs::MODULE_INFO_BIFS`] — `beam_bifs`' own roster of the BIFs
     /// that read the [`ModuleInfo`](beam_bifs::ModuleInfo) seam.
+    #[cfg(test)]
     pub(super) fn uses_module_info(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_module_info(module, function, arity)
     }
@@ -741,6 +866,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The set is [`beam_bifs::PERSISTENT_TERM_BIFS`] — `beam_bifs`' own roster of the BIFs
     /// that read the [`PersistentTerm`](beam_bifs::PersistentTerm) seam.
+    #[cfg(test)]
     pub(super) fn uses_persistent_term(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_persistent_term(module, function, arity)
     }
@@ -795,6 +921,7 @@ impl<'a> RuntimeContext<'a> {
     /// never a fabricated value.
     ///
     /// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
+    #[cfg(test)]
     pub(super) fn uses_runtime_hooks(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_runtime_hooks(module, function, arity)
     }
@@ -811,6 +938,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The set is [`beam_bifs::MEMORY_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs that
     /// read that seam.
+    #[cfg(test)]
     pub(super) fn uses_memory_hook(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_memory_hook(module, function, arity)
     }
@@ -831,6 +959,7 @@ impl<'a> RuntimeContext<'a> {
     /// The set is [`beam_bifs::FUN_CALLER_BIFS`] — `beam_bifs`' own roster of the BIFs that read
     /// the seam (the 18 `lists` + 4 `maps` + 2 `ets` keys a `beam_bifs` test pins equal to the
     /// registering modules' own roster).
+    #[cfg(test)]
     pub(super) fn uses_fun_caller(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_fun_caller(module, function, arity)
     }
@@ -857,6 +986,7 @@ impl<'a> RuntimeContext<'a> {
     /// Building the bridge eagerly for *every* registered call copies the caller module's
     /// `Arc` and allocates its `.beam` path, so it is built only here — the hook's absence is
     /// otherwise indistinguishable, since no other BIF calls the accessor.
+    #[cfg(test)]
     pub(super) fn uses_fun_identity(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_local_fun_identity(module, function, arity)
             || Self::reads_fun_identity_for_introspection(module, function, arity)
@@ -885,6 +1015,19 @@ impl<'a> RuntimeContext<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// The roster's anti-drift cases: one flag fetch must still answer every seam's question
+// ---------------------------------------------------------------------------------------
+/// The roster's own anti-drift cases, in their own file (`dispatch/roster_tests.rs`) because
+/// they are a key-by-key sweep of every `beam_bifs` hook roster rather than a memo unit, and
+/// this file is already past the house size target.
+///
+/// They pin the guarantee [`DispatchHooks::of`] used to get for free from calling the twelve
+/// `uses_*` predicates: a freshly fetched roster still equals those predicates one by one, and
+/// equals [`DispatchHooks::from_flags`] of `beam_bifs::hook_flags::flags` — so the one-probe fast
+/// path can never drift from what `beam_bifs` routes through each seam.
+#[cfg(test)]
+mod roster_tests;
 // ---------------------------------------------------------------------------------------
 // The memo's slot reuse: a collision costs work, never an answer, and never an allocation
 // ---------------------------------------------------------------------------------------
