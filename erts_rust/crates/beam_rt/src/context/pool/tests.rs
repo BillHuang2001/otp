@@ -606,14 +606,14 @@ fn a_refused_copy_leaves_the_pooled_bif_heap_unrewound() {
     }
     let retired_before = rt.eval_heap_retired.len();
     let capacity_before = rt.eval_heap.capacity();
-    let (result, used, still_on_the_pool) = {
+    let (used, still_on_the_pool) = {
         let mut ctx = RuntimeContext::new(&mut rt);
         let result = ctx
             .call_bif("pool_fixture", "refused", 0, &[])
             .expect("the fixture BIF returns");
         let heap = ctx.runtime.bif_heaps.last().expect("a region");
         let held = crate::context::calls::dest::pool_holds(ctx.runtime, heap, result);
-        (result, heap.used(), held)
+        (heap.used(), held)
     };
     assert!(
         still_on_the_pool,
