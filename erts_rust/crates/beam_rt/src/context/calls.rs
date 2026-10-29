@@ -1458,6 +1458,61 @@ impl<'a> RuntimeContext<'a> {
             && beam_term::tag::is_term_word(word)
             && (beam_term::boxed::is_boxed(word) || beam_term::prelude::is_list(word))
     }
+    /// Whether `term`'s **root shape alone** proves its whole graph holds no reference — the one
+    /// class of container result [`Self::graph_holds_reference`] may answer `false` for without
+    /// looking at a single child.
+    ///
+    /// # Why a root-shape test is enough
+    ///
+    /// The walk descends only through [`beam_term::layout::for_each_child_slot`], the workspace's
+    /// canonical per-shape child enumeration. For the shapes listed here that enumeration yields
+    /// either **nothing** or a word that is itself a bitstring, so no path from such a root can
+    /// reach a `REF_SUBTAG`/`EXTERNAL_REF_SUBTAG` object:
+    ///
+    /// * a **bitstring** — an `ErlHeapBits`, or the `ErlSubBits` an off-heap (refc) binary and a
+    ///   match context are rooted at — is payload bytes plus its `orig` word, and `orig` is again a
+    ///   bitstring (`for_each_child_slot`'s `SUB_BITS_SUBTAG` arm; the `BinRef` it names for a refc
+    ///   binary is not a term at all);
+    /// * a **bignum** is digits, a **float** is one value word ([`beam_term::boxed::HEADER_FLONUM`]);
+    /// * an **external pid/port** carries a node atom (an immediate) and integer fields.
+    ///
+    /// A *reference* is deliberately absent from the list, and so is every shape that holds term
+    /// children — a cons cell (whose car/cdr may be anything), a tuple, a record, a fun's `env`, a
+    /// map's keys and values — so all of those still walk. The list is a **positive whitelist**, not
+    /// "everything that is not a container": a shape `beam_term` adds later is *walked* rather than
+    /// skipped, which is the only safe direction to be wrong in.
+    ///
+    /// # What it buys
+    ///
+    /// `term_to_binary/1` and `iolist_to_binary/1` — the common container results of a codec-shaped
+    /// workload — return a **binary**, and before this test every one of them paid a full walk (a
+    /// worklist construction plus a visit) purely to answer `false`. On the
+    /// `copy_bound:etf_roundtrip` profile the reference walk was 6.36 % of the whole workload, and
+    /// this is the half of it a root-shape test answers for free.
+    #[allow(unsafe_code)]
+    #[inline]
+    fn root_is_reference_free(term: Eterm) -> bool {
+        if !beam_term::boxed::is_boxed_term(term) {
+            // A cons cell has no header word: its car/cdr can hold anything, so it must be walked.
+            // (An immediate or a bare `HEADER`-tagged non-term also lands here and is answered by
+            // the walk's own admission test — the same `false`, from the same place.)
+            return false;
+        }
+        let Some(address) = super::gc::dereferenceable_pointer(term) else {
+            return false;
+        };
+        // SAFETY: `term` is a boxed **term** word (`is_boxed_term` is `is_term_word && is_boxed`),
+        // so its object pointer is non-null and aligned for an `Eterm` and the word at that address
+        // is its live header word. The read is one word wide and writes nothing.
+        let header = unsafe { *(address as *const Eterm) };
+        // Only header sub-tags whose object holds no term child (or a bitstring `orig`) answer
+        // `true`; every other header — a reference's included — returns `false` and is walked.
+        beam_term::boxed::is_bitstring_header(header)
+            || beam_term::boxed::is_bignum_header(header)
+            || header == beam_term::boxed::HEADER_FLONUM
+            || beam_term::boxed::is_external_pid_header(header)
+            || beam_term::boxed::is_external_port_header(header)
+    }
 
     /// Whether anything in the graph rooted at `term` is a **reference** term — the one shape that
     /// must never be moved off the pooled heap.
@@ -1516,6 +1571,14 @@ impl<'a> RuntimeContext<'a> {
     /// itself and lets the copier refuse.
     #[allow(unsafe_code)]
     fn graph_holds_reference(term: Eterm) -> bool {
+        // The **root-shape fast decline**: a binary, a bignum, a float or an external pid/port has
+        // no reference anywhere under it ([`Self::root_is_reference_free`]), so the whole walk — the
+        // worklist construction included — is skipped for those results. It sits **before** the
+        // counters, so `walk_calls`/`walk_visits` keep meaning "a walk really ran" (a skipped walk
+        // is no walk, exactly like the immediate/literal cases that never reach here at all).
+        if Self::root_is_reference_free(term) {
+            return false;
+        }
         #[cfg(test)]
         notes::note_walk_call();
         perf_counters::bump(|c| &mut c.walk_calls);
@@ -2383,26 +2446,39 @@ const WALK_VISIT_BUDGET: usize = 1 << 20;
 /// stack-resident in the common case — which is what replaced a `HashSet` (SipHash) plus a growing
 /// `Vec` per call, the per-object bookkeeping this walk must not pay on the hot path of every
 /// container-returning BIF.
+///
+/// # Why the inline buffer is uninitialised
+///
+/// `len` alone says which slots are live, so the buffer never needs an initial value — and
+/// `[NIL; 64]` was a **512-byte fill on every walk**, i.e. the dominant cost of walking a small
+/// result (a 27-object `copy_bound` graph visits 27 objects; a one-object binary graph paid the fill
+/// and nothing else). `MaybeUninit` makes the fill disappear; the two methods below are the whole
+/// safety surface, and they only ever read a slot a previous `push` wrote.
 struct Walklist {
-    inline: [Eterm; WALK_INLINE_ITEMS],
+    inline: [core::mem::MaybeUninit<Eterm>; WALK_INLINE_ITEMS],
     len: usize,
     spill: Vec<Eterm>,
 }
 
 impl Walklist {
-    /// An empty worklist: the inline buffer unread, the spill not yet allocated (`Vec::new`).
+    /// An empty worklist: no slot of the inline buffer is live, the spill not yet allocated
+    /// (`Vec::new`).
     fn new() -> Self {
         Self {
-            inline: [beam_term::prelude::NIL; WALK_INLINE_ITEMS],
+            inline: [core::mem::MaybeUninit::uninit(); WALK_INLINE_ITEMS],
             len: 0,
             spill: Vec::new(),
         }
     }
 
     /// Pushes one term to visit, spilling only once the inline buffer is full.
+    #[allow(unsafe_code)]
     fn push(&mut self, item: Eterm) {
         if self.len < WALK_INLINE_ITEMS {
-            self.inline[self.len] = item;
+            // SAFETY: `len < WALK_INLINE_ITEMS`, so the slot is in bounds; `MaybeUninit::write`
+            // needs no initialised value and marks nothing — `len` below is what makes the slot
+            // live for `pop`.
+            self.inline[self.len].write(item);
             self.len += 1;
         } else {
             #[cfg(test)]
@@ -2412,12 +2488,16 @@ impl Walklist {
     }
 
     /// Pops the next term to visit — the spill first, so the inline buffer stays the common path.
+    #[allow(unsafe_code)]
     fn pop(&mut self) -> Option<Eterm> {
         if let Some(item) = self.spill.pop() {
             return Some(item);
         }
         self.len = self.len.checked_sub(1)?;
-        Some(self.inline[self.len])
+        // SAFETY: every slot below `len` was written by `push` (the only writer, which raises `len`
+        // only after writing that slot), and each slot is read at most once because `pop`
+        // decrements `len` past it before returning. So the slot holds an initialised `Eterm`.
+        Some(unsafe { self.inline[self.len].assume_init() })
     }
 }
 
