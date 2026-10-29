@@ -1,8 +1,11 @@
-# bench — measured results (m19)
+# bench — measured results (m19 full suite; m23 is the newest, §10)
 
 This is the definitive summary of the **full-suite** measurement session (`m19`, 2026-10-23/24) for the
 `erts_rust` benchmark driver — the session every §2/§3 figure and every external-target row comes from.
-Every number here comes from the committed raw artifacts under `results/m19-*`; regenerate with the
+The narrower later sessions are carried as §9 and §10, and the per-row currency list at the end of this
+preamble says which record each row is read through; `m23` (§10, `cowboy`) is the newest of them.
+Every number here comes from the committed raw artifacts under `results/` — `results/m19-*` unless the
+per-row currency list names a later session for that row; regenerate with the
 Runbook (§7) rather than quoting a stale copy.
 Raw JSON is authoritative — this file never edits a metric value.
 
