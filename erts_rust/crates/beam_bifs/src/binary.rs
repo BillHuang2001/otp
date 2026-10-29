@@ -131,31 +131,35 @@
 //!   entry lives for the process's lifetime (a bounded, monotonic leak). The
 //!   registry is process-global because [`BifContext`] exposes no seam for it —
 //!   see the module's `compiled_patterns` section.
-//! * **`referenced_byte_size/1` reports the binary's own size** (`src/term_conv.rs`):
-//!   it needs the off-heap `BinRef` of a sub-binary, which Milestone-1 does not
-//!   build; every result here is a fresh on-heap binary.
+//! * **`referenced_byte_size/1` answers the payload a term names** (`src/term_conv.rs`):
+//!   for a sub-binary window that is the parent payload's width; every binary this
+//!   crate *builds* stays on-heap by placement policy, so it answers its own size.
 //! * **`decode_unsigned`/`encode_unsigned` span the full integer range.**
 //!   `decode_unsigned` accepts any width and promotes a value past the 60-bit
 //!   small range to a bignum (the oracle's behaviour); `encode_unsigned` accepts a
 //!   bignum and emits its minimal byte image. Only a magnitude beyond the bignum
 //!   limb bound is `system_limit`.
-//! * **Sub-binaries are copied, not referenced.** `erts_binary_part` returns a
-//!   `SUB_BITS` sharing the source (`beam_term::bitstring::write_sub_bits` is the
-//!   layout writer for that window), but a `BinRef` window's payload is refcounted
-//!   and owned by the *source process's* off-heap store while this crate only ever
-//!   builds on the caller's destination heap — and the runtime's result copy-out
-//!   (`beam_rt`'s `move_result_into_process_heap` → `beam_message`'s
-//!   `copy_refc_binary`) resolves a `BinRef` only through the *source* off-heap
-//!   table, which the copy-out passes empty. A window minted here would therefore
-//!   be flattened on the way back to the process — byte-faithful, but with none of
-//!   the sharing the oracle gets. So the part is copied out of the parent into one
-//!   on-heap block: the same bytes, no dangling payload, and
-//!   `binary:referenced_byte_size/1` of the result reports its own size (the
-//!   divergence recorded at [`crate::term_conv::referenced_byte_size_1`]).
+//! * **Sub-binaries are minted as windows, and the host's copy-out flattens them.**
+//!   `binary:part/2,3` and `erlang:binary_part/2,3` share one producer
+//!   ([`part_slice`] → [`access::make_sub_binary`], the port of
+//!   `erts_build_sub_bitstring`), so the arm is C's: a window of at most
+//!   `ERL_ONHEAP_BITS_LIMIT` (512 bits / 64 bytes) is an on-heap `ErlHeapBits` copy
+//!   (own size), and a larger window over a parent **with an off-heap payload** is
+//!   the 8-word `[BinRef][ErlSubBits]` pair naming that payload (the parent
+//!   payload's width). Two residuals remain, both documented on [`part_slice`]:
+//!   (a) the runtime's result copy-out passes an **empty** source off-heap table
+//!   (`beam_rt`'s `copy_result_fresh` → `beam_message`'s `copy_refc_binary`), so it
+//!   *flattens* the window into a fresh on-heap bitstring — byte-faithful, never a
+//!   dangle, but the sharing does not survive to the process (the fix is a
+//!   `beam_rt` seam, not this crate's); and (b) a parent this crate built is always
+//!   on-heap, so a part of it above 64 bytes keeps the copy route
+//!   (`binary:copy/1,2`, `list_to_bin/1`, `iolist_to_binary/1` — a refc-producing
+//!   seam in `beam_rt`/`beam_engine` would close it).
 //!   Of the **cost** the oracle's aliasing avoids, only the copy of the *selected*
-//!   range remains: `part/2,3`, `bin_to_list/2,3` and `erlang:binary_part/2,3`
-//!   read the source through the borrowing [`crate::bits::with_bytes`] and copy a
-//!   buffer proportional to the result, never to the parent.
+//!   range remains on the copy arm: `part/2,3`, `bin_to_list/2,3` and
+//!   `erlang:binary_part/2,3` read the source through the borrowing
+//!   [`crate::bits::with_bytes`] and copy a buffer proportional to the result, never
+//!   to the parent.
 //! * **`binary:copy/2` cannot outgrow the fixed-size test heap**: a result larger
 //!   than the destination heap can hold reports `system_limit` rather than
 //!   allocating without bound (the same convention `convert::make_tuple` uses).
@@ -645,31 +649,98 @@ fn part_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     part_slice(ctx, args[0], args[1], args[2])
 }
 
-/// The shared body of `part/2,3`: the validated sub-binary, copied to the heap.
+/// The shared body of `binary:part/2,3` **and** `erlang:binary_part/2,3` — the
+/// crate's one sub-binary producer.
 ///
 /// The range rule is [`iolist::part_range`] (the crate's one spelling of
-/// `erts_binary_part`'s), and the payload is read through the borrowing
-/// [`bits::with_bytes`], so only the **selected** bytes are copied out of the term —
-/// a `{0,1}` part of a 64 KiB binary copies one byte, not the subject.
+/// `erts_binary_part`'s): a non-binary subject, a non-integer/non-small offset or
+/// length, a negative `Start`, a `|Length|` larger than `Start`, and a range that
+/// leaves the binary are all `badarg` — the subject's bytes are never copied to
+/// answer that question, the borrowing [`bits::with_bytes`] hands out a slice for
+/// the length check only.
 ///
-/// C makes the result a **sub-binary** sharing the source (`SUB_BITS` over the
-/// source's `BinRef`), so the oracle's `binary:referenced_byte_size/1` of a part
-/// reports the *parent* binary's size. This runtime keeps every binary it builds on
-/// the heap ([`crate::bits`]'s documented placement policy), so the value is copied
-/// and that size reports the part's own byte count — the divergence
-/// [`crate::term_conv::referenced_byte_size_1`] records. Aliasing is not reachable
-/// from this crate: a `BinRef` window's payload is refcounted and owned by the
-/// process's off-heap store, and this crate builds only on the caller's destination
-/// heap.
-fn part_slice(ctx: &mut BifContext<'_>, subject: Eterm, epos: Eterm, elen: Eterm) -> Result<Eterm> {
+/// The result is the C's **sub-binary** ([`access::make_sub_binary`], i.e.
+/// `erts_build_sub_bitstring`), on the arm C chooses — the *window's* bit size:
+///
+/// * a window of at most [`ERL_ONHEAP_BITS_LIMIT`] (512 bits / 64 bytes) is a fresh
+///   on-heap `ErlHeapBits` holding a copy of the selected bits, exactly as before
+///   this producer existed (the bytes are identical: the same writer,
+///   `beam_term::bitstring::write_heap_bits`, builds them) — and
+///   `binary:referenced_byte_size/1` of it is its own byte count, which is the
+///   oracle's answer for this arm too;
+/// * a larger window over a parent **with an off-heap payload** (the engine's
+///   `bs_create_bin` builds one for any payload above 64 bytes) is the 8-word
+///   `[BinRef][ErlSubBits]` pair naming the **parent's** payload, so nothing is
+///   copied and `referenced_byte_size/1` answers the parent payload's width — the
+///   oracle's shape;
+/// * a larger window over an on-heap parent keeps the **copy** route: the builder
+///   refuses that arm (there is no payload to share), and the copy is this crate's
+///   documented placement residual, below.
+///
+/// # The window and the host's result copy-out
+///
+/// The pair is written on [`crate::BifContext::heap`] — the runtime's pooled,
+/// never-reset, **unscanned** BIF arena — which is the same class of write
+/// [`access::make_heap_bitstring`] performs there, and the host then re-homes the
+/// result before the arena is rewound. `beam_rt`'s copy-out
+/// (`context/calls.rs::copy_result_fresh`) passes an **empty** source off-heap
+/// table, so `beam_message`'s `copy_refc_binary` finds no handle owning the parent
+/// payload and takes its `copy_match_context` arm: the window is **flattened** into
+/// a fresh on-heap bitstring of the window's own size. That is byte-faithful and
+/// cannot dangle (the parent payload is read only while the parent argument is live,
+/// and the flattened result names no payload at all), but the sharing is lost on the
+/// way back to the process. The `-eval` route flattens identically
+/// (`context/pool.rs::move_result_into_runtime_store`). Closing that half needs the
+/// copy-out to hand `copy_struct` the source table that owns the payload (a
+/// `beam_rt`/`beam_message` seam, outside this crate) — until then, a *program*
+/// observing `binary:referenced_byte_size/1` of a part still sees the part's size,
+/// while the BIF layer itself answers the parent payload's width (pinned by
+/// `tests/binary_copy_cost.rs`).
+///
+/// # Documented placement residual
+///
+/// Every binary **this crate builds** stays on-heap ([`crate::bits`]'s placement
+/// policy), so `binary:copy/1,2`, `list_to_bin/1` and `iolist_to_binary/1` produce
+/// `ErlHeapBits` parents however large they are, and their parts above 64 bytes take
+/// the copy arm (the figure stays the part's own size). C never sees that shape: it
+/// places a binary above `ERL_ONHEAP_BINARY_LIMIT` off-heap, so the same source text
+/// there windows over a payload. Closing it needs a refc-producing seam in
+/// `beam_rt`/`beam_engine` (this crate cannot allocate off-heap).
+///
+/// [`ERL_ONHEAP_BITS_LIMIT`]: beam_term::refc::ERL_ONHEAP_BITS_LIMIT
+pub(crate) fn part_slice(
+    ctx: &mut BifContext<'_>,
+    subject: Eterm,
+    epos: Eterm,
+    elen: Eterm,
+) -> Result<Eterm> {
     if !bits::is_binary(subject) {
         return Err(badarg());
     }
-    // The borrow ends before the heap write: the selected bytes are copied out of the
-    // term into a buffer proportional to the *result*, so no slice derived from the
-    // term's storage is live while the destination heap is written.
-    let slice = bits::with_bytes(subject, |bytes| Ok(checked_slice(bytes, epos, elen)?.to_vec()))?;
-    bits::make_binary(ctx.heap(), &slice)
+    // The borrow ends before the heap write: the range is validated (and, on the copy
+    // arm below, the selected bytes are copied out into a buffer proportional to the
+    // *result*), so no slice derived from the term's storage is live while the
+    // destination heap is written.
+    let (start, len) =
+        bits::with_bytes(subject, |bytes| iolist::part_range(bytes.len(), epos, elen))?;
+    let bit_offset = start.checked_mul(8).ok_or_else(system_limit)?;
+    let bit_size = len.checked_mul(8).ok_or_else(system_limit)?;
+    // The builder's window arm needs a parent payload to share; above the on-heap
+    // limit an `ErlHeapBits` parent has none, and that arm is the documented residual
+    // (see the doc comment) — so it is gated here, before the builder can refuse it.
+    if bit_size > beam_term::refc::ERL_ONHEAP_BITS_LIMIT
+        && access::refc_payload_bytes(subject).is_none()
+    {
+        let slice =
+            bits::with_bytes(subject, |bytes| Ok(bytes[start..start + len].to_vec()))?;
+        return bits::make_binary(ctx.heap(), &slice);
+    }
+    // `badarg` (the builder's only refusal) is unreachable here — the byte range was
+    // validated against the subject's own byte size, which is exactly the parent
+    // window `write_sub_binary` re-checks, and the arm above already covers the one
+    // reachable shape refusal — so it maps to the same `badarg` a wrong range would,
+    // never to a silently wrong size.
+    access::make_sub_binary(ctx.heap(), subject, bit_offset, bit_size)
 }
 
 /// `copy(Binary)`.
@@ -1553,6 +1624,198 @@ mod tests {
             assert!(matches!(part_2(ctx, &[atom, r]), Err(BeamError::BadArg)));
             let bits = bits::make_bitstring(ctx.heap(), &[0b1000_0000], 1).expect("fits");
             assert!(matches!(part_2(ctx, &[bits, r]), Err(BeamError::BadArg)));
+        });
+    }
+
+    /// The `binary:referenced_byte_size/1` figure of `term` — the crate's own reader,
+    /// so the arm a window takes is asserted through the observable BIF and not
+    /// through a private accessor.
+    fn referenced(ctx: &mut BifContext<'_>, term: Eterm) -> i64 {
+        let value = crate::term_conv::referenced_byte_size_1(ctx, &[term]).expect("a bitstring");
+        assert!(access::is_small(value), "referenced_byte_size must be a small int");
+        signed_value(value)
+    }
+
+    /// The oracle's >64-byte subject: `<<"z", (binary:copy(<<255>>, 1024))/binary>>`,
+    /// a **1025**-byte payload — so a 510-byte window at offset 1 answers `1025`
+    /// (a *compiled* construction; from `-eval` the C answers the payload's
+    /// allocated width, `2050`).
+    fn oracle_payload() -> Vec<u8> {
+        let mut data = vec![b'z'];
+        data.extend(core::iter::repeat_n(255u8, 1024));
+        data
+    }
+
+    /// `binary:part/2,3` of a **refc** parent above the 64-byte arm is a real
+    /// `[BinRef][ErlSubBits]` window, so `binary:referenced_byte_size/1` answers the
+    /// parent payload's width; at or below 512 bits it is the on-heap copy the C's
+    /// own `erts_extracted_bitstring_size` arm makes, so the figure is the window's.
+    ///
+    /// Measured on the oracle (OTP 29.1.2 / erts-17.1.1) over the same subject:
+    /// `ref_63 = 63`, `ref_64 = 64`, `ref_65 = 1025`, `ref_510 = 1025`,
+    /// `ref_1024 = 1025`, `ref_0 = 0`, `ref_payload = 1025`.
+    #[test]
+    fn part_of_a_refc_binary_windows_the_parent_payload() {
+        with_ctx(|ctx| {
+            let data = oracle_payload();
+            let (parent, _payload) =
+                access::test_refc_window(ctx.heap(), &data, 0, data.len() * 8);
+
+            // The measured 1025-shaped case: 510 bytes at offset 1.
+            let (one, five_ten) = (ctx.int(1).unwrap(), ctx.int(510).unwrap());
+            let part = part_3(ctx, &[parent, one, five_ten]).unwrap();
+            assert_eq!(bytes(part), data[1..511], "the window reads the parent's bytes");
+            assert_eq!(referenced(ctx, parent), 1025);
+            assert_eq!(referenced(ctx, part), 1025, "a window answers the payload's width");
+
+            // `binary:part/2` takes the same route.
+            let r = range(ctx, 1, 510);
+            let part = part_2(ctx, &[parent, r]).unwrap();
+            assert_eq!(bytes(part), data[1..511]);
+            assert_eq!(referenced(ctx, part), 1025);
+
+            // An empty window at `byte_size` is the on-heap empty binary.
+            let (end, zero) = (ctx.int(data.len() as i64).unwrap(), ctx.int(0).unwrap());
+            let empty = part_3(ctx, &[parent, end, zero]).unwrap();
+            assert!(bytes(empty).is_empty());
+            assert_eq!(referenced(ctx, empty), 0);
+
+            // The arm switch is on the WINDOW's bit size: 512 bits (64 bytes) is the
+            // last copying arm, 520 bits (65 bytes) the first windowing one.
+            let small = (1..=96u8).collect::<Vec<u8>>();
+            let (parent, _payload) = access::test_refc_window(ctx.heap(), &small, 0, 96 * 8);
+            let (zero, n63, n64, n65) = (
+                ctx.int(0).unwrap(),
+                ctx.int(63).unwrap(),
+                ctx.int(64).unwrap(),
+                ctx.int(65).unwrap(),
+            );
+            assert_eq!(referenced(ctx, parent), 96);
+            for (len, want) in [(n63, 63), (n64, 64), (n65, 96)] {
+                let part = part_3(ctx, &[parent, zero, len]).unwrap();
+                assert_eq!(referenced(ctx, part), want, "a {want}-byte figure");
+            }
+        });
+    }
+
+    /// A window **of a window** accumulates its `start` into the root's payload: the
+    /// bytes are the inner slice and the figure is still the root payload's width.
+    ///
+    /// The oracle answers `ref_wow = 1025` with `size_wow = 100` for a 100-byte
+    /// window of the 510-byte one (measured, same subject).
+    #[test]
+    fn a_window_of_a_window_reads_the_root_payload() {
+        with_ctx(|ctx| {
+            let data = oracle_payload();
+            let (parent, _payload) =
+                access::test_refc_window(ctx.heap(), &data, 0, data.len() * 8);
+            let (one, five_ten, two_five_four, hundred) = (
+                ctx.int(1).unwrap(),
+                ctx.int(510).unwrap(),
+                ctx.int(254).unwrap(),
+                ctx.int(100).unwrap(),
+            );
+            let mid = part_3(ctx, &[parent, one, five_ten]).unwrap();
+            assert_eq!(bytes(mid), data[1..511]);
+            let inner = part_3(ctx, &[mid, two_five_four, hundred]).unwrap();
+            assert_eq!(bytes(inner), data[255..355], "the child's start accumulates");
+            assert_eq!(bits::bit_size(inner).unwrap(), 100 * 8);
+            assert_eq!(referenced(ctx, inner), 1025);
+            assert_eq!(referenced(ctx, inner), referenced(ctx, mid));
+
+            // The same slice taken straight from the root, so `start` composition
+            // cannot silently double-count or drop an offset.
+            let (two_five_five, hundred) = (ctx.int(255).unwrap(), ctx.int(100).unwrap());
+            let direct = part_3(ctx, &[parent, two_five_five, hundred]).unwrap();
+            assert_eq!(bytes(inner), bytes(direct));
+            assert_eq!(referenced(ctx, direct), 1025);
+        });
+    }
+
+    /// A **bit-offset** window is minted by the same builder: `binary:part/2,3` of a
+    /// bitstring selects byte ranges, so the mid-byte arm is reached through
+    /// [`access::make_sub_binary`] directly (the shape `<<_:3, R/binary>>` produces).
+    ///
+    /// Two oracle facts this pins (measured on OTP 29.1.2 / erts-17.1.1): the C's
+    /// `erts_binary_part` refuses a subject whose own `TAIL_BITS` is non-zero but
+    /// **accepts** a subject that merely *starts* mid-byte (`<<_:3, R:8192/bits>>` ⇒
+    /// `binary:part(R,0,65)` succeeds and answers `1025`), and the ≤64-byte arm of such
+    /// a subject is still the copy (`binary:part(R,0,64)` ⇒ `64`).
+    #[test]
+    fn a_non_byte_aligned_window_is_still_a_window() {
+        with_ctx(|ctx| {
+            let data = oracle_payload();
+            let (parent, _payload) =
+                access::test_refc_window(ctx.heap(), &data, 0, data.len() * 8);
+            let window = access::make_sub_binary(ctx.heap(), parent, 3, 520).expect("minted");
+            assert_eq!(bits::bit_size(window).unwrap(), 520);
+            assert_eq!(access::refc_payload_bytes(window), Some(1025));
+            assert_eq!(referenced(ctx, window), 1025);
+
+            // A part of the bit-offset window is a window over the same payload; its
+            // `start` accumulates the offset.
+            let (zero, n65, n64) =
+                (ctx.int(0).unwrap(), ctx.int(65).unwrap(), ctx.int(64).unwrap());
+            let part = part_3(ctx, &[window, zero, n65]).expect("the C accepts this subject");
+            assert_eq!(bits::bit_size(part).unwrap(), 520);
+            assert_eq!(referenced(ctx, part), 1025);
+            let short = part_3(ctx, &[window, zero, n64]).expect("the copy arm");
+            assert_eq!(referenced(ctx, short), 64, "the ≤64-byte arm is the copy");
+
+            // A subject with tail bits of its own is `badarg` (the C's `TAIL_BITS`
+            // guard), which `bits::is_binary` already rejects.
+            let odd = access::make_sub_binary(ctx.heap(), parent, 3, 519).expect("minted");
+            let r = range(ctx, 0, 1);
+            assert!(matches!(part_2(ctx, &[odd, r]), Err(BeamError::BadArg)));
+        });
+    }
+
+    /// An **on-heap** parent above 64 bytes keeps the copy route: this crate's own
+    /// producers (`binary:copy/1,2`, `list_to_bin/1`, `iolist_to_binary/1`) hold every
+    /// byte in an `ErlHeapBits` block, and a block has no payload to share, so the
+    /// builder refuses that arm and the part is a fresh binary answering its own size.
+    ///
+    /// This is the documented residual — the oracle answers `1025` here — and the pin
+    /// exists so a later off-heap producer cannot change the figure silently.
+    #[test]
+    fn an_onheap_parent_above_the_limit_stays_a_copy() {
+        with_ctx(|ctx| {
+            let data = oracle_payload();
+            let parent = bin(ctx, &data);
+            assert!(bytes(parent).len() > 64);
+            let (one, five_ten) = (ctx.int(1).unwrap(), ctx.int(510).unwrap());
+            let part = part_3(ctx, &[parent, one, five_ten]).unwrap();
+            assert_eq!(bytes(part), data[1..511], "the bytes are still the window's");
+            assert_eq!(referenced(ctx, part), 510, "the copy answers its own size");
+        });
+    }
+
+    /// Every out-of-range / wrong-type refusal stays `badarg` on a refc parent — the
+    /// window arm changes the placement of the result, never the range rule
+    /// (`iolist::part_range`, the crate's one `erts_binary_part`).
+    #[test]
+    fn part_refuses_a_bad_range_over_a_refc_parent() {
+        with_ctx(|ctx| {
+            let data = oracle_payload();
+            let (parent, _payload) =
+                access::test_refc_window(ctx.heap(), &data, 0, data.len() * 8);
+            let (one, zero) = (ctx.int(1).unwrap(), ctx.int(0).unwrap());
+            // Past the end: `Start = 1025` with a non-zero length.
+            let past = ctx.int(data.len() as i64).unwrap();
+            assert!(matches!(part_3(ctx, &[parent, past, one]), Err(BeamError::BadArg)));
+            let whole = range(ctx, 0, data.len() as i64 + 1);
+            assert!(matches!(part_2(ctx, &[parent, whole]), Err(BeamError::BadArg)));
+            // A float, an atom and a bignum are all `badarg` in either slot.
+            let float = ctx.make_float(1.0).unwrap();
+            let atom = ctx.atom("a").unwrap();
+            assert!(matches!(part_3(ctx, &[parent, float, one]), Err(BeamError::BadArg)));
+            assert!(matches!(part_3(ctx, &[parent, one, float]), Err(BeamError::BadArg)));
+            assert!(matches!(part_3(ctx, &[parent, atom, one]), Err(BeamError::BadArg)));
+            let big = codec_term::make_big(ctx.heap(), false, &[1, 1 << 40]).expect("fits");
+            assert!(matches!(part_3(ctx, &[parent, big, one]), Err(BeamError::BadArg)));
+            assert!(matches!(part_3(ctx, &[parent, one, big]), Err(BeamError::BadArg)));
+            // A non-binary subject is refused before any range work.
+            assert!(matches!(part_3(ctx, &[atom, zero, one]), Err(BeamError::BadArg)));
         });
     }
 

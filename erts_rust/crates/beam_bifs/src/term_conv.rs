@@ -268,12 +268,16 @@ fn insert_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///   one off the 64-byte on-heap limit
 ///   (`binary:referenced_byte_size(binary:copy(<<1>>, 100000))` ⇒ `100000`).
 ///
-/// One documented divergence remains, on the *producer* side and not here: this
-/// crate's `binary:part/2,3` / `erlang:binary_part/2,3` **copy** the selected range
-/// instead of minting a shared window (the aliasing seam — see
-/// [`crate::binary::part_slice`]), so a >64-byte part of a larger binary is an
-/// ordinary whole binary here and reports its own (smaller) size. A
-/// **literal-area** binary (`<<1,2,3>>` of a compiled module) is likewise
+/// This crate's own window producers now feed the first arm: `binary:part/2,3` and
+/// `erlang:binary_part/2,3` mint a real `[BinRef][ErlSubBits]` window over a refc
+/// parent above 64 bytes ([`crate::binary::part_slice`] →
+/// [`access::make_sub_binary`]), so a part of a large *refc* binary answers the parent
+/// payload's width exactly as the oracle does. Two residuals stay on the *producer*
+/// side and are documented at [`crate::binary::part_slice`]: a window that is itself
+/// ≤ 64 bytes is an on-heap copy (the C's own `ERL_ONHEAP_BITS_LIMIT` arm, so it
+/// agrees), and a >64-byte part of an **on-heap** parent (`ErlHeapBits`, which is
+/// every binary this crate builds) is still a copy, because there is no payload to
+/// share. A **literal-area** binary (`<<1,2,3>>` of a compiled module) is likewise
 /// unmodelled: the oracle reports the literal chunk's allocated width (`256`), this
 /// runtime materializes no such literal.
 ///
@@ -281,7 +285,7 @@ fn insert_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when the argument is not a
 /// bitstring (`binary:referenced_byte_size([1,2])`).
-fn referenced_byte_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+pub(crate) fn referenced_byte_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if !bits::is_bitstring(term) {
         return Err(badarg());

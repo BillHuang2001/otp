@@ -573,6 +573,144 @@ pub(crate) fn refc_payload_bytes(term: Eterm) -> Option<usize> {
     Some(unsafe { beam_alloc::payload_capacity(val.cast::<u8>()) })
 }
 
+/// Builds the **sub-binary window** `parent[bit_offset .. bit_offset + bit_size]` on
+/// `heap` — the crate's one producer of a `binary:part/2,3` /
+/// `erlang:binary_part/2,3` result.
+///
+/// The layout and the arm choice are `beam_term::refc`'s (a port of
+/// `erts_build_sub_bitstring`, `../../erts/emulator/beam/erl_bits.c:2637-2665`), so
+/// this wrapper adds only the heap reservation and the crate's error mapping:
+/// `sub_binary_words` reports the words the writer needs (validating the parent's
+/// shape by the same rule the writer uses, so the two cannot disagree), and
+/// `write_sub_binary` writes them. Two arms, chosen on the **window's** bit size:
+///
+/// * `bit_size <= ERL_ONHEAP_BITS_LIMIT` (512 bits / 64 bytes) ⇒ a fresh
+///   `ErlHeapBits` at `hp` holding a shifted copy of the window's bits — the same
+///   block [`make_heap_bitstring`] writes, so `binary:referenced_byte_size/1` of the
+///   result is its own byte count (the oracle's answer for this arm too: C makes
+///   the same choice, `erts_extracted_bitstring_size`, and copies as well).
+/// * above it, over a parent **with an off-heap payload** ⇒ the 8-word
+///   `[BinRef][ErlSubBits]` pair naming the parent's payload with
+///   `start = parent_start + bit_offset`, so not a byte is copied and
+///   `binary:referenced_byte_size/1` answers the parent payload's width
+///   ([`refc_payload_bytes`], the C's `(br->val)->orig_size`).
+///
+/// The one shape the builder **refuses** is a window above the limit whose parent
+/// has no payload to share (`ErlHeapBits` — including every binary this crate itself
+/// builds, which stay on-heap by placement policy): there is no window to mint, so
+/// the refusal surfaces as [`BeamError::BadArg`] and the caller must keep copying
+/// (`crate::binary::part_slice` gates that arm before calling, and answers the copy
+/// there). Every other refusal (a malformed parent, a range outside it) is a bug in
+/// the caller, which validates the range first through [`crate::iolist::part_range`]
+/// — the crate's one spelling of `erts_binary_part`'s rule.
+///
+/// # Placement and lifetime
+///
+/// `heap` is the BIF context's destination heap ([`BifContext::heap`]): the
+/// runtime's pooled, never-reset, **unscanned** arena, so the pair written here is
+/// the exact class of write [`make_heap_bitstring`] already performs on it, and the
+/// host copies the result onto the process heap (or the `-eval` store) before the
+/// arena is rewound.
+///
+/// The child's `BinRef.val` names the **parent's** payload, which the window keeps
+/// alive only by the reachability convention the rest of this module relies on: the
+/// parent is a live BIF argument for the whole call, and the payload behind it is
+/// retained by whoever owns it (the engine's `RefcBinary` reservoir / the process's
+/// off-heap store) until the host's result copy-out, which reads the window and
+/// re-materializes it. Nothing here allocates or frees a payload, so this function
+/// cannot create a dangling pointer — but it also cannot extend the payload's life
+/// past the call (see `crate::binary`'s module doc, *The window and the host's
+/// result copy-out*).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] on either refusal above, and whatever the heap reports when
+/// the reservation cannot be satisfied.
+///
+/// [`BifContext::heap`]: crate::BifContext::heap
+pub(crate) fn make_sub_binary(
+    heap: &mut Heap,
+    parent: Eterm,
+    bit_offset: usize,
+    bit_size: usize,
+) -> Result<Eterm> {
+    // SAFETY: `parent` is a live bitstring term (the caller's validated BIF
+    // argument), so `sub_binary_words` dereferences only its header — and, for an
+    // `ErlSubBits`, its own live `orig` slot. It applies the identical shape
+    // validation `write_sub_binary` applies, so the word count returned is exactly
+    // what that writer expects at `hp`.
+    let words = unsafe { beam_term::refc::sub_binary_words(parent, bit_size) }
+        .map_err(|_| BeamError::BadArg)?;
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
+    let hp = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `hp` addresses exactly the `words` words `sub_binary_words` reported —
+    // exclusively owned and never moved (the arena is pointer-stable), which is the
+    // writer's first obligation. `parent` is still that live term, and the range
+    // `bit_offset .. bit_offset + bit_size` is inside its window: the caller validated
+    // the byte range with `iolist::part_range` against the parent's byte size, and the
+    // writer re-checks the bit range and refuses (writing nothing) rather than
+    // overrunning. The payload behind a refc parent is the live one the parent names
+    // and is read-only here, so the second obligation (alive and unmoved) holds for
+    // the whole call.
+    unsafe { beam_term::refc::write_sub_binary(hp, parent, bit_offset, bit_size) }
+        .map_err(|_| BeamError::BadArg)
+}
+
+/// Test-only: writes the off-heap `[BinRef][ErlSubBits]` pair for the window
+/// `offset_bits .. offset_bits + size_bits` over `payload` — the shape the engine's
+/// `bs_create_bin` writes for a payload above `ERL_ONHEAP_BINARY_LIMIT`, and the shape
+/// [`make_sub_binary`]'s window arm produces on top of a parent that already has a
+/// payload.
+///
+/// It lives **here** rather than in a test suite because writing the pair needs
+/// `unsafe`, and `crate::access` is one of this crate's two `#[allow(unsafe_code)]`
+/// modules: `crate::binary`'s in-module suite can therefore mint a real refc parent
+/// without a third allowance or a public term-construction helper.
+///
+/// `payload` owns the storage the pair points into and must outlive every use of the
+/// returned term.
+#[cfg(test)]
+pub(crate) fn test_refc_binary(
+    heap: &mut Heap,
+    payload: &beam_alloc::RefcBinary,
+    offset_bits: usize,
+    size_bits: usize,
+) -> Eterm {
+    let base = payload.data_ptr();
+    // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
+    // writable words — exactly the pair `write_refc_binary` fully writes.
+    let hp = unsafe { heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
+        .expect("the 8-word pair fits");
+    // SAFETY: `hp` is that reserved pair; `base` is the first byte of `payload`'s
+    // live, `UNIT_SIZE`-aligned data area (kept alive by the caller), which covers
+    // bits `offset_bits..offset_bits + size_bits`.
+    unsafe {
+        beam_term::refc::write_refc_binary(
+            hp,
+            base.cast::<Eterm>(),
+            core::ptr::null_mut(),
+            base,
+            offset_bits,
+            size_bits,
+        )
+    }
+}
+
+/// Test-only: [`test_refc_binary`] plus the payload it needs, minted over `bytes`
+/// (the caller keeps the payload alive) — the term a `binary:copy/2` above
+/// `ERL_ONHEAP_BINARY_LIMIT` would be if this crate could allocate off-heap.
+#[cfg(test)]
+pub(crate) fn test_refc_window(
+    heap: &mut Heap,
+    bytes: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+) -> (Eterm, beam_alloc::RefcBinary) {
+    let payload = beam_alloc::RefcBinary::new(bytes).expect("the off-heap payload allocates");
+    let root = test_refc_binary(heap, &payload, offset_bits, size_bits);
+    (root, payload)
+}
+
 /// Copies the bytes of a byte-aligned bitstring (a *binary*) out of the term.
 ///
 /// **Both** frozen bitstring representations are handled, through the LCA reader
@@ -1521,37 +1659,10 @@ mod tests {
         (1..=n).map(|i| (i % 256) as u8).collect()
     }
 
-    /// Builds the off-heap `[BinRef][ErlSubBits]` pair the engine's `bs_create_bin`
-    /// writes for a payload above `ERL_ONHEAP_BINARY_LIMIT` (64) bytes, and returns
-    /// the boxed root.
-    ///
-    /// `payload` owns the storage the pair points into and must outlive every use of
-    /// the returned term.
-    fn refc_binary(
-        heap: &mut Heap,
-        payload: &RefcBinary,
-        offset_bits: usize,
-        size_bits: usize,
-    ) -> Eterm {
-        let base = payload.data_ptr();
-        // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
-        // writable words — exactly the pair `write_refc_binary` fully writes.
-        let hp = unsafe { heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
-            .expect("the 8-word pair fits");
-        // SAFETY: `hp` is that reserved pair; `base` is the first byte of `payload`'s
-        // live, `UNIT_SIZE`-aligned data area (kept alive by the caller), which covers
-        // bits `offset_bits..offset_bits + size_bits`.
-        unsafe {
-            beam_term::refc::write_refc_binary(
-                hp,
-                base.cast::<Eterm>(),
-                core::ptr::null_mut(),
-                base,
-                offset_bits,
-                size_bits,
-            )
-        }
-    }
+    /// The module-level off-heap pair writer, named for this suite's call sites
+    /// (it lives in `crate::access` because only this module and
+    /// `crate::calendar::localtime` carry `#[allow(unsafe_code)]`).
+    use super::test_refc_binary as refc_binary;
 
     #[test]
     fn binary_bytes_reads_an_off_heap_refc_binary() {
