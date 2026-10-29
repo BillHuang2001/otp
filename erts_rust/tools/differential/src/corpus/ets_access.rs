@@ -34,15 +34,26 @@
 //! the access mode — a non-owner may inspect a `private` table's metadata. That is pinned
 //! here (as a shape: the size is an integer, the `info/1` result is a proplist).
 //!
-//! # The *denied* cells pin only the refusal, never the reason's shape
+//! # The *denied* cells refuse alike; only their stacktrace differs, so none is pinned
 //!
 //! The Rust runtime enforces the access mode both at `ets:new/2` (so `ets:info(T, protection)`
 //! agrees) and on a later access by a non-owner: a non-owner `ets:lookup/2` of a `private`
-//! table and a non-owner `ets:insert/2` of a `protected`/`private` table both raise. The
-//! **reason** differs though — the oracle raises a stacktrace-carrying `error:{badarg,
-//! Stacktrace}`, the Rust runtime a bare `error:badarg` — and the stacktrace frames are
-//! volatile, so the denial half of the matrix is a handoff to `beam_ets`/`beam_bifs` rather
-//! than a pinned case. The allowed half is covered end to end (owner + non-owner reads and
+//! table and a non-owner `ets:insert/2` of a `protected`/`private` table both raise. Across the
+//! twelve denied cells — a non-owner's `lookup`/`insert`/`delete`/`delete_all_objects`/
+//! `tab2list`/`select`/`match`/`update_counter`/`lookup_element` on a `private` table, plus
+//! `insert`/`delete`/`update_element` on a `protected` one — **both** sides answer the plain
+//! reason `error:badarg`; the oracle does *not* raise a `{badarg, Stacktrace}` reason. What
+//! differs is only the raise's stacktrace: its innermost `error_info` item is
+//! `#{cause => access, module => erl_stdlib_errors}` on the oracle against
+//! `#{module => erl_stdlib_errors}` here (the missing `{cause, _}` pair), and the `-eval` route's
+//! trace is deeper on the oracle (5 frames, 6 for `delete_all_objects`/`tab2list`, against 2 here,
+//! measured from the spawned non-owner).
+//!
+//! So a denial cell that pinned only the reason would agree, and pinning anything more would be
+//! a plain-value `mismatch` rather than an honest gap — which is why the denial half of the
+//! matrix stays a handoff to `beam_ets`/`beam_bifs` and no case here observes it. The residual
+//! (the missing `{cause, _}` pair) is recorded in `divergences.md` §A.1, with the ready recipe in
+//! `CASE_DRAFTS.md` §10. The allowed half is covered end to end (owner + non-owner reads and
 //! non-owner writes) so a regression in the enforcing path shows up as a failure.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
