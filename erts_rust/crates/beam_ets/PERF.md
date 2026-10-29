@@ -560,3 +560,94 @@ node sizes every object shares) and therefore maps more blocks. That is a real m
 heterogeneous shapes a real table sees — `ets:info(T, memory)` is unaffected (`Table::memory` sums
 live words, not block capacity), but the arena's high-water is not. Paying that for <2 % of the op
 was not a trade worth making; the next lever on this path is not the reservation count.
+
+## 5. The per-op arena cycle — run **replay**, bulk spines, immediate-child inlining
+
+Round 2 on `copy_bound/ets_copy`. §4 attacked the path's *bookkeeping* (which run to reuse, how to
+find it); what was left was the **cycle** itself: every op deep-copies the 71-word / 27-object payload
+into the table and frees the previous copy, so the arena allocates, fills and releases 27 runs twice a
+second per op. §5 records three shape changes that keep the same accounting but stop *paying per node
+for work the previous op already did*.
+
+### Method (unchanged from §4 — instructions, not wall time)
+
+`perf stat -e cpu_atom/instructions/u -x,` around
+`taskset -c 7 <beam_rt> -pa <scratch> run <scratch>/bench_copy_bound.beam bench_copy_bound:ets_copy/1 <N>`
+at `N = 100 000` and `N = 0` on the same module fixture, `instr/op = (instr(N) − instr(0)) / N`; the
+subtraction cancels the ~1.4 G-instruction boot.
+
+`cpu_core/instructions/u` is **unavailable on this host** (`<not counted>` — the P-core PMU is not
+readable), so the accepted event is `cpu_atom/instructions/u`. Each pass is followed by a second
+`N = 0` pass, and the three builds are measured **interleaved in one loop** (`before`, `after2`,
+`after3`, `before`, …) so a load swing cannot be attributed to a build. `/proc/loadavg` before the
+measurement loop `68.40` and after `66.61` — the host is shared and heavily loaded, which is exactly
+why this section quotes instruction counts and not wall time.
+
+### The three levers
+
+| # | locus | change | instr/op |
+|---|---|---|---|
+| — | — | baseline (round-1 tree, post-§4) | **18 964** (18 936 / 18 985 across sessions) |
+| 5 | `src/store/mod.rs` `copy`/`free`/`free`→`retire`/`alloc_words`/`drop_plan_tail`/`abort_plan` | a freed object's run list is **replayed** by the next copy instead of being taken apart into the per-size free buckets and re-found: `free` pushes the intact list onto `recyclable` (bounded by `RECYCLABLE_LISTS`), and `copy` takes it as its `plan`; `alloc_words` first tries `plan[plan_used]` (one pointer compare) and only falls back to `take_free_run`/bump/block when the shape diverges | **16 982** (−10.4 %) |
+| 6 | `src/store/mod.rs` `copy_elem` | every child site called `copy_term`, which re-tested `is_immediate` behind a real call frame (six callee-saved saves) for the ~2/3 of children that are atoms/small ints/`NIL`; `copy_elem` inlines that test at the site and recurses only for a boxed/cons child | **16 173** (−4.8 %) |
+| 7 | `src/store/mod.rs` `copy_spine` | the list spine was walked **twice** (count the cells, reserve `2 × cells`, fill); now a recycled candidate run sitting at the plan position *is* the previous copy's spine run, so `run.words / 2` is the cell count and the counting walk disappears. A shorter spine stops the fill early and hands the surplus words back (`bucket_run`, never `release` — they are already dead); a longer one copies the rest as the tail. Both are the same two-pass result | **16 002** (−1.06 %) |
+| — | — | after levers 5–7 | **16 002** / 15 995 (3 pairs: 15 999 / 16 012 / 15 995) |
+
+Cumulative: **18 964 → 16 002 instructions/op, −15.6 %**. Per-pair readings are
+`before 18 936 / 18 985 / 18 963 / 18 962 / 18 966` and `after 16 155 → 16 002` for the split, i.e. the
+spread is ±0.1 % and every lever is comfortably outside it.
+
+Lever 5 is the big one because it removes an **allocation-frequency** asymmetry, not a constant: the
+old `free` drained the run list into buckets (`bucket_run` per run, with a `free_runs` resize on the
+way) and `alloc_words` then found each run again by exact word count, so a steady-state op paid the
+bucket round trip twice per object forever. Replaying the list is the same information with no
+index in between. It is also why the *shape* matters: the plan is a hint, and a shape that changes
+still gets correct storage — just through the bucket path.
+
+### Profiles (share of the row's instructions)
+
+| symbol | baseline (§4 tree) | after levers 5–6 | after lever 7 |
+|---|---|---|---|
+| `beam_ets` total | **24.4 %** | 11.8 % | **8.7 %** |
+| `TermStore::copy_term` | 8.63 % | 4.86 % | 4.46 % |
+| `TermStore::alloc_words` | 6.99 % | 1.50 % | < 0.6 % |
+| (`release_all`, removed by lever 5) | 3.91 % | — | — |
+| `TermStore::copy_boxed` | 1.98 % | 2.76 % | 2.65 % |
+| `TermStore::copy` / `free` | 1.13 / 0.98 % | 1.34 / 1.30 % | < 0.6 each |
+
+Inside `copy_term` the hot lines are now the spine **fill** loop (`cmp`/`inc` for the cell bound, the
+`car`/`cdr` loads, the two word stores) — the counting walk's `add $0x2` + `inc` + dependent `mov`
+chain, which was ~40 % of the symbol, is gone.
+
+### The rest of the row is **not** this crate
+
+Attributing the remaining 16 002 instructions/op (per-symbol shares from the same `perf record`):
+
+| share | owner |
+|---|---|
+| 9.1 % | `beam_message::copy::shallow_unshared` — the **copy-out** of the `[{k,T}]` result onto the caller's heap (`beam_rt`'s registered-call tail) |
+| 7.2 % | `beam_rt::context::RuntimeContext::{call_registered,dispatch}` — BIF dispatch, table lookup/restore |
+| 6.3 % | `beam_bifs::ets::TableRegistry` (`hash_one` + `HashMap::remove` + `insert`) — the take/restore round trip around every `ets:*` BIF |
+| ~9.7 % | `__memcmp_avx2_movbe` + `beam_term::compare::{cmp_impl,cmp_lists,cmp_maps}` — the *program's* `case ets:lookup(...) of [{k, T}] -> …` match, i.e. term comparison, not storage |
+| 4.2 % | `__memmove_avx_unaligned_erms` (bulk copies on the copy-in/copy-out paths) |
+| ~5.0 % | `beam_engine`'s baseline-JIT glue (`enter_compiled_cached`, `call_ext_dispatch`, `import_target`) |
+
+None of these is reachable from `beam_ets`; they belong to `beam_rt`/`beam_bifs`/`beam_message`/
+`beam_term`. The honest ceiling for a `beam_ets`-only change on this row is therefore the ~8.7 % the
+crate still owns, and the row's remaining gap to the oracle is a runtime-copy-path question
+(`shallow_unshared` + the BIF dispatch round trip), not an ETS one.
+
+### What was deliberately NOT changed
+
+- **The A.1 copy boundary.** The payload is still fully deep-copied into table-owned storage on
+  `insert` and fully copied out by the host on `lookup`; the plan replay only chooses *which already
+  dead words* the copy lands in, so a table never aliases a caller's heap.
+- **Accounting exactness.** `live_words` still counts every word exactly once: a replayed run is an
+  exact-fit run (`run.words == n`), the surplus of an over-long spine hint is bucketed without
+  touching the live figure (it came from a freed object), and `relinquish` (the `take/2` path) still
+  never offers its words for reuse.
+- **`gather_bits`'s `Vec<u8>`** (`src/store/mod.rs`, the sub-bitstring arm) — it allocates a scratch
+  byte buffer per sub-bitstring copy where a stack buffer would do. It is **not on this workload's
+  path** (the payload's `"hello world"` is a 12-byte on-heap bitstring leaf, copied by `copy_leaf`),
+  so there is no measurement to justify the change here; it is named as the next small lever for a
+  workload that copies sub-binaries.
