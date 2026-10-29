@@ -1837,6 +1837,39 @@ mod tests {
         }
     }
 
+    /// `size_shared/1`'s pricing state is **call-scoped**: [`SharedOnce`] is constructed inside
+    /// [`size_shared_1`] for each call, so the same term prices identically every time. A `seen`
+    /// set that outlived the call (a `thread_local!`/`static`, a plausible "optimisation") would
+    /// remember the first call's objects and price the repeat as `0`.
+    ///
+    /// The term is `[L, L, L]` over **one** shared `[1, 2]` subterm, so the repeated object is
+    /// genuinely the same pointer (an identity-sharing walk prices it once per call). Every
+    /// `observe` below runs over its own fresh [`BifContext`], so a third call proves the state is
+    /// per-**call**, not per-context either.
+    #[test]
+    fn size_shared_is_call_scoped_and_answers_the_same_number_twice() {
+        let mut heap = Heap::new(1 << 12).expect("test heap");
+        let one = make_small(1);
+        let two = make_small(2);
+        let inner = list2(&mut heap, one, two); // [1, 2]
+        let repeated = list2(&mut heap, inner, inner); // [ [1,2], [1,2] ]
+        let triple = list2(&mut heap, inner, repeated); // [ [1,2], [1,2], [1,2] ]
+
+        let first = observe("size_shared", 1, &[triple]);
+        let second = observe("size_shared", 1, &[triple]);
+        assert_ne!(
+            first, "int(0)",
+            "the repeated subterm's words must be counted at least once"
+        );
+        assert_eq!(
+            first, second,
+            "size_shared/1 must be call-scoped: a fresh call says the same number"
+        );
+        // A third call through yet another fresh context must agree again.
+        let third = observe("size_shared", 1, &[triple]);
+        assert_eq!(first, third);
+    }
+
     /// The keys that stay **seam-backed** answer the typed capability gap — never a
     /// fabricated value, never `undef` — and the two keys this module implements for real
     /// are registered, listed in [`REAL_BIFS`] and gone from the seam roster.
