@@ -146,7 +146,7 @@ mod error_info;
 mod function_clause;
 mod handlers;
 mod legacy_catch;
-mod oracle;
+pub(crate) mod oracle;
 mod propagation;
 mod raising;
 mod stacktrace;

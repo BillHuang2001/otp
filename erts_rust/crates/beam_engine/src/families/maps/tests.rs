@@ -1171,6 +1171,138 @@ fn put_map_exact_missing_key_is_never_a_no_op() {
     assert!(cmp(result.unwrap(), expected, &module.atom_table).is_eq());
 }
 
+/// The flat sizes the no-change matrix is measured at: 3..=8 keys (the 1- and
+/// 2-key rows are pinned above; the 33-key boundary is the hash-map section below).
+const FLAT_NO_CHANGE_SIZES: [i64; 6] = [3, 4, 5, 6, 7, 8];
+
+#[test]
+fn a_no_op_update_answers_the_source_word_at_every_flat_size() {
+    // Oracle rows, measured on OTP 29.1.2 / erts-17.1.1 (the system `erl`), for
+    // every `n` in 3..=8 with `M = #{0 => 0, 1 => 1, …, (n-1) => (n-1)*(n-1)}`:
+    //   `erts_debug:same(M#{K => K*K}, M)`                      ⇒ `true`
+    //   `erts_debug:same(M#{K := K*K}, M)`                      ⇒ `true`
+    //   `erts_debug:same(M#{0 => 0, …, (n-1) => (n-1)*(n-1)}, M)` ⇒ `true`
+    //   `erts_debug:same(M#{0 := 0, …, (n-1) := (n-1)*(n-1)}, M)` ⇒ `true`
+    //   `erts_debug:same(M#{K => 99}, M)`                       ⇒ `false`
+    // `erts_debug:same/2` is raw `Eterm` word identity, so a `true` row states that
+    // the instruction answered the **source** map itself and a `false` row that it
+    // built a fresh one. The multi-pair rows matter because the whole-map form is
+    // one instruction with `n` pairs, not `n` single-pair updates.
+    for n in FLAT_NO_CHANGE_SIZES {
+        let last = n - 1;
+        let whole: Vec<(Operand, Operand)> = (0..n)
+            .map(|i| (Operand::Integer(i), Operand::Integer(i * i)))
+            .collect();
+        let last_pair = vec![(Operand::Integer(last), Operand::Integer(last * last))];
+        let forms: [(&str, bool, Vec<(Operand, Operand)>); 4] = [
+            ("assoc, one pair", false, last_pair.clone()),
+            ("exact, one pair", true, last_pair),
+            ("assoc, the whole map", false, whole.clone()),
+            ("exact, the whole map", true, whole),
+        ];
+        for (what, exact, pairs) in forms {
+            let mut fixture = Fixture::new(&[]);
+            let (entry, _) = if exact {
+                exact_function(&mut fixture, pairs)
+            } else {
+                assoc_function(&mut fixture, pairs)
+            };
+            let module = fixture.finish();
+            let mut ctx = MinimalContext::new();
+            let source = squares_map(&mut ctx, &module, n);
+            assert!(
+                !terms::is_hashmap(source),
+                "n={n}: the source must be a flat map, or the row is measuring the \
+                 hash-map route instead"
+            );
+            assert_eq!(
+                run(&mut ctx, &module, entry, &[source]).0.unwrap(),
+                source,
+                "n={n}: {what} changes nothing, so the source word IS the answer"
+            );
+        }
+        // The changing row, in the same shape: one value differs ⇒ a fresh map.
+        let mut fixture = Fixture::new(&[]);
+        let (entry, _) = assoc_function(
+            &mut fixture,
+            vec![(Operand::Integer(last), Operand::Integer(99))],
+        );
+        let module = fixture.finish();
+        let mut ctx = MinimalContext::new();
+        let source = squares_map(&mut ctx, &module, n);
+        let result = run(&mut ctx, &module, entry, &[source]).0.unwrap();
+        assert_ne!(result, source, "n={n}: a changed value builds a fresh map");
+        let entries = terms::map_entries(result).unwrap();
+        assert_eq!(entries.len(), n as usize, "n={n}: the key count is unchanged");
+        assert_eq!(
+            lookup(&entries, make_small(last), &module.atom_table),
+            Some(make_small(99)),
+            "n={n}: the changed pair carries the new value"
+        );
+    }
+}
+
+/// The hash-map keys the no-change matrix is measured at: the first key the fold
+/// inserted, two interior ones and the last — `erl_map.c`'s trie places them at
+/// different depths, so a single interior key would not prove the whole route.
+const HAMT_NO_CHANGE_KEYS: [i64; 4] = [0, 7, 20, 39];
+
+#[test]
+fn a_no_op_update_answers_the_source_word_at_every_hash_map_key() {
+    // Oracle rows (OTP 29.1.2 / erts-17.1.1), `H` = the 40-key fold-built map
+    // `lists:foldl(fun(I, M) -> M#{I => I*I} end, #{}, lists:seq(0, 39))`:
+    //   `erts_debug:same(H#{K => K*K}, H)` ⇒ `true`,
+    //   `erts_debug:same(H#{K := K*K}, H)` ⇒ `true`,
+    //   `erts_debug:same(H#{K := 99}, H)`  ⇒ `false`,
+    // for K = 0, 7, 20 and 39. The two BIF spellings of the same update
+    // (`maps:put/3`, `maps:update/3`) answer the same on the oracle and on
+    // `beam_rt`, but they are `beam_bifs`'s implementations — not this
+    // instruction's — so no row here can pin them.
+    for key in HAMT_NO_CHANGE_KEYS {
+        let pair = vec![(Operand::Integer(key), Operand::Integer(key * key))];
+        for exact in [false, true] {
+            let mut fixture = Fixture::new(&[]);
+            let (entry, _) = if exact {
+                exact_function(&mut fixture, pair.clone())
+            } else {
+                assoc_function(&mut fixture, pair.clone())
+            };
+            let module = fixture.finish();
+            let mut ctx = MinimalContext::new();
+            let source = squares_map(&mut ctx, &module, 40);
+            assert!(
+                terms::is_hashmap(source),
+                "key={key}: the 40-key source is a hash map"
+            );
+            assert_eq!(
+                run(&mut ctx, &module, entry, &[source]).0.unwrap(),
+                source,
+                "key={key}, exact={exact}: a hash-map no-op answers the source word"
+            );
+        }
+        let mut fixture = Fixture::new(&[]);
+        let (entry, _) = exact_function(
+            &mut fixture,
+            vec![(Operand::Integer(key), Operand::Integer(99))],
+        );
+        let module = fixture.finish();
+        let mut ctx = MinimalContext::new();
+        let source = squares_map(&mut ctx, &module, 40);
+        let result = run(&mut ctx, &module, entry, &[source]).0.unwrap();
+        assert_ne!(
+            result, source,
+            "key={key}: a changed value builds a fresh hash map"
+        );
+        let entries = terms::map_entries(result).unwrap();
+        assert_eq!(entries.len(), 40, "key={key}: the key count is unchanged");
+        assert_eq!(
+            lookup(&entries, make_small(key), &module.atom_table),
+            Some(make_small(99)),
+            "key={key}: the changed pair carries the new value"
+        );
+    }
+}
+
 // -- the O(1) capacity count ---------------------------------------------
 
 /// The sizes the capacity count is checked at: the empty map, the two ends of the
