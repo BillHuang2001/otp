@@ -428,18 +428,16 @@ fn binary_part_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     binary_part_range(ctx, args[0], args[1], args[2])
 }
 
-/// The shared `erts_binary_part` core.
+/// The shared `erts_binary_part` core, for the `erlang:binary_part/2,3` spelling.
 ///
-/// A negative `Length` selects the `|Length|` bytes *ending* at `Start` (so
-/// `binary_part(<<1,2,3,4,5>>, 4, -2)` is `<<3,4>>`), and `Start` itself is a
-/// non-negative offset. The subject must be byte-aligned and the whole range must
-/// lie inside it.
-///
-/// The range rule itself is [`iolist::part_range`] (the crate's one spelling of it, so
-/// `erlang:binary_part/2,3`, `binary:part/2,3`, `binary:bin_to_list/2,3` and
-/// `binary:match/2,3`'s `{scope, …}` cannot drift apart), and the payload is read
-/// through the borrowing [`bits::with_bytes`]: only the **selected** bytes are copied
-/// out of the term, never the whole subject.
+/// Both `ubif` rows (`bif.tab` declares `erlang:binary_part/2,3`, the *C*
+/// spelling, while `binary:part/2,3` are the two `bif` rows) reach the **same**
+/// producer — [`crate::binary::part_slice`] — so the two spellings cannot drift
+/// apart in either the range rule or the result's representation. That producer
+/// documents the whole contract: `iolist::part_range` (a negative `Length` selects
+/// the `|Length|` bytes *ending* at `Start`, `Start` is a non-negative offset, the
+/// subject must be byte-aligned and the range must lie inside it) and the
+/// sub-binary arm choice (`access::make_sub_binary`).
 ///
 /// # Errors
 ///
@@ -452,17 +450,7 @@ fn binary_part_range(
     start_term: Eterm,
     length_term: Eterm,
 ) -> Result<Eterm> {
-    if !bits::is_binary(subject) {
-        return Err(badarg());
-    }
-    // The borrow ends before the heap write below: the slice is copied out of the term
-    // first (a buffer proportional to the *result*, not to the subject), so nothing
-    // derived from the term's storage is live while the destination heap is written.
-    let slice = bits::with_bytes(subject, |data| {
-        let (start, length) = iolist::part_range(data.len(), start_term, length_term)?;
-        Ok(data[start..start + length].to_vec())
-    })?;
-    make_bin(ctx, &slice)
+    crate::binary::part_slice(ctx, subject, start_term, length_term)
 }
 
 // ---------------------------------------------------------------------------
