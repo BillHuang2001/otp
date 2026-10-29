@@ -43,7 +43,11 @@
 //! * `erlang:trace_delivered(Tracee)` — a fresh reference is sent back to the caller as
 //!   `{trace_delivered, Tracee, Ref}` and returned;
 //! * `erts_internal:trace/3` (the body `erlang:trace/2,3` calls) for the process targets
-//!   `Pid | all | existing | existing_processes | processes`;
+//!   `Pid | all | existing | existing_processes | processes`, with **every** process flag atom
+//!   ([`CANONICAL`], the `running`/`in`/`out`-selecting scheduler flag included) and the
+//!   `{tracer, Pid}` option accepted, recorded and reported back. Setting **adds** to the flags
+//!   already recorded and clearing removes only the flags named ([`TraceState::add_flags`],
+//!   [`TraceState::remove_flags`]), which is the oracle's own set semantics;
 //! * the **`send` and `'receive'` events** of the ordinary trace surface:
 //!   [`RuntimeContext::trace_send_events`] and [`RuntimeContext::trace_receive_events`] are
 //!   called by the send seam (the `RuntimeContext::send_message` the engine's `send`
@@ -73,6 +77,16 @@
 //!   decide whether a `call`/`return_from`/`return_to` event should be emitted; until that hook
 //!   exists it is only a query. Nor does a **match spec** filter the emitted events (none is
 //!   compiled — see below).
+//!   The **`running` flag** ([`CANONICAL`], the C's `F_TRACE_SCHED`,
+//!   `erl_bif_trace.c:760`) is *accepted, recorded, reported back and cleared* like every
+//!   other flag, and its `in`/`out` **events are not emitted**: this runtime is
+//!   single-threaded and has no scheduler-yield trace point, so
+//!   `erlang:trace(self(), true, [running])` answers `1` (and `trace_info(P, flags)` answers
+//!   `[running]`) while no `{trace, P, in, MFA}` / `{trace, P, out, MFA}` message is ever
+//!   produced. A caller that only needs the flag installed — `maps_SUITE`'s scheduler-yield
+//!   accounting, an OTP suite that arms `running` before a workload — sees exactly the
+//!   oracle's answers; a caller that *waits* for an `in`/`out` event parks until its timeout,
+//!   which is a named capability gap, never a wrong message.
 //! * **Carrying the sequential-trace token with a message.** The `{send, …}` event is emitted,
 //!   but the token is *not* attached to the message the send delivers, so a receiver cannot
 //!   inherit it (that needs a per-message slot in `beam_message`) and no `{'receive', …}`
@@ -219,6 +233,12 @@ impl TraceFlags {
     /// Whether the `arity` process flag is set (the `call` event carries the bare arity).
     pub(crate) fn has_arity(self) -> bool {
         self.0 & ARITY != 0
+    }
+
+    /// Whether no process flag is set — the C's `(ref->flags & TRACEE_FLAGS) == 0`, which is
+    /// what makes a tracee with no flags *no tracee at all* ([`TraceState::add_flags`]).
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -596,6 +616,61 @@ impl TraceState {
     /// Records `pid` as traced with `flags` reported to `tracer` (replacing any prior entry).
     pub fn set(&mut self, pid: ProcessId, flags: TraceFlags, tracer: Option<ProcessId>) {
         self.entries.insert(pid, TraceEntry { flags, tracer });
+    }
+
+    /// **Adds** `flags` to what `pid` already has and records `tracer` as its tracer — the C's
+    /// `start_trace` with `on = 1` (`../../erts/emulator/beam/erl_bif_trace.c:866-885`).
+    ///
+    /// Three facts from the C decide the shape:
+    ///
+    /// * the mask is **OR-ed** into the recorded flags (`ref->flags |= mask`), so a second
+    ///   `erlang:trace(P, true, …)` **adds** to the set instead of replacing it — the oracle's
+    ///   `[send]` then `[running]` reports `[running, send]`;
+    /// * a non-`nil` tracer **replaces** the recorded one (`erts_tracer_replace`), which is what
+    ///   `{tracer, Pid}` does; when the caller gave none it passes its own pid, so the recorded
+    ///   tracer is always the caller or the one it named;
+    /// * an entry whose flags end up **empty** is dropped (`(ref->flags & TRACEE_FLAGS) == 0` ⇒
+    ///   `clear_tracer_ref` + `delete_tracer_ref`), which is why
+    ///   `erlang:trace(P, true, [])` — and `[{tracer, P}]` with no flag atom — answers `1` while
+    ///   `trace_info(P, flags)` reports `[]` and `trace_info(P, tracer)` reports `[]`: no tracee
+    ///   exists at all, rather than one with an empty flag set.
+    ///
+    /// Unlike [`TraceState::set`] this never invents flags; it is the shape `erts_internal:trace/3`
+    /// uses, while `set` stays the direct "this is the whole state" writer for tests and the
+    /// runtime's own seams.
+    pub fn add_flags(&mut self, pid: ProcessId, flags: TraceFlags, tracer: Option<ProcessId>) {
+        let keep = {
+            let entry = self.entries.entry(pid).or_default();
+            entry.flags = TraceFlags(entry.flags.0 | flags.0);
+            if tracer.is_some() {
+                entry.tracer = tracer;
+            }
+            !entry.flags.is_empty()
+        };
+        if !keep {
+            self.entries.remove(&pid);
+        }
+    }
+
+    /// **Removes** the flag bits in `flags` from `pid`'s state — the C's `start_trace` with
+    /// `on = 0` (`ref->flags &= ~mask`), which drops the entry once no flag is left.
+    ///
+    /// Only the named bits go: after `[send, running]`, clearing `[running]` leaves `[send]`,
+    /// which is the oracle's answer. A **mask with no flags** (the `erlang:trace/2` wrapper's
+    /// `false, []`, and any `false` whose list held only a `{tracer, Pid}` option) clears
+    /// nothing — the C's `ref->flags &= ~0` — so an already-traced process stays traced and the
+    /// call only counts it.
+    pub fn remove_flags(&mut self, pid: ProcessId, flags: TraceFlags) {
+        let drop_entry = match self.entries.get_mut(&pid) {
+            Some(entry) => {
+                entry.flags = TraceFlags(entry.flags.0 & !flags.0);
+                entry.flags.is_empty()
+            }
+            None => false,
+        };
+        if drop_entry {
+            self.entries.remove(&pid);
+        }
     }
 
     /// Stops tracing `pid` (a no-op for an untraced one).
@@ -1286,6 +1361,78 @@ mod tests {
             state.get(pid(3)).expect("the entry").flags,
             flags_from_atoms(&["send"]).unwrap()
         );
+    }
+
+    /// `add_flags` is the C's `start_trace` `on = 1` half: it **OR-s** the mask into the flags
+    /// already recorded, replaces the tracer, and drops the entry when no flag is left.
+    #[test]
+    fn add_flags_ors_the_mask_replaces_the_tracer_and_drops_an_empty_entry() {
+        let mut state = TraceState::new();
+        let send = flags_from_atoms(&["send"]).expect("send");
+        let running = flags_from_atoms(&["running"]).expect("running");
+
+        // The first call records both the flag and the tracer.
+        state.add_flags(pid(1), send, Some(pid(2)));
+        assert_eq!(state.get(pid(1)).expect("the entry").flags, send);
+        assert_eq!(state.get(pid(1)).expect("the entry").tracer, Some(pid(2)));
+
+        // A second call **adds** — it never replaces — and the tracer follows the caller.
+        state.add_flags(pid(1), running, Some(pid(3)));
+        assert_eq!(
+            flags_to_atoms(state.get(pid(1)).expect("the entry").flags),
+            vec!["running", "send"],
+            "the oracle's `[send]` then `[running]` reports both flags"
+        );
+        assert_eq!(state.get(pid(1)).expect("the entry").tracer, Some(pid(3)));
+
+        // No tracer given leaves the recorded one alone (`add_flags` only replaces on `Some`).
+        state.add_flags(pid(1), running, None);
+        assert_eq!(state.get(pid(1)).expect("the entry").tracer, Some(pid(3)));
+
+        // A mask with no flag creates no entry at all — the C deletes the tracer ref.
+        state.add_flags(pid(7), TraceFlags(0), Some(pid(2)));
+        assert_eq!(state.get(pid(7)), None, "no flags, no tracee");
+        // …and adding nothing to an *existing* tracee keeps it exactly as it was.
+        state.add_flags(pid(1), TraceFlags(0), Some(pid(4)));
+        assert_eq!(
+            flags_to_atoms(state.get(pid(1)).expect("the entry").flags),
+            vec!["running", "send"]
+        );
+        assert_eq!(state.get(pid(1)).expect("the entry").tracer, Some(pid(4)));
+    }
+
+    /// `remove_flags` clears **only** the named bits, and a mask with no flag clears nothing —
+    /// the C's `ref->flags &= ~mask`, which is why `erlang:trace(P, false)` (the `/2` wrapper's
+    /// empty list) leaves an already-traced process traced.
+    #[test]
+    fn remove_flags_clears_only_the_named_bits() {
+        let mut state = TraceState::new();
+        let send = flags_from_atoms(&["send"]).expect("send");
+        let running = flags_from_atoms(&["running"]).expect("running");
+        state.add_flags(pid(1), TraceFlags(send.0 | running.0), Some(pid(2)));
+
+        // An empty mask is a no-op.
+        state.remove_flags(pid(1), TraceFlags(0));
+        assert_eq!(
+            flags_to_atoms(state.get(pid(1)).expect("the entry").flags),
+            vec!["running", "send"]
+        );
+
+        // Naming one flag removes exactly that one, and the tracer stays.
+        state.remove_flags(pid(1), running);
+        assert_eq!(
+            flags_to_atoms(state.get(pid(1)).expect("the entry").flags),
+            vec!["send"]
+        );
+        assert_eq!(state.get(pid(1)).expect("the entry").tracer, Some(pid(2)));
+
+        // Removing the last flag drops the entry (no tracee without flags).
+        state.remove_flags(pid(1), send);
+        assert_eq!(state.get(pid(1)), None);
+
+        // Removing from an untraced pid is a no-op, and `clear_all` is unaffected.
+        state.remove_flags(pid(9), send);
+        assert!(state.traced_pids().is_empty());
     }
 
     #[test]
