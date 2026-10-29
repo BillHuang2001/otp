@@ -3,11 +3,14 @@
 ## Intent
 The single owner of the four map `beam_loader::Instr` variants —
 `GetMapElements`, `HasMapFields`, `PutMapAssoc`, `PutMapExact` — dispatched from
-`../mod.rs::dispatch` (variant-partitioned router). Map layout is **read** through
-`crate::terms::map_entries` (both frozen layouts: flat map and HAMT) and **built** through
-`crate::terms::make_map` → `beam_term::map::write_map` (flat ≤ 32 distinct keys, else HAMT);
-key equality is `beam_term::cmp` (exact `=:=`, so `1` and `1.0` are distinct keys). The family
-borrows `module: &Module` for the atom table it compares keys with.
+`../mod.rs::dispatch` (variant-partitioned router). A read descends the map **once per key**
+through `beam_term::map::map_get` (both frozen layouts: the flat map's bounded key scan, the HAMT's
+hashed path walk) and never materializes a pair list;
+a write **copies the path** through `beam_term::map::map_put_cow` when the source is a hash map
+(> 32 keys) and **rebuilds** through `crate::terms::make_map` → `beam_term::map::write_map` when it
+is a flat map (≤ 32 distinct keys).
+Key equality is `beam_term::cmp` (`EQ` = exact `=:=`, so `1` and `1.0` are distinct keys). The
+family borrows `module: &Module` for the atom table it compares keys with.
 
 Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-173`,
 `beam_common.c:2237-2268` (`erts_gc_update_map_exact` sets `BADKEY`), `emu/ops.tab:1364-1424`,
@@ -15,22 +18,21 @@ Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-
 (`i_func_info_IaaI`) + `beam_common.c:448-544` (`handle_error`, the `function_clause` reason).
 
 ## Layout
-- `mod.rs` — `exec` (dispatch), `lookup`/`position` (linear `beam_term::cmp` scans, `:221`/`:230`),
-  `goto` (`:237`), `fail_or_raise` (`:246`), `fail_or_function_clause` (`:268`),
-  `raise_error_tuple` (`:289`).
-- `read.rs` — `get_map_elements` (`:54`), `has_map_fields` (`:85`).
-- `write.rs` — `put_map_assoc` (`:158`), `put_map_exact` (`:221`), `unchanged_after_update` (`:127`)
-  (the no-change fast path, next section); both reserve the whole map block with one rooted allocation
-  (`make_map_rooted` + `merge_slack_words`) and re-read every operand from the post-reserve machine
-  state, so a moving collector may run in the reserve.
-  The reservation's capacity is `key_count(...)` + the new pair count, where `key_count` is the
-  O(1) head-node size word (`beam_term::map::map_size`, the C's `flatmap_get_size`,
-  `beam_common.c:2002,2017`): the source's pair list is materialized **once** per instruction
-  (`put_map_assoc` by the merge, `put_map_exact` by the `{badkey,Key}` validation plus the merge),
-  never a second time for the length.
+- `mod.rs` — `exec` (dispatch), `position` (`:225`, the flat write arm's `beam_term::cmp` scan),
+  `goto` (`:232`), `fail_or_raise` (`:241`), `fail_or_function_clause` (`:263`),
+  `raise_error_tuple` (`:284`).
+- `read.rs` — `get_map_elements` (`:81`), `has_map_fields` (`:113`); the read model is the section
+  below.
+- `write.rs` — `key_count` (`:129`, the O(1) size word), `takes_cow_arm` (`:142`, the layout branch),
+  `merge_slack_words` (`:149`), `unchanged_after_update` (`:181`, the flat arm's no-change pre-walk),
+  `cow_update` (`:227`, the shared COW reservation + chained `region.put`), `put_map_assoc` (`:270`),
+  `put_map_exact` (`:344`); next section for the two arms and the no-change answers.
 - `tests.rs` — the unit suite (both layouts incl. the 32/33-key boundary, all failure paths, the
-  size-word/walk-count equivalence, the large-map reference-builder equivalence and the no-change
-  identity rows).
+  size-word equivalence, the large-map reference-builder equivalence, the no-change identity rows, and
+  the `path_copying` module: the rebuild-equivalence sweep over `n ∈ {0,1,31,32,33,34,250,2_500}`, the
+  exact-key fail/raise no-write rows, the HAMT multi-pair no-change rows, the size-independent
+  words-reserved pin and the `term_to_binary` byte row), plus its `read_path` submodule
+  (`tests_read.rs`: the read instructions' size sweep — see Test Strategy).
 
 ## The no-change fast path (term identity)
 An update that changes nothing answers the **source map's own `Eterm` word**, so
@@ -39,35 +41,122 @@ hashmap (>32 keys) alike.
 Ground truth: `erts_gc_update_map_assoc`'s `changed_keys`/`changed_values` fast path
 (`erts/emulator/beam/beam_common.c:2094-2142`), `erts_gc_update_map_exact`'s (`:2309,2325-2326`) and
 `erts_hashmap_insert`'s same-value answer (`erl_map.c:2493,2523-2526`).
-- The decision is `write.rs::unchanged_after_update`: every pair's key must already exist (looked up
-  with `beam_term::map::map_get` under the live atom namespace, i.e. the map's own key rule, so `1`
-  and `1.0` stay distinct) **and** its value must equal the stored value by **raw `Eterm` word
-  equality**, never by `=:=` (the C compares raw words).
-- It is a pure read that allocates nothing — no reservation, no materialized operand, not even a
-  pair-list `Vec` — which is what makes writing the source word to `dst` sound under a collecting
-  host: no collection can run between the read and the store, so the word cannot have moved.
-- Residual: an operand whose read would materialize it (a non-small `Operand::Integer`/`Character`,
-  i.e. a bignum) declines the fast path up front, so such an update rebuilds the map — correct
-  contents, identity lost.
-- `put_map_exact` runs the fast path **before** its `{badkey,Key}` validation and subsumes it for its
-  own answer: a missing key is never a no-op, so it falls through to the validation.
+- **HAMT source (> 32 keys): the decision is `map_put_cow`'s own zero-write arm.** `map_put_cow`
+  answers the **input map word** when the stored value word already equals `value`, and that insert
+  path allocates nothing — so the HAMT arm runs no pre-walk at all, it starts the one reservation and
+  writes nothing.
+  Cost of a no-change update on a HAMT: one reservation and zero writes, so the identity answer is
+  the writer's own and the words-reserved pin (`tests.rs`) is its figure.
+- **Flat source (≤ 32 keys): the decision is `write.rs::unchanged_after_update`**, kept because the
+  flat arm still rebuilds (it has no path-copying writer to defer to, and the pre-walk is what keeps
+  `put_map_assoc_no_change_allocates_nothing` green — no reservation happens on that path).
+  Every pair's key must already exist (looked up with `beam_term::map::map_get` under the live atom
+  namespace, i.e. the map's own key rule, so `1` and `1.0` stay distinct) **and** its value must equal
+  the stored value by **raw `Eterm` word** equality, never by `=:=` (the C compares raw words).
+- Both decisions are pure reads that allocate nothing — no materialized operand, not even a pair-list
+  `Vec` — which is what makes writing the source word to `dst` sound under a collecting host: no
+  collection can run between the read and the store, so the word cannot have moved.
+- Residual (flat arm only): an operand whose read would materialize it (a non-small
+  `Operand::Integer`/`Character`, i.e. a bignum) declines the pre-walk up front, so such an update
+  rebuilds the map — correct contents, identity lost. The HAMT arm has no such residual: its answer is
+  the writer's.
+- `put_map_exact` reaches its no-change answer **after** the `{badkey,Key}` validation: a missing key is
+  never a no-op, so it takes the failure path first; a present key set then falls through to the same
+  per-layout answer (the COW writer's zero-write arm on a HAMT, the pre-walk then a rebuild on a flat
+  map).
 - Pins (`tests.rs`): `put_map_assoc_no_change_returns_the_source_word`,
   `put_map_assoc_no_change_allocates_nothing` (the arena's `live_words` is unchanged — an invariant,
   not a magic count), `put_map_assoc_no_change_on_a_hash_map_returns_the_source_word` (a 40-key
   HAMT), `put_map_assoc_multi_pair_no_op_is_the_source_word` (every pair a no-op ⇒ identity) and its
   `…_with_one_change_is_not_the_source_word` twin, plus
   `put_map_exact_no_change_{returns_the_source_word,on_a_hash_map_returns_the_source_word}` and
-  `put_map_exact_missing_key_without_fail_raises_badkey`.
+  `put_map_exact_missing_key_without_fail_raises_badkey`; the `path_copying` module adds the HAMT
+  multi-pair no-op/one-change rows for **both** instructions at sizes up to 2 500.
+
+## The two write arms (layout-branched)
+`write.rs` branches on the source's own layout (`takes_cow_arm` = `terms::is_hashmap(map) && size >
+MAP_SMALL_MAP_LIMIT`), so both `put_map_assoc` and `put_map_exact` have two disjoint bodies; the
+destination store, the `badmap` check and the empty-pair short circuit are shared.
+- **HAMT source → `beam_term`'s path-copying writer.** This replaces the whole rebuild:
+  `map_put_cow` descends the key's path and shares every off-path subtree word, writing only the new
+  root-to-leaf nodes.
+  The source is therefore **not enumerated at all** — no `map_entries`, no pair `Vec`, no sort, no
+  `write_map` — which is what makes the cost O(k·log n) in the pairs instead of O(n + k) plus a whole
+  new map block.
+- **Flat source → today's rebuild, verbatim**, with its `unchanged_after_update` pre-walk. Kept
+  because a ≤ 32-key map has no deep path to copy (the whole map is one block, so copying the block
+  *is* the rebuild) and because the pre-walk is the flat arm's zero-allocation identity answer.
+- **The `map_put_cow` reserve rule: ONE rooted reservation of
+  `map_put_cow_words_capacity(size) · pairs + merge_slack_words(...)`,** carved as a `CowMapRegion` of
+  `pairs` slots of that stride (`terms::map_cow_rooted`, `src/terms/map.rs`).
+  Everything the closure does is a raw write **inside** the reservation: it re-reads the source with
+  `read_operand_slack` (the reserved-and-copied machine state, because a moving collector may have run
+  in the reserve) and threads the live map `region.put(i, map, key, value, atoms)?`, so a collection
+  can never move a term the writer is holding.
+  The per-put capacity is a **size-only bound** (293 words for any size > 32, 711 at exactly 32) and is
+  documented as sound for every map the writer accepts — that is why it, and not
+  `map_put_cow_words_required`, sizes a real write: the latter is exact but plans with an **empty**
+  `AtomTable`, so a key it could not order would under-size the reservation.
+  A non-multiple (`words % per != 0`), a zero stride, or a `checked_mul` overflow is a typed
+  `error::unsupported`, never a wrap or a truncated region.
+- **Exact-key validation is a hashed descent decided before any write.** `put_map_exact` validates
+  every key against the (immutable) source with `beam_term::map::map_get(map, key, atoms)` — not
+  `terms::map_entries` + a linear scan, which removes the old *double* full walk — and a `None` takes
+  the unchanged failure path (`fail_or_raise(..., "badkey", key_operand)`: the same jump for a fail
+  label, the same `{badkey,Key}` raise under `NO_FAIL`, the same `key_operand` identity).
+  Both arms' loops follow the reads' **rooting order** (`read.rs`'s rule): the key operand is read
+  first, the `source` operand word is **re-read** from the machine's post-collection state, and only
+  then does `map_get` consume it — the key read is the iteration's one allocating read, so a source
+  word (or a pair-list snapshot) taken before it is dead. `unchanged_after_update` is safe for the
+  same reason, decided up front: it declines any operand whose read would materialize a bignum
+  (`operand_slack_words`), so its loop allocates nothing while it holds the source word.
+  Nothing has been written at that point, so the failure path writes **no** word into either heap.
+  Because `map_put_cow` has *assoc* semantics (it inserts an absent key), the closure re-checks
+  presence right before each put and answers `error::unsupported("put_map_exact: key vanished across
+  the reserve")` on the impossible post-reserve state — the wording the merge already used, so the
+  typed-error surface is unchanged.
+- **Sharing and lifetime.** The destination is the process heap and so is the source map: two disjoint
+  bump regions, so the writer's "`hp` must outlive the result and must not be the source's own
+  storage" precondition holds trivially. Terms are immutable, so sharing the source's off-path subtree
+  words is sound, and **no word is ever written in place into the source**.
+  A malformed map is refused as `TermError::BadMap` → `BeamError::BadArg` (the same error
+  `terms::map_entries` produces), so error surfacing is unchanged and there is no rebuild fallback.
+- **Residual (honest).** A multi-pair HAMT update over-reserves `293·k` words even though the path
+  copy writes O(k·log n); `k` is 1 for the compiled single-key forms (`M#{K => V}` / `M#{K := V}`), so
+  the waste is real only for a hand-built multi-pair `put_map_*`.
+  The internal HAMT node order of a COW result is also not the rebuild's; content, `=:=` and canonical
+  `map_pairs` order are identical.
+
+## The read model (one descent per key, no pair list)
+- `get_map_elements` / `has_map_fields` read the source with `beam_term::map::map_get(map, key,
+  atoms)` **once per key** — the C's flatmap scan + `erts_hashmap_get` (`emu/map_instrs.tab:49-122`) —
+  which handles both frozen layouts, so a read costs O(k · log n) for k keys.
+  The source is **never enumerated**: the retired shape built a full `Vec<(Eterm, Eterm)>` by walking
+  every HAMT node (`crate::terms::map_entries`) and then scanned it linearly per key, i.e. O(n) for a
+  one-key guard.
+- `map_get`'s key rule is `beam_term::cmp`'s `EQ`, the same exact `=:=` the write side uses, so `1` and
+  `1.0` stay distinct keys and the engine still reimplements no term ordering (pinned by
+  `tests_read.rs::a_float_key_is_not_an_integer_key`).
+- **The rooting order rule.** `read_operand` can allocate (an `Operand::Integer`/`Character` beyond a
+  small int is materialized as a bignum), and an allocation may run a moving collector, so neither the
+  map word nor a key word is held across another operand read. Each iteration reads the key, **re-reads
+  the `source` operand** (after the iteration's allocating read; the re-read is a register/literal word
+  read and cannot allocate, because an allocating source operand is an integer and the `is_map` check
+  has already failed), then takes the `&AtomTable` from `ctx.atoms(module)` — it borrows `*ctx`
+  immutably, so it cannot be held across `read_operand`'s `&mut` — and descends with the
+  allocation-free `map_get`. Detail: [`read`](read.rs)'s module docs.
+- A malformed map's `TermError::BadMap` is reconciled into `BeamError::BadArg`, the error the previous
+  `map_entries` walk produced: no silent fallback, no wrong value.
 
 ## Failure paths
 | Site | Condition | `fail != NO_FAIL` | `fail == NO_FAIL` |
 |---|---|---|---|
-| `read.rs:65,96` / `write.rs:177,240` | non-map `source` | jump | raise `{badmap,Source}` |
-| `write.rs:257` | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
-| `read.rs:76,102` | key absent | jump | raise the **bare atom** `function_clause` |
+| `read.rs:92,124` / `write.rs:284,358` | non-map `source` | jump | raise `{badmap,Source}` |
+| `write.rs:385` (COW) / `:414` (flat) | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
+| `read.rs:104,132` | key absent | jump | raise the **bare atom** `function_clause` |
 
-`fail_or_raise` (`mod.rs:246`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
-(`mod.rs:289`); `fail_or_function_clause` (`mod.rs:268`) forwards the absent-key `NO_FAIL` branch to
+`fail_or_raise` (`mod.rs:241`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
+(`mod.rs:284`); `fail_or_function_clause` (`mod.rs:263`) forwards the absent-key `NO_FAIL` branch to
 the engine's single failed-clause definition `raise_function_clause_no_fail`
 (`dispatch.rs`; call site `mod.rs:275`, `what = "maps"`), which throws class `error`
 with the bare atom `function_clause` (no tuple — the reason is not `{Tag,Value}`).
@@ -140,7 +229,12 @@ Verified against the system `erlc` (OTP 29) disassembly:
   moving collector.
 - Atom-keyed flat-map storage order follows the *module-local* indices, so it can differ from
   the oracle's global-index order — visible only in a `term_to_binary` byte comparison of an
-  atom-keyed map, never in map semantics (`lookup`/`position` compare by name via `cmp`).
+  atom-keyed map, never in map semantics (`map_get`/`position` compare keys by name via `cmp`).
+  A HAMT result has a third order again (its node layout), so a byte comparison of a > 32-key map is
+  only meaningful between two builds of the **same** arm; canonical `map_pairs` order is the
+  layout-independent invariant.
+- `crates/beam_engine/Cargo.toml` carries a **dev-only** `beam_codec` edge (wave 1 → wave 4,
+  downward, no build-time cycle) for the `term_to_binary` byte row in `tests.rs`'s `path_copying`.
 
 ## Test Strategy
 - `tests.rs` unit suite: hand-built `Instr`s + a recording context. The raise cases intern the tag
@@ -167,12 +261,43 @@ Verified against the system `erlc` (OTP 29) disassembly:
   `beam_loader::load_file` table and asserts the exact typed
   `unsupported_opcode: maps: no 'badkey' atom in the module` (and no reason term). Neither can
   pass on the other's error.
-- `../../../tests/map_assoc_alloc.rs` pins the **capacity** count: a per-thread-armed counting
-  `#[global_allocator]` decomposes one `put_map_assoc` (1 000 and 2 775 source pairs) into
-  `harness + build + one source walk`, measured in the same binary, and requires the instruction to
-  fit that plus a slack smaller than a walk — so a re-introduced `map_entries(...).len()` second
-  walk fails — while the produced map is compared with the reference builder down to
-  `map_entries` storage order.
+- The same file's hash-map-cap source rows (`get_reads_a_hashmap_source`,
+  `get_with_a_missing_key_in_a_hashmap_takes_the_fail_label`,
+  `has_reports_presence_in_a_hashmap`) build their source with the frozen writer
+  (`beam_term::map::write_map` via `terms::make_map` plus small-integer filler keys, so the key count
+  is past `MAP_SMALL_MAP_LIMIT`), because only the real builder places a leaf in the slot its own
+  key's hash selects -- the locality `map_get` follows; the file's hand-written `Hamt` node blocks
+  serve the **write** path only, which enumerates the source or rebuilds it flat.
+- `tests.rs`'s `read_path` submodule (`tests_read.rs`) is the read side's size sweep, over sources
+  built with `terms::make_map` so each takes the frozen layout for its size
+  (`n ∈ {0,1,31,32,33,34,250,2_500}`): **every** present key fetched into its own `x(n)` destination
+  (two-key and three-key rows, so the destination count is unrelated to the map's size),
+  `has_map_fields` leaving its sentinel registers untouched, a 32-key atom-keyed flat source read by
+  both instructions, an absent key taking the `fail` label on both layouts (the earlier present key's
+  write staying harmless, the absent key's destination never written), the same absent key under
+  `NO_FAIL` raising the bare `function_clause` at every size on both layouts, that raise's typed-gap
+  residual on a hash map whose module does not name the atom, a non-map source's `fail` label and
+  `{badmap,Source}` for both instructions, and a `1.0` key not answering an integer `1` read.
+- `../../../tests/map_assoc_alloc.rs` keeps a per-thread-armed counting `#[global_allocator]` and the
+  `harness + build + one walk` band over one `put_map_assoc` (1 000 and 2 775 source pairs), measured
+  in the same binary, as an **upper-bound regression guard on the rebuild shape**: `build` is the
+  reference map the semantic pin compares against and `walk` is one `terms::map_entries` enumeration,
+  so an update that went back to enumerate-and-rebuild (or to the old `map_entries(map)?.len()` double
+  walk) still blows through the band while the hash-map arm sits far below it — it enumerates nothing,
+  and its arena reservation is not an allocator event at all.
+  The produced map is compared with the reference builder in canonical
+  `beam_term::map::map_pairs` order (`=:=` pair by pair), because a COW result's storage order is not
+  the rebuild's.
+  The same file carries the **read** pin (`the_map_read_instructions_do_not_allocate_a_pair_list`):
+  `get_map_elements` and `has_map_fields` (two keys) over a hash-map source at 250 and 6 250 keys make
+  the **same** allocation count at both sizes (9 events, all of them the run harness) and stay under a
+  small constant, so a read that went back to a pair list fails there as well as on the shape.
+- `tests.rs`'s `path_copying` module is the rebuild-equivalence gate for the COW arm: for
+  `put_map_assoc` and `put_map_exact` over `n ∈ {0,1,31,32,33,34,250,2_500}` (flat ≤ 32, HAMT ≥ 33)
+  with a replaced key, a replaced key plus a new one, and a new key, it asserts the instruction's
+  result is `=:=` the `terms::make_map` rebuild of the same merge, the same `map_size`, and the same
+  canonical `map_pairs` sequence; plus the exact-key fail/raise no-write rows, the HAMT multi-pair
+  no-change rows, the size-independent words-reserved pin and the `term_to_binary` byte row.
 - No differential-gate coverage of the compiled instruction path: the `errors/badmap_reason`,
   `errors/badmap_list_value`, `errors/badkey_reason`, `errors/badkey_compound_key` cases are all
   `CaseKind::Eval` (the `maps:get` BIF path), not a compiled `put_map_*`.
@@ -186,30 +311,35 @@ Verified against the system `erlc` (OTP 29) disassembly:
   instructions' `function_clause` case when the module does not name it. The seeded hosts
   (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name all three, so the raise is the oracle's
   `{badkey,Key}`/`{badmap,Source}` (and the engine-defined bare `function_clause`) exactly.
-- `lookup`/`position` are O(n) scans (no hash) and `put_map_assoc` is O(n²) in the pair count
-  (`write.rs:204`); correct but unoptimised. The source **walk** count is one per instruction
-  (`tests/map_assoc_alloc.rs` pins it with a counting allocator), and the no-change fast path is the
-  one route that materializes no pair list: it answers `map_get` per pair and never calls
-  `map_entries`.
-- **Cost model per update (n = source keys, k = pairs): one full `map_entries` walk into a `Vec`
-  (HAMT also a work-stack `Vec`, `terms/map.rs:273`), k `position` scans (`write.rs:204`, O(n·k)),
-  then `write_map`'s sort + rebuild (O((n+k) log(n+k))) — so at least two pair `Vec`s for a flat
-  update (`terms/map.rs:252` + `beam_term/src/map.rs:389`) and four+ plus one `Vec` per trie node for
-  a HAMT one (`:402`, `:434`, `build_trie` `:196`, `serialize_node` `:256`), and a whole new map
-  block of `map_words_capacity(n+k)` words per instruction.**
-- There is no incremental / path-copying update anywhere: `beam_term::map` exposes only `map_get`
-  (HAMT descent, `:590`) and the from-scratch `write_map` (`:379`), so every `PutMapAssoc` /
-  `PutMapExact` is a full rebuild (ERTS path-copies: O(log n) new nodes).
-- `put_map_exact` walks the source **twice** (the `{badkey,Key}` validation `write.rs:251` and the
-  merge `write.rs:272`).
-- The read instructions materialize the whole pair list and scan it linearly (`read.rs:67`, `:98`
-  plus `lookup` `mod.rs:221`) where `beam_term::map::map_get` (`beam_term/src/map.rs:590`) would
-  descend the HAMT — so a one-key guard (`has_map_fields` / `get_map_elements`) is O(n), not O(log n).
+- **Cost model per write (n = source keys, k = pairs), per arm.**
+  - **HAMT source (> 32 keys):** one rooted reservation of `map_put_cow_words_capacity(n)·k + slack`
+    arena words (293·k for any `n > 32`), then k puts, each descending the key's hash path and copying
+    only the nodes on it — O(k·log n) new nodes, **no** pair list, **no** sort, **no** whole-map block.
+    The source is not enumerated at all.
+  - **Flat source (≤ 32 keys):** the rebuild — the pre-walk (a `map_get` per pair, materializing
+    nothing), then one `map_entries` walk into a pair `Vec`, k `position` scans (the old O(n·k) shape)
+    and `write_map`'s sort + build: at least two pair `Vec`s (`terms/map.rs` + `beam_term/src/map.rs`)
+    and a new map block of `map_words_capacity(n+k)` words.
+- **A multi-pair HAMT update over-reserves.** The per-put capacity is a size-only bound, so `k` pairs
+  reserve `293·k` words even though the written node count is O(k·log n); `k` is 1 for the compiled
+  single-key forms (`M#{K => V}` / `M#{K := V}`), so the waste is only reachable from hand-built IR.
+  A HAMT result's internal node order is also not the rebuild's (content, `=:=` and canonical
+  `map_pairs` order are identical).
+- **No known-costly path remains on the read side.** Both read instructions descend once per key
+  with `beam_term::map::map_get` (the HAMT's hashed walk, the flat map's bounded scan of ≤ 32 keys),
+  allocate nothing, and never build a pair list — the retired `map_entries` + linear-scan shape is
+  gone (`tests/map_assoc_alloc.rs::the_map_read_instructions_do_not_allocate_a_pair_list` pins the
+  flat allocation count across a 25× size range). A flat map's `map_get` is still a bounded linear
+  scan (at most `MAP_SMALL_MAP_LIMIT` = 32 `cmp` comparisons), which is the frozen flat-map read rule,
+  not a cost that can grow.
+  `position` (`mod.rs:225`) survives only for the two **merge** closures (`write.rs:326`, `:433`);
+  `put_map_exact` validates each key with a hashed `map_get` descent — on both arms — and then
+  re-checks presence inside the COW closure, so no arm takes a full source walk to validate.
 - The baseline tier has **no inline arm** for any map instruction (`jit/baseline/emit/block.rs:1376`
   → `emit_family` → `family.rs:57` `jit_family` → `families::dispatch`), so each one costs a helper
   call plus a second variant match on top of the family body.
-- `write.rs:280` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
-  for an impossible post-reserve state.
+- `write.rs` (`put_map_exact: key vanished across the reserve`) is a defensive typed error for an
+  impossible post-reserve state, raised in both arms.
 
 ## Notes for Agents
 - `../../../tests/gaps.rs:272`/`:300` pin the two read instructions' `no_fail` cases to

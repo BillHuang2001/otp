@@ -26,6 +26,12 @@
 //! allocate through the plain [`ExecutionContext::alloc_words`]; their `*_rooted`
 //! twins reserve the block **before** a reader closure supplies the pairs, so a
 //! moving collector may relocate the operands in between ([`super::slack`]).
+//!
+//! [`map_cow_rooted`] is the **incremental** (path-copying) update seam: instead of
+//! rebuilding a map from a pair list it reserves one region of fixed [`CowMapRegion`]
+//! slots and lets a closure chain [`beam_term::map::map_put_cow`] calls into them, so
+//! one `put_map_assoc`/`put_map_exact` over a hash map costs Θ(log n) words rather
+//! than Θ(n).
 use beam_common::{BeamError, Result};
 use beam_loader::Module;
 use beam_term::{thing, AtomTable, Eterm};
@@ -195,6 +201,165 @@ where
     // live.
     let map = unsafe { beam_term::map::write_map(hp, &pairs, atoms) }?;
     Ok(map)
+}
+
+// ---------------------------------------------------------------------------
+// The path-copying (COW) update seam — `beam_term::map::map_put_cow`
+// ---------------------------------------------------------------------------
+
+/// The words a caller must reserve for **one** path-copying put over a map of
+/// `size` pairs — the size-only capacity bound of
+/// [`beam_term::map::map_put_cow`].
+///
+/// Forwarded verbatim from `beam_term`, which owns the figure and documents its
+/// derivation and its soundness domain: `293` for a hash-map source of more than
+/// [`MAP_SMALL_MAP_LIMIT`] keys, `map_words_capacity(33)` = `711` at exactly the
+/// limit, and `flatmap_size_words(size + 1)` below it. It is a **bound**, not the
+/// figure a particular put writes (`map_put_cow_words_required` is the exact one,
+/// and it must not be used to size a real write — it plans against an empty
+/// [`AtomTable`]).
+///
+/// A safe wrapper so the instruction families never name the raw-heap writer
+/// directly: this module is the crate's single raw-heap home.
+pub fn map_put_cow_capacity(size: usize) -> usize {
+    beam_term::map::map_put_cow_words_capacity(size)
+}
+
+/// A caller-reserved region of `count` fixed-`stride` **slots**, one per
+/// path-copying map put — the staging area an incremental map update writes its
+/// copied nodes into.
+///
+/// The region is carved out of one rooted reservation by [`map_cow_rooted`], so a
+/// moving collector may relocate the *operands* between the reserve and the first
+/// put but never the region itself (its pointer is not a root, which is exactly why
+/// nothing may allocate from the BEAM heap once the writes start).
+///
+/// Every slot is disjoint from the source map's storage and from every other slot;
+/// a slot a put declines to use (the writer's zero-write no-change arm) is simply
+/// left untouched.
+#[derive(Debug)]
+pub struct CowMapRegion {
+    /// The first word of the reservation (slot 0).
+    base: *mut Eterm,
+    /// The words reserved per slot — one [`map_put_cow_capacity`] figure.
+    stride: usize,
+    /// How many slots the reservation holds.
+    count: usize,
+}
+
+impl CowMapRegion {
+    /// The number of put slots the reservation holds.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The words reserved per slot (one [`map_put_cow_capacity`] figure).
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// `beam_term::map::map_put_cow` into slot `index`: the map `map` with `key`
+    /// associated to `value`, copying only the nodes on `key`'s hash path.
+    ///
+    /// Answers the **input map word unchanged** where the stored value word already
+    /// equals `value` (nothing is written then), so a chain of such puts answers the
+    /// source map itself — the observable [`crate::families::maps`]' no-change
+    /// contract relies on. An absent key inserts. A malformed map is the typed
+    /// [`BeamError::BadArg`], the same error the [`map_entries`] walk produces.
+    ///
+    /// An `index` at or past [`count`](Self::count) is a typed
+    /// [`crate::error::unsupported`] — a caller sizing bug, never a write past the
+    /// reservation.
+    pub fn put(
+        &self,
+        index: usize,
+        map: Eterm,
+        key: Eterm,
+        value: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<Eterm> {
+        if index >= self.count {
+            return Err(crate::error::unsupported(
+                "map_put_cow: slot index beyond the reserved region",
+            ));
+        }
+        // SAFETY: `index < count`, so `base + index * stride` addresses the
+        // `stride`-word slot the caller reserved for this put, inside a region that
+        // is exclusively owned (the source map never lives in it), is at least
+        // `count * stride` words long, and outlives the returned map — the three
+        // preconditions `map_put_cow` states. The region's words are never handed
+        // out twice, and no second reader of them exists (`&self` only).
+        Ok(unsafe {
+            beam_term::map::map_put_cow(self.base.add(index * self.stride), map, key, value, atoms)
+        }?)
+    }
+}
+
+/// The **rooted** entry point of an incremental map update: ONE rooted reservation
+/// of `words + extra` words, a [`CowMapRegion`] of `words / per` slots over it, and
+/// then the `write` closure, which chains the path-copying puts and answers the
+/// resulting map.
+///
+/// # Why one reservation, and why nothing may allocate after it
+///
+/// The reserve is the single allocating — and therefore possibly **collecting** —
+/// door ([`crate::terms::slack`]): a moving collector relocates every term
+/// reachable from the machine's root set and rewrites the roots in place, so a raw
+/// `Eterm` read *before* the reserve is stale afterwards, and the reserved block's
+/// own pointer is not a root. The closure therefore re-reads every operand from the
+/// machine's post-collection state, and neither it nor the writer may allocate from
+/// the BEAM heap: a second collecting allocation would strand the nodes already
+/// written into the region (nothing points at them yet).
+///
+/// The `extra`-word tail after the region is the [`Slack`] a non-small
+/// `Operand::Integer` operand is materialized into (see
+/// [`crate::operand::operand_slack_words`]), so the whole build still costs one
+/// allocation.
+///
+/// `words` is the total the caller reserved and must be a whole number of `per`
+/// (`per` is [`map_put_cow_capacity`]) word slots — the caller derives it as
+/// `per * pairs.len()`; a non-multiple (or a zero `per`) is a typed
+/// [`crate::error::unsupported`] sizing error, never a short reservation.
+///
+/// The atom **namespace** the writer hashes and compares keys with is taken from
+/// the host ([`ExecutionContext::atoms`](crate::context::ExecutionContext::atoms))
+/// **after** the reserve — the last `&mut ctx` use — and handed to the closure,
+/// exactly as [`make_map_rooted`] does.
+pub fn map_cow_rooted<R>(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    live: u32,
+    words: usize,
+    per: usize,
+    extra: usize,
+    write: R,
+) -> Result<Eterm>
+where
+    R: FnOnce(&Machine, &CowMapRegion, &mut Slack, &AtomTable) -> Result<Eterm>,
+{
+    if per == 0 || words % per != 0 {
+        return Err(crate::error::unsupported(
+            "map_cow: the reserved words are not a whole number of put slots",
+        ));
+    }
+    let count = words / per;
+    let total = words
+        .checked_add(extra)
+        .ok_or_else(|| crate::error::unsupported("map_cow: reservation overflows a word count"))?;
+    let hp = reserve(machine, ctx, total, live)?;
+    // SAFETY: the reserve returned `words + extra` exclusively-owned, writable
+    // words; the `extra`-word tail after the region is the slack.
+    let mut slack = unsafe { Slack::new(hp.add(words), extra) };
+    // Taken after the reserve (its last `&mut ctx` use) and held only across the
+    // closure call and the puts it performs, neither of which touches `ctx`.
+    let atoms = ctx.atoms(module);
+    let region = CowMapRegion {
+        base: hp,
+        stride: per,
+        count,
+    };
+    write(machine, &region, &mut slack, atoms)
 }
 
 /// Whether `t` is a map using the frozen **hashmap** (HAMT) layout.

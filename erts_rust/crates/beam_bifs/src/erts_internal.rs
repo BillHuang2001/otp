@@ -1139,7 +1139,8 @@ mod tests {
     #[test]
     fn map_hashmap_children_lists_the_head_slots_in_reverse_like_the_oracle() {
         with_ctx(|ctx| {
-            let map = access::make_map(ctx.heap(), &int_pairs(1..=33)).expect("the map fits");
+            let (atoms, heap) = ctx.atom_and_heap();
+            let map = access::make_map(heap, atoms, &int_pairs(1..=33)).expect("the map fits");
             assert!(access::is_hashmap(map));
             let shapes = child_shapes(ctx, map).expect("a HAMT head node");
             assert_eq!(
@@ -1169,7 +1170,8 @@ mod tests {
     #[test]
     fn map_hashmap_children_reverses_the_node_storage_order() {
         with_ctx(|ctx| {
-            let map = access::make_map(ctx.heap(), &int_pairs(1..=40)).expect("the map fits");
+            let (atoms, heap) = ctx.atom_and_heap();
+            let map = access::make_map(heap, atoms, &int_pairs(1..=40)).expect("the map fits");
             let slots = access::hamt_node(map).expect("a head node").slots;
             let list = map_hashmap_children_1(ctx, &[map]).expect("a HAMT head node");
             let mut got = Vec::new();
@@ -1192,7 +1194,8 @@ mod tests {
     #[test]
     fn map_hashmap_children_accepts_a_hamt_inner_node() {
         with_ctx(|ctx| {
-            let map = access::make_map(ctx.heap(), &int_pairs(1..=40)).expect("the map fits");
+            let (atoms, heap) = ctx.atom_and_heap();
+            let map = access::make_map(heap, atoms, &int_pairs(1..=40)).expect("the map fits");
             let node = {
                 let slots = access::hamt_node(map).expect("a head node").slots;
                 slots

@@ -40,11 +40,28 @@
 //! keys and a *HAMT* hash map above that (`erl_map.h`). Both layouts are owned by
 //! `beam_term::map` (`write_map`/`map_pairs_storage_order`/`map_size`/`map_get`),
 //! which this module reaches through [`crate::access`] — so every reader and every
-//! producer below handles either representation, with no pair-count ceiling. The
-//! writer ([`build`] → [`crate::access::make_map`] → `beam_term::map::write_map`)
-//! picks the representation exactly as ERTS does (≤32 distinct keys ⇒ flat map with
-//! the keys in `erts_cmp_flatmap_keys` order, more ⇒ a HAMT keyed by `erts_map_hash`)
-//! and collapses duplicate keys **last value wins**.
+//! producer below handles either representation, with no pair-count ceiling.
+//!
+//! # Two writers, one atom namespace
+//!
+//! The four *incremental* BIFs — `put/3`, `update/3`, `remove/2`, `take/2` — path-copy:
+//! they rewrite only the trie nodes on the key's hash path and share every off-path
+//! subtree with the source map by word (`beam_term::map::{map_put_cow, map_remove_cow}`,
+//! the C's `erts_maps_put`/`erts_maps_update`/`hashmap_delete`/`erts_maps_take`; see
+//! [`cow_put`]/[`cow_remove`]).
+//!
+//! The from-scratch builders — `new/0`, `from_list/1`, `from_keys/2`, `merge/2`,
+//! `with/2`, `without/2`, `map/2`, `filter/2` — still rebuild the whole map through
+//! [`build`] → [`crate::access::make_map`] → `beam_term::map::write_map`, which picks
+//! the representation exactly as ERTS does (≤32 distinct keys ⇒ flat map with the keys
+//! in `erts_cmp_flatmap_keys` order, more ⇒ a HAMT keyed by `erts_map_hash`) and
+//! collapses duplicate keys **last value wins**.
+//!
+//! Both routes order through the caller's **one live** atom table (`ctx.atoms()`, via
+//! `BifContext::atom_and_heap`): atom keys compare by raw index in
+//! `erts_cmp_flatmap_keys`, while a **compound** key's atom elements are ordered by
+//! **name** (`compare::cmp_atoms`, the C's `erts_cmp_atoms`), so a rebuild and a path
+//! copy store the same pairs in the same order.
 //!
 //! Reading a HAMT is the interesting half: an *existing* hash map reaches these BIFs
 //! whenever `beam_codec` decodes a `MAP_EXT` blob with more than 32 distinct keys
@@ -304,11 +321,45 @@ fn map_lookup(ctx: &BifContext<'_>, map: Eterm, key: Eterm) -> Result<Option<Ete
 /// keys **last value wins** — so callers may pass duplicates freely (the oracle's
 /// `maps:from_list/1`, `merge/2`, `from_keys/2` and `put/3` all behave that way).
 ///
+/// The **live** atom table goes with the heap (`BifContext::atom_and_heap`), exactly as
+/// for the path-copying writers below: it is the namespace `write_map` orders a flat
+/// map's **compound** keys' atom elements by, so a rebuild and a path copy agree on the
+/// stored order (see [`crate::access::make_map`]).
+///
 /// # Errors
 ///
 /// Propagates the heap's allocation failure.
 fn build(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
-    access::make_map(ctx.heap(), pairs)
+    let (atoms, heap) = ctx.atom_and_heap();
+    access::make_map(heap, atoms, pairs)
+}
+
+// ---------------------------------------------------------------------------
+// Path-copying writers: `put/3`, `update/3`, `remove/2`, `take/2`
+//
+// These four are the *incremental* map updates: one key changes, so only the nodes on
+// that key's hash path are rewritten and every off-path subtree is shared with the
+// source map by word (`beam_term::map::{map_put_cow, map_remove_cow}` — the C's
+// `erts_maps_put`/`erts_maps_update`/`hashmap_delete`/`erts_maps_take`). They are flat
+// in n; the older route (pair walk → mutate → `write_map` rebuild) was Θ(n log n) — it
+// hashed every key, sorted, built a trie and serialized it, for one changed pair.
+//
+// The output is reserved in the BIF working arena, never in the source map's storage;
+// the reservations and the `# Safety` reasoning live with the one `unsafe` module
+// ([`crate::access::map_put_cow`] / [`crate::access::map_remove_cow`]).
+// ---------------------------------------------------------------------------
+
+/// [`crate::access::map_put_cow`] over the context's working arena.
+fn cow_put(ctx: &mut BifContext<'_>, map: Eterm, key: Eterm, value: Eterm) -> Result<Eterm> {
+    let (atoms, heap) = ctx.atom_and_heap();
+    access::map_put_cow(heap, atoms, map, key, value)
+}
+
+/// [`crate::access::map_remove_cow`] over the context's working arena (`None` = absent
+/// key, nothing written).
+fn cow_remove(ctx: &mut BifContext<'_>, map: Eterm, key: Eterm) -> Result<Option<Eterm>> {
+    let (atoms, heap) = ctx.atom_and_heap();
+    access::map_remove_cow(heap, atoms, map, key)
 }
 
 /// Whether `term` is exactly the atom `name`.
@@ -426,28 +477,34 @@ fn find_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `maps:put/3` — a new map with `Key` bound to `Value` (inserting if absent).
 ///
+/// The write is a **path copy** ([`cow_put`]): only the nodes on `Key`'s hash path are
+/// rewritten, so the cost is flat in the map's size (`erl_map.c`'s `erts_maps_put` and
+/// its HAMT twin `erts_hashmap_insert_down`).
+///
 /// A call that changes nothing returns **`Map` itself**, not a rebuilt copy: when `Key`
 /// is already bound to this very value *word* the oracle hands the argument back
-/// (`erl_map.c`'s `erts_maps_put`, `found_key: if (*vs == value) { … return map; }`, and
-/// the HAMT twin `erts_hashmap_insert_down`'s `*sz = 0` "same value, same map"). The
-/// comparison is raw word identity ([`Eterm`]'s `==`), never the structural
-/// [`compare::eq`], because that is what the C compares — it is what
-/// `erts_debug:same/2` observes (`same(maps:put(a, V, M), M)` ⇒ `true` for
-/// `M = #{a => V}`, `same(maps:put(a, 43, M), M)` ⇒ `false`).
+/// (`erts_maps_put`'s `found_key: if (*vs == value) { … return map; }`, and the HAMT
+/// twin's `*sz = 0` "same value, same map"). The comparison is raw word identity
+/// ([`Eterm`]'s `==`), never the structural [`compare::eq`], because that is what the C
+/// compares — it is what `erts_debug:same/2` observes (`same(maps:put(a, V, M), M)` ⇒
+/// `true` for `M = #{a => V}`, `same(maps:put(a, 43, M), M)` ⇒ `false`). The writer's
+/// own `Nothing` arm makes that decision, so this BIF never descends the path twice for
+/// it.
+///
+/// Key presence is exact (`=:=`): `maps:put(1.0, V, #{1 => x})` keeps both keys. A
+/// `put` at the flat→HAMT boundary (32 → 33 pairs) converts the representation, as the
+/// oracle does.
 ///
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
 /// reason term of the raise).
 fn put_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    if access::is_map(args[2]) && map_lookup(ctx, args[2], args[0])? == Some(args[1]) {
-        // `Key` already holds this exact value word: nothing changes.
-        return Ok(args[2]);
+    let (key, value, map) = (args[0], args[1], args[2]);
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
     }
-    let mut pairs = map_pairs(ctx, args[2])?;
-    // Appending makes `write_map`'s last-wins dedup pick the new value.
-    pairs.push((args[0], args[1]));
-    build(ctx, &pairs)
+    cow_put(ctx, map, key, value)
 }
 
 /// `maps:update/3` — a new map with `Key`'s value replaced by `Value`.
@@ -460,56 +517,47 @@ fn put_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// Replacing a value with the very same **word** returns `Map` itself
 /// (`erl_map.c`'s `erts_maps_update`, `found_key: if (*vs == value) *res = map`, and
 /// the HAMT twin's `*sz = 0` arm) — see [`put_3`] for why the comparison is word
-/// equality and how `erts_debug:same/2` observes it.
+/// equality and how `erts_debug:same/2` observes it. Otherwise [`cow_put`] path-copies.
 ///
 /// # Errors
 ///
 /// A structured raise when `Map` is not a map (`error:{badmap, Map}`) or `Key` is absent
 /// (`error:{badkey, Key}`).
 fn update_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let pairs = map_pairs(ctx, args[2])?;
-    let mut out: Vec<(Eterm, Eterm)> = Vec::with_capacity(pairs.len());
-    let mut found = false;
-    for (k, v) in pairs {
-        if compare::eq(k, args[0], ctx.atoms()) {
-            if v == args[1] {
-                // `Key` already holds this exact value word: nothing changes.
-                return Ok(args[2]);
-            }
-            out.push((k, args[1]));
-            found = true;
-        } else {
-            out.push((k, v));
-        }
+    let (key, value, map) = (args[0], args[1], args[2]);
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
     }
-    if !found {
-        return Err(structured_error(ctx, "badkey", &[args[0]])?);
+    match map_lookup(ctx, map, key)? {
+        None => Err(structured_error(ctx, "badkey", &[key])?),
+        // `Key` already holds this exact value word: nothing changes (`cow_put`'s own
+        // `Nothing` arm would answer the same map, this just skips the reserve).
+        Some(current) if current == value => Ok(map),
+        Some(_) => cow_put(ctx, map, key, value),
     }
-    build(ctx, &out)
 }
 
 /// `maps:remove/2` — a new map without `Key` (a no-op when it is absent).
 ///
-/// An absent `Key` returns **`Map` itself**: `maps_remove_2` goes through
-/// `erts_maps_take`, whose contract is "if the key is not found `*res = map` (the input
-/// map)" — `erts_debug:same(maps:remove(zz, M), M)` ⇒ `true`.
+/// The write is a path copy ([`cow_remove`], the C's `hashmap_delete`); an absent `Key`
+/// returns **`Map` itself**: `maps_remove_2` goes through `erts_maps_take`, whose
+/// contract is "if the key is not found `*res = map` (the input map)" —
+/// `erts_debug:same(maps:remove(zz, M), M)` ⇒ `true`.
 ///
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
 /// reason term of the raise).
 fn remove_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let pairs = map_pairs(ctx, args[1])?;
-    let len = pairs.len();
-    let out: Vec<(Eterm, Eterm)> = pairs
-        .into_iter()
-        .filter(|&(k, _)| !compare::eq(k, args[0], ctx.atoms()))
-        .collect();
-    if out.len() == len {
-        // `Key` was absent, so the removal changed nothing.
-        return Ok(args[1]);
+    let (key, map) = (args[0], args[1]);
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
     }
-    build(ctx, &out)
+    match cow_remove(ctx, map, key)? {
+        Some(rest) => Ok(rest),
+        // `Key` was absent, so the removal changed nothing.
+        None => Ok(map),
+    }
 }
 
 /// `maps:take/2` — `{Value, MapWithoutKey}` when `Key` is present, else `error`.
@@ -518,27 +566,38 @@ fn remove_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// gives `maps:take(1.0, #{1 => x})` ⇒ `error` (and `maps:take(1, #{1.0 => x})`
 /// ⇒ `error`).
 ///
+/// The pair is assembled from two path descents: [`map_lookup`] reads the value (the
+/// writer's output carries only the new map) and [`cow_remove`] copies the path. They
+/// share the hash and the `=:=` key comparison, so they agree by construction; a
+/// disagreement — reachable only through a map interior that breaks the frozen layout's
+/// invariants — is reported as the typed gap rather than papered over with a wrong pair.
+///
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
 /// reason term of the raise).
 fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let pairs = map_pairs(ctx, args[1])?;
-    let Some(index) = pairs
-        .iter()
-        .position(|&(k, _)| compare::eq(k, args[0], ctx.atoms()))
-    else {
-        return ctx.intern_atom("error");
-    };
-    let value = pairs[index].1;
-    let rest: Vec<(Eterm, Eterm)> = pairs
-        .into_iter()
-        .enumerate()
-        .filter(|&(j, _)| j != index)
-        .map(|(_, pair)| pair)
-        .collect();
-    let rest = build(ctx, &rest)?;
-    ctx.tuple(&[value, rest])
+    let (key, map) = (args[0], args[1]);
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
+    }
+    let value = map_lookup(ctx, map, key)?;
+    let rest = cow_remove(ctx, map, key)?;
+    match (value, rest) {
+        (Some(value), Some(rest)) => ctx.tuple(&[value, rest]),
+        // `Key` is absent: both descents say so, and `maps:take/2` answers `error`.
+        (None, None) => ctx.intern_atom("error"),
+        // The two descents cannot disagree (same hash, same key comparison).
+        (value, rest) => {
+            debug_assert!(
+                false,
+                "maps:take/2 descents disagreed: lookup={} remove={}",
+                value.is_some(),
+                rest.is_some()
+            );
+            Err(crate::error::unsupported_bif())
+        }
+    }
 }
 
 /// `maps:from_keys/2` — a map with every key of the list `Keys` bound to `Value`.

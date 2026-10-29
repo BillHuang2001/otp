@@ -2313,7 +2313,8 @@ mod tests {
                 let entries: Vec<(Eterm, Eterm)> = (1..=LARGE_MAP_PAIRS)
                     .map(|k| (make_small(k), make_small(k)))
                     .collect();
-                let map = crate::access::make_map(ctx.heap(), &entries).expect("the map fits");
+                let (atoms, heap) = ctx.atom_and_heap();
+                let map = crate::access::make_map(heap, atoms, &entries).expect("the map fits");
                 (
                     format_term(ctx, map, false).expect("the large map renders"),
                     // The map's `depth == 1` arm must precede the pair bound, exactly as

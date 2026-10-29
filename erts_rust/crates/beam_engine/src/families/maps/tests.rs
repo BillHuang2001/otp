@@ -199,6 +199,22 @@ fn assert_unsupported_reason(err: BeamError, reason: &str) {
     );
 }
 
+/// The value bound to `key` in a `terms::map_entries` pair list, using exact key
+/// equality.
+///
+/// A **test-side** scan only: the production read instructions descend the map once
+/// per key with `beam_term::map::map_get` and never build such a list, but a test
+/// that has already enumerated the *produced* map (from a write instruction) wants
+/// one pair out of that enumeration. The comparison is delegated to
+/// `beam_term::cmp` (the exact `=:=` ordering), the same key rule the instructions
+/// use.
+fn lookup(entries: &[(Eterm, Eterm)], key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+    entries
+        .iter()
+        .find(|(candidate, _)| cmp(*candidate, key, atoms).is_eq())
+        .map(|(_, value)| *value)
+}
+
 // -- get_map_elements ----------------------------------------------------
 
 #[test]
@@ -1231,13 +1247,18 @@ fn the_map_size_word_counts_distinct_keys() {
 
 /// A `put_map_assoc` over a 1 000-pair hash map produces exactly the map the
 /// reference builder produces for the merged pair list — same key set, same values,
-/// same **storage order** (the HAMT shape, not just `cmp` equality) — and repeating
-/// the instruction on the same source yields the identical map again.
+/// same **canonical** key sequence (`beam_term::map::map_pairs`, which the frozen
+/// layout guarantees) — and repeating the instruction on the same source yields the
+/// identical map again.
+///
+/// The *storage* order is deliberately not pinned here any more: the update now
+/// descends the key's hash path instead of rebuilding the tree, so its internal HAMT
+/// node order is not the rebuild's (content, `=:=` and canonical order are).
 ///
 /// This pins the *result* independently of the capacity arithmetic: the reservation's
-/// size only has to be an upper bound (the builder deduplicates), so a wrong count
-/// would show up here as a `make_map_rooted` capacity error or a wrong map, never as a
-/// silently truncated update.
+/// size only has to be an upper bound, so a wrong count would show up here as a
+/// `map_cow_rooted` sizing error or a wrong map, never as a silently truncated
+/// update.
 #[test]
 fn put_map_assoc_over_a_large_hash_map_matches_the_reference_builder() {
     let mut fixture = Fixture::new(&[]);
@@ -1290,14 +1311,15 @@ fn put_map_assoc_over_a_large_hash_map_matches_the_reference_builder() {
         1_001,
         "999 stays, 5 000 is added"
     );
-    // Storage order too (the HAMT shape), which `cmp` alone would not pin.
-    let produced = terms::map_entries(first).unwrap();
-    let expected = terms::map_entries(reference).unwrap();
+    // The canonical key sequence too, which `cmp` alone would not pin; the internal
+    // HAMT node order is not pinned (`beam_term::map::map_pairs` is the canonical one).
+    let produced = beam_term::map::map_pairs(first, atoms).unwrap();
+    let expected = beam_term::map::map_pairs(reference, atoms).unwrap();
     assert_eq!(produced.len(), expected.len());
     for (got, want) in produced.iter().zip(expected.iter()) {
         assert!(
             cmp(got.0, want.0, atoms).is_eq() && cmp(got.1, want.1, atoms).is_eq(),
-            "storage-order pair mismatch: {got:?} vs {want:?}"
+            "canonical-order pair mismatch: {got:?} vs {want:?}"
         );
     }
 }
@@ -1485,3 +1507,15 @@ fn exec_claims_only_the_map_variants() {
     .unwrap();
     assert!(claimed.is_none());
 }
+// ---------------------------------------------------------------------------
+// The path-copying (COW) update arm — its own file (see `tests_path_copying.rs`)
+// ---------------------------------------------------------------------------
+#[path = "tests_path_copying.rs"]
+mod path_copying;
+
+// ---------------------------------------------------------------------------
+// The read instructions over the whole size sweep — its own file (see
+// `tests_read.rs`)
+// ---------------------------------------------------------------------------
+#[path = "tests_read.rs"]
+mod read_path;

@@ -803,22 +803,28 @@ pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
 /// and places a hash map's keys by `erts_map_hash`, collapsing duplicate keys
 /// **last value wins** in both cases.
 ///
-/// The atom table passed to `write_map` is a **fresh empty one**. The builder
-/// consults it only to name atoms in a *tie-break* (`compare::cmp_atoms`, reached
-/// from `cmp`/`eq` for keys whose hashes collide); an unknown name falls back to the
-/// raw atom index, so the result stays deterministic and — because distinct atoms
-/// have distinct indices — never merges two distinct keys. The same substitution
-/// (`beam_abi`'s driver host `map_term`) is used there for the same reason: taking
-/// `ctx.atoms()` alongside `ctx.heap()` would need two simultaneous borrows of
-/// [`BifContext`](crate::context::BifContext).
+/// `atoms` is the caller's **live** namespace — the same table [`map_put_cow`] is
+/// handed — and it decides only the ordering *tie-break* of a **compound** key's atom
+/// elements: a flat map's keys are ordered by `erts_cmp_flatmap_keys`, which compares
+/// two *atom* keys by raw atom index but recurses into `compare::cmp` for everything
+/// else, so a compound key's atom elements reach `compare::cmp_atoms`, which orders two
+/// *named* atoms by name. A fresh (or empty) table would leave every name unknown there
+/// and fall back to the raw atom index — the wrong order, because ERTS compares atoms by
+/// **name** (`erts_cmp_atoms`, `erts/emulator/beam/erl_utils.h:193-220`: an `ord0` fast
+/// path, then `sys_memcmp` on the name, then the length). Distinct atoms have distinct
+/// names *and* indices, so a rebuild never merges two distinct keys either way; only the
+/// stored order — hence the `MAP_EXT` bytes — differs.
 ///
 /// # Errors
 ///
 /// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
 /// fit the block, and the builder's own `TermError` (reconciled to
 /// [`BeamError::BadArg`]) for a malformed key.
-pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
-    let atoms = AtomTable::new();
+pub(crate) fn make_map(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    pairs: &[(Eterm, Eterm)],
+) -> Result<Eterm> {
     let words = beam_term::map::map_words_capacity(pairs.len());
     // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
     let p = unsafe { heap.alloc_words(words)? };
@@ -826,7 +832,118 @@ pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eter
     // it needs (the reservation is a documented upper bound, so trailing words may
     // stay unwritten) and returns a boxed root into the same block, which stays live
     // and unmoved for as long as `heap` does, which the caller keeps alive.
-    Ok(unsafe { beam_term::map::write_map(p, pairs, &atoms)? })
+    Ok(unsafe { beam_term::map::write_map(p, pairs, atoms)? })
+}
+
+/// The words [`map_put_cow`] must reserve for a put of `key` into `map`.
+///
+/// A **flat** map's hash path holds no collision node, so the size-only capacity bound
+/// is exact ([`beam_term::map::map_put_cow_words_capacity`]). A **hash** map's path may
+/// cross a collision node, whose cell count the map's size cannot bound, so the figure
+/// comes from the writer's own read-only, plan-sharing descent
+/// ([`beam_term::map::map_put_cow_words_required`]) — the same descent that refuses a
+/// map the writer rejects, so a refusal here precedes any reservation.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-map or a malformed map interior (the writer's
+/// `BadMap`) — the class the pair walk of the rebuild path reported for the same input.
+pub(crate) fn map_put_cow_words(map: Eterm, key: Eterm) -> Result<usize> {
+    let size = map_size(map)?;
+    if size > beam_term::map::MAP_SMALL_MAP_LIMIT {
+        Ok(beam_term::map::map_put_cow_words_required(map, key)?)
+    } else {
+        Ok(beam_term::map::map_put_cow_words_capacity(size))
+    }
+}
+
+/// The words [`map_remove_cow`] must reserve — [`map_put_cow_words`]'s rule on the
+/// remove side (`0` for an absent key, which writes nothing).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-map or a malformed map interior.
+pub(crate) fn map_remove_cow_words(map: Eterm, key: Eterm) -> Result<usize> {
+    let size = map_size(map)?;
+    if size > beam_term::map::MAP_SMALL_MAP_LIMIT {
+        Ok(beam_term::map::map_remove_cow_words_required(map, key)?)
+    } else {
+        Ok(beam_term::map::map_remove_cow_words_capacity(size))
+    }
+}
+
+/// The map that binds `key` to `value`, written by copying **only the nodes on `key`'s
+/// hash path** ([`beam_term::map::map_put_cow`] — the C's `erts_maps_put` and its HAMT
+/// twin `erts_hashmap_insert_down`); every off-path subtree is shared with `map` by
+/// word.
+///
+/// A put that finds the stored value word already identical writes nothing and returns
+/// **`map` itself** (the writer's `Nothing` arm, the C's `found_key: if (*vs == value)
+/// { … return map; }`).
+///
+/// `atoms` is the **live** namespace: it decides the flat-map key order of a *fresh*
+/// keys tuple (only through a compound key's atom elements, `cmp_flatmap_keys` → `cmp`)
+/// and a hash-collision node's cell order; atom keys themselves compare by raw index on
+/// either route.
+///
+/// # Errors
+///
+/// The writer's `BadMap` (reconciled to [`BeamError::BadArg`]) for a malformed map
+/// interior, and [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
+/// fit the reservation.
+///
+/// # Why the unsafe block is sound here
+///
+/// `heap` is a BIF working arena: a heap **distinct** from the source map's storage (a
+/// process heap, or an earlier region of this same arena), so no node is ever relocated
+/// in place, and its bump pointer lies past every word handed out so far, so the
+/// reservation cannot overlap a live term of the caller's call. It is sound for the
+/// arena to be shorter-lived than the source map because the caller copies the result
+/// onto the process heap before the arena is rewound, and that copy walks every
+/// reachable node — the off-path subtrees shared with `map` included. `map` is a live
+/// map term this crate's builders produced (the crate's universal term invariant, as
+/// for every other accessor here), and the writer validates its interior before
+/// writing.
+pub(crate) fn map_put_cow(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    map: Eterm,
+    key: Eterm,
+    value: Eterm,
+) -> Result<Eterm> {
+    let words = map_put_cow_words(map, key)?;
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words of the
+    // arena, whose bump pointer is past every live term — see the arena reasoning above.
+    let hp = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `hp` addresses the `map_put_cow_words_required`/`_capacity` extent for
+    // this map and key, in a heap that outlives the result's use; `map` is a live map
+    // this crate's builders produced, and the writer validates its interior (`BadMap`)
+    // before writing.
+    unsafe { beam_term::map::map_put_cow(hp, map, key, value, atoms) }.map_err(Into::into)
+}
+
+/// `map` without `key`, written by copying only the nodes on `key`'s hash path
+/// ([`beam_term::map::map_remove_cow`] — the C's `hashmap_delete`).
+///
+/// `Ok(None)` iff the key is absent: nothing is written then and the caller answers its
+/// input map, which is what `maps:remove/2` and `maps:take/2` do.
+///
+/// # Errors
+///
+/// As [`map_put_cow`].
+///
+/// The same arena reasoning as [`map_put_cow`], with [`map_remove_cow_words`]'s extent.
+pub(crate) fn map_remove_cow(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    map: Eterm,
+    key: Eterm,
+) -> Result<Option<Eterm>> {
+    let words = map_remove_cow_words(map, key)?;
+    // SAFETY: as in `map_put_cow`.
+    let hp = unsafe { heap.alloc_words(words)? };
+    // SAFETY: as in `map_put_cow`.
+    unsafe { beam_term::map::map_remove_cow(hp, map, key, atoms) }.map_err(Into::into)
 }
 
 /// The `(key, value)` pairs of **any** map — flat map or HAMT — in the order the map

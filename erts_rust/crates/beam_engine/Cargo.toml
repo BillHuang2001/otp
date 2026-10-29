@@ -20,6 +20,12 @@ cranelift-module = { workspace = true, optional = true }
 cranelift-jit = { workspace = true, optional = true }
 cranelift-frontend = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Test-only: the ETF encoder, so a `put_map_assoc`/`put_map_exact` result can be pinned
+# byte-for-byte against the rebuild of the same map (`src/families/maps/tests.rs`).
+# Directionally legal: `beam_codec` is wave 1, `beam_engine` wave 4, and `beam_codec`
+# does not depend on `beam_engine`.
+beam_codec = { path = "../beam_codec" }
 [features]
 default = []
 # Documented alias for the baseline tier: `"baseline-jit"` is part of every build's

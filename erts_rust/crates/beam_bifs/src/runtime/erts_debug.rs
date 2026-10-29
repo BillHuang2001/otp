@@ -1808,13 +1808,16 @@ mod tests {
     #[test]
     fn size_shared_prices_a_hash_map_node_twice_like_the_oracle() {
         let mut heap = Heap::new(1 << 18).expect("test heap");
+        // Integer keys only, so the table names no key: any namespace gives the same
+        // trie and the same stored order here.
+        let atoms = AtomTable::new();
         for (range, flat, shared) in [
             (1..=33i64, 123i64, 180i64),
             (1..=34, 126, 184),
             (1..=40, 148, 216),
             (1..=100, 364, 528),
         ] {
-            let map = int_map(&mut heap, range.clone());
+            let map = int_map(&mut heap, &atoms, range.clone());
             assert_eq!(
                 beam_term::size::size_object(map) as i64,
                 flat,
@@ -2709,13 +2712,15 @@ mod tests {
     // index and legitimately differs (see `beam_term::ihash`).
 
     /// Builds `maps:from_list([{K, K} || K <- keys])` through this crate's map
-    /// producer ([`access::make_map`] → `beam_term::map::write_map`).
-    fn int_map(heap: &mut Heap, keys: impl IntoIterator<Item = i64>) -> Eterm {
+    /// producer ([`access::make_map`] → `beam_term::map::write_map`), over the atom
+    /// table the caller's BIF context will see — the same live namespace the
+    /// path-copying writers get.
+    fn int_map(heap: &mut Heap, atoms: &AtomTable, keys: impl IntoIterator<Item = i64>) -> Eterm {
         let pairs: Vec<(Eterm, Eterm)> = keys
             .into_iter()
             .map(|key| (make_small(key), make_small(key)))
             .collect();
-        access::make_map(heap, &pairs).expect("the map fits")
+        access::make_map(heap, atoms, &pairs).expect("the map fits")
     }
 
     /// Calls `map_info/1` on `map` (which must already live on `heap`).
@@ -2797,8 +2802,8 @@ mod tests {
         let mut atoms = AtomTable::new();
         atoms.seed(["badmap", "depth", "arrays", "collisions", "bitmaps", "leafs"]);
         let mut heap = Heap::new(1 << 12).expect("test heap");
-        let empty = access::make_map(&mut heap, &[]).expect("the empty map fits");
-        let flat = int_map(&mut heap, 1..=32);
+        let empty = access::make_map(&mut heap, &atoms, &[]).expect("the empty map fits");
+        let flat = int_map(&mut heap, &atoms, 1..=32);
         let tuple = heap.tuple(&[make_small(1)]).expect("the tuple fits");
         for (label, term) in [("empty map", empty), ("32-key flat map", flat)] {
             match probe_info(&mut heap, &atoms, term) {
@@ -2842,7 +2847,7 @@ mod tests {
         let mut heap = Heap::new(1 << 16).expect("test heap");
 
         // 33 keys: a bitmap head with 13 slots, 4 of them leaves.
-        let m33 = int_map(&mut heap, 1..=33);
+        let m33 = int_map(&mut heap, &atoms, 1..=33);
         let info = probe_info(&mut heap, &atoms, m33).expect("map_info runs");
         assert_eq!(
             read_info(info, &atoms),
@@ -2860,7 +2865,7 @@ mod tests {
         );
 
         // 40 keys: a deeper bitmap head (14 nodes, one of them with 14 slots).
-        let m40 = int_map(&mut heap, 1..=40);
+        let m40 = int_map(&mut heap, &atoms, 1..=40);
         let info = probe_info(&mut heap, &atoms, m40).expect("map_info runs");
         assert_eq!(
             read_info(info, &atoms),
@@ -2885,12 +2890,12 @@ mod tests {
         let mut atoms = AtomTable::new();
         atoms.seed(["badmap", "depth", "arrays", "collisions", "bitmaps", "leafs"]);
         let mut heap = Heap::new(1 << 16).expect("test heap");
-        let inner = int_map(&mut heap, 1..=40);
+        let inner = int_map(&mut heap, &atoms, 1..=40);
         let mut pairs: Vec<(Eterm, Eterm)> = (50..=90)
             .map(|key| (make_small(key), make_small(key)))
             .collect();
         pairs.push((make_small(100), inner));
-        let map = access::make_map(&mut heap, &pairs).expect("the map fits");
+        let map = access::make_map(&mut heap, &atoms, &pairs).expect("the map fits");
 
         let info = probe_info(&mut heap, &atoms, map).expect("map_info runs");
         assert_eq!(
@@ -2916,7 +2921,7 @@ mod tests {
         let mut atoms = AtomTable::new();
         atoms.seed(["badmap", "depth", "arrays", "collisions", "bitmaps", "leafs"]);
         let mut heap = Heap::new(1 << 16).expect("test heap");
-        let map = int_map(&mut heap, 1..=33);
+        let map = int_map(&mut heap, &atoms, 1..=33);
         let node = {
             let view = access::hamt_node(map).expect("a head node");
             // A sub-node slot: a boxed HAMT node.
