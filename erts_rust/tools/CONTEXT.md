@@ -6,7 +6,7 @@ The three in-repo tooling crates that make the Rust ERTS rewrite **verifiable** 
 - `suites/` — the **real-suite driver**: third-party (Khepri) and OTP `stdlib` suites under both runtimes, per-module/per-case pass counts for both sides.
 - `bench/` — the **benchmark driver** (Part I §G.7/§I success metrics: startup latency, p99 tail latency, throughput on named benchmarks, memory footprint). It drives the external target projects named in `../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` and **always** records the system-ERTS baseline.
 
-Neither tool modifies the runtime or the external repos — both are pure drivers/observers.
+None of the three tools modifies the runtime or the external repos — they are pure drivers/observers.
 
 ## API Surface (CLI)
 Both crates ship a **library + a binary**: the library exists so `cargo test` can assert the harness itself (against the oracle / against fixture binaries), and the binary is what a human or CI drives. `--help` must be usable on every subcommand.
@@ -27,7 +27,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `bench compare <a.json> <b.json> [--json]` — diff two result sets.
 - Exit codes: `0` run completed (per-workload `skipped(reason)` is not fatal); `2` usage/env error. A workload that *errors* is recorded `failed` in JSON.
 
-## Shared Conventions (binding on both crates)
+## Shared Conventions (binding on all three crates)
 - **Runtime resolution — documented, overridable, no baked absolute paths:**
   - **Oracle** = `$ERTS_ORACLE` if set, else `erl` resolved on `PATH`. Missing ⇒ loud env error (exit 2).
   - **Rust runtime** = `$BEAM_RT` if set, else the workspace-relative `target/{release,debug}/beam_rt` (relative to `../..`). If neither exists ⇒ cases report `unsupported`.
