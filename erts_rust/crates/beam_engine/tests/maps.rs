@@ -33,8 +33,14 @@
 //! A **hashmap** (HAMT) *source* argument is built by the frozen writer
 //! ([`hashmap`] → `beam_term::map::write_map`) so every leaf sits in the slot its
 //! own key hash selects — the property the read path's per-key `map_get` descent
-//! depends on; [`Hamt`]'s hand-written node blocks serve the *write* path only,
-//! which enumerates the source (or rebuilds it flat) and never follows a hash.
+//! depends on, and (since `put_map_exact`'s exact-key validation is that same
+//! descent on **both** its arms) the property its validation depends on too. A hash
+//! map at or below `MAP_SMALL_MAP_LIMIT` cannot arise from the frozen builders
+//! (`write_map` writes a flat map there, and `hashmap_delete` rebuilds a HAMT that
+//! shrinks to the limit as a flat map, `erl_map.c:2946-2981`), so every real hashmap
+//! source is above the limit.
+//! [`Hamt`]'s hand-written node blocks serve the **assoc** write arm only, which
+//! enumerates the source (or rebuilds it flat) and never follows a hash.
 //! A hashmap the *engine builds* comes from `put_map_assoc`/`put_map_exact`
 //! crossing the flat-map limit (`beam_term::map::write_map`).
 //!
@@ -223,6 +229,11 @@ impl Hamt {
 
 /// A 32-entry hashmap: a bitmap head whose single occupied slot holds a collision
 /// node with the 32 leaves for `keys` (values are the leaf index).
+///
+/// Its leaves are **not** placed by the keys' hashes, so it serves the `assoc` write
+/// arm only (which enumerates the source and never follows a hash); a source the
+/// per-key `map_get` descent must read — the read instructions, and `put_map_exact`'s
+/// exact-key validation — is [`hashmap`].
 fn hashmap_32(hamt: &mut Hamt, keys: &[Eterm]) -> Eterm {
     assert_eq!(keys.len(), 32);
     let leaves: Vec<Eterm> = keys
@@ -233,6 +244,7 @@ fn hashmap_32(hamt: &mut Hamt, keys: &[Eterm]) -> Eterm {
     let child = hamt.collision(&leaves);
     hamt.head_bitmap(1, 32, &[child])
 }
+
 /// A **well-formed** hashmap source: the frozen writer
 /// (`beam_term::map::write_map`, via [`terms::make_map`]) over `entries` plus
 /// distinct small-integer filler keys, so the key count is past
@@ -487,19 +499,22 @@ fn assoc_that_exceeds_the_flat_map_limit_builds_a_hashmap() {
 }
 
 #[test]
-fn exact_on_a_32_pair_hashmap_builds_an_equivalent_flat_map() {
-    // A ≤ 32-pair result still fits the flat-map layout, so `put_map_exact` updates
-    // a hashmap source successfully; the *bindings* are identical and the ≤ 32-pair
-    // result is written back as a flat map (the layout rule the oracle uses).
+fn exact_on_a_hashmap_source_updates_the_binding() {
+    // The path-copying (COW) arm through the real fixture. A hash map of 32 pairs or
+    // fewer cannot come from the frozen builders — `write_map` writes a flat map at or
+    // below `MAP_SMALL_MAP_LIMIT`, and a HAMT that shrinks to the limit is rebuilt flat
+    // (`hashmap_delete`, `erl_map.c:2946-2981`, which `map_remove_cow` reproduces) — so
+    // `hashmap_32`'s hand-written node block is the only shape at that size, and it is
+    // exactly the shape no per-key `map_get` can read.
     let module = load();
     let mut ctx = MinimalContext::new();
-    let mut keys = vec![make_atom(atom(&module, "a"))];
-    keys.extend((1..=31i64).map(make_small));
-    let mut hamt = Hamt::new();
-    let map = hashmap_32(&mut hamt, &keys);
-
-    let result = run(&mut ctx, &module, "exact", &[map]).expect("exact on a <=32-pair hashmap");
-    assert!(!terms::is_hashmap(result), "32 pairs is a flat map");
+    let map = hashmap(&mut ctx, &module, &[("a", 10)]);
+    assert_eq!(terms::map_entries(map).unwrap().len(), 33);
+    let result = run(&mut ctx, &module, "exact", &[map]).expect("exact on a hashmap source");
+    assert!(terms::is_hashmap(result), "33 pairs stay a hash map");
+    assert_eq!(
+        beam_term::map::map_size(result, &module.atom_table).unwrap(),
+        33
+    );
     assert_eq!(entry(result, &module, "a"), Some(make_small(9)));
-    assert_eq!(terms::map_entries(result).unwrap().len(), 32);
 }

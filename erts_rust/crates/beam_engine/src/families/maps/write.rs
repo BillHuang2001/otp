@@ -370,9 +370,16 @@ pub(super) fn put_map_exact(
         // `beam_term::map::map_get` — a hashed descent of the (immutable) source, not a
         // materialized pair list — so the failure path writes nothing at all and the
         // source map's word and contents are untouched.
+        //
+        // Rooting order (the reads' rule): the key read is the iteration's one
+        // **allocating** read (a non-small `Operand::Integer` is materialized as a
+        // bignum — `operand_slack_words`), and one allocation is one possible
+        // collection, so the source word is read **last**, from the machine's
+        // post-collection state. The word read before the loop is dead from then on.
         for (key_operand, _) in pairs {
             let key = read_operand(machine, ctx, key_operand)?;
-            // The namespace is taken AFTER the operand read (it borrows `*ctx`
+            let map = read_operand(machine, ctx, source)?;
+            // The namespace is taken AFTER both operand reads (it borrows `*ctx`
             // immutably, so it must not be held across `read_operand`'s `&mut`).
             if beam_term::map::map_get(map, key, ctx.atoms(module))?.is_none() {
                 return fail_or_raise(machine, module, labels, ctx, fail, "badkey", key_operand);
@@ -392,12 +399,18 @@ pub(super) fn put_map_exact(
         return Ok(Step::Next);
     }
     let capacity = size + pairs.len();
-    let existing = terms::map_entries(map)?;
+    // The flat arm's `{badkey,Key}` validation, decided before the reserve exactly as
+    // the path-copying arm's is: the same `map_get`-per-key shape, so nothing is
+    // materialized and nothing is allocated. Rooting order is the reads' rule too —
+    // the key read is the iteration's one allocating read, so the source word is
+    // re-read after it (a snapshot pair list taken before it would have every word
+    // stale after the collecting allocation the key read may run).
     for (key_operand, _) in pairs {
         let key = read_operand(machine, ctx, key_operand)?;
-        // The namespace is taken AFTER the operand read (it borrows `*ctx`
+        let map = read_operand(machine, ctx, source)?;
+        // The namespace is taken AFTER both operand reads (it borrows `*ctx`
         // immutably, so it must not be held across `read_operand`'s `&mut`).
-        if position(&existing, key, ctx.atoms(module)).is_none() {
+        if beam_term::map::map_get(map, key, ctx.atoms(module))?.is_none() {
             return fail_or_raise(machine, module, labels, ctx, fail, "badkey", key_operand);
         }
     }

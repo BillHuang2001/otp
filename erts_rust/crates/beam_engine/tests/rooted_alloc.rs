@@ -62,7 +62,7 @@ use std::rc::Rc;
 use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::{error, terms, ExecutionContext, Machine, RunOutcome};
-use beam_loader::{Export, Function, Instr, Label, Module, Operand};
+use beam_loader::{Export, Function, Instr, Label, MapWriteArgs, Module, Operand, NO_FAIL};
 use beam_term::{
     boxed_val, is_boxed_term, is_list, make_atom, make_small, Atom, Eterm, NIL, TAG_PTR_MASK,
 };
@@ -1001,4 +1001,229 @@ fn a_moving_collector_relocates_the_live_operands_and_the_terms_stay_correct() {
         ctx.points_into_current_region(ctx.x3_seen[2]),
         "the third reserve is handed the relocated tuple in the live region"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (4) The map-update validation loops read the source AFTER the allocating read
+// ---------------------------------------------------------------------------
+
+/// Entry label of `ralloc_put_exact/1` — one `put_map_exact`.
+const L_PUT_EXACT: Label = Label(30);
+
+/// The update's key, given as an `Operand::Integer` **beyond a small int**, so its read
+/// materializes a fresh bignum — i.e. it is the iteration's *allocating* read
+/// ([`beam_engine::operand`]'s `operand_slack_words` predicate).
+const BIG_KEY: i64 = 999_999_999_999_999_999;
+
+/// The value the update writes for [`BIG_KEY`] (the source stores `0`); a small int, so
+/// the value read never allocates.
+const NEW_VALUE: i64 = 7;
+
+/// The small-int keys of the **flat**-arm source map (plus [`BIG_KEY`]: 4 keys, at or
+/// below `MAP_SMALL_MAP_LIMIT` = 32).
+const FLAT_SMALL_KEYS: i64 = 3;
+
+/// The small-int keys of the **path-copying**-arm source map (plus [`BIG_KEY`]: 40 keys,
+/// above the flat limit, so the source is a hash map).
+const HASH_SMALL_KEYS: i64 = 39;
+
+/// ```text
+/// ralloc_put_exact(M) -> M#{BIG_KEY => NEW_VALUE}     % put_map_exact
+/// ```
+fn put_exact_fixture() -> (Module, Atom) {
+    let mut fixture = Fixture::new();
+    let code = vec![
+        Instr::Label(L_PUT_EXACT),
+        Instr::PutMapExact(Box::new(MapWriteArgs {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            dst: Operand::X(0),
+            live: 0,
+            pairs: vec![(Operand::Integer(BIG_KEY), Operand::Integer(NEW_VALUE))],
+        })),
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("ralloc_put_exact", 1, code);
+    let function = fixture.export("ralloc_put_exact", 1, entry);
+    (fixture.finish(), function)
+}
+
+/// A [`MovingContext`] that also owns the machine's **X-register file**, so it collects
+/// on the *unrooted* allocation door too — the shape of a real host (`beam_rt` owns the
+/// process's register file, and its `alloc_words` collects).
+///
+/// [`MovingContext`] collects only where a [`RootSet`] is handed to it; the unrooted door
+/// carries none, which is exactly why an **allocating read** of an operand is hazardous:
+/// the engine leaves `read_operand` with a relocated register file and, if it kept a raw
+/// word from before the read, a stale local. This host models the host half of that walk:
+/// on every `alloc_words` it relocates every block reachable from the X file and rewrites
+/// the file in place.
+///
+/// [`collect_on_unrooted`](XFileMovingContext::collect_on_unrooted) arms the door: the
+/// fixture's own terms are assembled *before* collecting starts (a collection walked with
+/// no roots would — correctly — drop them), and from the run's first allocation on, every
+/// allocation collects.
+struct XFileMovingContext {
+    moving: MovingContext,
+    /// The machine's X-register file: stable heap storage (`Machine::with_max_register`
+    /// sizes the `Vec` once at construction; nothing resizes it afterwards), so a raw
+    /// base stays valid for the machine's whole life.
+    x_base: *mut Eterm,
+    x_len: usize,
+    /// Whether the unrooted door collects (see the type docs).
+    collect_on_unrooted: bool,
+}
+
+impl XFileMovingContext {
+    fn new(x_base: *mut Eterm, x_len: usize) -> XFileMovingContext {
+        XFileMovingContext {
+            moving: MovingContext::new(),
+            x_base,
+            x_len,
+            collect_on_unrooted: false,
+        }
+    }
+}
+
+impl ExecutionContext for XFileMovingContext {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.moving.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.moving.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    /// The **unrooted** door: no [`RootSet`] is handed over, so the collector reads the
+    /// root slice it owns itself — the machine's X file. That is what makes the door
+    /// move a live term at all, and therefore what a stale pre-read word dies on.
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        if self.collect_on_unrooted {
+            // SAFETY: `x_base`/`x_len` are the machine's X-register file base and its
+            // exact length, taken from `Machine::x_mut`; the backing allocation is made
+            // once (at `Machine::with_max_register`) and never resized, so the range is
+            // live and in bounds for this context's whole life. The file is written only
+            // here and in `alloc_words_rooted` — the same writable window the rooted door
+            // is handed — and every slot past the used prefix is `NIL`, hence not a root.
+            let x = unsafe { core::slice::from_raw_parts_mut(self.x_base, self.x_len) };
+            let mut no_stack: [Eterm; 0] = [];
+            let mut no_fr: [Eterm; 0] = [];
+            self.moving.collect(RootSet::new(
+                x,
+                &mut no_stack,
+                &mut no_fr,
+                RootSet::ALL_LIVE,
+            ));
+        }
+        self.moving.bump(n)
+    }
+
+    fn alloc_words_rooted(&mut self, n: usize, roots: RootSet<'_>) -> Result<*mut Eterm> {
+        self.moving.alloc_words_rooted(n, roots)
+    }
+}
+
+/// Build a source map of `small_keys` small-int keys (each mapped to `0`) plus
+/// [`BIG_KEY`], run `ralloc_put_exact/1` over it on a collecting [`XFileMovingContext`],
+/// and hand back the run's answer with the host that produced it.
+///
+/// The source map is an **argument**, so the machine's X(0) holds it and it is a root;
+/// the update's per-key read of [`BIG_KEY`] is the iteration's allocating read, so the
+/// collector runs *between* the source read and the key's lookup.
+fn run_put_exact(small_keys: i64) -> (Eterm, Module, XFileMovingContext) {
+    let (module, function) = put_exact_fixture();
+    let mut machine = Machine::with_max_register(8);
+    let (x_base, x_len) = {
+        let x = machine.x_mut();
+        (x.as_mut_ptr(), x.len())
+    };
+    let mut ctx = XFileMovingContext::new(x_base, x_len);
+
+    // The fixture's own terms are built with the collector still disarmed (see the host
+    // docs); the key is a bignum, exactly the shape the instruction will re-materialize.
+    let key = terms::make_integer(&mut ctx, BIG_KEY).expect("a bignum key");
+    let mut pairs: Vec<(Eterm, Eterm)> = (0..small_keys)
+        .map(|i| (make_small(i), make_small(0)))
+        .collect();
+    pairs.push((key, make_small(0)));
+    let source = terms::make_map(&mut ctx, &pairs, &module.atom_table).expect("a source map");
+    assert_eq!(
+        terms::is_hashmap(source),
+        small_keys > 32,
+        "the fixture must land on the arm the row is about"
+    );
+
+    ctx.collect_on_unrooted = true;
+    let outcome = machine
+        .run_export_outcome(&module, function, 1, &[source], &mut ctx)
+        .expect("the exact update must survive the relocation its own key read forces");
+    ctx.collect_on_unrooted = false;
+    (returned(outcome), module, ctx)
+}
+
+/// The update really happened: the size is unchanged, [`BIG_KEY`] now maps to
+/// [`NEW_VALUE`], and the run's key read **really relocated a live block** (the host's own
+/// witness, so a passing row cannot be one where nothing moved).
+fn assert_exact_update(
+    result: Eterm,
+    module: &Module,
+    ctx: &mut XFileMovingContext,
+    key_count: i64,
+) {
+    assert!(
+        ctx.moving.moved_any,
+        "the collector never relocated a live block: this row would prove nothing"
+    );
+    assert!(
+        ctx.moving.collections > 0,
+        "the collector never ran, so the source word could not have gone stale"
+    );
+    assert!(
+        terms::map_entries(result).is_ok(),
+        "the update must answer a well-formed map, not a stale word"
+    );
+    assert_eq!(
+        beam_term::map::map_size(result, &module.atom_table).expect("a map"),
+        key_count as usize,
+        "an exact update never changes the key count"
+    );
+    // Built with the collector disarmed again: this read must not move `result`.
+    let key = terms::make_integer(ctx, BIG_KEY).expect("a bignum key");
+    assert_eq!(
+        beam_term::map::map_get(result, key, &module.atom_table).expect("a map read"),
+        Some(make_small(NEW_VALUE)),
+        "the exact key must carry the value the update wrote"
+    );
+}
+
+/// The **flat** (rebuild) arm's validation loop holds no snapshot across the per-key
+/// read: it re-reads the source operand after the read of the non-small
+/// `Operand::Integer` key, whose bignum materialization collects and relocates the source
+/// map (and every word of the old `map_entries` snapshot with it).
+#[test]
+fn the_flat_exact_update_re_reads_the_source_after_its_allocating_key_read() {
+    let (result, module, mut ctx) = run_put_exact(FLAT_SMALL_KEYS);
+    assert!(!terms::is_hashmap(result), "the flat arm rebuilds a flat map");
+    assert_exact_update(result, &module, &mut ctx, FLAT_SMALL_KEYS + 1);
+}
+
+/// The same row on the **path-copying** arm: the `{badkey,Key}` validation there looked a
+/// pre-loop source word up with `map_get`, and the key read relocates that word.
+#[test]
+fn the_path_copying_exact_update_re_reads_the_source_after_its_allocating_key_read() {
+    let (result, module, mut ctx) = run_put_exact(HASH_SMALL_KEYS);
+    assert!(terms::is_hashmap(result), "the path-copying arm keeps a hash map");
+    assert_exact_update(result, &module, &mut ctx, HASH_SMALL_KEYS + 1);
 }

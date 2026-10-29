@@ -104,6 +104,12 @@ destination store, the `badmap` check and the empty-pair short circuit are share
   `terms::map_entries` + a linear scan, which removes the old *double* full walk — and a `None` takes
   the unchanged failure path (`fail_or_raise(..., "badkey", key_operand)`: the same jump for a fail
   label, the same `{badkey,Key}` raise under `NO_FAIL`, the same `key_operand` identity).
+  Both arms' loops follow the reads' **rooting order** (`read.rs`'s rule): the key operand is read
+  first, the `source` operand word is **re-read** from the machine's post-collection state, and only
+  then does `map_get` consume it — the key read is the iteration's one allocating read, so a source
+  word (or a pair-list snapshot) taken before it is dead. `unchanged_after_update` is safe for the
+  same reason, decided up front: it declines any operand whose read would materialize a bignum
+  (`operand_slack_words`), so its loop allocates nothing while it holds the source word.
   Nothing has been written at that point, so the failure path writes **no** word into either heap.
   Because `map_put_cow` has *assoc* semantics (it inserts an absent key), the closure re-checks
   presence right before each put and answers `error::unsupported("put_map_exact: key vanished across
@@ -146,7 +152,7 @@ destination store, the `badmap` check and the empty-pair short circuit are share
 | Site | Condition | `fail != NO_FAIL` | `fail == NO_FAIL` |
 |---|---|---|---|
 | `read.rs:92,124` / `write.rs:284,358` | non-map `source` | jump | raise `{badmap,Source}` |
-| `write.rs:378` (COW) / `:401` (flat) | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
+| `write.rs:385` (COW) / `:414` (flat) | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
 | `read.rs:104,132` | key absent | jump | raise the **bare atom** `function_clause` |
 
 `fail_or_raise` (`mod.rs:241`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
@@ -326,10 +332,9 @@ Verified against the system `erlc` (OTP 29) disassembly:
   flat allocation count across a 25× size range). A flat map's `map_get` is still a bounded linear
   scan (at most `MAP_SMALL_MAP_LIMIT` = 32 `cmp` comparisons), which is the frozen flat-map read rule,
   not a cost that can grow.
-  `position` (`mod.rs:225`) survives only for the **flat write** arm (`write.rs:326`, `:400`, `:420`);
-  `put_map_exact` validates each key with a hashed `map_get` descent and then re-checks presence
-  inside the COW closure, so it takes no full walk on a HAMT source (the flat arm still walks once for
-  the validation and once for the merge).
+  `position` (`mod.rs:225`) survives only for the two **merge** closures (`write.rs:326`, `:433`);
+  `put_map_exact` validates each key with a hashed `map_get` descent — on both arms — and then
+  re-checks presence inside the COW closure, so no arm takes a full source walk to validate.
 - The baseline tier has **no inline arm** for any map instruction (`jit/baseline/emit/block.rs:1376`
   → `emit_family` → `family.rs:57` `jit_family` → `families::dispatch`), so each one costs a helper
   call plus a second variant match on top of the family body.
