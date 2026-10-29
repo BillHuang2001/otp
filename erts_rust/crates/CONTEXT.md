@@ -47,7 +47,9 @@ This is the frozen public-API shape dependents design against; keep it stable.
   table handle so the tid decodes back through `beam_bifs::access::ref_thing_id`); it draws nothing and
   its uniqueness is the caller's claim. Reference ids decoded from another node are outside this space.
 - `beam_term` → frozen term layout; `map` (flat-map ↔ HAMT/CHAMP builder: `write_map`/`map_words_capacity`/
-  `map_size`/`map_get`/`map_pairs`/`map_put`/`map_remove`), `bitstring` (`write_heap_bits`/`write_binary`/
+  `map_size`/`map_get`/`map_pairs` for from-scratch builds, plus the **path-copying** writers
+  `map_put_cow`/`map_remove_cow` with `map_put_cow_words_capacity`/`map_remove_cow_words_capacity`
+  (size-independent bound) and the exact `map_{put,remove}_cow_words_required`), `bitstring` (`write_heap_bits`/`write_binary`/
   `write_sub_bits`/public `bitstring_parts`/`bit_at`/`float_bits`/`float_value`), `refc` (`BinRef`/`ErlSubBits`
   layout + accessors), plus `thing`/`compare`/`hashing`/`size`.
 - `beam_alloc` → `Allocator`/`AllocRef` (carrier-backed), `Heap`/bump process-heap, size classes; `RefCount`
