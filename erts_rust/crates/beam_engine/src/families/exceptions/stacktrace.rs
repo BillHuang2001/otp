@@ -194,7 +194,22 @@ pub(crate) fn symbolic_stacktrace(
     // `../../erts/emulator/beam/beam_common.c:1219-1223`). A raw-trace word is never
     // a cons cell — it is `NIL` or one synthesized item (the callee head,
     // [`super::callee`]) — so `is_list` is exactly the "already cooked" test.
+    //
+    // The **verbatim echo** arm comes first, because the shape it carries may be
+    // untestable by tag: `erlang:raise/3`'s third argument is echoed by the oracle
+    // with no decoding, no name resolution, no re-encoding and no frame counting
+    // (C's `build_stacktrace` `is_raised_exc` arm returns `c_p->ftrace` unchanged,
+    // `../../erts/emulator/beam/beam_common.c:1219-1223`; for a trace whose frames
+    // all already carry a location `raise_3` stored that very term,
+    // `c_p->ftrace = stacktrace`, `bif.c:1641-1643`), and an **explicitly empty**
+    // trace is the term `[]` — word-identical to "nothing supplied", so only the
+    // engine's one-shot marker can tell them apart. Consumed once here, so it
+    // describes exactly this cooking.
+    let verbatim = machine.take_raise_supplied_term_verbatim();
     let raw = read_operand(machine, ctx, head_operand)?;
+    if verbatim {
+        return Ok(raw);
+    }
     if is_list(raw) {
         return Ok(raw);
     }

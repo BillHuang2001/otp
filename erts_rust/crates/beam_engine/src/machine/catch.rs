@@ -265,6 +265,22 @@ impl Machine {
         self.raise_supplied_term.take()
     }
 
+    /// Consume the **live raise**'s *verbatim echo* marker
+    /// ([`Machine::raise_supplied_term_verbatim`]).
+    ///
+    /// `true` means the trace term the raise in flight supplies is the
+    /// `erlang:raise/3` third argument itself, so the cooked stacktrace is that term
+    /// returned unchanged — C's `build_stacktrace` `is_raised_exc` arm
+    /// (`../../erts/emulator/beam/beam_common.c:1219-1223`), which resolves nothing,
+    /// re-encodes nothing and validates no frame shape. It is the only discriminator
+    /// an **explicitly empty** supplied trace has, because the term `[]` is
+    /// word-identical to "no trace supplied".
+    ///
+    /// Taking it consumes it: the marker describes exactly **one** raise.
+    pub(crate) fn take_raise_supplied_term_verbatim(&mut self) -> bool {
+        std::mem::take(&mut self.raise_supplied_term_verbatim)
+    }
+
     /// Whether the raise currently in flight **supplied** its trace — either as
     /// explicit symbolic frames or as a trace term — **without** consuming the
     /// latch.
@@ -273,7 +289,9 @@ impl Machine {
     /// state at all: a raise that supplied a trace carries no derived snapshot, so
     /// the usual "empty snapshot ⇒ `NIL`" shortcut would drop the supplied trace.
     pub(crate) fn has_raise_supplied_trace(&self) -> bool {
-        self.raise_supplied_trace.is_some() || self.raise_supplied_term.is_some()
+        self.raise_supplied_trace.is_some()
+            || self.raise_supplied_term.is_some()
+            || self.raise_supplied_term_verbatim
     }
 
     /// Consume the **live raise**'s *propagated* marker
@@ -554,6 +572,12 @@ impl Machine {
             // raise must not rebuild the chain — the chain of the raise being re-raised
             // IS the supplied trace, and the term is published as the handler's `x(2)`.
             self.raise_supplied_term = self.pending_supplied_term.take();
+            // … and *which* term flavour it is. `true` means the term is the
+            // `erlang:raise/3` third argument to echo **verbatim** (C's `is_raised_exc`
+            // arm), `false` that it is the preserved cooked chain `raw_raise` supplies.
+            // Taken unconditionally so a raise that arrives with no such marker clears
+            // it: the marker describes exactly one raise.
+            self.raise_supplied_term_verbatim = std::mem::take(&mut self.pending_supplied_term_verbatim);
         }
         // A propagating raise takes none of the latches: they describe the exception
         // in flight, which is exactly what is being handed on.
@@ -708,6 +732,24 @@ impl Machine {
                 if let Some(supplied) = self.take_raise_supplied_trace() {
                     return BeamError::Raise(raise.with_stacktrace(supplied));
                 }
+                // A **verbatim echo** (`erlang:raise/3`'s own third argument, see
+                // [`Machine::raise_supplied_term_verbatim`]) renders NO frames here: the
+                // supplied term is the whole answer, and this funnel's model cannot
+                // express it (its frames carry an arity, never an argument list), while
+                // the snapshot a supplied raise deliberately does not rebuild would
+                // supply frames from an earlier exception. `raise(_, _, [])` — the
+                // oracle's empty trace — is exactly this arm, and it renders nothing.
+                // The residual (an uncaught supplied trace of unrepresentable frames
+                // reports no frames where the oracle prints the supplied items) is
+                // recorded in `families/exceptions/CONTEXT.md`.
+                if self.take_raise_supplied_term_verbatim() {
+                    let _supplied_term = self.take_raise_supplied_term();
+                    // Consume the failed-clause argument list and the propagated marker
+                    // all the same: they describe exactly this one raise.
+                    let _failed_clause_args = self.take_raise_function_clause_args();
+                    let _propagated = self.take_raise_propagated();
+                    return BeamError::Raise(raise);
+                }
                 // A **propagated** raise ([`Machine::throw_propagating`]) and a raise
                 // that supplied a trace **term** both render the chain the landed
                 // exception carries ([`Machine::raise_snapshot`]), never one derived
@@ -784,6 +826,11 @@ impl Machine {
     /// preserves ([`Machine::raise_snapshot`]) in
     /// [`Machine::with_uncaught_frames`]. No allocation happens between the two
     /// steps, so the term never leaves the frozen root set.
+    ///
+    /// This is the **non-verbatim** arming of the term latch: `term` is the cooked
+    /// chain the raise preserves, which the uncaught funnel re-renders from the
+    /// snapshot. The one-shot verbatim marker is therefore cleared here, so a
+    /// `raw_raise` can never inherit a preceding `erlang:raise/3`'s echo.
     pub(crate) fn raise_supplied(
         &mut self,
         class: ExceptionClass,
@@ -791,6 +838,7 @@ impl Machine {
         term: Eterm,
     ) -> Result<Step> {
         self.pending_supplied_term = Some(term);
+        self.pending_supplied_term_verbatim = false;
         self.throw_with_trace(class, reason, term)
     }
 

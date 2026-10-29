@@ -446,8 +446,13 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // that raised it).
         self.pending_supplied_trace = None;
         self.pending_supplied_term = None;
+        self.pending_supplied_term_verbatim = false;
         self.raise_supplied_trace = None;
         self.raise_supplied_term = None;
+        // The verbatim-echo marker describes the raise that is *in flight*, so a
+        // fresh run begins without one: a cooked trace in the new run must never be
+        // the word an earlier run's `erlang:raise/3` supplied.
+        self.raise_supplied_term_verbatim = false;
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).

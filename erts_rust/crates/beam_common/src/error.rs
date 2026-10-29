@@ -373,14 +373,15 @@ impl fmt::Debug for LiveReason {
     }
 }
 
-/// A complete BEAM exception: class, reason, stacktrace and the three opaque
-/// live-term slots a structured reason and the `erlang:error/2,3` raise shapes
-/// need.
+/// A complete BEAM exception: class, reason, stacktrace and the four opaque
+/// live-term slots a structured reason, the `erlang:error/2,3` raise shapes and a
+/// caller-supplied `erlang:raise/3` trace need.
 ///
 /// Equality and `Debug` cover only the observable parts ([`class`](Raise::class),
 /// [`reason`](Raise::reason), [`stacktrace`](Raise::stacktrace)): the
-/// [`live_reason`](Raise::live_reason), [`saved_args`](Raise::saved_args) and
-/// [`error_info`](Raise::error_info) payloads are out-of-band metadata that
+/// [`live_reason`](Raise::live_reason), [`saved_args`](Raise::saved_args),
+/// [`error_info`](Raise::error_info) and
+/// [`supplied_trace`](Raise::supplied_trace) payloads are out-of-band metadata that
 /// [`ExitReason`] cannot compare, so a raise carrying a live term compares equal to
 /// the same raise without it.
 ///
@@ -413,6 +414,32 @@ impl fmt::Debug for LiveReason {
 ///
 /// The execution engine renders both into that innermost item; `beam_common` only
 /// transports them.
+///
+/// # Why `supplied_trace` exists
+///
+/// `erlang:raise(Class, Reason, Stacktrace)` lets the raising program **supply** the
+/// whole trace, and ERTS then echoes it **verbatim**: C's `raise_3` stores the
+/// third argument as `c_p->ftrace` (`../../erts/emulator/beam/bif.c:1560-1690`) and
+/// `build_stacktrace`'s `is_raised_exc` arm returns it with no resolution, no
+/// re-encoding and no shape validation
+/// (`../../erts/emulator/beam/beam_common.c:1219-1223`). Measured on `erl` 29 /
+/// erts-17.1 with a compiled module:
+///
+/// - `try erlang:raise(error, boom, []) catch _:_:S -> S end` ⇒ `[]` — an
+///   explicitly empty supplied trace cooks to the **empty** list, which an
+///   [`ExitReason`]/[`StackTrace`] pair cannot distinguish from "no trace
+///   supplied";
+/// - `try erlang:raise(error, boom, [{m,f,[1,2],[]}]) ...` ⇒
+///   `[{m,f,[1,2],[]}]` — the `A` slot may be an **argument list**, a shape
+///   [`StackFrame`]'s `arity: u8` cannot express;
+/// - `try erlang:raise(error, boom, [{unknown_mod,f,1,[{file,"z.erl"},{line,3}]}]) ...`
+///   ⇒ echoed as-is — no frame is resolved against any loaded module.
+///
+/// A verbatim echo therefore needs the supplied trace **as a term**, which no
+/// [`StackTrace`] can represent. That term rides this slot: payload convention is
+/// the raising crate's live trace term as an `Eterm` word (recovered with
+/// `downcast_ref::<Eterm>()` like the other slots). `beam_common` names no term type
+/// and still depends on nothing.
 #[derive(Clone)]
 pub struct Raise {
     /// The class of the exception.
@@ -431,11 +458,17 @@ pub struct Raise {
     /// The live **`error_info` map** an `erlang:error/3` raise scanned out of its
     /// options list (payload convention as above: the map term as an `Eterm`).
     pub error_info: Option<LiveReason>,
+    /// The live **trace term** an `erlang:raise/3` raise was given as its third
+    /// argument (payload convention as above: the trace term as an `Eterm`), for the
+    /// **verbatim echo** C performs (see the `supplied_trace` section of this
+    /// type's docs). Present for **any** third-argument shape — a proper frame list,
+    /// `[]`, an improper list.
+    pub supplied_trace: Option<LiveReason>,
 }
 
 impl Raise {
     /// Creates a raise of `class` with `reason`, an empty stacktrace and no live
-    /// reason, saved args or error info.
+    /// reason, saved args, error info or supplied trace.
     pub fn new(class: ExceptionClass, reason: ExitReason) -> Self {
         Self {
             class,
@@ -444,6 +477,7 @@ impl Raise {
             live_reason: None,
             saved_args: None,
             error_info: None,
+            supplied_trace: None,
         }
     }
 
@@ -498,12 +532,28 @@ impl Raise {
     pub fn error_info(&self) -> Option<&LiveReason> {
         self.error_info.as_ref()
     }
+    /// Attaches the **caller-supplied trace term** of an `erlang:raise/3` raise,
+    /// returning the updated raise (builder style).
+    ///
+    /// The payload convention is the raising crate's live trace term as an `Eterm`
+    /// word, recovered with `downcast_ref::<Eterm>()` — exactly like
+    /// [`Raise::live_reason`]. The term is the third argument **verbatim**, for any
+    /// shape (a proper frame list, `[]`, an improper list): ERTS echoes it unchanged,
+    /// so no consumer may re-derive it from [`stacktrace`](Raise::stacktrace).
+    pub fn with_supplied_trace(mut self, supplied_trace: LiveReason) -> Self {
+        self.supplied_trace = Some(supplied_trace);
+        self
+    }
+    /// The caller-supplied trace term, when the raise carries one.
+    pub fn supplied_trace(&self) -> Option<&LiveReason> {
+        self.supplied_trace.as_ref()
+    }
 }
 
 impl fmt::Debug for Raise {
     /// Prints the observable parts and the placeholders `<live reason>`,
-    /// `<saved args>` and `<error info>` for the opaque slots; the payloads are
-    /// never dereferenced or printed.
+    /// `<saved args>`, `<error info>` and `<supplied trace>` for the opaque slots;
+    /// the payloads are never dereferenced or printed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Raise")
             .field("class", &self.class)
@@ -521,14 +571,19 @@ impl fmt::Debug for Raise {
                 "error_info",
                 &self.error_info.as_ref().map(|_| "<error info>"),
             )
+            .field(
+                "supplied_trace",
+                &self.supplied_trace.as_ref().map(|_| "<supplied trace>"),
+            )
             .finish()
     }
 }
 
 impl PartialEq for Raise {
     /// Compares only the observable parts; the opaque
-    /// [`live_reason`](Raise::live_reason), [`saved_args`](Raise::saved_args) and
-    /// [`error_info`](Raise::error_info) payloads are ignored.
+    /// [`live_reason`](Raise::live_reason), [`saved_args`](Raise::saved_args),
+    /// [`error_info`](Raise::error_info) and [`supplied_trace`](Raise::supplied_trace)
+    /// payloads are ignored.
     fn eq(&self, other: &Self) -> bool {
         self.class == other.class
             && self.reason == other.reason
@@ -1017,7 +1072,45 @@ mod tests {
         for raise in cases {
             assert!(raise.saved_args().is_none());
             assert!(raise.error_info().is_none());
+            assert!(raise.supplied_trace().is_none());
         }
+    }
+    #[test]
+    fn supplied_trace_round_trips_and_is_ignored_by_equality_and_debug() {
+        // The `erlang:raise/3` trace term as the engine sees it: an opaque word in a
+        // `LiveReason` slot. `beam_common` names no term type, so the payload here is
+        // a stand-in for the raising crate's `Eterm`.
+        let plain = Raise::error(ExitReason::Structured).with_stacktrace(sample_stacktrace());
+        let supplied = plain.clone().with_supplied_trace(LiveReason::new(0xdead_beef_u64));
+        assert_eq!(
+            supplied
+                .supplied_trace()
+                .and_then(|slot| slot.downcast_ref::<u64>()),
+            Some(&0xdead_beef)
+        );
+        assert!(supplied
+            .supplied_trace()
+            .and_then(|slot| slot.downcast_ref::<&'static str>())
+            .is_none());
+        // Out-of-band: equality and `Debug` keep covering only the observable parts.
+        assert_eq!(plain, supplied);
+        assert_eq!(supplied, plain);
+        let debug = format!("{supplied:?}");
+        assert!(debug.contains("<supplied trace>"));
+        assert!(!debug.contains("dead"));
+        // A clone shares the payload.
+        let clone = supplied.clone();
+        assert_eq!(
+            clone
+                .supplied_trace()
+                .and_then(|slot| slot.downcast_ref::<u64>()),
+            Some(&0xdead_beef)
+        );
+        // The observable parts still distinguish.
+        assert_ne!(
+            supplied,
+            supplied.clone().with_stacktrace(StackTrace::new())
+        );
     }
     #[test]
     fn raise_equality_ignores_saved_args_and_error_info() {

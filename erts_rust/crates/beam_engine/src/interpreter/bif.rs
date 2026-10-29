@@ -525,7 +525,11 @@ impl Machine {
         // The symbolic frames an incoming raise **arrived carrying** (e.g.
         // `erlang:raise/3` with a non-empty trace list). Extracted — never emptied —
         // only when non-empty, so an absent/empty supplied trace leaves every path
-        // byte-identical to the `raise_snapshot`-derived behavior.
+        // byte-identical to the `raise_snapshot`-derived behavior. This is only the
+        // *enrichment*: a supplied trace the frames model can express cooks through it
+        // (which reproduces the oracle's `{M,F,A}` ⇒ `{M,F,A,[]}` normalization), and
+        // one it cannot — the empty trace, an argument list in the `A` slot — cooks by
+        // echoing the raise's **trace term** instead (`supplied_term` below).
         let supplied_trace = match &error {
             BeamError::Raise(raise) if !raise.stacktrace.is_empty() => Some(raise.stacktrace.clone()),
             _ => None,
@@ -541,7 +545,7 @@ impl Machine {
         // (`../../erts/emulator/beam/beam_common.c:470-495`) and `save_stacktrace`'s
         // `non_bif_stacktrace:` arm hands both to the **innermost** frame
         // (`:1005-1032`) — the caller of `error/1,2,3`, never the BIF itself.
-        let (saved_args, error_info) = match &error {
+        let (saved_args, error_info, supplied_term) = match &error {
             BeamError::Raise(raise) => (
                 raise
                     .saved_args()
@@ -551,8 +555,21 @@ impl Machine {
                     .error_info()
                     .and_then(|live| live.downcast_ref::<Eterm>())
                     .copied(),
+                // The **trace term** an `erlang:raise/3` raise arrives carrying: the
+                // third argument verbatim (`Raise::supplied_trace`). It is the only
+                // representation an explicitly empty trace (`[]`) or a frame whose `A`
+                // slot is an argument list has, and the oracle echoes it unchanged
+                // (`build_stacktrace`'s `is_raised_exc` arm,
+                // `../../erts/emulator/beam/beam_common.c:1219-1223`; `raise_3`'s
+                // `must_copy == 0` path is literally `c_p->ftrace = stacktrace`,
+                // `bif.c:1641-1643`). Read here — no allocation may run between this
+                // word and the latch that roots it.
+                raise
+                    .supplied_trace()
+                    .and_then(|live| live.downcast_ref::<Eterm>())
+                    .copied(),
             ),
-            _ => (None, None),
+            _ => (None, None, None),
         };
         // A raise whose reason is a compound term lands (or propagates) with the
         // term, mirroring C's `handle_error` → `next_catch` for every reason shape.
@@ -574,6 +591,7 @@ impl Machine {
                     supplied_trace,
                     saved_args,
                     error_info,
+                    supplied_term,
                 );
             }
         }
@@ -616,20 +634,25 @@ impl Machine {
             supplied_trace,
             saved_args,
             error_info,
+            supplied_term,
         )
     }
 
     /// [`Machine::throw_with_trace`] that first arms the one-shot latches the raise
     /// arrived with, so the raise being landed is marked as carrying a synthesized
     /// callee head item (when `has_head`, which lives in `trace`), the explicit
-    /// symbolic frames it arrived with (when `supplied_trace` is `Some`) and/or the
+    /// symbolic frames it arrived with (when `supplied_trace` is `Some`), the
+    /// `erlang:raise/3` **trace term** to echo verbatim (when `supplied_term` is
+    /// `Some` and the frames model could not express it) and/or the
     /// `erlang:error/2,3` argument list and `{error_info, Map}` extension that
     /// **caller** frame reports (`saved_args`/`error_info`).
     ///
     /// Every latch is armed **immediately before** the `throw_with_trace` that lands
     /// the raise and with no allocation in between, so the words stay inside the
-    /// frozen root set; a raise that never reaches that call (the no-catch-frame
-    /// `Err` path above) leaves every latch clear.
+    /// frozen root set (the trace term included: it leaves this frame only by being
+    /// written into [`Machine::pending_supplied_term`], one of the loose heap terms
+    /// [`Machine::with_roots`] parks); a raise that never reaches that call (the
+    /// no-catch-frame `Err` path above) leaves every latch clear.
     #[inline]
     fn throw_with_trace_headed(
         &mut self,
@@ -640,6 +663,7 @@ impl Machine {
         supplied_trace: Option<StackTrace>,
         saved_args: Option<Eterm>,
         error_info: Option<Eterm>,
+        supplied_term: Option<Eterm>,
     ) -> Result<Step> {
         if has_head {
             self.pending_callee_head = true;
@@ -650,6 +674,27 @@ impl Machine {
         // trace stays the `raise_snapshot`-derived one.
         if supplied_trace.is_some() {
             self.pending_supplied_trace = supplied_trace;
+        } else if let Some(term) = supplied_term {
+            // No representable frames — so the supplied trace is echoed as the **term**
+            // it is: C's `build_stacktrace` `is_raised_exc` arm returns `c_p->ftrace`
+            // unchanged (`../../erts/emulator/beam/beam_common.c:1219-1223`), and for a
+            // trace whose frames all already carry a location `raise_3` in fact stored
+            // that very term (`c_p->ftrace = stacktrace`, `bif.c:1641-1643`). The
+            // verbatim marker is what makes an **explicitly empty** trace (`[]`, whose
+            // term is word-identical to "nothing supplied") distinguishable from an
+            // absent one, so `raise(C,R,[])` cooks `[]` instead of deriving frames from
+            // the snapshot the oracle never rebuilds.
+            //
+            // Both words are already inside the frozen root set: `pending_supplied_term`
+            // is one of the loose heap terms `Machine::with_roots` parks, and nothing
+            // allocates between here and the `throw_with_trace` below.
+            self.pending_supplied_term = Some(term);
+            self.pending_supplied_term_verbatim = true;
+        } else {
+            // A raise that supplies no trace at all (`error/1`, a BIF failure, …) clears
+            // the one-shot verbatim marker, exactly like every other latch: it describes
+            // exactly one raise.
+            self.pending_supplied_term_verbatim = false;
         }
         // The `erlang:error/2,3` slots go to the **innermost cooked item only**, and a
         // synthesized head item IS that item — it names the failing BIF and carries its
