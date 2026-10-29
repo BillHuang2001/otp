@@ -164,8 +164,8 @@ destination store, the `badmap` check and the empty-pair short circuit are share
   `NO_FAIL`); a non-map source takes `fail_or_raise(.., "badmap", source)` at the entry check, before
   any write; and a `map_get` `TermError::BadMap` on a word that already passed `predicates::is_map` is a
   malformed map **interior** (an unknown HAMT node header) and stays the typed `BeamError::BadArg` —
-  the same error the retired `map_entries` walk produced. "This operand is not a map" can no longer
-  reach that error: it is decided once, on the very word every descent consumes
+  the error a malformed map surfaces. "This operand is not a map" never reaches that error: it is
+  decided once, on the very word every descent consumes
   (`read.rs::descend`).
 - Cost: one `map_get` descent per key and **nothing materialized**; the allocating-key path additionally
   reserves one bignum's words per such key, in the single reservation above.
