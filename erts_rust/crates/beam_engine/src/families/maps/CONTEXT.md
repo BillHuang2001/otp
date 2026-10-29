@@ -3,13 +3,14 @@
 ## Intent
 The single owner of the four map `beam_loader::Instr` variants —
 `GetMapElements`, `HasMapFields`, `PutMapAssoc`, `PutMapExact` — dispatched from
-`../mod.rs::dispatch` (variant-partitioned router). Map layout is **read** through
-`crate::terms::map_entries` (both frozen layouts: flat map and HAMT);
+`../mod.rs::dispatch` (variant-partitioned router). A read descends the map **once per key**
+through `beam_term::map::map_get` (both frozen layouts: the flat map's bounded key scan, the HAMT's
+hashed path walk) and never materializes a pair list;
 a write **copies the path** through `beam_term::map::map_put_cow` when the source is a hash map
 (> 32 keys) and **rebuilds** through `crate::terms::make_map` → `beam_term::map::write_map` when it
 is a flat map (≤ 32 distinct keys).
-Key equality is `beam_term::cmp` (exact `=:=`, so `1` and `1.0` are distinct keys). The family
-borrows `module: &Module` for the atom table it compares keys with.
+Key equality is `beam_term::cmp` (`EQ` = exact `=:=`, so `1` and `1.0` are distinct keys). The
+family borrows `module: &Module` for the atom table it compares keys with.
 
 Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-173`,
 `beam_common.c:2237-2268` (`erts_gc_update_map_exact` sets `BADKEY`), `emu/ops.tab:1364-1424`,
@@ -17,10 +18,11 @@ Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-
 (`i_func_info_IaaI`) + `beam_common.c:448-544` (`handle_error`, the `function_clause` reason).
 
 ## Layout
-- `mod.rs` — `exec` (dispatch), `lookup`/`position` (linear `beam_term::cmp` scans, `:221`/`:230`),
-  `goto` (`:237`), `fail_or_raise` (`:246`), `fail_or_function_clause` (`:268`),
-  `raise_error_tuple` (`:289`).
-- `read.rs` — `get_map_elements` (`:54`), `has_map_fields` (`:85`).
+- `mod.rs` — `exec` (dispatch), `position` (`:225`, the flat write arm's `beam_term::cmp` scan),
+  `goto` (`:232`), `fail_or_raise` (`:241`), `fail_or_function_clause` (`:263`),
+  `raise_error_tuple` (`:284`).
+- `read.rs` — `get_map_elements` (`:81`), `has_map_fields` (`:113`); the read model is the section
+  below.
 - `write.rs` — `key_count` (`:129`, the O(1) size word), `takes_cow_arm` (`:142`, the layout branch),
   `merge_slack_words` (`:149`), `unchanged_after_update` (`:181`, the flat arm's no-change pre-walk),
   `cow_update` (`:227`, the shared COW reservation + chained `region.put`), `put_map_assoc` (`:270`),
@@ -29,7 +31,8 @@ Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-
   size-word equivalence, the large-map reference-builder equivalence, the no-change identity rows, and
   the `path_copying` module: the rebuild-equivalence sweep over `n ∈ {0,1,31,32,33,34,250,2_500}`, the
   exact-key fail/raise no-write rows, the HAMT multi-pair no-change rows, the size-independent
-  words-reserved pin and the `term_to_binary` byte row).
+  words-reserved pin and the `term_to_binary` byte row), plus its `read_path` submodule
+  (`tests_read.rs`: the read instructions' size sweep — see Test Strategy).
 
 ## The no-change fast path (term identity)
 An update that changes nothing answers the **source map's own `Eterm` word**, so
@@ -118,15 +121,36 @@ destination store, the `badmap` check and the empty-pair short circuit are share
   The internal HAMT node order of a COW result is also not the rebuild's; content, `=:=` and canonical
   `map_pairs` order are identical.
 
+## The read model (one descent per key, no pair list)
+- `get_map_elements` / `has_map_fields` read the source with `beam_term::map::map_get(map, key,
+  atoms)` **once per key** — the C's flatmap scan + `erts_hashmap_get` (`emu/map_instrs.tab:49-122`) —
+  which handles both frozen layouts, so a read costs O(k · log n) for k keys.
+  The source is **never enumerated**: the retired shape built a full `Vec<(Eterm, Eterm)>` by walking
+  every HAMT node (`crate::terms::map_entries`) and then scanned it linearly per key, i.e. O(n) for a
+  one-key guard.
+- `map_get`'s key rule is `beam_term::cmp`'s `EQ`, the same exact `=:=` the write side uses, so `1` and
+  `1.0` stay distinct keys and the engine still reimplements no term ordering (pinned by
+  `tests_read.rs::a_float_key_is_not_an_integer_key`).
+- **The rooting order rule.** `read_operand` can allocate (an `Operand::Integer`/`Character` beyond a
+  small int is materialized as a bignum), and an allocation may run a moving collector, so neither the
+  map word nor a key word is held across another operand read. Each iteration reads the key, **re-reads
+  the `source` operand** (after the iteration's allocating read; the re-read is a register/literal word
+  read and cannot allocate, because an allocating source operand is an integer and the `is_map` check
+  has already failed), then takes the `&AtomTable` from `ctx.atoms(module)` — it borrows `*ctx`
+  immutably, so it cannot be held across `read_operand`'s `&mut` — and descends with the
+  allocation-free `map_get`. Detail: [`read`](read.rs)'s module docs.
+- A malformed map's `TermError::BadMap` is reconciled into `BeamError::BadArg`, the error the previous
+  `map_entries` walk produced: no silent fallback, no wrong value.
+
 ## Failure paths
 | Site | Condition | `fail != NO_FAIL` | `fail == NO_FAIL` |
 |---|---|---|---|
-| `read.rs:65,96` / `write.rs:283,357` | non-map `source` | jump | raise `{badmap,Source}` |
+| `read.rs:92,124` / `write.rs:284,358` | non-map `source` | jump | raise `{badmap,Source}` |
 | `write.rs:378` (COW) / `:401` (flat) | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
-| `read.rs:76,102` | key absent | jump | raise the **bare atom** `function_clause` |
+| `read.rs:104,132` | key absent | jump | raise the **bare atom** `function_clause` |
 
-`fail_or_raise` (`mod.rs:246`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
-(`mod.rs:289`); `fail_or_function_clause` (`mod.rs:268`) forwards the absent-key `NO_FAIL` branch to
+`fail_or_raise` (`mod.rs:241`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
+(`mod.rs:284`); `fail_or_function_clause` (`mod.rs:263`) forwards the absent-key `NO_FAIL` branch to
 the engine's single failed-clause definition `raise_function_clause_no_fail`
 (`dispatch.rs`; call site `mod.rs:275`, `what = "maps"`), which throws class `error`
 with the bare atom `function_clause` (no tuple — the reason is not `{Tag,Value}`).
@@ -199,7 +223,7 @@ Verified against the system `erlc` (OTP 29) disassembly:
   moving collector.
 - Atom-keyed flat-map storage order follows the *module-local* indices, so it can differ from
   the oracle's global-index order — visible only in a `term_to_binary` byte comparison of an
-  atom-keyed map, never in map semantics (`lookup`/`position` compare by name via `cmp`).
+  atom-keyed map, never in map semantics (`map_get`/`position` compare keys by name via `cmp`).
   A HAMT result has a third order again (its node layout), so a byte comparison of a > 32-key map is
   only meaningful between two builds of the **same** arm; canonical `map_pairs` order is the
   layout-independent invariant.
@@ -231,6 +255,23 @@ Verified against the system `erlc` (OTP 29) disassembly:
   `beam_loader::load_file` table and asserts the exact typed
   `unsupported_opcode: maps: no 'badkey' atom in the module` (and no reason term). Neither can
   pass on the other's error.
+- The same file's hash-map-cap source rows (`get_reads_a_hashmap_source`,
+  `get_with_a_missing_key_in_a_hashmap_takes_the_fail_label`,
+  `has_reports_presence_in_a_hashmap`) build their source with the frozen writer
+  (`beam_term::map::write_map` via `terms::make_map` plus small-integer filler keys, so the key count
+  is past `MAP_SMALL_MAP_LIMIT`), because only the real builder places a leaf in the slot its own
+  key's hash selects -- the locality `map_get` follows; the file's hand-written `Hamt` node blocks
+  serve the **write** path only, which enumerates the source or rebuilds it flat.
+- `tests.rs`'s `read_path` submodule (`tests_read.rs`) is the read side's size sweep, over sources
+  built with `terms::make_map` so each takes the frozen layout for its size
+  (`n ∈ {0,1,31,32,33,34,250,2_500}`): **every** present key fetched into its own `x(n)` destination
+  (two-key and three-key rows, so the destination count is unrelated to the map's size),
+  `has_map_fields` leaving its sentinel registers untouched, a 32-key atom-keyed flat source read by
+  both instructions, an absent key taking the `fail` label on both layouts (the earlier present key's
+  write staying harmless, the absent key's destination never written), the same absent key under
+  `NO_FAIL` raising the bare `function_clause` at every size on both layouts, that raise's typed-gap
+  residual on a hash map whose module does not name the atom, a non-map source's `fail` label and
+  `{badmap,Source}` for both instructions, and a `1.0` key not answering an integer `1` read.
 - `../../../tests/map_assoc_alloc.rs` keeps a per-thread-armed counting `#[global_allocator]` and the
   `harness + build + one walk` band over one `put_map_assoc` (1 000 and 2 775 source pairs), measured
   in the same binary, as an **upper-bound regression guard on the rebuild shape**: `build` is the
@@ -241,6 +282,10 @@ Verified against the system `erlc` (OTP 29) disassembly:
   The produced map is compared with the reference builder in canonical
   `beam_term::map::map_pairs` order (`=:=` pair by pair), because a COW result's storage order is not
   the rebuild's.
+  The same file carries the **read** pin (`the_map_read_instructions_do_not_allocate_a_pair_list`):
+  `get_map_elements` and `has_map_fields` (two keys) over a hash-map source at 250 and 6 250 keys make
+  the **same** allocation count at both sizes (9 events, all of them the run harness) and stay under a
+  small constant, so a read that went back to a pair list fails there as well as on the shape.
 - `tests.rs`'s `path_copying` module is the rebuild-equivalence gate for the COW arm: for
   `put_map_assoc` and `put_map_exact` over `n ∈ {0,1,31,32,33,34,250,2_500}` (flat ≤ 32, HAMT ≥ 33)
   with a replaced key, a replaced key plus a new one, and a new key, it asserts the instruction's
@@ -274,13 +319,17 @@ Verified against the system `erlc` (OTP 29) disassembly:
   single-key forms (`M#{K => V}` / `M#{K := V}`), so the waste is only reachable from hand-built IR.
   A HAMT result's internal node order is also not the rebuild's (content, `=:=` and canonical
   `map_pairs` order are identical).
-- `lookup`/`position` are O(n) scans (no hash) — the **read** instructions' cost, unchanged.
+- **No known-costly path remains on the read side.** Both read instructions descend once per key
+  with `beam_term::map::map_get` (the HAMT's hashed walk, the flat map's bounded scan of ≤ 32 keys),
+  allocate nothing, and never build a pair list — the retired `map_entries` + linear-scan shape is
+  gone (`tests/map_assoc_alloc.rs::the_map_read_instructions_do_not_allocate_a_pair_list` pins the
+  flat allocation count across a 25× size range). A flat map's `map_get` is still a bounded linear
+  scan (at most `MAP_SMALL_MAP_LIMIT` = 32 `cmp` comparisons), which is the frozen flat-map read rule,
+  not a cost that can grow.
+  `position` (`mod.rs:225`) survives only for the **flat write** arm (`write.rs:326`, `:400`, `:420`);
   `put_map_exact` validates each key with a hashed `map_get` descent and then re-checks presence
   inside the COW closure, so it takes no full walk on a HAMT source (the flat arm still walks once for
   the validation and once for the merge).
-- The read instructions materialize the whole pair list and scan it linearly (`read.rs:67`, `:98`
-  plus `lookup` `mod.rs:221`) where `beam_term::map::map_get` (`beam_term/src/map.rs:590`) would
-  descend the HAMT — so a one-key guard (`has_map_fields` / `get_map_elements`) is O(n), not O(log n).
 - The baseline tier has **no inline arm** for any map instruction (`jit/baseline/emit/block.rs:1376`
   → `emit_family` → `family.rs:57` `jit_family` → `families::dispatch`), so each one costs a helper
   call plus a second variant match on top of the family body.

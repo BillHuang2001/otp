@@ -26,14 +26,42 @@
 //! - `has_map_fields` ([`beam_loader::Instr::HasMapFields`]) — test for the presence
 //!   of map keys.
 //!
-//! Both read the source through [`crate::terms::map_entries`], which handles **both**
-//! frozen map layouts (flat map and hashmap/HAMT, walked node by node), and match
-//! keys with `beam_term::cmp` — no hash function, no reimplemented term ordering. A
-//! non-map source takes the `fail` branch, or raises `{badmap, Source}` when the
+//! Both read the source with [`beam_term::map::map_get`] — **one descent per key**,
+//! the C's `erts_hashmap_get` (`emu/map_instrs.tab:49-122`): a hashed path walk for
+//! a hashmap/HAMT and the bounded key scan for a flat map, so both frozen layouts
+//! are read. Its key rule is `beam_term::cmp`'s `EQ` (the exact `=:=` ordering), so
+//! `1` and `1.0` stay distinct keys and the engine still reimplements no term
+//! ordering. The source is therefore **never enumerated**: no `[(Eterm, Eterm)]`
+//! pair list is materialized, and a read costs O(k · log n) for k keys instead of
+//! the old whole-map walk — which walked every HAMT node and grew a `Vec` per pair —
+//! plus a linear scan per key.
+//!
+//! A non-map source takes the `fail` branch, or raises `{badmap, Source}` when the
 //! label is `NO_FAIL`; an absent key takes the `fail` branch, or — when the label is
 //! `NO_FAIL` (engine-defined: the ground truth's read failure sets no reason) — raises
 //! the bare atom `function_clause` (the parent module docs carry the full semantics
 //! and the ground truth).
+//!
+//! # Rooting order: the source word `map_get` consumes is read last
+//!
+//! `read_operand` can **allocate** — an `Operand::Integer`/`Character` beyond a small
+//! int is materialized as a bignum ([`crate::operand::operand_slack_words`] is
+//! non-zero only for those) — and an allocation may run a moving collector that
+//! relocates any `Eterm` read before it. So no source-map word and no key word is
+//! held across another operand read:
+//!
+//! 1. read the key (this is the iteration's allocating read);
+//! 2. **re-read the source** — a register or literal word read, which cannot allocate
+//!    (an allocating source operand is an integer, so the `is_map` check above already
+//!    failed and never reached the loop), hence the key read in step 1 stays valid;
+//! 3. take the `&AtomTable` from `ctx.atoms(module)` (it borrows `*ctx` immutably, so
+//!    it cannot be held across `read_operand`'s `&mut` either);
+//! 4. descend with `map_get`, which allocates nothing.
+//!
+//! Nothing after step 1 allocates, so the word handed to `map_get` is the
+//! post-collection term. A malformed map's `TermError::BadMap` is reconciled into
+//! `BeamError::BadArg` — the error the previous `map_entries` walk produced — never a
+//! silent fallback and never a wrong value.
 
 use crate::interpreter::LabelMap;
 
@@ -44,10 +72,9 @@ use crate::context::ExecutionContext;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
-use crate::terms;
 use crate::Step;
 
-use super::{fail_or_function_clause, fail_or_raise, lookup};
+use super::{fail_or_function_clause, fail_or_raise};
 
 /// `get_map_elements Fail Src {Key,Dst}*` — write each key's value to its
 /// destination; a non-map source or an absent key fails.
@@ -64,13 +91,14 @@ pub(super) fn get_map_elements(
     if !predicates::is_map(map) {
         return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
-    let entries = terms::map_entries(map)?;
     for (key_operand, dst_operand) in pairs {
         let key = read_operand(machine, ctx, key_operand)?;
-        // The namespace is taken AFTER the operand read (it borrows `*ctx`
+        // Re-read the source AFTER the key read (see "Rooting order" above): the key
+        // read may allocate, and an allocation may relocate the map word.
+        let map = read_operand(machine, ctx, source)?;
+        // The namespace is taken AFTER the operand reads (it borrows `*ctx`
         // immutably, so it must not be held across `read_operand`'s `&mut`).
-        let found = lookup(&entries, key, ctx.atoms(module));
-        match found {
+        match beam_term::map::map_get(map, key, ctx.atoms(module))? {
             Some(value) => write_operand(machine, dst_operand, value)?,
             None => {
                 return fail_or_function_clause(machine, module, labels, ctx, fail);
@@ -95,10 +123,12 @@ pub(super) fn has_map_fields(
     if !predicates::is_map(map) {
         return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
-    let entries = terms::map_entries(map)?;
     for key_operand in keys {
         let key = read_operand(machine, ctx, key_operand)?;
-        if lookup(&entries, key, ctx.atoms(module)).is_none() {
+        // Same rooting order as `get_map_elements`: the map word is read after the
+        // iteration's allocating operand read.
+        let map = read_operand(machine, ctx, source)?;
+        if beam_term::map::map_get(map, key, ctx.atoms(module))?.is_none() {
             return fail_or_function_clause(machine, module, labels, ctx, fail);
         }
     }

@@ -199,6 +199,22 @@ fn assert_unsupported_reason(err: BeamError, reason: &str) {
     );
 }
 
+/// The value bound to `key` in a `terms::map_entries` pair list, using exact key
+/// equality.
+///
+/// A **test-side** scan only: the production read instructions descend the map once
+/// per key with `beam_term::map::map_get` and never build such a list, but a test
+/// that has already enumerated the *produced* map (from a write instruction) wants
+/// one pair out of that enumeration. The comparison is delegated to
+/// `beam_term::cmp` (the exact `=:=` ordering), the same key rule the instructions
+/// use.
+fn lookup(entries: &[(Eterm, Eterm)], key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+    entries
+        .iter()
+        .find(|(candidate, _)| cmp(*candidate, key, atoms).is_eq())
+        .map(|(_, value)| *value)
+}
+
 // -- get_map_elements ----------------------------------------------------
 
 #[test]
@@ -1496,3 +1512,10 @@ fn exec_claims_only_the_map_variants() {
 // ---------------------------------------------------------------------------
 #[path = "tests_path_copying.rs"]
 mod path_copying;
+
+// ---------------------------------------------------------------------------
+// The read instructions over the whole size sweep — its own file (see
+// `tests_read.rs`)
+// ---------------------------------------------------------------------------
+#[path = "tests_read.rs"]
+mod read_path;

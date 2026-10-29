@@ -30,10 +30,13 @@
 //!
 //! The flat-map arguments are built by the engine's own flat-map builder and keyed
 //! by the **module's** atom table, so the fixture's key operands compare equal.
-//! The **hashmap** (HAMT) *source* arguments are hand-written (see [`Hamt`]) so the
-//! read path can be exercised against an arbitrary frozen node shape; a hashmap the
-//! *engine builds* comes from `put_map_assoc`/`put_map_exact` crossing the flat-map
-//! limit (`beam_term::map::write_map`).
+//! A **hashmap** (HAMT) *source* argument is built by the frozen writer
+//! ([`hashmap`] → `beam_term::map::write_map`) so every leaf sits in the slot its
+//! own key hash selects — the property the read path's per-key `map_get` descent
+//! depends on; [`Hamt`]'s hand-written node blocks serve the *write* path only,
+//! which enumerates the source (or rebuilds it flat) and never follows a hash.
+//! A hashmap the *engine builds* comes from `put_map_assoc`/`put_map_exact`
+//! crossing the flat-map limit (`beam_term::map::write_map`).
 //!
 //! # The two load paths (atom nameability)
 //!
@@ -163,15 +166,19 @@ fn head_bitmap_header(bitmap: u16) -> Eterm {
     beam_term::make_header(size, beam_term::MAP_SUBTAG)
 }
 
-/// A hand-written **hashmap** (HAMT) fixture.
+/// A hand-written **hashmap** (HAMT) fixture for the *write* path.
 ///
-/// The builder lives in `beam_term` (`map::write_map`) and is reachable through
-/// `beam_engine::terms::make_map`, but a HAMT it builds has a node layout this
-/// fixture must *fix*, so these tests write the frozen `erl_map.h` node blocks
-/// directly and read them back through `beam_engine::terms::map_entries`.
 /// Every block lives in a `Box<[Eterm]>` the fixture keeps alive, so a sub-node
 /// pointer stored in a parent node stays valid — moving the `Box` moves the
 /// pointer, never the pointed-to block.
+///
+/// This shape is only a **fixture**, not a well-formed hash map: a leaf's slot
+/// here is chosen by position, while the frozen reader (`map_get`) follows
+/// `hashmap_nibble(hash(key), L)` and picks the slot by count of lower set bits
+/// in the head bitmap. The write path enumerates (`map_entries`) or takes the
+/// flat rebuild arm for a 32-pair source, so it reads this fixture positionally;
+/// a **read** test needs a map whose leaves sit in their own hash slots, i.e. one
+/// the real builder ([`hashmap`]) produced.
 #[derive(Default)]
 struct Hamt {
     blocks: Vec<Box<[Eterm]>>,
@@ -225,6 +232,28 @@ fn hashmap_32(hamt: &mut Hamt, keys: &[Eterm]) -> Eterm {
         .collect();
     let child = hamt.collision(&leaves);
     hamt.head_bitmap(1, 32, &[child])
+}
+/// A **well-formed** hashmap source: the frozen writer
+/// (`beam_term::map::write_map`, via [`terms::make_map`]) over `entries` plus
+/// distinct small-integer filler keys, so the key count is past
+/// `MAP_SMALL_MAP_LIMIT` and the layout really is the HAMT one.
+///
+/// A hand-written node block cannot serve the read path: `map_get` picks a slot
+/// by `popcount(bitmap & ((1 << nibble(hash(key))) - 1))`, so only the real
+/// builder places each leaf where its own key's hash leads.
+fn hashmap(ctx: &mut dyn ExecutionContext, module: &Module, entries: &[(&str, i64)]) -> Eterm {
+    let mut pairs: Vec<(Eterm, Eterm)> = entries
+        .iter()
+        .map(|(name, value)| (make_atom(atom(module, name)), make_small(*value)))
+        .collect();
+    let mut filler = 1i64;
+    while pairs.len() <= beam_term::map::MAP_SMALL_MAP_LIMIT {
+        pairs.push((make_small(filler), make_small(filler)));
+        filler += 1;
+    }
+    let map = terms::make_map(ctx, &pairs, &module.atom_table).expect("build a hashmap");
+    assert!(terms::is_hashmap(map), "a >32-key map is the HAMT layout");
+    map
 }
 
 #[test]
@@ -381,14 +410,14 @@ fn assoc_exact_runs_both_updates() {
 fn get_reads_a_hashmap_source() {
     let module = load();
     let mut ctx = MinimalContext::new();
-    let mut hamt = Hamt::new();
-    let a = hamt.leaf(make_atom(atom(&module, "a")), make_small(10));
-    let b = hamt.leaf(make_atom(atom(&module, "b")), make_small(20));
-    let map = hamt.head_bitmap(0b0011, 2, &[a, b]);
+    let map = hashmap(&mut ctx, &module, &[("a", 10), ("b", 20)]);
 
-    // The engine's reader enumerates the HAMT (both keys).
-    assert_eq!(terms::map_entries(map).expect("a hashmap is readable").len(), 2);
-    // ... and `get_map_elements` reads it exactly like a flat map.
+    // The source really is the >32-key HAMT layout ...
+    assert_eq!(
+        terms::map_entries(map).expect("a hashmap is readable").len(),
+        33
+    );
+    // ... and `get_map_elements` descends it per key, exactly like a flat map.
     let result = run(&mut ctx, &module, "get", &[map]).expect("get on a hashmap");
     assert_eq!(terms::tuple_element(result, 0).unwrap(), make_small(10));
     assert_eq!(terms::tuple_element(result, 1).unwrap(), make_small(20));
@@ -398,9 +427,8 @@ fn get_reads_a_hashmap_source() {
 fn get_with_a_missing_key_in_a_hashmap_takes_the_fail_label() {
     let module = load();
     let mut ctx = MinimalContext::new();
-    let mut hamt = Hamt::new();
-    let a = hamt.leaf(make_atom(atom(&module, "a")), make_small(10));
-    let map = hamt.head_bitmap(0b0001, 1, &[a]);
+    // `a` (plus the filler keys) is present, `b` is not.
+    let map = hashmap(&mut ctx, &module, &[("a", 10)]);
     // `get/1`'s `case_end` fail label raises `{case_clause, Map}` uncaught.
     assert!(matches!(
         run(&mut ctx, &module, "get", &[map]).unwrap_err(),
@@ -415,15 +443,10 @@ fn has_reports_presence_in_a_hashmap() {
     let yes = make_atom(atom(&module, "yes"));
     let no = make_atom(atom(&module, "no"));
 
-    let mut both = Hamt::new();
-    let a = both.leaf(make_atom(atom(&module, "a")), make_small(1));
-    let b = both.leaf(make_atom(atom(&module, "b")), make_small(2));
-    let both_map = both.head_bitmap(0b0011, 2, &[a, b]);
+    let both_map = hashmap(&mut ctx, &module, &[("a", 1), ("b", 2)]);
     assert_eq!(run(&mut ctx, &module, "has", &[both_map]).unwrap(), yes);
 
-    let mut one = Hamt::new();
-    let a = one.leaf(make_atom(atom(&module, "a")), make_small(1));
-    let one_map = one.head_bitmap(0b0001, 1, &[a]);
+    let one_map = hashmap(&mut ctx, &module, &[("a", 1)]);
     assert_eq!(run(&mut ctx, &module, "has", &[one_map]).unwrap(), no);
 }
 

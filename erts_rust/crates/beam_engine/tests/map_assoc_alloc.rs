@@ -18,10 +18,15 @@
 //
 // %CopyrightEnd%
 
-//! `put_map_assoc`'s **hash-map arm is incremental**: the source is not enumerated at
-//! all, and the instruction's allocation count no longer grows with `n`.
+//! Allocation pins for the map instructions: the **write** arm below is incremental,
+//! and the two **read** instructions build nothing proportional to the map size.
 //!
-//! # The two arms
+//! # The write instruction: `put_map_assoc`'s hash-map arm is incremental
+//!
+//! The source is not enumerated at all, and the instruction's allocation count no
+//! longer grows with `n`.
+//!
+//! ## The two arms
 //!
 //! The instruction picks its arm from the source's own layout:
 //!
@@ -37,7 +42,7 @@
 //!   `write_map` allocates a `Box` per HAMT node. That arm is what performs the 33rd
 //!   key's conversion to a hash map.
 //!
-//! # What this test still guards, and how
+//! ## What the write test still guards, and how
 //!
 //! The counting allocator and the `harness + build + one walk` band are kept
 //! **deliberately**, as an upper-bound regression guard on the *rebuild* shape:
@@ -47,6 +52,17 @@
 //! still blow through the band. The measured hash-map arm sits far below it (the
 //! figures are printed by `-- --nocapture`), so only a structural regression can
 //! fail this test.
+//!
+//! # The read instructions: one `map_get` descent per key, no pair list
+//!
+//! `get_map_elements` and `has_map_fields` read each key with
+//! `beam_term::map::map_get` (a hashed descent of a hash map, the bounded scan of a
+//! flat one) and never materialize the source, so their allocation count is
+//! **independent of `n`**: the second test below runs both over a hash-map source at
+//! `n = 250` and `n = 6 250` and asserts the counts are *equal*. A read path that went
+//! back to `terms::map_entries` + a linear scan would allocate (and grow) a
+//! `Vec<(Eterm, Eterm)>` per instruction, growing with `n`.
+
 //!
 //! # Method — a counting global allocator, per-thread armed
 //!
@@ -419,6 +435,193 @@ fn put_map_assoc_does_not_enumerate_the_source_map() {
              walk({walk_bytes}) + {BYTE_SLACK} = {band_bytes}; a walk allocates a `Vec` of \
              {n} pairs ({size} bytes) here",
             size = 16 * n
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The read instructions: no allocation proportional to the map size
+// ---------------------------------------------------------------------------
+
+/// The two hash-map sizes the read pin compares: the second is 25x the first, so a
+/// `Vec` of pairs — or any structure that grows per key — cannot answer the same
+/// allocation count at both.
+const READ_SIZES: [usize; 2] = [250, 6_250];
+
+/// `f/1`: `get_map_elements` for two keys of `x(0)` into `x(1)`/`x(2)`.
+fn get_elements_module() -> (Module, Label) {
+    let mut module = Module::default();
+    let name = module.atom_table.intern("g");
+    module.name = name;
+    let entry = Label(1);
+    let code = vec![
+        Instr::Label(entry),
+        Instr::GetMapElements {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            pairs: vec![
+                (Operand::Integer(0), Operand::X(1)),
+                (Operand::Integer(7), Operand::X(2)),
+            ],
+        },
+        Instr::Return,
+    ];
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| match instr {
+            Instr::Label(label) => Some((*label, index)),
+            _ => None,
+        })
+        .collect();
+    module.functions.push(Function {
+        func_label: entry,
+        entry_label: entry,
+        module: module.name,
+        name,
+        arity: 1,
+        code,
+        blocks: Vec::new(),
+        labels,
+    });
+    (module, entry)
+}
+
+/// `f/1`: `has_map_fields` for the same two keys of `x(0)`, writing nothing.
+fn has_fields_module() -> (Module, Label) {
+    let mut module = Module::default();
+    let name = module.atom_table.intern("h");
+    module.name = name;
+    let entry = Label(1);
+    let code = vec![
+        Instr::Label(entry),
+        Instr::HasMapFields {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            keys: vec![Operand::Integer(0), Operand::Integer(7)],
+        },
+        Instr::Return,
+    ];
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| match instr {
+            Instr::Label(label) => Some((*label, index)),
+            _ => None,
+        })
+        .collect();
+    module.functions.push(Function {
+        func_label: entry,
+        entry_label: entry,
+        module: module.name,
+        name,
+        arity: 1,
+        code,
+        blocks: Vec::new(),
+        labels,
+    });
+    (module, entry)
+}
+
+/// The allocation count of one read instruction over a `source`, measured.
+fn run_read_measured(
+    ctx: &mut MinimalContext,
+    module: &Module,
+    entry: Label,
+    source: Eterm,
+) -> (usize, usize, Eterm) {
+    measure(|| {
+        let mut machine = Machine::new();
+        machine
+            .run_label(module, entry, 1, &[source], ctx)
+            .expect("a well-formed read over a hash map")
+    })
+}
+
+/// The allocation ceiling for one measured read run.
+///
+/// A read allocates **nothing** in the map — every allocation in the window is the
+/// run harness itself (`Machine::new`'s register files plus the per-run label index),
+/// which is a fixed number of events (9 here) and does not scale with the source. The
+/// bound leaves it headroom while staying far below a pair-list read: one
+/// `terms::map_entries` walk of the same sources costs 12 events at 250 pairs and 18
+/// at 6 250, so such a read would land at ~21 and ~27 events.
+const READ_ALLOC_BOUND: usize = 16;
+
+/// The read pin: both instructions allocate the **same** number of times over a
+/// 250-key and a 6 250-key hash map — i.e. the read path materializes nothing
+/// proportional to the map's size.
+#[test]
+fn the_map_read_instructions_do_not_allocate_a_pair_list() {
+    let (get_module, get_entry) = get_elements_module();
+    let (has_module, has_entry) = has_fields_module();
+    let atoms = &get_module.atom_table;
+    let mut ctx = MinimalContext::new();
+
+    // Warm-up, outside every measured window: the first run of a module builds and
+    // caches its label index, the first arena allocation reserves the region (a
+    // large `mmap`, not an allocator event), and the source map's own build is a
+    // `Vec` of pairs. None of that may land inside a window, or the two sizes would
+    // differ for a reason unrelated to the instruction.
+    let warm_pairs: Vec<(Eterm, Eterm)> = (0..64i64).map(|i| (make_small(i), make_small(i))).collect();
+    let warm = terms::make_map(&mut ctx, &warm_pairs, atoms).expect("a hash map");
+    let _ = run_read_measured(&mut ctx, &get_module, get_entry, warm);
+    let _ = run_read_measured(&mut ctx, &has_module, has_entry, warm);
+
+    eprintln!();
+    eprintln!(
+        "{:>6} {:>12} {:>11} {:>10} | {:>10} {:>11}",
+        "n", "get-elements", "has-fields", "walk", "read bytes", "has bytes"
+    );
+
+    let mut counts = Vec::new();
+    for n in READ_SIZES {
+        // The source is built *outside* the measured windows.
+        let source_pairs: Vec<(Eterm, Eterm)> = (0..n as i64)
+            .map(|i| (make_small(i), make_small(3 * i)))
+            .collect();
+        let source = terms::make_map(&mut ctx, &source_pairs, atoms).expect("a hash map");
+        assert!(
+            terms::is_hashmap(source),
+            "n = {n}: the read pin needs a hash-map source"
+        );
+
+        let (get_allocs, get_bytes, fetched) =
+            run_read_measured(&mut ctx, &get_module, get_entry, source);
+        let (has_allocs, has_bytes, tested) =
+            run_read_measured(&mut ctx, &has_module, has_entry, source);
+        // Evidence, not a bound: one `terms::map_entries` walk of the same source, the
+        // shape the read instructions used to take.
+        let (walk_allocs, _walk_bytes, walked) =
+            measure(|| terms::map_entries(source).expect("a readable map"));
+        assert_eq!(walked.len(), n, "n = {n}: one walk sees every pair");
+        eprintln!(
+            "{n:>6} {get_allocs:>12} {has_allocs:>11} {walk_allocs:>10} | {get_bytes:>10} \
+             {has_bytes:>11}"
+        );
+        assert_eq!(fetched, source, "n = {n}: the fetch falls through");
+        assert_eq!(tested, source, "n = {n}: the field test falls through");
+        counts.push((n, get_allocs, has_allocs));
+    }
+
+    let (_, get_small, has_small) = counts[0];
+    let (_, get_large, has_large) = counts[1];
+    assert_eq!(
+        (get_small, has_small),
+        (get_large, has_large),
+        "the read allocation count must not grow with the map size: {counts:?} \
+         (a pair-list read allocates O(n) here)"
+    );
+    for (n, get_allocs, has_allocs) in &counts {
+        assert!(
+            *get_allocs <= READ_ALLOC_BOUND,
+            "n = {n}: get_map_elements made {get_allocs} allocations, above the harness-only \
+             bound {READ_ALLOC_BOUND}"
+        );
+        assert!(
+            *has_allocs <= READ_ALLOC_BOUND,
+            "n = {n}: has_map_fields made {has_allocs} allocations, above the harness-only \
+             bound {READ_ALLOC_BOUND}"
         );
     }
 }
