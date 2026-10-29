@@ -44,7 +44,20 @@ use crate::target::{self, TargetOptions};
 /// The suites measured when `--suite` is not given: self-contained, no `ct` data dir needed.
 pub const DEFAULT_SUITES: &[&str] = &["lists_SUITE", "maps_SUITE", "proplists_SUITE", "dict_SUITE"];
 /// Local helper modules some stdlib suites call; compiled alongside the suites.
-pub const HELPER_MODULES: &[&str] = &["error_info_lib", "dict_test_lib"];
+///
+/// These are the small non-`SUITE` modules of `lib/stdlib/test` that suites call directly
+/// (`error_info_lib:test/…`, `dict_test_lib:…`, `binref:encode_unsigned/1`,
+/// `random_iolist:…`, `sets_test_lib:…`). A helper that fails to compile is *not* fatal: it is
+/// recorded in the build detail, and the cases that need it simply fail (identically on both
+/// sides, so they land in `agree-fail-identical`).
+pub const HELPER_MODULES: &[&str] = &[
+    "error_info_lib",
+    "dict_test_lib",
+    "binref",
+    "random_iolist",
+    "random_unicode_list",
+    "sets_test_lib",
+];
 /// The committed runner source.
 pub const RUNNER: &str = include_str!("../data/ct_runner.erl");
 /// The `lib/stdlib/test` directory of this repository.
@@ -55,14 +68,16 @@ pub fn source(opts: &TargetOptions) -> PathBuf {
         opts.source.clone()
     }
 }
-/// The per-case drive given to **both** sides, with `{suite}`, `{timeout_ms}` and
-/// `{data_root}` substituted.
-pub const DRIVE: &str = "ct_runner:run('{suite}', {timeout_ms}, \"{data_root}\"), halt(0).";
+/// The per-case drive given to **both** sides, with the suite name, the per-case timeout, the
+/// suite budget and the data root substituted.
+pub const DRIVE: &str =
+    "ct_runner:run('{suite}', {case_timeout_ms}, {suite_budget_ms}, \"{data_root}\"), halt(0).";
 /// Builds the drive expression for one suite.
-pub fn drive(suite: &str, timeout_ms: u64, data_root: &Path) -> String {
+pub fn drive(suite: &str, case_timeout_ms: u64, suite_budget_ms: u64, data_root: &Path) -> String {
     DRIVE
         .replace("{suite}", suite)
-        .replace("{timeout_ms}", &timeout_ms.to_string())
+        .replace("{case_timeout_ms}", &case_timeout_ms.to_string())
+        .replace("{suite_budget_ms}", &suite_budget_ms.to_string())
         .replace("{data_root}", &data_root.display().to_string())
 }
 /// `erlc`: the oracle's sibling binary when present (so the compiler matches the oracle),
@@ -102,22 +117,38 @@ fn stage(suites: &[String], src: &Path, stage_dir: &Path, opts: &TargetOptions) 
     }
     Ok(stage_src)
 }
-/// Compiles the selected suites, their helper modules and the runner. Returns the ebin dir.
-fn compile(stage_dir: &Path, stage_src: &Path, suites: &[String], erlc: &Path, opts: &TargetOptions) -> Result<(PathBuf, Vec<String>)> {
+/// Compiles the selected suites, their helper modules and the runner.
+///
+/// Returns `(ebin, required_failures, optional_failures)`: a *selected suite* (or the runner)
+/// that does not compile makes the build fail; a helper module that does not compile is only
+/// recorded, because the cases needing it fail identically on both sides.
+fn compile(
+    stage_dir: &Path,
+    stage_src: &Path,
+    suites: &[String],
+    erlc: &Path,
+    opts: &TargetOptions,
+) -> Result<(PathBuf, Vec<String>, Vec<String>)> {
     let ebin = stage_dir.join("ebin");
     let ctl = stage_dir.join("ctl");
     std::fs::create_dir_all(&ebin)?;
     std::fs::create_dir_all(&ctl)?;
     std::fs::write(ctl.join("ct_runner.erl"), RUNNER)?;
-    let mut failures = Vec::new();
-    let mut modules: Vec<String> = suites.to_vec();
-    modules.extend(HELPER_MODULES.iter().map(|s| s.to_string()));
-    modules.push("ct_runner".into());
-    for module in &modules {
+    let mut required_failures = Vec::new();
+    let mut optional_failures = Vec::new();
+    let mut modules: Vec<(String, bool)> = suites.iter().map(|s| (s.clone(), true)).collect();
+    modules.extend(HELPER_MODULES.iter().map(|s| (s.to_string(), false)));
+    modules.push(("ct_runner".to_string(), true));
+    for (module, required) in &modules {
         let dir = if module == "ct_runner" { &ctl } else { stage_src };
         let source_file = dir.join(format!("{module}.erl"));
         if !source_file.is_file() {
-            failures.push(format!("{module}: source not found at {}", source_file.display()));
+            let message = format!("{module}: source not found at {}", source_file.display());
+            if *required {
+                required_failures.push(message);
+            } else {
+                optional_failures.push(message);
+            }
             continue;
         }
         let mut cmd = Command::new(erlc);
@@ -127,14 +158,19 @@ fn compile(stage_dir: &Path, stage_src: &Path, suites: &[String], erlc: &Path, o
         }
         let run = proc::run_with_timeout(&mut cmd, Some(std::time::Duration::from_secs(300)))?;
         if !run.success {
-            failures.push(format!(
+            let message = format!(
                 "{module}: exit {:?}: {}",
                 run.exit_code,
                 report::one_line(&run.tail(8), 500)
-            ));
+            );
+            if *required {
+                required_failures.push(message);
+            } else {
+                optional_failures.push(message);
+            }
         }
     }
-    Ok((ebin, failures))
+    Ok((ebin, required_failures, optional_failures))
 }
 /// One case's status as printed by the runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,11 +186,16 @@ pub enum CaseStatus {
     /// Not exported by the suite (malformed `all/0`).
     Missing,
 }
-/// Parses the runner's output into `(case, status)` pairs, in output order.
-pub fn parse(stdout: &str) -> (Vec<(String, CaseStatus)>, Option<String>, Option<String>) {
+/// Parses the runner's output into `(case, status)` pairs, in output order, plus the
+/// suite-level markers: `init_per_suite` failure, suite skip, and the count of cases the
+/// runner never launched because the suite budget was exhausted.
+pub fn parse(
+    stdout: &str,
+) -> (Vec<(String, CaseStatus)>, Option<String>, Option<String>, Option<u64>) {
     let mut cases = Vec::new();
     let mut init_failed = None;
     let mut suite_skip = None;
+    let mut deadline: Option<u64> = None;
     for line in stdout.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("CASE ") {
@@ -175,10 +216,24 @@ pub fn parse(stdout: &str) -> (Vec<(String, CaseStatus)>, Option<String>, Option
             init_failed = Some(rest.to_string());
         } else if let Some(rest) = t.strip_prefix("SUITE_SKIP ") {
             suite_skip = Some(rest.to_string());
+        } else if let Some(rest) = t.strip_prefix("SUITE_DEADLINE ") {
+            deadline = rest.trim().parse().ok();
         }
     }
-    (cases, init_failed, suite_skip)
+    (cases, init_failed, suite_skip, deadline)
 }
+/// A case that the side never reported: a `SUITE_DEADLINE` explains it (the case was *not
+/// measured*), otherwise the output is inconsistent with the other side's case list.
+fn missing_case(side: &str, deadline: Option<u64>) -> Outcome {
+    match deadline {
+        Some(not_run) => Outcome::bare(
+            Status::Timeout,
+            format!("not measured: the suite budget expired before this case ({not_run} cases not run)"),
+        ),
+        None => Outcome::bare(Status::Error, format!("case missing from the {side}'s output")),
+    }
+}
+
 /// The outcome of one case on one side.
 fn outcome_of(status: &CaseStatus) -> Outcome {
     match status {
@@ -189,8 +244,22 @@ fn outcome_of(status: &CaseStatus) -> Outcome {
         CaseStatus::Missing => Outcome::bare(Status::Error, "case not exported"),
     }
 }
-/// Observes one suite on one side: `(cases, failure)`, where `failure` replaces the case rows
-/// when the suite could not start at all.
+/// One side's observation of one suite.
+struct SideRun {
+    /// The cases the runner actually reported, in output order.
+    cases: Vec<(String, CaseStatus)>,
+    /// A suite-level failure (`init_per_suite`, load error, whole-process timeout, unparsable
+    /// output) that explains why cases are missing.
+    suite_failure: Option<Outcome>,
+    /// How many cases the runner refused to launch because the suite budget ran out.
+    deadline: Option<u64>,
+}
+impl SideRun {
+    fn failed(outcome: Outcome) -> Self {
+        SideRun { cases: Vec::new(), suite_failure: Some(outcome), deadline: None }
+    }
+}
+/// Observes one suite on one side.
 fn observe(
     runtime: &Runtime,
     code_path: &[PathBuf],
@@ -198,48 +267,94 @@ fn observe(
     data_root: &Path,
     opts: &TargetOptions,
     cwd: &Path,
-) -> (Vec<(String, CaseStatus)>, Option<Outcome>) {
+) -> SideRun {
     if runtime.program().is_none() {
-        return (
-            Vec::new(),
-            Some(Outcome::bare(
-                Status::NotRun,
-                runtime.absent_reason.clone().unwrap_or_default(),
-            )),
-        );
+        return SideRun::failed(Outcome::bare(
+            Status::NotRun,
+            runtime.absent_reason.clone().unwrap_or_default(),
+        ));
     }
-    let timeout_ms = opts.timeout.as_millis() as u64;
-    let eval = drive(suite, timeout_ms, data_root);
-    match target::invoke(
-        runtime,
-        code_path,
-        &eval,
-        opts.timeout + std::time::Duration::from_secs(30),
-        &[],
-        Some(cwd),
-    ) {
+    let case_timeout_ms = opts.timeout.as_millis() as u64;
+    let budget_ms = opts.suite_budget.as_millis() as u64;
+    let eval = drive(suite, case_timeout_ms, budget_ms, data_root);
+    // The process budget sits *above* the in-runner suite budget: the runner stops launching
+    // cases when its own budget expires, so the process should normally finish on its own. The
+    // extra margin covers `end_per_suite` and a case that overruns its own timeout.
+    let process_budget = opts.suite_budget + std::time::Duration::from_secs(180);
+    match target::invoke(runtime, code_path, &eval, process_budget, &[], Some(cwd)) {
         Ok(run) => {
             if run.timed_out {
-                return (
-                    Vec::new(),
-                    Some(Outcome::bare(Status::Timeout, format!("suite killed after {} ms", run.wall_ms.round()))),
-                );
+                return SideRun::failed(Outcome::bare(
+                    Status::Timeout,
+                    format!("suite process killed after {} ms (process budget)", run.wall_ms.round()),
+                ));
             }
-            let (cases, init_failed, suite_skip) = parse(&run.stdout);
-            if cases.is_empty() {
-                return (Vec::new(), Some(target::unclassified(&run)));
+            let (cases, init_failed, suite_skip, deadline) = parse(&run.stdout);
+            if cases.is_empty() && init_failed.is_none() && suite_skip.is_none() && deadline.is_none() {
+                return SideRun::failed(target::unclassified(&run));
             }
-            if let Some(reason) = init_failed {
-                return (cases, Some(Outcome::bare(Status::InitFail, reason)));
-            }
-            if let Some(reason) = suite_skip {
-                return (cases, Some(Outcome::bare(Status::Skip, reason)));
-            }
-            (cases, None)
+            let suite_failure = if let Some(reason) = init_failed {
+                Some(Outcome::bare(Status::InitFail, reason))
+            } else {
+                suite_skip.map(|reason| Outcome::bare(Status::Skip, reason))
+            };
+            SideRun { cases, suite_failure, deadline }
         }
-        Err(err) => (Vec::new(), Some(Outcome::bare(Status::Error, err))),
+        Err(err) => SideRun::failed(Outcome::bare(Status::Error, err)),
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parses_case_lines_and_markers() {
+        let out = "\nSUITE maps_SUITE\n\nCASE a OK\n\nCASE b EXC badarg\n\nCASE c SKIP nope\n\nCASE d TIMEOUT\n\nSUITE_DEADLINE 7\n\nDONE maps_SUITE\n";
+        let (cases, init_failed, suite_skip, deadline) = parse(out);
+        assert_eq!(cases.len(), 4);
+        assert_eq!(cases[0], ("a".to_string(), CaseStatus::Ok));
+        assert_eq!(cases[1], ("b".to_string(), CaseStatus::Exc("badarg".to_string())));
+        assert_eq!(cases[2], ("c".to_string(), CaseStatus::Skip("nope".to_string())));
+        assert_eq!(cases[3], ("d".to_string(), CaseStatus::Timeout));
+        assert!(init_failed.is_none());
+        assert!(suite_skip.is_none());
+        assert_eq!(deadline, Some(7));
+    }
+    #[test]
+    fn parses_suite_level_failures() {
+        let (cases, init_failed, suite_skip, deadline) =
+            parse("\nSUITE_INIT_FAILED {badmatch,enoent}\n");
+        assert!(cases.is_empty());
+        assert_eq!(init_failed.as_deref(), Some("{badmatch,enoent}"));
+        assert!(suite_skip.is_none());
+        assert!(deadline.is_none());
+    }
+    #[test]
+    fn a_case_that_printed_without_a_newline_does_not_swallow_the_next_line() {
+        // The runner prefixes every protocol line with `\n`, so a case's unfinished output can
+        // never glue itself onto `CASE …` (that is what made one oracle case look like a failure
+        // before the fix).
+        let out = "some log line\nCASE ok_one OK\nCASE ok_two OK\n";
+        let (cases, _, _, _) = parse(out);
+        assert_eq!(cases.len(), 2);
+    }
+    #[test]
+    fn missing_case_distinguishes_a_budget_expiry_from_bad_output() {
+        let expired = missing_case("rust runtime", Some(9));
+        assert_eq!(expired.status, Status::Timeout);
+        assert!(expired.detail.contains("9 cases not run"), "{}", expired.detail);
+        let inconsistent = missing_case("rust runtime", None);
+        assert_eq!(inconsistent.status, Status::Error);
+    }
+    #[test]
+    fn drive_embeds_both_timeouts_identically() {
+        let text = drive("lists_SUITE", 10_000, 600_000, Path::new("/staged/src"));
+        assert_eq!(
+            text,
+            "ct_runner:run('lists_SUITE', 10000, 600000, \"/staged/src\"), halt(0)."
+        );
+    }
+}
+
 /// Runs the stdlib target end to end.
 pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Result<TargetReport> {
     let src = source(opts);
@@ -259,17 +374,27 @@ pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Resu
     let oracle = runtimes.iter().find(|r| r.kind == RuntimeKind::Sys);
     let erlc = find_erlc(oracle)?;
     let stage_src = stage(&suites, &src, stage_dir, opts)?;
-    let (ebin, compile_failures) = compile(stage_dir, &stage_src, &suites, &erlc, opts)?;
+    let (ebin, compile_failures, helper_failures) = compile(stage_dir, &stage_src, &suites, &erlc, opts)?;
     let code_path = vec![ebin.clone(), stage_dir.join("ctl")];
     let cwd_root = stage_dir.join("cwd");
     let build = Build {
         command: format!("{} -o <stage>/ebin -I <stage>/src <suite>.erl …", erlc.display()),
         ok: compile_failures.is_empty(),
         reused: !opts.rebuild && stage_dir.join(".build-ok").is_file(),
-        detail: if compile_failures.is_empty() {
-            format!("compiled {} suites + helpers + runner with the oracle's erlc", suites.len())
-        } else {
-            compile_failures.join("; ")
+        detail: {
+            let mut parts = vec![if compile_failures.is_empty() {
+                format!(
+                    "compiled {} suites + {} helpers + runner with the oracle's erlc",
+                    suites.len(),
+                    HELPER_MODULES.len()
+                )
+            } else {
+                compile_failures.join("; ")
+            }];
+            if !helper_failures.is_empty() {
+                parts.push(format!("helper compile failures (non-fatal): {}", helper_failures.join("; ")));
+            }
+            parts.join(" | ")
         },
     };
     if build.ok {
@@ -279,7 +404,11 @@ pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Resu
         format!("drive (identical on both sides): `{}`", DRIVE),
         "each case runs in its own `spawn_monitor` with a per-case timeout; `init_per_group`/`end_per_group`/`init_per_testcase` hooks are NOT executed".to_string(),
         "cases that fail identically on both sides (missing `ct` config/data dirs, group-hook dependencies) are `agree-fail-identical`: excluded from both numerators, never counted as passes".to_string(),
-        format!("per-case timeout: {} s", opts.timeout.as_secs()),
+        format!(
+            "per-case timeout: {} s · suite budget: {} s (the runner stops launching cases when the budget expires and prints `SUITE_DEADLINE <not-run>`, so the remaining cases are reported as *not measured*, never as failures)",
+            opts.timeout.as_secs(),
+            opts.suite_budget.as_secs()
+        ),
     ];
     let mut invocations = Vec::new();
     for runtime in runtimes {
@@ -290,7 +419,12 @@ pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Resu
             command: target::describe(
                 runtime,
                 &code_path,
-                &drive(&sample, opts.timeout.as_millis() as u64, &stage_src),
+                &drive(
+                    &sample,
+                    opts.timeout.as_millis() as u64,
+                    opts.suite_budget.as_millis() as u64,
+                    &stage_src,
+                ),
                 &[],
                 Some(&cwd_root.join(&sample)),
             ),
@@ -307,15 +441,19 @@ pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Resu
         let cwd = cwd_root.join(suite);
         let sys = match oracle {
             Some(rt) => observe(rt, &code_path, suite, &stage_src, opts, &cwd),
-            None => (Vec::new(), Some(Outcome::bare(Status::NotRun, "oracle not selected"))),
+            None => SideRun::failed(Outcome::bare(Status::NotRun, "oracle not selected")),
         };
         let rust = match runtimes.iter().find(|r| r.kind == RuntimeKind::Rust) {
             Some(rt) => observe(rt, &code_path, suite, &stage_src, opts, &cwd),
-            None => (Vec::new(), Some(Outcome::bare(Status::NotRun, "rust runtime not selected"))),
+            None => SideRun::failed(Outcome::bare(Status::NotRun, "rust runtime not selected")),
         };
         (suite.clone(), sys, rust)
     });
-    for (suite, (sys_cases, sys_failure), (rust_cases, rust_failure)) in observed {
+    for (suite, sys_run, rust_run) in observed {
+        let sys_cases = &sys_run.cases;
+        let rust_cases = &rust_run.cases;
+        let sys_failure = &sys_run.suite_failure;
+        let rust_failure = &rust_run.suite_failure;
         if sys_cases.is_empty() && rust_cases.is_empty() {
             rows.push(Row {
                 id: suite.clone(),
@@ -330,7 +468,7 @@ pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Resu
         // Union of case names, in the oracle's order (grouped by suite, so the row table reads
         // like `ct`'s own case list), then anything only the Rust side reached.
         let mut names: Vec<String> = sys_cases.iter().map(|(n, _)| n.clone()).collect();
-        for (name, _) in &rust_cases {
+        for (name, _) in rust_cases {
             if !names.contains(name) {
                 names.push(name.clone());
             }
@@ -340,15 +478,15 @@ pub fn run(runtimes: &[Runtime], opts: &TargetOptions, stage_dir: &Path) -> Resu
         let mut sys_count = (0u32, 0u32);
         let mut rust_count = (0u32, 0u32);
         for name in &names {
-            let sys_outcome = match (sys_map(name), &sys_failure) {
+            let sys_outcome = match (sys_map(name), sys_failure) {
                 (Some(status), _) => outcome_of(&status),
                 (None, Some(failure)) => failure.clone(),
-                (None, None) => Outcome::bare(Status::Error, "case missing from the oracle's output"),
+                (None, None) => missing_case("oracle", sys_run.deadline),
             };
-            let rust_outcome = match (rust_map(name), &rust_failure) {
+            let rust_outcome = match (rust_map(name), rust_failure) {
                 (Some(status), _) => outcome_of(&status),
                 (None, Some(failure)) => failure.clone(),
-                (None, None) => Outcome::bare(Status::Error, "case missing from the rust runtime's output"),
+                (None, None) => missing_case("rust runtime", rust_run.deadline),
             };
             if matches!(sys_outcome.status, Status::Pass | Status::Fail) {
                 if sys_outcome.failed > 0 { sys_count.1 += 1 } else { sys_count.0 += 1 }

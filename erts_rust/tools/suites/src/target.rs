@@ -40,6 +40,9 @@ pub struct TargetOptions {
     pub only: Vec<String>,
     /// Per-module / per-case timeout.
     pub timeout: Duration,
+    /// Whole-suite budget (stdlib only): how long one suite's *process* may spend launching
+    /// cases before it stops and reports the rest as not measured.
+    pub suite_budget: Duration,
     /// Concurrent module runs.
     pub jobs: usize,
     /// Stream commands as they run.

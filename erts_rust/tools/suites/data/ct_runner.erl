@@ -37,33 +37,43 @@
 %% and excludes from both numerators rather than hiding.
 -module(ct_runner).
 
--export([run/3, cases/1]).
+-export([run/4, cases/1]).
 
 %% @doc Runs every case of `Suite' and prints the canonical per-case lines.
--spec run(atom(), non_neg_integer(), file:filename()) -> ok.
-run(Suite, TimeoutMs, DataRoot) ->
-    io:format("SUITE ~p~n", [Suite]),
+%%
+%% `CaseTimeoutMs' bounds one case; `SuiteBudgetMs' bounds the whole suite. When the budget is
+%% exhausted the runner stops launching cases and prints `SUITE_DEADLINE <not-run>`, so the
+%% driver can report the remaining cases as "not measured" instead of inventing a verdict for
+%% them (and instead of one hung case swallowing the whole suite's data).
+-spec run(atom(), non_neg_integer(), non_neg_integer(), file:filename()) -> ok.
+run(Suite, CaseTimeoutMs, SuiteBudgetMs, DataRoot) ->
+    Deadline = erlang:monotonic_time(millisecond) + SuiteBudgetMs,
+    io:format("~nSUITE ~p~n", [Suite]),
     DataDir = data_dir(Suite, DataRoot),
     Base = [{suite, Suite},
             {data_dir, DataDir},
             {priv_dir, DataDir},
-            {case_timeout, TimeoutMs}],
+            {case_timeout, CaseTimeoutMs}],
     case code:ensure_loaded(Suite) of
         {module, Suite} ->
             case init_per_suite(Suite, Base) of
                 {runner_skip, SkipReason} ->
-                    io:format("SUITE_SKIP ~s~n", [fmt(SkipReason)]);
+                    io:format("~nSUITE_SKIP ~s~n", [fmt(SkipReason)]);
                 {runner_init_failed, InitReason} ->
-                    io:format("SUITE_INIT_FAILED ~s~n", [fmt(InitReason)]);
+                    io:format("~nSUITE_INIT_FAILED ~s~n", [fmt(InitReason)]);
                 Config ->
-                    lists:foreach(fun(Case) -> run_case(Suite, Case, Config, TimeoutMs) end,
-                                  cases(Suite)),
+                    {Ran, Remaining} = run_cases(Suite, cases(Suite), Config, CaseTimeoutMs, Deadline),
+                    case Remaining of
+                        [] -> ok;
+                        _ -> io:format("~nSUITE_DEADLINE ~p~n", [length(Remaining)])
+                    end,
+                    _ = Ran,
                     end_per_suite(Suite, Config)
             end;
         LoadError ->
-            io:format("SUITE_LOAD_FAILED ~s~n", [fmt(LoadError)])
+            io:format("~nSUITE_LOAD_FAILED ~s~n", [fmt(LoadError)])
     end,
-    io:format("DONE ~p~n", [Suite]),
+    io:format("~nDONE ~p~n", [Suite]),
     ok.
 
 %% @doc The expanded case list of a suite: `all/0' with `groups/0' flattened, sorted and
@@ -113,6 +123,20 @@ expand_sub(Group, Sub, Groups, Seen) ->
         false -> expand(Sub, Groups, [Group | Seen])
     end.
 
+run_cases(Suite, Cases, Config, CaseTimeoutMs, Deadline) ->
+    run_cases(Suite, Cases, Config, CaseTimeoutMs, Deadline, 0).
+
+run_cases(_Suite, [], _Config, _CaseTimeoutMs, _Deadline, Ran) ->
+    {Ran, []};
+run_cases(Suite, [Case | Rest], Config, CaseTimeoutMs, Deadline, Ran) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            {Ran, [Case | Rest]};
+        false ->
+            run_case(Suite, Case, Config, CaseTimeoutMs),
+            run_cases(Suite, Rest, Config, CaseTimeoutMs, Deadline, Ran + 1)
+    end.
+
 data_dir(Suite, DataRoot) ->
     Candidate = filename:join(DataRoot, atom_to_list(Suite) ++ "_data"),
     case filelib:is_dir(Candidate) of
@@ -149,21 +173,21 @@ run_case(Suite, Case, Config, TimeoutMs) ->
         orelse erlang:function_exported(Suite, Case, 1),
     case Callable of
         false ->
-            io:format("CASE ~p MISSING~n", [Case]);
+            io:format("~nCASE ~p MISSING~n", [Case]);
         true ->
             {Pid, Ref} = spawn_monitor(
                            fun() -> exit({ct_case_result, call_case(Suite, Case, Config)}) end),
             receive
                 {'DOWN', Ref, process, Pid, {ct_case_result, ok}} ->
-                    io:format("CASE ~p OK~n", [Case]);
+                    io:format("~nCASE ~p OK~n", [Case]);
                 {'DOWN', Ref, process, Pid, {ct_case_result, {skip, Reason}}} ->
-                    io:format("CASE ~p SKIP ~s~n", [Case, fmt(Reason)]);
+                    io:format("~nCASE ~p SKIP ~s~n", [Case, fmt(Reason)]);
                 {'DOWN', Ref, process, Pid, Reason} ->
-                    io:format("CASE ~p EXC ~s~n", [Case, fmt(Reason)])
+                    io:format("~nCASE ~p EXC ~s~n", [Case, fmt(Reason)])
             after TimeoutMs ->
                 exit(Pid, kill),
                 receive {'DOWN', Ref, process, Pid, _} -> ok after 5000 -> ok end,
-                io:format("CASE ~p TIMEOUT~n", [Case])
+                io:format("~nCASE ~p TIMEOUT~n", [Case])
             end
     end.
 

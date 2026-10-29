@@ -55,6 +55,9 @@ pub struct RunArgs {
     pub runtimes: Vec<RuntimeKind>,
     /// Per-module / per-case timeout in seconds.
     pub timeout_secs: u64,
+    /// Whole-suite budget in seconds (stdlib: bounds one suite's process, so a hung case cannot
+    /// swallow the rest of the suite's data).
+    pub suite_budget_secs: u64,
     /// Concurrent module runs.
     pub jobs: usize,
     /// Output directory for the artifacts (default: `results/` next to the crate).
@@ -81,6 +84,7 @@ impl Default for RunArgs {
             only: Vec::new(),
             runtimes: vec![RuntimeKind::Sys, RuntimeKind::Rust],
             timeout_secs: 300,
+            suite_budget_secs: 600,
             jobs: 4,
             out_dir: None,
             out_file: None,
@@ -94,9 +98,13 @@ impl Default for RunArgs {
     }
 }
 impl RunArgs {
-    /// The per-run timeout.
+    /// The per-case / per-module timeout.
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_secs.max(1))
+    }
+    /// The whole-suite budget (never below one case timeout).
+    pub fn suite_budget(&self) -> Duration {
+        Duration::from_secs(self.suite_budget_secs.max(self.timeout_secs.max(1)))
     }
 }
 /// What the user asked for.
@@ -189,6 +197,11 @@ pub fn parse(args: &[String]) -> Result<Action> {
                             .parse()
                             .map_err(|_| SuitesError::Usage("--timeout expects seconds".into()))?;
                     }
+                    "--suite-budget" => {
+                        args.suite_budget_secs = value("--suite-budget")?
+                            .parse()
+                            .map_err(|_| SuitesError::Usage("--suite-budget expects seconds".into()))?;
+                    }
                     "--jobs" => {
                         args.jobs = value("--jobs")?
                             .parse::<usize>()
@@ -226,6 +239,7 @@ RUN OPTIONS:
     --module <name>[,<name>…]    restrict to these eunit modules (khepri)
     --runtime sys|rust|all       which sides to run (default: all)
     --timeout <secs>             per module/case timeout (default: 300)
+    --suite-budget <secs>        whole-suite budget (stdlib, default: 600)
     --jobs <n>                   concurrent module runs (default: 4)
     --out <dir>                  artifact directory (default: erts_rust/tools/suites/results)
     --out-file <path>            exact JSON artifact path
@@ -289,6 +303,14 @@ mod tests {
                 assert_eq!(args.timeout_secs, 42);
                 assert_eq!(args.jobs, 2);
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    #[test]
+    fn suite_budget_never_sits_below_the_case_timeout() {
+        let action = parse(&argv(&["run", "--timeout", "90", "--suite-budget", "5"])).expect("parse");
+        match action {
+            Action::Run(args) => assert_eq!(args.suite_budget().as_secs(), 90),
             other => panic!("unexpected {other:?}"),
         }
     }
