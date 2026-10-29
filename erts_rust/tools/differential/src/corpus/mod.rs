@@ -140,6 +140,7 @@ mod math_bifs;
 mod mexec;
 mod mexec_extra;
 mod modules;
+mod monitor_tag;
 mod nif;
 mod nif_a3;
 mod nif_abi;
@@ -691,6 +692,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(ets_spec::group());
     cases.extend(ordered_walk::group());
     cases.extend(proc_signals::group());
+    cases.extend(monitor_tag::group());
     cases.extend(re::group());
     cases.extend(proc_control::group());
     cases.extend(system_info::group());
