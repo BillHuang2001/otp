@@ -2477,6 +2477,118 @@ mod tests {
         });
     }
 
+    /// Compiles the single search string `pattern` on `heap` (the caller's arena)
+    /// and answers the registry id its `{bm, Ref}` handle names.
+    ///
+    /// The id is the only part of the handle that is an *immediate*: the `Ref`
+    /// thing itself is a 4-word block **on the compiling heap**, so a caller that
+    /// keeps the id can rebuild the handle anywhere (which the lifetime pins below
+    /// do). The same shape as `ets`'s continuation id.
+    fn compile_into(heap: &mut Heap, atoms: &AtomTable, pattern: &[u8]) -> u64 {
+        let mut ctx = BifContext::new(heap, atoms, ProcessId::new(1, 0));
+        let subject = bin(&mut ctx, pattern);
+        let compiled = compile_pattern_1(&mut ctx, &[subject]).expect("a valid pattern");
+        assert_eq!(compiled_tag(&ctx, compiled), "bm");
+        access::ref_thing_id(access::tuple_element(compiled, 1))
+            .expect("the handle carries a registry id")
+    }
+    /// Rebuilds the `{bm, Ref}` handle for `ref_id` from that id alone (a small
+    /// int, so nothing is rooted by the rebuilding heap) and answers what
+    /// `binary:match(<<"xabcx">>, Handle)` says through it.
+    fn match_through_rebuilt_handle(atoms: &AtomTable, ref_id: u64) -> String {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut ctx = BifContext::new(&mut heap, atoms, ProcessId::new(1, 0));
+        let reference = access::make_ref_thing(ctx.heap(), ref_id).expect("the id fits");
+        let compiled = handle(&mut ctx, "bm", reference);
+        let subject = bin(&mut ctx, b"xabcx");
+        let found = match_2(&mut ctx, &[subject, compiled]).expect("the pattern still resolves");
+        let rendered = render(&mut ctx, found);
+        // The same handle answers `matches/2` exactly as the **raw** pattern does,
+        // so no alternative was lost, truncated or replaced.
+        let matched = matches_2(&mut ctx, &[subject, compiled]).expect("the pattern still matches");
+        let raw = bin(&mut ctx, b"abc");
+        let raw_matched = matches_2(&mut ctx, &[subject, raw]).expect("the raw pattern matches");
+        assert_eq!(
+            render(&mut ctx, matched),
+            render(&mut ctx, raw_matched),
+            "the compiled handle must answer what the raw pattern answers"
+        );
+        rendered
+    }
+    /// **The compiled-pattern registry stores the alternatives' *bytes* in a
+    /// never-relocating slot, so a pattern outlives the heap it was compiled from.**
+    ///
+    /// This is the ownership/lifetime pin for that registry
+    /// (`CompiledPattern { tag: PatternTag, alternatives: Vec<Vec<u8>> }` —
+    /// `src/binary.rs:404`). `BifContext::heap()` is `beam_rt`'s pooled, **unscanned**
+    /// arena: `call_registered` rewinds it with `Heap::reset_to(mark)` after every
+    /// call and the next BIF call reuses the very same words. A raw `Eterm` parked
+    /// in the registry would root nothing — it would keep pointing into words that
+    /// now hold some later call's term (the measured symptom is a `SIGSEGV` inside
+    /// `beam_term`). The probe replays exactly that sequence: compile, rewind the
+    /// arena, cover it with unrelated binaries, then resolve the handle from a
+    /// **fresh** context whose heap shares no word with the compiling one.
+    #[test]
+    fn a_compiled_pattern_outlives_the_heap_it_was_compiled_from() {
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        // 1. Compile on a persistent arena, so the words the pattern came from are
+        //    the ones the runtime will rewind and reuse.
+        let mut arena = Heap::new(4096).expect("test heap");
+        let ref_id = compile_into(&mut arena, &atoms, b"abc");
+        // 2. The arena rewind `beam_rt` performs (`Heap::reset_to(mark)`), then the
+        //    reuse: `bits::make_binary` writes the very words the compiled pattern
+        //    came from, so an aliasing registry would read *these* bytes instead of
+        //    `abc` — a silently wrong result, never a crash.
+        let used = arena.used();
+        assert!(used > 0, "the compiling call allocated on the arena");
+        arena.reset_to(0).expect("the arena rewinds");
+        assert_eq!(arena.used(), 0, "the rewind released every word");
+        {
+            let mut ctx = BifContext::new(&mut arena, &atoms, ProcessId::new(1, 0));
+            for filler in [&b"zzz"[..], &b"qqq"[..], &b"www"[..], &b"vvv"[..]] {
+                let _ = bin(&mut ctx, filler);
+            }
+        }
+        // 3. Resolve the handle from a **fresh** heap: the `{bm, Ref}` is rebuilt
+        //    from the id alone (a small int), the alternatives come from the
+        //    registry's own copy.
+        // Oracle: `binary:match(<<"xabcx">>, binary:compile_pattern(<<"abc">>))`
+        // ⇒ `{1,3}`.
+        assert_eq!(match_through_rebuilt_handle(&atoms, ref_id), "{1,3}");
+    }
+    /// The `invalidate_caller_heap` probe (`src/ets/matches.rs` shape): overwriting
+    /// **every word** the compiling heap handed out — the source binary, the
+    /// pattern list, the handle's own `Ref` block — must not change what the
+    /// registry holds, because it holds a copy (`compile_pattern_arg` →
+    /// `bits::bytes` → `access::binary_bytes`, an owned `Vec<u8>`).
+    ///
+    /// Fails on any implementation that parks the caller's `Eterm` (or a slice of
+    /// its payload) in the slot: the words below are rewritten to `[]`, so an
+    /// aliasing registry would answer a term the match cannot decode.
+    #[test]
+    fn the_compiled_pattern_registry_keeps_no_word_of_the_compiling_heap() {
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        let mut heap = Heap::new(4096).expect("test heap");
+        let ref_id = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+            let subject = bin(&mut ctx, b"abc");
+            // Compile the *list* form too, so both the `bm` and the `ac` slot's
+            // argument materialization is covered by the invalidation below.
+            let ab = bin(&mut ctx, b"ab");
+            let cd = bin(&mut ctx, b"cd");
+            let list = ctx.list(&[ab, cd]).expect("the list fits");
+            let ac = compile_pattern_1(&mut ctx, &[list]).expect("a valid pattern");
+            assert_eq!(compiled_tag(&ctx, ac), "ac");
+            let compiled = compile_pattern_1(&mut ctx, &[subject]).expect("a valid pattern");
+            access::ref_thing_id(access::tuple_element(compiled, 1)).expect("a registry id")
+        };
+        for word in heap.used_words_mut() {
+            *word = Eterm::nil();
+        }
+        assert_eq!(match_through_rebuilt_handle(&atoms, ref_id), "{1,3}");
+    }
     #[test]
     fn forged_and_mistagged_compiled_patterns_are_badarg() {
         with_ctx(|ctx| {
