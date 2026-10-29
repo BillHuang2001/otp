@@ -16,7 +16,7 @@ entry says so explicitly — those are not cross-runtime ratios.
 
 ## 0. Which record is current (read this before quoting a number)
 
-Six records exist and they are **not interchangeable**. They measure overlapping rows under
+Seven records exist and they are **not interchangeable**. They measure overlapping rows under
 very different host load, which is why the same workload can appear at several ratios.
 
 | record | where | when | 1-min load | authoritative for |
@@ -24,14 +24,15 @@ very different host load, which is why the same workload can appear at several r
 | **m19** | `tools/bench/results/m19-*` | 2026-10-23/24 | 0.54–4.53 | **the most recent full-suite record, and the one behind `RESULTS.md` §2/§3 and the external-target rows**: twelve matched single-side passes over the nine `Runtimes::Both` workloads, the `--full` `baseline` pair, the memory rows, and the three-rep external stage over five targets plus the `emqx` skip |
 | **m21** | `tools/bench/results/m21-*` | 2026-10-27 | 5.65–19.57 (eunit stage 9.59–14.62) | the GC/allocator workstream's **before**-record over `baseline,gc_bound,gc_class,list_walk,slice` (`m21-xrun-gc-*`), read through `m21-xrun-ratios.txt`, plus the two eunit rows (`jsone`, `bbmustache` — `RESULTS.md` §9) |
 | **m22** | `tools/bench/results/m22-*` | 2026-10-27 | mid-load, same band as m21 | **the newest session**: that workstream's **after**-record over the same five workloads, read through `m22-vs-m21.txt` / `m22-xrun-ratios.txt` |
+| **m23** | `tools/bench/results/m23-*`, read through `RESULTS.md` §`m23` | 2026-10-28/29 | 0.68 → 500 (per pass; the boot A/B that is quoted is at **46–54**, the per-tier instruction table at 130–137) | **the startup round**: the phase-scoped execution tier, the shared per-image label maps and the three loader/MD5 cost passes. Authoritative for **start-up wall/CPU/peak-RSS against the oracle** (boot and `slice`), the **per-tier boot instruction/cycle/task-clock** split, the steady-state `list_walk` instructions-per-element slope, and the workload peak-RSS rows of that round. **Not** authoritative for any cross-runtime throughput ratio (its `ns_per_*` rows are load-flagged) |
 | **Q** (quiet) | `crates/beam_engine/MEASURED.md` §*Cross-runtime record and the binary A/B* | 2026-10-20 | **1.02–2.37** | the quietest per-row ratios for `list_walk`, `etf_roundtrip`, `ets_copy`, `send_recv`, `send_recv_plain`, `churn`, all four `foreign/*`; and the code-change A/B |
 | **m17** | `tools/bench/RESULTS.md` (session `m17`, 2026-10-18) | 2026-10-18 | 3 → 92 | start-up p50/p99, `slice`, the memory rows, `binary_append`'s last **full-record** figure, the external targets |
 | **fresh** | measured by hand while writing this file (§1.3), **no `out/` copy archived** | now | 161 → 181 | only what it says: one `binary_append` single round on a heavily loaded host — a hand measurement, not a record |
 
 **m19 is the most recent full-suite record and supersedes m17 for the rows it measures** (it is later);
 **`m21`/`m22` are later still but narrower**, covering only the GC workstream's row set, so they
-supersede m19 there and nowhere else; **Q stays authoritative for the quietest per-row ratios and the
-code-change A/B**.
+supersede m19 there and nowhere else; **m23 is the latest and covers start-up and memory only**;
+**Q stays authoritative for the quietest per-row ratios and the code-change A/B**.
 Concrete examples of the difference, all
 `rust`/`sys`:
 
@@ -142,7 +143,7 @@ owner's stated priority). "Gap" is the Q ratio unless the column says otherwise.
 | **B3** | `foreign/*` (4 real third-party modules) | **9.42× 12.65× 15.79× 19.00×** | per-instruction tax of a non-inlined opcode family + byte-at-a-time `BitWriter::push_bit` + match engine (`beam_engine`) | architectural **in shape**, small per cut | yes — 3 named levers; the big one already landed |
 | **B4** | `list_walk` | **7.72×** (A/B 0.853× — improved) | baseline-tier per-element return/dispatch: driver round-trip, `jit_call_store` re-decode, `local_call_seam` per call | **architectural** | yes — 3 named levers, 1 is a contract decision |
 | **B5** | `binary_append` | **≈18.1×** (single loaded round, §1.3); 40.02× in m17; A/B **0.449×** | the append itself is now linear — the residual is per-instruction cost on the baseline tier | **architectural work landed** | re-publish the ratio; the rest is B4 |
-| **B6** | start-up: `baseline` p50/p99, `slice` | **2.51× / 2.56× / 2.63×** (m17) | boot-script drive + preloaded set + per-`.beam` load (`beam_rt`) | architectural **but fidelity-bound** | one lever left: the memory row |
+| **B6** | start-up: boot p50/p99, `slice` | **0.91× / 0.84×** and **0.82× / 0.75× peak RSS** (m23 — *faster* than the oracle) | **closed by the boot phase + the load-path passes**; the residual is the load path's own user CPU | **landed** | yes — the remaining levers are named in §B6 |
 | **B7** | compiler throughput: root descent at every heap admission | **no cross-runtime ratio** (in-crate: 3.62 % → **44.50 %** of samples) | whole-graph unscanned-root walk (`beam_rt::context::gc_walk`) | **architectural** | yes — bound/incrementalise |
 | **B8** | `ets_copy` retained memory | rust peak RSS **90.30** vs sys **66.26 MiB**, linear in `N` | nursery grows and is never shrunk (`beam_rt` + `beam_gc`) | **architectural**, cross-crate | needs a new seam |
 
@@ -431,40 +432,96 @@ call-store immediates) — do not look for another append-specific fix.
 
 ---
 
-### B6 — start-up is 2.5× the oracle, and that is mostly fidelity
+### B6 — start-up is now *faster* than the oracle on wall, CPU **and** peak RSS (m23)
 
-**Workloads and both sides** (m17 — Q does not cover start-up).
-`baseline` start-up **p50 127.3 ms → 323.6 ms = 2.51×**, **p99 137.5 → 335.2 = 2.56×**;
-`slice` (one call per process, nine cases) **134.1–137.9 ms → 316.2–368.8 ms = 2.45–2.68×
-(median 2.63×)**; the like-for-like `slice` peak RSS is **68.0 → 120.0 MB = 1.76×** (§5 says why the
-loop workloads' RSS is not a memory comparison). Compute-loop p50 193.5 → 348.3 ms (1.84×) is
-native-floor dominated, not interpreter throughput.
+**Workloads and both sides** (m23, one `bench`/`wait4` harness, `taskset -c 3`, interleaved randomized
+order, paired per-round medians; `sys` = `erl` OTP 29.1.2 / erts-17.1.1; the pre-round build is
+`2d0fe67808`; the boot A/B ran at 1-min load 46–54 and the `slice` A/B at 46–49):
 
-**Mechanism.** Every action except `-version` drives the real boot script — 22 directives, for both
-runtimes (`crates/beam_rt/src/boot/drive.rs`, `bootscript.rs`) — and the whole process is **≈0.34 s
-wall / 0.33 s CPU**, CPU-bound, **0 `clock_nanosleep`**, 927 filesystem stats (2 on `os.beam`), **98
-`.beam` opens**. The oracle boots too, so most of this cost is *supposed* to be there; the gap is
-per-directive and per-load overhead.
+| row | rust (HEAD) | oracle | pre-round rust | rust/oracle | pre-round/rust |
+|---|---|---|---|---|---|
+| boot (`-noshell -eval 'halt().'`) wall p50 | **122.8 ms** | 133.7 ms | 156.6 ms | **0.910×** | 1.260× |
+| boot CPU p50 (`ru_utime+ru_stime`) | **116.1 ms** | 128.1 ms | 147.2 ms | **0.903×** | 1.262× |
+| boot peak RSS p50 | **48.51 MiB** | 59.37 MiB | 58.97 MiB | **0.817×** | 1.216× |
+| `slice` (`run slice.beam slice:fib/1 25`) wall p50 | **123.6 ms** | 148.9 ms | 152.2 ms | **0.837×** | 1.240× |
+| `slice` CPU p50 | **119.7 ms** | 143.3 ms | 148.3 ms | **0.831×** | 1.240× |
+| `slice` peak RSS p50 | **48.57 MiB** | 64.52 MiB | 59.00 MiB | **0.753×** | 1.214× |
 
-**Structural counter / landed.** The port-poll gate was the big measured win: the boot's *idle*
-`inet_gethost` port used to cost a 20 000-round ping-pong **1 063 blocking waits / 26.9 s**; made
-progress-aware it is **6 waits ≈ 137 ms**, `strace` shows **0 `clock_nanosleep`** over 200 000 round
-trips, and boot `epoll_wait` total fell **130.8 → 4.1 ms** over the same 15 calls.
-Same-binary pair (poll gate off → on): p50 **421.7 → 298.6 ms (0.708×)** and `slice` summed
-3 880.2 → 2 625.2 ms ⇒ the oracle multiple moved **3.741× → 2.649×** (slice 3.088× → 2.089×).
-m17's A/B also puts HEAD at **1.047×** the m15-era build's p50 (m16 said 1.17×).
+Workload peak RSS follows the boot: `slice` 0.845×, `list_walk` 0.844×, `copy_bound` 0.852×,
+`baseline`-compute 0.895× of the pre-round build, at **identical deterministic counters**
+(`list_walk` 50 000 000 elements; `etf_roundtrip` 500 k, `ets_copy` 250 k, `send_recv` 90 k,
+`send_recv_plain` 300 k ops). Steady state per walked element is **347.9 → 349.9 instructions
+(+0.57 %)** — and the binary carrying only the first loader pass already reads 350.0, so the round's
+later passes moved it **0.03 %**: parity.
+**No window below 1-min load 29 existed during the record**; every wall figure above is the 46–54
+band and the CPU/cycle columns are the load-robust record.
+
+**Instructions are not time** (5 interleaved `perf` rounds, load 130–137, `-e cpu_core/instructions/u`
+plus `cycles` and `task-clock`):
+
+| program | retired user instr | cycles | task-clock p50 | CPU p50 | peak RSS p50 |
+|---|---|---|---|---|---|
+| default (HEAD, phase rule) | 1 073.6 M | 342.6 M | 117.5 ms | 119.1 ms | 48.53 MiB |
+| `BEAM_RT_TIER=baseline` (JIT at boot) | 840.4 M | 385.2 M | 128.7 ms | 129.1 ms | 55.58 MiB |
+| `BEAM_RT_TIER=interpreter` | 1 073.7 M | 345.1 M | 117.5 ms | 117.6 ms | 48.48 MiB |
+| pre-round `2d0fe67808` | 1 083.7 M | 452.9 M | 148.3 ms | 149.8 ms | 58.84 MiB |
+| system oracle | 787.9 M | 344.6 M | 126.6 ms | 122.7 ms | 59.45 MiB |
+
+The default boot retires **1.36× the oracle's instructions** and still spends **0.99× its cycles**:
+the baseline tier's compile work is `mmap`/`mprotect`/first-touch-fault and i-cache bound, so it is
+kernel-side and stall-bound — expensive in task-clock, nearly free in retired instructions. That is
+why a change can *raise* instructions and *lower* time, and why no instruction count in this file may
+be read as a latency proxy.
+
+**Mechanism (what closed it).** Every action except `-version` drives the real 22-directive boot script
+(`crates/beam_rt/src/boot/drive.rs`, `bootscript.rs`), loading **99 distinct `.beam` files, 5.80 MiB**
+(not the 51-eager set — the rest is `init`'s own demand loads), so start-up is fidelity-bound *and*
+load-bound. Four changes, in measured order:
+1. **Phase-scoped execution tier** — `JitMode::Auto` selects `Tier::Interpreter` for a first entry
+   while `Runtime::in_boot_phase()` (`crates/beam_rt/src/runtime.rs`), `Tier::BaselineJit` after, with a
+   one-way upgrade at a boot-entered process's first post-boot slice boundary
+   (`crates/beam_rt/src/runner/run.rs`). `BEAM_RT_TIER` stays authoritative and phase-independent, and
+   `baseline` is the exact A/B control. **−13 % CPU, −10 % cycles, −13 % peak RSS, −15 % wall** vs the
+   same binary pinned to `baseline`.
+2. **Shared per-image label maps** — one `OnceLock<Arc<LabelMap>>` on the image
+   (`crates/beam_loader/src/labels.rs`, `Module::label_map`), replacing a per-`Machine` 32-entry LRU;
+   8 machines on one image now build **1** map instead of 8, and `Module::clone` derives its own.
+3. **Load-path passes** (`beam_loader`) — inline decoded operands (97.5 % of instructions have ≤3, so
+   they allocate nothing), a fused validate-while-grouping walk, `DefinedLabelSet` O(1) label checks,
+   the inlined decoder hot path, four dead `Module` fields dropped; **1.300 → 1.186 → 1.120 G** boot
+   instructions (with the tier held constant: 1.088 → 0.957 G).
+4. **MD5 compression unrolled** (`crates/beam_common/src/md5.rs`, a small additive cross-crate change) —
+   the canonical 4×16 constant-index form, 2 086 → 718 instructions per 64 B block; **−42.3 M
+   instructions (−3.77 % of boot)**, digests proven byte-identical over 284 real `.beam` files, the
+   RFC 1321 vectors, every pad boundary 0..=130 and the streaming path ⇒ **1.079 G**.
+A boot's retired instructions therefore read **1.088 G (pre-round) → 1.300 G (interpreting the boot
+instead of compiling it) → 1.186 → 1.120 → 1.079 G**; the tier composition alone explains the rise.
 
 **Tried and rejected.** Eager whole-module JIT compilation at first call — the measured cause of
 **11–12× one-shot regressions** (`string_str_length` 11.27×/12.34×); replaced by lazy per-function
-compilation, now ≈**1.2–1.25×** over the interpreter (31.86 ms default vs 25.51 ms interpreter).
-A static per-module switch-safety predicate that pinned modules to the interpreter for life —
-rejected. The m9 hypothesis that lazy compilation caused a `slice` rise — **a load confound, not
-real**. The interpreter tier as a performance option — measured worse on every case.
+compilation. A static per-module switch-safety predicate that pinned modules to the interpreter for
+life — rejected, and the phase rule's one-way *upgrade* is the sound version of it. The m9 hypothesis
+that lazy compilation caused a `slice` rise — **a load confound, not real**. The interpreter tier as a
+*steady-state* performance option — measured worse on every case (2 543 vs 350 instructions per walked
+element), which is exactly why the phase is one-way and the upgrade happens at the first post-boot
+slice boundary. Also rejected as levers, with measurements: shrinking the two 128 MiB capacity regions
+(`bif_heaps`, `eval_heap`) — they commit **36 kB RSS** between them because `beam_alloc::Heap` is a lazy
+anonymous mapping whose constructor writes only a block header; `bif_heaps` has no grow path, so a
+smaller default would turn "one BIF builds a large term" into a typed `system_limit`, and the win would
+be address space (495 → 239 MiB `VmSize`), which is neither RSS nor latency; and deferring the
+`{primLoad,…}` batch — the eager set is contract-required (`erlang:pre_loaded/0` must answer the 22
+exactly, the `prim_*`/`erts_*` names cannot be demand-loaded, `code:all_loaded/0` observes all 99) and
+≈52 % of the load cost is already on-demand, so trimming saves ≈0.
 
-**Next step.** No large lever is left that is not fidelity work: the residual is the preloaded set
-plus per-`.beam` load/relocation, and the only genuinely attackable row is the like-for-like memory
-figure (`slice` 1.76×) → **B8**. Re-run the tier control before quoting any tier figure: m17 ran every
-rust pass at the default tier and has **no** `BEAM_RT_TIER=interpreter` comparison.
+**Next step.** The residual is the load path's own user CPU, ranked in
+`crates/beam_rt/STARTUP_COST.md`'s current profile: engine dispatch 38.6 %, `beam_loader` 18.3 %,
+allocator churn 6.9 %, `IndexShards::get` 2.1 %, MD5 1.8 %. Named and not taken: `decode_stream`'s
+per-arity fast path (2–4 % of boot), `lower_instr` taking its `RawInstr` by value (`<Operand as
+Clone>::clone`, ~0.9 %), and a **loaded-but-not-lowered** state for the **29 of the 99 loaded modules
+that never execute** in a bare boot (≈5.8 MiB of IR, ~15 % of peak RSS, but it changes what
+`code:all_loaded/0`/`is_loaded/1` observe, so it is a `beam_loader` API decision, not a tweak).
+The load-path pass also corrected the retained-IR census in §*Startup footprint*: the retained IR is
+**≈20 MiB over 99 modules** (not 10.5 MiB over 51), and 71 % of it belongs to modules that do run.
 
 ---
 
@@ -567,6 +624,24 @@ Consolidated so a future round does not spend a day re-measuring a dead end.
   `format!` was 14.2 % of `list_walk` samples; fixed, `list_walk` 20.90 → **14.65 ns/instruction
   (1.43×)**, `encode` 1.24×. Never quote a pre-fix figure as engine cost.
 
+**Startup / boot** (m23; the mechanism that *did* work is §B6 — do not re-propose these)
+
+* **The two 128 MiB capacity regions are not a footprint lever.** `bif_heaps` (`1 << 24` words) and
+  `eval_heap` commit **24 kB + 12 kB = 36 kB RSS** between them: `beam_alloc::Heap` is one lazy
+  anonymous `mmap` whose constructor writes a block header and zeroes only the alignment padding
+  (`crates/beam_alloc/src/mseg/mapping.rs:82`, `allocator/core.rs`), and `bif_peak_used_words` is **512**
+  in a bare boot. A smaller default would not shrink RSS and would turn one large BIF term into a typed
+  `system_limit` (`bif_heaps` has no grow path) — the only thing it buys is address space
+  (`VmSize` 495 → 239 MiB). The 64 MiB main-thread stack (112 kB resident) and the 18.4 MiB JIT code
+  reservation (1.96 MiB resident) are the same class.
+* **Trimming the eager module set.** The 22 preloaded modules are 741 KiB and `erlang:pre_loaded/0`
+  must answer them exactly; the `prim_*`/`erts_*` names cannot be demand-loaded; `code:all_loaded/0`
+  observes all 99 loaded modules. ≈52 % of the boot's load cost is already on-demand.
+* **Reading boot instruction counts as latency.** See §B6's per-tier table: the default boot retires
+  1.36× the oracle's instructions while spending 0.99× its cycles.
+* A static per-module switch-safety predicate that pins modules to the interpreter for life — the
+  phase rule's one-way *upgrade* at the first post-boot slice boundary is the sound version.
+
 **GC**
 
 * **MMTk and Boehm — rejected outright**; GenImmix stays a measurement-gated option.
@@ -643,6 +718,10 @@ Consolidated so a future round does not spend a day re-measuring a dead end.
 * **The bench row set is not the whole product.** Q measures seven workloads; compiler throughput
   (B7) and the external targets have no cross-runtime ratio at all, and `binary_append` has no Q row
   (B5).
+* **`AllocatorConfig::zeroed_carriers` is a trap, not a knob.** The field defaults `true`
+  (`crates/beam_alloc/src/allocator/config.rs:40`) and has an accessor (`:84`), but **no allocation
+  path reads it** — wiring it into the large-carrier path would write all 128 MiB of the two capacity
+  regions and destroy the measured 36 kB-RSS property behind §5's startup entry.
 
 ---
 
