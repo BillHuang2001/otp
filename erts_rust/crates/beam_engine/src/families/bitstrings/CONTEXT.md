@@ -30,6 +30,7 @@ The only subject refused is a match context or bare off-heap binary reference wi
 ### A field's flags arrive in TWO shapes — both must resolve `native`
 - The standalone `bs_get_integer2`/`bs_get_float2`/`bs_get_utf*`/`bs_skip_utf*` opcodes carry a **raw `u32` flags operand** (`beam_loader`'s `lower/instr.rs` decodes it with `as_u32`; `beam_asm:flag_to_bit/1` encodes `little` as `16#02` and `native` as `16#10`), so `BSF_NATIVE` is a **live** flag, not a flag-table placeholder.
 - The `bs_match`-command / `bs_create_bin` segment route carries a **literal flag-atom list**, normalized by `mod.rs::flag_bit` (which maps the `native` atom to the target order, C's `$NativeEndian`).
+- Both directions honour it: the matching readers resolve it in `field_is_little`, and the construction collectors take the resolved flag (`create/segments.rs::put_utf16`/`put_utf32`), so `<<V/utf32-little>>` writes the code unit little-endian (C's `BSC_UTF32` → `erts_bs_put_integer_le`, `emu/bs_instrs.tab:690-712`).
 `matching/reads.rs::field_is_little(flags)` is the **single** place that resolves both `BSF_LITTLE` and `BSF_NATIVE` (little on a little-endian target, big otherwise), and every field reader (`read_integer_field_tracked`, `read_wide_integer_field`, `read_float_field`, `decode_utf16`, `decode_utf32`) goes through it.
 Testing `BSF_LITTLE` alone silently reads a `-native` field big-endian — a wrong value, which is the defect the rule prevents.
 
@@ -139,7 +140,7 @@ Every expected byte vector was taken from the system `erl` — never invented.
 Gate: the whole-crate suite is authoritative — `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --no-fail-fast` must stay green, the build `... -p beam_engine --all-targets` warning-free, and this family's subset is `... -p beam_engine --lib families::bitstrings`; re-run them for the live counts.
 The integration-suite enumeration is `../../../TEST_NOTES.md`.
 **Differential evidence:** `erts_rust/tools/differential` was run per-case over the whole `binary/` group plus every bitstring/binary-shaped corpus id (80 cases: all `binary/*`, `bits/*`, `semantics/bit*`, `wire/bit_binary*`, `wire_extra/eval_wide_binary*`, the four `gc/*binary*` cases and `errors/*binary*`) — **80 agree / 0 mismatch / 0 unsupported / 0 skipped**.
-**Corpus coverage hole (tools-owned):** no corpus case exercises a **bit-granular little-endian** integer write, a `float` segment, a `float-native` pattern or a `utf32-little` pattern (the `binary/bignum_*` LE cases are all byte-aligned 16/64-bit fields), so those shapes are covered only by this node's oracle-derived unit tests.
+**Corpus coverage hole (tools-owned):** no corpus case exercises a **bit-granular little-endian** integer write, a `float` segment, a `float-native` pattern or a `utf32-little` construction segment / matching pattern (the `binary/bignum_*` LE cases are all byte-aligned 16/64-bit fields), so those shapes are covered only by this node's oracle-derived unit tests and its two `run_tests.rs` UTF matrices.
 
 ## Routing Table
 Every entry below names something that exists, and both child directories have an entry.
@@ -191,7 +192,7 @@ Each remaining site is a guard for a **malformed `.beam`** or an internal invari
 - `system_limit` is modelled (`size*unit` overflow / the post-multiply sign bit / a positive-bignum size; a negative bignum size is `badarg`).
 
 ### Coverage hole (tools-owned)
-No `tools/differential` case exercises a bit-granular little-endian integer write, a `float` segment, a `float-native` pattern or a `utf32-little` pattern — see Test Strategy; the owner is `tools/differential`, not this crate.
+No `tools/differential` case exercises a bit-granular little-endian integer write, a `float` segment, a `float-native` pattern or a `utf32-little` construction segment / matching pattern — see Test Strategy; the owner is `tools/differential`, not this crate.
 
 ### Out-of-node findings (do not fix here)
 - **`crates/beam_loader` — the `bs_match` command-list generator expansion.** C never interprets a flattened command list at run time: `emu/ops.tab:1102` + `emu/generators.tab:1096-1112` make the loader explode `bs_match` at load time into `i_bs_ensure_bits`/`i_bs_ensure_bits_unit`/`i_bs_read_bits`/`i_bs_eq`/`i_bs_extract_integer`/`i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_get_tail`/`i_bs_skip`/`i_bs_drop`, including fused shapes.

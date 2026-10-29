@@ -119,8 +119,8 @@ pub(crate) enum PreparedSeg {
         value: Operand,
         width: Width,
     },
-    /// `utf8`/`utf16`/`utf32` — the `Size`/`Unit` operands are unused; only `utf16`
-    /// consults the endianness flag.
+    /// `utf8`/`utf16`/`utf32` — the `Size`/`Unit` operands are unused; `utf16` and
+    /// `utf32` consult the endianness flag.
     Utf {
         kind: UtfKind,
         little: bool,
@@ -581,7 +581,7 @@ pub(super) fn assemble_prepared(
                 let encoded = match (kind, small_value(value)) {
                     (UtfKind::Utf8, Some(v)) => put_utf8(v),
                     (UtfKind::Utf16, Some(v)) => put_utf16(v, *little),
-                    (UtfKind::Utf32, Some(v)) => put_utf32(v),
+                    (UtfKind::Utf32, Some(v)) => put_utf32(v, *little),
                     // A non-small value (a bignum) can never be a scalar.
                     _ => None,
                 };

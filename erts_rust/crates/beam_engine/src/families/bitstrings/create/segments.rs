@@ -173,9 +173,9 @@ pub(super) fn float_segment(
 
 /// `utf8`/`utf16`/`utf32` — write a codepoint's variable-width encoding.
 ///
-/// The `Size`/`Unit` operands are not used, only the endianness flag (`utf16`); a
-/// value that is not a small integer, or one outside the scalar range (or a surrogate),
-/// is the bare `badarg`.
+/// The `Size`/`Unit` operands are not used, only the endianness flag (`utf16` and
+/// `utf32`); a value that is not a small integer, or one outside the scalar range (or a
+/// surrogate), is the bare `badarg`.
 #[inline(never)]
 pub(super) fn utf_segment(
     machine: &mut Machine,
@@ -192,7 +192,7 @@ pub(super) fn utf_segment(
     let encoded = match (kind, small_value(value)) {
         ("utf8", Some(v)) => put_utf8(v),
         ("utf16", Some(v)) => put_utf16(v, flags & BSF_LITTLE != 0),
-        ("utf32", Some(v)) => put_utf32(v),
+        ("utf32", Some(v)) => put_utf32(v, flags & BSF_LITTLE != 0),
         // A non-small value (a bignum) can never be a scalar.
         _ => None,
     };
@@ -420,10 +420,15 @@ pub(super) fn put_utf16(value: i64, little: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `erts_bs_put_utf32`: encode a scalar as 32-bit big-endian. `None` for a value
-/// > U+10FFFF or a surrogate.
+/// `erts_bs_put_utf32`: encode a scalar as one 32-bit code unit, big- or
+/// little-endian. `None` for a value > U+10FFFF or a surrogate.
+///
+/// The C honours the field's endianness here exactly as it does for `utf16`:
+/// `case BSC_UTF32:` loads `Flags` and calls `erts_bs_put_integer_le` or
+/// `erts_bs_put_integer_be(..., 32)` (`emu/bs_instrs.tab:690-712`), so a
+/// `<<V/utf32-little>>` is the code point's little-endian bytes.
 #[inline(never)]
-pub(super) fn put_utf32(value: i64) -> Option<Vec<u8>> {
+pub(super) fn put_utf32(value: i64, little: bool) -> Option<Vec<u8>> {
     if value < 0 || value > 0x10FFFF {
         return None;
     }
@@ -431,5 +436,9 @@ pub(super) fn put_utf32(value: i64) -> Option<Vec<u8>> {
     if (0xD800..=0xDFFF).contains(&v) {
         return None;
     }
-    Some(v.to_be_bytes().to_vec())
+    Some(if little {
+        v.to_le_bytes().to_vec()
+    } else {
+        v.to_be_bytes().to_vec()
+    })
 }
