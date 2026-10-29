@@ -60,9 +60,9 @@
 //! (`beam_engine::Machine::resolve_call_ext_apply` handles arity 3 only), not to this crate; the
 //! test pins today's behaviour so the day that gap closes is visible.
 //!
-//! [`APPLIED_RECEIVE`] pins the `receive` inside an applied fun: the `-eval` route, which pumps,
-//! really waits (`timeout`, like the oracle), while the scheduled route — a nested machine that
-//! may not suspend the process — is the honest `unsupported` gap.
+//! [`APPLIED_RECEIVE`] pins the `receive` inside an applied fun: on **both** routes the nested
+//! machine enters in-machine and really parks, so `recv_after/0` waits out its `after 200` and
+//! answers `timeout`, exactly like the oracle.
 use std::path::Path;
 mod support;
 /// The banner every loud skip names.
@@ -422,31 +422,25 @@ fn an_uncaught_apply_two_failure_names_the_oracles_reason_atom() {
         }
     }
 }
-/// **A `receive` inside the applied fun: fine where the route can pump, the typed gap where it
-/// cannot.**
+/// **A `receive` inside the applied fun parks on both routes.**
 ///
-/// `apply/2` folds the closure into a **nested** machine, so whether the process may suspend
-/// inside it is a property of the calling route, and the two routes differ honestly:
+/// `apply/2` enters the closure **in-machine** on every route, so a `receive` that has to wait
+/// suspends the process for real instead of folding into a `blocked` verdict:
 ///
 /// * the `-eval` route pumps (`RECEIVE_PUMP_SLICES` + one port round + the timer heap), so
-///   `recv_after/0` really waits out its `after 200` and answers `timeout` — exactly the
-///   oracle's value, and `send_recv/0` answers `{got,hello}` because the message is already in
-///   the process's mailbox;
-/// * the **scheduled** route (`beam_rt run`) must not run an inner scheduler, so a `receive` that
-///   has to park inside the nested machine is the documented `unsupported` gap: exit 3 with one
-///   `beam_rt: unsupported: …` line (a future in-machine `apply/2` entry — the engine's
-///   `resolve_call_ext_apply` accepting arity 2 — would turn this row into `timeout`).
-///
-/// `send_recv/0` on the scheduled route is the control that separates the two: a message that is
-/// already there never parks, so it answers `{got,hello}` on **both** routes.
+///   `recv_after/0` waits out its `after 200` and answers `timeout` — the oracle's value;
+/// * the **scheduled** route (`beam_rt run`) answers the same `timeout` on both tiers: the
+///   nested machine parks the scheduled process and a later pass resumes it;
+/// * `send_recv/0` is the control that shows the parking is not unconditional — a message
+///   already in the mailbox is answered `{got,hello}` on both routes.
 #[test]
-fn a_receive_inside_the_applied_fun_is_answered_where_the_route_can_pump() {
+fn a_receive_inside_the_applied_fun_parks_on_both_routes() {
     let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two_recv", "ap2", FIXTURE_SRC)
     else {
         return;
     };
     for (tier, label) in TIERS {
-        // The pumping route reproduces the oracle, waiting included.
+        // Every route reproduces the oracle, waiting included.
         let oracle = support::fixture_oracle_answer(BANNER, fixture.dir(), "ap2:recv_after()")
             .unwrap_or_else(|| panic!("the oracle could not answer ap2:recv_after/0"));
         assert_eq!(oracle, "timeout", "ap2:recv_after/0 under the oracle");
@@ -473,19 +467,25 @@ fn a_receive_inside_the_applied_fun_is_answered_where_the_route_can_pump() {
             "{got,hello}",
             "{label}: ap2:send_recv/0 on the scheduled route must answer the oracle's value"
         );
-        // A receive that must park inside the nested machine is the typed capability gap.
+        // A receive that must wait inside the nested machine parks the scheduled process and
+        // takes its timeout, like the oracle.
         let parked = run_scheduled(&fixture, "recv_after", tier);
         assert_eq!(
-            parked.code, 3,
-            "{label}: ap2:recv_after/0 cannot suspend the process inside a nested machine, so it \
-             must be the typed gap; stdout={:?} stderr={:?}",
+            parked.code, 0,
+            "{label}: ap2:recv_after/0 must park the scheduled process and answer, not fail; \
+             stdout={:?} stderr={:?}",
             parked.stdout.trim(),
             parked.stderr.trim()
         );
         assert_eq!(
-            parked.stderr.trim(),
-            "beam_rt: unsupported: opcode: run: process blocked (no message available)",
-            "{label}: ap2:recv_after/0's scheduled-route gap"
+            parked.stdout.trim(),
+            oracle,
+            "{label}: ap2:recv_after/0 on the scheduled route must answer the oracle's value"
+        );
+        assert!(
+            !parked.stderr.contains("unsupported"),
+            "{label}: ap2:recv_after/0 must not be a capability gap; stderr={:?}",
+            parked.stderr.trim()
         );
     }
 }
