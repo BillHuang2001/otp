@@ -456,6 +456,13 @@ later passes moved it **0.03 %**: parity.
 **No window below 1-min load 29 existed during the record**; every wall figure above is the 46–54
 band and the CPU/cycle columns are the load-robust record.
 
+**Tail of the same 21-round boot A/B** (p99 of 21 samples is the near-max sample, so read it as "the worst run"):
+wall **180.3 ms** rust vs **148.0 ms** oracle = **1.22×** — one 190 ms sample taken under host
+preemption while the oracle's worst was 148.1; **CPU p99 121.5 vs 131.2 = 0.926×** and **peak RSS p99
+48.63 vs 59.52 MiB = 0.817×**. The tail is therefore a load artifact in wall only; the CPU and RSS
+tails are on the same side as their medians. Do not quote the wall p99 as a steady property without
+that caveat, and re-measure it in a quiet window before publishing an SLO.
+
 **Instructions are not time** (5 interleaved `perf` rounds, load 130–137, `-e cpu_core/instructions/u`
 plus `cycles` and `task-clock`):
 
