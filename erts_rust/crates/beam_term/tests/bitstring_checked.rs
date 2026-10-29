@@ -27,8 +27,8 @@
 //!
 //! # Why the sweep never manufactures a pointer outside its own buffer
 //!
-//! The check covers **shape**, not **provenance** (`beam_term/src/bitstring.rs`, module
-//! docs): a block that has been freed or moved is indistinguishable from a live one. So a
+//! The check covers **shape**, not **provenance** (`beam_term/src/bitstring/checked.rs`,
+//! module docs): a block that has been freed or moved is indistinguishable from a live one. So a
 //! sweep that fed the readers *raw* randomly-generated words would, on the day the shape
 //! check is correct, still dereference an arbitrary address the moment a random word
 //! happens to look like a boxed term — that is an unavoidable consequence of the honest
