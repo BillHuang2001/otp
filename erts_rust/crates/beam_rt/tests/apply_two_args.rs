@@ -36,29 +36,35 @@
 //! takes: `Args = id([...])` hides the value from the compiler, so the call really goes through
 //! `erlang:apply/2`.
 //!
-//! # The three failure classes, in the C's order
+//! # The four failure classes, in the C's order
 //!
 //! `apply_fun` (`beam_common.c:1734`) decodes the argument list **first**, so a bad list is
 //! reported before a non-fun is:
 //!
-//! 1. a non-list or improper `Args` ⇒ `error:badarg` with the BIF stacktrace head
-//!    `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}`;
-//! 2. more than `MAX_REG - 1` arguments (`decode_arglist`) ⇒ `error:system_limit`, same head;
-//! 3. a non-fun `Fun` ⇒ `EXC_BADFUN` (`badfun`).
+//! 1. a non-list or improper `Args` ⇒ `error:badarg`;
+//! 2. more than `MAX_REG - 1` arguments (`decode_arglist`) ⇒ `error:system_limit`;
+//! 3. a non-fun `Fun` ⇒ `EXC_BADFUN`, which C's `expand_error_value` wraps into
+//!    `{badfun, Fun}` (`beam_common.c:750-772`);
+//! 4. a fun applied at the wrong arity ⇒ `{badarity, {Fun, Args}}`, the same expansion.
 //!
-//! The fixture reports all three through one `caught/2` helper so the answers are values (atoms,
-//! booleans, small integers, short tuples) and never a `#Fun<…>` render.
+//! The fixture reports every class through one `caught/2` helper so the answers are values
+//! (atoms, booleans, small integers, short tuples) and never a `#Fun<…>` render.
 //!
 //! # What is pinned, and what is a documented residual
 //!
-//! [`PROBES`] must agree **exactly** with the oracle on the default tier and on
-//! `BEAM_RT_TIER=interpreter`. [`RESIDUALS`] pins the four shapes that do **not** yet: a
-//! non-fun / wrong-arity application reports the right class but differs in the trace head (this
-//! runtime arms the `erlang,apply` BIF item, the oracle keeps the **caller** frame) and in the
-//! reason (C's `expand_error_value` wraps `{badfun, Fun}` / `{badarity, {Fun, Args}}`, this
-//! runtime raises the bare atom). Both belong to the engine's `call_ext` raise path
-//! (`beam_engine::Machine::resolve_call_ext_apply` handles arity 3 only), not to this crate; the
-//! test pins today's behaviour so the day that gap closes is visible.
+//! `beam_engine` decodes the arity-2 `call_ext` shape in-machine (C's `i_apply_fun*`,
+//! `emu/ops.tab:872-874`), so all four classes agree with the oracle: the reason **wrappers**
+//! (`{badfun, Fun}`, `{badarity, {Fun, Args}}`) and, for classes 3 and 4, the **caller's** own
+//! stacktrace head (C's `non_bif_stacktrace` — the raise comes out of the inner `call_fun`).
+//! [`PROBES`] is that equality set and must hold on the default tier and on
+//! `BEAM_RT_TIER=interpreter`.
+//!
+//! [`RESIDUALS`] pins the one shape that still differs: classes 1 and 2 report the oracle's class
+//! and reason but a different **stacktrace head**. The oracle arms the BIF item
+//! `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}` there, while this
+//! engine raises `badarg`/`system_limit` through its non-BIF path and keeps the caller frame. The
+//! arming site is `beam_engine`'s raise path, not this crate's; the test pins today's behaviour so
+//! the day it closes is a visible, deliberate change to that table.
 //!
 //! [`APPLIED_RECEIVE`] pins the `receive` inside an applied fun: on **both** routes the nested
 //! machine enters in-machine and really parks, so `recv_after/0` waits out its `after 200` and
@@ -82,8 +88,9 @@ const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
 ///   key (`fun erlang:self/0`) and a local `fun ap2:id/1`;
 /// * `cd/0` … `ch/0`, `ctoo/0`, `cok/0`, `carity/0` — the same shapes through `caught/2`, which
 ///   turns each class into a value and reports the stacktrace head as
-///   `{frame, Module, Function, ArityMark, Location}` where `ArityMark` is
-///   `[Fun =:= Fun, Args =:= Args]` for the BIF's own `[Fun, Args]` argument vector;
+///   `{frame, Module, Function, ArityMark, Location}`, where `ArityMark` is
+///   `[Fun =:= Fun, Args =:= Args]` when the head is a BIF item (its `A` slot is then the BIF's
+///   own `[Fun, Args]` argument vector) and `not_a_list` for a caller frame;
 /// * `ce_shape/0`, `carity_shape/0` — the **reason's** shape (does C's `expand_error_value` wrap
 ///   it?);
 /// * `d/0`, `e/0`, `f/0`, `g/0`, `h/0`, `toomany/0` — the uncaught forms, where the runtime's own
@@ -169,7 +176,7 @@ send_recv() ->
 /// The strings are the oracle's own `~1000p` rendering (`ap2:<probe>()` under OTP 29.1.2 /
 /// `erts-17.1.1`) and are re-measured against it on every run, so a drift in the oracle is a
 /// failure here rather than a silently stale golden.
-const PROBES: [(&str, &str); 15] = [
+const PROBES: [(&str, &str); 14] = [
     // The success path: one argument, zero arguments, a free variable, two arguments.
     ("a", "2"),
     ("c", "{[]}"),
@@ -181,43 +188,59 @@ const PROBES: [(&str, &str); 15] = [
     ("ext", "[3,2,1]"),
     ("ext0", "true"),
     ("local_mfa", "9"),
-    // A non-list / improper argument list is `badarg`, head = the BIF's own `[Fun, Args]`.
-    ("cd", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    ("cf", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    ("cg", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    ("ch", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
-    // Past `MAX_REG` arguments (`decode_arglist`) is `system_limit`, same head.
-    (
-        "ctoo",
-        "{error,system_limit,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
-    ),
+    // A non-fun target (`EXC_BADFUN`) and a fun applied at the wrong arity
+    // (`EXC_BADARITY`) come out of the inner `call_fun`, so their stacktrace head is the
+    // **caller's** frame — `{ap2, caught, not_a_list, {other, 2}}`: C's `non_bif_stacktrace`,
+    // where the arity slot is not a list (the raise names no argument vector).
+    ("ce", "{error,badfun,{frame,ap2,caught,not_a_list,{other,2}}}"),
+    ("carity", "{error,badarity,{frame,ap2,caught,not_a_list,{other,2}}}"),
+    // …and C's `expand_error_value` wraps the reason: `{badfun, Fun}` / `{badarity, {Fun, Args}}`.
+    ("ce_shape", "{error,{badfun,true}}"),
+    ("carity_shape", "{error,{badarity,true,true}}"),
     // The control: a served key that really applies.
     ("cok", "{value,42}"),
     // A `receive` whose message is already in the mailbox never parks, so a nested machine
     // answers it on the scheduled route too.
     ("send_recv", "{got,hello}"),
 ];
-/// The four shapes this runtime does **not** yet reproduce, pinned as they are measured.
+/// The shapes this runtime does **not** yet reproduce, pinned as they are measured.
 ///
-/// Each entry is `(probe, oracle, this runtime)`. Every one of them is the same engine gap — the
-/// `erlang:apply/2` raise does not carry the C's stacktrace head (`non_bif_stacktrace` keeps the
-/// **caller** frame) nor `expand_error_value`'s reason wrapper. Closing it is a change in
-/// `beam_engine` (`Machine::resolve_call_ext_apply` handles only `import_arity == 3`), so the
-/// expectations below are what this crate can honestly claim today; when the engine lands the
-/// gap these rows become equalities and this table is what says so.
-const RESIDUALS: [(&str, &str, &str); 4] = [
+/// Each entry is `(probe, oracle, this runtime)`, and every one of them is the **same** engine
+/// gap: `apply_fun`'s own argument-list decode (`badarg` for a non-list/improper list,
+/// `system_limit` past the register-file bound) reports the oracle's class and reason but a
+/// different stacktrace head. The oracle arms the BIF item
+/// `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}`
+/// (`erts_engine_error` — the `[true,true]` arity mark says the item's `A` slot really is the
+/// BIF's own `[Fun, Args]` argument vector); this runtime raises those two classes through the
+/// non-BIF path, which keeps the **caller** frame. Arming the BIF item is `beam_engine`'s, so
+/// the expectations below are what this crate can honestly claim today; when the engine lands it
+/// these rows become equalities and this table is what says so.
+const RESIDUALS: [(&str, &str, &str); 5] = [
     (
-        "ce",
-        "{error,badfun,{frame,ap2,caught,not_a_list,{other,2}}}",
-        "{error,badfun,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "cd",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
     ),
     (
-        "carity",
-        "{error,badarity,{frame,ap2,caught,not_a_list,{other,2}}}",
-        "{error,badarity,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "cf",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
     ),
-    ("ce_shape", "{error,{badfun,true}}", "{error,badfun}"),
-    ("carity_shape", "{error,{badarity,true,true}}", "{error,badarity}"),
+    (
+        "cg",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
+    ),
+    (
+        "ch",
+        "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,badarg,{frame,ap2,caught,not_a_list,{other,2}}}",
+    ),
+    (
+        "ctoo",
+        "{error,system_limit,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+        "{error,system_limit,{frame,ap2,caught,not_a_list,{other,2}}}",
+    ),
 ];
 /// The uncaught probes and the reason atom each must name in the runtime's own diagnostic (the
 /// oracle's equivalent observable is a `catch` value — these are the same classes, uncaught).
@@ -327,24 +350,26 @@ fn apply_of_two_arguments_answers_the_oracle_on_both_tiers() {
         }
     }
 }
-/// **The two remaining classes keep their oracle class, with the residual difference pinned.**
+/// **The `apply_fun` argument-decode classes keep the oracle's class, with the head residual
+/// pinned.**
 ///
-/// `ce` (a non-fun), `carity` (the wrong arity), and their reason-shape twins must report the same
-/// `error`/`badfun`/`badarity` classification as the oracle. What differs today is *where* the
-/// report comes from:
+/// `cd` (a pid where the argument list belongs), `cf` (an improper list), `cg` (a bare atom),
+/// `ch` (a module atom) and `ctoo` (past the register-file bound) must report the same
+/// `error`/`badarg`/`system_limit` classification as the oracle — and they do. What differs today
+/// is *where* the report comes from: the oracle arms the BIF item
+/// `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}`, this runtime
+/// raises through the non-BIF path and keeps the caller's frame
+/// (`{ap2, caught, not_a_list, {other, 2}}`).
 ///
-/// * the trace head — this runtime arms the BIF item
-///   `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}` for **every**
-///   failing `apply/2`, where the oracle keeps the caller's frame (C's `non_bif_stacktrace`: only
-///   `badarg`/`system_limit` come from `apply_fun` itself, a `badfun`/`badarity` comes out of the
-///   inner `call_fun`);
-/// * the reason — C's `expand_error_value` turns `EXC_BADFUN`/`EXC_BADARITY` into
-///   `{badfun, Fun}` / `{badarity, {Fun, Args}}`, where this runtime raises the bare atom.
+/// The two classes that used to sit in this table are gone: `ce` (a non-fun) and `carity` (the
+/// wrong arity) now reproduce the oracle **exactly**, reason wrapper
+/// (`{badfun, Fun}` / `{badarity, {Fun, Args}}`) and caller frame included, and they are pinned as
+/// equalities in [`PROBES`].
 ///
-/// Both are the engine's `call_ext` raise path, not this crate's; pinning them here keeps the
-/// claim honest and makes the day they are fixed a visible, deliberate change to this table.
+/// The remaining difference is the engine's raise path, not this crate's; pinning it here keeps
+/// the claim honest and makes the day it is fixed a visible, deliberate change to this table.
 #[test]
-fn the_badfun_and_badarity_classes_keep_their_oracle_class_with_a_pinned_residual() {
+fn the_argument_decode_classes_pin_their_one_head_item_residual() {
     let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two_res", "ap2", FIXTURE_SRC)
     else {
         return;
