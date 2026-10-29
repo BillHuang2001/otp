@@ -94,6 +94,14 @@
 //!   key must already exist; a missing key jumps to `fail` (or raises
 //!   `{badkey, Key}` when `fail` is [`NO_FAIL`], the ground-truth reason above).
 //!
+//! An update that **changes nothing** — every pair replaces an existing key with the
+//! identical value *word* (`Eterm` word equality, never `=:=`) — writes the **source
+//! map term itself** to `dst`, so `erts_debug:same(M#{a => 1}, M)` is `true` when `M`
+//! already holds `a => 1`: the C's `changed_values`/`changed_keys` fast path
+//! (`beam_common.c:2094-2142`) and the HAMT route's `*sz = 0` same-value answer
+//! (`erl_map.c:2493,2523-2526`). A new key, or any value whose word differs, still builds
+//! a fresh map. Detail and the one declining shape: [`write`]'s module docs.
+//!
 //! `live` (the count of live X registers the C collector treats as GC roots across
 //! the update) is **unused at M1**: `MinimalContext` has no moving collector, so the
 //! update cannot relocate terms. It stays in the IR for the Stage-4 collector.
