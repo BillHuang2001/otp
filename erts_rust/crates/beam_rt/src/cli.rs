@@ -27,8 +27,8 @@
 //! | `-version`, `--version` | print the version banner and exit 0 |
 //! | `-noshell` | run head-less (Milestone-1 has no interactive shell) |
 //! | `-eval Expr` | evaluate a general Erlang **expression** and print **nothing** |
-//! | `-s Mod Func [Args…]` | apply `Mod:Func(Args…)` with **atom** arguments; the result is **discarded** (real `erl` semantics) |
-//! | `-run Mod Func [Args…]` | apply `Mod:Func(Args…)` with **string** (char list) arguments; the result is **discarded** |
+//! | `-s Mod Func [Args…]` | apply `Mod:Func([Atoms…])` — **one** argument, the list of the tokens as **atoms** (`Mod:Func()` with no token); the result is **discarded** (real `erl` semantics) |
+//! | `-run Mod Func [Args…]` | apply `Mod:Func([Strings…])` — **one** argument, the list of the tokens as **strings** (char lists; `Mod:Func()` with no token); the result is **discarded** |
 //! | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` directories) |
 //! | `-pz Dir` | add `Dir` to the code path (searched after) |
 //! | `+S N[:N]` | normal scheduler count (the first number) |
@@ -153,6 +153,7 @@ use crate::runtime::Runtime;
 
 mod env;
 pub(crate) mod flags;
+mod start;
 mod vars;
 pub use env::{
     merge_argv, merge_argv_with_plain, otp_flags_var, split_plain, tokenize, Env, MapEnv, ProcessEnv,
@@ -167,8 +168,10 @@ Switches:
   -version, --version       print the version banner and exit
   -noshell                  run head-less (the only Milestone-1 mode)
   -eval EXPR                evaluate an Erlang expression (prints nothing)
-  -s MOD FUNC [ARG...]      apply MOD:FUNC(ARG, ...) with atom arguments (result discarded)
-  -run MOD FUNC [ARG...]    apply MOD:FUNC(ARG, ...) with string arguments (result discarded)
+  -s MOD FUNC [ARG...]      start: apply MOD:FUNC([ARG...]) with atom arguments, or
+                            MOD:FUNC() with none (result discarded)
+  -run MOD FUNC [ARG...]    start: apply MOD:FUNC([ARG...]) with string arguments, or
+                            MOD:FUNC() with none (result discarded)
   -pa DIR [DIR...]          add DIR(s) to the head of the code path (before the system
                             directories; a missing dir is filtered out)
   -pz DIR [DIR...]          add DIR(s) to the tail of the code path (after the system
@@ -594,9 +597,14 @@ impl Builder {
     }
 
     /// Parses `-s Mod Func [Args…]` / `-run Mod Func [Args…]`, returning the index of
-    /// the next switch. `-s` collects **atom** arguments, `-run` **string** arguments —
-    /// exactly as real `erl` treats them; the difference only shows when the terms are
-    /// materialized by the driver.
+    /// the next switch. The collected tokens stop at the next switch-looking token (the
+    /// `init` rule, `get_args/2`: `check/2` classifies a `-`-leading token — `-s`,
+    /// `-run`, `-eval`, `-extra`, `--` and any other flag — as the end of the group), and
+    /// they are only ever the **tokens**: what they become is decided when the
+    /// instruction runs. ERTS applies **arity 1** whose one argument is the list of the
+    /// tokens (atoms for `-s`, strings for `-run`), and **arity 0** when no token
+    /// follows — see [`start::instruction_args`] for the ground truth and the measured
+    /// oracle table.
     fn parse_apply(&mut self, args: &[String], index: usize, switch: &str) -> Result<usize> {
         let module = args
             .get(index + 1)
@@ -1875,10 +1883,10 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
         } => {
             let mut runtime = build_runtime(config)?;
             let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
-                let mut terms = Vec::with_capacity(args.len());
-                for name in &args {
-                    terms.push(runtime.intern(name));
-                }
+                // ERTS's `{apply, M, F, [Atoms]}`: **one** argument — the list of the
+                // collected tokens as atoms — or none at all
+                // (`start::instruction_args`, `init.erl:607-624`).
+                let terms = runtime.materialize_args(&start::instruction_args(&args, true))?;
                 apply(runtime, &module, &function, &terms)
             })
             // A structured raise reason is rendered with its real term, exactly as the `run`
@@ -1895,8 +1903,9 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
         } => {
             let mut runtime = build_runtime(config)?;
             let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
-                let parsed: Vec<ArgTerm> = args.into_iter().map(ArgTerm::Str).collect();
-                let terms = runtime.materialize_args(&parsed)?;
+                // `{apply, M, F, [Strings]}` — the same single list argument, its elements
+                // the tokens as char lists (`init.erl`'s `bs2ss/1` converter).
+                let terms = runtime.materialize_args(&start::instruction_args(&args, false))?;
                 apply(runtime, &module, &function, &terms)
             })
             // As `Action::Apply`: the reason is rendered with its real, stabilized term.
@@ -2211,6 +2220,10 @@ pub(crate) fn resolve_boot_file_for(runtime: &Runtime, value: &str) -> Result<Pa
 /// The `-s Mod Func [Args…]` / `-run Mod Func [Args…]` action: the result is
 /// **discarded** (real `erl` semantics), so a failure is still reported but a value is
 /// not printed.
+///
+/// `args` is the Start instruction's **argument vector**, already in ERTS's shape: empty
+/// (arity 0) or the one list term [`start::instruction_args`] builds (arity 1). The
+/// arity is therefore `args.len()`, never the number of tokens on the command line.
 fn apply(runtime: &mut Runtime, module: &str, function: &str, args: &[Eterm]) -> Result<()> {
     let _result = runtime.run_named(module, function, args.len() as u32, args)?;
     Ok(())
@@ -2725,8 +2738,11 @@ mod tests {
         assert!(parse_args(&["-name"]).is_err());
     }
 
+    /// `-s`/`-run` collect their **tokens** (stopping at the next switch-looking one); the
+    /// one-list-argument shape ERTS applies is [`start::instruction_args`]'s, decided when
+    /// the action runs, so the parse's job is exactly this verbatim token list.
     #[test]
-    fn apply_switch_collects_atom_arguments_until_the_next_switch() {
+    fn apply_switch_collects_argument_tokens_until_the_next_switch() {
         let config = parsed(&["-s", "init", "stop", "a", "b", "+S", "2"]);
         assert_eq!(
             config.action,
@@ -2751,6 +2767,29 @@ mod tests {
         );
         assert!(parse_args(&["-s", "init"]).is_err(), "-s needs a function");
         assert!(parse_args(&["-s"]).is_err());
+    }
+
+    /// The `-s`/`-run` **argument shape** ERTS applies (`init`'s
+    /// `run_args_to_start_instructions/2`): arity 0 with no token, else arity 1 whose one
+    /// argument is the list of the tokens — atoms for `-s`, strings for `-run`.
+    #[test]
+    fn a_start_instruction_applies_one_list_argument_or_none() {
+        assert!(start::instruction_args(&[], true).is_empty());
+        assert!(start::instruction_args(&[], false).is_empty());
+        assert_eq!(
+            start::instruction_args(&["1".to_string(), "2".to_string()], true),
+            vec![ArgTerm::List(vec![
+                ArgTerm::Atom("1".to_string()),
+                ArgTerm::Atom("2".to_string()),
+            ])]
+        );
+        assert_eq!(
+            start::instruction_args(&["a".to_string(), "b".to_string()], false),
+            vec![ArgTerm::List(vec![
+                ArgTerm::Str("a".to_string()),
+                ArgTerm::Str("b".to_string()),
+            ])]
+        );
     }
 
     #[test]
