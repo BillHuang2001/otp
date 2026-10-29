@@ -60,6 +60,8 @@ the cross-module and public-surface behaviour.
 - `atom_witness.rs`, `atom_fork.rs`, `intern_alloc.rs` → `AtomTable` witness, fork and interning allocation pins
 - `map_alloc.rs`, `map_build_equivalence.rs`, `map_words_capacity.rs`, `map_hash.rs` → the map builder, its
   capacity reservation and its stored key order
+- `map_cow_equivalence.rs` → the incremental (path-copying) writers: rebuild-vs-COW equivalence, the
+  canonical node rendering, the copier's structural/sharing walk and the flat-in-n word scaling
 - `oracle.rs`, `number_oracle.rs`, `compare_oracle.rs`, `compare_external.rs`, `map_hash.rs` → the live-`erl`
   oracle cross-checks
 - `compare_terms.rs`, `compare_class_order.rs` → the term-order surface
