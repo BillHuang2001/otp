@@ -19,8 +19,10 @@ difference is the binary (`erl` vs `beam_rt`).
 ## API Surface (CLI)
 - `suites list [--json]` — resolved runtimes (with a live self-check), target sources, defaults.
 - `suites run [--target khepri|stdlib|all] [--suite <names>] [--module <names>]
-  [--runtime sys|rust|all] [--timeout <secs>] [--jobs <n>] [--out <dir>] [--out-file <path>]
-  [--json] [--verbose] [--rebuild] [--khepri-src <dir>] [--stdlib-src <dir>]`
+  [--runtime sys|rust|all] [--timeout <secs>] [--suite-budget <secs>] [--jobs <n>] [--out <dir>]
+  [--out-file <path>] [--json] [--verbose] [--rebuild] [--khepri-src <dir>] [--stdlib-src <dir>]`
+  — `--timeout` is the per-module/per-case budget, `--suite-budget` the whole-suite one (stdlib);
+  there is no single-case selector, narrow with `--suite`/`--module`.
 - `suites help`
 - Exit codes: `0` the sweep completed (per-row failures are **data**, not harness errors);
   `1` the harness failed (I/O, a target that could not be staged/compiled); `2` usage or
@@ -36,8 +38,14 @@ difference is the binary (`erl` vs `beam_rt`).
   statuses**, never a 0/0 pass.
 - **ct** rows: one row per `Suite:Case`. `data/ct_runner.erl` expands `Suite:all()` through
   `groups/0`, runs every case in its own `spawn_monitor` with a timeout, and prints
-  `CASE <name> OK|SKIP|EXC|TIMEOUT|MISSING`. Absent `init_per_group`/`end_per_group`/
-  `init_per_testcase` hooks are deliberate: a case needing them fails identically on both sides.
+  `CASE <name> OK|SKIP|EXC|TIMEOUT|MISSING` (every protocol line is `\n`-prefixed, so a case that
+  prints without a trailing newline cannot glue onto the next line). Absent
+  `init_per_group`/`end_per_group`/`init_per_testcase` hooks are deliberate: a case needing them
+  fails identically on both sides. When the suite budget expires the runner stops launching and
+  prints `SUITE_DEADLINE <not-run>`, and the unlaunched cases are reported *not measured*, never as
+  per-case timeouts or failures. Suites are compiled together with the helpers they import
+  (`error_info_lib`, `dict_test_lib`, `binref`, `random_iolist`, `random_unicode_list`,
+  `sets_test_lib`); a helper that fails to compile is not fatal.
 - **Verdicts**: `agree` · `agree-fail-identical` (both sides fail the same way: excluded from
   both numerators and reported as such) · `divergence` (the parity miss) · `rust-gap` (the Rust
   side could not run it: typed `unsupported`, timeout, unparsed output) · `oracle-only-fail` ·
@@ -79,13 +87,20 @@ difference is the binary (`erl` vs `beam_rt`).
   OTP 30.0-rc0 / erts-17.1) — **never** the in-tree `erts/` C build.
 
 ## Status
-- Harness complete: 22 unit tests green, zero build warnings; both targets run end to end.
-- Measured numbers, the excluded-case rationale and the root-cause classes live in
-  `RESULTS.md` (artifacts under `results/`); do not duplicate counts here.
+- Harness complete: 28 unit tests green, zero build warnings; both targets run end to end against a
+  real oracle and a real `beam_rt`.
+- Measured numbers, the excluded-case rationale and the root-cause classes live in `RESULTS.md`
+  (artifacts under `results/`); do not duplicate counts here. The per-row analysis — smallest failing
+  expression per class, both sides' observations, owning crate — lives in
+  `results/{khepri,stdlib}-notes.md` next to the artifacts.
+- The sweeps surface **real runtime defects**, and one of them is not a typed gap: the rust side of
+  `binary_module_SUITE` dies mid-suite (`beam_rt: system_limit`). Recording that is this crate's job;
+  fixing any of it belongs to the owning crate, not here.
 
 ## Routing Table
 - `data/` → the committed Erlang runner `ct_runner.erl` (embedded with `include_str!`).
-- `results/` → committed sweep artifacts (`report.json` + `summary.md` per target) — raw evidence
+- `results/` → committed sweep artifacts (`report.json` + `summary.md` per target), the per-row
+  analysis (`khepri-notes.md`, `stdlib-notes.md`) and the diagnostics behind them — raw evidence
   behind `RESULTS.md`.
 - `src/` → the driver: `cli`/`run` (dispatch), `runtime`/`proc`/`target` (resolution, timed
   subprocesses, staging, `par_map`, the identical-invocation helper), `eunit` (summary parser),

@@ -112,10 +112,14 @@ re-running the module).
 | | rows with real eunit tests | modules fully green | tests passed | tests failed |
 |---|---|---|---|---|
 | oracle (`erl`, erts-17.1.1) | 43 | **42** | **1500** | **1** (`stored_procs:crashing_sproc_stacktrace_test`) |
-| rust (`beam_rt`, erts-17.1) | 13 | **12** | **285** | **8** (`app` 5, `keep_while_conditions` 1, `projections` 1, `display_tree` 1) |
+| rust (`beam_rt`, erts-17.1) | 19 | **15** | **285** | **8** (`app` 5, `keep_while_conditions` 1, `projections` 1, `display_tree` 1) |
 
 51 candidate modules = 43 with real eunit tests + 8 with none (`no_tests` on **both** sides).
-The 12 modules fully green on rust are a strict subset of the 42 fully green on the oracle —
+On rust only **19** of the 43 owned a fixture that got far enough to run a test *at all* (12 `agree` +
+`db_info`, `protect_against_dups_option`, `simple_tx_misc` fully green, and `app`/`display_tree`/
+`keep_while_conditions`/`projections` partly), and the remaining **24** cancelled in setup — so of the
+oracle's 1 501 tests, **1 208 never ran on the rust side and are `unknown`, not failing**.
+The 15 modules fully green on rust are a strict subset of the 42 fully green on the oracle —
 nothing passes on the rust side that fails on the oracle.
 
 ## Root causes (each with its first failing test and smallest failing expression)
