@@ -54,6 +54,10 @@
 //!   `lists:reverse(a)` (a `function_clause` in an Erlang-**source** function, whose
 //!   `Location` carries **no** `error_info` at all) — and answers
 //!   `{[Legacy =:= Try, …], [projected item, …]}`.
+//! * **A failing BIF's `{error_info, Map}` extension is measured, never assumed.**
+//!   `errors/ets_bad_table_cause` pins the whole extension of the innermost `ets:lookup/2`
+//!   item, where the oracle renders the **two-pair** `#{cause => id, module =>
+//!   erl_stdlib_errors}` form.
 //!
 //! # Why each expression spawns a closure
 //!
@@ -75,23 +79,29 @@
 //! oracle's own stdout lines, measured with the corpus probe wrapper on `erl` 29.1.2 /
 //! erts-17.1.1.
 //!
-//! # The measured location residual, and the `errors/` id
+//! # The measured location residual, and the two `errors/` ids
 //!
-//! The family added below keeps the plain `errors/` prefix of the `errors` group: it pins that
-//! group's own subject (the stacktrace-side image of a raise), not a new one, and the id names
-//! the family rather than the file.
+//! The two families added below keep the plain `errors/` prefix of the `errors` group: they pin
+//! its own subject (the stacktrace-side image of a raise), not a new one, and the id names the
+//! family rather than the file.
 //!
 //! A BIF item cooked in compiled code carries **no** `{file,_}`/`{line,_}` position, while an
 //! item cooked by an Erlang-**source** function does (`maps:with/2` at `maps.erl:1303`,
 //! `lists:reverse/1` at `lists.erl:292`). This runtime omits the position on **every** item it
-//! cooks (`divergences.md` §A.1), so the family projects `Location` as its non-position entry
+//! cooks (`divergences.md` §A.1), so both families project `Location` as its non-position entry
 //! names — `[element(1,P) || P <- Loc, is_tuple(P), element(1,P) =/= file, element(1,P) =/=
 //! line]` — with an `{error_info, Map}` entry rendered as `{error_info,
 //! lists:sort(maps:to_list(M))}`, so the extension's **pairs** (never a multi-key map's print
 //! order) are what is pinned. That projection is scope-limited to the parts both sides agree
 //! on, and `errors/legacy_catch_bif_head_item` reproduces the oracle's line exactly on **both**
-//! routes. One measured row is deliberately **excluded**: `maps:get(k, #{})`, whose item this
-//! runtime names `{erlang,map_get,…}` where the oracle names the `maps:get/2` alias.
+//! routes. Two measured rows are deliberately **excluded**: `maps:get(k, #{})`, whose item this
+//! runtime names `{erlang,map_get,…}` where the oracle names the `maps:get/2` alias, and the
+//! `cause` pair of a BIF extension — which is `errors/ets_bad_table_cause`'s own subject, and
+//! the one subject the tree cannot yet reproduce: no host implements
+//! `ExecutionContext::bif_error_cause` (the sole source of a `cause`), so our side answers the
+//! one-key `#{module => erl_stdlib_errors}` where the oracle answers `#{cause => id, module =>
+//! erl_stdlib_errors}` (the divergence `divergences.md` §A.1 records, owned by
+//! `crates/beam_bifs`). Its golden is the oracle's line, unweakened.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -200,6 +210,22 @@ pub(super) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "errors/ets_bad_table_cause",
+            description: "a failing ets:lookup/2 item carries the two-pair {error_info,#{cause => id,module => erl_stdlib_errors}} extension",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "(fun() -> Self = self(), spawn(fun() -> {Cls, Rsn, St} = try ets:lookup(unknown_atom_xyz, k) catch Cls0:Rsn0:St0 -> {Cls0, Rsn0, St0} end, I = hd(St), Self ! {Cls, Rsn, element(1,I), element(2,I), element(3,I), [case P of {error_info, M} -> {error_info, lists:sort(maps:to_list(M))}; Q -> element(1, Q) end || P <- element(4,I), is_tuple(P), element(1,P) =/= file, element(1,P) =/= line]} end), receive X -> X after 10000 -> timeout end end)()",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{cause,id},{module,erl_stdlib_errors}]}]}",
+                ),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -209,7 +235,7 @@ mod tests {
 
     /// The exact ids this group emits, in order — the size pin, and the spelling of every
     /// id, live here so a case cannot be added, retitled or dropped without this table.
-    const IDS: [&str; 7] = [
+    const IDS: [&str; 8] = [
         "errors_extra/error_3_option_matrix",
         "errors_extra/error_2_fills_the_caller_frame_with_the_argument_list",
         "errors_extra/error_3_appends_the_error_info_extension",
@@ -217,6 +243,7 @@ mod tests {
         "errors_extra/supplied_trace_unknown_module_frame_is_echoed_verbatim",
         "errors_extra/proc_lib_re_raise_keeps_the_crash_trace",
         "errors/legacy_catch_bif_head_item",
+        "errors/ets_bad_table_cause",
     ];
 
     /// The two id prefixes this file may emit: the `errors_extra/` group it is named for, and the
@@ -372,5 +399,34 @@ mod tests {
             "the golden must assert the two routes agree on every row: {:?}",
             case.golden.stdout
         );
+    }
+
+    /// `errors/ets_bad_table_cause` exists to pin the **two-pair** extension. A rewrite that
+    /// trimmed the golden to the one-key form would have retired the case's subject, so the
+    /// `cause` pair itself is pinned here.
+    #[test]
+    fn the_ets_cause_case_pins_the_two_pair_extension() {
+        let cases = group();
+        let case = cases
+            .iter()
+            .find(|case| case.id == "errors/ets_bad_table_cause")
+            .expect("the ets cause case is present");
+        assert_eq!(
+            case.golden.stdout,
+            Some(
+                "ok {error,badarg,ets,lookup,[unknown_atom_xyz,k],[{error_info,[{cause,id},{module,erl_stdlib_errors}]}]}"
+            ),
+            "the golden is the oracle's two-pair extension for the failing ets:lookup/2 item"
+        );
+        let CaseKind::Eval { expr, .. } = case.kind else {
+            panic!("the ets cause case must be an Eval case");
+        };
+        for shape in [
+            "try ets:lookup(unknown_atom_xyz, k)",
+            "catch Cls0:Rsn0:St0 ->",
+            "lists:sort(maps:to_list(M))",
+        ] {
+            assert!(expr.contains(shape), "the ets cause case lost `{shape}`");
+        }
     }
 }
