@@ -35,6 +35,23 @@
 //! `#Fun<…>` rendering), plus the `system_limit` arity ceiling (1022 accepted into the arity
 //! check, 1023 refused).
 //!
+//! # Why the raise shapes assert from compiled bytecode
+//!
+//! `badfun`, `badarity` and the `system_limit` ceiling are raised by the **engine's** `apply/2`
+//! path, so each of those three cases raises inside a `spawn(fun() -> … end)` closure — the
+//! `errors_extra` pattern: the closure catches the raise, sends a projection back to `self()`,
+//! and the probe reads it under a bounded `receive … after 10000 -> timeout end`. A spawned
+//! `-eval` closure is the runtime's in-process **compile** route (it becomes real bytecode that
+//! runs on an engine machine), while the `-eval` route's own tree walker is a separate evaluator
+//! with no arity ceiling that answers a bare `badarg`/`badarity` instead of the engine's
+//! `{badfun, Term}`/`{badarity, {Fun, Args}}` pair — the divergence `divergences.md` §A.1
+//! records. A raise caught directly in `-eval` therefore cannot pin these shapes; the compiled
+//! route reproduces the oracle byte for byte.
+//!
+//! The two-atom `(module, function)` form is the exception: its `badarg` *is* the `-eval`
+//! walker's own reachable shape (the compiler would rewrite the same source to `apply/3`, which
+//! answers a pid), and both runtimes raise it, so that case keeps the direct route.
+//!
 //! The **code-store removal** surface (`erlang:delete_module/1`, `code:purge/1`,
 //! `code:soft_purge/1` and `erts_internal:purge_module/2`) is pinned only where the two runtimes
 //! agree — see the block comment above those cases for what is deliberately left unpinned (the
@@ -1536,14 +1553,17 @@ pub(crate) fn group() -> Vec<Case> {
         // `apply/2`'s **dynamic** call site: the argument list is computed, so the shape cannot
         // be the compiler's static `apply/3` rewrite. Each golden is the oracle's own line.
         //
-        // The raise reasons are pinned by **shape**, never by rendering: a `#Fun<…>` image is not
-        // stable across runtimes (module/fun indices differ), so `badfun`'s payload is observed
-        // only through `is_function/1` and `badarity`'s pair as `{badarity, is_function(F), Args}`
+        // The raise reasons are raised in **compiled bytecode** — inside a spawned closure, whose
+        // projection is sent back to `self()` and read under a bounded `receive` — because the
+        // engine (not the `-eval` tree walker) is what implements them (see the module doc).
+        // They are pinned by **shape**, never by rendering: a `#Fun<…>` image is not stable
+        // across runtimes (module/fun indices differ), so `badfun`'s payload is observed only
+        // through `is_function/1` and `badarity`'s pair as `{badarity, is_function(F), Args}`
         // (`element(2, Reason)` is the `{Fun, Args}` pair, so the fun is its `element(1, …)`).
         // `apply(erlang, self)` is the two-atom module+function form: the *compiler* rewrites it
         // to `apply(erlang, self, [])` (whose answer is the caller's pid), but the `apply/2` BIF
         // the `-eval` path reaches takes a fun only, so it raises `badarg` — measured on the
-        // oracle, not assumed.
+        // oracle, not assumed — and both sides agree on that direct (unspawned) route.
         //
         // The arity ceiling is a hard boundary: a 1022-element argument list reaches the arity
         // check (`badarity`), a 1023-element one is refused with `system_limit` before any call.
@@ -1564,13 +1584,17 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "bifs/apply_2_of_a_non_fun_is_badfun",
-            description: "erlang:apply/2 on a non-fun raises error:{badfun, NotAFun}, pinned as {element(1, Reason), is_function(element(2, Reason))}",
+            description: "erlang:apply/2 on a non-fun, raised in compiled bytecode, is error:{badfun, NotAFun}, pinned as {element(1, Reason), is_function(element(2, Reason))}",
             contracts: &[Contract::OtpApps],
             kind: CaseKind::Eval {
                 // `element(2, Reason)` really is the offending term, so this also proves the
                 // reason is a `badfun` pair and not a bare atom.
-                expr: "try apply(not_a_fun, [1]) \
-                       catch error:Reason -> {element(1, Reason), is_function(element(2, Reason))} end",
+                expr: "(fun() -> Self = self(), \
+                       spawn(fun() -> P = try apply(not_a_fun, [1]) \
+                                      catch error:Reason -> {element(1, Reason), \
+                                                             is_function(element(2, Reason))} end, \
+                              Self ! P end), \
+                       receive X -> X after 10000 -> timeout end end)()",
                 extra_argv: &[],
                 probe: Probe::Value,
             },
@@ -1581,14 +1605,19 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "bifs/apply_2_of_a_wrong_arity_is_badarity",
-            description: "erlang:apply/2 whose computed argument list has the wrong length raises error:{badarity, {Fun, Args}}, pinned as {badarity, is_function(Fun), Args}",
+            description: "erlang:apply/2 whose computed argument list has the wrong length, raised in compiled bytecode, is error:{badarity, {Fun, Args}}, pinned as {badarity, is_function(Fun), Args}",
             contracts: &[Contract::OtpApps],
             kind: CaseKind::Eval {
                 // The second element of the reason is the `{Fun, Args}` pair: its `element(1, …)`
                 // is a fun, its `element(2, …)` the argument list the call was given.
-                expr: "try apply(fun lists:reverse/1, [1,2]) catch error:Reason -> \
-                       {element(1, Reason), is_function(element(1, element(2, Reason))), \
-                        element(2, element(2, Reason))} end",
+                expr: "(fun() -> Self = self(), \
+                       spawn(fun() -> P = try apply(fun lists:reverse/1, [1,2]) \
+                                      catch error:Reason -> \
+                                          {element(1, Reason), \
+                                           is_function(element(1, element(2, Reason))), \
+                                           element(2, element(2, Reason))} end, \
+                              Self ! P end), \
+                       receive X -> X after 10000 -> timeout end end)()",
                 extra_argv: &[],
                 probe: Probe::Value,
             },
@@ -1616,19 +1645,21 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "bifs/apply_2_argument_ceiling_is_system_limit",
-            description: "erlang:apply/2's arity ceiling: a 1022-element argument list reaches the arity check (badarity) and a 1023-element one is refused with system_limit",
+            description: "erlang:apply/2's arity ceiling, raised in compiled bytecode: a 1022-element argument list reaches the arity check (badarity) and a 1023-element one is refused with system_limit",
             contracts: &[Contract::OtpApps],
             kind: CaseKind::Eval {
                 // The list is built by a comprehension-shaped `fun` (one `lists:seq/2` per arm),
                 // so both probes cost ~1k terms. Distinct catch variable names per `try`: the
                 // oracle's `erl_eval` refuses to reuse one across two catch clauses.
-                expr: "begin Mk = fun(N) -> lists:seq(1, N) end, \
-                       Below = try apply(fun lists:reverse/1, Mk(1022)) \
-                               catch error:Rsn1 -> {element(1, Rsn1), \
-                                                    length(element(2, element(2, Rsn1)))} end, \
-                       Above = try apply(fun lists:reverse/1, Mk(1023)) \
-                               catch Cls2:Rsn2 -> {Cls2, Rsn2} end, \
-                       {Below, Above} end",
+                expr: "(fun() -> Self = self(), \
+                       spawn(fun() -> Mk = fun(N) -> lists:seq(1, N) end, \
+                              Below = try apply(fun lists:reverse/1, Mk(1022)) \
+                                      catch error:Rsn1 -> {element(1, Rsn1), \
+                                                           length(element(2, element(2, Rsn1)))} end, \
+                              Above = try apply(fun lists:reverse/1, Mk(1023)) \
+                                      catch Cls2:Rsn2 -> {Cls2, Rsn2} end, \
+                              Self ! {Below, Above} end), \
+                       receive X -> X after 10000 -> timeout end end)()",
                 extra_argv: &[],
                 probe: Probe::Value,
             },
@@ -2714,6 +2745,72 @@ mod tests {
         for shape in ["Mk(1022)", "Mk(1023)"] {
             assert!(ceiling.contains(shape), "missing `{shape}`: {ceiling}");
         }
+    }
+
+    /// The three `apply/2` **raise** shapes assert from **compiled bytecode**, and the two-atom
+    /// `badarg` deliberately does not.
+    ///
+    /// The `-eval` route's tree walker is a separate evaluator: it has no arity ceiling and
+    /// answers a bare `badarg`/`badarity` where the engine raises `{badfun, Term}` /
+    /// `{badarity, {Fun, Args}}` / `system_limit` — the documented divergence
+    /// (`divergences.md` §A.1), so a raise caught directly in `-eval` cannot pin those shapes.
+    /// `spawn(fun() -> … end)` is the runtime's in-process **compile** route: the closure becomes
+    /// real bytecode and runs on an engine machine, so the engine's `erlang:apply/2` path
+    /// (`families::funs`) is what raises. Each of the three cases therefore raises inside such a
+    /// closure, has it send the projection back to `self()`, and reads it under a bounded
+    /// `receive` (the `errors_extra` pattern) — never an unbounded wait, so a lost message is an
+    /// observation (`timeout`), not a hang.
+    ///
+    /// The two-atom `(module, function)` form is the exception, and its expression must stay on
+    /// the direct route: the *compiler* rewrites that source into `apply/3` (whose answer is a
+    /// pid), so the `badarg` this case pins is only reachable through the `-eval` walker.
+    #[test]
+    fn the_apply_2_raise_shapes_assert_from_compiled_code() {
+        let cases: Vec<_> = group()
+            .into_iter()
+            .filter(|c| c.id.starts_with("bifs/apply_2_"))
+            .collect();
+        let expr = |id: &str| {
+            cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .expr()
+                .expect("eval case")
+        };
+        for id in [
+            "bifs/apply_2_of_a_non_fun_is_badfun",
+            "bifs/apply_2_of_a_wrong_arity_is_badarity",
+            "bifs/apply_2_argument_ceiling_is_system_limit",
+        ] {
+            let e = expr(id);
+            let spawned = e
+                .find("spawn(fun() ->")
+                .unwrap_or_else(|| panic!("case {id}: no spawned closure: {e}"));
+            assert!(
+                e[spawned..].contains("apply("),
+                "case {id}: the raise must happen inside the spawned closure: {e}"
+            );
+            assert!(
+                !e[..spawned].contains("apply("),
+                "case {id}: no `apply/2` may run before the closure is spawned: {e}"
+            );
+            assert!(
+                e.contains("Self ! "),
+                "case {id}: the closure must send its projection back: {e}"
+            );
+            assert!(
+                e.contains("receive X -> X after 10000 -> timeout end"),
+                "case {id}: the reply must be read under a bounded receive: {e}"
+            );
+        }
+        // The two-atom form keeps the direct `-eval` route: its `badarg` is the walker's own
+        // shape, and the compiled rewrite of the same source is `apply/3`.
+        let badarg = expr("bifs/apply_2_module_function_form_is_badarg");
+        assert!(
+            !badarg.contains("spawn(") && badarg.contains("apply(erlang, self)"),
+            "the two-atom badarg case must stay on the direct -eval route: {badarg}"
+        );
     }
 
     /// The debug-tool block: `erts_debug`'s constant/term-walk answers and the `erl_debugger`
