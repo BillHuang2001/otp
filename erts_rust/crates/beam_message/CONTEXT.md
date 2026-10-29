@@ -85,8 +85,8 @@ Every word-level read of a bitstring block, a sub-binary `orig` back-pointer or 
 | `copy.rs` `classify_sub_bits` dispatch (`:475`) | `try_sub_bits_parts` (+ `is_refc_binary`) | one shape proof **before** any word 1/4 use; a mis-shaped block is a typed `BadArg` |
 | `copy.rs` `copy_refc_binary` (`:321`) | `try_sub_bits_parts` + `is_bin_ref(orig)` | re-proves the block, so `bin_ref_parts` only ever reads a proven `BinRef` header |
 | `copy.rs` `copy_match_context` (`:377`) | `try_bitstring_parts` | a validated `(base, offset, size)` triple; the packing loop stays inside `[offset, offset+size)` of that base |
-| `preflight.rs` `object_words` (`:258`) | the same classifier | price and copy share one proof, so they cannot disagree |
-| `preflight.rs` `refc_binary_words` (`:303`) | `try_sub_bits_parts` + `is_bin_ref` | a refused copy was never priced as a success (`None` ⇒ 0 words) |
+| `preflight.rs` `object_words` (`:256`) | the same classifier | price and copy share one proof, so they cannot disagree |
+| `preflight.rs` `refc_binary_words` (`:300`) | `try_sub_bits_parts` (`:303`) + `is_bin_ref` (`:305`) | a refused copy was never priced as a success (`None` ⇒ 0 words) |
 | generic boxed leaf (`copy.rs:505`, `HEADER_HEAP_BITS` included) | none — header arity only | an `ErlHeapBits` is an opaque leaf whose extent is `arityval(hdr) + 1` words, the count it was allocated with; its bit count is never turned into a pointer and it exposes no child slot |
 | `OffHeapTable::binary_by_data_ptr` | none — pointer comparison | compares a `BinRef.val` against registered `data_ptr`s and reads no memory |
 | `layout::is_refc_binary` / `refc::bin_ref_parts` | reached only behind the two proofs above | `beam_term`'s unchecked forms; sound here because they only ever run on a block `try_sub_bits_parts` already accepted |
