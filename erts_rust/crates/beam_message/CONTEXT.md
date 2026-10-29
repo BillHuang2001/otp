@@ -78,6 +78,20 @@ Re-exported at the crate root and via `beam_message::prelude::*`; **per-module s
 - **The message-fragment move is a copy + release, not the C's in-place move markers** (a Rust term holds slot indices, not object pointers, so there is nothing to relink): the **net refcount is unchanged** — one increment from the copy, one decrement from the release. The fragment's backing `Heap` is a separate, never-moving allocation, so a root's address — and therefore `Message::payload` — stays valid as the `Message` moves.
 - **Per-object sizing and the whole-graph count both come from the LCA** (`beam_term::layout::object_words`, and `beam_term::size` driven by `CopyPricing`), whose enumerators cover every HAMT node kind — so a hash map copies as a whole trie and a widened fun descriptor is sized and copied automatically.
 
+## Sub-binary / refc read sites (checked vs unchecked)
+Every word-level read of a bitstring block, a sub-binary `orig` back-pointer or a refc payload word, with the guard that makes it sound; the checked readers are `beam_term::bitstring::checked`'s (`try_sub_bits_parts` / `try_bitstring_parts` / `try_bit_at`).
+| Site | Guard | Why sound |
+|---|---|---|
+| `copy.rs` `classify_sub_bits` dispatch (`:475`) | `try_sub_bits_parts` (+ `is_refc_binary`) | one shape proof **before** any word 1/4 use; a mis-shaped block is a typed `BadArg` |
+| `copy.rs` `copy_refc_binary` (`:321`) | `try_sub_bits_parts` + `is_bin_ref(orig)` | re-proves the block, so `bin_ref_parts` only ever reads a proven `BinRef` header |
+| `copy.rs` `copy_match_context` (`:377`) | `try_bitstring_parts` | a validated `(base, offset, size)` triple; the packing loop stays inside `[offset, offset+size)` of that base |
+| `preflight.rs` `object_words` (`:258`) | the same classifier | price and copy share one proof, so they cannot disagree |
+| `preflight.rs` `refc_binary_words` (`:303`) | `try_sub_bits_parts` + `is_bin_ref` | a refused copy was never priced as a success (`None` ⇒ 0 words) |
+| generic boxed leaf (`copy.rs:505`, `HEADER_HEAP_BITS` included) | none — header arity only | an `ErlHeapBits` is an opaque leaf whose extent is `arityval(hdr) + 1` words, the count it was allocated with; its bit count is never turned into a pointer and it exposes no child slot |
+| `OffHeapTable::binary_by_data_ptr` | none — pointer comparison | compares a `BinRef.val` against registered `data_ptr`s and reads no memory |
+| `layout::is_refc_binary` / `refc::bin_ref_parts` | reached only behind the two proofs above | `beam_term`'s unchecked forms; sound here because they only ever run on a block `try_sub_bits_parts` already accepted |
+Not askable on either side: region membership (provenance) — see Notes for Agents.
+
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` (one per `src/` module) plus one `tests/*.rs` file per contract area; every file and its pinned claims is in `tests/CONTEXT.md`.
 - **The destination-pricing walk is pinned equivalent to a bounded reference walk.** `src/copy_reference.rs` (`#[cfg(test)]`-gated) holds the bounded walk (`bounded_words_reference`/`is_acyclic_reference`/`preflight_words_reference`) as a test-only oracle, and five tests assert the shipped walk returns the *same* `Ok(n)` and the *same* rendered refusal over a **35-term corpus** covering every term class the copier prices (a refc binary handled and unhandled included, the two prices asserted *different* to prove the policy reads the `CopyContext`) at every limit `0..=count+2` and `usize::MAX`, that both walks refuse every forged cycle at every finite limit, and that the shipped walk also refuses a cycle **promptly at `usize::MAX`**.
