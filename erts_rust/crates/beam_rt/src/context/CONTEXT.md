@@ -86,7 +86,7 @@ Two further entry points sweep the `-eval` route's escaped store (`Runtime::eval
 Gates, per-slice cost, measured envelope and residuals: [`gc/CONTEXT.md`](gc/CONTEXT.md), [`../runner/CONTEXT.md`](../runner/CONTEXT.md), [`../../M1_GAPS_GC.md`](../../M1_GAPS_GC.md); pinning suite [`../../tests/nif_resource_gc.rs`](../../tests/nif_resource_gc.rs).
 
 ## Constraints
-* **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]`, with one `#![allow(unsafe_code)]` per marked module and a `// SAFETY:` rationale at each site — this node's `gc.rs`, `gc_walk.rs`, `gc/bin_vheap.rs`, `gc/valve_bounds.rs`, `calls.rs` and `../eval/reclaim.rs` + `../eval/reclaim/resource.rs`, plus `../nif.rs` and `../malloc.rs`; the glue otherwise uses only the safe peripheries of the lower crates.
+* **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]`, with one `#![allow(unsafe_code)]` per marked module and a `// SAFETY:` rationale at each site — this node's `gc.rs`, `gc_walk.rs`, `gc/bin_vheap.rs`, `gc/valve_bounds.rs`, `calls.rs` and `../eval/reclaim.rs` + `../eval/reclaim/resource.rs` + `../eval/native_stack.rs`, plus `../nif.rs` and `../malloc.rs`; the glue otherwise uses only the safe peripheries of the lower crates.
 * **Return-based errors, no silent swallowing** ([`../../CONTEXT.md`](../../CONTEXT.md) §3): every fallible helper returns `beam_common::Result`; no `panic!`/`unwrap()` on runtime data.
 * **Call down, never duplicate**: a BIF is served by `beam_bifs`/the native floor, never re-implemented here.
 * **Never fabricate a value**: a seam answer is either real state or the typed gap — `NodeIdentity` reports the runtime's **live** creation (`Runtime::node_creation()`), and the node hash is a genuine per-process computation, never a constant.

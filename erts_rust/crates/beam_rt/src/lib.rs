@@ -63,10 +63,15 @@
 //! * **Errors are return-based** (workspace `CONTEXT.md` §3): every fallible API returns
 //!   [`beam_common::Result`]; there is no crate-local error enum and nothing is swallowed.
 //! * **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]` and the glue is built on the
-//!   safe peripheries of the lower crates. Three narrowly-scoped `#[allow(unsafe_code)]` overrides exist:
-//!   `context/gc_walk.rs`'s sanctioned `beam_term::layout` object-walk, `nif.rs`'s `enif_compare`/
-//!   `enif_hash` `unsafe extern "C"` calls, and `malloc.rs`'s one `malloc_trim` call (the
-//!   allocator's free-page release).
+//!   safe peripheries of the lower crates. Every `#[allow(unsafe_code)]` is a marked module (or a
+//!   single marked function inside one) carrying a `// SAFETY:` rationale at each site:
+//!   `context/gc_walk.rs` (the sanctioned `beam_term::layout` object walk), `context/gc.rs` +
+//!   `context/gc/{bin_vheap,valve_bounds}.rs` and `context/calls.rs` (the GC root/valve raw reads),
+//!   `eval/reclaim.rs` + `eval/reclaim/resource.rs` (the `-eval` term-graph read),
+//!   `runtime/reclaim/{compact,holder}.rs` (the store move), `eval/native_stack.rs` (the three glibc
+//!   pthread attribute calls behind the walker's stack-headroom probe), `nif.rs` (`enif_compare`/
+//!   `enif_hash` `unsafe extern "C"` calls) and `malloc.rs` (one `malloc_trim` call, the allocator's
+//!   free-page release).
 //! * **Call down, never duplicate**: BIFs come from `beam_bifs`, terms/heaps from `beam_term`/
 //!   `beam_alloc`, pids from `beam_process`, modules from `beam_loader` and execution from
 //!   `beam_engine`. The printer is the registered `io:format/2` BIF, not a second printer.
