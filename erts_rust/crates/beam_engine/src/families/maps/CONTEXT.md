@@ -191,6 +191,23 @@ Verified against the system `erlc` (OTP 29) disassembly:
   (`tests/map_assoc_alloc.rs` pins it with a counting allocator), and the no-change fast path is the
   one route that materializes no pair list: it answers `map_get` per pair and never calls
   `map_entries`.
+- **Cost model per update (n = source keys, k = pairs): one full `map_entries` walk into a `Vec`
+  (HAMT also a work-stack `Vec`, `terms/map.rs:273`), k `position` scans (`write.rs:204`, O(n·k)),
+  then `write_map`'s sort + rebuild (O((n+k) log(n+k))) — so at least two pair `Vec`s for a flat
+  update (`terms/map.rs:252` + `beam_term/src/map.rs:389`) and four+ plus one `Vec` per trie node for
+  a HAMT one (`:402`, `:434`, `build_trie` `:196`, `serialize_node` `:256`), and a whole new map
+  block of `map_words_capacity(n+k)` words per instruction.**
+- There is no incremental / path-copying update anywhere: `beam_term::map` exposes only `map_get`
+  (HAMT descent, `:590`) and the from-scratch `write_map` (`:379`), so every `PutMapAssoc` /
+  `PutMapExact` is a full rebuild (ERTS path-copies: O(log n) new nodes).
+- `put_map_exact` walks the source **twice** (the `{badkey,Key}` validation `write.rs:251` and the
+  merge `write.rs:272`).
+- The read instructions materialize the whole pair list and scan it linearly (`read.rs:67`, `:98`
+  plus `lookup` `mod.rs:221`) where `beam_term::map::map_get` (`beam_term/src/map.rs:590`) would
+  descend the HAMT — so a one-key guard (`has_map_fields` / `get_map_elements`) is O(n), not O(log n).
+- The baseline tier has **no inline arm** for any map instruction (`jit/baseline/emit/block.rs:1376`
+  → `emit_family` → `family.rs:57` `jit_family` → `families::dispatch`), so each one costs a helper
+  call plus a second variant match on top of the family body.
 - `write.rs:280` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
   for an impossible post-reserve state.
 
