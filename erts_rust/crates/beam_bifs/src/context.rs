@@ -43,8 +43,8 @@
 //!   for `term_to_binary`), a [`ModuleInfo`] (`erlang:get_module_info/1,2`) and a
 //!   [`ProcessHook`] (the process/name/global-state queries — `whereis/1`,
 //!   `register/2`, `unregister/1`, `registered/0`, `is_process_alive/1`,
-//!   `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2` and
-//!   `group_leader/0`), a [`PersistentTerm`] (the node-global persistent-term store
+//!   `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2`,
+//!   `group_leader/0` and the `bump_reductions/1` reduction charge), a [`PersistentTerm`] (the node-global persistent-term store
 //!   behind the seven `persistent_term:*` BIFs), a [`MemoryHook`] (the node's memory
 //!   accounting behind `erlang:memory/0,1`), a [`RuntimeHooks`] (the single
 //!   dispatcher behind every `bif.tab` entry that only the *running* runtime can
@@ -678,22 +678,25 @@ pub enum ProcessInfoItem {
 /// liveness, the process and port inventories, per-process introspection and the
 /// per-process flags.
 ///
-/// The eleven BIFs behind this seam — `erlang:whereis/1`, `register/2`,
+/// The twelve BIFs behind this seam — `erlang:whereis/1`, `register/2`,
 /// `unregister/1`, `registered/0`, `is_process_alive/1`, `processes/0`,
-/// `ports/0`, `process_info/1`, `process_info/2`, `process_flag/2` and
-/// `group_leader/0` — answer questions about the *running* node: the name registry
+/// `ports/0`, `process_info/1`, `process_info/2`, `process_flag/2`,
+/// `group_leader/0` and `bump_reductions/1` — answer questions about the *running*
+/// node: the name registry
 /// (`beam_process`/`beam_rt`'s process table), the port table and the per-process
-/// state (flags, group leader, message queue, …). None of that is reachable from a
+/// state (flags, group leader, message queue, reduction counter, …). None of that is reachable from a
 /// BIF, so every operation routes through this hook, whose concrete implementation
 /// the runtime supplies. With no hook installed **every** one of those BIFs reports
 /// a typed `unsupported_bif` capability gap — never a fabricated empty list, never
-/// `undefined`, never `false` and never a made-up previous flag value
+/// `undefined`, never `false`, never a made-up previous flag value and never the
+/// fabricated `true` a reduction charge answers
 /// (workspace `CONTEXT.md` §3).
 ///
 /// The BIF layer still owns the `badarg` cases the arguments alone decide (a
 /// non-atom name, the atom `undefined` as a name, an `id` that is neither an
 /// internal pid nor an internal port, a non-pid, a non-atom flag, an item
-/// specification that is neither an atom nor a proper list of atoms) and checks
+/// specification that is neither an atom nor a proper list of atoms, a
+/// `bump_reductions/1` count that is not a non-negative small) and checks
 /// them *before* the hook is consulted.
 ///
 /// Ground truth (read-only): `../../erts/emulator/beam/bif.c`
@@ -703,9 +706,10 @@ pub enum ProcessInfoItem {
 /// (`erts_register_name:175`, `erts_whereis_name_to_id:277`, `registered_0:576`),
 /// `../../erts/emulator/beam/erl_bif_info.c` (`process_info_1:1561`,
 /// `process_info_2:1556`, `process_info_aux:1567`, `pi_1_keys:1008`,
-/// `is_process_alive_1:4069`) and `../../erts/emulator/beam/bif.tab`
+/// `is_process_alive_1:4069`), `../../erts/emulator/beam/bif.c`
+/// (`bump_reductions_1:5454`) and `../../erts/emulator/beam/bif.tab`
 /// (`group_leader/0:78`, `process_flag/2:129`, `process_info/1:131`,
-/// `process_info/2:132`).
+/// `process_info/2:132`, `bump_reductions/1:228`).
 pub trait ProcessHook {
     /// `whereis(Name)` — the id registered under `name`, or `None` when `name` is
     /// not registered (the BIF renders the atom `undefined`;
@@ -855,6 +859,40 @@ pub trait ProcessHook {
     ///
     /// Reports a table failure as a [`BeamError`].
     fn group_leader(&mut self) -> Result<ProcessId>;
+
+    /// `bump_reductions(N)` — charge `N` reductions to the calling process's
+    /// reduction counter (`bump_reductions_1`, `bif.c:5454`).
+    ///
+    /// `n` is the charge ERTS applies, i.e. the C's `reds` **after** both of its
+    /// adjustments: the argument validation (a non-negative small integer,
+    /// `bif.c:5457-5459`) and the slice cap
+    /// (`if (reds > CONTEXT_REDS) reds = CONTEXT_REDS;`, `bif.c:5460-5462`). So a
+    /// float, a bignum, an atom, a negative small and an over-budget count never
+    /// reach this method as themselves: the first four are `badarg` in the BIF, and
+    /// the last arrives as `CONTEXT_REDS` (4000, `erl_vm.h:47`; canonical in
+    /// `beam_common::CONTEXT_REDS`, the same constant `beam_process` derives its
+    /// per-process slice budget from). The cap lives there, in this layer, because
+    /// it is a compile-time constant of the ERTS interface — not host state — so it
+    /// cannot be applied differently by two hosts.
+    ///
+    /// **The hook adds `n` to the calling process's reduction counter, verbatim.**
+    /// ERTS returns `true` with `reds` as the BIF's own reduction charge
+    /// (`BIF_RET2(am_true, reds)`), so
+    /// `process_info(self(), reductions)` moves by `min(N, 4000)` plus the call's
+    /// own cost. Measured on the oracle: `bump_reductions(100)` moves the counter
+    /// by 104, and `(0)` by 4, while `(3999)`, `(4000)`, `(4001)`, `(100000)`,
+    /// `(1 bsl 40)` and `(MAX_SMALL)` all move it by 3992 — the cap, not the
+    /// argument, is what the counter sees. The call has **no** scheduling effect:
+    /// it charges the counter, it does not yield.
+    ///
+    /// # Errors
+    ///
+    /// Defaults to the typed `unsupported_bif` capability gap — a host with no
+    /// counter to bump must not fabricate the oracle's `true` (workspace
+    /// `CONTEXT.md` §3).
+    fn bump_reductions(&mut self, _n: u64) -> Result<()> {
+        Err(crate::error::unsupported_bif())
+    }
 }
 
 /// The node's memory accounting for `erlang:memory/0,1`.
@@ -1466,6 +1504,23 @@ impl<'a> BifContext<'a> {
     pub fn proc_group_leader(&mut self) -> Result<ProcessId> {
         match self.process.as_deref_mut() {
             Some(hook) => hook.group_leader(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Charges `n` reductions to the calling process's counter through the
+    /// installed [`ProcessHook`] — the seam behind `erlang:bump_reductions/1`.
+    ///
+    /// `n` is the charge to add: the validated non-negative small, already capped
+    /// at one scheduler slice by the BIF (see [`ProcessHook::bump_reductions`]).
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_bump_reductions(&mut self, n: u64) -> Result<()> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.bump_reductions(n),
             None => Err(crate::error::unsupported_bif()),
         }
     }

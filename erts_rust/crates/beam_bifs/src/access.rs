@@ -524,6 +524,55 @@ pub(crate) fn bitstring_bit_size(term: Eterm) -> Result<usize> {
     Ok(unsafe { beam_term::bitstring_size(term) })
 }
 
+/// The size, in **bytes**, of the whole off-heap payload an `ErlSubBits` window
+/// references — the C's `(br->val)->orig_size` (`Binary.orig_size`,
+/// `../../erts/emulator/beam/erl_binary.h:75`), which is the *requested* payload
+/// width and not the physical allocation: `erts_bin_nrml_alloc(size)` and
+/// `erts_bin_realloc(binp, size)` both record exactly `size`, so an allocator's
+/// rounding is invisible to the BIF
+/// (`erl_bif_binary.c:2711`, `binary:referenced_byte_size/1`).
+///
+/// The frozen analogue is [`beam_alloc::payload_capacity`], the payload header's
+/// `capacity` word ("the writable capacity in bytes — the append ceiling"): for a
+/// `RefcBinary::new(&bytes)` payload it *is* `bytes.len()`, and for an append
+/// accumulator it is the width the C's growth rule tests against
+/// (`erl_bits.c:1969`: `if (refc_binary->orig_size < used_size)`), never the
+/// allocator's `reserved` slack.
+///
+/// `None` is the C's `br == NULL`: an on-heap `ErlHeapBits` (every binary this crate
+/// *builds*), or an `ErlSubBits` whose `orig` slot is **not** a `BinRef` — a match
+/// context (`erl_bits.c:117`, `ERTS_GET_BITSTRING_REF`). Both answer their own bit
+/// size, which is the caller's fallback.
+///
+/// # Safety of the read
+///
+/// The caller must hold a live `term` (a BIF argument is live for the call), which
+/// keeps the payload it names alive by the same reachability convention
+/// [`binary_bytes`] above relies on to read the payload's *bytes*: `BinRef.val` is
+/// the payload's first data byte (the frozen contract
+/// `BinRef.val == RefcBinary::data_ptr()`), so `payload_capacity` reads only the
+/// control header word `HEADER_SIZE` bytes before it, and the window's own
+/// `offset_bits..end` cannot exceed that payload.
+pub(crate) fn refc_payload_bytes(term: Eterm) -> Option<usize> {
+    // SAFETY: `is_refc_binary` dereferences only the boxed thing's header and, for an
+    // `ErlSubBits`, its live `orig` slot; `term` is a live term.
+    if !unsafe { beam_term::refc::is_refc_binary(term) } {
+        return None;
+    }
+    // SAFETY: `is_refc_binary` just proved `term` is a 5-word `ErlSubBits`, so word
+    // 4 (`orig`) is initialised.
+    let (_base, _start, _end, orig) = unsafe { beam_term::bitstring::sub_bits_parts(term) };
+    // SAFETY: `orig` is a live `BinRef` (that is what `is_refc_binary` tested), so
+    // [`beam_term::refc::bin_ref_parts`] reads two initialised words of it.
+    let (val, _next) = unsafe { beam_term::refc::bin_ref_parts(orig) };
+    if val.is_null() {
+        return None;
+    }
+    // SAFETY: `val` is that live payload's first data byte, kept alive by `term`, and
+    // `payload_capacity` reads only the header's `capacity` word from it.
+    Some(unsafe { beam_alloc::payload_capacity(val.cast::<u8>()) })
+}
+
 /// Copies the bytes of a byte-aligned bitstring (a *binary*) out of the term.
 ///
 /// **Both** frozen bitstring representations are handled, through the LCA reader
