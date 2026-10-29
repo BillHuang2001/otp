@@ -1393,3 +1393,105 @@ fn oracle_agrees_on_flatmap_atom_key_order() {
         "the order must not be the lexicographic name order (that would prove nothing)",
     );
 }
+
+/// The oracle's flat-map atom-key order follows **atom creation order**, in both
+/// directions — the premise the runtime divergence rests on.
+///
+/// `erts_cmp_flatmap_keys` orders two atom keys by their raw atom word, i.e. by
+/// atom-table *index* (`erts/emulator/beam/erl_utils.h:263-269`), and an index is
+/// assigned by the order the name is interned. This check creates the same two
+/// novel atoms in **both** orders, in two fresh oracle VMs, and reads back the key
+/// order through `maps:to_list/1`:
+///
+/// * creation `zzzord_m` then `zzzord_n` (index order == name order) ⇒ `[1, 2]`;
+/// * creation `zzzord_n` then `zzzord_m` (index order **reversed**) ⇒ `[2, 1]`,
+///   which is *not* the name order — so creation/index order drives it;
+///
+/// where the printed value is fixed **by name** (`zzzord_m` ⇒ 1, `zzzord_n` ⇒ 2),
+/// so the value sequence names the key order. The Rust side seeds its
+/// [`AtomTable`] in the very same creation order, so it holds the same index order,
+/// and [`map_pairs_storage_order`] must report the oracle's sequence.
+#[test]
+fn oracle_agrees_on_flatmap_atom_key_creation_order() {
+    // Values are fixed by NAME, so the printed sequence identifies the key order.
+    fn value_of(name: &str) -> i64 {
+        match name {
+            "zzzord_m" => 1,
+            "zzzord_n" => 2,
+            other => panic!("unexpected key {other}"),
+        }
+    }
+
+    for creation in [["zzzord_m", "zzzord_n"], ["zzzord_n", "zzzord_m"]] {
+        let (first, second) = (creation[0], creation[1]);
+
+        // Rust side: the same creation order ⇒ the same atom-index order.
+        let mut atoms = AtomTable::new();
+        atoms.seed(creation.iter().copied());
+        let m = make_atom(atoms.lookup("zzzord_m").expect("interned"));
+        let n = make_atom(atoms.lookup("zzzord_n").expect("interned"));
+        let first_term = make_atom(atoms.lookup(first).expect("interned"));
+        let second_term = make_atom(atoms.lookup(second).expect("interned"));
+        assert!(
+            atom_val(first_term).raw() < atom_val(second_term).raw(),
+            "test premise: `{first}` has the lower index (created first)",
+        );
+
+        // Build with the pairs in the *literal* order `{value_of(m), value_of(n)}`,
+        // deliberately unrelated to the creation order in the reversed case.
+        let pairs = [
+            (m, make_small(value_of("zzzord_m"))),
+            (n, make_small(value_of("zzzord_n"))),
+        ];
+        let (_buf, map) = build_map(&pairs, &atoms);
+        // SAFETY: `map` is a live boxed map with two pairs.
+        assert!(unsafe { is_flatmap(map) }, "2 keys must build a flat map");
+        let stored: Vec<i64> = map_pairs_storage_order(map)
+            .expect("map_pairs_storage_order")
+            .iter()
+            .map(|(_, v)| signed_value(*v))
+            .collect();
+        assert_eq!(stored.len(), 2);
+
+        // Oracle side: create the two atoms in `creation` order, then build the same
+        // map (the same key/value association).
+        let expr = format!(
+            "First = list_to_atom(\"{first}\"), Second = list_to_atom(\"{second}\"), \
+             Map = #{{First => {v_first}, Second => {v_second}}}, \
+             io:format(\"~w\", [[V || {{_,V}} <- maps:to_list(Map)]])",
+            v_first = value_of(first),
+            v_second = value_of(second),
+        );
+        let Some(out) = erl_stdout(&expr) else {
+            eprintln!("skipping flat-map atom creation-order check: no oracle");
+            return;
+        };
+        let oracle_values: Vec<i64> = parse_int_list(&out)
+            .into_iter()
+            .map(|v| v.expect("no `none` in a maps:to_list value list"))
+            .collect();
+        assert_eq!(oracle_values.len(), 2, "unexpected oracle output: {out:?}");
+
+        // The rule: the oracle's stored order is the creation (index) order, and the
+        // crate reproduces it from the same index order.
+        let creation_values: Vec<i64> = [value_of(first), value_of(second)].to_vec();
+        assert_eq!(
+            oracle_values, creation_values,
+            "creating `{first}` before `{second}` must store them in that order",
+        );
+        assert_eq!(
+            stored, oracle_values,
+            "the crate's stored order must equal the oracle's for the same index order",
+        );
+
+        // Teeth: in the reversed direction the oracle must NOT report the name order,
+        // which would prove the rule is name-driven rather than index-driven.
+        if first == "zzzord_n" {
+            assert_ne!(
+                oracle_values,
+                vec![value_of("zzzord_m"), value_of("zzzord_n")],
+                "the order must not be the lexicographic name order",
+            );
+        }
+    }
+}
