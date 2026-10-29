@@ -13,6 +13,15 @@ runtime defects in the module setup path** (`dets`' file write, then `process_fl
 **~250–330× performance gap** in a delete fan-out (RC-D), and one is the pre-existing
 oracle-side failure in `stored_procs`.
 
+> **Re-verified since:** the RC-A/RC-B/RC-C/RC-D classes were re-measured against the current
+> runtime — see `khepri-diagnostics/FINDINGS.md`, which supersedes the per-class tables below
+> where they disagree. Current verdicts: **RC-A fixed** (improper-iodata writes and the `dets`
+> file are byte-identical to the oracle), **RC-B still present** (`min_heap_size`,
+> `min_bin_vheap_size`, `fullsweep_after` still `badarg`, and it is now the first wall — the
+> `ra` fixture dies at `ra_log_wal:init/1` line 313), **RC-C still present** (unchanged class),
+> **RC-D still present** (≈170–420× on the same-host ratio; the module's `DeletionTime < 1000`
+> assertion still fails).
+
 ## Environment
 
 | item | value |
