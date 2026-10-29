@@ -163,9 +163,12 @@ fn a_slot(cooked: Eterm, index: usize) -> Eterm {
 }
 
 /// The `Location` field of cooked item `index`, rendered as the oracle prints it.
-fn location(cooked: Eterm, index: usize) -> String {
+fn location(cooked: Eterm, index: usize, module: &Module) -> String {
     let items = crate::terms::list_elements(cooked).expect("the cooked stacktrace is a list");
-    render_location(crate::terms::tuple_element(items[index], 3).expect("the item's location"))
+    render_location(
+        crate::terms::tuple_element(items[index], 3).expect("the item's location"),
+        module,
+    )
 }
 
 /// The function name of cooked item `index` in `module`.
@@ -254,7 +257,7 @@ fn a_failed_two_arity_clause_cooks_the_argument_list_in_the_a_slot() {
     // included — is already compared by `assert_matches_the_oracle`; restating it
     // here makes a regression name the location rather than dump two strings).
     assert_eq!(
-        location(cooked, 0),
+        location(cooked, 0, &module),
         oracle_field(&oracle.items[0], 3),
         "the failing clause's own source line"
     );
@@ -267,7 +270,7 @@ fn a_failed_two_arity_clause_cooks_the_argument_list_in_the_a_slot() {
         "an outer frame's A slot is its declared arity, never an argument list"
     );
     assert_eq!(render_flat(outer, &module), "0");
-    assert_eq!(location(cooked, 1), oracle_field(&oracle.items[1], 3));
+    assert_eq!(location(cooked, 1, &module), oracle_field(&oracle.items[1], 3));
 }
 
 // ---------------------------------------------------------------------------
@@ -306,11 +309,11 @@ fn a_failed_zero_arity_clause_cooks_the_empty_argument_list_in_the_a_slot() {
         is_list(args) || is_nil(args),
         "the A slot of a failed zero-arity clause is the empty list, never the integer 0"
     );
-    assert_eq!(location(cooked, 0), oracle_field(&oracle.items[0], 3));
+    assert_eq!(location(cooked, 0, &module), oracle_field(&oracle.items[0], 3));
 
     assert_eq!(function_of(cooked, 1, &module), "run_h");
     assert_eq!(render_flat(a_slot(cooked, 1), &module), "0");
-    assert_eq!(location(cooked, 1), oracle_field(&oracle.items[1], 3));
+    assert_eq!(location(cooked, 1, &module), oracle_field(&oracle.items[1], 3));
 }
 
 // ---------------------------------------------------------------------------
@@ -345,11 +348,11 @@ fn a_failed_head_pattern_cooks_the_arguments_it_was_called_with() {
         "[1,2]",
         "the failed head pattern's real arguments"
     );
-    assert_eq!(location(cooked, 0), oracle_field(&oracle.items[0], 3));
+    assert_eq!(location(cooked, 0, &module), oracle_field(&oracle.items[0], 3));
 
     assert_eq!(function_of(cooked, 1, &module), "run_h2");
     assert_eq!(render_flat(a_slot(cooked, 1), &module), "0");
-    assert_eq!(location(cooked, 1), oracle_field(&oracle.items[1], 3));
+    assert_eq!(location(cooked, 1, &module), oracle_field(&oracle.items[1], 3));
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +612,7 @@ fn without_the_latch_the_a_slot_is_the_declared_arity() {
         "2",
         "the declared arity, even though x(0)/x(1) hold [1,2]"
     );
-    assert_eq!(location(cooked, 0), "[]", "no line marker is in effect at pc 0");
+    assert_eq!(location(cooked, 0, &module), "[]", "no line marker is in effect at pc 0");
 }
 
 /// **The latch route.** `func_info` publishes the failed clause's **real call

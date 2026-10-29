@@ -214,7 +214,17 @@ fn render_exit_value(
     runtime.format_term(value, None)
 }
 /// The exit-value **term** on `heap` (see [`render_exit_value`] for the lifetime rule).
-fn exit_value(
+///
+/// This is the **one** definition of ERTS's exit value — `{Reason, Stacktrace}` for an `error`,
+/// `{{nocatch, Reason}, Stacktrace}` for an uncaught `throw`, the bare `reason` for an `exit`
+/// class — so the crash report and the *signalled* exit reason (the term a linked peer's
+/// `{'EXIT', Pid, R}` and a monitor's `'DOWN'` carry, built by `crate::runner::reason`'s
+/// `signalled_reason`) can never disagree about its shape.
+///
+/// The caller owns `heap`: the term points into it, so it must be either rendered before `heap`
+/// is dropped (what [`render_exit_value`] does) or copied onto a runtime-lifetime store while
+/// the heap is still alive (what the runner does through [`Runtime::stabilize_term`]).
+pub(crate) fn exit_value(
     runtime: &mut Runtime,
     heap: &mut Heap,
     class: ExceptionClass,
@@ -275,10 +285,13 @@ fn string_term(heap: &mut Heap, text: &str) -> Result<Eterm> {
 }
 /// A safe upper bound on the words [`exit_value`] needs for `frames`.
 ///
+/// Shared with the signalled-reason builder so both size the same private heap from the same
+/// rule.
+///
 /// Per frame: the 4-tuple (5 words), its list cell (2), the location list's two cells (4), the
 /// `{file, …}`/`{line, …}` tuples (6) and the file string (2 words per character plus the nil).
 /// The constant covers the outer tuple and the `{nocatch, …}` tuple of a throw.
-fn term_words(frames: &[StackFrame]) -> usize {
+pub(crate) fn term_words(frames: &[StackFrame]) -> usize {
     let mut words = 32;
     for frame in frames {
         let file_len = frame

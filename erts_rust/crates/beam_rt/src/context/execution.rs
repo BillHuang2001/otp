@@ -108,7 +108,6 @@ impl ExecutionContext for RuntimeContext<'_> {
         }
         Ok(beam_bifs::serves_local_call(module, function, arity as usize))
     }
-
     /// Resolve an interned atom id to its name from the runtime's **live** shared namespace,
     /// falling back to the running module's own load-time snapshot
     /// ([`ExecutionContext::atom_name`]).

@@ -119,8 +119,8 @@ mod supplied_stacktrace;
 #[allow(unsafe_code)]
 pub mod terms;
 pub use context::{
-    BifOutcome, ContextHeapStats, ExecutionContext, FunOutcome, HeapMark, HeapReclaim, HeapRewind,
-    Mailbox, MinimalContext, TraceEvent,
+    BifOutcome, ContextHeapStats, ExecutionContext, FunOutcome, HeapMark, HeapReclaim,
+    HeapRewind, Mailbox, MinimalContext, TraceEvent,
 };
 pub use error::{bad_register, blocked, suspended, unknown_label, unsupported};
 pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};

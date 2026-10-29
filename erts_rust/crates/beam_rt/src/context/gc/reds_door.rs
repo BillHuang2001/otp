@@ -193,6 +193,7 @@ pub(crate) fn collect_at_reds_boundary(
     fr_count: usize,
     reds_since_check: u32,
 ) -> Result<()> {
+    audit::audit_machine_roots(&roots, fr_count);
     let pid = ctx.mailbox_pid;
     if !ctx.runtime.gc_process_enabled(pid) {
         return Ok(());
@@ -396,4 +397,134 @@ pub(crate) fn collect_at_reds_boundary(
         return Ok(());
     }
     Ok(())
+}
+/// **The root-set audit** — a debug-only validator that classifies every word the boundary
+/// hand-off is about to publish and reports the ones no live term can be at.
+///
+/// Set `BEAM_RT_GC_ROOT_AUDIT` to any value to switch it on; it is silent unless set, nothing
+/// depends on it, and it never changes a decision (a diagnostic of the same kind as the crate's
+/// other channels, e.g. `BEAM_RT_VALVE_TRACE` in [`crate::context::gc_valve_trace`]).
+///
+/// It exists to name the **writer** of a stray word, not to guard the reader: the valve's
+/// classification ([`super::foreign_shape_pointer`]) rejects only `NULL` and misaligned words, so
+/// a small non-pointer word with a `LIST`/`BOXED`-shaped tag passes it and is dereferenced. This
+/// audit reports such a word with its root family, slot index and the boundary it first appeared
+/// at, so the publication site (not the reading valve) is the thing being fixed.
+pub(crate) mod audit {
+    use std::sync::{Mutex, OnceLock};
+    use beam_engine::context::RootSet;
+    use beam_term::Eterm;
+    /// The lowest address a term can live at: every heap region this runtime hands out is a
+    /// page-aligned `mmap` or a block inside one, so a pointer below one page is never a term.
+    const MIN_TERM_ADDR: usize = 0x1000;
+    /// Whether the audit is on (`BEAM_RT_GC_ROOT_AUDIT` present).
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("BEAM_RT_GC_ROOT_AUDIT").is_some())
+    }
+    /// One audited root slot: the family tag, the slot index and the word.
+    type Slot = (u8, usize, Eterm);
+    /// The per-process audit state: the boundary counter and the previous boundary's full
+    /// snapshot (so a word's *first* appearance, and the value it replaced, can both be named).
+    struct State {
+        boundary: u64,
+        previous: Vec<Slot>,
+    }
+    fn state() -> &'static Mutex<State> {
+        static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+        STATE.get_or_init(|| {
+            Mutex::new(State {
+                boundary: 0,
+                previous: Vec::new(),
+            })
+        })
+    }
+    /// A word that classifies as a heap pointer but names no address a term can be at.
+    fn bogus(word: Eterm) -> Option<usize> {
+        if !super::super::is_pointer_bearing(word) || beam_term::literal::is_literal(word) {
+            return None;
+        }
+        let ptr = super::super::dereferenceable_pointer(word)?;
+        (ptr < MIN_TERM_ADDR).then_some(ptr)
+    }
+    /// Records and reports this boundary's suspicious slots.
+    pub(crate) fn audit_machine_roots(roots: &RootSet<'_>, fr_count: usize) {
+        if !enabled() {
+            return;
+        }
+        let fr_count = fr_count.min(roots.fr.len());
+        let mut current: Vec<Slot> = Vec::new();
+        let mut report = String::new();
+        let mut visit = |family: u8, label: &str, words: &[Eterm]| {
+            for (index, &word) in words.iter().enumerate() {
+                if let Some(ptr) = bogus(word) {
+                    current.push((family, index, word));
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut report,
+                        format_args!(
+                            "[rt-root-audit] family={label} index={index} word={:#x} ptr={:#x}\n",
+                            word.raw(),
+                            ptr
+                        ),
+                    );
+                }
+            }
+        };
+        visit(0, "x", roots.x);
+        visit(1, "stack", roots.stack);
+        visit(2, "fr", &roots.fr[..fr_count]);
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        state.boundary += 1;
+        // Report only what is **new** this boundary (a slot that already carried a stray word is
+        // not news), plus the value the slot held at the previous boundary.
+        let mut fresh = String::new();
+        for &slot in &current {
+            if state.previous.contains(&slot) {
+                continue;
+            }
+            let replaced = state
+                .previous
+                .iter()
+                .find(|(family, index, _)| *family == slot.0 && *index == slot.1)
+                .map(|(_, _, word)| word.raw());
+            let window: String = match slot.0 {
+                0 => window(roots.x, slot.1),
+                1 => window(roots.stack, slot.1),
+                _ => window(&roots.fr[..fr_count], slot.1),
+            };
+            let _ = std::fmt::Write::write_fmt(
+                &mut fresh,
+                format_args!(
+                    "[rt-root-audit] NEW at boundary={} family={} index={} word={:#x} replaced={:x?}\n\
+                     [rt-root-audit]   window: {}\n",
+                    state.boundary,
+                    ["x", "stack", "fr"][slot.0 as usize],
+                    slot.1,
+                    slot.2.raw(),
+                    replaced.map(|w| format!("{w:#x}")),
+                    window,
+                ),
+            );
+        }
+        if !fresh.is_empty() {
+            eprint!("{fresh}{report}");
+        }
+        state.previous = current;
+    }
+    /// The audited words around `index`, as hex, for the report line.
+    fn window(words: &[Eterm], index: usize) -> String {
+        let start = index.saturating_sub(4);
+        let end = (index + 5).min(words.len());
+        let mut out = String::new();
+        for at in start..end {
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("{}{}={:#x}", if at == index { "*" } else { "" }, at, words[at].raw()),
+            );
+            if at + 1 < end {
+                out.push(' ');
+            }
+        }
+        out
+    }
 }

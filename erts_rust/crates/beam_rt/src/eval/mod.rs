@@ -99,6 +99,7 @@ mod bits;
 mod bits_decode;
 mod bits_match;
 pub(crate) mod compile;
+mod native_stack;
 mod nesting;
 mod parse;
 pub(crate) mod reclaim;
@@ -3489,6 +3490,34 @@ mod tests {
              length(F(10000, []))",
             10_000,
         );
+    }
+    /// The nesting budget is **physical**: on a thread whose whole stack is far below the
+    /// walker's reserve ([`nesting::WALK_STACK_RESERVE`]), the first application is handed to the
+    /// compiled route, which answers the oracle's value — the recursion never aborts the process.
+    ///
+    /// This is the stack-size-independent half of the property: the libtest thread is 2 MiB, so
+    /// the test above proves the gate fires *below* the counter; this one proves the compiled
+    /// route still fits in a stack the walker cannot use at all.
+    #[test]
+    fn a_small_thread_stack_answers_a_deep_recursion_on_the_compiled_route() {
+        let (value, compiled) = std::thread::Builder::new()
+            .stack_size(nesting::WALK_STACK_RESERVE / 2)
+            .spawn(|| {
+                let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+                let mut sink = beam_bifs::NullSink;
+                let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+                // oracle: `done`
+                let value =
+                    eval(&mut ctx, "F = fun G(0) -> done; G(N) -> G(N - 1) end, F(10000).")
+                        .expect("the compiled route answers where the walker may not walk");
+                let name = ctx.runtime.atoms().name(atom_val(value)).map(str::to_owned);
+                (name, ctx.runtime.eval_compiled.len())
+            })
+            .expect("a thread with an explicit stack")
+            .join()
+            .expect("a thread below the walker's reserve does not abort");
+        assert_eq!(value.as_deref(), Some("done"));
+        assert_eq!(compiled, 1, "the recursion was handed to one compiled module");
     }
 
     /// A recursion that must **alternate** compiled code and the walker — a fun value applied to

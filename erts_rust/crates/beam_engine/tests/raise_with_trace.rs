@@ -38,21 +38,38 @@
 //! `build_stacktrace` must cook the **supplied** frames, not the engine's
 //! `raise_snapshot` heuristic.
 //!
-//! A raise whose supplied trace is **empty** is currently indistinguishable from a
-//! raise that supplied none, so both cook the same `raise_snapshot`-derived output —
-//! pinned by [`an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace`].
-//! That equivalence is a **`beam_common::Raise` limitation, not intended semantics**:
-//! `Raise` carries no supplied-trace flag, so "supplied `[]`" and "no trace supplied"
-//! reach the engine as the same value. C's discriminator is `is_raised_exc`
-//! (`erts/emulator/beam/beam_common.c:1119-1126`), which keeps a supplied empty trace
-//! and returns it verbatim. The crate `CONTEXT.md` §Known Issues entry records the gap
-//! and the change it needs — the fix is owned by the sibling `beam_common` node, whose
-//! `Raise` has to carry the flag.
+//! Two **different** raise shapes must not be conflated, and the oracle tells them
+//! apart:
+//!
+//! - a raise that supplied the trace **term** `[]` (what `erlang:raise(error, boom, [])`
+//!   does) cooks `[]` — C stores the empty list behind the negative "already cooked"
+//!   header and `build_stacktrace`'s `is_raised_exc` arm returns it unchanged
+//!   (`erts/emulator/beam/beam_common.c:1219-1223`; `raise_3`'s no-copy path is
+//!   `c_p->ftrace = stacktrace`, `erts/emulator/beam/bif.c:1641-1643`), so
+//!   `1> try erlang:raise(error, boom, []) catch _C:_R:S -> S end.` answers `[]`;
+//! - a raise that supplied **nothing** has no trace to echo, so the engine derives
+//!   one — `[{host,target,[],[]},{raise_with_trace,run,0,[]}]` for this fixture, i.e.
+//!   the failing import's synthesized head item in front of the `raise_snapshot`-derived
+//!   raising frame.
+//!
+//! The discriminator is `Raise::supplied_trace`'s **presence**, never the value: the
+//! term `[]` is word-identical to "no trace", so only the slot can say which shape
+//! arrived. Both rows are re-pinned by
+//! [`an_empty_supplied_term_cooks_the_empty_list_where_an_absent_one_derives_frames`].
+//! A host that populates only the **structural** `Raise::stacktrace` with an empty
+//! `StackTrace` (and no term) still derives frames — a documented residual of that
+//! subordinate shape, asserted in the same test, never a statement that the two
+//! `erlang:raise/3` shapes are equivalent.
 //!
 //! Every name a supplied frame needs (`my`, `fake`, the `file`/`line` location keys)
-//! is resolved from the running module's atom table and is **never substituted**: a
-//! name it cannot intern is a typed `unsupported` — pinned by
-//! [`a_supplied_frame_naming_an_unknown_atom_is_a_typed_error`].
+//! is resolved through the engine's **live atom namespace**
+//! ([`ExecutionContext::atoms`](beam_engine::ExecutionContext::atoms)) with the
+//! running module's load-time snapshot as the fallback, and is **never substituted**:
+//! a name **neither** source can name is a typed `unsupported` — pinned by
+//! [`a_supplied_frame_naming_an_unknown_atom_is_a_typed_error`]. A name only the LIVE
+//! namespace knows must still cook, because a re-raised trace (`proc_lib`,
+//! `gen_server`, a supervisor) names modules the re-raising module never mentioned —
+//! pinned by [`a_supplied_frame_naming_an_atom_the_live_namespace_knows_is_cooked`].
 //!
 //! The oracle-backed case **skips loudly** when no runnable `erl` is on `PATH`
 //! (the discipline of `tests/trace.rs::oracle_eval`).
@@ -60,12 +77,14 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-use beam_common::{AtomName, BeamError, ExitReason, Raise, SourceLocation, StackFrame, StackTrace};
+use beam_common::{
+    AtomName, BeamError, ExitReason, LiveReason, Raise, SourceLocation, StackFrame, StackTrace,
+};
 use beam_engine::{terms, Machine, MinimalContext};
 use beam_loader::{
     Atom, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand,
 };
-use beam_term::{cmp, make_atom, make_small, Eterm, NIL};
+use beam_term::{cmp, is_nil, make_atom, make_small, Eterm, NIL};
 
 // ---------------------------------------------------------------------------
 // The synthetic module: `run/0` wraps an unresolvable import in a live `try`
@@ -208,6 +227,16 @@ fn raise_with(trace: Option<StackTrace>) -> BeamError {
     }
 }
 
+/// `error:boom`, optionally carrying the caller-supplied trace **term** — the shape
+/// `erlang:raise/3` produces (`Raise::with_supplied_trace`), whose value the engine
+/// echoes verbatim.
+fn raise_with_term(supplied: Option<Eterm>) -> BeamError {
+    let raise = Raise::error(ExitReason::atom("boom"));
+    match supplied {
+        Some(term) => BeamError::Raise(raise.with_supplied_trace(LiveReason::new(term))),
+        None => BeamError::Raise(raise),
+    }
+}
 /// The supplied frames of the oracle example:
 /// `[{my,fake,2,[{file,"x.erl"},{line,7}]}]`.
 fn supplied_frames() -> StackTrace {
@@ -235,6 +264,19 @@ fn run_caught(trace: Option<StackTrace>) -> (Eterm, Module, MinimalContext) {
     (cooked, module, ctx)
 }
 
+/// [`run_caught`] for the **term** shape: the hook raises `error:boom` carrying
+/// `supplied` as the verbatim trace, and the handler's cooked `S` is returned.
+fn run_caught_term(supplied: Option<Eterm>) -> (Eterm, Module, MinimalContext) {
+    let (module, run_atom) = Fixture::build();
+    let mut ctx =
+        MinimalContext::with_bif_hook(Box::new(move |_, _, _, _| Err(raise_with_term(supplied))));
+    let mut machine = Machine::new();
+    let cooked = machine
+        .run_export(&module, run_atom, 0, &[], &mut ctx)
+        .expect("the live catch frame returns the cooked S");
+    assert_eq!(machine.catch_frame_depth(), 0, "try_case consumed the frame");
+    (cooked, module, ctx)
+}
 // ---------------------------------------------------------------------------
 // Expected terms, built from the oracle's printed shape
 // ---------------------------------------------------------------------------
@@ -275,6 +317,26 @@ fn expected_snapshot(ctx: &mut MinimalContext, module: &Module) -> Eterm {
     let item = terms::make_tuple(ctx, &[make_atom(module.name), run_atom, make_small(0), NIL])
         .expect("a tuple");
     terms::make_list(ctx, &[item]).expect("a list")
+}
+
+/// `[{host,target,[],[]},{raise_with_trace,run,0,[]}]` — what a raise out of the
+/// fixture's `call_ext` **actually** cooks, head item first.
+///
+/// The failing import is dispatched as a BIF, so the raise carries the synthesized
+/// innermost item naming that callee with its own argument list
+/// (`{host,target,[],[]}`; `host` is outside the closed format-module table, so its
+/// `Location` is the empty list), and the `raise_snapshot`-derived `run/0` frame
+/// follows it. That is also what the oracle produces for an unresolvable
+/// `host:target()` call — the `undef` head item, `[{host,target,[],[]}]` — modulo the
+/// trailing `erl_eval`/`init` frames this run does not have.
+fn expected_cooked(ctx: &mut MinimalContext, module: &Module) -> Eterm {
+    let host = make_atom(module.atom_table.lookup("host").expect("seeded"));
+    let target = make_atom(module.atom_table.lookup("target").expect("seeded"));
+    let head = terms::make_tuple(ctx, &[host, target, NIL, NIL]).expect("a tuple");
+    let run_atom = make_atom(module.atom_table.lookup("run").expect("seeded"));
+    let frame = terms::make_tuple(ctx, &[make_atom(module.name), run_atom, make_small(0), NIL])
+        .expect("a tuple");
+    terms::make_list(ctx, &[head, frame]).expect("a list")
 }
 
 // ===========================================================================
@@ -330,59 +392,50 @@ fn a_supplied_frame_without_a_location_renders_an_empty_location() {
 }
 
 // ===========================================================================
-// 2. An empty supplied trace is indistinguishable from no supplied trace
+// 2. A supplied EMPTY trace is the empty list; an absent one derives frames
 // ===========================================================================
-
-/// A raise carrying an explicitly **empty** trace list cooks exactly the same trace
-/// as a raise that supplied none.
+/// A raise whose supplied trace **term** is `[]` cooks `[]`, while a raise that
+/// supplied **no** trace derives the failing call's frames — the distinction the
+/// oracle makes between `erlang:raise(error, boom, [])` and a raise with no trace.
 ///
-/// The equivalence pins a **`beam_common::Raise` LIMITATION, not intended
-/// semantics**: `Raise` carries no supplied-trace flag, so "supplied `[]`" and "no
-/// trace supplied" are the same value by the time the engine sees the raise (the
-/// one-shot latch's arming condition is `!raise.stacktrace.is_empty()`, which a
-/// supplied `[]` cannot satisfy). C tells them apart with `is_raised_exc`
-/// (`erts/emulator/beam/beam_common.c:1119-1126`) and returns a stored `[]`
-/// verbatim (`raise_3` stores `NIL` behind the negative "already cooked" header),
-/// so the oracle answers `{error,boom,[]}` where the engine derives a frame list.
-///
-/// The crate `CONTEXT.md` §Known Issues entry records the gap and the change it
-/// needs — a `supplied_trace: bool` on `beam_common::Raise` plus two small engine
-/// hunks — and notes that it is owned by the sibling `beam_common` node, not by
-/// this crate. Treat this test as the pin on a known-divergent shape, **never** as
-/// a statement that the two raises are supposed to be equivalent.
+/// Both rows are measured against the system oracle in
+/// [`the_oracle_and_the_engine_both_keep_a_supplied_empty_trace`]; this test pins the
+/// engine side, and additionally pins the **structural** residual: a host that
+/// populates only `Raise::stacktrace` with an empty `StackTrace` (and no term) is
+/// still indistinguishable from "nothing supplied" — the one-shot latch's arming
+/// condition is `!raise.stacktrace.is_empty()` — so it derives the same frames. That
+/// subordinate shape is not something `erlang:raise/3` produces any more (it always
+/// carries the term), so the residual cannot re-mask a re-raised trace.
 #[test]
-fn an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace() {
-    // Two runs of the SAME synthetic module, differing only in whether the raise
-    // carried an explicitly EMPTY `StackTrace`. An empty trace cannot arm the
-    // one-shot supplied-trace latch (the `Raise` value carries no flag saying one was
-    // supplied, and an empty trace list is indistinguishable from an absent one), so
-    // the two cooked traces are byte-identical.
-    let (without, module, _keep_without) = run_caught(None);
-    let (empty, module_b, _keep_empty) = run_caught(Some(StackTrace::new()));
-    assert!(
-        cmp(without, empty, &module.atom_table).is_eq(),
-        "an empty supplied trace must be byte-identical to no supplied trace"
-    );
-    assert!(
-        cmp(without, empty, &module_b.atom_table).is_eq(),
-        "the two fixtures agree under either module's atom table"
-    );
-
-    // ... and both are the `raise_snapshot`-derived single raising frame (`run/0`),
-    // proving the empty case takes the derivation path. For a supplied empty trace the
-    // oracle keeps `[]` instead; that value is out of this engine's reach until
-    // `beam_common::Raise` carries the discriminator (see the doc comment above and
-    // the crate `CONTEXT.md` §Known Issues entry).
+fn an_empty_supplied_term_cooks_the_empty_list_where_an_absent_one_derives_frames() {
+    // Row: nothing supplied ⇒ the derived two-item trace.
+    let (absent, module, _keep_absent) = run_caught_term(None);
     let mut build = MinimalContext::new();
-    let snapshot = expected_snapshot(&mut build, &module);
-    for (label, cooked) in [("no trace", without), ("empty trace", empty)] {
-        assert!(
-            cmp(cooked, snapshot, &module.atom_table).is_eq(),
-            "{label}: the cooked S must stay the snapshot-derived trace: got {cooked:?}"
-        );
-    }
+    let derived = expected_cooked(&mut build, &module);
+    assert!(
+        cmp(absent, derived, &module.atom_table).is_eq(),
+        "with no supplied trace the cooked S is the derived list: got {absent:?}"
+    );
+    // Row: `erlang:raise(error, boom, [])` ⇒ `[]`.
+    let (empty, module_b, _keep_empty) = run_caught_term(Some(NIL));
+    assert!(
+        is_nil(empty),
+        "a supplied [] cooks [], not derived frames: got {empty:?}"
+    );
+    assert!(
+        !cmp(empty, absent, &module_b.atom_table).is_eq(),
+        "the two raise shapes must be distinguishable"
+    );
+    // Structural residual: `Raise::stacktrace == []` and no term behaves like absent.
+    let (structural, module_c, _keep_structural) = run_caught(Some(StackTrace::new()));
+    let mut build_c = MinimalContext::new();
+    let derived_c = expected_cooked(&mut build_c, &module_c);
+    assert!(
+        cmp(structural, derived_c, &module_c.atom_table).is_eq(),
+        "a structural-only empty trace still derives frames (documented residual): \
+         got {structural:?}"
+    );
 }
-
 // ===========================================================================
 // 3. A supplied frame naming an atom the module cannot intern is a typed error
 // ===========================================================================
@@ -417,6 +470,65 @@ fn a_supplied_frame_naming_an_unknown_atom_is_a_typed_error() {
         }
         other => panic!("expected a typed unsupported for the unknown atom, got {other:?}"),
     }
+}
+
+// ===========================================================================
+// 3b. A supplied frame naming an atom only the LIVE namespace knows still cooks
+// ===========================================================================
+
+/// A `Module` whose **load-time snapshot** cannot name a frame's atoms still cooks
+/// the supplied frames when the host's live namespace can — the Khepri/ranch shape.
+///
+/// `proc_lib`/`gen_server`/supervisors re-raise a captured trace with
+/// `erlang:raise(C,R,S)`; the re-raising module (a supervisor) never mentions the
+/// frames' modules, so its snapshot cannot name them, while the runtime's ONE live
+/// atom namespace (interned when those modules were loaded) can. The oracle echoes
+/// such a trace verbatim — `build_stacktrace`'s `is_raised_exc` branch returns the
+/// supplied list with no atom resolution at all
+/// (`../../erts/emulator/beam/beam_common.c:1219-1223`) — so declining here
+/// destroyed the crash report instead of reporting it.
+#[test]
+fn a_supplied_frame_naming_an_atom_the_live_namespace_knows_is_cooked() {
+    let mut frame = StackFrame::new("ranch_acceptors_sup", "init", 1);
+    frame.location = None;
+    let mut trace = StackTrace::new();
+    trace.push(frame);
+
+    let (module, run_atom) = Fixture::build();
+    // The runtime's live namespace: the module's snapshot plus the names interned
+    // when the frame's own modules were loaded.
+    let mut live = module.atom_table.clone();
+    let module_atom = live.intern("ranch_acceptors_sup");
+    let function_atom = live.intern("init");
+    assert!(
+        module.atom_table.lookup("ranch_acceptors_sup").is_none(),
+        "the running module's snapshot must NOT name the frame's module, or this \
+         test would not pin the live-namespace route"
+    );
+
+    let mut ctx = MinimalContext::with_shared_atoms(live.clone());
+    ctx.set_bif_hook(Box::new(move |_, _, _, _| Err(raise_with(Some(trace.clone())))));
+    let mut machine = Machine::new();
+    let cooked = machine
+        .run_export(&module, run_atom, 0, &[], &mut ctx)
+        .expect("the live namespace names every atom the supplied frame uses");
+
+    let mut build = MinimalContext::new();
+    let item = terms::make_tuple(
+        &mut build,
+        &[
+            make_atom(module_atom),
+            make_atom(function_atom),
+            make_small(1),
+            NIL,
+        ],
+    )
+    .expect("a tuple");
+    let expected = terms::make_list(&mut build, &[item]).expect("a list");
+    assert!(
+        cmp(cooked, expected, &live).is_eq(),
+        "the cooked S must be [{{ranch_acceptors_sup,init,1,[]}}]: got {cooked:?}"
+    );
 }
 
 // ===========================================================================
@@ -466,19 +578,21 @@ fn the_oracle_replaces_the_derived_trace_with_the_supplied_one() {
 }
 
 #[test]
-fn the_oracle_replaces_the_derived_trace_the_engine_heuristic_would_have_produced() {
-    // Contrast: a raise that carries an EMPTY trace list. The oracle keeps `[]`, while
-    // the engine derives a trace, because `beam_common::Raise` cannot say "a trace was
-    // supplied" when that trace is empty. Only the NON-EMPTY case is cross-checked as a
-    // *shared* behaviour above; this row records the oracle's answer so the divergence
-    // is measured rather than assumed — the crate `CONTEXT.md` §Known Issues entry
-    // tracks it (owned by the sibling `beam_common` node).
-    let expr = "try erlang:raise(error, boom, []) catch _C:_R:S -> io:format(\"~w\", [S]) end, halt().";
+fn the_oracle_and_the_engine_both_keep_a_supplied_empty_trace() {
+    // The row the distinction rests on: the oracle answers `[]` for a supplied empty
+    // trace, and so does the engine — `Raise::supplied_trace` carries the term, so the
+    // empty list is no longer conflated with "nothing supplied".
+    let expr =
+        "try erlang:raise(error, boom, []) catch _C:_R:S -> io:format(\"~w\", [S]) end, halt().";
+    let (cooked, _module, _keep) = run_caught_term(Some(NIL));
+    assert!(
+        is_nil(cooked),
+        "the engine keeps a supplied empty trace: got {cooked:?}"
+    );
     match oracle(expr) {
         Some(actual) => assert_eq!(
             actual, "[]",
-            "the oracle keeps a supplied empty trace verbatim (the engine's known \
-             divergence, tracked in the crate CONTEXT.md §Known Issues)"
+            "the oracle keeps a supplied empty trace verbatim"
         ),
         None => eprintln!(
             "SKIP raise_with_trace: no system `erl` on PATH — the empty-trace oracle \

@@ -25,21 +25,42 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   - `pub type Result<T> = core::result::Result<T, BeamError>;`
   - `BeamError` variants: `BadArg`, `BadArith`, `BadArity`, `BadMatch`, `SystemLimit`,
     `Alloc(AllocFailure)`, `TermNotFound`, `Io(std::io::Error)`, `Raise(Raise)`.
-  - `Raise { class, reason, stacktrace, live_reason }` (all fields public). `live_reason:
-    Option<LiveReason>` is the **opaque live-reason slot**: `ExitReason::Structured` is a unit variant,
-    so a structured reason's live *term* travels out-of-band here instead of in the reason. Builders
-    `new`/`error`/`exit`/`throw`/`with_stacktrace`/`with_live_reason`, accessor `live_reason()`.
+  - `Raise { class, reason, stacktrace, live_reason, saved_args, error_info, supplied_trace }` (all fields public).
+    `live_reason: Option<LiveReason>` is the **opaque live-reason slot**: `ExitReason::Structured` is a
+    unit variant, so a structured reason's live *term* travels out-of-band here instead of in the
+    reason. Builders
+    `new`/`error`/`exit`/`throw`/`with_stacktrace`/`with_live_reason`/`with_saved_args`/`with_error_info`/
+    `with_supplied_trace`,
+    accessors `live_reason()`/`saved_args()`/`error_info()`/`supplied_trace()`.
+    The other two slots are the `erlang:error/2,3` raise shapes the engine renders into the
+    **innermost** stacktrace item: `saved_args: Option<LiveReason>` carries the argument **list** term
+    (`error/2,3`'s second argument, which *replaces* the caller frame's `A` slot — the C's
+    `EXC_ERROR_2` saved args; `try erlang:error(foo,[1,2]) catch C:R:S -> S end` ⇒
+    `{p,f,[1,2],[…]}`), and `error_info: Option<LiveReason>` carries the map scanned out of an
+    `{error_info, Map}` option, which is *appended* to that frame's `Location`
+    (`try erlang:error({badmap,zz},[1,2],[{error_info,#{module=>erl_stdlib_errors}}]) …` ⇒
+    `{p,g,[1,2],[{file,"p.erl"},{line,9},{error_info,#{module => erl_stdlib_errors}}]}`).
+    The fourth slot is the `erlang:raise/3` shape: `supplied_trace: Option<LiveReason>` carries the
+    third argument **verbatim** (the trace *term*), because C echoes a supplied trace unchanged
+    (`erts/emulator/beam/beam_common.c:1219-1223`) — the slot's *presence*, not its value, is the
+    discriminator, so a supplied `[]` is distinguishable from "nothing supplied".
     `Debug`+`Clone`+`PartialEq`+`Eq` are kept, but `Debug`, `PartialEq` and `Eq` are **manual**:
-    equality compares only the observable parts (`class`/`reason`/`stacktrace`) and ignores the slot,
-    and `Debug` prints the placeholder `<live reason>` for it — so the payload is never printed,
-    dereferenced or compared. `Clone` stays derived (the handle is an `Arc`).
+    equality compares only the observable parts (`class`/`reason`/`stacktrace`) and ignores all four
+    slots, and `Debug` prints the placeholders `<live reason>`, `<saved args>`, `<error info>` and
+    `<supplied trace>` — so no payload is ever printed, dereferenced or compared. `Clone` stays
+    derived (each handle is an `Arc`).
   - `LiveReason` — the opaque handle: `new<T: Any + Send + Sync + 'static>(T)`,
     `downcast_ref::<T>(&self) -> Option<&T>`, `as_any(&self) -> &dyn Any`; `Clone` + `Send` + `Sync`;
     `Debug` prints `<live reason>` (never the payload).
   - **Live-reason convention (for adopters):** a raising crate with a term representation stores its
     live reason term as an `Eterm` payload (`LiveReason::new(term)`) and attaches it with
-    `Raise::with_live_reason`; a consumer recovers it with `downcast_ref::<Eterm>()`. `beam_common`
+    `Raise::with_live_reason`; a consumer recovers it with `downcast_ref::<Eterm>()`. The three
+    term-carrying raise slots follow the same convention verbatim — `with_saved_args` carries the live
+    argument list term, `with_error_info` the live `error_info` map term and `with_supplied_trace` the
+    live supplied-trace term. `beam_common`
     names no term type — that is the adopter's payload type, not a dependency of this crate.
+    Both new slots are pure out-of-band metadata: they start as `None` from
+    `new`/`error`/`exit`/`throw`, are ignored by `PartialEq`/`Eq` and never dereferenced by `Debug`.
   - `#![forbid(unsafe_code)]` in this crate; `AtomName` wraps `Cow<'static, str>` (no interning,
     no term dependency).
 - `version` — `OTP_VERSION` ("30.0-rc0"), `ERTS_VERSION` ("17.1"), `ERTS_VSN` ("erts-17.1"),
@@ -81,7 +102,9 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
 - **No dependency on `beam_term`.** `ExitReason`/`Raise`/`AtomName` are **term-independent**; the
   raising crate maps them to live terms. A structured (tuple/list/map) reason is shown here as
   `ExitReason::Structured` (unit variant, no term), and its live term rides along out-of-band in the
-  opaque `Raise::live_reason` slot — never as a `beam_term` dependency.
+  opaque `Raise::live_reason` slot — never as a `beam_term` dependency. The `Raise::saved_args`
+  (argument list term), `Raise::error_info` (`error_info` map term) and `Raise::supplied_trace`
+  (supplied-trace term) slots are opaque for the same reason and add no dependency either.
 - **Stability:** public enums/structs are `#[non_exhaustive]`; construct via `Default`/`new` +
   builder setters. `BeamError` implements `Display` + `std::error::Error` (source = the inner
   `io::Error`); `From<std::io::Error>` is provided.
@@ -222,7 +245,11 @@ those with `node`/`serial`, which M1 keeps at `0`, so the guarantee is over *loc
     `LiveReason` round-trip + wrong-type `downcast_ref`/`as_any`; `Raise` slot survives `Clone`;
     `PartialEq` ignores the slot but still splits `class`/`reason`/`stacktrace`; `Debug` hides the
     payload and `Display` is unchanged; a slot-less raise behaves as before and a `Structured` raise
-    with a slot still yields `as_atom() == None`.
+    with a slot still yields `as_atom() == None`. The same matrix covers the two new slots
+    (`u64`/`&'static str` stand-ins — nothing here names `Eterm`): both `None` from every
+    constructor, equality ignoring them (and a differing payload still equal), survival through
+    `Clone` with a working `downcast_ref` of the right — and a miss of the wrong — type, and `Debug`
+    containing `<saved args>`/`<error info>` (absent when unset) without the payload text.
   - `version`: parse/round-trip `OTP_VERSION`/`ERTS_VERSION`, prerelease parse, `Display`, and the
     rejection of malformed input (`ParseVersionError`).
   - `config`: `Default` values, `Flavor` parse/`as_str`, `FeatureFlags::for_flavor`, builder setters,

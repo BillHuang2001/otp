@@ -589,7 +589,6 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     ) -> Result<Option<beam_loader::RecordDefinition>> {
         ExecutionContext::foreign_record_definition(self.inner, owner, name)
     }
-
     /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
     /// for that one admission point first.
     ///

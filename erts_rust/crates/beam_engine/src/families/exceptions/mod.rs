@@ -115,6 +115,7 @@ use raise::{classify_class, install_class_atom, raise_error_atom, raise_error_tu
 use stacktrace::symbolic_stacktrace;
 
 mod raise;
+pub(crate) mod bif_frame;
 pub(crate) mod callee;
 pub(crate) mod stacktrace;
 
@@ -394,7 +395,18 @@ pub(crate) fn exec(
                     // Whether the trace must be cooked at all is a **tag test** on `x(2)`:
                     // keep the answer as a `bool`, never the term, because the cooking
                     // itself reserves (and a collecting host may move every root).
-                    let cook = is_nil(read_operand(machine, ctx, &Operand::X(2))?);
+                    //
+                    // … unless the raise being handled is a **verbatim echo**
+                    // (`erlang:raise/3`'s supplied term, `Machine::raise_supplied_term_verbatim`):
+                    // then `x(2)` IS the raised trace object C re-stores in `c_p->ftrace`
+                    // (`beam_common.c:1164`), and `build_stacktrace` echoes it unchanged
+                    // (`:1219-1223`) — including the **empty** trace, whose term `[]` is
+                    // word-identical to the raw-trace word `NIL` this operand holds when
+                    // no term was landed. Cooking that would derive the *previous*
+                    // exception's frames (a supplied raise deliberately rebuilds no
+                    // snapshot), so the marker decides the arm, not the tag.
+                    let echo = machine.live_raise_supplied_term_verbatim();
+                    let cook = !echo && is_nil(read_operand(machine, ctx, &Operand::X(2))?);
                     let cooked = if cook {
                         Some(symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?)
                     } else {
@@ -417,8 +429,12 @@ pub(crate) fn exec(
                     // Nothing allocates between these reads and `raise_supplied` (it arms
                     // the one-shot latch and forwards to `throw_with_trace`, which only
                     // unwinds and writes registers), so both words stay valid to the
-                    // raise.
-                    machine.raise_supplied(class, value, supplied).map(Some)
+                    // raise. `echo` re-arms the verbatim marker on the new raise, so the
+                    // echoed shape (an argument-list `A` slot, an unknown module, or the
+                    // empty list) survives a rethrow exactly as C's trace object does.
+                    machine
+                        .raise_supplied(class, value, supplied, echo)
+                        .map(Some)
                 }
                 None => {
                     // C: an unknown class is not an error — `raw_raise` returns 1,
