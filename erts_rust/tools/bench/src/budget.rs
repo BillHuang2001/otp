@@ -628,8 +628,10 @@ pub const BUDGETS: &[Budget] = &[
                     three m19 external reps (m17's contended pass read 3.03-3.59 ms at ~38k \
                     req/s): 5 ms leaves room for a loaded host yet still flags a real latency \
                     regression; it reads the summary the cowboy row actually records \
-                    (`latency_ms` — there is no separate p99 metric) and it is sys-only because \
-                    the Rust runtime cannot boot an OTP release.",
+                    (`latency_ms` — there is no separate p99 metric), and it stays sys-only \
+                    because the row now serves the same harness under **both** runtimes but only \
+                    the sys side has a calibrated tail: a rust tail must not fail a run that has \
+                    no limit tuned for it.",
     },
     Budget {
         workload: "list_walk",

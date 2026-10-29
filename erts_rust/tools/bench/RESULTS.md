@@ -304,6 +304,11 @@ Caveats that travel with each of these rows:
   req/s **together with** `latency_ms`: p50 0.063 ms and p99 0.145 ms are an order of magnitude tighter
   than m17's contended pass (p99 3.03–3.59 ms, ~38 k req/s) and this row is the honest low-load reference.
   The build git-fetches cowlib+ranch (network).
+- **That `cowboy` figure was produced by a recipe that no longer exists**: m19 started a relx release,
+  while the row now stages one build and serves one harness (`cw_serve`) through `cowboy_serve` under
+  **both** runtimes (it is `Runtimes::Both` as of this change). The 120 k req/s above is therefore a
+  **historical sys-side reference**, not a reproduction target, and the row needs its own matched session
+  before any cross-runtime ratio is quoted — the smoke passes so far ran at a 1-min load of 31–68.
 - **`plb` drives `elixir` only** (`--no-docker`, no container runtime on this host), and **two kernels are
   excluded as untimed**: the tool reported `timeMS = 0` for **`spectral-norm/4000` and
   `spectral-norm/8000`** — its marker for a run it could not time (aborted at the input's declared
