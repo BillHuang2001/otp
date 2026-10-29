@@ -178,7 +178,7 @@ is blocked, so whether the ~1 200 not-yet-run Khepri tests would then pass is *u
 "failing". Both classes must be fixed (or worked around) before the next sweep can say more.
 
 ### RC-C — `term_to_binary`/`external_size` of a term that *contains* a local fun: typed `unsupported_local_fun`
-**1 row** (`display_tree`, 10/1) + **1 of the 2 oracle-side** rows is unrelated.
+**1 row** (`display_tree`: rust 10 passed / 1 failed, the oracle 11/0).
 
 First failing test: `display_tree:machine_overview_test/0` (test/display_tree.erl:380) →
 `khepri_machine:compute_command_size/1` (src/khepri_machine.erl:2994) →
@@ -268,8 +268,8 @@ erlc -o /tmp/probe results/khepri-diagnostics/*.erl
 <runtime> -noshell -pa /tmp/probe -eval 'iodata_probe:main(), halt(0).'
 ```
 
-Two *workarounds* were used to look behind RC-A; **neither is in this repository** (both were built
-in `$TMPDIR` and neither side of the committed sweep used them — the committed numbers are the
+The first *workaround* below was used to look behind RC-A; **it is not in this repository** (it was
+built in `$TMPDIR`, and neither side of the committed sweep used it — the committed numbers are the
 unmodified runtime):
 
 1. **dets fix (diagnostic only).** Copy `lib/stdlib/src/{dets_utils.erl,dets.hrl}` to `$TMPDIR`,
