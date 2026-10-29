@@ -101,6 +101,9 @@ expand_item(_Other, _Groups, _Seen) ->
 expand_group(Group, Groups, Seen) ->
     case lists:keyfind(Group, 1, Groups) of
         {Group, _Props, Sub} -> expand_sub(Group, Sub, Groups, Seen);
+        %% A group declared in the `ct' default-properties form `{Name, Cases}': the second
+        %% element is the case list, not a property list (a props list is never a 2-tuple).
+        {Group, Sub} when is_list(Sub) -> expand_sub(Group, Sub, Groups, Seen);
         _ -> [Group]
     end.
 

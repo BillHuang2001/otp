@@ -1,0 +1,4497 @@
+{
+  "schema": "suites/1",
+  "generated_at": 1793246779,
+  "run_command": "suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --jobs 4 --out results/stdlib",
+  "host": {
+    "loadavg_before": "1.17 8.41 29.97 2/857 5",
+    "loadavg_after": "1.56 5.70 22.41 2/865 977",
+    "nproc": 16,
+    "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
+    "oracle_version": "29/17.1.1"
+  },
+  "rust": {
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A595/erts_rust/target/release/beam_rt",
+    "sha": "ec44fa3f7fc7d8419ae32f11b23a06448b565ec7",
+    "version": "30/17.1",
+    "tier": null
+  },
+  "targets": [
+    {
+      "id": "stdlib",
+      "kind": "ct",
+      "source": {
+        "repo": "otp",
+        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A595/lib/stdlib/test",
+        "sha": "ec44fa3f7fc7d8419ae32f11b23a06448b565ec7",
+        "staged": "/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src"
+      },
+      "build": {
+        "command": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …",
+        "ok": true,
+        "reused": true,
+        "detail": "compiled 8 suites + helpers + runner with the oracle's erlc"
+      },
+      "code_path": [
+        "/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ebin",
+        "/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl"
+      ],
+      "invocations": [
+        {
+          "side": "sys",
+          "purpose": "ct binary_module_SUITE",
+          "command": "cd /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 300000, \"/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src\"), halt(0).'"
+        },
+        {
+          "side": "rust",
+          "purpose": "ct binary_module_SUITE",
+          "command": "cd /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A595/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 300000, \"/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src\"), halt(0).'"
+        },
+        {
+          "side": "build",
+          "purpose": "erlc",
+          "command": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …"
+        }
+      ],
+      "tally": {
+        "measured": 210,
+        "agree": 145,
+        "agree_fail_identical": 6,
+        "divergence": 21,
+        "oracle_only_fail": 1,
+        "rust_gap": 37,
+        "not_run": 0,
+        "sys_passed": 197,
+        "sys_failed": 12,
+        "rust_passed": 145,
+        "rust_failed": 22
+      },
+      "rows": [
+        {
+          "id": "binary_module_SUITE:ac_simd_root_skip",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:badargs",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:bin_to_list",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,exit,badresult,{binary_module_SUITE,'-random_bin_to_list/1-lc$^1/1-1-',2,...}}"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "timeout"
+          },
+          "verdict": "agree-fail-identical",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:check_no_invalid_read_bug",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:copy",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,exit,mismatch,{binary_module_SUITE,random_copy,1,...}}"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,exit,mismatch,{binary_module_SUITE,random_copy,1,...}}"
+          },
+          "verdict": "agree-fail-identical",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:doctests",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{1,errors},{ct_doctest,run_module_docs,3,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:encode_decode",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,undef,{binref,encode_unsigned,[...],...}}"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,undef,{binref,encode_unsigned,[...],...}}"
+          },
+          "verdict": "agree-fail-identical",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:guard",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:hex_encoding",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:interesting",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,do_interesting,1,...}}"
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:join",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:list_to_bin",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,undef,{random_iolist,run,[...],...}}"
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:longest_common_trap",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:parts",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,'-random_parts/1-lc$^1/1-1-',2,...}}"
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:random_ref_comp",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,exit,mismatch,{binary_module_SUITE,do_match_comp,2,...}}"
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:random_ref_fla_comp",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,exit,mismatch,{binary_module_SUITE,do_random_first_comp,2,...}}"
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:random_ref_sr_comp",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,exit,mismatch,{binary_module_SUITE,do_split_comp,3,...}}"
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:referenced",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:scope_return",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the rust runtime's output"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "dict_SUITE:create",
+          "suite": "dict_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "dict_SUITE:doctests_dict",
+          "suite": "dict_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "dict_SUITE:doctests_gb_trees",
+          "suite": "dict_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "dict_SUITE:doctests_orddict",
+          "suite": "dict_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "dict_SUITE:iterate",
+          "suite": "dict_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "dict_SUITE:remove",
+          "suite": "dict_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "dict_SUITE:store",
+          "suite": "dict_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:append_1",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:append_2",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,system_limit,{lists,duplicate,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:doctests",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:droplast",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:dropwhile",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:enumerate",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:filter_partition",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:flatten_1",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:flatten_1_e",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:flatten_2",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:flatten_2_e",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:hof",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:join",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keymember",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keymerge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keyreplace",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keysearch_keyfind",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keysort_1",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keysort_error",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keysort_i",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keysort_rand",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keystore",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:keytake",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:member",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:merge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:otp_5939",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:otp_6023",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:otp_6606",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:otp_7230",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:reverse",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:rkeymerge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:rmerge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:rukeymerge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:rumerge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:search",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:seq_2",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:seq_2_e",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:seq_3",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:seq_3_e",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:seq_loop",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:sort_1",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:sort_2",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:sort_rand",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:sublist_2",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:sublist_2_e",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:sublist_3",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:sublist_3_e",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:subtract",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,system_limit,{lists,duplicate,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:suffix",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:takewhile",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:ukeymerge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:ukeysort_1",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:ukeysort_error",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:ukeysort_i",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:ukeysort_rand",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:umerge",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:uniq_1",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:uniq_2",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:usort_1",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:usort_2",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:usort_rand",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip3_fail",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip3_pad",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip3_trim",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip_fail",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip_pad",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip_trim",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip_unzip",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zip_unzip3",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith3",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith3_fail",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith3_pad",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith3_trim",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith_fail",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith_pad",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:zipwith_trim",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "lists_SUITE:error_info",
+          "suite": "lists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "error",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "case missing from the oracle's output"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,'unsupported: erlang:system_info(snifs): this runtime publishes no static NIF table',{erlang,system_info,[...],...}}"
+          },
+          "verdict": "oracle-only-fail",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:doctests",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_filter_2",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_filtermap_2",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_fold_3",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_foreach_2",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_from_keys",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_from_keys_check_trapping",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_from_keys_kill_process",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_from_list_check_trapping",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_from_list_kill_process",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_get_3",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_groups_from_list",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_intersect",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_intersect_with",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_iterator_1",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_iterator_2",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_iterator_valid",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_keys_kill_process",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_keys_trapping",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_map_2",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_merge_opt",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_merge_with",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_order_consistency",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_put_opt",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_size_1",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_update_with_3",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_update_with_4",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_values_kill_process",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_values_trapping",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_with_2",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "maps_SUITE:t_without_2",
+          "suite": "maps_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "timeout",
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "detail": "suite killed after 330017 ms"
+          },
+          "verdict": "rust-gap",
+          "note": ""
+        },
+        {
+          "id": "proplists_SUITE:examples",
+          "suite": "proplists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "proplists_SUITE:map_conversion",
+          "suite": "proplists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "proplists_SUITE:map_conversion_normalize",
+          "suite": "proplists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "proplists_SUITE:pm_fold_test",
+          "suite": "proplists_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "queue_SUITE:do",
+          "suite": "queue_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "queue_SUITE:doctests",
+          "suite": "queue_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "queue_SUITE:error",
+          "suite": "queue_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "queue_SUITE:io_test",
+          "suite": "queue_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "queue_SUITE:op_test",
+          "suite": "queue_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "queue_SUITE:to_list",
+          "suite": "queue_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:casefold",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:cd_gc",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:centre",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:chars",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:chomp",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:chr_rchr",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:copies",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:doctests",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:equal",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:find",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:is_empty",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:jaro_similarity",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:join",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:left_right",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:len",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:length",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:lexemes",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:lowercase",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:meas",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:nth_lexeme",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:old_concat",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:old_equal",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:old_to_float",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:old_to_integer",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:old_tokens",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:pad",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:prefix",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:replace",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:reverse",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:slice",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:span_cspan",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:split",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:str_rstr",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:strip",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:sub_string",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:sub_word",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:substr",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:take",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:titlecase",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:to_float",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:to_graphemes",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:to_integer",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:to_upper_to_lower",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:trim",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:uppercase",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "string_SUITE:words",
+          "suite": "string_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:bin_is_7bit",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:binaries_errors_limit",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:category",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,system_limit,{lists,seq,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:ex_binaries_errors_utf16_big",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf16_inner_loop,6,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:ex_binaries_errors_utf16_little",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf16_inner_loop,6,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:ex_binaries_errors_utf32_big",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf32_inner_loop,6,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:ex_binaries_errors_utf32_little",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf32_inner_loop,6,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:ex_binaries_errors_utf8",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,'-ex_binaries_errors_utf8/1-lc$^1/1-1-',6,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:exceptions",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:huge_illegal_code_points",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:incomplete_utf32_to_latin1",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:is_id",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
+          },
+          "verdict": "agree-fail-identical",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:is_whitespace",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
+          },
+          "verdict": "agree-fail-identical",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:latin1",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:normalize",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:random_lists",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,undef,{random_iolist,run,[...],...}}"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+          },
+          "verdict": "agree-fail-identical",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:roundtrips",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:utf16_illegal_sequences_bif",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "unicode_SUITE:utf8_illegal_sequences_bif",
+          "suite": "unicode_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        }
+      ],
+      "notes": [
+        "drive (identical on both sides): `ct_runner:run('{suite}', {timeout_ms}, \"{data_root}\"), halt(0).`",
+        "each case runs in its own `spawn_monitor` with a per-case timeout; `init_per_group`/`end_per_group`/`init_per_testcase` hooks are NOT executed",
+        "cases that fail identically on both sides (missing `ct` config/data dirs, group-hook dependencies) are `agree-fail-identical`: excluded from both numerators, never counted as passes",
+        "per-case timeout: 300 s",
+        "binary_module_SUITE: 19 cases — sys 10/9 pass/fail, rust 3/4 pass/fail",
+        "dict_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail",
+        "lists_SUITE: 78 cases — sys 77/0 pass/fail, rust 75/3 pass/fail",
+        "maps_SUITE: 31 cases — sys 31/0 pass/fail, rust 0/0 pass/fail",
+        "maps_SUITE: rust-side suite failure: suite killed after 330017 ms",
+        "proplists_SUITE: 4 cases — sys 4/0 pass/fail, rust 4/0 pass/fail",
+        "queue_SUITE: 6 cases — sys 6/0 pass/fail, rust 6/0 pass/fail",
+        "string_SUITE: 46 cases — sys 46/0 pass/fail, rust 46/0 pass/fail",
+        "unicode_SUITE: 19 cases — sys 16/3 pass/fail, rust 4/15 pass/fail"
+      ]
+    }
+  ]
+}
