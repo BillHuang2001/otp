@@ -1,0 +1,14 @@
+differential gate: total=3469 agree=3465 mismatch=0 unsupported=1 skipped=0 oracle_drift=3 (report /tmp/genesis/final/sweep-merged.json)
+report ratchet counters (the report's own view):   gaps allowed=1 unauthorized=0 stale=0; oracle drift allowed=3 unauthorized=0 stale=0
+live re-classification against the allowlists here: gaps allowed=1 unauthorized=0 stale=0; oracle drift allowed=3 unauthorized=0 stale=0
+judged counters (per-counter max — these drive the exit code): mismatch=0; gaps allowed=1 unauthorized=0 stale=0; oracle drift allowed=3 unauthorized=0 stale=0
+non-agreeing cases:
+  oracle_drift boot_extra/system_info_version_is_frozen_17_1
+  oracle_drift nif_abi/system_info_frozen_fields
+  oracle_drift system_info/version
+  unsupported wire/new_fun_ext_encode
+recorded oracle drift:
+  boot_extra/system_info_version_is_frozen_17_1
+  nif_abi/system_info_frozen_fields
+  system_info/version
+gate: PASS — every case agreed or is a recorded capability gap or oracle drift (tolerated 3 recorded oracle drift(s)); both ratchets are fresh (exit 0)

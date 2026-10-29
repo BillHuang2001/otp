@@ -1,0 +1,571 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (erts_rust/target/debug/deps/beam_loader-043ae5fa3eee6f1d)
+
+running 297 tests
+test checksum::tests::a_real_fixture_digests_deterministically ... ok
+test checksum::tests::only_the_significant_chunks_are_digested ... ok
+test checksum::tests::rfc1321_vectors ... ok
+test chunk::atom::tests::count_overflow_is_rejected ... ok
+test checksum::tests::corrupt_funtab_is_rejected ... ok
+test checksum::tests::the_obsolete_atom_chunk_is_digested_only_when_present ... ok
+test checksum::tests::chunk_order_is_fixed_and_concatenated ... ok
+test checksum::tests::funtab_zero_entries_is_valid_and_digests_its_count ... ok
+test chunk::atom::tests::an_atom_name_longer_than_the_byte_limit_is_rejected ... ok
+test checksum::tests::funtab_olduniq_is_forced_to_zero ... ok
+test chunk::atom::tests::missing_count_is_rejected ... ok
+test checksum::tests::md5_handles_every_padding_boundary ... ok
+test chunk::atom::tests::parses_long_form_lengths ... ok
+test chunk::atom::tests::parses_short_form_lengths ... ok
+test checksum::tests::duplicate_ids_keep_the_first ... ok
+test checksum::tests::streamed_digest_equals_an_independently_built_concatenation ... ok
+test chunk::atom::tests::an_empty_atom_table_is_rejected ... ok
+test chunk::atom::tests::an_atom_name_longer_than_the_character_limit_is_rejected ... ok
+test chunk::classify::tests::an_unrecognized_id_is_not_classified ... ok
+test chunk::classify::tests::classes_have_distinct_labels ... ok
+test checksum::tests::funtab_contributes_nothing_when_absent_or_empty ... ok
+test chunk::classify::tests::every_installed_corpus_id_is_classified ... ok
+test chunk::classify::tests::the_table_has_no_duplicate_ids ... ok
+test chunk::atom::tests::empty_atom_name_is_allowed ... ok
+test chunk::code::tests::a_max_opcode_above_the_roster_is_rejected ... ok
+test chunk::atom::tests::truncated_atom_is_rejected ... ok
+test chunk::code::tests::a_max_opcode_below_swap_is_rejected ... ok
+test chunk::atom::tests::non_utf8_atom_is_rejected ... ok
+test chunk::atom::tests::truncated_long_form_length_is_rejected ... ok
+test chunk::code::tests::head_size_below_minimum_is_rejected ... ok
+test chunk::code::tests::head_size_running_past_the_chunk_is_rejected ... ok
+test chunk::code::tests::empty_stream_is_allowed ... ok
+test chunk::code::tests::larger_head_size_skips_extra_bytes ... ok
+test chunk::code::tests::nonzero_format_number_is_rejected ... ok
+test chunk::code::tests::parses_a_valid_header ... ok
+test chunk::code::tests::the_max_opcode_boundaries_are_inclusive ... ok
+test chunk::code::tests::truncated_header_is_rejected ... ok
+test chunk::line::tests::a_negative_line_number_is_rejected ... ok
+test chunk::line::tests::illegal_item_tag_is_rejected ... ok
+test chunk::line::tests::non_utf8_file_name_is_rejected ... ok
+test chunk::line::tests::nonzero_version_is_ignored ... ok
+test chunk::line::tests::out_of_range_name_index_is_rejected ... ok
+test chunk::line::tests::parses_a_line_table_without_file_names ... ok
+test chunk::line::tests::stream_with_fewer_tag_i_items_than_item_count_is_rejected ... ok
+test chunk::line::tests::tag_a_items_do_not_count_toward_item_count ... ok
+test chunk::line::tests::tag_a_sets_the_current_file_index ... ok
+test chunk::line::tests::truncated_header_is_rejected ... ok
+test chunk::line::tests::truncated_item_stream_is_rejected ... ok
+test chunk::line::tests::zero_items_yields_only_the_undefined_location ... ok
+test chunk::literal::tests::missing_uncompressed_size_is_rejected ... ok
+test chunk::literal::tests::compressed_empty_table_round_trips ... ok
+test chunk::literal::tests::the_framing_carries_payloads_that_are_not_terms ... ok
+test chunk::literal::tests::zero_literals_is_allowed ... ok
+test chunk::literal::tests::compressed_chunk_parses_to_the_same_records ... ok
+test chunk::literal::tests::uncompressed_size_disagreeing_with_the_inflated_length_is_rejected ... ok
+test chunk::literal::tests::corrupt_compressed_stream_is_rejected ... ok
+test chunk::literal::tests::every_truncation_of_a_verbatim_chunk_is_a_typed_error ... ok
+test chunk::literal::tests::declared_size_over_the_decompress_bound_is_rejected ... ok
+test chunk::literal::tests::negative_count_inside_a_compressed_table_is_rejected ... ok
+test chunk::literal::tests::negative_count_is_rejected ... ok
+test chunk::literal::tests::negative_literal_size_is_rejected ... ok
+test chunk::literal::tests::parses_literal_records ... ok
+test chunk::literal::tests::truncated_literal_inside_a_compressed_table_is_rejected ... ok
+test chunk::literal::tests::truncated_literal_is_rejected ... ok
+test chunk::record::tests::a_negative_field_count_is_rejected ... ok
+test chunk::record::tests::a_negative_record_count_is_rejected ... ok
+test chunk::record::tests::a_non_atom_record_name_is_rejected ... ok
+test chunk::record::tests::a_truncated_payload_is_rejected ... ok
+test chunk::record::tests::a_wrong_opcode_is_rejected ... ok
+test chunk::literal::tests::compressed_chunk_with_a_large_repetitive_payload_round_trips ... ok
+test chunk::record::tests::an_export_flag_that_is_not_true_or_false_is_rejected ... ok
+test chunk::record::tests::an_unknown_z_sub_tag_is_rejected ... ok
+test chunk::record::tests::an_odd_field_list_length_is_rejected ... ok
+test chunk::record::tests::an_unsupported_default_tag_is_rejected ... ok
+test chunk::record::tests::distinguishes_an_integer_zero_default_from_an_absent_default ... ok
+test chunk::record::tests::parses_a_record_with_every_default_encoding ... ok
+test chunk::record::tests::parses_a_record_with_no_fields ... ok
+test chunk::record::tests::parses_an_empty_record_table ... ok
+test chunk::record::tests::the_records_are_true_or_false ... ok
+test chunk::table::tests::missing_count_is_rejected ... ok
+test chunk::table::tests::negative_counts_are_rejected ... ok
+test chunk::table::tests::parses_exports ... ok
+test chunk::table::tests::parses_funs ... ok
+test chunk::table::tests::parses_imports ... ok
+test chunk::table::tests::parses_locals_like_exports ... ok
+test chunk::record::tests::a_non_zero_version_yields_no_records ... ok
+test chunk::table::tests::partial_fun_entry_is_rejected ... ok
+test chunk::table::tests::short_tables_are_rejected ... ok
+test chunk::table::tests::zero_entries_is_allowed ... ok
+test chunk::tests::missing_atom_chunk_is_rejected ... ok
+test chunk::types::tests::a_bounded_any_entry_is_rejected ... ok
+test chunk::types::tests::a_unit_without_a_bitstring_union_is_rejected ... ok
+test chunk::types::tests::missing_version_is_rejected ... ok
+test chunk::types::tests::parses_the_oracle_type_table ... ok
+test chunk::tests::missing_code_chunk_is_rejected ... ok
+test chunk::tests::missing_import_or_export_table_is_rejected ... ok
+test chunk::tests::missing_locals_chunk_yields_an_empty_table ... ok
+test chunk::tests::parses_the_oracle_fixture ... ok
+test chunk::types::tests::a_bound_without_a_numeric_union_is_rejected ... ok
+test chunk::types::tests::a_first_entry_that_is_not_the_any_type_is_rejected ... ok
+test chunk::types::tests::an_empty_type_word_is_rejected ... ok
+test chunk::types::tests::negative_count_is_rejected ... ok
+test chunk::types::tests::parses_upper_bound_and_unit ... ok
+test chunk::types::tests::truncated_entry_is_rejected ... ok
+test chunk::types::tests::unsupported_version_falls_back ... ok
+test chunk::types::tests::version_3_bit_layout ... ok
+test chunk::types::tests::version_3_decodes_like_version_4 ... ok
+test chunk::types::tests::version_3_is_accepted ... ok
+test chunk::types::tests::zero_count_is_rejected ... ok
+test container::tests::a_chunk_whose_padding_does_not_fit_the_form_is_rejected ... ok
+test container::tests::a_form_that_ends_inside_a_chunk_is_rejected ... ok
+test container::tests::bad_form_type_is_rejected ... ok
+test container::tests::empty_chunk_directory_is_valid ... ok
+test container::tests::form_length_larger_than_file_is_rejected ... ok
+test container::tests::form_length_smaller_than_the_form_type_is_rejected ... ok
+test container::tests::incomplete_chunk_header_is_ignored_when_it_lies_past_the_form ... ok
+test container::tests::parses_a_single_chunk ... ok
+test container::tests::parses_multiple_chunks_and_skips_padding ... ok
+test decode::tests::allocation_entry_bounds_the_count_and_rejects_a_bad_kind ... ok
+test decode::tests::collapses_a_typed_register_when_types_are_a_fallback ... ok
+test decode::tests::decodes_a_static_literal ... ok
+test decode::tests::decodes_a_wide_signed_integer_operand ... ok
+test decode::tests::decodes_an_argument_list ... ok
+test decode::tests::decodes_atoms_and_the_nil_placeholder ... ok
+test decode::tests::decodes_gc_bif2_operands_in_order ... ok
+test decode::tests::decodes_is_eq_exact_and_classifies_it ... ok
+test decode::tests::decodes_move_x0_to_x1 ... ok
+test decode::tests::decodes_register_label_and_character_tags ... ok
+test decode::tests::decodes_untagged_and_signed_integers ... ok
+test decode::tests::derived_arity_table_matches_the_roster ... ok
+test decode::tests::int_code_end_terminates_an_empty_stream ... ok
+test decode::tests::keeps_the_type_index_of_a_typed_register ... ok
+test decode::tests::recovers_the_c_word_total_from_an_allocation_list ... ok
+test decode::tests::rejects_a_float_register_index_at_or_past_max_reg ... ok
+test decode::tests::rejects_a_label_index_at_or_past_label_count ... ok
+test decode::tests::rejects_a_label_inside_an_argument_list_that_is_out_of_range ... ok
+test decode::tests::rejects_a_non_i_operand_wider_than_a_machine_word ... ok
+test container::tests::bad_magic_is_rejected ... ok
+test container::tests::chunk_size_overrunning_the_file_is_rejected ... ok
+test container::tests::find_returns_the_first_duplicate ... ok
+test container::tests::incomplete_chunk_header_inside_the_form_is_rejected ... ok
+test container::tests::truncated_preamble_is_rejected ... ok
+test decode::tests::allocation_entry_counts_funs_and_records_at_two_words_each ... ok
+test decode::tests::decodes_a_float_register ... ok
+test decode::tests::decodes_an_allocation_list_with_heap_words ... ok
+test decode::tests::rejects_a_register_index_at_or_past_max_reg ... ok
+test decode::tests::rejects_a_truncated_argument_list ... ok
+test decode::tests::rejects_a_non_normalized_wide_integer_operand ... ok
+test decode::tests::rejects_a_typed_register_that_is_not_a_register ... ok
+test decode::tests::rejects_an_allocation_list_longer_than_the_four_kinds ... ok
+test decode::tests::rejects_an_argument_list_that_is_not_the_last_operand ... ok
+test decode::tests::rejects_an_invalid_allocation_kind ... ok
+test decode::tests::rejects_an_opcode_above_max_opcode ... ok
+test decode::tests::rejects_an_opcode_with_no_roster_entry ... ok
+test decode::tests::rejects_an_out_of_range_atom_index ... ok
+test decode::tests::rejects_the_obsolete_and_unknown_z_sub_tags ... ok
+test decode::tests::test_kind_is_none_for_every_other_opcode ... ok
+test decode::tests::test_kind_maps_the_is_family ... ok
+test decode::tests::rejects_a_stream_that_never_reaches_int_code_end ... ok
+test labels::tests::a_clone_is_a_different_image ... ok
+test decode::tests::rejects_a_truncated_operand ... ok
+test decode::tests::rejects_a_type_index_at_or_past_the_type_count ... ok
+test decode::tests::rejects_a_zero_opcode_byte ... ok
+test labels::tests::imports_answer_only_for_their_own_image ... ok
+test labels::tests::two_images_get_two_maps ... ok
+test labels::tests::one_image_is_built_once_for_every_consumer ... ok
+test labels::tests::retained_bytes_counts_the_table ... ok
+test lower::fuse::tests::fuse_in_place_keeps_the_allocation_and_only_lowers_the_length ... ok
+test lower::fuse::tests::fuse_in_place_keeps_the_allocation_when_nothing_fuses ... ok
+test literal::tests::an_empty_literal_table_yields_an_empty_area ... ok
+test literal::tests::the_capacity_estimate_grows_with_the_payload ... ok
+test lower::fuse::tests::fuse_and_fuse_in_place_agree_on_a_mixed_body ... ok
+test lower::fuse::tests::fuses_an_adjacent_deallocate_return_pair ... ok
+test lower::fuse::tests::fuses_every_pair_in_a_multi_function_body ... ok
+test lower::fuse::tests::leaves_a_deallocate_at_the_end_of_the_stream_untouched ... ok
+test lower::fuse::tests::leaves_a_deallocate_not_followed_by_return_untouched ... ok
+test lower::fuse::tests::leaves_a_lone_deallocate_untouched ... ok
+test lower::fuse::tests::leaves_a_lone_return_untouched ... ok
+test lower::fuse::tests::never_fuses_across_a_label ... ok
+test literal::tests::nested_terms_are_decoded_into_the_one_arena ... ok
+test lower::group::tests::body_shape_counts_labels_and_fused_pairs_in_one_pass ... ok
+test lower::group::tests::build_blocks_allocates_its_blocks_exactly ... ok
+test lower::group::tests::build_blocks_of_an_empty_body_is_empty ... ok
+test lower::group::tests::build_blocks_splits_at_every_label ... ok
+test lower::group::tests::build_blocks_yields_nothing_without_labels ... ok
+test lower::group::tests::checked_grouping_rejects_a_duplicate_label_across_two_functions ... ok
+test lower::group::tests::checked_grouping_rejects_a_duplicate_label_inside_one_body ... ok
+test lower::group::tests::checked_grouping_rejects_a_label_at_or_above_label_count ... ok
+test lower::group::tests::checked_grouping_rejects_a_line_reference_past_the_item_table ... ok
+test lower::group::tests::checked_grouping_rejects_a_label_definition_of_zero ... ok
+test lower::group::tests::checked_grouping_rejects_an_import_index_past_the_import_table ... ok
+test lower::group::tests::emit_fused_fuses_adjacent_pairs_and_keeps_a_lone_deallocate ... ok
+test lower::group::tests::checked_grouping_yields_the_same_code_blocks_and_labels_as_the_unchecked_one ... ok
+test lower::group::tests::emit_fused_reports_the_first_unlowerable_instruction ... ok
+test lower::group::tests::group_functions_allocates_each_body_exactly ... ok
+test lower::group::tests::group_functions_cuts_at_func_info_and_keeps_both_labels ... ok
+test lower::group::tests::group_functions_fuses_each_body_and_keeps_its_blocks ... ok
+test lower::group::tests::group_functions_rejects_a_func_info_not_immediately_after_its_label ... ok
+test lower::group::tests::group_functions_rejects_a_func_info_without_a_label ... ok
+test lower::group::tests::group_functions_rejects_a_func_info_without_an_entry_label ... ok
+test lower::group::tests::group_functions_rejects_a_stream_without_func_info ... ok
+test lower::group::tests::group_functions_rejects_an_unlowerable_instruction_before_the_first_function ... ok
+test lower::group::tests::group_functions_rejects_an_unlowerable_instruction_inside_a_body ... ok
+test lower::group::tests::group_functions_reports_the_first_unlowerable_instruction_of_a_body ... ok
+test literal::tests::a_zlib_compressed_litt_chunk_round_trips_into_terms ... ok
+test literal::tests::decodes_a_hand_built_payload ... ok
+test lower::group::tests::the_checked_route_validates_a_fused_instruction_once ... ok
+test lower::group::tests::the_duplicate_rule_of_the_checked_route_applies_without_a_code_header ... ok
+test literal::tests::decodes_several_literals_in_index_order ... ok
+test lower::group::tests::the_walk_sizes_a_body_ending_in_a_trailing_label_and_skips_the_prefix ... ok
+test lower::instr::tests::a_plain_integer_need_lowers_to_words ... ok
+test lower::instr::tests::a_structurally_wrong_need_operand_is_rejected ... ok
+test literal::tests::a_malformed_payload_is_a_typed_error ... ok
+test lower::instr::tests::allocate_and_allocate_heap_accept_both_need_forms ... ok
+test lower::instr::tests::an_allocation_list_need_lowers_to_alloc_preserving_entries ... ok
+test lower::instr::tests::heap_need_words_recovers_the_total ... ok
+test lower::instr::tests::is_any_native_record_lowers_to_its_typed_variant ... ok
+test lower::instr::tests::is_any_native_record_rejects_a_wrongly_typed_operand ... ok
+test literal::tests::an_exhausted_decode_is_retried_on_a_larger_heap ... ok
+test literal::tests::every_truncation_of_a_payload_is_a_typed_error ... ok
+test lower::instr::tests::native_record_family_lowers_to_typed_variants ... ok
+test literal::tests::a_payload_beyond_the_bounded_retries_reports_the_allocation_failure ... ok
+test lower::instr::tests::native_record_family_rejects_wrongly_typed_operands ... ok
+test lower::tests::a_bs_create_bin_with_a_non_integer_non_alloc_alloc_operand_is_rejected ... ok
+test lower::tests::a_fun_descriptor_with_a_known_label_is_lowered ... ok
+test lower::tests::a_fun_descriptor_with_an_unknown_label_is_rejected ... ok
+test lower::tests::a_locals_entry_is_validated_like_an_export ... ok
+test lower::instr::tests::the_coverage_fixture_reports_both_test_heap_forms ... ok
+test lower::instr::tests::the_committed_fixtures_load_end_to_end ... ok
+test lower::tests::a_locals_entry_with_an_out_of_range_atom_is_rejected ... ok
+test lower::tests::a_malformed_literal_fails_the_load ... ok
+test lower::tests::a_move_with_missing_operands_is_rejected ... ok
+test lower::tests::a_named_variant_with_a_structurally_wrong_operand_is_rejected ... ok
+test lower::tests::a_test_instruction_with_a_non_label_failure_operand_is_rejected ... ok
+test lower::tests::a_wide_integer_inside_an_argument_list_is_rewritten ... ok
+test lower::tests::a_wide_integer_operand_becomes_a_static_literal_end_to_end ... ok
+test lower::tests::a_wide_integer_operand_becomes_a_synthesized_static_literal ... ok
+test lower::tests::big_integer_payload_uses_the_large_form_for_a_wide_magnitude ... ok
+test lower::tests::lowers_apply_and_make_fun3 ... ok
+test lower::tests::lowers_bs_create_bin_with_an_allocation_list_alloc ... ok
+test lower::tests::lowers_call_fun_and_call_fun2 ... ok
+test lower::tests::lowers_get_tuple_element_and_select_tuple_arity ... ok
+test lower::tests::lowers_has_map_fields_and_get_map_elements ... ok
+test lower::tests::lowers_jump_init_yregs_and_put_tuple2 ... ok
+test lower::tests::lowers_put_map_assoc_and_put_map_exact ... ok
+test lower::tests::lowers_set_tuple_element_in_file_operand_order ... ok
+test lower::tests::lowers_the_bif_family ... ok
+test lower::tests::lowers_the_binary_match_instructions ... ok
+test lower::tests::lowers_the_exception_instructions ... ok
+test lower::tests::lowers_the_float_instructions ... ok
+test lower::tests::lowers_the_line_markers ... ok
+test lower::tests::lowers_the_list_instructions ... ok
+test lower::tests::lowers_the_module_markers ... ok
+test lower::tests::lowers_the_receive_instructions ... ok
+test lower::tests::lowers_the_utf_and_binary_building_instructions ... ok
+test lower::tests::lowers_update_record ... ok
+test lower::tests::rejects_a_static_literal_index_the_file_does_not_define ... ok
+test lower::tests::rejects_a_static_literal_inside_an_argument_list_that_is_out_of_range ... ok
+test lower::tests::rewriting_wide_integers_is_a_no_op_without_one ... ok
+test lower::tests::the_coverage_fixture_resolves_its_fun_descriptor ... ok
+test lower::tests::the_coverage_fixture_resolves_its_static_literals ... ok
+test lower::tests::the_empty_literal_table_of_the_slice_fixture_yields_an_empty_area ... ok
+test lower::tests::the_literal_bound_is_checked_before_synthesized_literals_are_appended ... ok
+test lower::validate::tests::a_zero_label_count_skips_the_label_range_rule ... ok
+test lower::validate::tests::accepts_a_well_formed_stream ... ok
+test lower::validate::tests::an_absent_line_table_skips_the_line_reference_rule ... ok
+test lower::validate::tests::rejects_a_func_info_arity_above_the_runtime_maximum ... ok
+test lower::validate::tests::rejects_a_function_count_that_disagrees_with_the_header ... ok
+test lower::validate::tests::rejects_a_label_definition_at_or_above_label_count ... ok
+test lower::validate::tests::rejects_a_label_definition_of_zero ... ok
+test chunk::literal::tests::every_truncation_of_a_compressed_chunk_is_a_typed_error ... ok
+test lower::validate::tests::rejects_a_line_reference_past_the_item_table ... ok
+test lower::tests::unmodelled_opcodes_round_trip_as_generic ... ok
+test lower::validate::tests::rejects_every_import_reference_past_the_import_table ... ok
+test lower::validate::tests::a_fun_label_of_zero_is_not_a_defined_label ... ok
+test lower::validate::tests::a_label_count_too_large_to_index_falls_back_to_the_tree ... ok
+test lower::validate::tests::a_label_space_too_large_to_index_still_answers_membership ... ok
+test lower::validate::tests::a_literal_bound_failure_wins_over_a_wide_integer_count ... ok
+test lower::validate::tests::the_duplicate_rule_applies_without_a_code_header ... ok
+test lower::validate::tests::the_indexed_bound_is_the_guarded_size ... ok
+test lower::validate::tests::the_label_table_indexes_a_declared_space_and_rejects_a_repeat ... ok
+test lower::validate::tests::the_module_level_check_reads_each_functions_own_arity ... ok
+test lower::validate::tests::the_operand_walk_counts_nested_wide_integers ... ok
+test opcode::tests::opcode_roster_bounds_match_the_table ... ok
+test raw::tests::a_spilled_list_keeps_growing_and_is_mutable_through_its_prefix ... ok
+test raw::tests::a_wider_operand_list_spills_and_preserves_order_and_length ... ok
+test raw::tests::an_out_of_range_inline_len_is_clamped ... ok
+test raw::tests::from_vec_inlines_up_to_the_capacity_and_keeps_a_wider_vector ... ok
+test raw::tests::raw_operands_and_raw_instr_keep_their_sizes ... ok
+test lower::validate::tests::the_operand_walk_descends_into_an_argument_list ... ok
+test lower::validate::tests::the_operand_walk_rejects_an_undefined_static_literal ... ok
+test opcode::tests::every_numbered_table_row_is_contiguous_from_one ... ok
+test raw::tests::a_raw_instr_carries_its_opcode_and_offset ... ok
+test raw::tests::an_inline_operand_list_preserves_order_and_length ... ok
+test lower::group::tests::emit_fused_agrees_with_lower_then_fuse_over_every_short_body ... ok
+test lower::validate::tests::rejects_a_duplicate_label_definition_across_functions ... ok
+test lower::group::tests::grouped_bodies_are_sized_exactly_like_the_whole_body_pass ... ok
+
+test result: ok. 297 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/bs_test_tail.rs (erts_rust/target/debug/deps/bs_test_tail-ad0de154ab08b68d)
+
+running 1 test
+test bstail_lowers_bs_test_tail2_typed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/checksum.rs (erts_rust/target/debug/deps/checksum-ba9714cdc0c3151b)
+
+running 7 tests
+test a_synthesized_image_with_a_corrupt_funtab_is_rejected_by_the_public_api ... ok
+test the_checksum_is_available_through_the_public_re_exports ... ok
+test committed_fixtures_match_the_pinned_oracle_digests ... ok
+test a_default_module_has_a_zero_checksum_and_a_loaded_one_does_not ... ok
+test the_loaded_checksum_equals_the_raw_chunk_digest ... ok
+test committed_fixtures_match_the_live_oracle ... ok
+test installed_otp_modules_match_the_live_oracle ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+
+     Running tests/chunks.rs (erts_rust/target/debug/deps/chunks-f8e4db2a999a0b56)
+
+running 4 tests
+test the_classification_table_matches_the_documented_categories ... ok
+test every_corpus_chunk_id_is_classified ... ok
+test the_attr_chunk_is_a_faithful_raw_term ... ok
+test the_compile_info_and_meta_chunks_are_faithful_raw_terms ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s
+
+     Running tests/container.rs (erts_rust/target/debug/deps/container-4b8e8bd3ebb2775f)
+
+running 12 tests
+test code_header_matches_the_oracle ... ok
+test atoms_are_parsed_in_wire_order ... ok
+test locals_table_is_parsed_from_the_loct_chunk ... ok
+test line_table_matches_the_oracle ... ok
+test a_container_without_a_loct_chunk_has_no_locals ... ok
+test the_debug_chunk_ids_are_distinct_and_recognized ... ok
+test type_table_matches_the_oracle ... ok
+test exports_are_parsed_in_file_order ... ok
+test data_chunks_are_captured ... ok
+test container_chunk_directory_is_the_oracle_sequence ... ok
+test imports_are_parsed_in_file_order ... ok
+test container_find_locates_the_atom_chunk ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fixtures_are_path_free.rs (erts_rust/target/debug/deps/fixtures_are_path_free-a9ee2f762fbd2e18)
+
+running 3 tests
+test the_scanner_finds_a_synthetic_absolute_path ... ok
+test committed_beam_fixtures_contain_no_absolute_paths ... ok
+test compressed_chunk_payloads_are_scanned_too ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fun_name.rs (erts_rust/target/debug/deps/fun_name-72104d8c7e17446e)
+
+running 1 test
+test fun_descriptor_function_is_the_funt_function_atom ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/generic_census.rs (erts_rust/target/debug/deps/generic_census-cc3820640d97cc04)
+
+running 2 tests
+test census_detects_a_residual_generic_opcode ... ok
+test compiler_emitted_opcodes_are_all_modelled ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+
+     Running tests/ir.rs (erts_rust/target/debug/deps/ir-e2a2596ec922123b)
+
+running 14 tests
+test export_lookup_returns_the_entry_label ... ok
+test every_block_starts_at_its_own_label ... ok
+test a_local_function_is_not_an_export ... ok
+test preserves_the_export_and_import_tables_in_file_order ... ok
+test lowers_module_info_1_and_ends_the_stream_with_int_code_end ... ok
+test lowers_pick_1 ... ok
+test groups_functions_with_their_two_labels ... ok
+test lowers_fib_1 ... ok
+test lowers_fib_3_with_typed_registers ... ok
+test lowers_module_info_0 ... ok
+test loads_the_code_header_and_module_name ... ok
+test preserves_the_wire_atom_table ... ok
+test decomposes_fib_3_into_label_delimited_blocks ... ok
+test lowers_add_2 ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/line_info.rs (erts_rust/target/debug/deps/line_info-f1738abd8470c433)
+
+running 2 tests
+test linecov_lowers_executable_line_typed ... ok
+test dbgline_lowers_debug_line_typed ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/literals.rs (erts_rust/target/debug/deps/literals-006eca11e44555e3)
+
+running 7 tests
+test the_committed_fixtures_cover_both_litt_forms ... ok
+test nested_literal_children_carry_the_literal_tag ... ok
+test the_fixture_covers_every_required_literal_kind ... ok
+test map_bearing_fixture_literal_is_normalized_to_erts_key_order_on_load ... ok
+test the_literal_area_words_carry_the_literal_tag ... ok
+test both_litt_forms_decode_to_identically_encoded_terms ... ok
+test installed_literal_pools_agree_with_the_oracle ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.58s
+
+     Running tests/load_cost.rs (erts_rust/target/debug/deps/load_cost-97dda4c134210c59)
+
+running 1 test
+test load_cost_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.46s
+
+     Running tests/native_record.rs (erts_rust/target/debug/deps/native_record-8552bbcc64fec967)
+
+running 2 tests
+test committed_native_records_lower_typed ... ok
+test native_record_family_never_lowers_generic_in_installed_modules ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+     Running tests/negative.rs (erts_rust/target/debug/deps/negative-fe92936fac665049)
+
+running 28 tests
+test rejects_a_bad_for1_magic ... ok
+test rejects_a_chunk_size_that_overruns_the_file ... ok
+test rejects_a_missing_atom_or_code_chunk ... ok
+test rejects_a_max_opcode_below_swap_in_a_whole_image ... ok
+test rejects_a_truncated_image ... ok
+test rejects_a_nonzero_code_format_number ... ok
+test rejects_a_max_opcode_above_the_roster_in_a_whole_image ... ok
+test rejects_a_select_tuple_arity_whose_destinations_are_not_a_list ... ok
+test rejects_a_test_heap_whose_need_is_neither_integer_nor_allocation ... ok
+test rejects_a_put_tuple2_whose_elements_are_not_a_list ... ok
+test rejects_a_truncated_header ... ok
+test rejects_a_bad_form_type ... ok
+test rejects_a_zero_opcode_byte ... ok
+test rejects_an_allocation_list_longer_than_the_four_kinds ... ok
+test rejects_an_out_of_roster_opcode_in_a_crafted_stream ... ok
+test rejects_an_argument_list_that_is_not_the_last_operand ... ok
+test rejects_a_truncated_operand ... ok
+test rejects_a_static_literal_index_the_file_does_not_define ... ok
+test rejects_a_zero_opcode_byte_in_a_crafted_stream ... ok
+test rejects_a_stream_with_no_func_info ... ok
+test rejects_an_opcode_above_max_opcode ... ok
+test rejects_an_out_of_range_atom_index ... ok
+test rejects_a_stream_that_never_reaches_int_code_end ... ok
+test rejects_an_out_of_range_type_index ... ok
+test rejects_an_out_of_range_float_register_index ... ok
+test rejects_an_out_of_range_label_index ... ok
+test rejects_an_out_of_range_x_register_index ... ok
+test rejects_an_out_of_range_y_register_index ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/negative_ir.rs (erts_rust/target/debug/deps/negative_ir-abffb9465f6f7e38)
+
+running 13 tests
+test rejects_a_duplicate_label_definition ... ok
+test rejects_a_line_index_past_the_line_table ... ok
+test rejects_an_executable_line_index_past_the_line_table ... ok
+test rejects_an_import_index_past_the_import_table ... ok
+test rejects_a_label_definition_of_zero ... ok
+test rejects_every_external_call_when_the_import_table_is_empty ... ok
+test rejects_a_fun_descriptor_with_a_zero_label ... ok
+test the_unmutated_fixtures_load ... ok
+test rejects_two_fun_descriptors_naming_the_same_label ... ok
+test rejects_a_function_count_below_the_func_info_count ... ok
+test rejects_a_function_count_above_the_func_info_count ... ok
+test rejects_a_func_info_arity_above_the_runtime_maximum ... ok
+test rejects_a_label_definition_at_the_label_count ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/negative_tables.rs (erts_rust/target/debug/deps/negative_tables-003b607361036427)
+
+running 23 tests
+test a_bounded_any_entry_is_rejected ... ok
+test a_form_shorter_than_its_last_chunk_is_rejected ... ok
+test a_chunk_that_overruns_the_form_is_rejected ... ok
+test a_missing_export_table_is_rejected ... ok
+test a_negative_export_arity_is_rejected ... ok
+test a_missing_import_table_is_rejected ... ok
+test a_form_that_does_not_hold_the_form_type_is_rejected ... ok
+test a_negative_export_label_is_rejected ... ok
+test a_negative_line_number_is_rejected ... ok
+test a_type_table_not_starting_with_the_any_type_is_rejected ... ok
+test a_type_unit_without_a_bitstring_union_is_rejected ... ok
+test a_type_bound_without_a_numeric_union_is_rejected ... ok
+test an_atom_name_longer_than_max_atom_characters_is_rejected ... ok
+test an_empty_atom_table_is_rejected ... ok
+test an_empty_type_table_is_rejected ... ok
+test an_atom_name_longer_than_max_atom_sz_limit_is_rejected ... ok
+test an_empty_type_word_is_rejected ... ok
+test an_export_arity_above_max_arg_is_rejected ... ok
+test an_import_arity_above_max_arg_is_rejected ... ok
+test the_control_type_table_loads ... ok
+test the_reassembled_fixture_is_byte_identical ... ok
+test trailing_bytes_past_the_form_are_ignored ... ok
+test a_local_table_arity_is_bounded_like_an_export ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/real_modules.rs (erts_rust/target/debug/deps/real_modules-a5d8d71b0ea53fb7)
+
+running 2 tests
+test nested_fun_literals_decode_to_their_mfa ... ok
+test loads_every_installed_otp_beam ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+
+     Running tests/records.rs (erts_rust/target/debug/deps/records-0ae589578429150a)
+
+running 16 tests
+test a_negative_record_count_is_rejected ... ok
+test a_non_atom_record_name_is_rejected ... ok
+test a_hand_built_recs_chunk_loads ... ok
+test a_non_zero_version_yields_no_records ... ok
+test a_record_count_larger_than_the_entries_is_rejected ... ok
+test a_truncated_payload_is_rejected ... ok
+test a_wrong_opcode_byte_is_rejected ... ok
+test an_export_flag_that_is_not_true_or_false_is_rejected ... ok
+test an_odd_field_list_count_is_rejected ... ok
+test the_mixed_record_reproduces_every_default_encoding ... ok
+test the_user_record_has_the_oracle_field_list ... ok
+test records_resolve_by_name_and_by_atom ... ok
+test the_empty_record_has_no_fields ... ok
+test the_four_records_are_parsed_in_declaration_order ... ok
+test the_shared_record_is_exported ... ok
+test the_live_oracle_agrees_with_the_pinned_definitions ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/widened_ir.rs (erts_rust/target/debug/deps/widened_ir-b456834bde966cda)
+
+running 15 tests
+test lowers_bs_create_bin_with_an_allocation_list_alloc ... ok
+test lowers_stack_and_heap_need_operands_in_both_encodings ... ok
+test covered_opcodes_never_fall_back_to_generic ... ok
+test lowers_the_closure_opcodes_to_typed_variants ... ok
+test lowers_the_bitstring_opcodes_to_typed_variants ... ok
+test lowers_bif2_and_type_tests_to_typed_variants ... ok
+test lowers_the_exception_opcodes_to_typed_variants ... ok
+test lowers_the_map_opcodes_to_typed_variants ... ok
+test lowers_the_float_opcodes_to_typed_variants ... ok
+test lowers_the_tuple_opcodes_to_typed_variants ... ok
+test both_oracle_fixtures_load_end_to_end ... ok
+test lowers_the_list_opcodes_to_typed_variants ... ok
+test the_slice_fixture_has_no_literals_and_no_funs ... ok
+test the_slice_fixture_still_lowers_to_its_pre_existing_variants ... ok
+test resolves_the_coverage_literals_and_fun_descriptor ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests beam_loader
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

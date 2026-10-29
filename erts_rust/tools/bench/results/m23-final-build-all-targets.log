@@ -1,0 +1,55 @@
+   Compiling libc v0.2.190
+   Compiling cfg-if v1.0.5
+   Compiling parking_lot_core v0.9.12
+   Compiling smallvec v1.16.2
+   Compiling scopeguard v1.2.0
+   Compiling beam_abi v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_abi)
+   Compiling log v0.4.34
+   Compiling beam_io v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_io)
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling once_cell v1.21.4
+   Compiling regex-syntax v0.8.11
+   Compiling pin-project-lite v0.2.17
+   Compiling lazy_static v1.5.1
+   Compiling lock_api v0.4.14
+   Compiling thread_local v1.1.10
+   Compiling sharded-slab v0.1.7
+   Compiling nu-ansi-term v0.50.3
+   Compiling tracing-core v0.1.36
+   Compiling beam_rt v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_rt)
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling tracing-log v0.2.0
+   Compiling regex-automata v0.4.18
+   Compiling syn v2.0.119
+   Compiling syn v3.0.6
+   Compiling beam_common v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_common)
+   Compiling mio v1.2.4
+   Compiling parking_lot v0.12.5
+   Compiling beam_term v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_term)
+   Compiling beam_deflate v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_deflate)
+   Compiling beam_alloc v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_alloc)
+   Compiling beam_codec v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_codec)
+   Compiling beam_gc v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_gc)
+   Compiling beam_message v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_message)
+   Compiling beam_ets v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_ets)
+   Compiling beam_process v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_process)
+   Compiling beam_loader v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_loader)
+   Compiling beam_dist v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_dist)
+   Compiling matchers v0.2.0
+   Compiling beam_engine v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_engine)
+   Compiling beam_bifs v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/crates/beam_bifs)
+   Compiling serde_derive v1.0.229
+   Compiling differential v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/tools/differential)
+   Compiling bench v0.1.0 (/home/bill/Source/otp/.genesis/workers/worker_T1_A551/erts_rust/tools/bench)
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing v0.1.44
+   Compiling tracing-subscriber v0.3.23
+    Finished `dev` profile [optimized + debuginfo] target(s) in 5m 11s
+EXIT=0
