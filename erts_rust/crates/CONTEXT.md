@@ -414,10 +414,12 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   term as an `Eterm`; `beam_engine` populates it on every raise, `beam_bifs` attaches the true reason term
   (`{badmap,M}`, `{badkey,K}`, `{case_clause,V}`, `{badrecord,T}`, `{badfield,{{M,N},K}}`, any non-atom
   `error/1,2`/`exit/1`/`throw/1`/`nif_error/1,2` argument), and `beam_rt::runner::exit_reason` renders it as
-  the uncaught reason (an atom reason stays `ExitReason::Atom` with no slot). Two sibling slots use the same
+  the uncaught reason (an atom reason stays `ExitReason::Atom` with no slot). Three sibling slots use the same
   opaque-payload convention for the *stacktrace* rather than the reason: `saved_args` (`error/2,3`'s second
-  argument verbatim) and `error_info` (the map scanned out of `error/3`'s options) — out-of-band metadata,
-  ignored by `Raise`'s `Eq`/`Debug` like `live_reason`, consumed by the engine's innermost-item renderer.
+  argument verbatim), `error_info` (the map scanned out of `error/3`'s options) and `supplied_trace` (the
+  trace **term** `erlang:raise/3` was given, echoed verbatim with no decode or atom resolution — so `[]` is
+  an empty trace, not "no trace") — out-of-band metadata, ignored by `Raise`'s `Eq`/`Debug` like
+  `live_reason`, consumed by the engine's stacktrace renderer.
   Per-node detail: `beam_common/CONTEXT.md`, `beam_bifs/CONTEXT.md`.
 - **Failed head-clause/guard terminates via `func_info`; a missing module/function is bare `undef`.** `Instr::FuncInfo`
   raises `error:function_clause` (the C's `i_func_info_IaaI`); the `undef` raise's stacktrace HEAD is the
