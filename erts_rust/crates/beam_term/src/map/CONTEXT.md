@@ -93,7 +93,7 @@ exact on every arm **except** the flat→HAMT conversion, where it is `write_map
   typed rejections (`TermError::BadMap` for a malformed node/child) happen before any write, and (c) the
   `debug_assert!(out.written() == plan.words)` a real invariant. Keep it: no arm may write while still
   able to reach a fallible check.
-- Files ~1000 lines, one responsibility each: the writer is the `cow/` cluster — `cow/mod.rs` (296 lines:
+- Files ~1000 lines, one responsibility each: the writer is the `cow/` cluster — `cow/mod.rs` (297 lines:
   the staging cursor and the two entry points), `cow/words.rs` (115: the word figures and their
   derivation), `cow/node.rs` (106: node classification), `cow/put.rs` (557: the put arm), `cow/remove.rs`
   (481: the remove arm). Grow a new arm as a new child module rather than into an existing one.
