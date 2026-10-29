@@ -1383,6 +1383,9 @@ type RowFn = fn(&BifRegistry, &mut BifContext<'_>, Eterm, Eterm, Eterm) -> Eterm
 /// This runtime's own rows, keyed exactly as [`ORACLE_MODULE`] keys them: the same
 /// calls over maps built the same way (`maps:from_list/1` over small-integer pairs, so
 /// no atom index and no literal sharing can differ).
+/// The committed `MAP_EXT` images of every writer row (see the oracle test below).
+const GOLDENS: &str = include_str!("data/maps_cow_oracle.goldens");
+
 fn our_rows(reg: &BifRegistry, ctx: &mut BifContext<'_>) -> HashMap<String, String> {
     let mut rows = HashMap::new();
     let put: RowFn = |reg, ctx, k, v, m| call(reg, ctx, "maps", "put", &[k, v, m]);
@@ -1477,52 +1480,104 @@ fn our_rows(reg: &BifRegistry, ctx: &mut BifContext<'_>) -> HashMap<String, Stri
     rows
 }
 
-/// Re-derives every writer result's `MAP_EXT` image from the live system `erl` and
-/// requires the two to agree byte for byte.
+/// Committed `MAP_EXT` images for every path-copying writer result, plus the live-oracle
+/// re-derivation of the same rows.
 ///
-/// A row that only one side produced is a failure in both directions (`HashMap`
-/// equality), so a silently missing or extra case cannot pass. Skips LOUDLY when
-/// `erlc`/`erl` is unavailable: CI's `cargo test` job has no oracle, and a test that
-/// passed silently without a comparison would be worse than a skip.
+/// The **committed** set is the leg that always runs (CI's `cargo test` job has no
+/// `erl`); the live leg then rebuilds the rows with the system `erlc`+`erl` and
+/// requires the two to agree byte for byte, skipping LOUDLY when the toolchain is
+/// absent. A row that only one side produced is a failure in both directions, so a
+/// silently missing or extra case cannot pass.
+///
+/// Regenerate the golden file after an intentional change (and re-read the diff: it is
+/// the oracle's answer, not ours):
+/// `MAPS_COW_WRITE_GOLDENS=1 erts_rust/scripts/cargo.sh test --manifest-path
+/// erts_rust/Cargo.toml -p beam_bifs --test maps_cow path_copied -- --nocapture`.
 #[test]
 fn path_copied_results_match_the_live_oracle_term_to_binary_images() {
+    let ours = run_sized(1 << 20, |reg, ctx| our_rows(reg, ctx));
+    if std::env::var_os("MAPS_COW_WRITE_GOLDENS").is_some() {
+        let mut names: Vec<&String> = ours.keys().collect();
+        names.sort();
+        let mut text = String::from(
+            "# `MAP_EXT` images of the path-copying `maps` writer results, one row per case\n\
+             # (name=hex). Regenerate with MAPS_COW_WRITE_GOLDENS=1 (see tests/maps_cow.rs).\n",
+        );
+        for name in names {
+            use std::fmt::Write as _;
+            writeln!(text, "{name}={}", ours[name]).expect("formatting into a String");
+        }
+        let path = std::path::Path::new("tests/data/maps_cow_oracle.goldens");
+        std::fs::write(path, &text).expect("write the golden file");
+        eprintln!("wrote {} rows to {}", ours.len(), path.display());
+        return;
+    }
+    let goldens = parse_goldens(GOLDENS);
+    let mut names: Vec<&String> = goldens.keys().collect();
+    names.sort();
+    for name in names {
+        let want = &goldens[name];
+        let got = ours.get(name).unwrap_or_else(|| {
+            panic!(
+                "the writer matrix produced no `{name}` row (it must produce all {})",
+                goldens.len()
+            )
+        });
+        assert_eq!(
+            got, want,
+            "`{name}`: this runtime's term_to_binary/1 image left the committed golden"
+        );
+    }
+    assert_eq!(
+        ours.len(),
+        goldens.len(),
+        "the writer matrix and the golden set must be the same size (ours: {}, goldens: {})",
+        ours.len(),
+        goldens.len()
+    );
     let Some(oracle) = compiled_module_oracle() else {
         eprintln!(
-            "SKIP: the system `erlc`/`erl` oracle is unavailable; the path-copying \
-             `MAP_EXT` cross-check is skipped"
+            "SKIP: the system `erlc`/`erl` oracle is unavailable; the committed `MAP_EXT` \
+             goldens still ran, only the live re-derivation is skipped"
         );
         return;
     };
-
-    let ours = run_sized(1 << 20, |reg, ctx| our_rows(reg, ctx));
-    assert!(
-        ours.len() >= 49,
-        "the Rust side must produce every row the oracle does ({} so far)",
-        ours.len()
+    assert_eq!(
+        oracle.len(),
+        goldens.len(),
+        "the live oracle printed {} rows where the golden set holds {}",
+        oracle.len(),
+        goldens.len()
     );
-
-    let mut names: Vec<&String> = ours.keys().collect();
-    names.sort();
-    for name in names {
-        let want = oracle.get(name).unwrap_or_else(|| {
+    for (name, want) in &goldens {
+        let got = oracle.get(name).unwrap_or_else(|| {
             panic!(
                 "the live oracle printed no `{name}` row ({} rows seen)",
                 oracle.len()
             )
         });
         assert_eq!(
-            ours.get(name).map(String::as_str),
-            Some(want.as_str()),
-            "`{name}`: this runtime's term_to_binary/1 image differs from the live oracle's"
+            got, want,
+            "`{name}`: the committed golden differs from the live oracle\'s image              (the oracle changed, or the golden was hand-edited)"
         );
     }
-    assert_eq!(
-        ours.len(),
-        oracle.len(),
-        "the two row sets must be the same size (ours: {}, oracle's: {})",
-        ours.len(),
-        oracle.len()
-    );
+}
+
+/// Parses the committed `name=hex` golden file (`#` comments and blank lines ignored).
+fn parse_goldens(text: &str) -> HashMap<String, String> {
+    let mut rows = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, image) = line
+            .split_once('=')
+            .unwrap_or_else(|| panic!("malformed golden row {line:?} (want `name=hex`)"));
+        rows.insert(name.to_string(), image.to_string());
+    }
+    assert!(!rows.is_empty(), "the golden file must not be empty");
+    rows
 }
 
 // ---------------------------------------------------------------------------
