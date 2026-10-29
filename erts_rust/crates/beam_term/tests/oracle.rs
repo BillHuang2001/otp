@@ -1393,6 +1393,7 @@ fn oracle_agrees_on_flatmap_atom_key_order() {
         "the order must not be the lexicographic name order (that would prove nothing)",
     );
 }
+
 /// The oracle's flat-map atom-key order follows **atom creation order**, in both
 /// directions — the premise the runtime divergence rests on.
 ///
