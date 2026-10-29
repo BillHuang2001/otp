@@ -6,7 +6,7 @@ description: The per-group inventory of the differential conformance corpus (`er
 Each group is a module `src/corpus/<group>.rs` exposing `group() -> Vec<Case>`, concatenated by
 `corpus::mod::build_corpus()`. A case id is `<prefix>/<name>`, where the prefix is a *subdivision*
 and NOT the file name (one file may emit several prefixes). Counts below are for the current corpus
-(3 485 cases total, one allowlisted gap, `wire/new_fun_ext_encode`, three recorded oracle drifts); re-derive them with
+(3 524 cases total, one allowlisted gap, `wire/new_fun_ext_encode`, three recorded oracle drifts); re-derive them with
 `erts_rust/target/release/differential list 2>/dev/null | grep -c '^<prefix>/'` rather than trusting
 this file, which drifts on every corpus round.
 ## A.1 — language semantics
@@ -19,14 +19,32 @@ this file, which drifts on every corpus round.
   `{Module,Function,ArgList,Location}` with a real arg LIST on the `-eval` route
   (`errors/undef_head_item_{arg_list,shape}_from_apply`, `errors/undef_head_item_arg_list_from_call_ext`);
   the compiled-code route is pinned from `modules.rs`.
+- `errors_extra.rs` (6 cases) — the stacktrace-side payload of an `error` raise: `error/2`'s caller
+  frame carries the exception's own argument **list** in its `A` slot
+  (`errors_extra/error_2_fills_the_caller_frame_with_the_argument_list`),
+  `error/3`'s `{error_info,Map}` extension is consed after the `{file,_}`/`{line,_}` pairs with the
+  option scan reduced to one term (`errors_extra/error_3_{appends_the_error_info_extension,option_matrix}`),
+  and a trace supplied to `erlang:raise/3` is echoed **verbatim** — a supplied `[]` stays `[]`, an
+  unknown module frame is not replaced, and the `proc_lib` catch/re-raise is idempotent. Every case
+  raises inside a `spawn`ed closure, the compiled-code route that actually implements the payload.
 - `ordered_walk.rs` — the `ets` `ordered_set` walk across the `ORDER`=32 node split
   (`ets:first/1`+`next/2`, `ets:last/1`+`prev/2` over >2×ORDER keys interleaved with insert/delete),
   the absent-key range-bound anchor and the terminal `'$end_of_table'`.
-- `bitbin.rs` (6 cases) — the **opcode** half of the binary surface: a writable accumulator
-  (`bs_init_writable` + private append; pinned by byte count **and** md5), growth past the payload's
+- `bitbin.rs` (6 cases: five under `bitbin/` plus one under `ets_copy/`) — the **opcode** half of the
+  binary surface: a writable accumulator (`bs_init_writable` + private append; pinned by byte count
+  **and** md5), growth past the payload's
   reservation, a `bs_match` over a **refc** subject at a non-zero non-byte-aligned offset (integer and
   binary fields), its byte-aligned control, and one large-payload `ets` copy round trip.
 - `copypath.rs` (5 cases) — the **process copy boundary's** cons-chain fast path (`copy_cons_chain`'s one-flat-pass copy bounded by the receiver's remaining words, plus the per-thread fix-up worklist): a 20 000-element int chain, a 200 000-element one (longer than the receiver's remaining heap words), 400 conses of distinct 4 KiB refc binaries, a 10 000-cons improper chain with an atom tail, and a chain of mixed nested elements. Each is sent to a **spawned** process and **echoed back**, compared as `term_to_binary(Echo) =:= term_to_binary(L)` — never a one-way send, which pins only that the send did not raise; the golden is `true`, a corrupted copy answers `false`, a lost message `timeout`.
+- `monitor_tag.rs` (4 cases) — `erlang:monitor/3`'s `{tag, Tag}` **user tag**, which is stored and
+  copied at monitor-creation time: a tag resident on the watcher's own heap still arrives `=:=` the
+  original after the watcher has collected its own heap
+  (`monitor_tag/tagged_down_with_a_heap_resident_tag_echoes_the_tag`), a 1000-byte binary tag keeps
+  its payload through the copy (`monitor_tag/a_binary_tag_survives_the_copy_with_its_size`), an
+  immediate tag is stored verbatim (`monitor_tag/an_immediate_tag_is_stored_and_echoed_verbatim`),
+  and `demonitor(Ref, [flush])` flushes head-agnostically, so a queued **tagged** DOWN is removed
+  (`monitor_tag/demonitor_flush_removes_a_queued_tagged_down`). Every golden is an atom, a boolean
+  or a size, and every wait is a bounded `receive … after 2000`.
 ## A.2 — `.beam`/ETF images
 - `etf.rs` (90 cases) — `term_to_binary` bytes + `binary_to_term` round trips incl. local pid/ref
   identity; the `[local]` `LOCAL_EXT` image with the per-VM 4-byte node hash masked
@@ -51,11 +69,12 @@ this file, which drifts on every corpus round.
   per-VM-start id/creation byte reaches a golden).
 ## A.3 — NIF C ABI
 - `nif.rs` — `erlang:nif_error/1,2` reason shapes.
-- `nif_so.rs` (45 cases) — `load_nif/2` of a real `cc`-built `.so`, the `load_failed`/`bad_lib`/reload
-  shapes (integer-classified) and the load **refusal matrix** (`load/1` veto, `ErlNifEntry`
+- `nif_so.rs` (46 cases: 15 under `nif_so/` plus 31 under `nif_rt/`) — `load_nif/2` of a real
+  `cc`-built `.so`, the `load_failed`/`bad_lib`/reload shapes (integer-classified) and the load
+  **refusal matrix** (`load/1` veto, `ErlNifEntry`
   module-name mismatch, `ERL_NIF_MINOR_VERSION` too old/too new, `vm_variant` mismatch, the `LoadInfo`
   term reaching the callback, a non-string path as a catchable `badarg`).
-  Plus the 30-case `nif_rt/…` block over a second embedded module with its `NIF_RT_C` /
+  Plus the 31-case `nif_rt/…` block over a second embedded module with its `NIF_RT_C` /
   `NIF_RT_RAISE_C` fixtures:
   * real data through the ABI — a >32-key HAMT map built by `enif_make_map_from_arrays` and by 40
     `enif_make_map_put`s and walked by `enif_map_iterator_*`, a deep mixed iolist flattened by
@@ -127,16 +146,27 @@ this file, which drifts on every corpus round.
   to end: a submission answering a positive id, `async_invoke` running, `ready_async` firing exactly
   once with the armed `async_data`, and `async_free` instead where the slot is `NULL`), and
   `STATE_DRIVER_C`.
-- `driver_abi.rs` (90 cases) — one shared driver `.so` dispatched by a one-byte selector.
-- `driver_abi_extra.rs` (78 cases, `driver_extra/…`) — `driver_get_now/1`, timeslice, port-queue,
+- `driver_abi.rs` (91 cases) — one shared driver `.so` dispatched by a one-byte selector.
+- `driver_abi_extra.rs` (84 cases, `driver_extra/…`) — `driver_get_now/1`, timeslice, port-queue,
   `driver_pdl_*`, the `erl_drv_thread_exit`/rwlock/cond families, the `tcp_inet` built-in.
-- `udp.rs` (32) / `ram_file.rs` (21) / `inet_control.rs` (15) / `inet_write.rs` (11) — the **built-in
+- `sendfile.rs` (3 cases) — the `file:sendfile/5` → `prim_file:sendfile/8` chain over an inet socket,
+  and `prim_file:advise/4` as a hint. The runtime answers `{error,enotsup}` for the driver's
+  `TCP_REQ_SENDFILE`, so `file.erl` falls through to OTP's own Erlang `sendfile_fallback` over the
+  port-command seam; the group pins that both mechanisms deliver the requested sub-extent
+  (`file:sendfile(Fd, Sock, 10, 5, [])` → `{ok,5}` and those five bytes on the peer's queue, from a
+  run-unique path so no temp path reaches a golden). `advise/4` answers `ok` as
+  a hint for all six advice atoms and for a bignum / zero extent, `{error,einval}` only for a
+  negative extent or an out-of-set atom, and `{error,badarg}` for a non-number offset/length — the
+  `prim_file:advise/4` wrapper answer, whose NIF raises there. A non-descriptor argument stays
+  unpinned: the oracle raises `function_clause`, this runtime answers `{error,badarg}`.
+- `udp.rs` (32) / `ram_file.rs` (21) / `inet_control.rs` (19) / `inet_write.rs` (23) — the **built-in
   drivers**; see the "built-in drivers" section below.
 ## A.5 — distribution wire / live nodes
 - `wire.rs` — the ETF/distribution tag codec: canonical flatmap key order, legacy→modern id upgrades,
   `EXPORT_EXT`/`NEW_FUN_EXT`, `compressed`, version framing.
-- `wire_extra.rs` (443 cases) — tag-level byte goldens + round trips, framing + `[safe]`/`[used]`,
-  `DOP_*` control tuples + `ERL_DIST_HEADER`, the `term_to_binary/2` minor-version matrix reduced to
+- `wire_extra.rs` (446 cases: 443 under `wire_extra/` plus three under `bin2term/`) — tag-level byte
+  goldens + round trips, framing + `[safe]`/`[used]`, `DOP_*` control tuples + `ERL_DIST_HEADER`, the
+  `term_to_binary/2` minor-version matrix reduced to
   per-VM-free tag bytes, latin-1↔UTF-8 atom re-encoding, every non-byte-aligned bitstring width,
   ±2^128 `SMALL_BIG_EXT`, seven `binary_to_term` `badarg` refusals, the send-path `term_to_iovec/1,2`
   family pinned by its relation to the `term_to_binary` image (never by a segment split), truncation
@@ -148,11 +178,11 @@ this file, which drifts on every corpus round.
   twice, and `{nodedown,_}`. `{nodeup,_}` is deliberately unpinned (the oracle delivers no `nodeup`
   with that shape, so pinning it would pin an OTP-version-dependent absence). Cross-runtime traffic
   cannot be a case (the two legs never coexist) — see `divergences.md` §A.5.
-- `dist_extra.rs` (15 `CaseKind::Command` cases, `dist_extra/…`) — the widened **two-VM self-pair**
-  surface: `net_kernel:connect_node/1`, a ping of a missing node (`pang`), a **cookie-mismatch
-  refusal**, a foreign pid's `{node,N}` tag (far-side `node/1` compared locally ⇒ a boolean, no node
-  name in the golden), `erlang:send` to a remote pid *and* to a remote registered name with the
-  arrival order preserved, five ordered round trips, atom / list / binary / 100-element-tuple /
+- `dist_extra.rs` (21 `CaseKind::Command` cases, `dist_extra/…`, every one carrying a `PeerRun`) — the
+  widened **two-VM self-pair** surface: `net_kernel:connect_node/1`, a ping of a missing node
+  (`pang`), a **cookie-mismatch refusal**, a foreign pid's `{node,N}` tag (far-side `node/1` compared
+  locally ⇒ a boolean, no node name in the golden), `erlang:send` to a remote pid *and* to a remote
+  registered name with the arrival order preserved, five ordered round trips, atom / list / binary / 100-element-tuple /
   40-level-nested payloads whose identity is pinned **relationally** (far-side `erlang:phash2/1` and
   `byte_size(term_to_binary/1)` against the sender's own — never a hash constant), a send to a
   missing remote name and to a dead remote pid (the client must survive). Two measured boundaries
@@ -194,8 +224,9 @@ this file, which drifts on every corpus round.
   `bifs/fun_caller_lists_foreach_and_ets_folds` (`lists:foreach/2`, `ets:foldl/3`, `ets:foldr/3`, the
   fold direction pinned via `lists:reverse` + `hd/1`).
 - `ets.rs` — the plain `ets:*` surface + table types/options; `ets_access.rs` — the access-control
-  matrix (the *denied* cells are a divergence, not pinned); `ets_spec.rs` (35) —
-  `select`/`match`/`match_object` + continuations + delete/replace/count, `match_spec_*` incl. the
+  matrix (the *denied* cells are a divergence, not pinned); `ets_spec.rs` (39 cases: 27 under `ets/`,
+  seven under `ets_spec/` and five under `specs/`) — `select`/`match`/`match_object` + continuations
+  + delete/replace/count, `match_spec_*` incl. the
   `specs/`-prefixed `match_spec_compile/1` shapes, the `ordered_set` arithmetic-key rule.
 - `maps.rs` — the fun-taking `maps` BIFs (`fold/3`/`map/2`/`filter/2`/`foreach/2`/`to_list/1`) over a
   map *and* over every `maps:iterator/1,2` order incl. a custom 2-arity comparator, `maps:next/1`'s
@@ -207,7 +238,7 @@ this file, which drifts on every corpus round.
   fun** (an `-eval` lambda has no module/index identity, so it cannot pin that seam), folding the
   `#Fun<Mod.Idx.Uniq>` text (with `uniq` read from `fun_info/2`, never pinned) and both size arities
   into one integer.
-- `re.rs` (141) — `re:run/2,3`, `re:compile/1,2`, `re:replace/3,4` + the run/compile options (promoted
+- `re.rs` (140) — `re:run/2,3`, `re:compile/1,2`, `re:replace/3,4` + the run/compile options (promoted
   from the live-oracle source `crates/beam_bifs/src/re/oracle.rs`); payload-bearing `re:compile`/
   `re:inspect` results are projected payload-free *inside the expression*, and malformed patterns pin
   the byte-comparable `{error,{Msg,Pos}}`.
@@ -241,7 +272,7 @@ this file, which drifts on every corpus round.
   `utf8`/`utf16`/`utf32` construction and decoding, string-literal and unsized `binary`/`bitstring`
   segments, the non-byte-aligned sizes, and the absolute rule that an invalid/truncated/out-of-range
   **pattern** field is a match failure, never a raise.
-- `gc.rs` (38) — post-collection value/identity preservation over big lists, flat/HAMT maps,
+- `gc.rs` (39) — post-collection value/identity preservation over big lists, flat/HAMT maps,
   refc/sub binaries, refs/pids/funs; collector-stressing folds; the `erlang:garbage_collect/0,1,2`
   return value + the `/2` option form and the `process_info(memory|garbage_collection)` surface; five
   `erlc`-compiled module-runs. Comparability limits in `GC_COMPARABILITY.md`.
@@ -261,7 +292,7 @@ this file, which drifts on every corpus round.
   `NUMBER`/`OK`/`ERROR` proper-list shapes, `port_set_data/2`+`port_get_data/1`, `port_control/3`'s
   `badarg` for every verb). Reply bytes are pinned through `iolist_to_binary/1` because the oracle
   splits a DATA reply into an improper list — see `divergences.md` §A.4.
-- `inet_control.rs` (15) — the inet drivers through `gen_udp`/`gen_tcp`/`inet`: open + option store
+- `inet_control.rs` (19) — the inet drivers through `gen_udp`/`gen_tcp`/`inet`: open + option store
   round trip, the bare refusal matrix for both families, a loopback `gen_tcp:listen/2`'s `sockname/1`
   shape with the `{active,_}`/`{packet,_}` store and the unknown-option `{error,einval}`, the static
   `spawn_driver` namespace incl. the `efile`/`fd` `badarg`, the `{packet,N}` option store on both
@@ -269,22 +300,25 @@ this file, which drifts on every corpus round.
   framing inherited from `gen_tcp:listen/2` and buffering across segments), and the **data path**
   (`gen_tcp:send/2` on a listening vs a connected socket, active-mode TCP delivery + peer-close
   teardown, a datagram delivered between two `gen_udp` sockets, a passive `gen_udp:recv/3`). The
-  framed **write** — a block framing mode on the *sending* socket — writes no length header on
-  `beam_rt` and is therefore a ledger row, never a case (`divergences.md` §A.4).
-- `inet_write.rs` (11) — the **write** half of the same data path, all `Eval`+`Probe::Value` with a
+  framed **write** — a block framing mode on the *sending* socket — belongs to `inet_write`.
+- `inet_write.rs` (23) — the **write** half of the same data path, all `Eval`+`Probe::Value` with a
   loopback `port 0` listener and a length-draining bounded `receive` (so TCP coalescing cannot change
   the answer): an iolist vs a flat binary arriving as the concatenation, segmented `send`s, byte
   transparency (`0..255`), the `{error,closed}`/`{error,enotconn}` answer matrix plus the send after
   the peer-close notification, an empty payload as a successful no-op, the write-side option store
   (`send_timeout`/`send_timeout_close`/`packet_size`/`nodelay`/`delay_send` + `einval` on an unknown
   option), a 64 KiB write fully received, both directions of one stream, `{packet, line}` on a sender
-  adding **no** prefix, and the datagram write path. Its guards reject `gen_tcp:recv(` and
-  `gen_tcp:shutdown(` (both are the `process blocked` exit-3 gap), `inet:getstat(` (the send-side
-  counters stay `{0,0}` on `beam_rt`), any `{packet, 1|2|4}` (the framed write — `line` is the one
-  framing that agrees), and a bare-integer payload (the oracle writes byte N, the runtime drops it).
+  adding **no** prefix, the block framing modes on a **sender** (`{packet, 1|2|4}` prefix the frame
+  length, including a mode applied by `inet:setopts/2` after `gen_tcp:connect/3`, and the prefix
+  round-tripping into a framed receiver), the half-close family (`gen_tcp:shutdown(Cl, write)` then
+  the `{error,closed}`→`{error,enotconn}` latch, repeated shutdowns, zero-length writes on a
+  write-shut socket and the latch's read side), `inet:getstat/1`'s **send-side** counters, and the
+  datagram write path. Its guards reject `port_command`/`prim_inet`/`os:cmd`, a passive
+  `gen_tcp:recv(` outside the latched-close rows it names, and a bare-integer payload (the oracle
+  emits a racy `=ERROR REPORT====` line on stdout).
 ## A.9 — boot, preloaded, code server, in-process compile
 - `boot.rs` — version banner, code-server + `application:*` observability, boot-time process surface.
-- `boot_prereq.rs` (72) — `erlang:pre_loaded/0`, `which_applications/0`, `code:is_loaded(init)`,
+- `boot_prereq.rs` (80, all under `boot/…`) — `erlang:pre_loaded/0`, `which_applications/0`, `code:is_loaded(init)`,
   `register/2`+`whereis/1`, the `-boot` arg, `proc_lib:start_link/4`, and four observations under the
   `-boot start` flag (the kernel registered-process names plus three independent boot-completion
   signals, collected as `BOOT_COMPLETION_CASES`: `boot/kernel_processes_registered_under_boot_flag`,
@@ -316,7 +350,7 @@ this file, which drifts on every corpus round.
   routes (`erl_lint.erl` ≈164 s, `erl_scan.erl` ≈36 s on the Rust side) are ledger entries, not cases
   — see `divergences.md` §A.9.
 ## A.2/A.7 — module runs
-- `modules.rs` (71) — embedded `erlc`-compiled wrappers + `erl_error:format_exception/3` regressions +
+- `modules.rs` (75) — embedded `erlc`-compiled wrappers + `erl_error:format_exception/3` regressions +
   a zero-length-binary case + the `diff_trace_info` source's two compiled-code cases over the
   synthesized callee-head `undef` stacktrace (`modules/undef_head_item_{shape,identity}_in_compiled_code`,
   reached through the three-argument `try C:R:St ->` form that real bytecode carries and the `-eval`
@@ -345,14 +379,15 @@ malformed case.
 - Never assert an order-unstable golden: a multi-key-map `~w`, a per-VM-start pid/port/ref/creation
   value, or a temp-dir-bearing `load_nif` message. Assert a shape / `maps:size` / sorted keys, or
   classify into an integer.
-- The `udp.rs`, `inet_control.rs` and `inet_write.rs` group tests still fence their modules: `udp`
-  rejects `gen_udp:send`/`gen_udp:recv`/`prim_inet` (those belong to `inet_control`), `inet_control`
-  rejects `port_command`/`prim_inet`/`os:cmd` (an external-injection route would make the golden
-  host-dependent) **and** a `{packet, N}` in a `gen_tcp:connect/3` option list (the framed *write*,
-  a measured divergence — a framing mode on a *receiving* socket is free), and each pins its group
-  size (32 / 15 / 11) — a case lands only together with the matching guard/size edit in the same
-  change. `inet_write` additionally rejects `gen_tcp:recv(`, `gen_tcp:shutdown(`, `inet:getstat(` and
-  a bare-integer payload (see its section above).
+- The `udp.rs`, `inet_control.rs` and `inet_write.rs` group tests fence their modules, and each pins
+  its group size (32 / 19 / 23): a case lands only together with the matching guard/size edit in the
+  same change. `udp` rejects `gen_udp:send`/`gen_udp:recv`/`prim_inet` (the module-level socket API
+  belongs to `inet_control`); `inet_control` and `inet_write` reject `port_command`/`prim_inet`/
+  `os:cmd` (an external-injection route would make the golden host-dependent); `inet_control` admits
+  a passive `gen_tcp:recv(` only when the sender is armed with a bounded `receive after` or the row
+  writes nothing (a read with the bytes already queued is the measured divergence), and `inet_write`
+  admits one only for the latched-close rows it names and rejects a bare-integer payload (see their
+  sections above).
 - A NIF/driver fixture may reference only `enif_*`/`driver_*` symbols the Rust runtime really exports
   (both runtimes `dlopen(RTLD_NOW)` it): an unexported symbol makes the *Rust* load fail while the
   oracle loads — a mismatch, not a gap.
