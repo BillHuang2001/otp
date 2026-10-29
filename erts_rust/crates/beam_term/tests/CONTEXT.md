@@ -55,8 +55,10 @@ the cross-module and public-surface behaviour.
 ## Routing Table
 - `layout.rs`, `abi.rs`, `non_term.rs`, `internal_ref.rs` → the frozen-layout / ABI / non-term contract pins
 - `atom_witness.rs`, `atom_fork.rs`, `intern_alloc.rs` → `AtomTable` witness, fork and interning allocation pins
-- `map_alloc.rs`, `map_build_equivalence.rs`, `map_words_capacity.rs`, `map_hash.rs` → the map builder, its
-  capacity reservation and its stored key order
+- `map_alloc.rs`, `map_build_equivalence.rs`, `map_words_capacity.rs`, `map_hash.rs`, `map_order.rs` → the map builder, its
+  capacity reservation, its stored key order and the discriminating index-order pin
+- `bitstring_checked.rs`, `refc_window.rs` → the checked bitstring readers on corrupt data, and the refc sub-binary window
+  writer / payload key (incl. why the referenced size cannot live in the term)
 - `oracle.rs`, `number_oracle.rs`, `compare_oracle.rs`, `compare_external.rs`, `map_hash.rs` → the live-`erl`
   oracle cross-checks
 - `compare_terms.rs`, `compare_class_order.rs` → the term-order surface
