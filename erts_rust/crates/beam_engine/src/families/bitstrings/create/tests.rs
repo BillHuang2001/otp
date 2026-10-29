@@ -601,16 +601,31 @@ fn put_utf16_rejects_non_scalars() {
 
 #[test]
 fn put_utf32_encodes_big_endian_fixed_width() {
-    assert_eq!(put_utf32(0), Some(vec![0x00, 0x00, 0x00, 0x00]));
-    assert_eq!(put_utf32(1), Some(vec![0x00, 0x00, 0x00, 0x01]));
-    assert_eq!(put_utf32(0x10000), Some(vec![0x00, 0x01, 0x00, 0x00]));
-    assert_eq!(put_utf32(0x10FFFF), Some(vec![0x00, 0x10, 0xFF, 0xFF]));
+    assert_eq!(put_utf32(0, false), Some(vec![0x00, 0x00, 0x00, 0x00]));
+    assert_eq!(put_utf32(1, false), Some(vec![0x00, 0x00, 0x00, 0x01]));
+    assert_eq!(put_utf32(0x1234, false), Some(vec![0x00, 0x00, 0x12, 0x34]));
+    assert_eq!(put_utf32(0x10000, false), Some(vec![0x00, 0x01, 0x00, 0x00]));
+    assert_eq!(put_utf32(0x10FFFF, false), Some(vec![0x00, 0x10, 0xFF, 0xFF]));
+    assert_eq!(put_utf32(0x1F600, false), Some(vec![0x00, 0x01, 0xF6, 0x00]));
+}
+
+/// `<<V/utf32-little>>` is the code unit's little-endian bytes — the oracle's
+/// `[1,0,0,0]` for `<<1/utf32-little>>` and `[52,18,0,0]` for `<<16#1234/utf32-little>>`.
+#[test]
+fn put_utf32_little_endian_is_the_code_unit_little_endian() {
+    assert_eq!(put_utf32(0, true), Some(vec![0x00, 0x00, 0x00, 0x00]));
+    assert_eq!(put_utf32(1, true), Some(vec![0x01, 0x00, 0x00, 0x00]));
+    assert_eq!(put_utf32(0x1234, true), Some(vec![0x34, 0x12, 0x00, 0x00]));
+    assert_eq!(put_utf32(0x10FFFF, true), Some(vec![0xFF, 0xFF, 0x10, 0x00]));
+    assert_eq!(put_utf32(0x1F600, true), Some(vec![0x00, 0xF6, 0x01, 0x00]));
 }
 
 #[test]
 fn put_utf32_rejects_non_scalars() {
-    assert_eq!(put_utf32(-1), None);
-    assert_eq!(put_utf32(0xD800), None);
-    assert_eq!(put_utf32(0xDFFF), None);
-    assert_eq!(put_utf32(0x110000), None);
+    for little in [false, true] {
+        assert_eq!(put_utf32(-1, little), None);
+        assert_eq!(put_utf32(0xD800, little), None);
+        assert_eq!(put_utf32(0xDFFF, little), None);
+        assert_eq!(put_utf32(0x110000, little), None);
+    }
 }

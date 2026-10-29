@@ -392,7 +392,9 @@ pub(super) fn render_location(term: Eterm, module: &Module) -> String {
 /// Only the shapes these fixtures build are covered: an atom/list/small-integer
 /// value. A HAMT (more than `MAP_SMALL_MAP_LIMIT` keys) renders in storage order,
 /// which is *not* the oracle's `~p` order, so no oracle-comparison row uses one.
-pub(super) fn render_error_info_extension(term: Eterm, module: &Module) -> String {
+/// `pub(crate)` for [`super::super::bif_frame::tests`], whose order rows render the
+/// same extension.
+pub(crate) fn render_error_info_extension(term: Eterm, module: &Module) -> String {
     let arity = crate::terms::tuple_arity(term).expect("the extension is a 2-tuple");
     assert_eq!(arity, 2, "a location extension is a 2-tuple, got arity {arity}");
     let key = crate::terms::tuple_element(term, 0).expect("the extension's key");
@@ -407,7 +409,12 @@ pub(super) fn render_error_info_extension(term: Eterm, module: &Module) -> Strin
         .iter()
         .map(|(k, v)| format!("{} => {}", render_flat(*k, module), render_flat(*v, module)))
         .collect();
-    format!("{{error_info,#{{#{}}}}}", rendered.join(","))
+    // Built without a `format!` so the literal `#{` cannot be miscounted: the
+    // oracle prints `{error_info,#{K => V,...}}`.
+    let mut extension = String::from("{error_info,#{");
+    extension.push_str(&rendered.join(","));
+    extension.push_str("}}");
+    extension
 }
 /// Render one cooked stacktrace item the way the oracle probe prints its four
 /// fields.

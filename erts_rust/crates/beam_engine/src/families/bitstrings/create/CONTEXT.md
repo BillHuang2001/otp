@@ -11,6 +11,8 @@ Ground truth is `erts/emulator/beam/erl_bits.c` (`erts_bs_private_append_checked
 - `prepared.rs` → `prepare` folds that flat list once per `(module image, function, code offset)` into a `CreateProgram` of `PreparedSeg` variants for `assemble_prepared`; a shape it declines keeps the generic walk and its exact typed error.
 - `size.rs` → the segment size validation (`SegSize`/`segment_size`, `seg_nbits`, `float_nbits`) and the `SegReason` raise (`fail_seg`).
 - `segments.rs` → the per-segment sources and encoders (`segment_source`, `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`) plus the cold-body host the hot block calls.
+- `put_utf16(value, little)` and `put_utf32(value, little)` take the segment's **already resolved** `little` flag (`decode_flags`/`flag_bit` folds the `native` atom into the target order before the writer sees it), so a UTF segment's code unit goes out in the segment's own byte order.
+- `utf8` has no byte order, `utf16` encodes a surrogate pair per 16-bit unit, and `utf32` is one 32-bit unit; the scalar validation (`> U+10FFFF`, the surrogate band, a negative value ⇒ the bare `badarg`) is identical in both byte orders.
 - `seam.rs` → the family-private surface `src/jit/**` reads as `crate::families::bitstrings::create::seam`: `append_plan(module, segments) -> Option<AppendPlan>` (pure, takes no `Machine`), the run-time doors `open_append` (`#[cfg(test)]`, the byte-aligned reference answer) and `open_append_any` (the general, unit-gated door), and the bit-granular write `write_bit_field`.
 - `AppendPlan { source, unit, tail_bits, fields, binary_all }` with `Field::{Bits { value, bits }, ConstBytes { bytes }}`.
 - `AppendPlan::binary_all` carries the whole-binary tail shape: `Some(source)` exactly when the plan is a `private_append` of the accumulator followed by **one** `binary all` segment and nothing else — an `integer`/`string` field before it, or any segment after it, keeps the plan `None`, because a run-time width fixes no static offset for anything later.
@@ -22,6 +24,7 @@ Ground truth is `erts/emulator/beam/erl_bits.c` (`erts_bs_private_append_checked
 ## Constraints
 - **Never a wrong result.** A shape the seam cannot express exactly is `None` (the family body answers) and a shape a door cannot serve is a refusal, never an approximation.
 - Errors are `beam_common::{Result, BeamError}` only; a non-integer field value is the bare `badarg` at every width, a non-whole `size * unit` is `badarg`, a size overflow is `system_limit`.
+- The endianness flag reaches the writer through `decode_flags` on **both** routes (the generic segment walk and the prepared program carry the same `flags & BSF_LITTLE` bit), so a `utf16`/`utf32` segment can never disagree with itself between the two.
 - The doors are `&Machine` queries and mutate nothing; the build's only mutations are the payload bytes and the single `ErlSubBits.end` write, in that order.
 - `write_bit_field` is the family's one bit-granular write rule (MSB-first, low `nbits` bits, entered byte cleared, window-end byte masked) and is re-execution idempotent.
 - `open_append` stays `#[cfg(test)]`: it is the byte-aligned door's reference answer, not a production entry.
@@ -33,7 +36,8 @@ Ground truth is `erts/emulator/beam/erl_bits.c` (`erts_bs_private_append_checked
 - `prepared_tests.rs` → the prepared-versus-generic equivalence suite (same bytes, same bit count, same typed error), plus the per-instruction reservation leaving `RefcBinary::growth_counters` untouched.
 - `seam_tests.rs` → the seam's accept and decline sets, both doors' run-time answers (including the unit gate), the word-identity/no-growth pin, and `write_bit_field`'s byte-for-byte agreement with the family's own `BitWriter` at every width in `1..=64`.
 - `inplace_tests.rs`, `grow_tests.rs`, `wide_tests.rs`, `le_tests.rs`, `float_seg_tests.rs` → the in-place append window, the growth/relocation schedule, the wide-integer masking, the bit-granular little-endian field, and the bignum `float` segment.
-- `../run_tests.rs` → the end-to-end rows through the real public execution entries, plus a live `erlc`/`erl` oracle cross-check.
+- `../run_tests.rs` → the end-to-end rows through the real public execution entries, plus a live `erlc`/`erl` oracle cross-check of the readable/append paths.
+- `../utf_matrix_tests.rs` → the UTF matrix suites (`the_utf_construction_matrix_matches_the_oracle`, `the_utf_matching_matrix_matches_the_oracle`: every `utf8`/`utf16`/`utf32` endianness spelling, the binary comprehension, and the compiled match segment, each compared with the system `erl` on the same input).
 
 ## Notes for Agents
 - The seam decides *plannability*; a tier's shape predicate decides *emittability*. A change here can silently widen or narrow what `src/jit/baseline/emit/bitstr_inline/create.rs` may emit — update both sides and the tier's pins (`jit/baseline/bs_create_bin_tests.rs`, `jit/baseline/foreign_kernel_tests.rs`) together.

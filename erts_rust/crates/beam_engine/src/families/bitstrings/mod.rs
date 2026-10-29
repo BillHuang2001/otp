@@ -71,6 +71,8 @@ pub(crate) mod programs;
 pub(crate) mod raw;
 #[cfg(test)]
 mod run_tests;
+#[cfg(test)]
+mod utf_matrix_tests;
 /// The one narrow name a host's BIF floor adopts to serve `erlang:bit_size/1`: a BIF
 /// cannot reach this module's `pub(super)` family readers, so the frozen bitstring /
 /// `ErlSubBits` size is exposed as a single safe function that answers `None` (→ the

@@ -32,6 +32,7 @@ use beam_loader::{Atom, Export, Function, HeapNeed, Import, ImportRef, Instr, La
 use beam_term::{cmp, make_small, AtomTable};
 
 use crate::context::MinimalContext;
+use crate::families::exceptions::tests::oracle::render_error_info_extension;
 use crate::jit::Tier;
 use crate::machine::CatchFrame;
 use crate::terms::test_support as terms;
@@ -868,10 +869,11 @@ fn head_item_with<C: ExecutionContext>(
     .expect("the arena never refuses a reservation")
 }
 
-/// The `error_info` map of an item's `Location` — the single `{error_info, Map}`
-/// entry, unwrapped. Panics if the location is not exactly that one-entry list, so a
-/// row that expects the empty-list location uses the item itself instead.
-fn error_info_map(module: &Module, item: Eterm) -> Eterm {
+/// The item's single `{error_info, Map}` location entry — the extension tuple itself,
+/// the shape [`render_error_info_extension`] renders (and the one the order rows
+/// below assert on). Panics unless the `Location` is exactly that one-entry list, so
+/// a row that expects the empty-list location uses the item itself instead.
+fn error_info_entry(module: &Module, item: Eterm) -> Eterm {
     let location = tuple_element(item, 3).expect("the item's Location slot");
     let entries = list_elements(location).expect("a proper Location list");
     assert_eq!(entries.len(), 1, "exactly one `{{error_info, Map}}` entry");
@@ -880,7 +882,13 @@ fn error_info_map(module: &Module, item: Eterm) -> Eterm {
         atom_of(module, "error_info"),
         "the location entry's key is `error_info`"
     );
-    tuple_element(entries[0], 1).expect("the entry's Map slot")
+    entries[0]
+}
+
+/// The `error_info` map of an item's `Location` — the single `{error_info, Map}`
+/// entry, unwrapped.
+fn error_info_map(module: &Module, item: Eterm) -> Eterm {
+    tuple_element(error_info_entry(module, item), 1).expect("the entry's Map slot")
 }
 
 /// The map's `(key, value)` pairs in a **storage** order — the order `~p` renders and
@@ -969,6 +977,80 @@ fn the_two_pairs_are_stored_in_the_order_the_oracle_renders() {
     );
     assert_eq!(pairs[0].1, atom_of(&module, "id"));
     assert_eq!(pairs[1].1, atom_of(&module, "erl_stdlib_errors"));
+}
+
+#[test]
+fn the_two_pair_extension_renders_the_oracles_string() {
+    // The exact text the oracle prints (`~p` of the item), measured on OTP 29.1.2 /
+    // erts-17.1.1 with a compiled module:
+    //   `try ets:lookup(unknown_atom_xyz, k) catch C:R:S -> hd(S) end`
+    //   -> `{ets,lookup,[unknown_atom_xyz,k],
+    //        [{error_info,#{cause => id,module => erl_stdlib_errors}}]}`
+    // i.e. its `Location` renders as
+    // `[{error_info,#{cause => id,module => erl_stdlib_errors}}]` — `cause` FIRST.
+    //
+    // **Who decides that order.** A flat map stores its atom keys in **atom-index**
+    // order (C's `erts_cmp_flatmap_keys`, `../../erts/emulator/beam/erl_utils.h:267-272`:
+    // two atoms compare by their raw words, i.e. by index) and `~p` prints them in
+    // stored order, so the oracle's `cause, module` is a property of ITS atom table,
+    // where `atom.names` interns `cause` (`:178`) long before `module` (`:471`). This
+    // engine reproduces the rule, not the order:
+    // `beam_term/src/compare.rs:483-489` (`cmp_flatmap_keys`) + the sort in
+    // `beam_term/src/map.rs:379-390` (`write_map`).
+    //
+    // So this row must seed a table in that order — [`cause_first_fixture`] — to be
+    // the oracle's string; a host whose table interns `module` first renders the pairs
+    // the other way round (the next test). On `beam_rt` the question is latent today:
+    // no host answers `ExecutionContext::bif_error_cause` yet, so only the one-pair
+    // form is ever rendered there, and `beam_rt::boot::CORE_ATOMS` seats `module`
+    // without seating `cause` — a host adopting the seam has to intern `cause` before
+    // `module` to keep this row's text.
+    let module = cause_first_fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::answering(atom_of(&module, "id"));
+    let item = head_item_with(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("the item is synthesized");
+    assert_eq!(
+        render_error_info_extension(error_info_entry(&module, item), &module),
+        "{error_info,#{cause => id,module => erl_stdlib_errors}}",
+        "the rendered extension must be the oracle's text"
+    );
+}
+
+#[test]
+fn the_two_pair_extension_follows_the_hosts_atom_index_order() {
+    // The same item on a table that interns `module` **before** `cause` — the shape
+    // `beam_rt::boot::CORE_ATOMS` has (`module` is seeded; `cause` is not seeded at
+    // all) — renders `module` first. That is C's rule reproduced faithfully, and the
+    // divergence it exposes is the *host's* atom ordering, not an engine choice:
+    // `beam_term/src/compare.rs:483-489` orders two atom keys by index, so the stored
+    // (and therefore rendered) order follows the table.
+    //
+    // This row exists so the dependency is pinned rather than assumed: it is the
+    // engine's contract that the extension is `MAP2(cause, value, module, format)`
+    // contents-wise and that its key order is the flat-map rule — see
+    // `the_two_pair_extension_renders_the_oracles_string` for the table that yields
+    // the oracle's text. Nothing here may be "fixed" by re-interning atoms: the atom
+    // table is the host's.
+    let module = fixture();
+    // The premise, asserted rather than assumed: `fixture()` interns `module` first.
+    let (module_index, cause_index) = (
+        module.atom_table.lookup("module").expect("`module` is interned"),
+        module.atom_table.lookup("cause").expect("`cause` is interned"),
+    );
+    assert!(
+        module_index < cause_index,
+        "the fixture must intern `module` before `cause`"
+    );
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = CauseCtx::answering(atom_of(&module, "id"));
+    let item = head_item_with(&mut machine, &mut ctx, &module, "ets", "lookup", &[1, 2])
+        .expect("the item is synthesized");
+    assert_eq!(
+        render_error_info_extension(error_info_entry(&module, item), &module),
+        "{error_info,#{module => erl_stdlib_errors,cause => id}}",
+        "the rendered order is the atom table's index order, so it follows the host"
+    );
 }
 
 #[test]

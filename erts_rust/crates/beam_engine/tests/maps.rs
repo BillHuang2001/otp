@@ -59,6 +59,7 @@ mod support;
 use std::sync::Arc;
 
 use beam_common::{BeamError, ExceptionClass};
+use beam_engine::jit::Tier;
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{load_file, Module};
 use beam_term::{cmp, make_atom, make_small, Atom, Eterm};
@@ -478,4 +479,176 @@ fn exact_on_a_32_pair_hashmap_builds_an_equivalent_flat_map() {
     assert!(!terms::is_hashmap(result), "32 pairs is a flat map");
     assert_eq!(entry(result, &module, "a"), Some(make_small(9)));
     assert_eq!(terms::map_entries(result).unwrap().len(), 32);
+}
+
+// ---------------------------------------------------------------------------
+// The no-change fast path, reached through COMPILED code
+// ---------------------------------------------------------------------------
+//
+// The rows above drive `PutMapAssoc`/`PutMapExact` as hand-built instructions; these
+// drive the same instructions through the fixture's *compiled* bodies, so the syntax
+// forms a program actually writes are covered: `assoc/1` is `M#{c => 3}`
+// (`put_map_assoc`), `exact/1` is `M#{a := 9}` (`put_map_exact`) and `assoc_exact/1`
+// is the two-pair `M#{a := 9, c => 3}` (both, back to back).
+//
+// Oracle, measured on the system `erl` (OTP 29.1.2 / erts-17.1.1) with this very
+// fixture: `erts_debug:same(mapfx:assoc(M), M)` is `true` exactly when `M` already
+// holds `c => 3`, `erts_debug:same(mapfx:exact(M), M)` exactly when `M` holds
+// `a => 9`, and `erts_debug:same(mapfx:assoc_exact(M), M)` exactly when `M` holds
+// both — for a flat map and for a >32-key hash map alike, and `false` for any
+// changed value. `erts_debug:same/2` is raw word identity, so `true` means the
+// instruction answered the source map itself.
+//
+// Every row runs on both execution tiers and asserts they agree before either is
+// compared with the source word.
+
+/// [`run`] on an explicit execution [`Tier`].
+fn run_on(
+    tier: Tier,
+    ctx: &mut MinimalContext,
+    module: &Module,
+    fun: &str,
+    args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    let mut machine = Machine::new();
+    machine.run_with_tier(module, atom(module, fun), args.len() as u32, args, ctx, tier)
+}
+
+/// [`run`] of `fun` on **both** tiers, asserting they answer the same word and
+/// returning that word.
+fn run_both_tiers(ctx: &mut MinimalContext, module: &Module, fun: &str, args: &[Eterm]) -> Eterm {
+    let interpreted =
+        run_on(Tier::Interpreter, ctx, module, fun, args).expect("the interpreter answers");
+    let jitted = run_on(Tier::BaselineJit, ctx, module, fun, args).expect("the baseline tier answers");
+    assert_eq!(
+        jitted, interpreted,
+        "{fun}: the two tiers must answer the same word"
+    );
+    interpreted
+}
+
+/// A hash map — `keys` integer pairs `i => i * i` (`40` is above
+/// `MAP_SMALL_MAP_LIMIT`, so the layout is a HAMT) plus the fixture's `extra` atom
+/// pairs, keyed through the fixture's own atom table.
+fn hash_map_with(
+    ctx: &mut MinimalContext,
+    module: &Module,
+    extra: &[(&str, i64)],
+) -> Eterm {
+    let mut pairs: Vec<(Eterm, Eterm)> = (0..40i64)
+        .map(|i| (make_small(i), make_small(i * i)))
+        .collect();
+    pairs.extend(
+        extra
+            .iter()
+            .map(|(name, value)| (make_atom(atom(module, name)), make_small(*value))),
+    );
+    let map = terms::make_map(ctx, &pairs, &module.atom_table).expect("build the source map");
+    assert!(
+        terms::is_hashmap(map),
+        "the 40-key source must be a hash map, or the row measures the flat route"
+    );
+    map
+}
+
+#[test]
+fn a_no_op_assoc_on_compiled_code_answers_the_source_word() {
+    let module = load();
+    let mut ctx = MinimalContext::new();
+    let source = flatmap(&mut ctx, &module, &[("c", 3)]);
+    let result = run_both_tiers(&mut ctx, &module, "assoc", &[source]);
+    assert_eq!(
+        result, source,
+        "`assoc/1`'s `c => 3` pair on a map that already holds it is the source map itself"
+    );
+    assert_eq!(terms::map_entries(result).unwrap().len(), 1);
+}
+
+#[test]
+fn a_no_op_exact_update_on_compiled_code_answers_the_source_word() {
+    let module = load();
+    let mut ctx = MinimalContext::new();
+    let source = flatmap(&mut ctx, &module, &[("a", 9), ("b", 2)]);
+    let result = run_both_tiers(&mut ctx, &module, "exact", &[source]);
+    assert_eq!(
+        result, source,
+        "`exact/1`'s `a := 9` update on a map that already holds it is the source map itself"
+    );
+}
+
+#[test]
+fn a_no_op_two_pair_update_on_compiled_code_answers_the_source_word() {
+    // One instruction pair (`put_map_exact` then `put_map_assoc`), both no-ops.
+    let module = load();
+    let mut ctx = MinimalContext::new();
+    let source = flatmap(&mut ctx, &module, &[("a", 9), ("c", 3)]);
+    let result = run_both_tiers(&mut ctx, &module, "assoc_exact", &[source]);
+    assert_eq!(
+        result, source,
+        "the two pairs on a map that already holds both are the source map itself"
+    );
+}
+
+#[test]
+fn a_no_op_update_on_a_compiled_hash_map_answers_the_source_word() {
+    let module = load();
+    let mut ctx = MinimalContext::new();
+    // `assoc/1` adds `c => 3`; the 40-key source already holds it.
+    let assoc_source = hash_map_with(&mut ctx, &module, &[("c", 3)]);
+    assert_eq!(
+        run_both_tiers(&mut ctx, &module, "assoc", &[assoc_source]),
+        assoc_source,
+        "a hash-map `c => 3` no-op is the source map itself"
+    );
+    // `exact/1` rewrites `a := 9`; the source already holds `a => 9`.
+    let exact_source = hash_map_with(&mut ctx, &module, &[("a", 9)]);
+    assert_eq!(
+        run_both_tiers(&mut ctx, &module, "exact", &[exact_source]),
+        exact_source,
+        "a hash-map `a := 9` no-op is the source map itself"
+    );
+    // Both pairs at once, on a hash map.
+    let both_source = hash_map_with(&mut ctx, &module, &[("a", 9), ("c", 3)]);
+    assert_eq!(
+        run_both_tiers(&mut ctx, &module, "assoc_exact", &[both_source]),
+        both_source,
+        "a hash-map two-pair no-op is the source map itself"
+    );
+}
+
+#[test]
+fn a_changing_update_on_compiled_code_builds_a_fresh_word() {
+    // A *changing* update allocates, so the two tiers answer two different (fresh)
+    // words; these rows therefore compare each tier's answer against the source by
+    // **word** and the two tiers against each other by term equality.
+    let module = load();
+    let mut ctx = MinimalContext::new();
+    let changing = |ctx: &mut MinimalContext, fun: &str, source: Eterm| {
+        let interpreted =
+            run_on(Tier::Interpreter, ctx, &module, fun, &[source]).expect("the interpreter");
+        assert_ne!(interpreted, source, "{fun}: a change builds a fresh map");
+        let jitted =
+            run_on(Tier::BaselineJit, ctx, &module, fun, &[source]).expect("the baseline tier");
+        assert_ne!(jitted, source, "{fun}: a change builds a fresh map");
+        assert!(
+            cmp(interpreted, jitted, &module.atom_table).is_eq(),
+            "{fun}: the two tiers must build the same map"
+        );
+        interpreted
+    };
+    // New value.
+    let source = flatmap(&mut ctx, &module, &[("c", 4)]);
+    let result = changing(&mut ctx, "assoc", source);
+    assert_eq!(entry(result, &module, "c"), Some(make_small(3)));
+    // New key (`exact/1` cannot add one, so the assoc form carries this row).
+    let source = flatmap(&mut ctx, &module, &[("a", 1)]);
+    let result = changing(&mut ctx, "assoc", source);
+    assert_eq!(entry(result, &module, "a"), Some(make_small(1)));
+    assert_eq!(entry(result, &module, "c"), Some(make_small(3)));
+    // Changed value on a hash map.
+    let source = hash_map_with(&mut ctx, &module, &[("a", 8)]);
+    let result = changing(&mut ctx, "exact", source);
+    assert_eq!(entry(result, &module, "a"), Some(make_small(9)));
+    // The 40 integer keys plus the `a` pair the helper adds: 41 distinct keys.
+    assert_eq!(terms::map_entries(result).unwrap().len(), 41);
 }

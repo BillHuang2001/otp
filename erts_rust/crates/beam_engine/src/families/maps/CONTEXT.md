@@ -58,6 +58,14 @@ Ground truth: `erts_gc_update_map_assoc`'s `changed_keys`/`changed_values` fast 
   `…_with_one_change_is_not_the_source_word` twin, plus
   `put_map_exact_no_change_{returns_the_source_word,on_a_hash_map_returns_the_source_word}` and
   `put_map_exact_missing_key_without_fail_raises_badkey`.
+- Size- and key-complete pins: `a_no_op_update_answers_the_source_word_at_every_flat_size` sweeps every
+  flat size `3..=8` (single-pair and whole-map no-op, plus a changing row that must build a fresh map of
+  the same size), and `a_no_op_update_answers_the_source_word_at_every_hash_map_key` does the same for a
+  40-key HAMT at keys `0`, `7`, `20` and `39` (all published, one per node).
+- The rule is reached through **compiled code** too, not only through a hand-built instruction:
+  `tests/maps.rs`'s `mapfx` module covers `assoc/1` (`#{K => V}`), `exact/1` (`#{K := V}`) and
+  `assoc_exact/1` on both tiers (each asserts the two tiers answer the same word), plus a 40-key HAMT and
+  a changing update whose answer must differ from the source while both tiers stay `is_eq`.
 
 ## Failure paths
 | Site | Condition | `fail != NO_FAIL` | `fail == NO_FAIL` |

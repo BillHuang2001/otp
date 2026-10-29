@@ -18,13 +18,13 @@
 //
 // %CopyrightEnd%
 
-//! End-to-end integration tests for the bitstring family's two **readable-subject**
-//! paths, driven through the real public execution entries
+//! End-to-end integration tests for the bitstring family's **readable-subject** and
+//! **append** paths, driven through the real public execution entries
 //! ([`Machine::run_label`] / [`Machine::run_export`]) over synthetic
 //! `beam_loader::Module`s and a [`MinimalContext`] — never by calling a family
 //! helper directly.
 //!
-//! Two capabilities the family used to refuse are pinned here from the *outside*:
+//! What is pinned here, from the *outside*:
 //!
 //! 1. **A refc-subject window that does not start on a byte boundary.**
 //!    [`raw::heap_bits`] recovers `(base, size, off)` for an off-heap refc binary
@@ -37,12 +37,20 @@
 //!    `bs_create_bin`'s segment walk concatenates the source bitstring at the point
 //!    the appending segment appears, so `<<7:8, Src/bits>>` builds through a
 //!    synthetic segment list `[integer, …] [append, …]`.
+//! 3. **`bs_get_binary2`/`bs_get_integer2`/`bs_get_float2` whose `Dst` is the match
+//!    context's own register**, which must commit the position before it rebinds the
+//!    register to the extracted value.
+//! 4. **A live `erlc`/`erl` oracle cross-check**: an inline Erlang source string is
+//!    compiled at test time with the system `erlc`, loaded with
+//!    [`beam_loader::load_file`], run with [`Machine::run_export`], and compared with
+//!    the real system `erl` on the *same* subject bytes (`first3`, `tail16`, `rest16`,
+//!    `rest16bin`, `built_tail`), alongside [`raw::bit_size`] over every bitstring form.
+//!    The whole suite **skips loudly** (never a silent pass) when `erlc`/`erl` are not
+//!    on `PATH`.
 //!
-//! A third suite is a **live `erlc`/`erl` oracle cross-check**: an inline Erlang
-//! source string is compiled at test time with the system `erlc`, loaded with
-//! [`beam_loader::load_file`], run with [`Machine::run_export`], and compared with
-//! the real system `erl` on the *same* subject bytes. The whole suite **skips
-//! loudly** (never a silent pass) when `erlc`/`erl` are not on `PATH`.
+//! The UTF construction/matching matrix is the sibling [`super::utf_matrix_tests`]; the
+//! fixture/oracle plumbing below (`compile_source`, `erl_eval`, `byte_literal`,
+//! `oracle_export`, `bitstring`) is shared with it and is therefore `pub(super)`.
 //!
 //! `unsafe` is confined to the frozen-layout readers here (the same
 //! `bitstring_parts`/`write_refc_binary` accessors the family's own `raw` module
@@ -129,7 +137,7 @@ impl Fixture {
 ///
 /// [`binary_bytes`] cannot read a non-byte-aligned bitstring by design, so the
 /// exact-size assertions go through the frozen reader instead.
-fn bitstring(term: Eterm) -> (Vec<u8>, usize) {
+pub(super) fn bitstring(term: Eterm) -> (Vec<u8>, usize) {
     // SAFETY: `term` is a live bitstring the engine just produced; the arena the
     // context owns outlives this call (the context is borrowed for the whole test).
     let (base, offset, size) = unsafe { beam_term::bitstring_parts(term) };
@@ -617,31 +625,36 @@ built_tail(Seed) ->
     Rest.
 ";
 
-/// Compile [`ORACLE_SRC`] into a per-`tag` fresh temp dir and return that dir.
+/// Compile `src` as `<name>.erl` into a per-`tag` fresh temp dir and return that dir.
 ///
 /// `None` means `erlc` could not be **spawned** at all (the caller skips loudly). An
 /// `erlc` that *ran* and exited non-zero is a **harness** failure (the source is
 /// valid Erlang), so it panics with the captured stderr rather than masquerading as
 /// an absent toolchain.
-fn compile_oracle(tag: &str) -> Option<PathBuf> {
+pub(super) fn compile_source(tag: &str, name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join(format!("beam_engine_bitstring_run_{tag}"));
     std::fs::create_dir_all(&dir)
         .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
-    std::fs::write(dir.join("bitsrun.erl"), ORACLE_SRC)
-        .unwrap_or_else(|error| panic!("write bitsrun.erl: {error}"));
+    std::fs::write(dir.join(format!("{name}.erl")), src)
+        .unwrap_or_else(|error| panic!("write {name}.erl: {error}"));
     let output = Command::new("erlc")
         .arg("+deterministic")
-        .arg("bitsrun.erl")
+        .arg(format!("{name}.erl"))
         .current_dir(&dir)
         .output()
         .ok()?;
     assert!(
         output.status.success(),
-        "the system `erlc` exited {} compiling bitsrun.erl\n  stderr: {}",
+        "the system `erlc` exited {} compiling {name}.erl\n  stderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Some(dir)
+}
+
+/// Compile [`ORACLE_SRC`] into a per-`tag` fresh temp dir and return that dir.
+fn compile_oracle(tag: &str) -> Option<PathBuf> {
+    compile_source(tag, "bitsrun", ORACLE_SRC)
 }
 
 /// Run `eval` under the system `erl` with `dir` **appended** to the code path and
@@ -650,7 +663,7 @@ fn compile_oracle(tag: &str) -> Option<PathBuf> {
 /// `-pz`, never `-pa`: appending keeps the real stdlib ahead of any fixture module in
 /// `dir`. `None` means no runnable `erl` at all (the caller skips loudly); a spawned
 /// `erl` that exits non-zero is a harness failure and panics with the stderr.
-fn erl_eval(dir: &Path, eval: &str) -> Option<String> {
+pub(super) fn erl_eval(dir: &Path, eval: &str) -> Option<String> {
     let output = Command::new("erl")
         .arg("-noshell")
         .arg("-pz")
@@ -669,7 +682,7 @@ fn erl_eval(dir: &Path, eval: &str) -> Option<String> {
 }
 
 /// The bytes of a binary literal, for the inline `erl -eval` source.
-fn byte_literal(bytes: &[u8]) -> String {
+pub(super) fn byte_literal(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|byte| byte.to_string())
@@ -678,7 +691,7 @@ fn byte_literal(bytes: &[u8]) -> String {
 }
 
 /// Load the compiled fixture's export atom.
-fn oracle_export(module: &Module, name: &str) -> Atom {
+pub(super) fn oracle_export(module: &Module, name: &str) -> Atom {
     module
         .atom_table
         .lookup(name)
