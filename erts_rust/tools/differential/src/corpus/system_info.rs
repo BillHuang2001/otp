@@ -1432,6 +1432,28 @@ pub(crate) fn group() -> Vec<Case> {
             "seq_trace:set_token(label, my_label)",
             "ok 0",
         ),
+        // --- `erlang:system_info(snifs)`: the declared `bif.tab` roster, REVERSED ------------
+        // `build_snifs_term` (`erts/emulator/beam/erl_bif_info.c`) conses `bif_table[0..BIF_SIZE]`
+        // forward onto the tail, so the answer is the declared table in reverse order. The
+        // projection is release-INDEPENDENT on purpose: the roster's *length* is not pinned
+        // (OTP 30 adds `erlang:{pid,port,ref}_to_binary/1`, so this tree declares 556 rows where
+        // an OTP-29 oracle answers 553) and neither is `hd/1` — the last declared row **is** one of
+        // those three release-specific rows. What is pinned instead: the list-of-`{Module,
+        // Function, Arity}` shape, a `> 500` length floor, the reversed order through
+        // `lists:last/1` (the *first* declared row, `{erlang, abs, 1}`, in both releases), and the
+        // membership of two rows that exist in every release.
+        case(
+            "system_info/snifs_is_the_reversed_bif_tab_roster",
+            "erlang:system_info(snifs) is the declared bif.tab roster reversed \
+             (release-independent: length floor, 3-tuple shape, lists:last/1 order and two \
+             member rows, never the exact length or head)",
+            "(fun() -> S = erlang:system_info(snifs), [is_list(S), length(S) > 500, \
+             lists:all(fun(T) -> tuple_size(T) =:= 3 andalso is_atom(element(1, T)) andalso \
+             is_atom(element(2, T)) andalso is_integer(element(3, T)) end, S), \
+             lists:last(S), lists:member({erlang, abs, 1}, S), \
+             lists:member({lists, reverse, 2}, S)] end)()",
+            "ok [true,true,true,{erlang,abs,1},true,true]",
+        ),
     ]
 }
 
@@ -1800,5 +1822,66 @@ mod tests {
         assert_eq!(case.golden.stdout, Some("exception error badarg"));
         assert_eq!(case.golden.exit_code, 1);
         assert_eq!(case.expr(), Some("erlang:trace([self()], true, [call])"));
+    }
+
+    /// The `snifs` roster guard. `erlang:system_info(snifs)` answers the declared `bif.tab`
+    /// table **reversed**, so it is release-coupled in exactly two places: its *length* (this
+    /// tree, OTP 30, declares 556 rows where an OTP-29 oracle answers 553 — the extra rows are
+    /// `erlang:{pid,port,ref}_to_binary/1`) and its *head* (the last declared row **is** one of
+    /// those three rows, so `hd/1` answers `{records,get_definition,2}` on an OTP-29 oracle and
+    /// `{erlang,ref_to_binary,1}` here). Neither may be pinned as a value — that would be a hard
+    /// mismatch on one release or the other. What the case pins instead is the projection that
+    /// holds on both: the `{Module, Function, Arity}` shape, a `> 500` length **floor**, the
+    /// reversed order through `lists:last/1` (the *first* declared row, `{erlang, abs, 1}`, in
+    /// both releases), and two member rows present in both.
+    #[test]
+    fn the_snifs_roster_case_pins_a_release_independent_projection() {
+        let case = group()
+            .into_iter()
+            .find(|c| c.id == "system_info/snifs_is_the_reversed_bif_tab_roster")
+            .expect("the snifs roster case is registered");
+        assert_eq!(
+            case.golden.stdout,
+            Some("ok [true,true,true,{erlang,abs,1},true,true]"),
+            "case {}: the golden is the measured OTP-29 oracle line",
+            case.id
+        );
+        assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
+        let expr = case.expr().expect("an eval expression");
+        // The length floor, never an exact row count.
+        assert!(
+            expr.contains("length(S) > 500"),
+            "case {}: the expression must bound the roster with a `> 500` length floor, not an \
+             exact count (the count is release-coupled: 556 here, 553 on an OTP-29 oracle)",
+            case.id
+        );
+        assert!(
+            !expr.contains("length(S) =:="),
+            "case {}: a pinned roster length is release-coupled and must never be a golden",
+            case.id
+        );
+        // The order is pinned by `lists:last/1` (release-independent), never by `hd/1`.
+        assert!(
+            !expr.contains("hd(S)"),
+            "case {}: `hd/1` is the LAST declared table row, which is `erlang:ref_to_binary/1` \
+             here but `records:get_definition/2` on an OTP-29 oracle — it must not be pinned",
+            case.id
+        );
+        for needle in [
+            "lists:last(S)",
+            "is_list(S)",
+            "tuple_size(T) =:= 3",
+            "is_atom(element(1, T))",
+            "is_atom(element(2, T))",
+            "is_integer(element(3, T))",
+            "lists:member({erlang, abs, 1}, S)",
+            "lists:member({lists, reverse, 2}, S)",
+        ] {
+            assert!(
+                expr.contains(needle),
+                "case {}: the expression is missing `{needle}`",
+                case.id
+            );
+        }
     }
 }

@@ -2229,6 +2229,39 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // ---------------------------------------------------------------------------------
+        // `lists:seq/2,3` over **bignum** bounds (`crates/beam_bifs/tests/seq_bignum.rs` pins
+        // the wide matrix in-crate). The stdlib guards with `is_integer/1` only
+        // (`lib/stdlib/src/lists.erl:476-489` / `:532-553`) and computes with exact term
+        // arithmetic, so a bound past the 60-bit small range is an ordinary sequence — not the
+        // `function_clause`/`badarg` a small-int-only fast path would raise.
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "bifs/lists_seq_bignum",
+            description: "lists:seq/2 and seq/3 walk a bignum interval in both directions and with an explicit increment",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `B` is ~90 bits (three 64-bit limbs), so every bound — and every element the
+                // three calls produce — is a bignum. The three shapes are the reported failures:
+                // the ascending `seq/2`, the descending `seq/3` from `B+2` with `-1`, and the
+                // ascending `seq/3` with an explicit `1` (the step makes it a different clause,
+                // so it is pinned next to the `/2` form).
+                expr: "begin B = 748274827583793785928592859, \
+                       {lists:seq(B, B+2), lists:seq(B+2, B, -1), lists:seq(B, B+2, 1)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {[748274827583793785928592859,748274827583793785928592860,\
+                     748274827583793785928592861],[748274827583793785928592861,\
+                     748274827583793785928592860,748274827583793785928592859],\
+                     [748274827583793785928592859,748274827583793785928592860,\
+                     748274827583793785928592861]}",
+                ),
+                exit_code: 0,
+            },
+        },
     ]
 }
 #[cfg(test)]
@@ -2627,5 +2660,40 @@ mod tests {
                 case.id
             );
         }
+    }
+    /// The widened `lists:seq/2,3` block: the oracle's own line **and** the property that makes
+    /// it a pin — the bound is written as a bignum literal in the case itself and all three
+    /// shapes walk it, so a small-integer-only fast path cannot produce this golden.
+    ///
+    /// The wide matrix itself is pinned in-crate by
+    /// `crates/beam_bifs/tests/seq_bignum.rs`; this is its gate-visible counterpart.
+    #[test]
+    fn the_bignum_seq_case_pins_the_oracle_line() {
+        const B: &str = "748274827583793785928592859";
+        const B_1: &str = "748274827583793785928592860";
+        const B_2: &str = "748274827583793785928592861";
+        let case = group()
+            .into_iter()
+            .find(|c| c.id == "bifs/lists_seq_bignum")
+            .expect("the bignum `lists:seq` case is registered");
+        let expr = case.expr().expect("eval case");
+        // The bound is bound to a **bignum literal** in the expression, never computed from
+        // small integers (e.g. `2 bsl 70`), so the case cannot silently stop covering the wide
+        // path.
+        assert!(expr.contains(&format!("B = {B}")), "bound literal: {expr}");
+        for shape in [
+            "lists:seq(B, B+2)",
+            "lists:seq(B+2, B, -1)",
+            "lists:seq(B, B+2, 1)",
+        ] {
+            assert!(expr.contains(shape), "missing `{shape}`: {expr}");
+        }
+        // The oracle's line: the ascending interval twice (as `seq/2` and as `seq/3` with an
+        // explicit `1`) around the descending one.
+        let ascending = format!("[{B},{B_1},{B_2}]");
+        let descending = format!("[{B_2},{B_1},{B}]");
+        let expected = format!("ok {{{ascending},{descending},{ascending}}}");
+        assert_eq!(case.golden.stdout, Some(expected.as_str()));
+        assert_eq!(case.golden.exit_code, 0);
     }
 }
