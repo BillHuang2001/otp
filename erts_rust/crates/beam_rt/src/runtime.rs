@@ -384,6 +384,22 @@ pub struct Runtime {
     /// the measurement [`Runtime::bif_nested_heap_words`]' self-tuning is derived from, and the
     /// figure that says how much of a nested region's capacity was actually bought.
     pub(crate) bif_nested_peak_words: usize,
+    /// The largest number of words one **outermost** registered BIF call has ever handed out of its
+    /// region at once (`used() - mark` at the call's tail), and therefore the reservation
+    /// [`RuntimeContext::take_bif_frontier`](crate::context::RuntimeContext::take_bif_frontier)
+    /// makes before the next one — `crate::context::calls::frontier`'s learned half.
+    ///
+    /// It is a **per-call demand**, not a region high-water mark: [`Runtime::bif_nested_peak_words`]
+    /// already tracks the latter for region sizing, and using it here would ratchet the reservation
+    /// toward a whole region's capacity because `peak_used()` includes the words a *previous*,
+    /// non-rewinding caller still owns below this call's mark.
+    ///
+    /// It never shrinks (a `max`), so the cost of learning is the one growth step that follows it.
+    pub(crate) bif_frontier_need_outer: usize,
+    /// [`Runtime::bif_frontier_need_outer`] for a **nested** call (one that found the pool holding
+    /// another call's region). Kept apart so a large outermost demand does not inflate every nested
+    /// region's reservation, which is the retention the depth-aware sizing exists to avoid.
+    pub(crate) bif_frontier_need_nested: usize,
     /// How many pooled BIF heaps are **out on loan** right now.
     ///
     /// It is the runtime's current **nested-call depth**: [`Runtime::take_bif_heap`] adds one per
@@ -1597,6 +1613,8 @@ impl Runtime {
             bif_heap_words: heap_words,
             bif_nested_heap_words: NESTED_BIF_HEAP_SEED_WORDS.min(heap_words),
             bif_nested_peak_words: 0,
+            bif_frontier_need_outer: 0,
+            bif_frontier_need_nested: 0,
             bif_heaps_taken: 0,
             scheduler: Scheduler::new(),
             runner_state: RunnerState::default(),
