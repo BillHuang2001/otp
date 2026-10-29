@@ -43,6 +43,7 @@ use beam_term::prelude::*;
 use super::expr::classify;
 use super::{atom_name, tuple_elements, var_index};
 use crate::error::badarg;
+use crate::shape::cons_cell;
 
 /// One head pattern node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +69,16 @@ pub enum Pattern {
 }
 
 /// Decode a head pattern term, recording every `'$N'` it binds in `vars`.
+///
+/// A word that is not a term at all (a bare `TAG_PRIMARY_HEADER` word, e.g. the
+/// ABI's `THE_NON_VALUE`) is rejected up front with `badarg` — the oracle's answer
+/// for a malformed spec (the C compiles a header word into nothing sensible) — so
+/// no header word can reach any shape test below, at any nesting depth.
 pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &mut BTreeSet<u32>) -> Result<Pattern> {
+    if !is_term_word(term) {
+        // A header word is not a term: a spec holding one is malformed.
+        return Err(badarg());
+    }
     if let Some(name) = atom_name(term, atoms) {
         match name {
             "_" => return Ok(Pattern::Wildcard),
@@ -90,11 +100,13 @@ pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &mut BTreeSet<u32>) -
         }
         return Ok(Pattern::Tuple(patterns));
     }
-    if is_list(term) {
-        // SAFETY: `is_list(term)` established that `term` is a live cons cell, so
-        // its two `[CAR, CDR]` words are readable; the spec term is caller-owned
-        // and stays live for the whole call.
-        let (head_term, tail_term) = unsafe { (car(term), cdr(term)) };
+    if let Some(cell) = cons_cell(term) {
+        // SAFETY: `cons_cell` established that `term` is a `TAG_PRIMARY_LIST`
+        // cons-cell word with a non-null cell pointer, so its two `[CAR, CDR]`
+        // words are addressable. Liveness/reachability is the caller's contract
+        // (the spec term is caller-owned and outlives the call); the shape test
+        // cannot validate it.
+        let (head_term, tail_term) = unsafe { (*cell, *cell.add(1)) };
         let head = Box::new(decode(head_term, atoms, vars)?);
         let tail = Box::new(decode(tail_term, atoms, vars)?);
         return Ok(Pattern::Cons(head, tail));
@@ -169,11 +181,16 @@ pub(super) fn matches(
             true
         }
         Pattern::Cons(head, tail) => {
-            if !is_list(object) {
+            // The object is table-owned (or a `match_spec_run` element), so a
+            // header-shaped or non-cons word is a **non-match**, never a read.
+            let Some(cell) = cons_cell(object) else {
                 return false;
-            }
-            // SAFETY: `is_list(object)` established a live cons cell.
-            let (car_term, cdr_term) = unsafe { (car(object), cdr(object)) };
+            };
+            // SAFETY: `cons_cell` established that `object` is a `TAG_PRIMARY_LIST`
+            // cons-cell word with a non-null cell pointer, so both `[CAR, CDR]` words
+            // are addressable. Liveness/reachability is the caller's contract (the
+            // object outlives the call); the shape test cannot validate it.
+            let (car_term, cdr_term) = unsafe { (*cell, *cell.add(1)) };
             matches(head, car_term, atoms, binds) && matches(tail, cdr_term, atoms, binds)
         }
         Pattern::Map(entries) => {
