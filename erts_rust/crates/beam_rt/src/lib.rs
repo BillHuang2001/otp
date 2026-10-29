@@ -77,6 +77,7 @@
 //!   `beam_engine`. The printer is the registered `io:format/2` BIF, not a second printer.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+pub mod atom_seed;
 pub mod boot;
 pub mod cli;
 pub mod codeserver;

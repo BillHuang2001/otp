@@ -42,6 +42,14 @@
 //! keeps the shared prefix it was loaded with; a term produced by that module is
 //! nameable by the server's (now larger) table. Nothing ever renumbers.
 //!
+//! The table is **not** empty at the start: [`CodeServer::new`] interns
+//! `erts/emulator/beam/atom.names` in file order first ([`crate::atom_seed`]), so the base of
+//! the index space is the one real ERTS uses. What that buys is the *observable* order —
+//! a flat map's key tuple, `maps:keys/1`, `~p`'s map rendering and `term_to_binary/1`'s
+//! `MAP_EXT` key sequence are all in atom **index** order (comparison is by name since OTP 26,
+//! storage order is not). Names the file does not list follow, in this runtime's load/usage
+//! order — ERTS' own rule (atom.names, then each module's `AtU8` in load order).
+//!
 //! # The code path
 //!
 //! [`CodeServer::find_file`] searches, in order: the `-pa` directories (head, in reverse
@@ -107,6 +115,12 @@ pub enum RecordedName {
 /// ordered code path.
 pub struct CodeServer {
     /// The one atom table every loaded module is interned into.
+    ///
+    /// It starts with the emulator's **initial atom index space** —
+    /// `erts/emulator/beam/atom.names`, interned in file order by
+    /// [`crate::atom_seed::seed`] in [`CodeServer::new`] — so an atom's index is the one real
+    /// ERTS gives it, and only names outside that file are appended in this runtime's own
+    /// load/usage order (the ERTS rule: `atom.names`, then each module's `AtU8` in load order).
     ///
     /// Shared through an [`Rc`] so a BIF call can hand a `BifContext` a table handle that
     /// does **not** borrow the runtime: [`CodeServer::atoms_handle`] clones the `Rc` and
@@ -215,14 +229,24 @@ pub struct CodeServer {
 }
 
 impl CodeServer {
-    /// An empty server: no atoms, no modules, no code path.
+    /// A server holding the **initial atom index space** (see [`CodeServer::atoms`]), no
+    /// modules and no code path.
+    ///
+    /// The shared table starts seeded with `erts/emulator/beam/atom.names` in file order
+    /// ([`crate::atom_seed::seed`]) — the index order real ERTS starts from — which is what makes
+    /// map-key storage order, `maps:keys/1`, `~p`-rendered maps and `term_to_binary/1`'s
+    /// `MAP_EXT` key sequence agree with the oracle. That is a build-time constant, so it cannot
+    /// fail; the loop/boot vocabulary ([`crate::boot::seed_core_atoms`]) is interned **after** it,
+    /// by the boot path.
     ///
     /// The system `ebin` directories are added explicitly with
     /// [`CodeServer::add_system_paths`], so a caller that only needs an explicit code
     /// path never depends on a system Erlang installation.
     pub fn new() -> CodeServer {
+        let mut atoms = AtomTable::new();
+        crate::atom_seed::seed(&mut atoms);
         CodeServer {
-            atoms: Rc::new(AtomTable::new()),
+            atoms: Rc::new(atoms),
             modules: HashMap::new(),
             module_paths: HashMap::new(),
             module_files: HashMap::new(),
