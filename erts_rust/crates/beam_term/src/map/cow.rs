@@ -80,7 +80,12 @@
 //! `c - 1` for a delete from one.
 //!
 //! Every writer `debug_assert!`s that the words it wrote equal its plan's figure
-//! (the exactness half the tests lean on). The plan's figure is *not* asserted
+//! (the exactness half the tests lean on) — on every arm except the flat→HAMT
+//! conversion, whose plan is `write_map`'s capacity bound `map_words_capacity(n +
+//! 1)` rather than the words written. That arm is therefore the one place where a
+//! `*_words_required` figure is a bound and not an exact figure; the remove side is
+//! exact on every arm, its flat conversion writing exactly
+//! `flatmap_size_words(32)`. The plan's figure is *not* asserted
 //! against the size-only capacity bound: a collision node on the key's path may
 //! legitimately exceed it, which is the one case that must read
 //! [`map_put_cow_words_required`] / [`map_remove_cow_words_required`] instead.
@@ -172,9 +177,9 @@ pub fn map_remove_cow_words_capacity(size: usize) -> usize {
     }
 }
 
-/// The **exact** number of words [`map_put_cow`] will write for this map and key:
-/// a read-only O(log n) descent (hashing and nibbles only — no `atoms`, no term
-/// allocation), so it answers for a key that is not in the map yet.
+/// The number of words [`map_put_cow`] will write for this map and key: a read-only
+/// O(log n) descent (hashing and nibbles only — no `atoms`, no term allocation), so
+/// it answers for a key that is not in the map yet.
 ///
 /// It differs from [`map_put_cow_words_capacity`] exactly where the size cannot
 /// say: an insert into a `c`-cell collision node writes `c + 1` cells (`1 + c + 1`
@@ -183,6 +188,14 @@ pub fn map_remove_cow_words_capacity(size: usize) -> usize {
 /// No value is known here, so the figure is the *writing* put's: a put that finds
 /// the stored value word already identical writes nothing (`erl_map.c:2523-2525`),
 /// which makes this figure a sound upper bound for it.
+///
+/// The figure is exact on every arm **except the flat→HAMT conversion** — a flat map
+/// holding `MAP_SMALL_MAP_LIMIT` pairs and an absent key — where it is `write_map`'s
+/// capacity bound `map_words_capacity(n + 1)`: `711` at `n = 32`, against the `127`
+/// words `write_map` actually writes for `33` keys.
+/// That is an over-reservation of address space only, never an under-reservation,
+/// which is why this arm carries no `written == plan.words` assert.
+/// [`map_remove_cow_words_required`] has no such arm: it is exact everywhere.
 ///
 /// A caller that already holds the map can always reserve this figure; a caller
 /// that only knows the size must use the capacity bound.
