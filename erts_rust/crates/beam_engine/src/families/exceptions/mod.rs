@@ -262,8 +262,32 @@ pub(crate) fn exec(
                         // `{'EXIT',Inner}` and the inner `{Reason,Trace}`, carved from
                         // its spare `Sink` tail, so no second (collecting) allocation
                         // can strand a node written by the first.
+                        //
+                        // The raise may have published a synthesized **head item** —
+                        // the failing BIF's `{Module,Function,ArgList,Location}`
+                        // (`super::bif_frame`) or an `undef`'s unresolvable callee
+                        // (`super::callee`) — as its raw-trace word, which the landing
+                        // published in `x(2)`. It is C's **innermost** cooked item, and
+                        // it belongs to exactly one cooking: consume the one-shot latch
+                        // here, in the arm that cooks, and hand it to the builder — the
+                        // same protocol [`Instr::BuildStacktrace`] uses below. Without
+                        // it the `catch`-fold's list would start at the first
+                        // `raise_snapshot` frame, i.e. at the **caller** that invoked
+                        // the BIF, where the oracle names the BIF.
+                        //
+                        // A `true` also carries the "the head word IS `x(2)`"
+                        // obligation: `symbolic_stacktrace` re-reads that register
+                        // **after** its rooted reservation (the word cannot be captured
+                        // as a pre-reservation `Eterm`), so the term handed on is the
+                        // operand, never a stale term. The `throw`/`exit` arms do NOT
+                        // consume it (they cook no trace at all); a stale latch cannot
+                        // leak into a later cooking because every **fresh** raise
+                        // re-derives it from its own site (`Machine::throw_inner`), and
+                        // a propagating one deliberately carries the in-flight
+                        // exception's head onward.
+                        let head = machine.take_raise_head_item();
                         let cooked =
-                            symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?;
+                            symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), head)?;
                         machine.set_x(0, cooked)?;
                         // The reservation's spare tail (3 words: the inner pair's
                         // `arityval` header plus its 2 elements) is the inner

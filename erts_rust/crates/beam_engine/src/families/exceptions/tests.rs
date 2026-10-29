@@ -145,6 +145,7 @@ mod end_to_end;
 mod error_info;
 mod function_clause;
 mod handlers;
+mod legacy_catch;
 mod oracle;
 mod propagation;
 mod raising;
