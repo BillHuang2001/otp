@@ -18,22 +18,35 @@
 //
 // %CopyrightEnd%
 
-//! `put_map_assoc`'s capacity count is **O(1)**: the source map is enumerated
-//! exactly once per instruction, and that is pinned by a counting allocator.
+//! `put_map_assoc`'s **hash-map arm is incremental**: the source is not enumerated at
+//! all, and the instruction's allocation count no longer grows with `n`.
 //!
-//! # The waste this pins
+//! # The two arms
 //!
-//! `put_map_assoc` sizes its reservation from the source map's key count plus the
-//! number of new pairs (`beam_common.c:2002,2017` — the C reads
-//! `flatmap_get_size(old_mp)` off the header). The count used to come from
-//! `terms::map_entries(map)?.len()`, which materializes a `Vec<(Eterm, Eterm)>` of
-//! every existing pair and drops it again **purely for the length**, before the
-//! merge builds the same list a second time. On the dominant memory path of an
-//! in-process `-eval` compile (`lib/kernel/src/inet_parse.erl`, 69.7 % of its arena
-//! words in `put_map_assoc` reservations) that doubled the walk on every update.
+//! The instruction picks its arm from the source's own layout:
 //!
-//! The count now comes from [`beam_term::map::map_size`] — the head node's own size
-//! word, one O(1) read — so the pair list is built once.
+//! * a **hash map** (HAMT) source takes the path-copying writer,
+//!   `beam_term::map::map_put_cow`, through [`beam_engine::terms::map_cow_rooted`]:
+//!   one rooted reservation of `map_put_cow_capacity(size) * pairs` arena words, then
+//!   one put per pair that descends the key's hash path and copies only the nodes on
+//!   it. **No pair list is materialized** — the source is not walked once, let alone
+//!   twice — and the reservation is two orders of magnitude below the whole-map
+//!   rebuild's.
+//! * a **flat map** (≤ `MAP_SMALL_MAP_LIMIT` = 32 keys) keeps the rebuild: merge into
+//!   a fresh pair list and build it with [`beam_engine::terms::make_map`], whose
+//!   `write_map` allocates a `Box` per HAMT node. That arm is what performs the 33rd
+//!   key's conversion to a hash map.
+//!
+//! # What this test still guards, and how
+//!
+//! The counting allocator and the `harness + build + one walk` band are kept
+//! **deliberately**, as an upper-bound regression guard on the *rebuild* shape:
+//! `build` is the reference map the semantic pin compares against and `walk` is one
+//! [`beam_engine::terms::map_entries`] enumeration, so an update that went back to
+//! enumerate-and-rebuild (or to the old `map_entries(map)?.len()` double walk) would
+//! still blow through the band. The measured hash-map arm sits far below it (the
+//! figures are printed by `-- --nocapture`), so only a structural regression can
+//! fail this test.
 //!
 //! # Method — a counting global allocator, per-thread armed
 //!
@@ -43,11 +56,8 @@
 //! the flag here is **per-thread**, so a sibling `#[test]` in this binary — or
 //! libtest's own result collection — cannot contaminate a measurement.
 //!
-//! A `put_map_assoc` run is *not* allocation-free: `Machine::run_label` builds the
-//! run's label index and [`beam_term::map::write_map`] allocates a `Box` per HAMT
-//! node (see `beam_term/tests/map_words_capacity.rs`). So the bound is not zero — it
-//! is **calibrated in this same binary** from the three parts the instruction is made
-//! of, all measured with the same counter:
+//! The band is **calibrated in this same binary** from the three parts a rebuilding
+//! update is made of, all measured with the same counter:
 //!
 //! * the **harness** (`harness_module`: `Machine::new` + one label index over a
 //!   body that allocates nothing);
@@ -55,28 +65,23 @@
 //!   the semantic pin compares against);
 //! * **one** source walk (`terms::map_entries(source)`).
 //!
-//! The instruction must fit `harness + build + one walk + a slack smaller than a
-//! walk`, i.e. the source is enumerated once. The measured decomposition is exact
-//! (`A == harness + build + walk`), and the old `map_entries(map)?.len()` code sat one
-//! full walk above it:
-//!
-//! | n | harness | build | one walk | instruction | band | **old (two walks)** |
-//! |---|---|---|---|---|---|---|
-//! | 1 000 | 6 | 1 173 | 14 | 1 193 | 1 199 | **1 207** |
-//! | 2 775 | 6 | 3 174 | 17 | 3 197 | 3 203 | **3 214** |
-//!
-//! (bytes, n = 1 000: 165 264 measured vs 181 904 for the two-walk code; n = 2 775:
-//! 455 944 vs 521 992 — the difference is exactly one walk's `Vec<(Eterm, Eterm)>`,
-//! `16n` bytes of growth.) The figures are printed (`-- --nocapture`).
+//! `harness + build + one walk` is what an enumerate-once-and-rebuild update costs;
+//! the old `map_entries(map)?.len()` code sat one full walk above it (the `OLD`
+//! column below). Both are now *bounds*, not the model: the reserved arena words of
+//! a path-copying put are not allocator events at all (they come out of the arena's
+//! own region), so the hash-map arm's allocator figure is the harness plus the
+//! reference build and nothing that scales with `n`.
 //!
 //! # The semantic pin (independent of the counter)
 //!
-//! The capacity only sizes the reservation — the builder deduplicates, so any upper
-//! bound yields the same map. The test therefore also pins the **result**: the same
-//! instruction run twice must produce equal maps, and the produced map must equal the
-//! reference map built for the same merged pair list by the general builder
-//! ([`beam_engine::terms::make_map`]), down to `terms::map_entries`' **storage order**
-//! (the HAMT shape, which term equality alone would not pin).
+//! The reservation only sizes the block a put writes into. The test therefore also
+//! pins the **result**: the same instruction run twice must produce equal maps, and
+//! the produced map must equal the reference map built for the same merged pair list
+//! by the general builder ([`beam_engine::terms::make_map`]) — `=:=`, the same size
+//! word, and the same **canonical** key sequence
+//! ([`beam_term::map::map_pairs`]). The *internal* HAMT node order is deliberately
+//! not pinned: a path-copied map copies the nodes on one key's path and shares the
+//! rest, so its node order is not the rebuild's in general.
 //!
 //! # Running it
 //!
@@ -284,9 +289,8 @@ fn harness_module() -> (Module, Label) {
 /// allocation events.
 ///
 /// One `terms::map_entries` walk over a 1 000-pair hash map costs **14** allocation
-/// events here (17 at 2 775 pairs), so no single-walk path can absorb a second walk
-/// inside this slack — while the single-walk path needs none of it (measured: exactly
-/// `harness + build + one walk`).
+/// events here (17 at 2 775 pairs), so no enumerate-and-rebuild path can slip under
+/// the band by absorbing a walk inside this slack.
 const ALLOC_SLACK: usize = 6;
 
 /// The same head-room in bytes — one walk's `Vec<(Eterm, Eterm)>` costs `16 * n`
@@ -300,12 +304,12 @@ const BYTE_SLACK: usize = 1_024;
 /// The counters are process-global, so every measurement lives in **one** `#[test]`
 /// (libtest would otherwise run the sizes concurrently in the same process).
 ///
-/// The whole measurement fits in the `MinimalContext`'s first reserved region
-/// (~2.5 MiB of the 4 MiB one: four `map_words_capacity(n)` blocks per size), so no
-/// region reservation — a large `mmap` in the counter — can land inside a window; the
-/// byte figures are evidence of that, being exactly linear in `n`.
+/// The whole measurement fits in the `MinimalContext`'s reserved regions (a source,
+/// a reference and a few path-copying reservations per size), so no region
+/// reservation — a large `mmap` in the counter — can land inside a window; the byte
+/// figures are evidence of that, being flat in `n`.
 #[test]
-fn put_map_assoc_walks_the_source_map_once() {
+fn put_map_assoc_does_not_enumerate_the_source_map() {
     let (module, entry) = assoc_module();
     let (harness_module, harness_entry) = harness_module();
     let atoms = &module.atom_table;
@@ -341,14 +345,14 @@ fn put_map_assoc_walks_the_source_map_once() {
         //     pin.
         let (allocs, bytes, first) = run_measured(&mut ctx, &module, entry, source);
         let (_, _, second) = run_measured(&mut ctx, &module, entry, source);
-        // (2) The source walk the capacity count must NOT need a second time.
+        // (2) One source walk: part of the band's upper bound (the rebuild shape walks
+        //     the source; the hash-map arm does not walk it at all).
         let (walk_allocs, walk_bytes, walked) = measure(|| {
             terms::map_entries(source).expect("a readable map")
         });
         assert_eq!(walked.len(), n, "n = {n}: one walk sees every pair");
-        // (3) The build alone: the reference map for the merged pair list, whose
-        //     `map_entries` **storage order** must match too — the HAMT shape, which
-        //     term equality alone would not pin.
+        // (3) The build alone: the reference map for the merged pair list, which is
+        //     the rebuild model's cost and the semantic pin's other side.
         let (build_allocs, build_bytes, reference) =
             measure(|| terms::make_map(&mut ctx, &merged, atoms).expect("the reference map"));
 
@@ -384,29 +388,35 @@ fn put_map_assoc_walks_the_source_map_once() {
             cmp(first, reference, atoms).is_eq(),
             "n = {n}: the update equals the reference build"
         );
-        let produced = terms::map_entries(first).expect("a readable map");
-        let expected = terms::map_entries(reference).expect("a readable map");
+        // The canonical key sequence, which the frozen layout does guarantee. The
+        // *internal* HAMT node order is not pinned: the update copies one key's path
+        // and shares the rest, so its node order is not the rebuild's in general.
+        let produced = beam_term::map::map_pairs(first, atoms).expect("a readable map");
+        let expected = beam_term::map::map_pairs(reference, atoms).expect("a readable map");
         assert_eq!(produced.len(), expected.len(), "n = {n}: same key count");
         for (got, want) in produced.iter().zip(expected.iter()) {
             assert!(
                 cmp(got.0, want.0, atoms).is_eq() && cmp(got.1, want.1, atoms).is_eq(),
-                "n = {n}: storage-order pair mismatch: {got:?} vs {want:?}"
+                "n = {n}: canonical-order pair mismatch: {got:?} vs {want:?}"
             );
         }
 
-        // The allocation pin: `harness + build + ONE walk`, with a slack smaller than
-        // a single walk. The old code (`map_entries(map)?.len()`) walked twice, so it
-        // sat at `harness + build + 2 * walk` — above the band on both signals.
+        // The band is an UPPER BOUND on the rebuild shape (`harness + build + one
+        // walk`, with a slack smaller than a single walk): the hash-map arm's
+        // path-copying reservation is arena storage, not an allocator event, so it
+        // sits far below it. An update that went back to enumerate-and-rebuild —
+        // including the old `map_entries(map)?.len()` double walk — lands above it on
+        // both signals.
         assert!(
             allocs <= band_allocs,
             "n = {n}: {allocs} allocations exceed harness({h_allocs}) + build({build_allocs}) + \
-             one walk({walk_allocs}) + {ALLOC_SLACK} = {band_allocs}; the capacity count must \
-             come from the map's size word, not from a second `map_entries` walk"
+             one walk({walk_allocs}) + {ALLOC_SLACK} = {band_allocs}; the update must not \
+             materialize the source map as a pair list"
         );
         assert!(
             bytes <= band_bytes,
             "n = {n}: {bytes} bytes exceed harness({h_bytes}) + build({build_bytes}) + one \
-             walk({walk_bytes}) + {BYTE_SLACK} = {band_bytes}; a second walk allocates a `Vec` of \
+             walk({walk_bytes}) + {BYTE_SLACK} = {band_bytes}; a walk allocates a `Vec` of \
              {n} pairs ({size} bytes) here",
             size = 16 * n
         );

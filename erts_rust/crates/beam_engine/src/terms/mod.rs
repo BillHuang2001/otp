@@ -60,7 +60,9 @@
 //! ([`beam_term::map::write_map`]), so [`map_entries`] walks the `erl_map.h` node
 //! tree itself while [`make_map`] delegates construction to
 //! [`beam_term::map::write_map`] — a flat map at/below `MAP_SMALL_MAP_LIMIT` (32)
-//! pairs, a hashmap above it, exactly the oracle's choice.
+//! pairs, a hashmap above it, exactly the oracle's choice. [`map_cow_rooted`] /
+//! [`CowMapRegion`] are the safe wrappers over `beam_term`'s **path-copying**
+//! writer, which an incremental update uses instead of a rebuild.
 //!
 //! # Error strategy
 //!
@@ -120,7 +122,10 @@ pub use fun::{
 pub use fun::make_fun_rooted;
 #[cfg(test)]
 pub(crate) use fun::make_fun_external;
-pub use map::{is_hashmap, make_flatmap, make_flatmap_rooted, make_map, make_map_rooted, map_entries};
+pub use map::{
+    is_hashmap, make_flatmap, make_flatmap_rooted, make_map, make_map_rooted, map_cow_rooted,
+    map_entries, map_put_cow_capacity, CowMapRegion,
+};
 pub use number::{float_value, make_float, make_float_rooted, make_integer, make_integer_rooted};
 pub(crate) use number::make_integer_unrooted;
 pub use read::{binary_bytes, cons_head, cons_tail, list_elements, tuple_arity, tuple_element};

@@ -165,9 +165,10 @@ fn head_bitmap_header(bitmap: u16) -> Eterm {
 
 /// A hand-written **hashmap** (HAMT) fixture.
 ///
-/// No crate in the rewrite can *build* a HAMT (`beam_engine::terms::map_entries`
-/// can read one; the builder belongs to `beam_term`/`beam_codec` and does not
-/// exist yet), so these tests write the frozen `erl_map.h` node blocks directly.
+/// The builder lives in `beam_term` (`map::write_map`) and is reachable through
+/// `beam_engine::terms::make_map`, but a HAMT it builds has a node layout this
+/// fixture must *fix*, so these tests write the frozen `erl_map.h` node blocks
+/// directly and read them back through `beam_engine::terms::map_entries`.
 /// Every block lives in a `Box<[Eterm]>` the fixture keeps alive, so a sub-node
 /// pointer stored in a parent node stays valid — moving the `Box` moves the
 /// pointer, never the pointed-to block.
