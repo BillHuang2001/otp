@@ -179,6 +179,7 @@ The design rationale and binding invariants of the runtime glue — the mature-G
 * `send_after/3`/`cancel_timer/1` and the `RuntimeHooksBridge` timer/link/module keys are floor capabilities; `system_info/2` and the other `RuntimeHooks` keys are gaps — G *Timers*.
 * Four collection points, three of them heap-admission doors — GC *GC / heap model*.
 * The unscanned-root valve declines a collection only where relocation is genuinely unsafe — GC *GC / heap model*.
+* A repeated BIF-raise loop inside a scheduled slice dies by **SIGSEGV** in the unscanned-root valve's per-word phase — a `LIST`-tagged machine root whose pointer is `0x18` is dereferenced as a cons cell — a memory-safety fault, not a typed gap; the `-eval` route is clean and the crashing shape set and iteration cliff are tier-specific — GC, [`src/context/CONTEXT.md`](src/context/CONTEXT.md) *Known Issues*.
 * The engine's refc-binary reservoir is pruned at every pre-emption; every gate is a decline, so the residual is a leak, never a dangle — `tests/off_heap_reclaim.rs`, GC *GC / heap model*.
 * `Runtime::eval_off_heap` is pruned at two points (doubt ⇒ decline; the nested point prunes only its own run's handles) — GC *GC / heap model*.
 * `erlang:memory/0,1` adopted, `statistics/1` partly served; `+hmax` is a cumulative ceiling with a refused-growth arena residual — GC *Heap switches*.
