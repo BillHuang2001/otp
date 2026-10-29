@@ -40,6 +40,11 @@ the cross-module and public-surface behaviour.
   retired-instruction figures are the load-independent evidence; timing shapes go to `../examples/`.
 - `map_build_equivalence.rs` is an **equivalence gate, not a golden re-pin**: a dedup rewrite must keep the
   file unchanged and green.
+- `map_cow_equivalence.rs` pins the path-copying writers' **semantics** against `write_map` (the rebuild
+  route) and their **sharing** against the copier's own walk, so a COW-internal refactor must keep it green
+  and unchanged; only a deliberate semantic change may edit it.
+- The `beam_gc` copy test over a *partially shared* map (a collection relocating the source and the result
+  across heaps) is **not here** — it belongs to `beam_gc`, and `map_cow_equivalence.rs`'s module docs say so.
 - The counting `#[global_allocator]` pattern (a `std::alloc::System` wrapper with counters armed **per
   thread**) is deliberate: libtest's harness must never perturb a measurement.
 - Exact-allocation pins are deliberate and bidirectional: a *reduction* fails them exactly like a regression,
