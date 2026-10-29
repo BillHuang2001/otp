@@ -232,7 +232,7 @@ Every `src/*.rs` file is a routing node; its item list is the module section abo
 - `src/map.rs` → the Erlang map (flat-map/HAMT builder, `collapse_eq_runs`, the readers, `map_words_capacity`)
 - `src/record.rs` → native records (size fns, `write_record`, the `record_*` readers)
 - `src/number.rs` → `big_to_f64` + `number_as_f64`
-- `src/bitstring.rs` → `ErlHeapBits`/`ErlSubBits` writers+readers, `bitstring_parts`/`bit_at`, the float readers
+- `src/bitstring/` → bit-level payloads: `mod.rs` (unchecked `ErlHeapBits`/`ErlSubBits` writers+readers, `bitstring_parts`/`bit_at`, the float readers) and `checked.rs` (the shape-validating `try_*` forms) — what makes a corrupt payload word a typed error instead of a wild read (child node — `src/bitstring/CONTEXT.md`)
 - `src/refc.rs` → off-heap (`refc`) binaries (the `BinRef`+`ErlSubBits` pair, the on-heap limits)
 - `src/error.rs` → `TermError`/`TermResult` + the `From<TermError> for BeamError` interop impl
 - `tests/` → the public-surface suites, allocation pins and live-`erl` cross-checks (child node, 22 files — `tests/CONTEXT.md`)
