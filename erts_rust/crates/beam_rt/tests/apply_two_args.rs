@@ -1,0 +1,491 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+//! **`erlang:apply/2` is `apply(Fun, Args)`** — the fun/argument-list form, served by the
+//! runtime-native floor, oracle-cross-checked on both execution tiers.
+//!
+//! # Why the floor owns it
+//!
+//! `apply/2` and `apply/3` are the two "BIFs" ERTS implements as **instructions** rather than
+//! as SNIFs (`erts_is_builtin`'s hardcoded special case, `erts/emulator/beam/beam_common.c`;
+//! `emu/ops.tab` rewrites a `call_ext*` to them into `i_apply_fun*`), so neither name appears in
+//! `bif.tab` and `beam_bifs` carries no implementation for them. The engine special-cases the
+//! arity-3 form (`resolve_call_ext_apply`); the arity-2 form reaches the host's `call_bif`, which
+//! is why `RuntimeContext::apply_2` (`src/context/apply.rs`) implements it.
+//!
+//! The wrong reading — `apply(Mod, Fun)` as a zero-arity `Mod:Fun()` — is invisible with a
+//! **literal** argument list (the compiler knows the arity and emits `call_fun`/`apply`, never
+//! `call_ext`), and only surfaces when the argument list is a **variable** (`beam_ssa_codegen`
+//! then emits `call_ext_only 2 {extfunc,erlang,apply,2}`). That is the shape every probe below
+//! takes: `Args = id([...])` hides the value from the compiler, so the call really goes through
+//! `erlang:apply/2`.
+//!
+//! # The three failure classes, in the C's order
+//!
+//! `apply_fun` (`beam_common.c:1734`) decodes the argument list **first**, so a bad list is
+//! reported before a non-fun is:
+//!
+//! 1. a non-list or improper `Args` ⇒ `error:badarg` with the BIF stacktrace head
+//!    `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}`;
+//! 2. more than `MAX_REG - 1` arguments (`decode_arglist`) ⇒ `error:system_limit`, same head;
+//! 3. a non-fun `Fun` ⇒ `EXC_BADFUN` (`badfun`).
+//!
+//! The fixture reports all three through one `caught/2` helper so the answers are values (atoms,
+//! booleans, small integers, short tuples) and never a `#Fun<…>` render.
+//!
+//! # What is pinned, and what is a documented residual
+//!
+//! [`PROBES`] must agree **exactly** with the oracle on the default tier and on
+//! `BEAM_RT_TIER=interpreter`. [`RESIDUALS`] pins the four shapes that do **not** yet: a
+//! non-fun / wrong-arity application reports the right class but differs in the trace head (this
+//! runtime arms the `erlang,apply` BIF item, the oracle keeps the **caller** frame) and in the
+//! reason (C's `expand_error_value` wraps `{badfun, Fun}` / `{badarity, {Fun, Args}}`, this
+//! runtime raises the bare atom). Both belong to the engine's `call_ext` raise path
+//! (`beam_engine::Machine::resolve_call_ext_apply` handles arity 3 only), not to this crate; the
+//! test pins today's behaviour so the day that gap closes is visible.
+//!
+//! [`APPLIED_RECEIVE`] pins the `receive` inside an applied fun: the `-eval` route, which pumps,
+//! really waits (`timeout`, like the oracle), while the scheduled route — a nested machine that
+//! may not suspend the process — is the honest `unsupported` gap.
+use std::path::Path;
+mod support;
+/// The banner every loud skip names.
+const BANNER: &str = "erlang:apply/2";
+/// The executable under test.
+const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
+/// The fixture: every `apply/2` shape worth distinguishing, in one module.
+///
+/// Each probe hides its argument list behind `id/1` so the compiler cannot turn the call into a
+/// `call_fun`/`apply` instruction — the only way `erlang:apply/2` is reached at all.
+///
+/// * `a/0`, `c/0`, `zero/0`, `closure/0`, `two_arg/0` — the success path: a closure with one
+///   argument, a zero-arity closure, a closure with a **free variable** (`N = 10`), and a
+///   two-argument closure (the argument-list decode, not a fixed arity);
+/// * `ext/0`, `ext0/0`, `local_mfa/0` — the three **fun kinds** an `apply/2` can be handed: an
+///   external `fun lists:reverse/1` (an `EXPORT_EXT`), an external fun naming a runtime-served
+///   key (`fun erlang:self/0`) and a local `fun ap2:id/1`;
+/// * `cd/0` … `ch/0`, `ctoo/0`, `cok/0`, `carity/0` — the same shapes through `caught/2`, which
+///   turns each class into a value and reports the stacktrace head as
+///   `{frame, Module, Function, ArityMark, Location}` where `ArityMark` is
+///   `[Fun =:= Fun, Args =:= Args]` for the BIF's own `[Fun, Args]` argument vector;
+/// * `ce_shape/0`, `carity_shape/0` — the **reason's** shape (does C's `expand_error_value` wrap
+///   it?);
+/// * `d/0`, `e/0`, `f/0`, `g/0`, `h/0`, `toomany/0` — the uncaught forms, where the runtime's own
+///   diagnostic is checked instead of a caught value;
+/// * `recv_after/0`, `send_recv/0` — a `receive` **inside** the applied fun.
+const FIXTURE_SRC: &str = r#"
+-module(ap2).
+-export([a/0,c/0,zero/0,closure/0,two_arg/0,ext/0,ext0/0,local_mfa/0,
+         d/0,e/0,f/0,g/0,h/0,toomany/0,
+         recv_after/0,send_recv/0,
+         cd/0,ce/0,cf/0,cg/0,ch/0,ctoo/0,cok/0,carity/0,
+         ce_shape/0,carity_shape/0,id/1]).
+%% The compiler barrier: a variable argument list is what makes the call site a
+%% `call_ext_only 2 {extfunc,erlang,apply,2}` instead of an `apply`/`call_fun` instruction.
+id(X) -> X.
+a() -> F = fun(X) -> X+1 end, Args = id([1]), apply(F, Args).
+c() -> F = fun() -> {[]} end, Args = id([]), apply(F, Args).
+zero() -> F = fun() -> 7 end, Args = id([]), apply(F, Args).
+closure() -> N = 10, F = fun(X) -> X+N end, Args = id([5]), apply(F, Args).
+two_arg() -> F = fun(X, Y) -> X*Y end, Args = id([6, 7]), apply(F, Args).
+%% The fun kinds: an `EXPORT_EXT`, one naming a runtime-served key, and a local `fun M:F/A`.
+ext() -> F = fun lists:reverse/1, Args = id([[1,2,3]]), apply(F, Args).
+ext0() -> F = fun erlang:self/0, Args = id([]), is_pid(apply(F, Args)).
+local_mfa() -> F = fun ap2:id/1, Args = id([9]), apply(F, Args).
+d() -> erlang:apply(erlang, self).
+e() -> F = notafun, Args = id([1]), apply(F, Args).
+f() -> F = fun(X) -> X end, Args = id([1|2]), apply(F, Args).
+g() -> F = fun(X) -> X end, Args = id(notalist), apply(F, Args).
+h() -> erlang:apply(lists, reverse).
+toomany() -> F = fun(X) -> X end, Args = id(lists:seq(1, 2000)), apply(F, Args).
+
+%% One `try … catch` around the apply, reporting the class, the reason's class and the head of
+%% the stacktrace as a comparable shape (never a fun).
+caught(Fun, Args) ->
+    try apply(Fun, Args) of
+        V -> {value, V}
+    catch C:R:S -> {C, reason_class(R), head(S, Fun, Args)}
+    end.
+cd() -> caught(erlang, self).
+ce() -> caught(notafun, id([1])).
+cf() -> F = fun(X) -> X end, caught(F, id([1|2])).
+cg() -> F = fun(X) -> X end, caught(F, id(notalist)).
+ch() -> caught(lists, reverse).
+ctoo() -> F = fun(X) -> X end, caught(F, id(lists:seq(1, 2000))).
+cok() -> F = fun(X) -> X+1 end, caught(F, id([41])).
+carity() -> F = fun(X) -> X end, caught(F, id([1,2])).
+ce_shape() -> reason_shape(raw(notafun, id([1]))).
+carity_shape() -> reason_shape(raw(fun(X) -> X end, id([1,2]))).
+raw(Fun, Args) ->
+    try apply(Fun, Args) of V -> {value, V} catch C:R -> {C, R} end.
+%% `{badfun, Fun}` / `{badarity, {Fun, Args}}` is C's `expand_error_value`; a bare atom is not.
+reason_shape({error, {badfun, F}}) -> {error, {badfun, is_atom(F)}};
+reason_shape({error, {badarity, {F, A}}}) -> {error, {badarity, is_function(F), is_list(A)}};
+reason_shape(R) -> R.
+
+reason_class({badfun, _}) -> badfun;
+reason_class({badarity, _}) -> badarity;
+reason_class(R) -> R.
+loc([]) -> none;
+loc([{error_info, #{module := M}}]) -> {error_info, M};
+loc(Other) when is_list(Other) -> {other, length(Other)}.
+head([{M, F, A, L} | _], Fun, Args) -> {frame, M, F, arity(A, Fun, Args), loc(L)};
+head(Other, _, _) -> {other, length(Other)}.
+arity(A, Fun, Args) when is_list(A) ->
+    case A of
+        [Fun0, Args0] -> [Fun0 =:= Fun, Args0 =:= Args];
+        _ -> {length, length(A)}
+    end;
+arity(_, _, _) -> not_a_list.
+
+recv_after() ->
+    F = fun() -> receive X -> X after 200 -> timeout end end,
+    Args = id([]),
+    apply(F, Args).
+send_recv() ->
+    F = fun() -> receive X -> {got, X} after 500 -> timeout end end,
+    self() ! hello,
+    Args = id([]),
+    apply(F, Args).
+"#;
+/// The `apply/2` shapes that must agree with the oracle **exactly**, on every tier.
+///
+/// The strings are the oracle's own `~1000p` rendering (`ap2:<probe>()` under OTP 29.1.2 /
+/// `erts-17.1.1`) and are re-measured against it on every run, so a drift in the oracle is a
+/// failure here rather than a silently stale golden.
+const PROBES: [(&str, &str); 15] = [
+    // The success path: one argument, zero arguments, a free variable, two arguments.
+    ("a", "2"),
+    ("c", "{[]}"),
+    ("zero", "7"),
+    ("closure", "15"),
+    ("two_arg", "42"),
+    // Every fun kind an `apply/2` can be handed: an `EXPORT_EXT`, a runtime-served key, a
+    // local `fun M:F/A`.
+    ("ext", "[3,2,1]"),
+    ("ext0", "true"),
+    ("local_mfa", "9"),
+    // A non-list / improper argument list is `badarg`, head = the BIF's own `[Fun, Args]`.
+    ("cd", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
+    ("cf", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
+    ("cg", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
+    ("ch", "{error,badarg,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}"),
+    // Past `MAX_REG` arguments (`decode_arglist`) is `system_limit`, same head.
+    (
+        "ctoo",
+        "{error,system_limit,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+    ),
+    // The control: a served key that really applies.
+    ("cok", "{value,42}"),
+    // A `receive` whose message is already in the mailbox never parks, so a nested machine
+    // answers it on the scheduled route too.
+    ("send_recv", "{got,hello}"),
+];
+/// The four shapes this runtime does **not** yet reproduce, pinned as they are measured.
+///
+/// Each entry is `(probe, oracle, this runtime)`. Every one of them is the same engine gap — the
+/// `erlang:apply/2` raise does not carry the C's stacktrace head (`non_bif_stacktrace` keeps the
+/// **caller** frame) nor `expand_error_value`'s reason wrapper. Closing it is a change in
+/// `beam_engine` (`Machine::resolve_call_ext_apply` handles only `import_arity == 3`), so the
+/// expectations below are what this crate can honestly claim today; when the engine lands the
+/// gap these rows become equalities and this table is what says so.
+const RESIDUALS: [(&str, &str, &str); 4] = [
+    (
+        "ce",
+        "{error,badfun,{frame,ap2,caught,not_a_list,{other,2}}}",
+        "{error,badfun,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+    ),
+    (
+        "carity",
+        "{error,badarity,{frame,ap2,caught,not_a_list,{other,2}}}",
+        "{error,badarity,{frame,erlang,apply,[true,true],{error_info,erl_erts_errors}}}",
+    ),
+    ("ce_shape", "{error,{badfun,true}}", "{error,badfun}"),
+    ("carity_shape", "{error,{badarity,true,true}}", "{error,badarity}"),
+];
+/// The uncaught probes and the reason atom each must name in the runtime's own diagnostic (the
+/// oracle's equivalent observable is a `catch` value — these are the same classes, uncaught).
+const UNCAUGHT: [(&str, &str); 6] = [
+    ("d", "badarg"),
+    ("e", "badfun"),
+    ("f", "badarg"),
+    ("g", "badarg"),
+    ("h", "badarg"),
+    ("toomany", "system_limit"),
+];
+/// The execution tiers the probes run on: the process **default** (the variable is removed, so an
+/// ambient `BEAM_RT_TIER` cannot leak in) and the `BEAM_RT_TIER=interpreter` reference tier.
+const TIERS: [(Option<&str>, &str); 2] = [(None, "default"), (Some("interpreter"), "interpreter")];
+/// One bounded child run on one tier.
+fn run_tier(args: &[&str], tier: Option<&str>, what: &str) -> support::Observed {
+    let output = support::run_bounded_with_env(
+        Path::new(BINARY),
+        args,
+        &[("BEAM_RT_TIER", tier)],
+    )
+    .unwrap_or_else(|| panic!("`{what}` could not be run to completion (killed at the bound)"));
+    support::Observed {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+/// `beam_rt run ap2.beam ap2:<function>/0` — the **scheduled** route (a real process).
+fn run_scheduled(
+    fixture: &support::ErlangFixture,
+    function: &str,
+    tier: Option<&str>,
+) -> support::Observed {
+    let dir = fixture.dir().to_str().expect("an ASCII scratch path");
+    let beam = fixture.beam();
+    let beam = beam
+        .to_str()
+        .unwrap_or_else(|| panic!("the fixture path is not UTF-8: {}", beam.display()));
+    let spec = format!("ap2:{function}/0");
+    run_tier(
+        &["-noshell", "-pa", dir, "run", beam, &spec],
+        tier,
+        function,
+    )
+}
+/// `beam_rt -noshell -pa <dir> -eval 'io:format("~1000p~n", [ap2:<function>()]).'` — the
+/// **pumping** route, where a nested run may spend the timer heap and the mailbox.
+///
+/// `~1000p` is `~p` at a 1000-column width, so a nested term stays one line in both runtimes (the
+/// CLI's own `run` route prints `~w`, which never wraps; the oracle needs the wider `~p` to
+/// match it).
+fn run_eval(
+    fixture: &support::ErlangFixture,
+    expression: &str,
+    tier: Option<&str>,
+) -> support::Observed {
+    let dir = fixture.dir().to_str().expect("an ASCII scratch path");
+    let expr = format!("io:format(\"~1000p~n\",[{expression}]), halt(0).");
+    run_tier(&["-noshell", "-pa", dir, "-eval", &expr], tier, expression)
+}
+/// **`apply(Fun, Args)` answers the oracle's value, `badarg` and `system_limit` shapes exactly.**
+///
+/// The oracle is probed first and must print every recorded answer — that is what keeps the
+/// goldens pinned to the system ERTS instead of to this suite's memory. Then each tier runs the
+/// same probes on the **scheduled** route (`beam_rt run`), which is the route a real program
+/// takes, and must reproduce every answer byte for byte.
+///
+/// The probes are shaped so the compiler cannot elide the `erlang:apply/2` call site: a literal
+/// argument list becomes a `call_fun` instruction and never reaches the floor.
+///
+/// Skips **loudly** without `erl`/`erlc`.
+#[test]
+fn apply_of_two_arguments_answers_the_oracle_on_both_tiers() {
+    let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two", "ap2", FIXTURE_SRC)
+    else {
+        return;
+    };
+    // The oracle is the spec.
+    for (function, expected) in PROBES {
+        let answer = support::fixture_oracle_answer(BANNER, fixture.dir(), &format!("ap2:{function}()"))
+            .unwrap_or_else(|| panic!("the oracle could not answer ap2:{function}/0"));
+        assert_eq!(answer, expected, "ap2:{function}/0 under the oracle");
+    }
+    for (tier, label) in TIERS {
+        for (function, expected) in PROBES {
+            let run = run_scheduled(&fixture, function, tier);
+            // A **caught** raise is a value, so the process returns normally whatever the class
+            // was: a non-zero exit here means the raise escaped, i.e. the wrong class.
+            assert_eq!(
+                run.code,
+                0,
+                "{label}: ap2:{function}/0 must return normally; stdout={:?} stderr={:?}",
+                run.stdout.trim(),
+                run.stderr.trim()
+            );
+            assert!(
+                !run.stderr.contains("unsupported"),
+                "{label}: ap2:{function}/0 must not be a capability gap; stderr={:?}",
+                run.stderr.trim()
+            );
+            assert_eq!(
+                run.stdout.trim(),
+                expected,
+                "{label}: ap2:{function}/0 must answer the oracle's {expected:?}"
+            );
+        }
+    }
+}
+/// **The two remaining classes keep their oracle class, with the residual difference pinned.**
+///
+/// `ce` (a non-fun), `carity` (the wrong arity), and their reason-shape twins must report the same
+/// `error`/`badfun`/`badarity` classification as the oracle. What differs today is *where* the
+/// report comes from:
+///
+/// * the trace head — this runtime arms the BIF item
+///   `{erlang, apply, [Fun, Args], [{error_info, #{module => erl_erts_errors}}]}` for **every**
+///   failing `apply/2`, where the oracle keeps the caller's frame (C's `non_bif_stacktrace`: only
+///   `badarg`/`system_limit` come from `apply_fun` itself, a `badfun`/`badarity` comes out of the
+///   inner `call_fun`);
+/// * the reason — C's `expand_error_value` turns `EXC_BADFUN`/`EXC_BADARITY` into
+///   `{badfun, Fun}` / `{badarity, {Fun, Args}}`, where this runtime raises the bare atom.
+///
+/// Both are the engine's `call_ext` raise path, not this crate's; pinning them here keeps the
+/// claim honest and makes the day they are fixed a visible, deliberate change to this table.
+#[test]
+fn the_badfun_and_badarity_classes_keep_their_oracle_class_with_a_pinned_residual() {
+    let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two_res", "ap2", FIXTURE_SRC)
+    else {
+        return;
+    };
+    for (tier, label) in TIERS {
+        for (function, oracle, rust) in RESIDUALS {
+            let answer = support::fixture_oracle_answer(BANNER, fixture.dir(), &format!("ap2:{function}()"))
+                .unwrap_or_else(|| panic!("the oracle could not answer ap2:{function}/0"));
+            assert_eq!(answer, oracle, "ap2:{function}/0 under the oracle");
+            let run = run_scheduled(&fixture, function, tier);
+            assert_eq!(
+                run.code, 0,
+                "{label}: ap2:{function}/0 must return normally; stderr={:?}",
+                run.stderr.trim()
+            );
+            assert_eq!(
+                run.stdout.trim(),
+                rust,
+                "{label}: ap2:{function}/0 is the pinned residual (a change here is the engine's \
+                 call_ext raise path landing, and this table must then become an equality with \
+                 the oracle's {oracle:?})"
+            );
+            // The exception class itself already agrees, on both sides.
+            assert!(
+                oracle.starts_with("{error,") && run.stdout.trim().starts_with("{error,"),
+                "{label}: ap2:{function}/0 must be an `error`-class raise on both sides; \
+                 oracle={oracle:?} rust={:?}",
+                run.stdout.trim()
+            );
+        }
+    }
+}
+/// **An uncaught `apply/2` failure is a genuine runtime error naming the oracle's reason atom.**
+///
+/// The caught probes above report the classes as values; these are the same seven shapes
+/// **uncaught**, where the observable is the runtime's own diagnostic: exit 1 (a real runtime
+/// error — never the `3` a capability gap exits with, and never the `0` a wrong `erlang:self/0`
+/// call would exit with), empty stdout (the failing apply returns no value), and a stderr line
+/// that names the reason atom the oracle also raises.
+///
+/// `d` is the probe that pins the fix's own regression: `erlang:apply(erlang, self)` read the
+/// first argument as a **module** and called `erlang:self/0` instead of rejecting the atom
+/// `erlang` as a non-fun.
+#[test]
+fn an_uncaught_apply_two_failure_names_the_oracles_reason_atom() {
+    let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two_uncaught", "ap2", FIXTURE_SRC)
+    else {
+        return;
+    };
+    for (tier, label) in TIERS {
+        for (function, class) in UNCAUGHT {
+            let run = run_scheduled(&fixture, function, tier);
+            assert_eq!(
+                run.code, 1,
+                "{label}: an uncaught ap2:{function}/0 must be a runtime error (exit 1); \
+                 stdout={:?} stderr={:?}",
+                run.stdout.trim(),
+                run.stderr.trim()
+            );
+            assert!(
+                run.stdout.trim().is_empty(),
+                "{label}: ap2:{function}/0 raised, so it must print no value; got {:?}",
+                run.stdout.trim()
+            );
+            assert!(
+                run.stderr.contains(class),
+                "{label}: ap2:{function}/0 must report `{class}`; stderr={:?}",
+                run.stderr.trim()
+            );
+            assert!(
+                !run.stderr.contains("unsupported"),
+                "{label}: ap2:{function}/0 must not be a capability gap; stderr={:?}",
+                run.stderr.trim()
+            );
+        }
+    }
+}
+/// **A `receive` inside the applied fun: fine where the route can pump, the typed gap where it
+/// cannot.**
+///
+/// `apply/2` folds the closure into a **nested** machine, so whether the process may suspend
+/// inside it is a property of the calling route, and the two routes differ honestly:
+///
+/// * the `-eval` route pumps (`RECEIVE_PUMP_SLICES` + one port round + the timer heap), so
+///   `recv_after/0` really waits out its `after 200` and answers `timeout` — exactly the
+///   oracle's value, and `send_recv/0` answers `{got,hello}` because the message is already in
+///   the process's mailbox;
+/// * the **scheduled** route (`beam_rt run`) must not run an inner scheduler, so a `receive` that
+///   has to park inside the nested machine is the documented `unsupported` gap: exit 3 with one
+///   `beam_rt: unsupported: …` line (a future in-machine `apply/2` entry — the engine's
+///   `resolve_call_ext_apply` accepting arity 2 — would turn this row into `timeout`).
+///
+/// `send_recv/0` on the scheduled route is the control that separates the two: a message that is
+/// already there never parks, so it answers `{got,hello}` on **both** routes.
+#[test]
+fn a_receive_inside_the_applied_fun_is_answered_where_the_route_can_pump() {
+    let Some(fixture) = support::ErlangFixture::compile(BANNER, "apply_two_recv", "ap2", FIXTURE_SRC)
+    else {
+        return;
+    };
+    for (tier, label) in TIERS {
+        // The pumping route reproduces the oracle, waiting included.
+        let oracle = support::fixture_oracle_answer(BANNER, fixture.dir(), "ap2:recv_after()")
+            .unwrap_or_else(|| panic!("the oracle could not answer ap2:recv_after/0"));
+        assert_eq!(oracle, "timeout", "ap2:recv_after/0 under the oracle");
+        let pumped = run_eval(&fixture, "ap2:recv_after()", tier);
+        assert_eq!(
+            pumped.code, 0,
+            "{label}: the `-eval` route must pump the applied fun's receive; stderr={:?}",
+            pumped.stderr.trim()
+        );
+        assert_eq!(
+            pumped.stdout.trim(),
+            oracle,
+            "{label}: ap2:recv_after/0 on the `-eval` route must answer the oracle's value"
+        );
+        // A message already in the mailbox is answered on either route.
+        let scheduled = run_scheduled(&fixture, "send_recv", tier);
+        assert_eq!(
+            scheduled.code, 0,
+            "{label}: ap2:send_recv/0 must not park; stderr={:?}",
+            scheduled.stderr.trim()
+        );
+        assert_eq!(
+            scheduled.stdout.trim(),
+            "{got,hello}",
+            "{label}: ap2:send_recv/0 on the scheduled route must answer the oracle's value"
+        );
+        // A receive that must park inside the nested machine is the typed capability gap.
+        let parked = run_scheduled(&fixture, "recv_after", tier);
+        assert_eq!(
+            parked.code, 3,
+            "{label}: ap2:recv_after/0 cannot suspend the process inside a nested machine, so it \
+             must be the typed gap; stdout={:?} stderr={:?}",
+            parked.stdout.trim(),
+            parked.stderr.trim()
+        );
+        assert_eq!(
+            parked.stderr.trim(),
+            "beam_rt: unsupported: opcode: run: process blocked (no message available)",
+            "{label}: ap2:recv_after/0's scheduled-route gap"
+        );
+    }
+}

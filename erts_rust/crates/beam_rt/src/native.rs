@@ -411,8 +411,14 @@ impl RuntimeContext<'_> {
             ("io", "request", 2) => self.io_native_request(args, 2, false),
             ("io", "requests", 1) => self.io_native_request(args, 1, true),
             ("io", "requests", 2) => self.io_native_request(args, 2, true),
-            ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
-            ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
+            // `erlang:apply/2` is `apply(Fun, Args)` — *not* a zero-arity `Module:Function`
+            // call. C implements both apply forms as **instructions** rather than SNIFs
+            // (`emu/ops.tab:872-874` rewrites a `call_ext*` to them into `i_apply_fun*`;
+            // neither name appears in `bif.tab`), and the engine special-cases only the
+            // arity-3 form, so the arity-2 form is served here:
+            // [`RuntimeContext::apply_2`](crate::context::RuntimeContext).
+            ("erlang", "apply", 2) => Some(self.apply_2(args)),
+            ("erlang", "apply", 3) => Some(self.apply_3(args)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
             // `process_info/1,2` stay on the floor: they answer from *this* runtime's
             // process tables through the shared `crate::native::memory` implementation
@@ -772,24 +778,23 @@ impl RuntimeContext<'_> {
         error::halt(status)
     }
 
-    // -- erlang:apply/2,3 -----------------------------------------------------
-    /// `erlang:apply(Mod, Fun)` / `erlang:apply(Mod, Fun, Args)`.
+    // -- erlang:apply/3 -------------------------------------------------------
+    /// `erlang:apply(Module, Function, Args)`.
     ///
     /// Re-enters the host's dispatch with `self` as the context, so the target may be a
     /// native BIF, a `beam_bifs` BIF **or** an external module function loaded on
     /// demand from the code path.
-    fn apply_dynamic(&mut self, args: &[Eterm], with_args: bool) -> Result<Eterm> {
+    ///
+    /// The arity-2 form is a **different operation** — `apply(Fun, Args)` — and lives
+    /// in [`RuntimeContext::apply_2`](crate::context::RuntimeContext) (see the floor arm).
+    fn apply_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let module = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
         let function = self
             .atom_name(*args.get(1).ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
-        let call_args: Vec<Eterm> = if with_args {
-            terms::list_elements(*args.get(2).ok_or(BeamError::BadArg)?)?
-        } else {
-            Vec::new()
-        };
+        let call_args: Vec<Eterm> = terms::list_elements(*args.get(2).ok_or(BeamError::BadArg)?)?;
         let arity = call_args.len() as u32;
         self.call_bif(&module, &function, arity, &call_args)
     }
@@ -1786,16 +1791,89 @@ mod tests {
         // pins — a `~p` renderer (the floor's deleted one) writes a bare `\n`.
         assert_eq!(sink.as_str(), "42\r\n");
     }
+    /// `erlang:apply/2` is `apply(Fun, Args)` — **never** a zero-arity `Module:Function()`.
+    ///
+    /// The floor used to read `args[0]` as a module and `args[1]` as a function, so
+    /// `erlang:apply(erlang, self)` answered a pid (it called `erlang:self/0`). C's
+    /// `apply_fun` decodes the **second** argument as the argument list *before* it looks
+    /// at the first, so this shape — the second argument is the atom `self`, not a list —
+    /// is `error:badarg` (measured on the oracle: `catch erlang:apply(erlang, self)` ⇒
+    /// `{'EXIT',{badarg,[{erlang,apply,[erlang,self],…},…]}}`).
     #[test]
-    fn apply_of_two_arguments_calls_a_zero_arity_bif() {
+    fn apply_of_two_arguments_reads_the_second_argument_as_an_argument_list() {
         let mut runtime = runtime();
-        // `erlang:apply(erlang, self)` — a registered `erlang` BIF reached dynamically.
         let module = atom(&mut runtime, "erlang");
         let function = atom(&mut runtime, "self");
-        let self_pid = call(&mut runtime, "erlang", "apply", &[module, function])
-            .expect("apply/2 dispatches to the BIF registry");
-        assert!(!is_small(self_pid));
-        assert!(!is_atom(self_pid));
+        let error = call(&mut runtime, "erlang", "apply", &[module, function])
+            .expect_err("apply/2 must not call erlang:self/0");
+        assert!(matches!(error, BeamError::BadArg), "{error}");
+    }
+
+    /// A first argument that is not a fun is the C's `EXC_BADFUN` (`call_fun`'s
+    /// `is_not_any_fun` arm): class `error` with the reason atom `badfun` — never the
+    /// `badarg` the floor used to raise. Measured on the oracle:
+    /// `catch apply(notafun, [1])` ⇒ `{'EXIT',{{badfun,notafun},[{qq10,e,0,…}]}}`; the
+    /// `{badfun, Fun}` payload is the engine's to expand (`crate::error::bad_fun`).
+    #[test]
+    fn apply_of_two_arguments_rejects_a_non_fun_with_badfun() {
+        let mut runtime = runtime();
+        let arguments = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_list(&mut context, &[make_small(1)]).expect("a list")
+        };
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), arguments])
+            .expect_err("apply/2 of a non-fun");
+        assert_eq!(error.as_atom(), Some("badfun"), "{error}");
+    }
+
+    /// A non-list or an **improper** second argument is `badarg` — and it wins over a
+    /// non-fun first argument, because C walks the argument list first (measured:
+    /// `catch apply(erlang, self)` is `badarg`, not `{badfun,erlang}`).
+    #[test]
+    fn apply_of_two_arguments_rejects_a_non_list_and_an_improper_list() {
+        let mut runtime = runtime();
+        // A non-list second argument.
+        let notalist = atom(&mut runtime, "notalist");
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), notalist])
+            .expect_err("apply/2 with an atom argument list");
+        assert!(matches!(error, BeamError::BadArg), "{error}");
+        // An improper list `[1 | 2]`.
+        let improper = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_cons(&mut context, make_small(1), make_small(2)).expect("a cons cell")
+        };
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), improper])
+            .expect_err("apply/2 with an improper argument list");
+        assert!(matches!(error, BeamError::BadArg), "{error}");
+    }
+
+    /// More arguments than the x-register file can hold is `error:system_limit`, and the
+    /// boundary is C's: `MAX_REG - 1` arguments are accepted (`apply_fun` must still be
+    /// able to put the fun at `reg[arity]`), the next one is `system_limit`.
+    ///
+    /// The first argument is deliberately a non-fun, so a `MAX_REG - 1`-element list
+    /// answers `badfun` (the list was decoded and the fun check was reached) while a
+    /// `MAX_REG`-element list never gets there.
+    #[test]
+    fn apply_of_two_arguments_stops_at_the_register_file_bound() {
+        let mut runtime = runtime();
+        let (max, over) = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            let mut bytes = vec![make_small(1); beam_engine::MAX_REGISTER as usize - 1];
+            let max = terms::make_list(&mut context, &bytes).expect("a 1023-element list");
+            bytes.push(make_small(1));
+            let over = terms::make_list(&mut context, &bytes).expect("a 1024-element list");
+            (max, over)
+        };
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), max])
+            .expect_err("apply/2 of 1023 arguments and a non-fun");
+        assert_eq!(error.as_atom(), Some("badfun"), "{error}");
+        let error = call(&mut runtime, "erlang", "apply", &[make_small(7), over])
+            .expect_err("apply/2 of 1024 arguments");
+        assert!(matches!(error, BeamError::SystemLimit), "{error}");
     }
 
     #[test]
@@ -1813,12 +1891,24 @@ mod tests {
         assert_eq!(signed_value(sum), 5);
     }
 
+    /// `apply/3`'s two leading atoms are checked **in order** — a non-atom module *or* a
+    /// non-atom function is `badarg` — and the arity-2 form is not involved at all.
     #[test]
-    fn apply_rejects_a_non_atom_target() {
+    fn apply_of_three_arguments_rejects_a_non_atom_target() {
         let mut runtime = runtime();
         let function = atom(&mut runtime, "self");
+        let arguments = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_list(&mut context, &[]).expect("the empty list")
+        };
         assert!(matches!(
-            call(&mut runtime, "erlang", "apply", &[make_small(1), function]),
+            call(
+                &mut runtime,
+                "erlang",
+                "apply",
+                &[make_small(1), function, arguments]
+            ),
             Err(BeamError::BadArg)
         ));
     }
