@@ -1,31 +1,31 @@
 # Test-suite parity sweep
 
-Generated at `1793247177` (Unix seconds) by `suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib`.
+Generated at `1793248490` (Unix seconds) by `suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib`.
 
 ## Environment
 
 - oracle: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` — `29/17.1.1`
-- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A579/erts_rust/target/release/beam_rt` — `30/17.1`
-- rust workspace commit: `caf5c958f2a658aa083b9ed7893eef761aa1be9c`
+- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A604/erts_rust/target/release/beam_rt` — `30/17.1`
+- rust workspace commit: `32732ba94bc9d89e8f67be6c472d5a6259af80c0`
 - tier: `default`
-- loadavg before/after: `4.26 4.14 17.32 5/854 2` / `5.31 5.16 16.13 35/949 1098` on 16 logical CPUs
+- loadavg before/after: `9.89 5.02 7.34 2/835 5` / `4.29 4.59 6.94 2/815 1101` on 16 logical CPUs
 - the host is **shared**: only pass/fail counts are portable, never a wall time
 
 ### Target `stdlib` (ct)
 
-- source: `/home/bill/Source/otp/.genesis/workers/worker_T1_A579/lib/stdlib/test` (otp) at `caf5c958f2a6`
-- staged copy: `/tmp/erts-suites-stage/stdlib/src`
+- source: `/home/bill/Source/otp/.genesis/workers/worker_T1_A604/lib/stdlib/test` (otp) at `32732ba94bc9`
+- staged copy: `/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src`
 - build: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …` — ok (reused a completed build)
 - build detail: compiled 8 suites + 6 helpers + runner with the oracle's erlc
-- tally: measured 214 · agree 166 · agree-fail-identical (excluded) 4 · divergence 32 · oracle-only-fail 0 · rust-gap 12 · not-run 0
-- totals: sys 209/5 passed/failed · rust 166/35 passed/failed
+- tally: measured 214 · agree 167 · agree-fail-identical (excluded) 4 · divergence 31 · oracle-only-fail 0 · rust-gap 12 · not-run 0
+- totals: sys 209/5 passed/failed · rust 167/34 passed/failed
 
 Notes:
 - drive (identical on both sides): `ct_runner:run('{suite}', {case_timeout_ms}, {suite_budget_ms}, "{data_root}"), halt(0).`
 - each case runs in its own `spawn_monitor` with a per-case timeout; `init_per_group`/`end_per_group`/`init_per_testcase` hooks are NOT executed
 - cases that fail identically on both sides (missing `ct` config/data dirs, group-hook dependencies) are `agree-fail-identical`: excluded from both numerators, never counted as passes
 - per-case timeout: 10 s · suite budget: 300 s (the runner stops launching cases when the budget expires and prints `SUITE_DEADLINE <not-run>`, so the remaining cases are reported as *not measured*, never as failures)
-- binary_module_SUITE: 20 cases — sys 18/2 pass/fail, rust 3/4 pass/fail
+- binary_module_SUITE: 20 cases — sys 18/2 pass/fail, rust 4/3 pass/fail
 - dict_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail
 - lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 76/2 pass/fail
 - maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 19/13 pass/fail
@@ -42,7 +42,7 @@ Notes:
 | `binary_module_SUITE:check_no_invalid_read_bug` | 1/0 | 1/0 | agree |  |
 | `binary_module_SUITE:copy` | 0/1 | 0/1 | agree-fail-identical | {exception,error,unsupported_bif,{erts_debug,set_internal_state,[...],...}} |
 | `binary_module_SUITE:doctests` | 1/0 | 0/1 | divergence | {exception,error,{1,errors},{ct_doctest,run_module_docs,3,...}} |
-| `binary_module_SUITE:encode_decode` | 1/0 | 0/1 | divergence | timeout |
+| `binary_module_SUITE:encode_decode` | 1/0 | 1/0 | agree |  |
 | `binary_module_SUITE:error_info` | 1/0 | error | rust-gap | case missing from the rust runtime's output |
 | `binary_module_SUITE:guard` | 1/0 | error | rust-gap | case missing from the rust runtime's output |
 | `binary_module_SUITE:hex_encoding` | 1/0 | error | rust-gap | case missing from the rust runtime's output |
@@ -255,9 +255,9 @@ Recorded invocations (the two sides get the *same* `-pa` set and the *same* `-ev
 
 ```
 # ct binary_module_SUITE [sys]
-cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/erts-suites-stage/stdlib/src"), halt(0).'
+cd /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src"), halt(0).'
 # ct binary_module_SUITE [rust]
-cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A579/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/erts-suites-stage/stdlib/src"), halt(0).'
+cd /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A604/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/genesis/task_1d03f76b129d1c78/erts-suites-stage/stdlib/src"), halt(0).'
 # erlc [build]
 /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …
 ```

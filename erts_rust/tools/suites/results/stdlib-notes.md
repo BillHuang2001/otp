@@ -1,558 +1,331 @@
-# OTP `stdlib` `common_test` suites under the system ERTS vs the Rust runtime (`beam_rt`)
+# stdlib sweep — analysis of the committed artifact
 
-Per-case sweep of eight `lib/stdlib/test` `common_test` suites driven by `erts_rust/tools/suites`
-(`data/ct_runner.erl`, which expands `Suite:all()` through `groups/0` and prints one
-`CASE <name> OK|SKIP|EXC|TIMEOUT|MISSING` line per case).
+Analysis of **`results/stdlib/report.json`** (schema `suites/1`) and its rendered
+`results/stdlib/summary.md`. Every number below is re-derived from that JSON; the environment block is
+copied from the report's own `host`/`rust`/`generated_at`/`run_command` fields.
 
-## A. Environment
+Rust side = `erts_rust/target/release/beam_rt` built from this worktree; oracle = the system `erl` on
+`$PATH`. **The host is shared** — only pass/fail counts, ratios and directions are meaningful; no
+absolute wall time here is portable.
 
-| item | value |
-| --- | --- |
-| oracle | `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` — OTP release/erts `29/17.1.1` |
-| rust runtime | `/home/bill/Source/otp/.genesis/workers/worker_T1_A595/erts_rust/target/release/beam_rt` — version `30/17.1`, tier default (baseline JIT) |
-| rust runtime git sha (measured) | `ec44fa3f7fc7d8419ae32f11b23a06448b565ec7` |
-| suites | 8 — dict_SUITE, lists_SUITE, maps_SUITE, proplists_SUITE, queue_SUITE, binary_module_SUITE, string_SUITE, unicode_SUITE |
-| `--jobs` | 4 |
-| nproc | 16 |
-| host loadavg before | `1.17 8.41 29.97 2/857 5` |
-| host loadavg after | `1.56 5.70 22.41 2/865 977` |
-| per-case timeout of the canonical run | 300 s (suite budget 330 s) |
+---
 
-Commands (repo root):
+## A. Environment (from the report)
+
+| field | value |
+|---|---|
+| `generated_at` | `1793248490` |
+| `run_command` | `suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib` |
+| `host.oracle` | `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` |
+| `host.oracle_version` | `29/17.1.1` (tree pins OTP `30.0-rc0`, erts `17.1`) |
+| `host.nproc` | 16 |
+| `host.loadavg_before` | `9.89 5.02 7.34 2/835 5` |
+| `host.loadavg_after` | `4.29 4.59 6.94 2/815 1101` |
+| `rust.path` | `erts_rust/target/release/beam_rt` (this worktree) |
+| `rust.sha` | `32732ba94bc9d89e8f67be6c472d5a6259af80c0` |
+| `rust.version` | `30/17.1` |
+| `rust.tier` | `null` (default baseline-JIT tier) |
+| `targets[0].build` | `erlc -o <stage>/ebin -I <stage>/src <suite>.erl …` — `ok: true`, `reused: true`; `compiled 8 suites + 6 helpers + runner with the oracle's erlc` |
+| `targets[0].code_path` | `<stage>/ebin`, `<stage>/ctl` (identical `-pa` for both sides) |
+
+Load was ~10 at the start of the sweep and ~4 at the end, i.e. **this sweep ran on a busy host**; that
+matters for §D10 (the timeout rows) and is the reason timeouts are re-measured there rather than read
+straight out of the report.
+
+Invocation shape for every row (per `targets[0].invocations`), the *only* difference being the binary:
 
 ```
-CARGO_HOME=${CARGO_HOME:-$HOME/.cache/cargo-home} cargo build --manifest-path erts_rust/tools/suites/Cargo.toml
-erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt --release
-cd erts_rust/tools/suites && ./target/debug/suites run --target stdlib \
-  --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE \
-  --jobs 4 --out results/stdlib
+cd <stage>/cwd/<SUITE> && <RUNTIME> -noshell -pa <stage>/ebin -pa <stage>/ctl \
+  -eval 'ct_runner:run(<SUITE>, 10000, 300000, "<stage>/src"), halt(0).'
 ```
 
-Artifacts: `results/stdlib/report.json` (schema `suites/1`) + `results/stdlib/summary.md`;
-raw per-case logs and the extra probes quoted below are under `results/stdlib/raw/`.
+## B. Per-suite results
 
-## B. Per-suite case tables
+`rows` = ct cases reported for that suite; P/F are the case counts per side; verdicts are the
+harness's `agree` / `agree-fail-identical` (`afi`) / `divergence` / `rust-gap`.
 
-`sys`/`rust` cells are `status (passed/failed)`; `timeout`/`error` are harness statuses with no
-pass/fail split. The last column is the verified root-cause class (see §D for the reduction).
+| suite | rows | sys P/F | rust P/F | agree | afi | divergence | rust-gap |
+|---|---|---|---|---|---|---|---|
+| `binary_module_SUITE` | 20 | 18 / 2 | 4 / 3 | 4 | 1 | 3 | 12 |
+| `dict_SUITE` | 7 | 7 / 0 | 7 / 0 | 7 | 0 | 0 | 0 |
+| `lists_SUITE` | 78 | 78 / 0 | 76 / 2 | 76 | 0 | 2 | 0 |
+| `maps_SUITE` | 32 | 32 / 0 | 19 / 13 | 19 | 0 | 13 | 0 |
+| `proplists_SUITE` | 4 | 4 / 0 | 4 / 0 | 4 | 0 | 0 | 0 |
+| `queue_SUITE` | 7 | 7 / 0 | 6 / 1 | 6 | 0 | 1 | 0 |
+| `string_SUITE` | 46 | 45 / 1 | 45 / 1 | 45 | 1 | 0 | 0 |
+| `unicode_SUITE` | 20 | 18 / 2 | 6 / 14 | 6 | 2 | 12 | 0 |
+| **total** | **214** | **209 / 5** | **167 / 34** | **167** | **4** | **31** | **12** |
 
-### dict_SUITE (7 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `create` | pass (1/0) | pass (1/0) | agree | — |
-| `doctests_dict` | pass (1/0) | pass (1/0) | agree | — |
-| `doctests_gb_trees` | pass (1/0) | pass (1/0) | agree | — |
-| `doctests_orddict` | pass (1/0) | pass (1/0) | agree | — |
-| `iterate` | pass (1/0) | pass (1/0) | agree | — |
-| `remove` | pass (1/0) | pass (1/0) | agree | — |
-| `store` | pass (1/0) | pass (1/0) | agree | — |
-
-Totals: cases 7 · sys 7 pass / 0 fail · rust 7 pass / 0 fail
-
-### lists_SUITE (78 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `append_1` | pass (1/0) | pass (1/0) | agree | — |
-| `append_2` | pass (1/0) | fail (0/1) | divergence | heap-cap → `system_limit` (BIF heap 16 Mi words) |
-| `doctests` | pass (1/0) | pass (1/0) | agree | — |
-| `droplast` | pass (1/0) | pass (1/0) | agree | — |
-| `dropwhile` | pass (1/0) | pass (1/0) | agree | — |
-| `enumerate` | pass (1/0) | pass (1/0) | agree | — |
-| `filter_partition` | pass (1/0) | pass (1/0) | agree | — |
-| `flatten_1` | pass (1/0) | pass (1/0) | agree | — |
-| `flatten_1_e` | pass (1/0) | pass (1/0) | agree | — |
-| `flatten_2` | pass (1/0) | pass (1/0) | agree | — |
-| `flatten_2_e` | pass (1/0) | pass (1/0) | agree | — |
-| `hof` | pass (1/0) | pass (1/0) | agree | — |
-| `join` | pass (1/0) | pass (1/0) | agree | — |
-| `keymember` | pass (1/0) | pass (1/0) | agree | — |
-| `keymerge` | pass (1/0) | pass (1/0) | agree | — |
-| `keyreplace` | pass (1/0) | pass (1/0) | agree | — |
-| `keysearch_keyfind` | pass (1/0) | pass (1/0) | agree | — |
-| `keysort_1` | pass (1/0) | pass (1/0) | agree | — |
-| `keysort_error` | pass (1/0) | pass (1/0) | agree | — |
-| `keysort_i` | pass (1/0) | pass (1/0) | agree | — |
-| `keysort_rand` | pass (1/0) | pass (1/0) | agree | — |
-| `keystore` | pass (1/0) | pass (1/0) | agree | — |
-| `keytake` | pass (1/0) | pass (1/0) | agree | — |
-| `member` | pass (1/0) | pass (1/0) | agree | — |
-| `merge` | pass (1/0) | pass (1/0) | agree | — |
-| `otp_5939` | pass (1/0) | pass (1/0) | agree | — |
-| `otp_6023` | pass (1/0) | pass (1/0) | agree | — |
-| `otp_6606` | pass (1/0) | pass (1/0) | agree | — |
-| `otp_7230` | pass (1/0) | pass (1/0) | agree | — |
-| `reverse` | pass (1/0) | pass (1/0) | agree | — |
-| `rkeymerge` | pass (1/0) | pass (1/0) | agree | — |
-| `rmerge` | pass (1/0) | pass (1/0) | agree | — |
-| `rukeymerge` | pass (1/0) | pass (1/0) | agree | — |
-| `rumerge` | pass (1/0) | pass (1/0) | agree | — |
-| `search` | pass (1/0) | pass (1/0) | agree | — |
-| `seq_2` | pass (1/0) | pass (1/0) | agree | — |
-| `seq_2_e` | pass (1/0) | pass (1/0) | agree | — |
-| `seq_3` | pass (1/0) | pass (1/0) | agree | — |
-| `seq_3_e` | pass (1/0) | pass (1/0) | agree | — |
-| `seq_loop` | pass (1/0) | pass (1/0) | agree | — |
-| `sort_1` | pass (1/0) | pass (1/0) | agree | — |
-| `sort_2` | pass (1/0) | pass (1/0) | agree | — |
-| `sort_rand` | pass (1/0) | pass (1/0) | agree | — |
-| `sublist_2` | pass (1/0) | pass (1/0) | agree | — |
-| `sublist_2_e` | pass (1/0) | pass (1/0) | agree | — |
-| `sublist_3` | pass (1/0) | pass (1/0) | agree | — |
-| `sublist_3_e` | pass (1/0) | pass (1/0) | agree | — |
-| `subtract` | pass (1/0) | fail (0/1) | divergence | heap-cap → `system_limit` (BIF heap 16 Mi words) |
-| `suffix` | pass (1/0) | pass (1/0) | agree | — |
-| `takewhile` | pass (1/0) | pass (1/0) | agree | — |
-| `ukeymerge` | pass (1/0) | pass (1/0) | agree | — |
-| `ukeysort_1` | pass (1/0) | pass (1/0) | agree | — |
-| `ukeysort_error` | pass (1/0) | pass (1/0) | agree | — |
-| `ukeysort_i` | pass (1/0) | pass (1/0) | agree | — |
-| `ukeysort_rand` | pass (1/0) | pass (1/0) | agree | — |
-| `umerge` | pass (1/0) | pass (1/0) | agree | — |
-| `uniq_1` | pass (1/0) | pass (1/0) | agree | — |
-| `uniq_2` | pass (1/0) | pass (1/0) | agree | — |
-| `usort_1` | pass (1/0) | pass (1/0) | agree | — |
-| `usort_2` | pass (1/0) | pass (1/0) | agree | — |
-| `usort_rand` | pass (1/0) | pass (1/0) | agree | — |
-| `zip3_fail` | pass (1/0) | pass (1/0) | agree | — |
-| `zip3_pad` | pass (1/0) | pass (1/0) | agree | — |
-| `zip3_trim` | pass (1/0) | pass (1/0) | agree | — |
-| `zip_fail` | pass (1/0) | pass (1/0) | agree | — |
-| `zip_pad` | pass (1/0) | pass (1/0) | agree | — |
-| `zip_trim` | pass (1/0) | pass (1/0) | agree | — |
-| `zip_unzip` | pass (1/0) | pass (1/0) | agree | — |
-| `zip_unzip3` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith3` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith3_fail` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith3_pad` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith3_trim` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith_fail` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith_pad` | pass (1/0) | pass (1/0) | agree | — |
-| `zipwith_trim` | pass (1/0) | pass (1/0) | agree | — |
-| `error_info` | error | fail (0/1) | oracle-only-fail | `unsupported_bif`-class `erlang:system_info(snifs)`; sys side mis-parsed (see §E) |
-
-Totals: cases 78 · sys 77 pass / 0 fail / 1 error · rust 75 pass / 3 fail
-
-### maps_SUITE (31 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `doctests` | pass (1/0) | timeout | rust-gap | `unsupported_bif` `erlang:bump_reductions/1` (doctests) |
-| `t_filter_2` | pass (1/0) | timeout | rust-gap | — |
-| `t_filtermap_2` | pass (1/0) | timeout | rust-gap | — |
-| `t_fold_3` | pass (1/0) | timeout | rust-gap | — |
-| `t_foreach_2` | pass (1/0) | timeout | rust-gap | — |
-| `t_from_keys` | pass (1/0) | timeout | rust-gap | stacktrace head lacks `{maps,F,A}` frame |
-| `t_from_keys_check_trapping` | pass (1/0) | timeout | rust-gap | `erlang:trace/3` → `badarg` |
-| `t_from_keys_kill_process` | pass (1/0) | timeout | rust-gap | no yield/preemption in long BIF loop → per-case timeout |
-| `t_from_list_check_trapping` | pass (1/0) | timeout | rust-gap | `erlang:trace/3` → `badarg` |
-| `t_from_list_kill_process` | pass (1/0) | timeout | rust-gap | no yield/preemption in long BIF loop → per-case timeout |
-| `t_get_3` | pass (1/0) | timeout | rust-gap | — |
-| `t_groups_from_list` | pass (1/0) | timeout | rust-gap | — |
-| `t_intersect` | pass (1/0) | timeout | rust-gap | no yield/preemption in long BIF loop → per-case timeout |
-| `t_intersect_with` | pass (1/0) | timeout | rust-gap | no yield/preemption in long BIF loop → per-case timeout |
-| `t_iterator_1` | pass (1/0) | timeout | rust-gap | heap-cap → `system_limit` (BIF heap 16 Mi words) |
-| `t_iterator_2` | pass (1/0) | timeout | rust-gap | heap-cap → `system_limit` (BIF heap 16 Mi words) |
-| `t_iterator_valid` | pass (1/0) | timeout | rust-gap | — |
-| `t_keys_kill_process` | pass (1/0) | timeout | rust-gap | no yield/preemption in long BIF loop → per-case timeout |
-| `t_keys_trapping` | pass (1/0) | timeout | rust-gap | `erlang:trace/3` → `badarg` |
-| `t_map_2` | pass (1/0) | timeout | rust-gap | — |
-| `t_merge_opt` | pass (1/0) | timeout | rust-gap | `erts_debug:same/2` false (map fast-path identity) |
-| `t_merge_with` | pass (1/0) | timeout | rust-gap | no yield/preemption in long BIF loop → per-case timeout |
-| `t_order_consistency` | pass (1/0) | timeout | rust-gap | — |
-| `t_put_opt` | pass (1/0) | timeout | rust-gap | `erts_debug:same/2` false (map fast-path identity) |
-| `t_size_1` | pass (1/0) | timeout | rust-gap | — |
-| `t_update_with_3` | pass (1/0) | timeout | rust-gap | — |
-| `t_update_with_4` | pass (1/0) | timeout | rust-gap | — |
-| `t_values_kill_process` | pass (1/0) | timeout | rust-gap | no yield/preemption in long BIF loop → per-case timeout |
-| `t_values_trapping` | pass (1/0) | timeout | rust-gap | `erlang:trace/3` → `badarg` |
-| `t_with_2` | pass (1/0) | timeout | rust-gap | stacktrace head lacks `{maps,F,A}` frame |
-| `t_without_2` | pass (1/0) | timeout | rust-gap | stacktrace head lacks `{maps,F,A}` frame |
-
-Totals: cases 31 · sys 31 pass / 0 fail · rust 0 pass / 0 fail / 31 timeout
-
-Every `rust` cell in this table is the **suite-level** kill (seven cases hang past the 330 s suite
-budget at a 300 s per-case budget), so `0/0` here is not "31 failures": the same drive at a 5 s
-per-case budget answers 10 pass / 21 fail-or-timeout, case by case, in §D7.
-
-### proplists_SUITE (4 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `examples` | pass (1/0) | pass (1/0) | agree | — |
-| `map_conversion` | pass (1/0) | pass (1/0) | agree | — |
-| `map_conversion_normalize` | pass (1/0) | pass (1/0) | agree | — |
-| `pm_fold_test` | pass (1/0) | pass (1/0) | agree | — |
-
-Totals: cases 4 · sys 4 pass / 0 fail · rust 4 pass / 0 fail
-
-### queue_SUITE (6 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `do` | pass (1/0) | pass (1/0) | agree | — |
-| `doctests` | pass (1/0) | pass (1/0) | agree | — |
-| `error` | pass (1/0) | pass (1/0) | agree | — |
-| `io_test` | pass (1/0) | pass (1/0) | agree | — |
-| `op_test` | pass (1/0) | pass (1/0) | agree | — |
-| `to_list` | pass (1/0) | pass (1/0) | agree | — |
-
-Totals: cases 6 · sys 6 pass / 0 fail · rust 6 pass / 0 fail
-
-### binary_module_SUITE (19 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `ac_simd_root_skip` | pass (1/0) | pass (1/0) | agree | — |
-| `badargs` | pass (1/0) | pass (1/0) | agree | — |
-| `bin_to_list` | fail (0/1) | fail (0/1) | agree-fail-identical | rust per-case timeout (>300 s); sys exits `badresult` |
-| `check_no_invalid_read_bug` | pass (1/0) | pass (1/0) | agree | — |
-| `copy` | fail (0/1) | fail (0/1) | agree-fail-identical | identical failure both sides (`mismatch` in the suite) |
-| `doctests` | pass (1/0) | fail (0/1) | divergence | `unsupported_bif` `erlang:bump_reductions/1` (doctests) |
-| `encode_decode` | fail (0/1) | fail (0/1) | agree-fail-identical | identical failure both sides (`undef binref:encode_unsigned/1` — helper not staged) |
-| `guard` | pass (1/0) | error | rust-gap | rust run aborted (`beam_rt: system_limit`, VM-fatal) — no row |
-| `hex_encoding` | pass (1/0) | error | rust-gap | rust run aborted (`beam_rt: system_limit`, VM-fatal) — no row |
-| `interesting` | fail (0/1) | error | divergence | rust run aborted (VM-fatal `system_limit`); sys case also fails |
-| `join` | pass (1/0) | error | rust-gap | rust run aborted (`beam_rt: system_limit`, VM-fatal) — no row |
-| `list_to_bin` | fail (0/1) | error | divergence | rust run aborted (VM-fatal `system_limit`); sys case also fails |
-| `longest_common_trap` | pass (1/0) | error | rust-gap | rust run aborted (`beam_rt: system_limit`, VM-fatal) — no row |
-| `parts` | fail (0/1) | error | divergence | rust run aborted (VM-fatal `system_limit`); sys case also fails |
-| `random_ref_comp` | fail (0/1) | error | divergence | rust run aborted (VM-fatal `system_limit`); sys case also fails |
-| `random_ref_fla_comp` | fail (0/1) | error | divergence | rust run aborted (VM-fatal `system_limit`); sys case also fails |
-| `random_ref_sr_comp` | fail (0/1) | error | divergence | rust run aborted (VM-fatal `system_limit`); sys case also fails |
-| `referenced` | pass (1/0) | error | rust-gap | rust run aborted (`beam_rt: system_limit`, VM-fatal) — no row |
-| `scope_return` | pass (1/0) | error | rust-gap | rust run aborted (`beam_rt: system_limit`, VM-fatal) — no row |
-
-Totals: cases 19 · sys 10 pass / 9 fail · rust 3 pass / 4 fail / 12 error
-
-### string_SUITE (46 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `casefold` | pass (1/0) | pass (1/0) | agree | — |
-| `cd_gc` | pass (1/0) | pass (1/0) | agree | — |
-| `centre` | pass (1/0) | pass (1/0) | agree | — |
-| `chars` | pass (1/0) | pass (1/0) | agree | — |
-| `chomp` | pass (1/0) | pass (1/0) | agree | — |
-| `chr_rchr` | pass (1/0) | pass (1/0) | agree | — |
-| `copies` | pass (1/0) | pass (1/0) | agree | — |
-| `doctests` | pass (1/0) | pass (1/0) | agree | — |
-| `equal` | pass (1/0) | pass (1/0) | agree | — |
-| `find` | pass (1/0) | pass (1/0) | agree | — |
-| `is_empty` | pass (1/0) | pass (1/0) | agree | — |
-| `jaro_similarity` | pass (1/0) | pass (1/0) | agree | — |
-| `join` | pass (1/0) | pass (1/0) | agree | — |
-| `left_right` | pass (1/0) | pass (1/0) | agree | — |
-| `len` | pass (1/0) | pass (1/0) | agree | — |
-| `length` | pass (1/0) | pass (1/0) | agree | — |
-| `lexemes` | pass (1/0) | pass (1/0) | agree | — |
-| `lowercase` | pass (1/0) | pass (1/0) | agree | — |
-| `meas` | pass (1/0) | pass (1/0) | agree | — |
-| `nth_lexeme` | pass (1/0) | pass (1/0) | agree | — |
-| `old_concat` | pass (1/0) | pass (1/0) | agree | — |
-| `old_equal` | pass (1/0) | pass (1/0) | agree | — |
-| `old_to_float` | pass (1/0) | pass (1/0) | agree | — |
-| `old_to_integer` | pass (1/0) | pass (1/0) | agree | — |
-| `old_tokens` | pass (1/0) | pass (1/0) | agree | — |
-| `pad` | pass (1/0) | pass (1/0) | agree | — |
-| `prefix` | pass (1/0) | pass (1/0) | agree | — |
-| `replace` | pass (1/0) | pass (1/0) | agree | — |
-| `reverse` | pass (1/0) | pass (1/0) | agree | — |
-| `slice` | pass (1/0) | pass (1/0) | agree | — |
-| `span_cspan` | pass (1/0) | pass (1/0) | agree | — |
-| `split` | pass (1/0) | pass (1/0) | agree | — |
-| `str_rstr` | pass (1/0) | pass (1/0) | agree | — |
-| `strip` | pass (1/0) | pass (1/0) | agree | — |
-| `sub_string` | pass (1/0) | pass (1/0) | agree | — |
-| `sub_word` | pass (1/0) | pass (1/0) | agree | — |
-| `substr` | pass (1/0) | pass (1/0) | agree | — |
-| `take` | pass (1/0) | pass (1/0) | agree | — |
-| `titlecase` | pass (1/0) | pass (1/0) | agree | — |
-| `to_float` | pass (1/0) | pass (1/0) | agree | — |
-| `to_graphemes` | pass (1/0) | pass (1/0) | agree | — |
-| `to_integer` | pass (1/0) | pass (1/0) | agree | — |
-| `to_upper_to_lower` | pass (1/0) | pass (1/0) | agree | — |
-| `trim` | pass (1/0) | pass (1/0) | agree | — |
-| `uppercase` | pass (1/0) | pass (1/0) | agree | — |
-| `words` | pass (1/0) | pass (1/0) | agree | — |
-
-Totals: cases 46 · sys 46 pass / 0 fail · rust 46 pass / 0 fail
-
-### unicode_SUITE (19 cases)
-
-| case | sys | rust | verdict | root-cause class |
-| --- | --- | --- | --- | --- |
-| `bin_is_7bit` | pass (1/0) | pass (1/0) | agree | — |
-| `binaries_errors_limit` | pass (1/0) | fail (0/1) | divergence | `unsupported_bif` `erts_debug:set_internal_state(unicode_loop_limit,N)` |
-| `category` | pass (1/0) | fail (0/1) | divergence | heap-cap → `system_limit` (BIF heap 16 Mi words) |
-| `ex_binaries_errors_utf16_big` | pass (1/0) | fail (0/1) | divergence | `binary:referenced_byte_size/1` (own size, not referenced) |
-| `ex_binaries_errors_utf16_little` | pass (1/0) | fail (0/1) | divergence | `binary:referenced_byte_size/1` (own size, not referenced) |
-| `ex_binaries_errors_utf32_big` | pass (1/0) | fail (0/1) | divergence | `binary:referenced_byte_size/1` (own size, not referenced) |
-| `ex_binaries_errors_utf32_little` | pass (1/0) | fail (0/1) | divergence | `binary:referenced_byte_size/1` (own size, not referenced) |
-| `ex_binaries_errors_utf8` | pass (1/0) | fail (0/1) | divergence | `binary:referenced_byte_size/1` (own size, not referenced) |
-| `exceptions` | pass (1/0) | fail (0/1) | divergence | `unsupported_bif` `erts_debug:set_internal_state(unicode_loop_limit,N)` |
-| `huge_illegal_code_points` | pass (1/0) | pass (1/0) | agree | — |
-| `incomplete_utf32_to_latin1` | pass (1/0) | pass (1/0) | agree | — |
-| `is_id` | fail (0/1) | fail (0/1) | agree-fail-identical | identical: `{badmatch,{error,enoent}}` (UnicodeData.txt data-dir absent on both) |
-| `is_whitespace` | fail (0/1) | fail (0/1) | agree-fail-identical | identical: `{badmatch,{error,enoent}}` (UnicodeData.txt data-dir absent on both) |
-| `latin1` | pass (1/0) | fail (0/1) | divergence | `unsupported_bif` `erts_debug:set_internal_state(unicode_loop_limit,N)` |
-| `normalize` | pass (1/0) | pass (1/0) | agree | — |
-| `random_lists` | fail (0/1) | fail (0/1) | agree-fail-identical | BOTH fail, different reasons (sys `undef random_iolist`; rust `unsupported_bif set_internal_state`) |
-| `roundtrips` | pass (1/0) | fail (0/1) | divergence | `unsupported_bif` `erts_debug:set_internal_state(unicode_loop_limit,N)` |
-| `utf16_illegal_sequences_bif` | pass (1/0) | fail (0/1) | divergence | `unsupported_bif` `erts_debug:set_internal_state(unicode_loop_limit,N)` |
-| `utf8_illegal_sequences_bif` | pass (1/0) | fail (0/1) | divergence | `unsupported_bif` `erts_debug:set_internal_state(unicode_loop_limit,N)` |
-
-Totals: cases 19 · sys 16 pass / 3 fail · rust 4 pass / 15 fail
+Clean suites (every case agrees, nothing excluded): `dict_SUITE`, `proplists_SUITE`, `string_SUITE`
+(45 agree + 1 excluded).
 
 ## C. Totals
 
-| suite | cases | sys pass | sys fail | sys other | rust pass | rust fail | rust other | agree | agree-fail-identical | divergence | rust-gap | oracle-only-fail |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| dict_SUITE | 7 | 7 | 0 | 0 | 7 | 0 | 0 | 7 | 0 | 0 | 0 | 0 |
-| lists_SUITE | 78 | 77 | 0 | 1 | 75 | 3 | 0 | 75 | 0 | 2 | 0 | 1 |
-| maps_SUITE | 31 | 31 | 0 | 0 | 0 | 0 | 31 | 0 | 0 | 0 | 31 | 0 |
-| proplists_SUITE | 4 | 4 | 0 | 0 | 4 | 0 | 0 | 4 | 0 | 0 | 0 | 0 |
-| queue_SUITE | 6 | 6 | 0 | 0 | 6 | 0 | 0 | 6 | 0 | 0 | 0 | 0 |
-| binary_module_SUITE | 19 | 10 | 9 | 0 | 3 | 4 | 12 | 3 | 3 | 7 | 6 | 0 |
-| string_SUITE | 46 | 46 | 0 | 0 | 46 | 0 | 0 | 46 | 0 | 0 | 0 | 0 |
-| unicode_SUITE | 19 | 16 | 3 | 0 | 4 | 15 | 0 | 4 | 3 | 12 | 0 | 0 |
-| **total** | **210** | **197** | **12** | **1** | **145** | **22** | **43** | **145** | **6** | **21** | **37** | **1** |
+- **214 rows** measured; no row is `not-run` and none is `oracle-only-fail`.
+- **Oracle: 209 rows pass, 5 fail.** Rust: **167 pass, 34 fail**.
+- **Fully green rows: 209 of 214** on the oracle and **167 of 214** on rust (a `rust-gap` row has no
+  rust result at all — it is not a pass).
+- **Excluded from both numerators: 4 rows** (`agree-fail-identical`) — see §E.
+- **Verdict split:** `agree 167` · `agree-fail-identical 4` · `divergence 31` · `rust-gap 12`.
+- **No rust pass corresponds to an oracle failure.** Every one of the 167 `agree` rows has
+  `sys.status = pass`; the only rows where rust "passes" something the oracle does not are the two
+  documented `afi` rows (`unicode_SUITE:is_id`, `unicode_SUITE:is_whitespace`) where **both** sides
+  fail identically, and `string_SUITE:meas` / `binary_module_SUITE:copy`, which are excluded for the
+  reasons in §E. There is no case in this sweep where the Rust runtime succeeds and the oracle fails.
+- The 12 `rust-gap` rows are all one root cause: the rust side of `binary_module_SUITE` **died
+  mid-suite** (§D1), so the remaining cases never ran.
 
-Counts, not rates: the two sides do not run the same number of cases per suite (the Rust side
-loses rows when its process dies).
+## D. Non-agree rows, by root-cause class
 
-Reading of the numbers: **145 of 210 cases (69%) agree**; **6** are excluded as
-`agree-fail-identical` (the SAME failure on both sides — excluded from both numerators, never
-counted as passes); **21** divergences and **37** rust-gaps plus **1** oracle-only-fail remain
-and are itemised in §D.
-## D. Divergences and rust-gaps, by root-cause class
+47 rows are non-agree (31 `divergence` + 12 `rust-gap` + the 4 `afi` rows are discussed in §E).
+`<rt>` below means either binary; each reproducer is a one-liner you can paste into a shell.
 
-Every reduction below was run under **both** runtimes at
-`erts_rust/target/release/beam_rt -noshell -eval …` versus `erl -noshell -eval …` (or, where
-noted, through a *compiled* probe module on the same `-pa` set), and the two answers are quoted
-verbatim. Nothing here was fixed — these are observations for the owning crates.
+### D1 — `binary_module_SUITE` rust side DIES mid-suite  (**crash, not a typed gap**) — 13 rows
 
-### D1. BIF-heap budget → `error:system_limit` where the oracle completes (5 rows + 12 fallout rows)
+Rows: `rust-gap` `error_info`, `guard`, `hex_encoding`, `join`, `list_to_bin`, `longest_common_trap`,
+`parts`, `random_ref_comp`, `random_ref_fla_comp`, `random_ref_sr_comp`, `referenced`, `scope_return`
+(all `error 0/0 case missing from the rust runtime's output`) plus `divergence` `interesting`.
 
-Smallest failing expression (compiled probe module `cap.erl`, `-pa` on both sides):
+Reproducing the recorded rust invocation by hand gives the same shape:
+
+```
+SUITE binary_module_SUITE
+CASE ac_simd_root_skip    OK
+CASE badargs              OK
+CASE bin_to_list          TIMEOUT     (10 s budget; it passes in ~27 s serially — §D10)
+CASE check_no_invalid_read_bug OK
+CASE copy                 EXC  {exception,error,unsupported_bif,{erts_debug,set_internal_state,…}}
+CASE doctests             EXC  {exception,error,{1,errors},…}   (the failing doctest is D2's expression)
+CASE encode_decode        OK
+… then the first two `binary:at/2` error-info prints, then the process exits 1
+stderr: beam_rt: system_limit
+```
+
+The 12 later cases are therefore never reported by the runner.
+
+**Smallest reproducer (not reduced to a single expression — see the caveat):** a *spawned child* that
+runs the suite's own `error_info/1`:
+
+```
+erlc -o $TMPDIR/probe/ebin lib/stdlib/test/binary_module_SUITE.erl   # system erlc, $TMPDIR only
+cd $TMPDIR/probe/cwd && <rt> -noshell -pa $TMPDIR/probe/ebin -pa <staged>/ebin \
+  -eval 'P = spawn_monitor(fun() -> binary_module_SUITE:error_info([]) end),
+         receive {'DOWN',R,process,Pid,Why} -> io:format("~p~n",[{R,Why}]) end, halt(0).'
+```
+
+- oracle: `{normal,normal}`, 464 lines of output.
+- rust: the child dies (`{function_clause,[]}`) or the whole runtime aborts with
+  `beam_rt: system_limit`, after only part of the output.
+
+Calling `binary_module_SUITE:error_info([])` **in the main process** is fine on rust (32 397 bytes,
+508 lines), so the failure is specific to a *spawned child*. It is **entry-count dependent**: running
+only the first `N` error-info entries in the child is green up to `N = 38` and dies at `N = 39`;
+pre-computing the entry list in the parent makes the child succeed; a heap warm-up
+(`lists:seq(1,200000)` + `erlang:garbage_collect()`) does **not** help. The dying child emits none of
+the case's own output markers, so it is a VMs-side abort during the writes, not a failing `binary:*`
+call.
+
+**Owner:** `beam_engine` (spawned-child heap/stack growth at the `binary:at/2`/`io:format` argument
+boundary) with `beam_gc` as the second suspect. This is the single most valuable finding of this pass:
+a **crash**, not a typed `unsupported`, so it breaks the "every gap is a typed error" contract.
+
+### D2 — `binary:referenced_byte_size/1` of a sub-binary answers its own size — 6 rows
+
+Rows: `binary_module_SUITE:doctests` (`{1,errors}`), `unicode_SUITE:ex_binaries_errors_utf8`,
+`_utf16_big`, `_utf16_little`, `_utf32_big`, `_utf32_little` (`{badmatch,false}` inside
+`utf*_inner_loop/6` / the utf8 list comprehension — all five assert
+`true = (binary:referenced_byte_size(Chomped) =:= PBSz)`).
+
+```
+<rt> -noshell -eval 'Part = <<"z",(binary:copy(<<255>>,1024))/binary>>,
+                      C = binary:part(Part,1,510),
+                      io:format("~p~n",[{byte_size(C), binary:referenced_byte_size(C)}]), halt(0).'
+```
+
+- rust: `{510,510}`
+- oracle: `{510,2050}`
+
+**Owner:** `beam_bifs` (the binary BIF) over `beam_term`/`beam_alloc` sub-binary bookkeeping — the
+runtime does not track the referenced (parent) binary of a sub-binary.
+
+### D3 — `erlang:trace/3` answers `badarg` — 4 rows
+
+Rows: `maps_SUITE:t_from_keys_check_trapping`, `t_from_list_check_trapping`, `t_keys_trapping`,
+`t_values_trapping` — each `{badmatch,badarg}` in `maps_SUITE:count_nr_of_yields/2`.
+
+```
+<rt> -noshell -eval 'io:format("~p~n",[catch erlang:trace(self(),true,[running,{tracer,self()}])]), halt(0).'
+```
+
+- rust: `{'EXIT',{badarg,[]}}`
+- oracle: `1`
+
+**Owner:** `beam_bifs` (`erlang:trace/3`) with `beam_engine`'s trace machinery.
+
+### D4 — map identity is not preserved (`erts_debug:same/2`) — 2 rows
+
+Rows: `maps_SUITE:t_merge_opt`, `t_put_opt` (`{badmatch,false}`).
+
+```
+<rt> -noshell -eval 'M = #{a => 1}, io:format("~p ~p~n",[erts_debug:same(maps:merge(#{},M),M),
+                                                      erts_debug:same(maps:put(a,1,M),M)]), halt(0).'
+```
+
+- rust: `false false`
+- oracle: `true true`
+
+A no-op `maps:merge/2` / `maps:put/3` must return the *same* map term. **Owner:** `beam_bifs` (maps
+BIFs return a rebuilt map instead of the input).
+
+### D5 — stack-trace head names the caller instead of the BIF — 3 rows
+
+Rows: `maps_SUITE:t_from_keys`, `t_with_2`, `t_without_2` (`{badmatch,{'EXIT',_}}`).
+
+```
+<rt> -noshell -eval 'io:format("~p~n",[catch maps:with([a,b],(fun(X) -> X end)(a))]), halt(0).'
+```
+
+- rust: `{'EXIT',{{badmap,a},[{mm,with2,0,[{file,…}]},…]}}` — head is the calling local fun.
+- oracle: `{'EXIT',{{badmap,a},[{maps,with,[[a,b],a],…},…]}}` — head is the failing BIF.
+
+**Owner:** `beam_engine` (`families/exceptions/callee.rs` stack-trace synthesis) — the BIF frame is
+missing from the trace head.
+
+### D6 — `erlang:bump_reductions/1` is not served — 1 row
+
+Row: `maps_SUITE:doctests` (`{1,errors}`) — raised from `prim_eval:arg_reg_alloc/0`, which calls
+`erlang:bump_reductions(134217727)`.
+
+```
+<rt> -noshell -eval 'io:format("~p~n",[catch erlang:bump_reductions(134217727)]), halt(0).'
+```
+
+- rust: `{'EXIT',{unsupported_bif,…}}` (a typed capability gap, reported as `unsupported: erlang:bump_reductions/1`)
+- oracle: `true`
+
+**Owner:** `beam_bifs`.
+
+### D7 — `erlang:system_info(snifs)` is not published — 1 row
+
+Row: `lists_SUITE:error_info`.
+
+```
+<rt> -noshell -eval 'io:format("~p~n",[erlang:system_info(snifs)]), halt(0).'
+```
+
+- rust: `beam_rt: unsupported: erlang:system_info(snifs): this runtime publishes no static NIF table` (exit 3)
+- oracle: `553`
+
+**Owner:** `beam_rt` (`system_info`) — this is a *reported* capability gap, not a wrong answer.
+
+### D8 — no preemption inside long BIF-driven recursion — 3 rows
+
+Rows: `maps_SUITE:t_intersect_with`, `t_iterator_2`, `t_merge_with`.
+
+These are `pass` on rust when run alone; they blow the 10 s per-case budget in the parallel sweep.
+Serial measurements (probe driver, one case, 60 s budget, same command shape):
+
+| row | rust | oracle |
+|---|---|---|
+| `maps_SUITE:t_intersect_with` | **OK 10.1 s** | OK 0.011 s |
+| `maps_SUITE:t_iterator_2` | **OK 41.0 s** | OK 0.047 s |
+| `maps_SUITE:t_merge_with` | **OK 31.4 s** | OK 0.023 s |
+
+So they are *slow*, not stuck: the rows are correct results delivered 900×–1000× late. **Owner:**
+`beam_bifs` (the `maps` BIFs that iterate by calling an Erlang fun never bump reductions) plus
+`beam_engine`'s reduction accounting/preemption — this is the same missing-yield lever recorded in
+`crates/beam_rt` §BOTTLENECKS (a BIF-driven loop that never pre-empts).
+
+### D9 — a calling convention bug: `apply/2` over an argument list built by a `case` — 1 row
+
+Row: `queue_SUITE:oops` — the suite's own `emul/4` comparison throws
+`{diff,[{value,empty},{error,badarg},peek,[{[],[]}],[{[]}]]}`: the corrupt value is the *fun itself*,
+which answers `badarg`.
+
+Minimal probe module (compiled with the system `erlc` into `$TMPDIR`, nothing committed):
 
 ```erlang
-cap:dup(N) -> length(lists:duplicate(N, gurka)).
-%%  cap:dup(1048596)  oracle 1048596   rust 1048596      (fits)
-%%  cap:dup(10000000) oracle 10000000  rust {'EXIT',{system_limit,[]}}
-cap:seq(N) -> length(lists:seq(1, N)).          % same shape for lists:seq/2
-map_size(maps:from_keys(lists:seq(1,1000000), ok))
-%%  oracle 1000000     rust {'EXIT',{system_limit,[]}}
+-module(qq9). -export([c/0]).
+c() ->
+    Ts = [], F = fun(peek) -> {[],[]} end,
+    Args = case Ts of [] -> [] end,
+    [{K, catch apply(F, Args)} || K <- lists:seq(1,1)].
 ```
 
-The runtime's BIF heap region is a fixed arena, `beam_rt::config::DEFAULT_HEAP_WORDS = 1 << 24`
-words (128 MB); a **single** BIF that would build a term past the remaining budget of that region
-raises `system_limit`, where the oracle grows/YIELDs and succeeds. The same terms built by
-*Erlang* code (a recursive `[x|A]` loop to 8 M elements) are fine, so the ceiling is the BIF
-region, not the process heap.
+- rust: `[{1,{'EXIT',{badarg,[{qq9,'-c/0-lc$^0/1-0-',2,[…]}]}}}]`
+- oracle: `[{1,{[]}}]`
 
-It is **state-dependent** in-suite: `cap:loop()` (the exact `append_trapping_1/1` shape of
-`lists_SUITE:append_2`, N = 0…20) passes standalone on both sides, yet `lists_SUITE:append_2`
-fails in the suite (both sweep runs, at loadavg ≈ 117 and at loadavg ≈ 1.2) because earlier cases
-have already retained heap. Caveat on the reduction vehicle: going through `-eval` does **not**
-reproduce it, because the `-eval` evaluator does not build on the BIF heap region — the compiled
-module above is the valid form.
+Variants that do **not** build `Args` with a `case` (`qq9:a/0`, `b/0`, `d/0`) agree on both sides, and
+once the arg list is computed inside a comprehension the value shows up as `{badfun,{peek,[q],v,#Fun<…>}}`.
+**Owner:** `beam_engine` — BIF/`apply` argument resolution (a register holding a fun is read where the
+argument list is expected).
 
-Rows: `lists_SUITE:append_2`, `lists_SUITE:subtract`, `unicode_SUITE:category`
-(`lists:seq(1,16#10FFFF)`), `maps_SUITE:t_iterator_1`, `maps_SUITE:t_iterator_2`
-(`maps:from_list/1`); plus the `binary_module_SUITE` aborts of D9.
+### D10 — `TIMEOUT` rows: measured, and only two are genuine
 
-### D2. `erlang:trace/3` rejects `[running, {tracer, Pid}]` → `badarg` (4 rows)
+The sweep's `--timeout 10` at `--jobs 4` on a host at loadavg ~10 makes `TIMEOUT` a *load* signal, not
+a capability. Each TIMEOUT row was re-measured **serially** with the same per-case shape:
 
-```erlang
-erlang:trace(self(), true, [running, {tracer, self()}]).
-%%  oracle 1     rust {'EXIT',{badarg,[…]}}
-```
+| row | rust (serial) | oracle (serial) | classification |
+|---|---|---|---|
+| `binary_module_SUITE:bin_to_list` | OK **26.7 s** | OK 0.93 s | slow (≈29× the budget) — not a hang |
+| `binary_module_SUITE:encode_decode` | OK **0.43 s** | OK 0.02 s | **sweep artefact** (load) — not slow at all |
+| `binary_module_SUITE:copy` | fails in 8.97 s (typed `unsupported_bif`, §E) | OK **11.3 s** | oracle-side budget overshoot at 10 s |
+| `lists_SUITE:suffix` | OK **26 ms** standalone | OK 25 ms | not a property of the case — see below |
+| `string_SUITE:meas` | OK **118.0 s** | OK **118.0 s** | genuinely over budget on **both** sides (§E) |
+| `maps_SUITE:t_*` (3 rows) | see §D8 | ms | slow, preemption (§D8) |
 
-Rows: `maps_SUITE:t_keys_trapping`, `t_values_trapping`, `t_from_keys_check_trapping`,
-`t_from_list_check_trapping` — all fail in the suite's `count_nr_of_yields/2` helper with
-`{badmatch,badarg}`. The suite's other traceless cases are unaffected.
+`lists_SUITE:suffix` is the interesting one: standalone it costs **26 ms** on rust. Running the whole
+78-case suite with `suffix` appended last gives `CASE takewhile TIMEOUT` and `CASE suffix OK`; running
+the first `K` cases plus `suffix` is green for `K = 10,20,30,40,50,60,70` and also green for *all 77*
+cases with `suffix` last. The committed sweep nevertheless reports `suffix` as the timeout and an
+earlier run reported `takewhile` instead — i.e. **which** case absorbs the timeout moves between runs
+of the same suite. So the `TIMEOUT` is a *cumulative* per-suite effect (one case per run pays for a
+lingering cost left by the run as a whole), not a property of `suffix`'s own work. Config: the
+`suffix` case alone is 26 ms; the row costs ~10 s+ only in the full-suite context.
 
-### D3. `erts_debug:set_internal_state(unicode_loop_limit, N)` → `unsupported_bif` (6 rows)
+`string_SUITE:meas` takes **~118 s on both sides** — it is excluded as `agree-fail-identical` (§E),
+never a rust-only gap.
 
-```erlang
-A = erts_debug:set_internal_state(available_internal_state, true),
-erts_debug:set_internal_state(unicode_loop_limit, 10).
-%%  oracle {false,40000}     rust {false,{'EXIT',{unsupported_bif,…}}}
-```
+## E. Exclusions (`agree-fail-identical`, 4 rows — in neither numerator)
 
-`available_internal_state` **is** served (both answer `false`); the per-verb setter is the typed
-capability gap. Rows: `unicode_SUITE:binaries_errors_limit`, `exceptions`, `latin1`, `roundtrips`,
-`utf16_illegal_sequences_bif`, `utf8_illegal_sequences_bif`. (`binary_module_SUITE` uses the
-sibling verb `binary_loop_limit`, which is equally missing — those cases are killed earlier by D9.)
+| row | why it is excluded |
+|---|---|
+| `binary_module_SUITE:copy` | oracle **TIMEOUT at the 10 s budget** (it needs 11.3 s serially); rust stops at 8.97 s with the typed `unsupported_bif` `erts_debug:set_internal_state` (§D1's class). Neither side gives a comparable result. |
+| `string_SUITE:meas` | **both** sides TIMEOUT at 10 s; both need ~118 s serially. Excluded as a budget mismatch, and it is not evidence of any rust gap. |
+| `unicode_SUITE:is_id` | both fail identically: `{badmatch,{error,enoent}}` in `parse_properties/1` — the suite wants `UnicodeData.txt`, which the staged `data_dir` does not contain (the harness passes the *source* dir as `data_dir`, and deliberately runs no `init_per_suite`). |
+| `unicode_SUITE:is_whitespace` | same as `is_id`. |
 
-### D4. `binary:referenced_byte_size/1` on a sub-binary reports its own size (5 rows)
+## F. Caveats
 
-```erlang
-Partly  = binary:copy(<<OK/binary, (binary:copy(<<255>>, 1024))/binary>>),   % 1279 bytes
-Chomped = binary:part(Partly, 769, 510),
-{byte_size(Chomped), binary:referenced_byte_size(Chomped)}.
-%%  oracle {510,1279}     rust {510,510}
-```
+- **`--jobs 4` + a loadavg of ~10 makes `TIMEOUT` unreliable.** §D10 re-measures every timeout row
+  serially; only two rows (`string_SUITE:meas`, `binary_module_SUITE:copy`) genuinely exceed the
+  budget, and in `meas`'s case on both sides.
+- **The `binary_module_SUITE` numbers are a lower bound.** The rust run dies after 8 of its 20 cases,
+  so the 12 `rust-gap` rows carry no evidence either way; they are `error`, never `pass`.
+- **Counts, not seconds.** Everything measured in §D8/§D10 was taken on the same shared host (loadavg
+  4–10); the seconds are quoted only to separate *slow* from *stuck* and to show the direction. Do not
+  compare them with any other machine.
+- **The oracle is OTP 29.1.2 / erts 17.1.1**, while this tree pins OTP `30.0-rc0` / erts `17.1`; a
+  suite that pins erts-versioned data can therefore differ for reasons unrelated to the runtime.
+- **Attribution is a hypothesis, not a fix.** No crate outside `erts_rust/tools/suites` was touched;
+  every "Owner" above names the crate the *analysis* points at.
+- **The artifact set for this sweep is exactly `results/stdlib/report.json` + `results/stdlib/summary.md`**
+  (`report.json` is authoritative; `summary.md` is rendered from it). `results/stdlib/raw/` is *not*
+  part of it: it holds hand-captured probe evidence from the investigations above —
+  `binary_module-rust-tail.txt` is the tail of the dying rust `binary_module_SUITE` run, and the
+  `*-per-case-5s.txt` files are earlier 5 s probes whose name records the budget they were taken with.
+  They are kept as evidence for §D1/§D10; regenerate them by hand (they are not produced by
+  `suites run`), and do not read them as the current sweep's raw output.
 
-Rows: `unicode_SUITE:ex_binaries_errors_utf8`, `ex_binaries_errors_utf16_big`,
-`ex_binaries_errors_utf16_little`, `ex_binaries_errors_utf32_big`,
-`ex_binaries_errors_utf32_little` — each dies on the inner loop's assertion
-`true = (binary:referenced_byte_size(Chomped) =:= PBSz)` with `{badmatch,false}`.
+## G. Harness notes
 
-### D5. `erts_debug:same/2` is false for the map fast-path identity (2 rows)
-
-```erlang
-M = (fun(X) -> X end)(#{a => 1}),          % defeat constant folding
-erts_debug:same(maps:merge(#{}, M), M).
-%%  oracle true      rust false
-%% same for maps:merge(M, M), maps:merge(M, #{}), and maps:put(K,V,M) with an unchanged value
-%% (erts_debug:same(M, M) alone IS true on both)
-```
-
-The oracle returns the *input map object* from `maps:merge/2`/`maps:put/3` when nothing changes;
-this runtime returns a copy. Rows: `maps_SUITE:t_merge_opt`, `maps_SUITE:t_put_opt`
-(`{badmatch,false}`).
-
-### D6. The raised term's stacktrace head lacks the raising `{maps,F,A}` frame (3 rows)
-
-`maps_SUITE.erl:53` defines `-define(badmap(V,F,Args), {'EXIT', {{badmap,V}, [{maps,F,Args,_}|_]}})`,
-i.e. the macro matches the **head** of the stacktrace. Both runtimes produce the same reason:
-
-```erlang
-catch maps:with([a,b], (fun(X) -> X end)(a)).
-%%  oracle {'EXIT',{{badmap,a},[{maps,with,[[a,b],a],…},{erl_eval,…}|…]}}
-%%  rust   {'EXIT',{{badmap,a},[{maps_SUITE,t_with_2,1,…},…]}}      % caller frame first
-```
-
-Rows: `maps_SUITE:t_with_2` (line 390), `t_without_2`, `t_from_keys` — each fails as
-`{badmatch,{'EXIT',{{badmap…}}}}` because the innermost frame is missing.
-
-### D7. Long BIF loops neither yield nor pre-empt → per-case `TIMEOUT` (7 rows)
-
-Rows: `maps_SUITE:t_from_keys_kill_process`, `t_from_list_kill_process`, `t_keys_kill_process`,
-`t_values_kill_process`, `t_intersect`, `t_intersect_with`, `t_merge_with`. Their shape is a
-`maps:from_keys/2` / `maps:merge/2` / `maps:intersect/2` over 10 000–1 000 000 keys inside a
-`spawn_monitor`ed loop that a killer process is supposed to interrupt (`exit(Pid,kill)` between
-rounds, or the round loop itself never terminating). Because the BIF loop never reaches a
-scheduling point, the kill never lands and the case burns the whole per-case budget. This is the
-**observed symptom** of the same region whose hard ceiling is D1.
-
-For evidence at a finer grain than the canonical artifact (which records only
-`maps_SUITE … suite killed after 330017 ms` for all 31 rows, because 7 hung cases × 300 s blow the
-suite budget), `results/stdlib/raw/maps-{rust,sys}-per-case-5s.txt` hold the identical drive run
-with a **5 s** per-case budget:
-
-| case | sys (5 s budget) | rust (5 s budget) |
-| --- | --- | --- |
-| doctests | OK | EXC `{1,errors}` (ct_doctest → D8) |
-| t_filter_2, t_filtermap_2, t_fold_3, t_foreach_2, t_get_3, t_groups_from_list, t_iterator_valid, t_map_2, t_order_consistency, t_size_1, t_update_with_3, t_update_with_4 | OK | OK |
-| t_from_keys, t_with_2, t_without_2 | OK | EXC (D6) |
-| t_merge_opt, t_put_opt | OK | EXC `{badmatch,false}` (D5) |
-| t_keys_trapping, t_values_trapping, t_from_keys_check_trapping, t_from_list_check_trapping | OK | EXC `{badmatch,badarg}` (D2) |
-| t_iterator_1, t_iterator_2 | OK | EXC `system_limit` (D1) |
-| t_from_keys_kill_process, t_from_list_kill_process, t_keys_kill_process, t_values_kill_process, t_intersect, t_intersect_with, t_merge_with | OK | TIMEOUT (D7) |
-
-So the Rust side of `maps_SUITE` is 10/31 pass at a 5 s budget, not 0/31: the canonical 0/31 is a
-**reporting consequence** of the seven hangs, not 31 separate failures.
-
-### D8. `erlang:bump_reductions/1` is not served (2 rows)
-
-```erlang
-erlang:bump_reductions(134217727).
-%%  oracle true      rust the doctest's own error  ('unsupported: erlang:bump_reductions/1')
-```
-
-Reached from `prim_eval:arg_reg_alloc/0` inside the `ct_doctest` machinery. Rows:
-`binary_module_SUITE:doctests` and `maps_SUITE:doctests` (both `{1,errors}`).
-
-### D9. A VM-fatal `system_limit` aborts the whole `beam_rt` process mid-suite (12 rows)
-
-The Rust leg of `binary_module_SUITE` stops emitting `CASE` lines after `encode_decode`; the
-process then exits with
-
-```
-beam_rt: system_limit
-  in call from ct_runner:'-run_case/4-fun-0-'/3 (…/ctl/ct_runner.erl:152)
-```
-
-(`results/stdlib/raw/binary_module-rust-tail.txt`, reproduced twice). The raise happens while
-running `guard/1`, a case whose entire body is `{comment, "Guard tests are run in emulator test
-suite"}` — which **passes** when run alone (`probe:run_case(binary_module_SUITE, guard)` → the
-comment term). So the abort is not `guard`'s logic: it is a `system_limit` that escapes a
-`spawn_monitor`ed worker and terminates the VM instead of being delivered as a `DOWN` message
-(the allocation-pressure symptom of D1 — `bin_to_list/1` is killed at its 300 s per-case timeout
-immediately before, after building ~10⁶-element lists in a random loop).
-
-Consequence for the report: the six cases after it (`guard`, `hex_encoding`, `join`,
-`longest_common_trap`, `referenced`, `scope_return`) are recorded `rust-gap / case missing from
-the rust runtime's output`, and the six that the *oracle* also fails (`interesting`, `list_to_bin`,
-`parts`, `random_ref_comp`, `random_ref_fla_comp`, `random_ref_sr_comp`) are recorded `divergence`
-for the same reason — the Rust row is missing, so the harness cannot call them identical. Their
-oracle-side failures are all the suite's own `?MASK_ERROR`-style mismatch (e.g.
-`{exception,exit,mismatch,{binary_module_SUITE,random_copy,1,…}}` and `undef random_iolist:run`
-for an unstaged helper).
-
-### D10. `erlang:system_info(snifs)` is not published (1 row, plus an oracle-side parse artifact)
-
-```erlang
-erlang:system_info(snifs).
-%%  oracle a list of NIF rows     rust 'unsupported: erlang:system_info(snifs): this runtime
-%%                                     publishes no static NIF table'
-```
-
-Row: `lists_SUITE:error_info`, recorded `oracle-only-fail` because the **oracle's own** row is
-missing from the parsed output. That is a line-protocol artifact, not a divergence: the case
-prints a diagnostic without a trailing newline and the runner's `CASE error_info OK` is glued onto
-it (`results/stdlib/raw/lists-sys-stdout.txt`: 78 `CASE ` occurrences, 77 at line start; the
-glued one reads `…ct_runner.erl:152)CASE error_info OK`). The Rust leg of the same case genuinely
-fails on `system_info(snifs)`.
-
-## E. Exclusions — identical-failure rows (6), and what is NOT a pass
-
-These are **excluded from both numerators**, never counted as passes. Each was confirmed by
-reading the `detail` of *both* sides in `report.json` (the raw reason strings are quoted below).
-
-| case | sys reason | rust reason | why identical |
-| --- | --- | --- | --- |
-| `binary_module_SUITE:copy` | `{exception,exit,mismatch,{binary_module_SUITE,random_copy,1,_}}` | same | the suite's own randomized comparison fails identically (its random generator is the same code on both sides) |
-| `binary_module_SUITE:encode_decode` | `{exception,error,undef,{binref,encode_unsigned,[…]}}` | same | the helper module `binref` is not among the staged helper modules (`HELPER_MODULES` = `error_info_lib`, `dict_test_lib`), so `undef` on both sides |
-| `unicode_SUITE:is_id` | `{badmatch,{error,enoent}}` in `parse_properties/1` | same | needs `UnicodeData.txt` from a `ct` data dir; the runner passes the stage's source dir as `data_dir`, so the file is absent on both sides |
-| `unicode_SUITE:is_whitespace` | `{badmatch,{error,enoent}}` | same | same data-dir dependency |
-| `unicode_SUITE:random_lists` | `{exception,error,undef,{random_iolist,run,…}}` | `{exception,error,unsupported_bif,{erts_debug,set_internal_state,…}}` | **both fail, but not for the same reason** — kept in the excluded bucket because both sides failed, flagged here explicitly: the oracle dies on the unstaged `random_iolist` helper before it reaches the `erts_debug` call that the Rust side cannot serve (D3) |
-| `binary_module_SUITE:bin_to_list` | `{exception,exit,badresult,…}` | per-case `TIMEOUT` (300 s) | **also flagged**: both sides "fail", but the oracle fails fast inside the case while the Rust side never finishes; this row is the Rust side of D1/D9 |
-
-Two further non-pass, non-fail statuses worth naming:
-
-* `maps_SUITE` — all 31 rows are `rust-gap / suite killed after 330017 ms`; the honest per-case
-  picture is the 5 s-budget table in D7 (10 pass / 21 fail-or-timeout).
-* `string_SUITE` — 46 cases, **all** `agree`.
-
-## F. Caveat (read before quoting any number)
-
-The host is shared (16 logical CPUs; loadavg at the two sweep runs was `116.82 …` → `3.58 …` and
-`1.17 …` → `1.56 …`), so only the **counts** in this document are portable: a wall time, a
-timeout verdict and the exact threshold at which the D1 ceiling bites all move with machine load
-and with how much heap earlier cases in the same VM retained. The runner also deliberately does
-not execute `init_per_group/1`, `end_per_group/1`, `init_per_testcase/2` or `end_per_testcase/2`,
-and it passes the staged source directory as both `data_dir` and `priv_dir`; any case that needs
-a real `ct` data/privacy directory, a group hook, or a helper module that `HELPER_MODULES` does
-not stage fails **identically** on both sides and lands in §E rather than in the pass column.
-Where a case's own output is not newline-terminated the harness's line scan can also lose a
-`CASE` line (§D10). Nothing in §B/§C should be read as "the suite passes on the Rust runtime";
-the honest summary is **145 of 210 measured cases agree, 6 are excluded as identical failures,
-21 diverge, 37 are rust-gaps and 1 is an oracle-side parse artifact** — with `queue_SUITE` (6/6),
-`proplists_SUITE` (4/4), `dict_SUITE` (7/7) and `string_SUITE` (46/46) fully agreeing, `lists_SUITE`
-75/78, `unicode_SUITE` 4/19, `binary_module_SUITE` 3/7 measured and `maps_SUITE` 0/31 as recorded.
-
-## G. Harness change made during this sweep (one line, in `data/ct_runner.erl`)
-
-`expand_group/3` only matched the 3-tuple group form `{Name, Props, Cases}`, so a group declared in
-`ct`'s default-properties form `{Name, Cases}` (e.g. every group in `string_SUITE:groups/0`) was
-treated as a *case name* and reported as `case not exported`. The first sweep therefore measured
-3 rows for `string_SUITE` (2 × "case not exported" + `doctests`). The fix adds the `{Group, Sub}
-when is_list(Sub)` clause next to the existing one; `string_SUITE` then expands to its real
-**46 cases — all 46 agree** on both sides. No other part of `src/` was touched, and no runtime
-crate was modified.
+- `data/ct_runner.erl` expands a suite through `groups/0`, including the `{Group, [SubCase, …]}`
+  form (`expand_group/3`), so grouped cases are reported individually.
+- The runner deliberately does **not** call `init_per_suite`/`init_per_group`/`init_per_testcase`. A
+  case that needs them fails identically on both sides — that is what makes `unicode_SUITE:is_id` /
+  `is_whitespace` an honest `agree-fail-identical` instead of a rust gap.
+- Each case runs in its own `spawn_monitor` with its own timeout, so one timed-out case never poisons
+  the suite… except that the *measured* cost of a timed-out case still lands wherever the run happens
+  to be (§D10). Raise `--timeout` (and use `--jobs 1`) before reading a `TIMEOUT` as a capability gap.
+- Every protocol line is `\n`-prefixed (`SUITE`, `CASE <name> OK|SKIP|EXC|TIMEOUT|MISSING`,
+  `SUITE_INIT_FAILED`, `SUITE_DEADLINE <n>`, `DONE`).
