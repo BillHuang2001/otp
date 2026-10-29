@@ -349,9 +349,14 @@ The boot-path engine-entry map — which of the 22 directives enter module code,
   keep their existing semantics/return types; `boot()` stays idempotent and returns `Result<()>`;
   `execute_reporting` is purely additive (`execute` keeps its signature).
 - **The atom seed is the materialization source for every atom-valued answer**, so `CORE_ATOMS` is
-  **append-only**: the group order fixes the atom indices, and a seeded *prefix* must resolve every
-  name it contains identically (asserted by `boot.rs`'s `core_atoms_seed_is_idempotent_and_complete`
-  + `seed_core_atoms_interns_the_exception_reason_and_class_atoms`). A name an `InfoValue::Atom` can
+  **append-only**: the group order fixes the atom indices it assigns, and a seeded *prefix* must resolve
+  every name it contains identically (asserted by `boot.rs`'s
+  `core_atoms_seed_is_idempotent_and_complete` + `seed_core_atoms_interns_the_exception_reason_and_class_atoms`,
+  the latter starting both tables from the same `crate::atom_seed` run). `CORE_ATOMS` is **not** the base
+  of the index space: `CodeServer::new` first interns `erts/emulator/beam/atom.names` in file order
+  ([`../atom_seed.rs`](../atom_seed.rs)), which is what makes an atom's index the one real ERTS gives it
+  (and therefore what orders a flat map's keys, `maps:keys/1`, `~p` and `MAP_EXT`). A name an
+  `InfoValue::Atom` can
   emit but the seed lacks surfaces as `term not found` (`BeamError::TermNotFound`) instead of the
   answer, which is why each appended group exists: the C `error_atom` table
   (`beam_common.c:382-406`), the stacktrace auxiliaries `file`/`line`, the node atom

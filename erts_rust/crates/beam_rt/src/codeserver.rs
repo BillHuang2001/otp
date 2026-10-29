@@ -1451,9 +1451,19 @@ mod tests {
         root.join("lib").join(format!("{app}-9.9")).join("ebin")
     }
     #[test]
-    fn an_empty_server_has_no_atoms_no_modules_and_no_path() {
+    fn a_fresh_server_has_the_atom_seed_but_no_modules_and_no_path() {
         let mut server = CodeServer::new();
-        assert!(server.atoms().is_empty());
+        // Not empty any more: the table starts from the emulator's initial index space
+        // (`erts/emulator/beam/atom.names`, interned in file order by `crate::atom_seed`), so
+        // every index a module later sees is the one real ERTS gives it. Nothing else is set.
+        let mut seeded = AtomTable::new();
+        crate::atom_seed::seed(&mut seeded);
+        assert_eq!(
+            server.atoms().len(),
+            seeded.len(),
+            "a fresh server holds exactly the atom.names run"
+        );
+        assert_eq!(server.atoms().lookup("false").map(|a| a.raw()), Some(0));
         assert!(server.paths().is_empty());
         assert!(server.loaded().is_empty());
         assert!(!server.is_loaded("lists"));

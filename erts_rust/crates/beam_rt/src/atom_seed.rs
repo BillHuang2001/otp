@@ -165,10 +165,12 @@ mod tests {
         seed(&mut table);
         let first = table.lookup("infinity").expect("seeded").raw();
         let len = table.len();
-        assert!(
-            (table.intern("infinity").raw() as usize) >= len,
-            "no new index for the repeat"
+        assert_eq!(
+            table.intern("infinity").raw(),
+            first,
+            "a repeat resolves to its first appearance's index"
         );
+        assert_eq!(table.len(), len, "and the table did not grow");
         assert_eq!(table.lookup("infinity").map(Atom::raw), Some(first));
         // `infinity` is declared on its own line *and* again in `atom infinity timeout normal
         // call return`, so the next name in that line proves the repeat was folded rather than
