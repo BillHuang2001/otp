@@ -14,30 +14,33 @@ are meaningful; no absolute wall time here is portable.
 | field | recorded sweep | budget re-check |
 |---|---|---|
 | artifact | `results/stdlib/report.json` | `results/stdlib/recheck-120/report.json` |
-| `generated_at` | `1793256012` | `1793256335` |
+| `generated_at` | `1793266383` | `1793266833` |
 | suites | the 8 of §B | `maps`, `lists`, `binary_module` |
 | `--timeout` / `--suite-budget` / `--jobs` | `10` / `300000` / `4` | `120` / `900000` / `1` |
 | `host.oracle` | `/nix/store/…-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` | same |
 | `host.oracle_version` | `29/17.1.1` (tree pins OTP `30.0-rc0`, erts `17.1`) | same |
 | `host.nproc` | 16 | 16 |
-| `host.loadavg_before` | `27.19 39.03 30.12 2/882 4` | `11.72 26.84 27.05 17/881 4` |
-| `host.loadavg_after` | `22.19 32.24 28.68 3/935 1100` | `11.23 16.25 22.54 100/1258 597` |
+| `host.loadavg_before` | `3.98 5.95 17.43 3/843 3605` | `6.28 6.20 16.28 3/881 4704` |
+| `host.loadavg_after` | `6.28 6.20 16.28 2/881 4701` | `4.72 5.49 12.15 2/879 5297` |
 | `rust.path` | `erts_rust/target/release/beam_rt` (per-worktree, git-ignored) | same |
-| `rust.sha` | `125ca3a9f3f7260dfc2400faff18117b67834558` | same |
+| `rust.sha` | `e18f151ba89a30f3dffb39d68805b985a1c98133` | `e18f151ba89a` (same worktree) |
 | `rust.version` | `30/17.1` | same |
 | `rust.tier` | `null` (default baseline-JIT tier) | same |
 
-Both reports name the same workspace commit, and no file under `erts_rust/crates` differs between it
-and the current tree (`git diff --stat 125ca3a9f3f7 HEAD -- erts_rust/crates` is empty), so both
+Both reports were written from the same worktree and name the same workspace commit (`e18f151b…`), and the
+runtime sources themselves are `71ffbbb37971d0b193e0dc74b60b6c448874349e`: no file under
+`erts_rust/crates` differs between that commit and the current tree
+(`git diff --stat 71ffbbb37971d0b193e0dc74b60b6c448874349e HEAD -- erts_rust/crates` is empty), so both
 sweeps describe the current runtime sources. The sha names a commit, not a binary hash: `beam_rt` is
 per-worktree and git-ignored. In the recorded report `targets[0].build` is `erlc -o <stage>/ebin -I
 <stage>/src <suite>.erl …` with the oracle's `erlc` (`ok: true`, `reused: true`, "compiled 8 suites + 6
 helpers + runner"); `targets[0].code_path` is `<stage>/ebin` + `<stage>/ctl` on both sides.
 
-Load was 27 → 22 during the recorded sweep and ~12–27 during the re-check, i.e. **both ran on a busy
-host**, which is why the `TIMEOUT` rows are re-measured serially instead of read as capability
-statements. Every suite runs in its own cwd (`<stage>/cwd/<SUITE>`) that the harness **clears before the
-row starts** (`target::fresh_dir`), so a fixture tree left by an earlier sweep cannot poison either side;
+Load was ~4–6 during the recorded sweep and ~5–6 during the re-check (the diagnostics probes ran up to
+~12) on a **shared** host, which is why the `TIMEOUT` rows are re-measured serially instead of read as
+capability statements. Every suite runs in its own cwd (`<stage>/cwd/<SUITE>`) that the harness
+**clears before the row starts** (`target::fresh_dir`), so a fixture tree left by an earlier sweep cannot
+poison either side;
 both sides of a row share it. Invocation shape for every row (per `targets[0].invocations`), only the
 binary differing:
 
@@ -53,55 +56,58 @@ cd <stage>/cwd/<SUITE> && <RUNTIME> -noshell -pa <stage>/ebin -pa <stage>/ctl \
 
 | suite | rows | sys P/F | rust P/F | agree | afi | divergence | rust-gap |
 |---|---|---|---|---|---|---|---|
-| `binary_module_SUITE` | 20 | 18 / 2 | 4 / 3 | 4 | 1 | 3 | 12 |
+| `binary_module_SUITE` | 20 | 18 / 2 | 9 / 11 | 9 | 2 | 9 | 0 |
 | `dict_SUITE` | 7 | 7 / 0 | 7 / 0 | 7 | 0 | 0 | 0 |
 | `lists_SUITE` | 78 | 78 / 0 | 77 / 1 | 77 | 0 | 1 | 0 |
 | `maps_SUITE` | 32 | 32 / 0 | 20 / 12 | 20 | 0 | 12 | 0 |
 | `proplists_SUITE` | 4 | 4 / 0 | 4 / 0 | 4 | 0 | 0 | 0 |
-| `queue_SUITE` | 7 | 7 / 0 | 6 / 1 | 6 | 0 | 1 | 0 |
+| `queue_SUITE` | 7 | 7 / 0 | 7 / 0 | 7 | 0 | 0 | 0 |
 | `string_SUITE` | 46 | 45 / 1 | 45 / 1 | 45 | 1 | 0 | 0 |
-| `unicode_SUITE` | 20 | 18 / 2 | 6 / 14 | 6 | 2 | 12 | 0 |
-| **total** | **214** | **209 / 5** | **169 / 32** | **169** | **4** | **29** | **12** |
+| `unicode_SUITE` | 20 | 18 / 2 | 8 / 12 | 8 | 2 | 10 | 0 |
+| **total** | **214** | **209 / 5** | **177 / 37** | **177** | **5** | **32** | **0** |
 
-`dict_SUITE` and `proplists_SUITE` agree on every case; `lists_SUITE` and `string_SUITE` differ on one
-row each (a 10 s-budget timeout and an identically failing case). The oracle's five failures are
+`dict_SUITE`, `proplists_SUITE` and `queue_SUITE` agree on every case; `lists_SUITE` and `string_SUITE`
+differ on one row each (a 10 s-budget timeout and an identically failing case). The oracle's five failures are
 `binary_module_SUITE:copy` and `string_SUITE:meas` (both over the 10 s budget),
 `unicode_SUITE:is_id`/`is_whitespace` (missing `UnicodeData.txt`) and `binary_module_SUITE:interesting`
-(`{badmatch,false}` in `do_interesting/1` on both sides).
+(`{badmatch,false}` in `do_interesting/1` on both sides). No row is `rust-gap` or `not-run`.
 
-The re-check covers the three suites that own every rust-side `TIMEOUT`:
+The re-check covers three of the eight suites, which own 12 of the 15 rust-side `TIMEOUT` rows:
 
-| suite | rows | sys P/F | rust P/F | agree | divergence | rust-gap |
+| suite | rows | sys P/F | rust P/F | agree | afi | divergence |
 |---|---|---|---|---|---|---|
-| `binary_module_SUITE` | 20 | 19 / 1 | 5 / 2 | 5 | 3 | 12 |
+| `binary_module_SUITE` | 20 | 19 / 1 | 13 / 7 | 13 | 1 | 6 |
 | `lists_SUITE` | 78 | 78 / 0 | 78 / 0 | 78 | 0 | 0 |
-| `maps_SUITE` | 32 | 32 / 0 | 23 / 9 | 23 | 9 | 0 |
+| `maps_SUITE` | 32 | 32 / 0 | 23 / 9 | 23 | 0 | 9 |
+| **total** | **130** | **129 / 1** | **114 / 16** | **114** | **1** | **15** |
 
 ## C. Totals
 
-- **214 rows** measured; no row is `not-run` and none is `oracle-only-fail`.
-- **Oracle: 209 rows pass, 5 fail.** Rust: **169 pass, 32 fail**, plus **13 `error`** rows that carry no
-  per-row measurement from the sweep (the 12 `rust-gap` rows and `binary_module_SUITE:interesting`).
-- **Fully green rows: 209 of 214** on the oracle and **169 of 214** on rust; **4 rows are excluded from
-  both numerators** (`agree-fail-identical`, §E). A `rust-gap` row has no rust result at all — not a pass.
-- **Verdict split:** `agree 169` · `agree-fail-identical 4` · `divergence 29` · `rust-gap 12`.
-- **No rust pass corresponds to an oracle failure.** All 169 `agree` rows have `sys.status = pass`; the
+- **214 rows** measured; no row is `not-run`, none is `oracle-only-fail` and none is `rust-gap`.
+- **Oracle: 209 rows pass, 5 fail.** Rust: **177 pass, 37 fail**.
+- **Fully green rows: 209 of 214** on the oracle and **177 of 214** on rust; **5 rows are excluded from
+  both numerators** (`agree-fail-identical`, §E).
+- **Verdict split:** `agree 177` · `agree-fail-identical 5` · `divergence 32`.
+- **No rust pass corresponds to an oracle failure.** All 177 `agree` rows have `sys.status = pass`; the
   only rows whose rust side lacks a pass are the `afi` ones, where **both** sides fail.
-- The 12 `rust-gap` rows are one event: the rust side of `binary_module_SUITE` **dies mid-suite** (§D1), so
-  every later case loses its turn. Measured one process per row they split 8 `agree`, 1
-  `agree-fail-identical`, 1 typed gap, 1 D2 divergence and 2 too slow to finish (§D1's table).
-- **Re-check (120 s, serial):** 130 rows over 3 suites — sys 129/1, rust 106/11 + 13 `error`; verdicts
-  `agree 106` · `divergence 12` · `rust-gap 12`. It moves five of the seven one-sided `TIMEOUT` rows to
-  `agree` (`bin_to_list`, `lists:suffix`, `maps:t_intersect`, `t_iterator_2`, `t_merge_with`), leaves two
-  as `system_limit` (`maps:t_keys_trapping`, `t_values_trapping`) and turns `binary_module:copy` into a
-  **divergence** (oracle passes at 120 s; rust still fails on D10).
+- **Every suite runs to its end in one process**: a suite is 20–78 cases and the per-case budget is what
+  stops a case, so no row loses its turn to an earlier crash.
+- **Re-check (120 s, serial):** 130 rows over 3 suites — sys 129/1, rust 114/16; verdicts
+  `agree 114` · `divergence 15` · `agree-fail-identical 1` (`binary_module:interesting`). It moves 7 of
+  the re-checked suites' 22 divergence rows to `agree` (`binary_module:bin_to_list`, `parts`,
+  `random_ref_fla_comp`, `lists:suffix`, `maps:t_intersect`, `t_iterator_2`, `t_merge_with`), leaves two
+  over the budget (`binary_module:random_ref_comp`, `random_ref_sr_comp`) and shows two as D1's
+  `system_limit` rather than slowness (`maps:t_keys_trapping`, `t_values_trapping`).
+  `binary_module:copy` moves from excluded to **`agree`**: both sides time out at 10 s and both pass at
+  120 s.
 
 ## D. Non-agree rows, by class
 
-41 rows are non-agree in the recorded sweep (29 `divergence` + 12 `rust-gap`); the 4 `afi` rows are
-§E's exclusions. The per-class counts below add up to 43 rather than 41 because two rows are named
-twice on purpose: `binary_module:copy` is §E's excluded row that D10 explains, and
-`longest_common_trap` is both one of D1c's 13 missing cases and the D10 gap that case needs.
+37 rows are non-agree in the recorded sweep (32 `divergence` + 5 `afi`); the `afi` rows are
+§E's exclusions and are in neither numerator.
+Of the 32 divergence rows, 20 carry a class id below or in §D12/D12b, 1 is D12b's latin1 row and the
+remaining 11 are budget or pure performance (§D8, §F): 9 agree at a larger budget and 2 are the
+`random_ref_*` rows.
 `<rt>` below means either binary. Class ids are the ones in
 `results/stdlib-diagnostics/FINDINGS.md`, which re-verifies each one against the current runtime: **5 fixed**
 (D1b, D3, D7, D9, D10), **5 still present** (D1, D2, D4 — `maps:put/3` identity on the compiled route — D8,
@@ -110,7 +116,7 @@ abort is gone, the raise reason is now the placeholder atom `'exit <structured r
 (D12, a `utf32` segment ignoring `little`/`native`, and D12b, `unicode:characters_to_binary/3`'s latin1
 error split). `FINDINGS.md` is authoritative for every verdict below.
 
-### D1 — the `system_limit` family — 16 rows, two mechanisms
+### D1 — the term-heap `system_limit` — 3 rows, one mechanism
 
 **D1a, allocation inside a `lists` BIF callback — 3 rows.** `maps_SUITE:t_from_keys_check_trapping`,
 `t_keys_trapping`, `t_values_trapping` all end `{badmatch,system_limit}` in
@@ -120,85 +126,44 @@ The reduced class is *"a large allocation inside a fun invoked by a higher-order
 
 ```
 <rt> -noshell -eval 'io:format("~p~n",[lists:foreach(fun(_) ->
-      length(lists:duplicate(200000, x)) end, [1])]), halt(0).'
+      length(lists:duplicate(65537, x)) end, [1])]), halt(0).'
 ```
 
 - oracle: `ok`; rust: catchable `error:system_limit` — uncaught it terminates the runtime with
   `beam_rt: system_limit`, exit 1.
 
-The threshold sits between 131 072 and 200 000 list elements (2–3 MiB of cons cells); the same work in a
-tail-recursive loop, in a directly-called fun, or in a `spawn_monitor` child is `ok`, so only the
-*higher-order BIF callback* shape refuses. It is a plain `error`, not a typed capability gap.
+The threshold is exactly **65 536** list elements (`FINDINGS.md` §D1: `N = 65536` is `ok`, `N = 65537`
+refuses — 131 072 words, 1 MiB of cons cells); the same work in a tail-recursive loop, in a
+directly-called fun, in a `spawn_monitor` child or at `N = 65536` is `ok`, so only the *higher-order BIF
+callback* shape refuses. It is a plain `error`, not a wrong value.
 **Owner:** `beam_rt` (heap admission / `enforce_term_heap_limit` from a BIF-invoked fun).
 
-**D1c, the suite-path abort — 13 rows.** The recorded sweep reports 12 of them `error 0/0 case missing
-from the rust runtime's output` and `interesting` as a `divergence`:
-
-```
-SUITE binary_module_SUITE
-CASE … encode_decode       OK
-… the first two error_info blocks, then the process exits 1
-stderr: beam_rt: system_limit
-```
-
-The abort is deterministic for a given build and reproduces by hand with the harness's own argv. It is
-**entry-count dependent**: `error_info_abort_probe:main({prefix, N})` (the suite's `error_info/1` list
-through `ct_runner:run_case/4`'s shape) completes with exit 0 up to `N = 69` and aborts at `N = 70` of
-the 73 entries (`N = 68`/`69` answer a ct exception result, not a passing case — the point is that the
-runtime survives them).
-The load-bearing ingredient is the ct hand-off — `spawn_monitor` child, `try`/`catch` around the case,
-`exit({ct_case_result, Result})` out of the child: the case's own logic passes in the main process, in a
-plain child, and when the value is merely returned, and dropping any single entry does not move the
-threshold.
-
-The mechanism is inside the runtime, not an escaping user error: the raise's reason crosses the runtime's
-escape boundary and the **error-live-reason stabilization** copies a term it should not, and the arm maps
-the failure to `error:system_limit`, so no `catch` in the program can see it —
-`runtime/gc.rs::stabilize_error_live_reason` → `Runtime::stabilize_term` (src/runtime.rs:2650) →
-`beam_message::copy::try_copy_fast`/`copy_struct_simple` → `copy_match_context`
-(crates/beam_message/src/copy.rs:365) → `beam_term::bitstring::bit_at`
-(crates/beam_term/src/bitstring.rs:339). `copy_match_context` takes its bit window from the term's
-`ErlSubBits` words and dereferences the base pointer stored in the term with no owning handle to validate
-it, because the copy runs on the empty-source-table path (`Runtime::stabilize_term`, not
-`stabilize_term_with`). Garbage there yields an impossible window (→ the reservation is refused →
-`system_limit`) or an unmapped page (→ SIGSEGV at the same instruction); the same program has produced
-both manifests. **Which payload inside the reason is dead is unknown from the outside**; what is
-established is that the reader is unsound on that path. **Owners:** `beam_rt` (the stabilization path),
-`beam_message` (`copy_match_context`), `beam_term` (`bit_at`). This is the only class that is **not** a
-typed gap: it breaks the "every gap is a typed error, never a wrong result" contract.
-
-The 13 cases, each measured alone in a fresh process (`error_info_abort_probe:main({one, Case})`,
-`FINDINGS.md` §D1):
-
-| case | rust (alone) | oracle | would record as |
-|---|---|---|---|
-| `error_info` | `{ok,ok}` | `{ok,ok}` | agree |
-| `guard` | `{ok,{comment,"…"}}` | same | agree |
-| `hex_encoding` | `{ok,ok}` | `{ok,ok}` | agree |
-| `interesting` | `{case_exception,error,{badmatch,false},…}` | identical | agree-fail-identical |
-| `join` | `{ok,<<>>}` | same | agree |
-| `list_to_bin` | `{ok,ok}` | `{ok,ok}` | agree |
-| `longest_common_trap` | `{case_exception,error,unsupported_bif,{erts_debug,set_internal_state,[binary_loop_limit,10],[]}}` | `{ok,ok}` | rust-gap (typed, D10) |
-| `parts` | `{ok,ok}` | `{ok,ok}` | agree |
-| `random_ref_comp` | timeout (60 s; log reached 5 287 successes) | `{ok,ok}` | rust-gap (too slow) |
-| `random_ref_fla_comp` | `{ok,ok}` | `{ok,ok}` | agree |
-| `random_ref_sr_comp` | timeout (60 s; 7 500 successes) | `{ok,ok}` | rust-gap (too slow) |
-| `referenced` | `{case_exception,error,{badmatch,1023},…}` | `{ok,ok}` | divergence (D2) |
-| `scope_return` | `{ok,ok}` | `{ok,ok}` | agree |
-
-So "case missing from the rust runtime's output" is a property of **running the suite in one process**,
-not of the cases: the abort takes the process down at `error_info` and every later case loses its turn.
-`random_ref_comp`/`random_ref_sr_comp` are over the sweep's own 10 s per-case budget as well, so they are
-unmeasured there too; `random_ref_fla_comp` finishing in the same run shows the two timeouts are
-workload cost, not a hang.
+**D1c, the suite-level abort is gone; the raise reason is a placeholder — 1 row.**
+`binary_module_SUITE:error_info` is the only D1c row, and it no longer takes the suite down: all 20
+`binary_module_SUITE` cases are measured in one process now.
+What remains is the *death-boundary reason*: `error_info_abort_probe:main({prefix, 70})` (the suite's
+`error_info/1` list driven through `ct_runner:run_case/4`'s `spawn_monitor` + `try`/`catch` +
+`exit({ct_case_result, R})` shape) answers `{ok,ok}` on the oracle and hands the parent the atom
+`'exit <structured reason>'` here — the `Display` of a structured raise reason, interned when the live
+reason was dropped (`crates/beam_rt/src/runner/reason.rs` over `runtime/gc.rs`'s
+`stabilize_error_live_reason` → `degrade_live_reason`, whose price/copy gate refuses this payload).
+An Erlang program can match that atom, so it is a wrong value rather than a typed gap.
+**Owner:** `beam_rt` (the escape-boundary stabilization; the fallback should degrade to the bare
+class/reason instead of an invented atom).
+The standalone measurements behind the two slow `binary_module_SUITE` rows still hold and are quoted
+where they matter (§D8, §F): `random_ref_comp` and `random_ref_sr_comp` are over 400 s against the
+oracle's 4 s / 3 s, while `random_ref_fla_comp`, `parts`, `bin_to_list` and `list_to_bin` finish and agree
+once the budget is 120 s.
 
 ### D2 — `binary:referenced_byte_size/1` of a sub-binary answers its own size — 6 rows
 
 Rows: `binary_module_SUITE:doctests` (`{1,errors}` — the failing doctest is this expression, `A test
-failed in function referenced_byte_size/1: 6> {byte_size(C), binary:referenced_byte_size(C)}.`) and
-`unicode_SUITE:ex_binaries_errors_utf8`, `_utf16_big`, `_utf16_little`, `_utf32_big`, `_utf32_little`
-(`{badmatch,false}` inside `utf*_inner_loop/6` / the utf8 list comprehension — all five assert
+failed in function referenced_byte_size/1: 6> {byte_size(C), binary:referenced_byte_size(C)}.`),
+`binary_module_SUITE:referenced` (`{badmatch,1023}`), `unicode_SUITE:binaries_errors_limit` and
+`unicode_SUITE:ex_binaries_errors_utf8`, `_utf16_big`, `_utf16_little` (`{badmatch,false}` inside
+`utf*_inner_loop/6` / the utf8 list comprehension — they assert
 `true = (binary:referenced_byte_size(Chomped) =:= PBSz)`).
+The two `utf32` rows are **D12**, not this class.
 
 ```
 <rt> -noshell -eval 'Part = <<"z",(binary:copy(<<255>>,1024))/binary>>,
@@ -206,7 +171,7 @@ failed in function referenced_byte_size/1: 6> {byte_size(C), binary:referenced_b
                       io:format("~p~n",[{byte_size(C), binary:referenced_byte_size(C)}]), halt(0).'
 ```
 
-- rust: `{510,510}` · oracle: `{510,2050}`
+- rust: `{510,510}` · oracle: `{510,1025}`
 
 **Owner:** `beam_bifs` (the binary BIF) over `beam_term`/`beam_alloc` sub-binary bookkeeping — the
 runtime does not track the referenced (parent) binary of a sub-binary.
@@ -231,9 +196,10 @@ The frame is present when the same raise is caught by `try … catch` (the shape
 sides), and absent when it is caught by the legacy `catch Expr` expression — the shape these four suites
 use. **Owner:** `beam_engine` (`families/exceptions/callee.rs`, trace-head synthesis on the `catch` path).
 
-### D6 — `erlang:bump_reductions/1` is not served — 1 row
+### D6 — `erlang:bump_reductions/1` is not served — 2 rows
 
-Row: `maps_SUITE:doctests` (`{1,errors}`). The captured doctest transcript
+Rows: `maps_SUITE:doctests` (`{1,errors}`) and `binary_module_SUITE:longest_common_trap`
+(`{exception,error,unsupported_bif,{erlang,bump_reductions,[…]}}`). The captured doctest transcript
 (`results/stdlib/raw/maps-rust-per-case-5s.txt`) names the failing doctest expression:
 
 ```
@@ -256,14 +222,14 @@ catches the Erlang error, the `-eval` driver reports the CLI signal). **Owner:**
 Rows: `maps_SUITE:t_merge_with`, `t_iterator_2`. Both blow the 10 s per-case budget in the parallel sweep
 (rust `fail`, detail `timeout`) and both pass in the serial 120 s re-check, so their class is slowness,
 not a wrong result. Isolated ratios (`maps_bif_loop_probe.erl`, 1 000-key maps, 50 rounds, one invocation
-per runtime, run twice with the order swapped, host loadavg ~32 — only the ratio is meaningful):
+per runtime, run twice with the order swapped, host loadavg ~19 — only the ratio is meaningful):
 
 | workload | rounds × size | ratio, run 1 | ratio, run 2 |
 |---|---|---|---|
-| `maps:merge_with/3` | 50 × 1000 keys | **580×** | **764×** |
-| `maps:intersect_with/3` | 50 × 1000 keys | **94×** | **107×** |
-| `maps:iterator/1` + `maps:next/1` | 50 × 1000 entries | **442×** | **525×** |
-| `maps:to_list/1` (no Erlang callback) | 50 × 1000 entries | 4.8× | 4.3× |
+| `maps:merge_with/3` | 50 × 1000 keys | **662×** | **614×** |
+| `maps:intersect_with/3` | 50 × 1000 keys | **92×** | **95×** |
+| `maps:iterator/1` + `maps:next/1` | 50 × 1000 entries | **438×** | **480×** |
+| `maps:to_list/1` (no Erlang callback) | 50 × 1000 entries | 3.7× | 3.7× |
 
 Both sides compute the same work (the probe's checksum is `0` on both sides for every row). The last row
 is the control: a pure BIF over the same map costs ~4–5×, so essentially the whole residual is the
@@ -289,8 +255,8 @@ the `queue` side answers `empty`, the **model** side answers `{error,badarg}`. T
 Patching that one `apply/2` in the suite's helper to a direct fun dispatch makes the Rust side run all
 3 142 ops to `ok`, which attributes the row to `apply/2` and to nothing in `queue`.
 
-`erlang:apply/2` is unimplemented: a genuine `call_ext erlang:apply/2` reaches `beam_rt`'s native floor,
-which decodes it as the `apply/3` `(Module, Function, Args)` shape
+`erlang:apply/2` used to be unimplemented: a genuine `call_ext erlang:apply/2` reached `beam_rt`'s native
+floor, which decoded it as the `apply/3` `(Module, Function, Args)` shape
 (`crates/beam_rt/src/native.rs`, `apply_dynamic`), so the two operands are read as a module and a
 function name.
 
@@ -307,19 +273,18 @@ smallest(Args) -> apply(fun(X) -> X end, Args).
 The matrix (`apply_args_probe.erl`, `queue_oops_probe.erl`): a literal argument list, `apply/3`, `F(Args)`
 and the `-eval` evaluator all agree — the compiler rewrites a literal-length argument list into
 `call_fun` (`erlc -S` shows `{call_fun,1}`), so only a *dynamically* built list reaches the floor.
-Wrong on the value side too, not just the error side: `apply(erlang, self)` answers a pid where the
-oracle raises `badarg` (it ran `erlang:self/0`), `apply(lists, reverse)` answers `undef`, and an arity
-mismatch degrades `{badarity,{Fun,Args}}` to plain `badarg`.
-**Owner:** `beam_rt` (the native `apply/2` floor; three of that floor's own unit tests pin the wrong
-semantics and must move with the fix). The engine and `beam_bifs` are correct by contract —
+It was wrong on the value side too, not just the error side: `apply(erlang, self)` answered a pid where
+the oracle raises `badarg` (it ran `erlang:self/0`), and `apply(lists, reverse)` answered `undef`; both are
+`badarg` on both sides now.
+**Owner:** `beam_rt` (the native `apply/2` floor) for the one residual reason shape. The engine and `beam_bifs` are correct by contract —
 `crates/beam_engine/src/families/funs/call_ext_apply.rs` pins that arity 2 must reach the host's own
 `apply/2`.
 
 ### D10 — `erts_debug:set_internal_state/2` — served (the xchg rule agrees) — 0 rows
 
-Rows: `unicode_SUITE:binaries_errors_limit`, `exceptions`, `latin1`, `random_lists`, `roundtrips`,
-`utf16_illegal_sequences_bif`, `utf8_illegal_sequences_bif` (all through `setlimit/1`) plus
-`binary_module_SUITE:copy` and `longest_common_trap`.
+D10 owns **no** row of the current sweep: the `setlimit/1`-driven `unicode_SUITE` cases that used to hit
+it are measured now, and the divergence rows among them belong to D2 (`binaries_errors_limit`,
+`ex_binaries_errors_utf16_*`, `_utf8`), D12 (`_utf32_*`, `roundtrips`) and D12b (`latin1`).
 
 The gate call has to be reproduced carefully, because the oracle needs access enabled first:
 
@@ -332,7 +297,8 @@ erts_debug:set_internal_state(unicode_loop_limit,10)          → 40000   (previ
 Both sides answer the **previous** value for every limit (`unicode_loop_limit` `40000`, `binary_loop_limit` `0`,
 `re_loop_limit` `64000`), the gate-off call answers `undef` on both sides, and an uncaught `-eval` call no longer
 leaves through the CLI channel. **Owner:** `beam_bifs` (`src/runtime/erts_debug.rs`).
-`binary_module_SUITE:copy` is therefore no longer blocked by this class: at 120 s both sides pass it.
+`binary_module_SUITE:copy` is therefore no longer blocked by this class: both sides time out at the 10 s
+budget and both **pass** it at 120 s.
 
 ### D11 — `erlang:trace_delivered/1` rejects an exited pid — 1 row
 
@@ -349,35 +315,53 @@ arrived:
 - rust: `{'EXIT',{badarg,[]}}` · oracle: `#Ref<…>`
 
 For a **live** pid both sides answer a delivery ref, so the function is served; what is missing is the
-delivery bookkeeping for a pid that has already exited. **Owner:** `beam_bifs`.
+delivery bookkeeping for a pid that has already exited. **Owner:** `beam_rt`
+(`src/trace.rs::trace_delivered_1` rejects a pid the process table no longer holds, while OTP's
+`trace_delivered_1` accepts any internal pid plus `all`).
 
+### D12 / D12b — the `utf32` segment flag, and the latin1 error split — 4 rows
+D12 (3 rows): `unicode_SUITE:ex_binaries_errors_utf32_big`, `_utf32_little` and `roundtrips`. Construction of
+a `utf32` segment with an explicit `little`/`native` flag drops the flag for a runtime value —
+`f(E) -> <<E/utf32-little>>.` called `f(1)` answers `<<0,0,0,1>>` here and `<<1,0,0,0>>` on the oracle — while a
+compile-time constant, `<<E/utf32>>`, `<<E/utf32-big>>` and the `utf16`/integer families agree.
+**Owner:** `beam_engine` (`families/bitstrings/create`: `put_utf32` takes no `little` parameter).
+D12b (1 row): `unicode_SUITE:latin1` fails at staged `unicode_SUITE.erl:414`, where
+`{error,DoubleUtf8,Rest2} = unicode:characters_to_binary([All,AllBin,16#FFF], latin1)` followed by
+`[16#FFF] = lists:flatten(Rest2)` answers `{badmatch,<<0,0,…>>}` — the wrong remainder for a latin1 error in a
+mixed character-list/binary argument. **Owner:** not yet attributed (candidate: `beam_bifs`'s
+`unicode:characters_to_binary/3` error/rest construction on the latin1 character-list path).
+`results/stdlib-diagnostics/FINDINGS.md` §D12 and §D12b carry the full matrices.
 ### Classes that own no row in this sweep
 
 `erlang:trace/3` is served: `erlang:trace(self(),true,[running,{tracer,self()}])` answers `1` on both
-sides, and `trace_info(self(),flags)` reads back `{flags,[running,call]}` (D3). `erts_debug:same/2` is
-`true` for both the no-op `maps:merge(#{},M)` and `maps:put(a,1,M)` (D4). `erlang:system_info(snifs)`
+sides, and `trace_info(self(),flags)` reads back `{flags,[running,call]}` (D3). `erlang:system_info(snifs)`
 publishes 556 `{M,F,A}` triples against the oracle's 553 — each runtime's own static-NIF table, so the
-counts are not expected to match (D7).
+counts are not expected to match (D7). D4 (map no-op identity) survives only on the **compiled** route and
+only for `maps:put/3` on a map with ≥ 2 keys (`erts_debug:same(maps:put(a,1,M),M)` → `false` vs `true`; the
+`-eval` route, the `M#{a=>1}` update syntax, `maps:merge(#{},M)` and a 1-key flatmap all agree), and no
+suite row reaches it.
 
-## E. Exclusions (`agree-fail-identical`, 4 rows — in neither numerator)
+## E. Exclusions (`agree-fail-identical`, 5 rows — in neither numerator)
 
 | row | why it is excluded |
 |---|---|
-| `binary_module_SUITE:copy` | **A budget artefact that flips into a divergence.** At the 10 s budget the oracle TIMEOUTs while rust fails `{exception,error,unsupported_bif,{erts_debug,set_internal_state,…}}` (D10), so neither side gives a comparable result and the row is excluded. At 120 s the oracle **passes** and rust still fails on D10 — a divergence at a larger budget, never agreement. |
+| `binary_module_SUITE:copy` | **A budget artefact.** **Both** sides TIMEOUT at the 10 s budget (`detail: timeout` on each side), so the row is excluded; at 120 s **both** sides **pass** it, which is why the re-check reports it `agree`. |
 | `string_SUITE:meas` | **both** sides TIMEOUT at the 10 s budget (`detail: timeout` on each side). A budget mismatch, and no evidence of a rust gap. |
 | `unicode_SUITE:is_id` | both fail identically: `{badmatch,{error,enoent}}` in `parse_properties/1` — the suite wants `UnicodeData.txt`, which lives in `lib/stdlib/uc_spec`, not in the `unicode_SUITE_data` dir the runner resolves, and the suite exports no `init_per_suite` to fetch it. |
 | `unicode_SUITE:is_whitespace` | same as `is_id`. |
+| `binary_module_SUITE:interesting` | both fail identically with `{badmatch,false}` in `do_interesting/1`, so the row carries no evidence either way. |
 
 ## F. Caveats
 
-- **`--jobs 4` on a loadavg-27 host makes `TIMEOUT` unreliable.** Seven rows time out on the rust side
-  only at 10 s; the serial 120 s re-check turns five into `agree` (`binary_module:bin_to_list`,
-  `lists:suffix`, `maps:t_intersect`, `t_iterator_2`, `t_merge_with`), leaves two as `system_limit`
-  (`maps:t_keys_trapping`, `t_values_trapping`), and turns `copy` into a divergence. A `TIMEOUT` is a
-  budget statement, never a pass.
-- **The `binary_module_SUITE` numbers are a lower bound.** The rust run dies after 8 of its 20 cases, so
-  the 12 `rust-gap` rows carry no sweep verdict either way; their measured values are §D1's per-case
-  table. They are never `pass`.
+- **`--jobs 4` on a loaded host makes `TIMEOUT` unreliable.** 13 divergence rows plus 2 excluded ones carry
+  a rust-side `timeout` at 10 s; the serial 120 s re-check covers 12 of them and 8 pass there
+  (`binary_module:bin_to_list`, `parts`, `random_ref_fla_comp`, `copy`, `lists:suffix`,
+  `maps:t_intersect`, `t_iterator_2`, `t_merge_with`), 2 are still over the budget
+  (`binary_module:random_ref_comp`, `random_ref_sr_comp`) and 2 are really D1's `system_limit`
+  (`maps:t_keys_trapping`, `t_values_trapping`). A `TIMEOUT` is a budget statement, never a pass.
+- **The `binary_module_SUITE` numbers are complete at the 10 s budget.** All 20 cases are measured in one
+  process (no `rust-gap` row), and the two rows still over the budget at 120 s are performance, not value,
+  divergences.
 - **Counts, not seconds.** Every ratio in §D8 and every figure in §D1 came from the same shared host, so
   the seconds only separate *slow* from *stuck*; do not compare them with another machine.
 - **The oracle is OTP 29.1.2 / erts 17.1.1**, while this tree pins OTP `30.0-rc0` / erts `17.1`; a suite
@@ -386,8 +370,8 @@ counts are not expected to match (D7).
   "Owner" above names the crate the analysis points at.
 - **The artifact set is `results/stdlib/report.json` + `results/stdlib/summary.md` and the re-check
   `results/stdlib/recheck-120/`** (`report.json` is authoritative; `summary.md` is rendered from it).
-  `results/stdlib/raw/` is *not* part of it: hand-captured probe evidence (the tail of a dying rust
-  `binary_module_SUITE` run, per-suite stdout, earlier 5 s probes), not `suites run` output.
+  `results/stdlib/raw/` is *not* part of it: hand-captured probe evidence (per-suite stdout, per-case 5 s
+  probes, the tail of an earlier `binary_module_SUITE` run), not `suites run` output.
 
 ## G. Harness notes
 

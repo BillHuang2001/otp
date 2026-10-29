@@ -7,8 +7,8 @@ their full observation tables live in `khepri-diagnostics/FINDINGS.md`, next to 
 notes add over the artifact is the attribution: the first failing test, the smallest failing expression
 and the owning crate for every row that is not `agree`.
 **Headline.** 51 candidate modules: 43 run real eunit tests on the oracle (`1500` passed / `1` failed),
-8 run none. Tally: **17 `agree`, 8 `agree-fail-identical`, 2 `divergence`, 21 `rust-gap`**, rust
-`412` passed / `1` failed. Every one of the 21 `rust-gap` rows is now one of two runtime defects: **20
+8 run none. Tally: **21 `agree`, 8 `agree-fail-identical`, 2 `divergence`, 20 `rust-gap`**, rust
+`403` passed / `1` failed. Every one of the 20 `rust-gap` rows is one of two runtime defects: **19
 block on the nested-run pump (RC-E)** and **1 dies by SIGSEGV on a stale compiled match spec (RC-F)**.
 The single rust test failure left is the performance assertion of **RC-D** (`keep_while_conditions`); the
 second `divergence` verdict, `stored_procs`, is the oracle's own pre-existing failure (its rust cell is
@@ -21,8 +21,8 @@ the same RC-E block).
   `_build/test/lib/khepri/test`), identical on both sides.
 - Drive: `eunit:test('<module>',[verbose]), halt(0).`; `--jobs 4`, one OS process and one fresh cwd per
   module (`target::fresh_dir`: a `_test.<module>` tree left behind otherwise reddens both sides).
-- Host: 16 logical CPUs, **shared**; loadavg before/after the sweep `9.06 10.67 10.47` /
-  `14.85 12.52 11.17`. Only counts and same-host paired ratios are portable.
+- Host: 16 logical CPUs, **shared**; loadavg before/after the sweep `2.76 6.12 18.63` /
+  `3.98 5.95 17.43`. Only counts and same-host paired ratios are portable.
 Throughout, `sys P/F` and `rust P/F` are `passed/failed` as parsed from eunit's own summary. `unsupported`
 means the runtime refused the whole run with a typed capability gap (no counts exist); `error` means the
 process died or printed no parseable summary.
@@ -30,10 +30,10 @@ process died or printed no parseable summary.
 | module | sys P/F | rust P/F | verdict | root-cause class |
 |---|---|---|---|---|
 | `advanced_delete` | 33/0 | unsupported | rust-gap | **RC-E** |
-| `advanced_get` | 13/0 | unsupported | rust-gap | **RC-E** |
+| `advanced_get` | 13/0 | 13/0 | agree | — |
 | `advanced_put` | 40/0 | unsupported | rust-gap | **RC-E** |
 | `advanced_tx_delete` | 39/0 | error (SIGSEGV) | rust-gap | **RC-F** |
-| `advanced_tx_get` | 15/0 | unsupported | rust-gap | **RC-E** |
+| `advanced_tx_get` | 15/0 | 15/0 | agree | — |
 | `advanced_tx_put` | 43/0 | unsupported | rust-gap | **RC-E** |
 | `app` | 36/0 | 36/0 | agree | — |
 | `async_option` | 20/0 | unsupported | rust-gap | **RC-E** |
@@ -43,7 +43,7 @@ process died or printed no parseable summary.
 | `cth_log_redirect_any_domains` | no_tests | no_tests | agree-fail-identical | — (common_test suite) |
 | `db_info` | 24/0 | unsupported | rust-gap | **RC-E** |
 | `delete_command` | 12/0 | 12/0 | agree | — |
-| `display_tree` | 11/0 | 11/0 | agree | — (the former RC-C row now agrees) |
+| `display_tree` | 11/0 | 11/0 | agree | — |
 | `export` | 56/0 | unsupported | rust-gap | **RC-E** |
 | `export_erlang` | 63/0 | unsupported | rust-gap | **RC-E** |
 | `export_helper` | no_tests | no_tests | agree-fail-identical | — (helper module) |
@@ -51,7 +51,7 @@ process died or printed no parseable summary.
 | `fence` | 6/0 | 6/0 | agree | — |
 | `helpers` | no_tests | no_tests | agree-fail-identical | — (helper module) |
 | `keep_while_conditions` | 27/0 | 26/1 | divergence | **RC-D** (`?assert(DeletionTime < 1000)`) |
-| `machine_code_called_from_ra` | 15/0 | unsupported | rust-gap | **RC-E** |
+| `machine_code_called_from_ra` | 15/0 | 15/0 | agree | — |
 | `mod_used_for_transactions` | no_tests | no_tests | agree-fail-identical | — (helper module) |
 | `non_versioned_commands` | 15/0 | 15/0 | agree | — |
 | `path_operations` | 51/0 | 51/0 | agree | — |
@@ -63,13 +63,13 @@ process died or printed no parseable summary.
 | `protect_against_dups_option` | 13/0 | 13/0 | agree | — |
 | `put_command` | 19/0 | 19/0 | agree | — |
 | `queries` | 16/0 | 16/0 | agree | — |
-| `return_indirect_deletes_option` | 15/0 | 15/0 | agree | — |
+| `return_indirect_deletes_option` | 15/0 | unsupported | rust-gap | **RC-E** |
 | `root_node` | 22/0 | 22/0 | agree | — |
 | `sigils` | 4/0 | 4/0 | agree | — |
-| `simple_delete` | 42/0 | unsupported | rust-gap | **RC-E** |
+| `simple_delete` | 42/0 | 42/0 | agree | — |
 | `simple_get` | 94/0 | unsupported | rust-gap | **RC-E** |
 | `simple_put` | 38/0 | unsupported | rust-gap | **RC-E** |
-| `simple_tx_delete` | 46/0 | 46/0 | agree | — |
+| `simple_tx_delete` | 46/0 | unsupported | rust-gap | **RC-E** |
 | `simple_tx_get` | 106/0 | unsupported | rust-gap | **RC-E** |
 | `simple_tx_misc` | 45/0 | unsupported | rust-gap | **RC-E** |
 | `simple_tx_put` | 47/0 | unsupported | rust-gap | **RC-E** |
@@ -77,17 +77,25 @@ process died or printed no parseable summary.
 | `test_ra_server_helpers` | no_tests | no_tests | agree-fail-identical | — (helper module) |
 | `timeout` | 6/0 | 6/0 | agree | — |
 | `triggers` | 118/0 | unsupported | rust-gap | **RC-E** |
+| `tx_funs` | 42/0 | 42/0 | agree | — |
+| `tx_sprocs` | 33/0 | unsupported | rust-gap | **RC-E** |
+| `utils` | 7/0 | 7/0 | agree | — |
 ## Totals
 | | rows that ran a test | tests passed | tests failed |
 |---|---|---|---|
 | oracle (`erl`, erts-17.1.1) | 43 | **1500** | **1** (`stored_procs:crashing_sproc_stacktrace_test`) |
-| rust (`beam_rt`, erts-17.1) | 18 | **412** | **1** (`keep_while_conditions`, RC-D) |
+| rust (`beam_rt`, erts-17.1) | 22 | **403** | **1** (`keep_while_conditions`, RC-D) |
 
-17 rows are fully green on rust (`agree`) and nothing passes on rust that fails on the oracle.
-The 20 RC-E rows contribute no counts: the runtime refuses the run before eunit finishes, so their
+21 rows are fully green on rust (`agree`), and no rust pass corresponds to an oracle failure; the single
+rust failure (`keep_while_conditions`) is an oracle pass, and §RC-D owns it.
+The 1 097 oracle tests rust does not execute — 1 501 minus the 404 it does — all sit behind the 21 rows
+whose rust cell carries no counts: the 19 `rust-gap` RC-E rows, RC-F's `advanced_tx_delete`, and
+`stored_procs`, whose rust cell is the same RC-E block.
+No RC-E cell contributes counts: the runtime refuses the run before eunit finishes, so their
 oracle-passing tests are `unknown`, not failing. RC-E is intermittent by nature — the same module can
 pass and block across runs — so a row that reports counts on one sweep can report `unsupported` on the
-next without any runtime change.
+next without any runtime change (the earlier committed sweep, `git show
+9e860feef6:erts_rust/tools/suites/results/khepri/report.json`, reads rust `412/1` with 20 `agree`).
 ## Root causes (first failing test, smallest failing expression, owning crate)
 The classes are the ones named in `khepri-diagnostics/FINDINGS.md`, which carries the per-probe
 observation tables and the exact commands; this section states the attribution and points there for the
