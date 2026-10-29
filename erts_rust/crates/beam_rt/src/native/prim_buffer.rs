@@ -315,7 +315,7 @@ impl RuntimeContext<'_> {
             ("peek_head", 1) => {
                 let head = self.with_prim_buffer(args[0], |buffer| buffer.peek_head().map(<[u8]>::to_vec))?;
                 match head {
-                    Some(bytes) => terms::make_heap_binary(self, &bytes),
+                    Some(bytes) => self.prim_buffer_binary(&bytes),
                     None => Err(BeamError::BadArg),
                 }
             }
@@ -326,7 +326,7 @@ impl RuntimeContext<'_> {
                 let count = buffer_count(args.get(1).copied())?;
                 let bytes = self.with_prim_buffer(args[0], |buffer| buffer.copying_read(count))?;
                 match bytes {
-                    Some(bytes) => terms::make_heap_binary(self, &bytes),
+                    Some(bytes) => self.prim_buffer_binary(&bytes),
                     None => Err(BeamError::BadArg),
                 }
             }
@@ -432,6 +432,19 @@ impl RuntimeContext<'_> {
             .buffers_mut()
             .insert(reference.id(), PrimBuffer::new());
         Ok(term)
+    }
+
+    /// A binary reply of **any** size.
+    ///
+    /// `peek_head/1` and `copying_read/2` answer a whole queue element, and an element is up to
+    /// [`ACCUMULATOR_SIZE`] bytes, so the answer cannot be built by the heap-binary-only
+    /// [`beam_engine::terms::make_heap_binary`] (it refuses more than
+    /// `ERL_ONHEAP_BINARY_LIMIT` = 64 bytes). It goes through `beam_codec`'s one binary writer on
+    /// the runtime's `-eval` store instead — the same builder `prim_file`'s read replies and
+    /// `prim_file/readahead.rs`'s line answer use, which picks the on-heap `ErlHeapBits`
+    /// representation for a short payload and the off-heap `[BinRef][ErlSubBits]` pair beyond it.
+    fn prim_buffer_binary(&mut self, bytes: &[u8]) -> Result<Eterm> {
+        beam_codec::term::make_binary(self.eval_heap(), bytes)
     }
 
     /// Run `body` over the live queue `term` names, or raise `badarg` — the C's
