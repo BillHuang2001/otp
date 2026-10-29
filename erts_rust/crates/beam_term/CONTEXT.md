@@ -84,7 +84,7 @@ Writers/readers for the boxed "thing" families this crate owns (float, bignum, f
 - Float `FLOAT_SIZE_WORDS = 2`; bignum `big_size_words(n)` = `n + 1` (one `ErtsDigit`=`u64` per word, LS-first, sign in `_BIG_SIGN_BIT`); flat map `flatmap_size_words(n)` = `3` empty else `4 + 2n`, block `[arityval(n), k0..k(n-1), MAP_HEADER_FLATMAP, n, keys-tuple, v0..v(n-1)]`, root `make_boxed(hp + 1 + n)`.
 - External things (incl. the M1 "`next` holds `creation`" substitution): `MAX_REF_IDS = 5`; pid/port blocks are 4 words, `external_ref_size_words(n_ids)` = `3 + n_ids/2 + 1` on `ARCH_64`. **`ids` may be empty**: a zero-id external reference round-trips (`[header, node, creation, count = 0]`, `external_ref_size_words(0) == 4`, hashing mixes the zeroed word after count ⇒ `0`).
 
-### `bitstring.rs` — bit-level payloads
+### `bitstring/` — bit-level payloads (`src/bitstring/{mod,checked}.rs`; child node `src/bitstring/CONTEXT.md`)
 `ErlHeapBits`/`ErlSubBits` writers+readers plus the public bit/float payload helpers; bits are **MSB-first inside each byte**, the last byte's unused trailing bits are zeroed, **non-byte-aligned shapes are supported**, and `ERL_SUB_BITS_FLAG_MASK = 0x3` (`_MUTABLE`/`_VOLATILE`).
 `bit_count_to_bytes(n_bits)` = `ceil(n_bits/8)`, `heap_bits_size_words(n_bits)` = `2 + ceil(ceil(n_bits/8)/8)`; `write_heap_bits` builds `[make_header(words-1, HEAP_BITS_SUBTAG), n_bits, data…]`, rejecting (`BadBitstring`) a `bytes` shorter than `ceil(n_bits/8)`; `write_binary`/`write_sub_bits`/`sub_bits_parts` cover the 5-word `ErlSubBits` block.
 `bitstring_parts` returns (base, **bit** offset, **bit** size); `bit_at`/`float_bits`/`float_value` live here as the crate's single float readers (`compare.rs` and `hashing/` forward).
