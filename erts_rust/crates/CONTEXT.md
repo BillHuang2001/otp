@@ -343,11 +343,14 @@ the caller reserves the words and passes `hp: *mut Eterm`). Per-item detail in `
   `compare`/`hashing`/`size`; `thing` (heap-agnostic off-heap term materialization, forwarded to by
   `beam_codec::term`). Writers take a caller-provided `*mut Eterm`; allocation stays in `beam_alloc`.
 - **Stage-1 execution tiers shipped:** a direct-threaded interpreter plus a native x86-64 baseline tier
-  (`beam_engine/src/jit/`, block linker + cross-run block cache + linked local tail calls), the **default for
-  every `beam_rt` process entry**, compiled lazily per function; `BEAM_RT_TIER=interpreter` is the only kill
-  switch. Tier-equivalence gate `beam_engine/tests/jit_real_module.rs`: 736/736 oracle-checked comparisons
+  (`beam_engine/src/jit/`, block linker + cross-run block cache + linked local tail calls), compiled lazily per
+  function. The default tier mode is **phase-scoped**: `JitMode::Auto` selects `Tier::Interpreter` for a first
+  entry while `Runtime::in_boot_phase()` holds (the boot-script window, so a boot compiles nothing) and
+  `Tier::BaselineJit` afterwards, a boot-entered process being upgraded one-way at its first post-boot slice
+  boundary (`beam_rt/src/runner/{tier,run}.rs`); `BEAM_RT_TIER=interpreter|baseline|cranelift` pins a tier in
+  both phases. Tier-equivalence gate `beam_engine/tests/jit_real_module.rs`: 736/736 oracle-checked comparisons
   agree. An optional default-OFF Cranelift hot tier sits behind the `jit-cranelift` feature. Detail:
-  `beam_engine/CONTEXT.md`.
+  `beam_engine/CONTEXT.md`, `beam_rt/src/runner/CONTEXT.md`.
 - **BIF surface complete:** **556/556** declared `bif.tab` BIFs; registry **667 keys** = 556 declared + 111
   stdlib fast paths (25 of them `zlib`), re-derived from code and pinned by `beam_bifs/tests/bif_tab.rs`. A
   registered-but-unadopted BIF answers the typed `unsupported_bif` until a host hook is installed. Per-seam and
