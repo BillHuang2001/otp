@@ -165,8 +165,8 @@ Non-corpus modules:
 - `src/test_support.rs` → `#[cfg(test)]`-only helpers (`Scratch` dir, compiler stubs) for the `module_build`/`nif_build` tests.
 
 Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-corpus-map` skill** (enabled at this node) — every group's id prefix, case count and the behaviours it pins, plus its pinning traps. The A-contract → file map, with the counts that are easy to get wrong:
-- A.1 → `terms.rs`, `semantics.rs`, `errors.rs`, `ordered_walk.rs`
-- A.2 → `etf.rs` (84), `wire_ids.rs`
+- A.1 → `terms.rs`, `semantics.rs`, `errors.rs`, `ordered_walk.rs`, `copypath.rs` (5: the process copy boundary's cons-chain fast path — see the `copypath` line in the routing table)
+- A.2 → `etf.rs` (90), `wire_ids.rs`
 - A.3 → `nif.rs`, `nif_so.rs` (46), `nif_res.rs` (30), `nif_abi.rs` (166), `nif_abi_extra.rs` (131), `nif_state.rs` (9), `nif_thread.rs` (8), `nif_a3.rs` (12)
 - A.4 → `driver_ports.rs`, `driver.rs`, `driver_c.rs` (54), `driver_abi.rs` (90), `driver_abi_extra.rs` (78)
 - A.4 built-in drivers → `udp.rs` (32), `ram_file.rs` (21), `inet_control.rs` (18), `inet_write.rs` (23)
