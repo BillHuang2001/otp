@@ -41,8 +41,32 @@
 //!    post-boot step relies on ([`a_second_registration_does_not_duplicate_the_default_handler`]);
 //! 4. `init:restart/0` re-boots onto exactly one `default` handler
 //!    ([`init_restart_keeps_exactly_one_default_handler`]) — no duplicate, no failure;
-//! 5. a `logger:error/1`-class call does not take the action down
-//!    ([`a_log_event_does_not_crash_the_action`]).
+//! 5. a `logger:error/1`-class call **is emitted by the default handler**, and the emitted block
+//!    is byte-identical to the live oracle's once its wall-clock header is elided
+//!    ([`a_log_event_reaches_the_default_handler`] — the flush makes the emission an observable);
+//! 6. the same call **never takes the action down**, whether or not the asynchronous handler won
+//!    the race against the final `halt/0` ([`a_log_event_does_not_crash_the_action`], which
+//!    pins the exit code and the `survived` effect only — never the racy tail).
+//!
+//! # Why the report's appearance is pinned *with a flush*, and the crash check without one
+//!
+//! `default` is a `logger_std_h` handler behind `logger_olp`: `logger:error/1` only **queues**
+//! the event, so `halt(0)` can end the node before the handler process writes anything.
+//! Measured on this host: `logger:error("boom"), io:format("survived~n"), halt(0).` prints the
+//! report **0/10** runs here against the oracle's **9/10** — an asynchronous handler racing
+//! `halt/0`, not a divergence in the handler path. `logger_std_h:filesync/1` is the handler's
+//! own flush call (a `gen_server:call` the handler answers `ok` on both runtimes), and with it
+//! the identical block appears **10/10** on both sides, so [`a_log_event_reaches_the_default_handler`]
+//! is what pins the block's *content* and [`a_log_event_does_not_crash_the_action`] pins only the
+//! invariant the racy form can honestly support.
+//!
+//! # Why no map is ever rendered whole
+//!
+//! `~p` renders a small map in its **internal** key order, which ERTS does not keep stable
+//! across VMs: the oracle alternates `#{single_line => …,legacy_header => …}` with the reverse
+//! (2/40 runs measured) and does the same inside `get_primary_config/0`. Map iteration order is
+//! not part of the contract here, so every map in [`HANDLER_STATE_EXPR`] is rendered as its
+//! **sorted** `{Key, Value}` pairs — every key and every value still compared, in one fixed order.
 //!
 //! Tests that compare against the oracle skip **loudly** when no `erl` is installed
 //! ([`support::require_oracle`]); the pinned literals they assert first keep each case
@@ -69,33 +93,44 @@ fn start_boot_base() -> PathBuf {
     PathBuf::from(base)
 }
 
+// ---------------------------------------------------------------------------------------
+// The two maps are compared as sorted pairs, never as maps
+// ---------------------------------------------------------------------------------------
+
 /// The one `~p` render the whole handler state is compared in: the id set, then the `default`
 /// handler's module/level/filter-default/device-type/formatter/filters, then
 /// `get_handler_config(simple)`, `get_primary_config/0` and the registered-server check.
 ///
 /// The tuple shape is deliberate: `get_handler_config(default)`'s own map renders its keys in a
 /// different order in the two runtimes (map iteration order is not part of the contract), while
-/// every **value** here is.
+/// every **value** here is — and the two maps that do appear (`formatter`'s options and the
+/// primary config) are rendered as their **sorted** `{Key, Value}` pairs, so the oracle's
+/// alternation between two internal key orders cannot flip the verdict.
 const HANDLER_STATE_EXPR: &str = concat!(
     "{ok, C} = logger:get_handler_config(default), ",
     "Type = maps:get(type, maps:get(config, C)), ",
+    "{FMod, FCfg} = maps:get(formatter, C), ",
+    "Fmt = {FMod, [{K, maps:get(K, FCfg)} || K <- lists:sort(maps:keys(FCfg))]}, ",
+    "PC = logger:get_primary_config(), ",
+    "Primary = [{K, maps:get(K, PC)} || K <- lists:sort(maps:keys(PC))], ",
     "io:format(\"~p~n\", [{logger:get_handler_ids(), maps:get(module, C), maps:get(level, C), ",
-    "maps:get(filter_default, C), Type, maps:get(formatter, C), maps:get(filters, C), ",
-    "logger:get_handler_config(simple), logger:get_primary_config(), ",
+    "maps:get(filter_default, C), Type, Fmt, maps:get(filters, C), ",
+    "logger:get_handler_config(simple), Primary, ",
     "is_pid(whereis(logger))}]), halt(0)."
 );
 
 /// The oracle's answer to [`HANDLER_STATE_EXPR`], byte for byte (verified against OTP
-/// 29.1.2 / erts-17.1.1 and reproduced by this runtime).
+/// 29.1.2 / erts-17.1.1 and reproduced by this runtime; the oracle's own internal map order
+/// alternates, which is exactly why the maps are printed as sorted pairs).
 const HANDLER_STATE_EXPECTED: &str = "\
 {[default],
  logger_std_h,all,stop,standard_io,
- {logger_formatter,#{single_line => false,legacy_header => true}},
+ {logger_formatter,[{legacy_header,true},{single_line,false}]},
  [{remote_gl,{fun logger_filters:remote_gl/2,stop}},
   {domain,{fun logger_filters:domain/2,{log,super,[otp,sasl]}}},
   {no_domain,{fun logger_filters:domain/2,{log,undefined,[]}}}],
  {error,{not_found,simple}},
- #{level => notice,filter_default => log,filters => [],metadata => #{}},
+ [{filter_default,log},{filters,[]},{level,notice},{metadata,#{}}],
  true}
 ";
 
@@ -108,6 +143,55 @@ go() ->
     io:format("~p~n", [logger:get_handler_ids()]),
     ok.
 "#;
+
+// ---------------------------------------------------------------------------------------
+// The report block, and why its header is elided
+// ---------------------------------------------------------------------------------------
+
+/// A default-handler report's header with the wall-clock timestamp elided: two processes cannot
+/// agree on a timestamp, and nothing else in the header is machine-dependent.
+const REPORT_HEADER: &str = "=ERROR REPORT==== <timestamp> ===";
+
+/// Rewrites every report header's timestamp to [`REPORT_HEADER`], leaving every other byte —
+/// the reason line included — verbatim, so a dropped or mangled report still fails any
+/// comparison made through this function.
+fn normalize_report_timestamp(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let header = line
+                .strip_prefix("=ERROR REPORT==== ")
+                .and_then(|rest| rest.strip_suffix(" ==="));
+            if header.is_some() {
+                REPORT_HEADER
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `logger:error/1`, then the handler's own **flush** (`logger_std_h:filesync/1`, a
+/// `gen_server:call` the handler answers `ok` on both runtimes), then the observable effect.
+/// The flush is what makes the emission — not merely the call — an observable.
+const LOG_REPORT_FLUSH_EXPR: &str = concat!(
+    "logger:error(\"boom\"), ",
+    "logger_std_h:filesync(default), ",
+    "io:format(\"survived~n\"), halt(0)."
+);
+
+/// This runtime's (and the oracle's) answer to [`LOG_REPORT_FLUSH_EXPR`], with the header's
+/// timestamp elided: the default handler's report for `logger:error("boom")` is the legacy
+/// `=ERROR REPORT==== … ===` header plus the message, and the action then survives.
+const LOG_REPORT_FLUSH_EXPECTED: &str = "\
+=ERROR REPORT==== <timestamp> ===
+boom
+survived";
+
+/// The **racy** form: no flush, so the asynchronous handler and the final `halt/0` race — the
+/// report may or may not reach stdout (measured 0/10 here, 9/10 on the oracle). Only the
+/// invariant is pinned from it.
+const LOG_EVENT_RACY_EXPR: &str = "logger:error(\"boom\"), io:format(\"survived~n\"), halt(0).";
 
 // ---------------------------------------------------------------------------------------
 // 1. The whole answer, against the live oracle
@@ -248,22 +332,65 @@ fn init_restart_keeps_exactly_one_default_handler() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 5. A log event does not crash the action
+// 5. A log event IS emitted by the default handler — flush, then compare the block
+// ---------------------------------------------------------------------------------------
+#[test]
+fn a_log_event_reaches_the_default_handler() {
+    // The flush (`LOG_REPORT_FLUSH_EXPR`) is what removes the race with `halt/0`: measured
+    // 10/10 runs with it, 0/10 without it on this runtime. The comparison is byte-identical
+    // apart from the header's wall-clock timestamp, which no two processes can share
+    // (`normalize_report_timestamp`).
+    let probe = run_runtime(&["-noshell", "-eval", LOG_REPORT_FLUSH_EXPR])
+        .expect("the flushed log-event probe runs to completion");
+    assert_eq!(
+        probe.code, 0,
+        "the flushed log-event probe exits 0 (stderr: {})",
+        probe.stderr
+    );
+    let ours = normalize_report_timestamp(&probe.stdout);
+    assert_eq!(
+        ours.trim_end(),
+        LOG_REPORT_FLUSH_EXPECTED,
+        "the report the default handler emitted for `logger:error(\"boom\")` (stderr: {})",
+        probe.stderr
+    );
+
+    let Some(oracle) = support::require_oracle("logger/log_event_report") else {
+        return;
+    };
+    let theirs = support::oracle_eval(&oracle, None, LOG_REPORT_FLUSH_EXPR)
+        .expect("the oracle answers the same flushed log-event probe");
+    assert_eq!(
+        normalize_report_timestamp(&theirs).trim_end(),
+        ours.trim_end(),
+        "the emitted block is byte-identical to the live oracle's (header timestamp elided)"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 6. The *racy* form still never crashes the action (never byte-compared)
 // ---------------------------------------------------------------------------------------
 #[test]
 fn a_log_event_does_not_crash_the_action() {
-    // The `default` handler is asynchronous (`logger_olp`), so the event need not reach a
-    // device before the node halts — exactly as with the oracle, whose own `halt/0` drops an
-    // unflushed event. What is pinned is that the call returns and the action survives.
-    let probe = differential_eval(
-        "logger/log_event",
-        "`logger:error/1` then an observable effect",
-        "logger:error(\"boom\"), io:format(\"survived~n\"), halt(0).",
-    );
+    // No flush: the `default` handler is asynchronous (`logger_olp`), so whether the event
+    // reaches a device before `halt/0` is a race — measured **0/10** here against the oracle's
+    // **9/10**, which is why the racy tail can never be byte-compared (and no oracle is asked
+    // here). What is pinned is the invariant that holds either way: the call returns, the
+    // action exits 0, and the `survived` effect happens — preceded by nothing or by the very
+    // report shape [`a_log_event_reaches_the_default_handler`] pins in full.
+    let probe = run_runtime(&["-noshell", "-eval", LOG_EVENT_RACY_EXPR])
+        .expect("the racy log-event probe runs to completion");
     assert_eq!(
-        probe.stdout_text(),
-        "survived\n",
+        probe.code, 0,
         "the action survives a log event (stderr: {})",
-        probe.stderr_text()
+        probe.stderr
+    );
+    let observed = normalize_report_timestamp(&probe.stdout);
+    let with_report = format!("{REPORT_HEADER}\nboom\nsurvived\n");
+    assert!(
+        observed == "survived\n" || observed == with_report,
+        "the racy action's stdout is either the bare effect or the report block plus it — \
+         got {observed:?} (stderr: {})",
+        probe.stderr
     );
 }

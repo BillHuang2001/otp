@@ -188,8 +188,8 @@ fn live_process_state() -> (Runtime, ProcessId) {
     let template = stable_term(&mut rt, "{timer, message}");
     // The two queued signals: each reason is a boxed term (`SignalQueue::gather_roots` publishes
     // the reason of every queued signal) and the monitor-`'DOWN'` also carries a user **tag**,
-    // which is the queue's second term-holding slot. A tag must be heap-independent, so it is an
-    // atom — an immediate.
+    // which is the queue's second term-holding slot — `gather_roots`/`scatter_roots` carry it
+    // exactly like the reason.
     let exit_reason = stable_term(&mut rt, "{exit, reason}");
     let down_reason = stable_term(&mut rt, "{down, reason}");
     let down_tag = rt.intern("root_coverage_tag");

@@ -99,7 +99,8 @@
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
 //! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
 //! `erlang:*` process/registry/reference entries in [`process`], the
-//! `prim_file:*` primitives in [`prim`], the `erl_ddll:*`
+//! `prim_file:*` primitives in [`prim`], the two static-NIF libraries (`prim_tty`'s terminal
+//! handles in [`prim_tty`], `prim_buffer`'s byte queue in [`prim_buffer`]), the `erl_ddll:*`
 //! loaded-driver-list entries in [`ddll`], the distribution **identity** in [`node`] and the
 //! distribution **node set + connector** (`erlang:nodes/0,1,2`, `net_adm:ping/1`,
 //! `net_kernel:connect_node/1`, `erl_distribution:start_link/0,1`) in [`net`]. The submodules
@@ -119,6 +120,7 @@ pub(crate) mod net_kernel;
 mod node;
 pub(crate) mod port;
 mod prim;
+pub(crate) mod prim_buffer;
 pub(crate) mod prim_file;
 pub(crate) mod prim_tty;
 mod process;
@@ -154,7 +156,7 @@ use crate::error;
 ///
 /// `application` is **not** a member: the floor serves no key of that namespace (the live
 /// `application_controller` owns all of them), so the whole module is entered in-machine.
-pub(crate) const FLOOR_MODULES: [&str; 13] = [
+pub(crate) const FLOOR_MODULES: [&str; 14] = [
     "code",
     "erl_ddll",
     "erl_distribution",
@@ -166,6 +168,7 @@ pub(crate) const FLOOR_MODULES: [&str; 13] = [
     "net_adm",
     "net_kernel",
     "os",
+    "prim_buffer",
     "prim_file",
     "prim_tty",
 ];
@@ -263,6 +266,11 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
         // refused (→ `call_bif` → `try_native`) while the module's Erlang wrappers are
         // ordinary `.beam` bodies.
         "prim_tty" => Some(&prim_tty::NIF_KEYS),
+        // `prim_buffer` is the identical shape: its `NIF_KEYS` list is exactly the nine `-nifs`
+        // stubs of `erts/preloaded/src/prim_buffer.erl`, so those stubs are refused (→ `call_bif`
+        // → `try_native`) while the module's `read/2`, `read_iovec/2` and `wipe/1` — exported
+        // **Erlang bodies** over the stubs — stay enterable in-machine.
+        "prim_buffer" => Some(&prim_buffer::NIF_KEYS),
         // `code` is the same shape: the floor answers the *queries* below **and** the
         // path-mutating entries (`add_patha/1,2`, `add_pathz/1,2`, `add_path/1,2`,
         // `del_path/1`). Entering the `lib/kernel/src/code.erl` bodies instead would reach the
@@ -642,6 +650,15 @@ impl RuntimeContext<'_> {
             // every unlisted Erlang wrapper (`load/0`, `init/1`, `writer/1`, …) stays
             // enterable in-machine, protecting its `receive`s.
             ("prim_tty", _, _) => self.prim_tty_call(function, arity, args),
+            // The `prim_buffer` NIF library's stubs (contract A.7) — the same shape as
+            // `prim_tty` and for the same reason: ERTS serves the nine `-nifs` stubs of
+            // `erts/preloaded/src/prim_buffer.erl` from a **statically linked** NIF
+            // (`erts/emulator/nifs/common/prim_buffer_nif.c`), so `load_nif("prim_buffer", …)`
+            // never `dlopen`s anything; [`prim_buffer`] is the Rust counterpart, its `NIF_KEYS`
+            // is the key list [`floor_keys`] enumerates — so exactly the NIF stubs reach this arm
+            // and the three **exported Erlang bodies** over them (`read/2`, `read_iovec/2`,
+            // `wipe/1`) stay enterable in-machine.
+            ("prim_buffer", _, _) => self.prim_buffer_call(function, arity, args),
             _ => None,
         }
     }
@@ -1341,11 +1358,12 @@ mod tests {
     /// A namespace the floor owns **no** key of is in neither this table nor
     /// [`MODULE_WIDE_NAMESPACES`] and is not a [`FLOOR_MODULES`] member: `application` (the live
     /// `application_controller` owns every key, so the whole module is entered in-machine).
-    const KEY_GRANULAR_NAMESPACES: [&str; 5] = [
+    const KEY_GRANULAR_NAMESPACES: [&str; 6] = [
         "code",
         "erl_distribution",
         "init",
         "io",
+        "prim_buffer",
         "prim_tty",
     ];
 
@@ -1463,9 +1481,9 @@ mod tests {
     /// arm, or a new floor namespace, must be reflected in those tables (and, for a key-granular
     /// one, in [`floor_keys`]) — the guard is loud, never silently skippable.
     ///
-    /// `prim_tty` is the one key-granular namespace whose arm is a `_, _` wildcard, so its key set
-    /// is checked against `floor_shadows` rather than against the parsed arms (its
-    /// [`prim_tty::NIF_KEYS`] list is the curated `-nifs` surface).
+    /// `prim_tty` and `prim_buffer` are the two key-granular namespaces whose arm is a `_, _`
+    /// wildcard, so their key sets are checked against `floor_shadows` rather than against the
+    /// parsed arms (their `NIF_KEYS` lists are the curated `-nifs` surfaces).
     #[test]
     fn every_floor_arm_key_is_refused_and_every_key_granular_list_is_exact() {
         let arms = try_native_arms();
@@ -1531,8 +1549,9 @@ mod tests {
                     listed.dedup();
                     let parsed = arm_keys(module);
                     if has_wildcard_arm(module) {
-                        // `prim_tty`: the arm dispatches per function into `prim_tty_call`, so
-                        // `NIF_KEYS` — not the arms — is the curated key set.
+                        // `prim_tty`/`prim_buffer`: the arm dispatches per function into
+                        // `prim_tty_call`/`prim_buffer_call`, so `NIF_KEYS` — not the arms — is
+                        // the curated key set.
                         assert!(
                             parsed.is_empty(),
                             "`{module}` has both a `_, _` wildcard arm and explicit arms"

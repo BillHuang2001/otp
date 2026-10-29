@@ -6,15 +6,19 @@ correction saying why no case is possible. A recipe whose gap the owning crate h
 lands in `src/corpus/**`, and `known-gaps.txt`/`GAPS.md` are refreshed in the same change (see
 `../CONTEXT.md` §"Notes for Agents"). A recipe for a gap that is still **open but closable** stays
 drafted here and deliberately **not** in `known-gaps.txt` — the allowlist records only genuinely
-unclosable gaps, and recording a closable one would defeat the ratchet. No recipe here is open at
-this revision: every section is either landed or a recorded non-gap.
+unclosable gaps, and recording a closable one would defeat the ratchet. §8 is the one recipe
+open at this revision (closable, blocked on `beam_rt`) and §9 records a measured divergence, so no
+case can pin it; every other section is either landed or a recorded non-gap.
 
 At a glance: **§1**, **§2**, **§4b**, **§4c**, **§5a**, **§5b** and **§6** are **landed** — every
 one agrees in `beam_rt` and is pinned by the `src/corpus/**` groups (`zlib.rs`, `bifs.rs`,
 `system_info.rs`, `flags.rs`, `flags_apply.rs`); **§3** and **§7** record items that were named as
 gaps but are not gaps at all. The only remaining zlib divergences are **§4a** (the repetitive-body
 wrapped size form) and **§4**'s large-body image-choice (the 100-byte raw-DEFLATE `zip/1` stream),
-both unpinnable and recorded in `divergences.md`, not drafts.
+both unpinnable and recorded in `divergences.md`, not drafts. §8 is `blocked-on-beam_rt` — the
+`system_info(snifs)` recipe is ready and lands the moment the key is served — and §9 is a
+`maps` no-op-identity **divergence**, not a case: no golden can pin it while the result-admission
+path deep-copies every BIF result.
 
 Three coverage facts worth knowing: the synthesized callee-head `undef` stacktrace
 head item `{Module,Function,ArgList,Location}` is pinned on **both** routes — the `-eval` form
@@ -455,4 +459,47 @@ A NIF `.so` may therefore reference any declared `enif_*` without risking a `{er
 on the Rust side; when an owning crate ever *does* stop exporting one, the missing symbol shows up
 as a non-empty `comm` above and must be added back before a NIF case can pin it.
 
+## 8. `erlang:system_info(snifs)` — **blocked**; owner `beam_rt`
 
+**Status:** `blocked-on-beam_rt` — the roster **data** is ready (`beam_bifs::snifs()` yields the 556 declared `bif.tab` rows in the oracle's list order), but this HEAD's `beam_rt` does not serve the key: `crates/beam_rt/src/info.rs:253` still lists `"snifs"` in `UNSUPPORTED_KEYS`, so the Rust side answers the typed `beam_rt: unsupported: …` and exits `3` (the case reports `[UNSUPPORTED]`). This is a **closable** gap, deliberately **not** recorded in `known-gaps.txt` (that allowlist holds only genuinely unclosable gaps); the recipe lands the moment the key is served.
+
+```rust
+Case {
+    id: "system_info/snifs_is_the_reversed_bif_tab_roster",
+    description: "erlang:system_info(snifs) is the declared bif.tab roster reversed (release-independent: length floor, 3-tuple shape, lists:last/1 order and two member rows, never the exact length or head)",
+    contracts: &[Contract::Introspection],
+    kind: CaseKind::Eval {
+        expr: "(fun() -> S = erlang:system_info(snifs), [is_list(S), length(S) > 500, lists:all(fun(T) -> tuple_size(T) =:= 3 andalso is_atom(element(1, T)) andalso is_atom(element(2, T)) andalso is_integer(element(3, T)) end, S), lists:last(S), lists:member({erlang, abs, 1}, S), lists:member({lists, reverse, 2}, S)] end)()",
+        extra_argv: &[],
+        probe: Probe::Value,
+    },
+    golden: Golden { stdout: Some("ok [true,true,true,{erlang,abs,1},true,true]"), exit_code: 0 },
+}
+```
+
+* **the oracle-recorded golden**: `ok [true,true,true,{erlang,abs,1},true,true]`, exit `0` — re-measured on this host (OTP 29.1.2 / erts-17.1.1) with the `Probe::Value` wrapper `erl -noshell -eval 'try (EXPR) of V -> io:format("ok ~w~n",[V]), halt(0) catch C:R -> io:format("exception ~w ~w~n",[C,R]), halt(1) end.'`.
+* **three pinning traps, each re-measured here:**
+  * `hd/1` must NOT be pinned: this oracle's head is `{records,get_definition,2}` while this tree's roster head is `{erlang,ref_to_binary,1}` — the last three `bif.tab` rows are the OTP-30-only `erlang:{pid,port,ref}_to_binary/1`.
+  * `length/1` must NOT be pinned by value: **553** rows on this OTP-29 oracle vs **556** declared in this tree. The `length(S) > 500` **floor** is what holds on both releases.
+  * `{lists,reverse,1}` does not exist in either roster (measured `false`; the entry is `reverse/2`). The reversal is pinned release-independently through `lists:last(S) =:= {erlang, abs, 1}` — the *first* declared row in both releases.
+* **the work the owning crate must do** (from `crates/beam_bifs/CONTEXT.md`, read-only): `"snifs"` out of `crates/beam_rt/src/info.rs`'s `UNSUPPORTED_KEYS` into the served set, plus a builder in `crates/beam_rt/src/info/system.rs` whose value is `beam_bifs::snifs()`'s rows as `{Module, Function, Arity}` 3-tuples; the per-key rationale deleted from `crates/beam_rt/src/info/unsupported.rs` (and from its doc table); the two key-count pins retyped (`src/info.rs` `88 → 89` supported and `27 → 26` unsupported); the atom vocabulary widened to the roster's **465** distinct names (25 modules + 440 function names), or `every_supported_key_materializes…` fails on `TermNotFound`; and `tests/system_info_oracle.rs` moving `"snifs"` out of the unsupported set into the **SHAPE-ONLY** class — never `ORACLE_EQUAL`, because the value legitimately differs by release (553 vs 556).
+* repro once the key is served: `erts_rust/target/release/differential compare 'erlang:system_info(snifs)'`, and `differential run system_info/snifs_is_the_reversed_bif_tab_roster` once the case lands.
+
+## 9. `maps` no-op identity — **not a case** (a measured divergence); owner `beam_rt`
+
+**Status:** `blocked-on-beam_rt (a divergence, so no case can pin it)` — `crates/beam_bifs`'s `maps` no-op early returns are correct; the divergence lives in the result-admission path.
+
+Measured on this host, both sides, `Probe::Value`, for
+
+```erlang
+(fun() -> M = maps:from_list([{a,1},{b,2}]), Q = maps:from_list([{b,2},{a,1}]), [erts_debug:same(M, maps:put(a,1,M)), erts_debug:same(M, maps:update(a,1,M)), erts_debug:same(M, maps:remove(zz,M)), erts_debug:same(M, maps:merge(M,M)), erts_debug:same(M,Q), M =:= Q, erts_debug:same(M, maps:with([a],M)), erts_debug:same(M, maps:put(a,2,M))] end)()
+```
+
+* **oracle**: `ok [true,true,true,true,false,true,false,false]`
+* **`beam_rt`**: `ok [false,false,false,false,false,true,false,false]`
+
+Both lines are stored structure identity (`erts_debug:same/2`), not equality: the oracle's `maps` returns the *argument's own term* from a no-op, so `maps:put(M, a, 1)`, `maps:update/3`, `maps:remove/2` of an absent key and `maps:merge(M, M)` are all the same word as `M`; the same holds for `maps:with/2` on this shape. `M =:= Q` is `true` on both sides (structural equality is not the issue), and a *changing* call (`maps:put(M, a, 2)`) is a fresh term on both — which is why the divergence is invisible to every equality-based case and can only be seen through `erts_debug:same/2`.
+
+**Mechanism (the measured cause).** A registered BIF's result is always deep-copied into the caller's heap — `move_result_into_process_heap` → `copy_result_fresh` → `beam_message::copy_struct` (`crates/beam_rt/src/context/calls.rs`) — so a no-op BIF can never hand back the argument's word. Only the **inlined guard** BIFs keep it, and only from compiled code: there, measured `{erts_debug:same(M, element(1,{M})), erts_debug:same(M, hd([M])), erts_debug:same(M, lists:nth(1,[M])), erts_debug:same(M, M)}` is `{true,true,true,true}` on the oracle and `{true,true,false,true}` on `beam_rt` (`element/2` and `hd/1` compile to the `get_tuple_element`/`get_list` opcodes, while `lists:nth/2` is a registered BIF), unchanged under `BEAM_RT_TIER=interpreter` — so the tier is not the variable. On the `-eval` tree-walking route the same tuple is `{false,false,false,true}` here (the walker routes even those two through the result copy), which is the same mechanism seen on the other route.
+
+**Owner and why no case can pin it.** `crates/beam_bifs`'s `maps` no-op early returns are correct and are already pinned crate-side (`crates/beam_bifs/tests/maps_identity.rs`); the fix belongs to the result-admission path in `crates/beam_rt` (a BIF whose result is its own argument must be admitted without a copy), not to the BIF. A corpus case is impossible in the meantime: the only observable is a plain `false` (a `mismatch`-class value) rather than the runtime's documented `unsupported` signal, so pinning the oracle line would turn the gate red by design.

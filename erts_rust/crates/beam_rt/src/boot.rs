@@ -292,11 +292,12 @@ pub fn seed_core_atoms(atoms: &mut AtomTable) {
         atoms.intern(name);
     }
     // The introspection surface ([`crate::info`]) materializes its atom-valued keys
-    // through this table, so every name it can emit must be present. `INFO_ATOMS` is the
-    // single source of truth for that vocabulary (the platform/boolean group overlaps
-    // `CORE_ATOMS`, and interning is idempotent), so derive the seed from it rather than
-    // repeating the names here.
-    for name in crate::info::INFO_ATOMS {
+    // through this table, so every name it can emit must be present. `info_atoms()` is the
+    // single source of truth for that vocabulary — `INFO_ATOMS` plus the static-NIF
+    // roster's names ([`crate::info::snifs_atoms`]), which `system_info(snifs)` emits — and
+    // the platform/boolean group overlaps `CORE_ATOMS`. Interning is idempotent, so derive
+    // the seed from it rather than repeating the names here.
+    for name in crate::info::info_atoms() {
         atoms.intern(name);
     }
     // The port surface ([`crate::port`]) resolves the atoms `port_info/1,2` can emit
@@ -413,13 +414,18 @@ mod tests {
     fn seed_core_atoms_interns_the_whole_info_vocabulary() {
         // The introspection surface (`crate::info`) resolves an `InfoValue::Atom` through
         // this table and reports `TermNotFound` for a name that is absent, so the seed
-        // must contain every name `system_info/1` can emit. `INFO_ATOMS` is that list and
+        // must contain every name `system_info/1` can emit. `info_atoms()` is that list and
         // the seed is derived from it, so deriving and asserting cannot drift apart; the
         // flavor atom (`jit` for the JIT emulator, `emu` for the interpreter) is the one
         // that used to fall through the seed.
         let mut atoms = AtomTable::new();
         seed_core_atoms(&mut atoms);
-        for name in crate::info::INFO_ATOMS {
+        for name in crate::info::info_atoms() {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        // The static-NIF roster's names are the half that lives in its own table; a name
+        // there that the seed skipped would make `system_info(snifs)` answer `TermNotFound`.
+        for name in crate::info::snifs_atoms::SNIFS_ATOMS {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
         for name in ["jit", "emu", "true", "false", "unix", "linux", "win32", "nt"] {

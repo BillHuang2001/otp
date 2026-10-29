@@ -54,6 +54,17 @@
 //! pins `erlang:fun_info/1` of a `fun ?MODULE:f/0` **built by compiled code** (an *external* fun:
 //! exactly the `arity`/`env`/`module`/`name`/`type` keys and their values).
 //!
+//! The `modules/bif_head_item_*` block pins the **synthesized BIF head item**: a raise coming
+//! out of a BIF makes the BIF itself the innermost stacktrace item, carrying the **real call
+//! arguments** in its `A` slot and **no** `{file,_}`/`{line,_}` position, plus — for a BIF
+//! module in the closed format-module table — an `error_info` location extension
+//! (`crates/beam_engine/src/families/exceptions/bif_frame.rs`). The three-argument
+//! `try C:R:St ->` pattern is compiled-code only, so this block is the only place the item is
+//! observable verbatim. Four cases split the observation: the item's structural shape, the
+//! `Module`/`Function`/`ArgList` identity of the **BIF** (never the caller), the verbatim
+//! `[{error_info, #{module => _}}]` extension of a `binary:` failure, and the BIF-then-caller
+//! **pair ordering**. Every golden is an integer bit mask, never a path-bearing `~w`.
+//!
 //! `modules/timer_apply_after_message_is_delivered_in_compiled_code` pins the **fired** timer
 //! from real bytecode: `timer:apply_after/4` must really send its message once the delay
 //! elapses and the engine must wake the process waiting in the compiled `receive` (the `wait`/
@@ -226,6 +237,83 @@ pub(crate) const DIFF_TRACE_SOURCE: &str = "-module(diff_trace_info).\n\
      bool2int(true) -> 1;\n\
      bool2int(false) -> 0.\n";
 
+/// The source compiled for the **BIF head-item** stacktrace cases.
+///
+/// A raise coming out of a BIF makes the **BIF itself** the innermost stacktrace item (C's
+/// `save_stacktrace` sets `s->current = bif_mfa` and `pc = NULL`), so the item carries the
+/// **real call arguments** in its `A` slot and **no** `{file,_}`/`{line,_}` position; for a
+/// BIF module in the closed format-module table it also carries an `error_info` **location
+/// extension**. The three-argument `try C:R:St ->` pattern (which the runtime's `-eval`
+/// evaluator cannot parse) binds the trace, so this is only observable from **real bytecode**.
+///
+/// Each exported function returns an **integer** — the single shape a module-run golden pins —
+/// and reduces the item to a bit mask over the properties being checked:
+///
+/// * `bif_head_shape/0` — the item's structural mask (atom module, atom function, list arg
+///   list, list location, a location with **no** position pair) plus `100 * length(Args)`;
+/// * `bif_head_identity/0` — the item's `Module`/`Function`/`ArgList` identity: the **BIF**
+///   (`erlang:hd/1`), never the calling module;
+/// * `bif_head_extension/0` — the verbatim `[{error_info, #{module => erl_stdlib_errors}}]`
+///   location of a `binary:` BIF failure, plus the item's identity and argument list;
+/// * `bif_head_pair/0` — the pair ordering: the BIF first, the calling compiled function second.
+///
+/// Measured on the system oracle (`erl` 29.1.2 / erts-17.1.1) as
+/// `{erlang,hd,[1],[{error_info,#{module => erl_erts_errors}}]}` for `hd(1)` and
+/// `{binary,at,[<<>>,0],[{error_info,#{module => erl_stdlib_errors}}]}` for `binary:at(<<>>, 0)`
+/// — the shapes this runtime reproduces byte for byte. The `#{cause => _, module => _}`
+/// variant of that extension is deliberately **not** pinned: the engine renders the module arm
+/// only (measured: `ets:lookup(nonexistent, k)` answers `#{cause => id, …}` on the oracle and a
+/// one-key map here), so a case pinning it would be a divergence, not agreement.
+pub(crate) const DIFF_BIF_ITEM_SOURCE: &str = "-module(diff_bif_item).\n\
+     -export([bif_head_shape/0, bif_head_identity/0, bif_head_extension/0, bif_head_pair/0]).\n\
+     bif_head_shape() ->\n\
+     \x20   try hd(1) of\n\
+     \x20       _ -> 0\n\
+     \x20   catch\n\
+     \x20       _C:_R:St ->\n\
+     \x20           {M,F,Args,Loc} = hd(St),\n\
+     \x20           bool2int(is_atom(M)) + 2 * bool2int(is_atom(F))\n\
+     \x20               + 4 * bool2int(is_list(Args)) + 8 * bool2int(is_list(Loc))\n\
+     \x20               + 16 * bool2int(no_position(Loc))\n\
+     \x20               + 100 * length(Args)\n\
+     \x20   end.\n\
+     bif_head_identity() ->\n\
+     \x20   try hd(1) of\n\
+     \x20       _ -> 0\n\
+     \x20   catch\n\
+     \x20       _C:_R:St ->\n\
+     \x20           {M,F,Args,_Loc} = hd(St),\n\
+     \x20           bool2int(M =:= erlang) + 2 * bool2int(F =:= hd)\n\
+     \x20               + 4 * bool2int(Args =:= [1])\n\
+     \x20               + 8 * bool2int(M =/= diff_bif_item)\n\
+     \x20   end.\n\
+     bif_head_extension() ->\n\
+     \x20   try binary:at(<<>>, 0) of\n\
+     \x20       _ -> 0\n\
+     \x20   catch\n\
+     \x20       _C:_R:St ->\n\
+     \x20           {M,F,Args,Loc} = hd(St),\n\
+     \x20           bool2int(Loc =:= [{error_info, #{module => erl_stdlib_errors}}])\n\
+     \x20               + 2 * bool2int(M =:= binary) + 4 * bool2int(F =:= at)\n\
+     \x20               + 8 * bool2int(Args =:= [<<>>, 0])\n\
+     \x20   end.\n\
+     bif_head_pair() ->\n\
+     \x20   try hd(1) of\n\
+     \x20       _ -> 0\n\
+     \x20   catch\n\
+     \x20       _C:_R:St ->\n\
+     \x20           {M1,F1,_A1,_L1} = hd(St),\n\
+     \x20           {M2,F2,_A2,_L2} = hd(tl(St)),\n\
+     \x20           bool2int(M1 =:= erlang) + 2 * bool2int(F1 =:= hd)\n\
+     \x20               + 4 * bool2int(M2 =:= diff_bif_item)\n\
+     \x20               + 8 * bool2int(F2 =:= bif_head_pair)\n\
+     \x20   end.\n\
+     no_position([]) -> true;\n\
+     no_position([{error_info, _} | T]) -> no_position(T);\n\
+     no_position(_) -> false.\n\
+     bool2int(true) -> 1;\n\
+     bool2int(false) -> 0.\n";
+
 /// The source of the fired-timer module.
 ///
 /// A timer is only observable once it **fires**, and the message it sends must arrive at the
@@ -313,6 +401,32 @@ fn trace_case(
         kind: CaseKind::Module(ModuleRun {
             source: DIFF_TRACE_SOURCE,
             module: "diff_trace_info",
+            function,
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+/// Build one BIF-head-item stacktrace module-run case (arity-0, integer result).
+fn bif_case(
+    id: &'static str,
+    description: &'static str,
+    contracts: &'static [Contract],
+    function: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts,
+        kind: CaseKind::Module(ModuleRun {
+            source: DIFF_BIF_ITEM_SOURCE,
+            module: "diff_bif_item",
             function,
             arity: 0,
             args: &[],
@@ -985,6 +1099,63 @@ pub(crate) fn group() -> Vec<Case> {
             &[BeamAsm, LanguageSemantics],
             "undef_head_arg_list",
             "7",
+        ),
+        // --- A.1/A.2: the synthesized **BIF** head-item stacktrace item, from real bytecode ----
+        //
+        // A raise out of a BIF names the **BIF** as the innermost cooked item, with the real call
+        // arguments in its `A` slot and no source position (`save_stacktrace` sets
+        // `s->current = bif_mfa`, `pc = NULL`). `hd(1)` fails with `badarg`, so the item must be a
+        // 4-tuple of an atom module, an atom function, a **list** argument list and a **list**
+        // location whose entries are the `error_info` extension only — never a `{file,_}`/`{line,_}`
+        // pair (the oracle has no position for a BIF either). The golden is the structural mask
+        // `is_atom(M) + 2*is_atom(F) + 4*is_list(Args) + 8*is_list(Loc) + 16*no_position(Loc)` plus
+        // `100 * length(Args)`, so a 4-tuple with the real 1-element argument list and a
+        // position-free location is `1+2+4+8+16 + 100 = 131`. Measured on the oracle:
+        // `{erlang,hd,[1],[{error_info,#{module => erl_erts_errors}}]}`.
+        bif_case(
+            "modules/bif_head_item_shape_in_compiled_code",
+            "from compiled bytecode a BIF raise's innermost stacktrace item has an atom module, atom function, list args and a position-free location",
+            &[BeamAsm, LanguageSemantics],
+            "bif_head_shape",
+            "131",
+        ),
+        // The mask alone would accept *any* module/function/argument list, so the identity is
+        // pinned separately: the item must read `{erlang, hd, [1], _Loc}` — the **BIF**, not the
+        // calling module/function — so all four bits are set (`1 + 2 + 4 + 8 = 15`).
+        bif_case(
+            "modules/bif_head_item_identity_in_compiled_code",
+            "from compiled bytecode a BIF raise's innermost stacktrace item names the failing BIF itself, not the calling function",
+            &[BeamAsm, LanguageSemantics],
+            "bif_head_identity",
+            "15",
+        ),
+        // A BIF module in the closed format-module table attaches an `error_info` location
+        // extension. `binary:at(<<>>, 0)` fails with `badarg` and `binary` maps to
+        // `erl_stdlib_errors`, so the location is **exactly**
+        // `[{error_info, #{module => erl_stdlib_errors}}]` — no position pair, and the extension
+        // rendered verbatim (`1`), plus the item's identity (`2`/`4`) and real argument list (`8`).
+        //
+        // The `#{cause => _, module => _}` variant of that extension is deliberately absent: the
+        // engine renders the module arm only (`ets:lookup(nonexistent, k)` ⇒ oracle
+        // `#{cause => id, module => erl_stdlib_errors}`, this runtime a one-key map), so a case
+        // pinning a `cause` would be a divergence rather than agreement.
+        bif_case(
+            "modules/bif_head_item_stdlib_extension_in_compiled_code",
+            "from compiled bytecode a binary: BIF failure carries the verbatim {error_info, #{module => erl_stdlib_errors}} location extension",
+            &[BeamAsm, OtpApps],
+            "bif_head_extension",
+            "15",
+        ),
+        // The ordering of the pair: the innermost item is the BIF (`erlang:hd/1`) and the **next**
+        // one is the calling compiled function at the call site, so
+        // `{erlang,hd,_,_} + {diff_bif_item,bif_head_pair,_,_}` sets all four bits (`15`). A
+        // caller-first order, or a head item naming the caller, clears one of them.
+        bif_case(
+            "modules/bif_head_item_vs_caller_frame_in_compiled_code",
+            "from compiled bytecode the BIF item is innermost and the next stacktrace item is the calling compiled function",
+            &[BeamAsm, LanguageSemantics],
+            "bif_head_pair",
+            "15",
         ),
         // --- A.7/A.2: `erlang:fun_info/1` of a fun built by compiled code --------------------
         //

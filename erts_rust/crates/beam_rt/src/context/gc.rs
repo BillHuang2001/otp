@@ -386,12 +386,31 @@ fn module_may_be_collected(runtime: &mut Runtime, name: &str) -> bool {
 /// ([`word_region_exactly`]); every production classifier inside a walk takes the block from a
 /// [`Geometry`] instead, so the descent reads these three fields once per walk rather than once
 /// per classified word (see [`Geometry`]).
-#[cfg(test)]
-fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
+pub(crate) fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
     let words = heap.used().saturating_mul(std::mem::size_of::<Eterm>());
     let base = (heap.hp() as usize).wrapping_sub(words);
     let end = heap.hend() as usize;
     ptr >= base && ptr < end
+}
+
+/// Whether `term`'s **root object** already lives inside `heap`'s block — the containment test
+/// for a destination that is a [`beam_alloc::Heap`] the caller owns outright.
+///
+/// [`in_heap_block`] against the address [`word_region`] would classify, i.e. an immediate, a
+/// literal-area constant and a word naming no dereferenceable address all answer `false` (they
+/// point into no block *and* the tag tricks cannot tell them from a cons). Its one production
+/// caller is the BIF-result copy-out's destination-containment short-circuit
+/// ([`super::calls::dest`]): the `-eval`/single-pass store, whose regions are [`Runtime`]'s own
+/// [`beam_alloc::Heap`] values rather than a collector's spaces, so [`Geometry::word_is_scanned`]
+/// has no geometry to read for them.
+///
+/// [`Runtime`]: crate::runtime::Runtime
+#[inline]
+pub(crate) fn term_in_heap_block(heap: &Heap, term: Eterm) -> bool {
+    match foreign_shape_pointer(term) {
+        Some(ptr) => in_heap_block(heap, ptr),
+        None => false,
+    }
 }
 
 /// The **two per-walk geometries** every per-word classification is decided against, read

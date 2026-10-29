@@ -60,7 +60,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// `(module, function, arity)` itself, so the engine marshals `x(0..arity)` through
     /// [`Self::call_bif`] under the arm's own frame discipline.
     ///
-    /// Three local keys are served, all as **non-exported same-module stubs** (the compiler
+    /// Four local key sets are served, all as **non-exported same-module stubs** (the compiler
     /// emits a LOCAL `call`/`call_only` for each, so `call_ext`/`floor_shadows` never sees
     /// them):
     ///
@@ -84,26 +84,34 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   `{error,badarg}` value instead of falling into the stub's `erlang:nif_error(undef)`.
     ///   The implementation is [`crate::native::prim_file`]'s, reached through the same
     ///   `try_native` arm the exported `advise/4` uses.
+    /// * the `prim_buffer` NIF library's two unexported stubs — `peek_head/1` and
+    ///   `copying_read/2` (`erts/preloaded/src/prim_buffer.erl:40-41`). Its own exported bodies
+    ///   (`read/2`, `read_iovec/2`, `wipe/1`) chain into them **locally**, and its exported stubs
+    ///   go through `floor_shadows`; both routes converge on the same `try_native` arm
+    ///   ([`crate::native::prim_buffer`]).
     ///
     /// This is consulted for **every** local call in **every** module, so it must answer
     /// `Ok(false)` for everything else and stay allocation-free: each predicate begins with a
-    /// **module-name equality** check (`prim_tty`, `zlib`, `prim_file`) and only then tests
-    /// membership in a fixed `(name, arity)` table — no registry lookup, no hash, no term is
-    /// built.
+    /// **module-name equality** check (`prim_tty`, `zlib`, `prim_file`, `prim_buffer`) and only
+    /// then tests membership in a fixed `(name, arity)` table — no registry lookup, no hash, no
+    /// term is built.
     ///
     /// The leading `matches!` guard is a fast path that is **equivalent to, not narrower than**
-    /// the three predicates: `prim_tty::serves_local_call`, `prim_file::serves_local_call` and
-    /// `beam_bifs::serves_local_call` each start with a module-name equality (`prim_tty`,
-    /// `prim_file`, `zlib`) over exactly these three names, so no other module can reach their
-    /// `true` and the guard can never mask one.
+    /// the four predicates: `prim_tty::serves_local_call`, `prim_file::serves_local_call`,
+    /// `prim_buffer::serves_local_call` and `beam_bifs::serves_local_call` each start with a
+    /// module-name equality (`prim_tty`, `prim_file`, `prim_buffer`, `zlib`) over exactly these
+    /// four names, so no other module can reach their `true` and the guard can never mask one.
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
-        if !matches!(module, "prim_tty" | "prim_file" | "zlib") {
+        if !matches!(module, "prim_tty" | "prim_file" | "prim_buffer" | "zlib") {
             return Ok(false);
         }
         if crate::native::prim_tty::serves_local_call(module, function, arity) {
             return Ok(true);
         }
         if crate::native::prim_file::serves_local_call(module, function, arity) {
+            return Ok(true);
+        }
+        if crate::native::prim_buffer::serves_local_call(module, function, arity) {
             return Ok(true);
         }
         Ok(beam_bifs::serves_local_call(module, function, arity as usize))

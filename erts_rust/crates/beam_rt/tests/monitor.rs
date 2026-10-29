@@ -515,17 +515,22 @@ fn the_adopted_targets_succeed_silently() {
     }
 }
 
-/// `erlang:monitor/3`'s `{tag, T}` is served for an **immediate** (an atom here) and for a
-/// **module-literal** tag: both runtimes deliver the `{'DOWN', …}` with that term as its head.
-/// A **heap-resident** tag — a term built on a process heap, so neither immediate nor literal —
-/// is this runtime's typed capability gap (exit 3, one `unsupported:` line), where the oracle
-/// performs the monitor; the acceptance rule is `beam_process`'s `is_heap_independent`, which a
-/// monitor record's plain, unscanned value requires.
+/// `erlang:monitor/3`'s `{tag, T}` is served for **every** term shape and the `{'DOWN', …}`
+/// carries that term verbatim as its head: an **immediate** (an atom here), a
+/// **module-literal** tag and a **heap-resident** one all run, and both runtimes deliver the
+/// same answer.
+///
+/// A heap-resident tag is accepted because the monitor takes ownership of it at
+/// monitor-creation time — `beam_process`'s `monitor_tag_slot` copies any term that is not
+/// heap-independent into the monitor's own heap fragment, so a later collection of the
+/// watcher's heap cannot invalidate it. A tag on a **remote** external-pid target stays a typed
+/// capability gap (exit 3, one `unsupported:` line): the `DOP_MONITOR_P` control signal carries
+/// no tag field.
 ///
 /// The case must run **compiled**: every term the `-eval` evaluator builds is heap-resident, so
-/// it cannot express the literal-area shape at all.
+/// `-eval` cannot express the literal-area shape at all.
 #[test]
-fn a_tag_is_an_immediate_or_a_module_literal_and_a_heap_resident_one_is_the_typed_gap() {
+fn a_tag_is_accepted_for_every_term_shape_and_delivered_verbatim() {
     let Some(oracle) = support::require_oracle("monitor") else {
         return;
     };
@@ -562,24 +567,29 @@ fn a_tag_is_an_immediate_or_a_module_literal_and_a_heap_resident_one_is_the_type
         );
     }
 
-    // A heap-resident tag. The oracle hands it over; this runtime refuses it with the typed
-    // capability gap rather than storing a word a later collection would invalidate.
+    // A heap-resident tag: built at run time, so neither an immediate nor a module-literal. It
+    // is accepted like every other shape — the monitor takes ownership of it by copying it into
+    // its own fragment — and both runtimes deliver the same `heap_ok`.
     let heap = run_compiled(&fixtures, "heap");
     assert_eq!(
-        heap.code, 3,
-        "a heap-resident tag is a capability gap, stderr {}",
-        heap.err
+        heap.code, 0,
+        "`beam_rt run montag:heap/0` must exit 0, got {}: {}",
+        heap.code, heap.err
     );
     assert!(
-        heap.err.contains("unsupported: monitor/3: tag must be an immediate"),
-        "the gap is named: {}",
+        !heap.err.contains("unsupported"),
+        "an accepted tag is not a capability gap: {}",
         heap.err
     );
-    assert!(heap.out.is_empty(), "nothing is printed: {}", heap.out);
+    assert!(heap.err.is_empty(), "a monitor prints nothing: {}", heap.err);
     let theirs = oracle_compiled(&oracle, &fixtures, "heap")
-        .expect("the live oracle could not answer montag:heap/0");
+        .unwrap_or_else(|| panic!("the live oracle could not answer montag:heap/0"));
     assert_eq!(
         theirs, "heap_ok",
-        "the oracle accepts a heap-resident tag, so the refusal is this runtime's own gap"
+        "the oracle hands the heap-resident tag back as the message head"
+    );
+    assert_eq!(
+        heap.out, theirs,
+        "beam_rt's answer for a heap-resident tag must be the live oracle's"
     );
 }

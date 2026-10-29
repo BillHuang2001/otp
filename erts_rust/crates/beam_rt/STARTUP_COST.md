@@ -4,7 +4,8 @@ The startup record: the retired-instruction floor of one `beam_rt -noshell -eval
 invocation, the paired delta each landed change bought, the current profile's self-time split, the
 boot's collection accounting with its mechanism, and the two cross-node asks — both answered, with
 what each answer is and what it is worth.
-The instrument is a **retired-instruction count**, never a wall time: the figures below are
+The instrument is a **retired-instruction count**, never a wall time (the footprint section is the
+one exception and names its own instrument): the figures below are
 `perf stat -e cpu_core/instructions/u` / `perf record -e cpu_core/instructions/u -c 2000000
 --call-graph dwarf,16384` over `./target/release/beam_rt -noshell -eval 'halt().'`, pinned
 `taskset -c 2` on a P-core, with the two binaries alternated inside every round and each round's
@@ -206,6 +207,30 @@ That row is the floor's own figure: at the shape's 233-word minor target the kee
 `max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × 233) = max(3 000, 1 864) = 3 000`, so the
 carried collapse installs the floor itself and neither the capacity nor the collection cadence sits
 below it.
+
+## The footprint — what the ~59 MiB of a minimal run is, and is not
+
+The instrument here is **peak RSS and an allocator census**, not retired instructions.
+The measured OS peak (`VmHWM`, `wait4`/`ru_maxrss`, median of 5 interleaved pairs, P-core pinned) of `beam_rt -noshell -eval 'halt().'` is **59.45 MiB** against the oracle's **59.34 MiB** (1.002×) and `-s init stop` 59.40 vs 58.70 — parity, not a win, since across sessions the pair reads anywhere in 59.3–61.1 MiB on **both** sides (the oracle is OTP 29.1.2/erts-17.1.1, the tree pins erts-17.1).
+The other measured peak-RSS ratios are `slice` **0.999×**, the `baseline` compute run **0.70×** (peak 90.1 MiB) and `gc_bound`/`list_walk`/`gc_class` **1.011–1.014×**, and `-version`, which boots nothing, is 4.8 MiB against the oracle's 11.9 — so the peak is **boot work, not the process image**.
+The peak is allocator-visible retention, not a beam region: massif's peak snapshot is 35.3 MiB heap + 1.6 MiB overhead (the 47 064 kB anonymous `rw-p` bucket `smaps` groups a booted runtime into), **≈24 MiB of it `beam_loader`'s lowering** (18.32 MiB one per-function-body `Vec<Instr>`) and ≈3.1 MiB the atom store's CoW shards.
+The two 128 MiB term heaps are address space only (`MAP_PRIVATE|MAP_ANONYMOUS`, 12–48 kB resident) and the collectors' 233+233 words × ~33–38 live processes is ≈140 KiB — a module-graph *retention* question, a `beam_loader`/`beam_term` change, not `beam_rt`'s.
+
+### The boot work that sets it
+
+* **One `Machine` per spawned process** (~26 KiB fixed: 1 024-word `x` + 1 024-word `fr` files, 256-word stack, 256 frames, 8 catch frames) plus one **transient** machine per boot-script `{apply,…}`; the four `Runtime::new` services get none and nested runs recycle through the thread-local pool (≤ 32 idle).
+* **Only 7 of the 22 boot directives enter `.beam` code** (3 `{kernelProcess,…}`, 4 `{apply,…}`), and the `{apply}` route uses the **interpreter** entries, so it compiles nothing while a spawned process selects the baseline tier once at first entry; the two 128 MiB-*capacity* regions (`bif_heaps`, `eval_heap`) and the engine arena cost address space only until written.
+* **The recorded `90.1 MiB` / `128.9 MiB` peak pair is the `baseline` *compute* run, not `halt().`** — `tools/bench/src/workloads/baseline.rs` accumulates `peak_memory_bytes` only from the `COMPUTE_EVAL` runs (`lists:sum(lists:seq(1,1000000))`, whose ≈31 MB is two ≈16 MB copies of the 1M-cons list: `ctx.cons` on the pooled BIF heap, then the copy-out into `eval_heap`); `tests/rss_bound.rs` bounds the boot peak at 120 MiB.
+* **The dominant consumer is retained module IR**: `size_of::<Instr>() == 64` at ≈4.25 `Code`-stream bytes per instruction ⇒ ≈15 B of IR per `Code` byte, ≈3.5× a module's `.beam` image, which is why `-eval`'s `erlang:memory(total)` is only 7.71 MB (this heap is outside the `MemoryHook`'s accounting).
+* **Eagerly loaded at boot: 22 preloaded + the script's first `{primLoad, …}` batch of 29 = 51 modules**; the other two batches (86 + 87) are `init`'s post-`{kernel_load_completed}` no-ops and the rest is on demand, so the final count is not pinned.
+* **`erlang:memory(atom)` counts the *shared* table only** (`8 × atoms.len()` index slots plus Σ name bytes), so per-module forks are invisible to it, and each fork is re-taken from the **merged** shared table at the end of the load so it pins no diverged shard copies of its own.
+* **Processes, not reservations, are what the heap counts**: each live process costs one `Machine` + a `Process` PCB (~9.3 KiB of `XRegs`) + a 233+233-word heap inside a shared 1 MiB carrier, and nothing pins how many processes a boot leaves live (see [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md)).
+
+### What the 51 eagerly-booted modules retain (measured against the host oracle)
+
+The 51 eagerly loaded modules are **3 016 872 B (2.88 MiB) of `.beam`** on the host oracle, and post-boot retention by the code server is at most ≈ **11.3 MiB**, of which ≈ **10.5 MiB is the IR** (`Function::code`'s `Vec<Instr>` at the pre-fusion census bound, 163 372 instructions × 64 B, so fusion only lowers it) plus 727 KiB of `Block` vecs, ≈98 KiB of decoded tables, 223.9 KiB `literals` and ≈86 KiB of raw `attributes`/`compile_info`.
+The only **dead** share is `locals` 44.6 KiB (zero workspace readers), raw `meta` 2.2 KiB and the three decoded tables ≈214 KiB, so `get_module_info(M, attributes|compile)` re-decodes the raw bytes through a fresh 8 192-word scratch `Heap` per call (`src/context/module_info.rs`) and `read_image`'s buffer is dropped.
+Per-route detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md), [`src/context/CONTEXT.md`](src/context/CONTEXT.md), [`src/runner/CONTEXT.md`](src/runner/CONTEXT.md), [`src/eval/CONTEXT.md`](src/eval/CONTEXT.md); the store/arena ceilings in [`src/context/pump/CONTEXT.md`](src/context/pump/CONTEXT.md).
 
 ## Measurement discipline
 

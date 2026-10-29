@@ -78,6 +78,16 @@ use super::dispatch::DispatchHooks;
 use super::export_gate::ExportGateBridge;
 use super::fun_identity::FunIdentityBridge;
 pub(super) mod perf_counters;
+/// The copy-out's destination-containment short-circuit (see [`dest`]): a BIF result whose root
+/// object already lives on the region the copy would put it on is handed through unchanged, so a
+/// no-op container BIF keeps the *identity* of the term it was given
+/// (`erts_debug:same(maps:put(a,V,M), M)`, the C's `erts_maps_put` returning its argument word).
+pub(super) mod dest;
+/// The pooled BIF-heap frontier's **need-aware reservation** (see [`frontier`]): the words a call
+/// must find free in the region it is handed — a quarter of the region, capped, and the largest
+/// single-call demand that depth has ever made — so one BIF building a large term is reserved for
+/// instead of raising a spurious `error:system_limit`.
+pub(super) mod frontier;
 
 use super::memory_hook::RuntimeMemory;
 use super::module_info::ModuleInfoBridge;
@@ -85,16 +95,6 @@ use super::persistent_term::PersistentTermBridge;
 use super::process_bridge::ProcessBridge;
 use super::runtime_context::RuntimeContext;
 use super::runtime_hooks::RuntimeHooksBridge;
-
-/// How much free room a pooled BIF heap must still have for a call to use it as its allocation
-/// frontier: less than `capacity() / BIF_HEAP_GROWTH_DIVISOR` free words is "nearly exhausted" and
-/// [`RuntimeContext::take_bif_frontier`] retires the region instead.
-///
-/// The threshold is deliberately a *fraction of the capacity* rather than a word count, so the
-/// same policy applies to the default region and to every region a growth step produced. It also
-/// makes the check a single compare on the hot path — the pool is taken on **every** registered
-/// call.
-const BIF_HEAP_GROWTH_DIVISOR: usize = 16;
 
 /// [`error::enforce_term_heap_limit`], out of line for the registered-call tail.
 ///
@@ -151,6 +151,20 @@ impl<'a> RuntimeContext<'a> {
     /// happens **before** the call's own work, so the BIF runs exactly once and no side effect can
     /// be repeated.
     ///
+    /// # The reservation (see [`frontier`])
+    ///
+    /// The region is not accepted merely because it is not *nearly* exhausted: the check is
+    /// `available() >= frontier::need(...)`, i.e. it must be able to serve the **largest single call
+    /// at this depth** — a quarter of its own capacity (capped at
+    /// [`frontier::BIF_FRONTIER_MAX_WORDS`]), raised to whatever an actual call has already demanded
+    /// (`used() - mark` at the call's tail, learned per depth by [`frontier::note_demand`]).
+    ///
+    /// A fixed fraction of the capacity alone cannot foresee a BIF whose one-shot demand is a large
+    /// multiple of it: `lists:duplicate(1 bsl 21, X)` builds `2^22` words (32 MiB) in one call and
+    /// used to raise a spurious `error:system_limit` whenever the pooled region started that call
+    /// with more than `capacity()/16` free words but fewer than the call needed — the oracle has no
+    /// analogue for that, because every word such a BIF builds is transient.
+    ///
     /// # The cap
     ///
     /// The new frontier is the old capacity doubled ([`usize::saturating_mul`]) — **from the
@@ -159,7 +173,9 @@ impl<'a> RuntimeContext<'a> {
     /// ([`Runtime::take_bif_heap`](crate::Runtime::take_bif_heap)), and jumping it straight back to a
     /// full-size region is exactly the `nesting depth × heap_words` retention the seed removed. A
     /// small region therefore climbs to whatever it needs in geometric steps, which is what the
-    /// doubling is for.
+    /// doubling is for. The reservation is a **lower bound** on top of the doubling
+    /// ([`frontier::grown_capacity`]), so one growth serves a whole run of calls instead of a single
+    /// step.
     ///
     /// The growth is capped by a configured `+hmax`
     /// ([`crate::config::RuntimeConfig::heap_options`]'s
@@ -179,32 +195,32 @@ impl<'a> RuntimeContext<'a> {
     #[inline]
     fn take_bif_frontier(&mut self) -> Result<Heap> {
         let heap = self.runtime.take_bif_heap()?;
-        if heap.available() >= heap.capacity() / BIF_HEAP_GROWTH_DIVISOR {
+        let need = frontier::need(&self.runtime, heap.capacity());
+        if heap.available() >= need {
             return Ok(heap);
         }
-        self.grow_bif_frontier(heap)
+        self.grow_bif_frontier(heap, need)
     }
 
     /// [`Self::take_bif_frontier`]'s **growth** arm, out of line.
     ///
     /// The frontier is taken on **every** registered call (and every NIF call), and the answer is
     /// "the pooled region, unchanged" for all but the handful of calls that arrive when the region
-    /// has less than `1/BIF_HEAP_GROWTH_DIVISOR` of its capacity free. Keeping the growth here is
-    /// what makes the taker a handful of instructions: inlined together, the growth's own frame
-    /// (six saved registers and a 200-byte scratch area — it calls `Runtime::config`, reads the
-    /// heap policy, and may allocate) was paid by every call, `#[cold]`-marked or not, because
-    /// LLVM could not shrink a function whose two arms it had to keep reachable from one prologue.
+    /// cannot serve the reservation [`frontier::need`] asks for. Keeping the growth here is what
+    /// makes the taker a handful of instructions: inlined together, the growth's own frame (six
+    /// saved registers and a 200-byte scratch area — it calls `Runtime::config`, reads the heap
+    /// policy, and may allocate) was paid by every call, `#[cold]`-marked or not, because LLVM could
+    /// not shrink a function whose two arms it had to keep reachable from one prologue.
     #[cold]
     #[inline(never)]
-    fn grow_bif_frontier(&mut self, heap: Heap) -> Result<Heap> {
-        let doubled = heap.capacity().saturating_mul(2);
+    fn grow_bif_frontier(&mut self, heap: Heap, need: usize) -> Result<Heap> {
+        let capacity = heap.capacity();
         let max = self.runtime.config().heap_options().policy().max_heap_words;
-        let grown = if max == 0 { doubled } else { doubled.min(max) };
-        if grown <= heap.capacity() {
+        let Some(grown) = frontier::grown_capacity(capacity, need, max) else {
             // A configured `+hmax` forbids the growth: keep today's region and today's
             // `system_limit` for a call that really overflows it.
             return Ok(heap);
-        }
+        };
         // Retire the exhausted region — never freed, never moved, so the words another caller owns
         // in it stay valid — and continue the run in a fresh, larger frontier.
         perf_counters::bump(|c| &mut c.pool_grown);
@@ -1229,7 +1245,7 @@ impl<'a> RuntimeContext<'a> {
                     notes::note_alias_copy();
                     #[cfg(test)]
                     notes::note_alias_copy_pool(mark, heap.used());
-                    match self.rehome_container_result(term) {
+                    match self.rehome_container_result(term, None) {
                         Some(copied) => {
                             perf_counters::bump(|c| &mut c.rehomed);
                             result = Ok(copied);
@@ -1275,7 +1291,7 @@ impl<'a> RuntimeContext<'a> {
                 } else if move_container {
                     // The copy first and, only once it succeeded, the rewind: a refused copy leaves
                     // both the result and the pool exactly as they were.
-                    if let Some(copied) = self.rehome_container_result(term) {
+                    if let Some(copied) = self.rehome_container_result(term, Some(heap)) {
                         perf_counters::bump(|c| &mut c.rehomed);
                         result = Ok(copied);
                         rewind = safe_to_rewind;
@@ -1332,6 +1348,16 @@ impl<'a> RuntimeContext<'a> {
         // leaves the heap untouched (its own contract), so the honest answer is to surface it —
         // that is a `BeamError::BadArg` out of the same `Result` this call already returns, never
         // a recycled live word and never a silently mis-sized pool.
+        // The frontier's **learned demand**: the words this call actually handed out of its region,
+        // `[mark, used)`. Recorded before the rewind (which erases the figure) and before the error
+        // mapping below, because a call that died mid-allocation taught the pool the most: its
+        // region really did have to serve those words, and the next call at this depth is reserved
+        // for them (see `frontier` — `used() - mark`, never `peak_used()`, which includes another
+        // caller's words below this call's mark).
+        let demand = heap.used().saturating_sub(mark);
+        if demand != 0 {
+            frontier::note_demand(&mut *self.runtime, demand);
+        }
         if rewind {
             perf_counters::bump(|c| &mut c.rewound);
             heap.reset_to(mark)?;
@@ -1660,7 +1686,7 @@ impl<'a> RuntimeContext<'a> {
             // An immediate or a frozen literal names nothing on the scratch region.
             return term;
         }
-        match self.rehome_container_result(term) {
+        match self.rehome_container_result(term, None) {
             Some(copied) => copied,
             None => {
                 self.runtime.taint_info_scratch();
@@ -1687,13 +1713,25 @@ impl<'a> RuntimeContext<'a> {
     ///   is *stabilized* rather than grown for
     ///   ([`Self::move_result_into_process_heap`]'s `refuse ⇒ stabilize, never dangle` rule).
     ///
+    /// `pool` is the **pooled region this call allocated from**, when the caller can vouch for it:
+    /// the `-eval` store arm uses it to answer "is there anything to move at all?"
+    /// ([`super::calls::dest::pool_holds`]) — a result on no pooled region predates the call, so
+    /// handing it through is sound and keeps its term identity observable. `None` means the result
+    /// may have come from a region the caller cannot vouch for (the aliased-ETS `TermStore`, the
+    /// `system_info` scratch region), and that arm always copies. The process arm ignores it: its
+    /// containment test is the copier's own classification.
+    ///
     /// `None` on every route means the copy was refused for a reason capacity cannot fix, so the
     /// caller leaves the pool un-rewound and the result on it.
-    pub(crate) fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
+    pub(crate) fn rehome_container_result(
+        &mut self,
+        term: Eterm,
+        pool: Option<&beam_alloc::Heap>,
+    ) -> Option<Eterm> {
         if self.mailbox_table.is_some() {
             self.move_result_into_process_heap(term)
         } else {
-            self.move_result_into_runtime_store(term)
+            self.move_result_into_runtime_store(term, pool)
         }
     }
 
@@ -1850,6 +1888,19 @@ impl<'a> RuntimeContext<'a> {
             // for byte (the result stays on the pooled heap, which is then not rewound).
             let table = mailbox_table.as_deref_mut()?;
             let process = table.get_mut(pid)?;
+            // THE DESTINATION-CONTAINMENT SHORT-CIRCUIT (process arm, [`dest`]): the result's root
+            // object already lives on a region this process's collector **scans**, so the copy
+            // below would only replace a live, collectable object by a structural twin — and a
+            // no-op container BIF (`maps:put/3` with the bound value, the C's `erts_maps_put`
+            // returning its argument word) must keep the term's identity, which is what
+            // `erts_debug:same/2` observes. Hand the word through: no copy, no growth, no hint.
+            // Only a *root* is tested — a container the BIF built on its own pooled frontier is on
+            // a region no process collector scans, so it takes the copy path unchanged.
+            if dest::process_holds(process, term) {
+                #[cfg(test)]
+                notes::note_dest_contained();
+                return Some(term);
+            }
             // Read the window state **once** (the process is borrowed for the rest of the call, and
             // the two seams below — the hint gate and the growth — must agree): a young-space
             // REPLACEMENT is legal only while this process's root set is complete, see
@@ -1955,7 +2006,7 @@ impl<'a> RuntimeContext<'a> {
             // self-contained copy on the runtime's pointer-stable store, so this call can license
             // its pool rewind exactly as on the non-exempt route — `refuse ⇒ stabilize, never
             // dangle`.
-            return self.move_result_into_runtime_store(term);
+            return self.move_result_into_runtime_store(term, None);
         }
         outcome
     }
@@ -2599,6 +2650,7 @@ mod notes {
         static ALIAS_MARKS: Cell<usize> = const { Cell::new(0) };
         static ALIAS_REFUSALS: Cell<usize> = const { Cell::new(0) };
         static ALIAS_COPY_POOL: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+        static DEST_CONTAINED: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The reference walk's counters, in one value so a test can assert them as a unit.
@@ -2741,6 +2793,20 @@ mod notes {
         (ALIAS_COPIES.with(Cell::get), ALIAS_REFUSALS.with(Cell::get))
     }
 
+    /// Records one BIF result the copy-out's **destination-containment short-circuit** handed
+    /// through unchanged ([`dest::process_holds`]/[`dest::store_holds`]) — i.e. one container the
+    /// BIF returned whose root object already lived on the destination region, so no copy ran and
+    /// the term kept its identity.
+    #[allow(dead_code)]
+    pub(super) fn note_dest_contained() {
+        DEST_CONTAINED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// This thread's count of results the destination-containment short-circuit handed through.
+    pub(super) fn dest_contained() -> usize {
+        DEST_CONTAINED.with(Cell::get)
+    }
+
     /// This thread's count of calls whose `ets` **table-alias witness** fired
     /// ([`note_alias_mark`]).
     ///
@@ -2765,6 +2831,7 @@ mod notes {
         ALIAS_MARKS.with(|c| c.set(0));
         ALIAS_REFUSALS.with(|c| c.set(0));
         ALIAS_COPY_POOL.with(|c| c.set((0, 0)));
+        DEST_CONTAINED.with(|c| c.set(0));
     }
 
     /// This thread's `(copy_attempts, grow_retries, empty_destination_attempts)`.

@@ -58,6 +58,7 @@
 //! | [`terms`] | A.1 — language semantics (ordering, equality) |
 //! | [`semantics`] | A.1 — arithmetic, control flow, data structures, funs |
 //! | [`errors`] | A.1 — the exception classes (`error`/`exit`/`throw`) and reasons |
+//! | [`errors_extra`] | A.1 — `erlang:error/2,3`'s stacktrace payload (the caller-frame argument list and the `{error_info,Map}` location extension), plus the verbatim echo of a supplied `erlang:raise/3` trace |
 //! | [`eval_route`] | A.1/A.6 — the `-eval` route's own semantics: a send to an already-dead pid (silent success, in every position) vs a dead **name** (`badarg`), and the `receive … after T` deadline |
 //! | [`etf`] | A.2 — `.beam` binary / `term_to_binary` bytes |
 //! | [`nif`] | A.3 — the observable `erlang:nif_error/1` NIF surface |
@@ -81,6 +82,7 @@
 //! | [`ets_spec`] | A.7 — the `ets` match-spec / `select` family + the `info/1,2` fields + the `ordered_set` arithmetic-key rule |
 //! | [`ordered_walk`] | A.1 — the Erlang term-order walk over an `ordered_set` (`first`/`next` + `last`/`prev` across the `ORDER` = 32 node split, under mutation, and the absent-key anchor) |
 //! | [`proc_signals`] | A.7 — the group leader, the `dt_*` switches, `erlang:statistics/1`, `spawn_monitor`/`monitor` |
+//! | [`monitor_tag`] | A.1 — `erlang:monitor/3`'s `{tag,T}` user-tag surface: a heap-resident tag echoed by identity in a tagged `'DOWN'`, a large binary tag surviving the copy, and `demonitor/2` `[flush]` removing a queued tagged DOWN |
 //! | [`proc_control`] | A.7 — `monitor`/`demonitor`, the `exit/1,2` taxonomy, `register`/`unregister`/`whereis`, the run-queue priorities |
 //! | [`gc`] | A.1/A.7 — the per-process collector observed through the values it must preserve (forced collections, collector-stressing programs, the `garbage_collect`/`process_info` BIF surface) |
 //! | [`system_info`] | A.8 — introspection (incl. `erlang:memory/0,1` — a Rust capability gap — and the trace / `seq_trace` / `halt` surface) |
@@ -96,6 +98,7 @@
 //! | [`udp`] | A.4 — the `udp_inet` built-in driver through `open_port/2` / `port_command` / `port_info` |
 //! | [`ram_file`] | A.4 — the `ram_file_drv` built-in driver's reply encodings |
 //! | [`inet_control`] | A.4 — the built-in inet drivers' control surface through `gen_udp` / `gen_tcp` / `inet` (option store, refusal matrix, driver-name namespace, packet-framing modes) |
+//! | [`sendfile`] | A.4 — `file:sendfile/5` over an inet socket and `prim_file:advise/4`'s hint/`badarg` surface |
 //!
 //! A.3 is reachable **end to end**, not only through its raise surface: the [`nif_so`] group
 //! runs a compiled module that `erlang:load_nif/2`s a **real `.so`** (built into the case's
@@ -124,6 +127,7 @@ mod decode_packet;
 mod dist;
 mod dist_extra;
 mod errors;
+mod errors_extra;
 mod etf;
 mod ets;
 mod ets_access;
@@ -140,6 +144,7 @@ mod math_bifs;
 mod mexec;
 mod mexec_extra;
 mod modules;
+mod monitor_tag;
 mod nif;
 mod nif_a3;
 mod nif_abi;
@@ -156,6 +161,7 @@ mod proc_signals;
 mod ram_file;
 mod re;
 mod records;
+mod sendfile;
 mod selfhost;
 mod selfhost_chain;
 mod semantics;
@@ -658,6 +664,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(semantics::group());
     cases.extend(eval_route::group());
     cases.extend(errors::group());
+    cases.extend(errors_extra::group());
     cases.extend(nif::group());
     cases.extend(nif_so::group());
     cases.extend(nif_state::group());
@@ -691,6 +698,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(ets_spec::group());
     cases.extend(ordered_walk::group());
     cases.extend(proc_signals::group());
+    cases.extend(monitor_tag::group());
     cases.extend(re::group());
     cases.extend(proc_control::group());
     cases.extend(system_info::group());
@@ -713,6 +721,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(ram_file::group());
     cases.extend(inet_control::group());
     cases.extend(inet_write::group());
+    cases.extend(sendfile::group());
     cases
 }
 

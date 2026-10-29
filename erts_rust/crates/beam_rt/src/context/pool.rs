@@ -94,8 +94,46 @@ impl RuntimeContext<'_> {
     /// preflight already reported ([`copy_shortfall_words`]) — never by a second traversal — and
     /// the copy is retried against the fresh region. Region replacement never moves a term, so
     /// everything the store already held stays valid (see [`Runtime::grow_eval_heap`]).
-    pub(super) fn move_result_into_runtime_store(&mut self, term: Eterm) -> Option<Eterm> {
+    pub(super) fn move_result_into_runtime_store(
+        &mut self,
+        term: Eterm,
+        pool: Option<&beam_alloc::Heap>,
+    ) -> Option<Eterm> {
         let RuntimeContext { runtime, .. } = self;
+        // THE SHORT-CIRCUIT (store arm, [`super::calls::dest`]): the copy has exactly one job —
+        // move the result **off** the pooled region the call allocated from, because the tail
+        // rewinds that region once this returns. Two answers mean there is nothing to move:
+        //
+        // * the root already lives in this store (the live `eval_heap` region, or one a growth
+        //   step retired), so copying it would only replace a live, store-owned object by a
+        //   structural twin;
+        // * `pool` is known and the root lies on **no pooled region at all**, so the graph it
+        //   reaches predates this call and the rewind cannot invalidate a word of it. This is the
+        //   arm that keeps a no-op container BIF's term identity observable on the
+        //   `-eval`/`-s`/`-run` route (`erts_debug:same(maps:put(a,V,M), M)` ⇒ `true`), where the
+        //   evaluator's own containers stand on the engine **arena**, not on this store.
+        //
+        // `pool == None` is the caller saying it cannot vouch for the region the result came from
+        // (the aliased-ETS `TermStore`, the `system_info` scratch region): then only the store half
+        // can answer, and the copy runs as it always did.
+        //
+        // The escape-store descent gate is opened exactly as on the copy path below: the store is
+        // outside every process's scanned heap, so a handed-through container must keep the
+        // over-approximate "an escaped store may hold roots" latch set just the same.
+        let nothing_to_move = match pool {
+            // Known region: hand through what the store already holds, and anything that is not on
+            // a pooled region.
+            Some(pool) => {
+                super::calls::dest::store_holds(runtime, term)
+                    || !super::calls::dest::pool_holds(runtime, pool, term)
+            }
+            // Unknown origin: only the store half can answer.
+            None => super::calls::dest::store_holds(runtime, term),
+        };
+        if nothing_to_move {
+            runtime.note_escaped_store_roots(term);
+            return Some(term);
+        }
         let needed = match copy_result_fresh(
             &mut runtime.eval_heap,
             &mut runtime.eval_off_heap,

@@ -1205,7 +1205,10 @@ impl RuntimeContext<'_> {
         for watcher in snapshot.monitored_by.iter().rev() {
             list = scratch.cons(*watcher, list)?;
         }
-        match self.rehome_container_result(list) {
+        // `None`: the list stands on a local **scratch** region, never on the call's pooled BIF
+        // heap, so the copy-out's "nothing to move" question cannot be answered from a pool and
+        // the result is always copied onto a destination that outlives this function.
+        match self.rehome_container_result(list, None) {
             Some(copied) => Ok(copied),
             // Unreachable in practice: a refusal means the copier rejected a graph this runtime
             // just built, or a destination that could not be grown. The scratch words are freed
@@ -1274,7 +1277,10 @@ impl RuntimeContext<'_> {
         for linked in snapshot.links.iter().rev() {
             list = scratch.cons(*linked, list)?;
         }
-        match self.rehome_container_result(list) {
+        // `None`: the list stands on a local **scratch** region, never on the call's pooled BIF
+        // heap, so the copy-out's "nothing to move" question cannot be answered from a pool and
+        // the result is always copied onto a destination that outlives this function.
+        match self.rehome_container_result(list, None) {
             Some(copied) => Ok(copied),
             // Unreachable in practice: a refusal means the copier rejected a graph this runtime
             // just built, or a destination that could not be grown. The scratch words are freed

@@ -160,6 +160,7 @@ use crate::error;
 use crate::runtime::Runtime;
 
 mod advise;
+mod readahead;
 mod sendfile;
 
 pub(crate) use advise::serves_local_call;
@@ -226,6 +227,14 @@ impl RuntimeContext<'_> {
         let id = reference.id();
         let descriptor = self.build_descriptor(&modes, handle, id)?;
         self.runtime.open_files_mut().insert(id, file);
+        // A read-shaped descriptor owns a real `prim_buffer` queue for its read-ahead window
+        // (`build_fd_data/5`'s `r_buffer => prim_buffer:new()`), keyed by the **descriptor id**
+        // so `close/1` retires it with the host file. A write-only descriptor has neither.
+        if modes.read_shape() {
+            self.runtime
+                .buffers_mut()
+                .insert(id, crate::native::prim_buffer::PrimBuffer::new());
+        }
         self.ok_tuple(descriptor)
     }
 
@@ -261,16 +270,31 @@ impl RuntimeContext<'_> {
             ReadSize::BadArg => return self.error_tuple("badarg"),
             ReadSize::EInval => return self.error_tuple("einval"),
         };
+        // `read_1/5`'s read-ahead arms (`prim_file.erl:180-191`): a queue that already holds the
+        // asked-for bytes answers from it without a host read, and a partial queue is
+        // concatenated with a fresh host read.
+        let buffered = self.readahead_size(descriptor.id);
+        if buffered >= count {
+            let bytes = self.take_readahead(descriptor.id, count);
+            return self.binary_answer(&bytes);
+        }
+        let mut prefix = Vec::new();
+        if buffered > 0 {
+            prefix = self.take_readahead(descriptor.id, buffered);
+        }
+        let wanted = count - prefix.len();
         // The descriptor borrow stays inside the `match` statement: the `File` is never
         // held across a heap-borrowing `self` call.
         let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
             None => None,
-            Some(file) => Some(read_extent(file, count)),
+            Some(file) => Some(read_extent(file, wanted)),
         };
         let Some(read) = outcome else {
             return self.error_tuple("einval");
         };
         match read {
+            // `read_1/5` answers the buffered part when the host read drains (`:187`).
+            Ok(bytes) if bytes.is_empty() && !prefix.is_empty() => self.binary_answer(&prefix),
             // A drained descriptor answers the bare atom `eof` (`am_eof`, `:653-655`) —
             // but only a **positive** request can drain: a zero-byte read is `{ok,<<>>}`
             // wherever the descriptor stands, exactly as `read_1/5`'s zero-size head is.
@@ -279,11 +303,16 @@ impl RuntimeContext<'_> {
             // `beam_codec::term::make_binary` `prim_file:read_file/1` uses (and, unlike
             // `beam_engine::terms::make_heap_binary`, with no 64-byte on-heap limit).
             Ok(bytes) => {
-                let contents = beam_codec::term::make_binary(self.eval_heap(), &bytes)?;
-                self.ok_tuple(contents)
+                prefix.extend_from_slice(&bytes);
+                self.binary_answer(&prefix)
             }
             Err(error) => self.error_tuple_for(&error),
         }
+    }
+    /// `{ok, Binary}` for `bytes` on the runtime's long-lived `-eval` heap.
+    fn binary_answer(&mut self, bytes: &[u8]) -> Result<Eterm> {
+        let contents = beam_codec::term::make_binary(self.eval_heap(), bytes)?;
+        self.ok_tuple(contents)
     }
 
     // -- prim_file:write/2 ----------------------------------------------------
@@ -344,6 +373,9 @@ impl RuntimeContext<'_> {
         };
         self.check_owner(&descriptor)?;
         let closed = self.runtime.open_files_mut().remove(&descriptor.id).is_some();
+        // The descriptor's read-ahead queue goes with it (a write-only descriptor has none, so
+        // the removal is a no-op there).
+        self.runtime.buffers_mut().remove(&descriptor.id);
         if closed {
             self.ok_atom()
         } else {
@@ -379,17 +411,21 @@ impl RuntimeContext<'_> {
         let Some(seek) = self.seek_target(location) else {
             return self.error_tuple("badarg");
         };
+        // `position_1/3` wipes the read-ahead queue (`prim_file.erl:330`), and `position/2`'s
+        // `{cur, Offset}` head first shifts the offset back by the queued byte count — the host
+        // cursor runs exactly that far ahead of the logical position (`:307-311`).
+        let buffered = self.readahead_size(descriptor.id);
+        self.wipe_readahead(descriptor.id);
         // `SeekFrom::Start` is `u64`-only, so a negative `bof` offset never reaches the host
         // — it is the `lseek(SEEK_SET, -1)` `EINVAL` the oracle reports.
         let seek = match seek {
             SeekTarget::Bof(offset) if offset < 0 => return self.error_tuple("einval"),
             SeekTarget::Bof(offset) => SeekFrom::Start(offset as u64),
-            SeekTarget::Cur(offset) => SeekFrom::Current(offset),
+            SeekTarget::Cur(offset) => {
+                SeekFrom::Current(offset - i64::try_from(buffered).unwrap_or(i64::MAX))
+            }
             SeekTarget::Eof(offset) => SeekFrom::End(offset),
         };
-        // `position_1/3` wipes the read buffer first; the oracle's `prim_buffer:wipe/1`
-        // only resets the (dead, see the module docs) read-ahead buffer, so the seek is the
-        // whole observable effect.
         let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
             None => None,
             Some(file) => Some(match file.seek(seek) {
@@ -990,10 +1026,16 @@ impl RuntimeContext<'_> {
         let mut handle = false;
         let mut owner = None;
         let mut id = None;
+        let mut read_ahead = 0;
         for (key, value) in terms::map_entries(data).ok()? {
             match self.atom_name(key).as_deref() {
                 Some("handle") => handle = true,
                 Some("owner") => owner = Some(value),
+                Some("r_ahead_size") => {
+                    if is_small(value) && signed_value(value) >= 0 {
+                        read_ahead = usize::try_from(signed_value(value)).map_or(0, |size| size);
+                    }
+                }
                 Some(REGISTRY_ID_KEY) => {
                     if !is_small(value) || signed_value(value) < 0 {
                         return None;
@@ -1009,6 +1051,7 @@ impl RuntimeContext<'_> {
         Some(Descriptor {
             id: id?,
             owner: owner?,
+            read_ahead,
         })
     }
 
@@ -1029,7 +1072,15 @@ impl RuntimeContext<'_> {
     ///
     /// The `handle` entry is the reference minted for this file, the `owner` entry this
     /// process's own pid, and [`REGISTRY_ID_KEY`] the runtime-table key; the **read shape**
-    /// additionally carries the `r_buffer` marker and `r_ahead_size`.
+    /// additionally carries `r_buffer` and `r_ahead_size`.
+    ///
+    /// `r_buffer` is the **same reference** as `handle`, and the queue registered under that
+    /// reference's id is the descriptor's read-ahead buffer ([`super::prim_buffer`]). The
+    /// oracle mints a second reference for it (`build_fd_data/5`'s `prim_buffer:new()` calls
+    /// `enif_make_resource`), so `erlang:display(Fd)` shows two distinct `#Ref<…>`s there and
+    /// one here — the descriptor's data map is a private field, and sharing the id is what keeps
+    /// the queue and the host file on **one** table key, so `close/1` cannot leak either half
+    /// (see the module docs' *Documented divergences*).
     fn build_descriptor(&mut self, modes: &OpenModes, handle: Eterm, id: u64) -> Result<Eterm> {
         let id_value = i64::try_from(id).map(make_small).map_err(|_| {
             error::unsupported("prim_file:open/2: file handle id beyond the immediate range")
@@ -1041,8 +1092,7 @@ impl RuntimeContext<'_> {
             (self.atom(REGISTRY_ID_KEY)?, id_value),
         ];
         if modes.read_shape() {
-            let (_, buffer) = self.mint_reference()?;
-            pairs.push((self.atom("r_buffer")?, buffer));
+            pairs.push((self.atom("r_buffer")?, handle));
             pairs.push((self.atom("r_ahead_size")?, make_small(modes.read_ahead)));
         }
         // Intern the two name atoms **before** taking the table handle below.
@@ -1208,6 +1258,9 @@ struct Descriptor {
     id: u64,
     /// The pid `open/2` recorded, compared against the caller's own.
     owner: Eterm,
+    /// The descriptor's `r_ahead_size` (`0` for the write shape, which carries none) — the chunk
+    /// `read_line/1` reads (`prim_file/readahead.rs`).
+    read_ahead: usize,
 }
 
 /// The `Data` map of a `#file_descriptor{}` argument, or `None` when the term is not a
@@ -1444,10 +1497,12 @@ fn ipread(file: &File, pointer_offset: u64, max_payload: i64) -> io::Result<IpRe
 }/// The flattened bytes of a `write/2` iodata argument — `erlang:iolist_to_iovec/1`'s walk
 /// (`erl_bif_binary.c`), `None` for the `badarg` it raises.
 ///
-/// Accepted: a byte-aligned binary (its bytes), a byte (`0..=255`), and a proper list of
-/// those at any nesting. Rejected: any other term, an integer outside a byte's range, an
-/// improper tail, a non-byte-aligned bitstring, and a nesting deeper than
-/// [`MAX_IODATA_DEPTH`].
+/// Accepted: a byte-aligned binary (its bytes), a byte (`0..=255`), and a list of those at any
+/// nesting — **including** an improper list whose tail is a byte-aligned binary, which
+/// `iolist()` allows (`[<<"ab">> | <<"cd">>]`) and `dets`' own file header relies on
+/// (`dets_v9:init_file/…`'s `{0, [FileHeader | <<0:…>>]}`). Rejected: any other term, an
+/// integer outside a byte's range, any other improper tail, a non-byte-aligned bitstring, and a
+/// nesting deeper than [`MAX_IODATA_DEPTH`].
 ///
 /// The walk is **iterative** — an explicit pending list carrying each element's nesting
 /// depth — so no argument can exhaust the Rust stack. Elements are pushed in reverse so the
@@ -1484,6 +1539,12 @@ fn flatten_iodata(term: Eterm) -> Option<Vec<u8>> {
                 break;
             }
             if !is_list(cell) {
+                // `iolist()`'s one improper tail: a byte-aligned binary, whose bytes follow
+                // every element of the list (`[<<"ab">> | <<"cd">>]` is `"abcd"`).
+                if terms::binary_bytes(cell).is_ok() {
+                    cells.push(cell);
+                    break;
+                }
                 return None;
             }
             cells.push(terms::cons_head(cell).ok()?);

@@ -41,7 +41,7 @@
 //! | `compile_info` | not built by a C toolchain, so it has no `ldflags`/`cflags`/`config.h` triple |
 //! | `ethread_info` / `ethread_used_tse` | no C ethread library (and no thread-specific-data slots) |
 //! | `constant_pool_support` / `beam_jump_table` | no ERTS constant-pool code loading, and no `NO_JUMP_TABLE` build switch to report |
-//! | `snifs` / `taints` | no static NIF table, and no NIF-taint tracking |
+//! | `taints` | no NIF-taint tracking |
 //! | `emu_args` | the emulator argument vector is not exposed |
 //! | `reader_groups_map` / `decentralized_counter_groups_map` | no reader groups and no decentralized counters to distribute |
 //! | `max_integer` | no `BIG_ARITY_MAX` bignum-arity cap |
@@ -104,7 +104,6 @@ pub(crate) fn try_value(key: &str, _rt: &Runtime) -> Option<Result<InfoValue>> {
         "beam_jump_table" => {
             "this runtime has no ERTS jump-table dispatch build switch (NO_JUMP_TABLE) to report"
         }
-        "snifs" => "this runtime publishes no static NIF table",
         "taints" => "this runtime does not track the taints loading a NIF would record",
         "emu_args" => "this runtime does not expose an emulator argument vector",
         "reader_groups_map" => "this runtime has no reader groups to distribute over schedulers",

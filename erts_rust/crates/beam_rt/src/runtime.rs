@@ -384,6 +384,22 @@ pub struct Runtime {
     /// the measurement [`Runtime::bif_nested_heap_words`]' self-tuning is derived from, and the
     /// figure that says how much of a nested region's capacity was actually bought.
     pub(crate) bif_nested_peak_words: usize,
+    /// The largest number of words one **outermost** registered BIF call has ever handed out of its
+    /// region at once (`used() - mark` at the call's tail), and therefore the reservation
+    /// [`RuntimeContext::take_bif_frontier`](crate::context::RuntimeContext::take_bif_frontier)
+    /// makes before the next one — `crate::context::calls::frontier`'s learned half.
+    ///
+    /// It is a **per-call demand**, not a region high-water mark: [`Runtime::bif_nested_peak_words`]
+    /// already tracks the latter for region sizing, and using it here would ratchet the reservation
+    /// toward a whole region's capacity because `peak_used()` includes the words a *previous*,
+    /// non-rewinding caller still owns below this call's mark.
+    ///
+    /// It never shrinks (a `max`), so the cost of learning is the one growth step that follows it.
+    pub(crate) bif_frontier_need_outer: usize,
+    /// [`Runtime::bif_frontier_need_outer`] for a **nested** call (one that found the pool holding
+    /// another call's region). Kept apart so a large outermost demand does not inflate every nested
+    /// region's reservation, which is the retention the depth-aware sizing exists to avoid.
+    pub(crate) bif_frontier_need_nested: usize,
     /// How many pooled BIF heaps are **out on loan** right now.
     ///
     /// It is the runtime's current **nested-call depth**: [`Runtime::take_bif_heap`] adds one per
@@ -1166,6 +1182,15 @@ pub struct Runtime {
     /// Owned by the `Runtime` (not a `thread_local!`) because several runtimes can live in one
     /// thread.
     prim_tty_handles: HashMap<u64, i32>,
+    /// The live `prim_buffer` byte queues (contract A.7) — each entry maps the reference id
+    /// minted by `prim_buffer:new/0` (`src/native/prim_buffer.rs`) to its queue.
+    ///
+    /// The handle is the oracle's opaque NIF resource (`#Ref<…>`-shaped and unobservable); a
+    /// term whose id is not in this table is the C's `enif_get_resource` failure (`badarg`).
+    /// `prim_file`'s descriptors also own a queue here (keyed by the **descriptor id**, so a
+    /// `prim_file:close/1` removes both halves at once). Owned by the `Runtime` (not a
+    /// `thread_local!`) because several runtimes can live in one thread.
+    buffers: HashMap<u64, crate::native::prim_buffer::PrimBuffer>,
     /// The **native `file_server_2` service** and its live io-devices (contract A.9) — see
     /// [`crate::native::file_server`].
     ///
@@ -1597,6 +1622,8 @@ impl Runtime {
             bif_heap_words: heap_words,
             bif_nested_heap_words: NESTED_BIF_HEAP_SEED_WORDS.min(heap_words),
             bif_nested_peak_words: 0,
+            bif_frontier_need_outer: 0,
+            bif_frontier_need_nested: 0,
             bif_heaps_taken: 0,
             scheduler: Scheduler::new(),
             runner_state: RunnerState::default(),
@@ -1667,6 +1694,7 @@ impl Runtime {
             perf_map,
             open_files: HashMap::new(),
             prim_tty_handles: HashMap::new(),
+            buffers: HashMap::new(),
             file_services,
             net_kernel,
             boot_script_id: None,
@@ -2368,6 +2396,18 @@ impl Runtime {
     /// own docs and [`crate::native::prim_tty`].
     pub(crate) fn prim_tty_handles_mut(&mut self) -> &mut HashMap<u64, i32> {
         &mut self.prim_tty_handles
+    }
+    /// The live `prim_buffer` byte-queue table (contract A.7), keyed by the reference id the
+    /// buffer handle term carries — and, for a `prim_file` descriptor, by the descriptor's own
+    /// id so `prim_file:close/1` retires both the host file and its read buffer.
+    ///
+    /// `prim_buffer:new/0` inserts the minted handle's queue and every other stub looks it up (a
+    /// miss is the C's `enif_get_resource` failure, `badarg`). See the field's own docs and
+    /// [`crate::native::prim_buffer`].
+    pub(crate) fn buffers_mut(
+        &mut self,
+    ) -> &mut HashMap<u64, crate::native::prim_buffer::PrimBuffer> {
+        &mut self.buffers
     }
 
     /// Rewinds the **scratch** heap [`Runtime::info_heap`] to its base for the next

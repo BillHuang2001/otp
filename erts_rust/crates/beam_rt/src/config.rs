@@ -443,29 +443,33 @@ pub enum Action {
     /// Evaluate the documented integer-expression subset and **discard** the result
     /// (`-eval Expr`). Real `erl -eval '2+3'` prints nothing and exits 0.
     Eval(String),
-    /// Apply `module:function(AtomArgs…)` and discard the result (`-s Mod Func …`).
+    /// Apply `module:function([AtomArgs…])` and discard the result (`-s Mod Func …`).
     ///
-    /// The arguments are the **atom names** given on the command line, exactly as
-    /// real `erl` treats them.
+    /// ERTS applies **arity 1** whose one argument is the **list** of the tokens on the
+    /// command line, as **atoms**; with no token it applies arity 0 (`init`'s
+    /// `run_args_to_start_instructions/2`, `erts/preloaded/src/init.erl:607-624`). So
+    /// `-s Mod F x y` is `Mod:F(['x','y'])`, never `Mod:F(x, y)`.
     Apply {
         /// The module to call into.
         module: String,
         /// The function to call.
         function: String,
-        /// The atom arguments, verbatim from the command line.
+        /// The argument **tokens**, verbatim from the command line; they become the one
+        /// list argument when the action runs.
         args: Vec<String>,
     },
-    /// Apply `module:function(StringArgs…)` and discard the result
+    /// Apply `module:function([StringArgs…])` and discard the result
     /// (`-run Mod Func …`).
     ///
-    /// Unlike `-s`, every argument is a **string** (an Erlang char list) — real
-    /// `erl` semantics.
+    /// The same single-list shape as `-s`, except every token is a **string** (an Erlang
+    /// char list) instead of an atom — real `erl` semantics.
     Run {
         /// The module to call into.
         module: String,
         /// The function to call.
         function: String,
-        /// The string arguments, verbatim from the command line.
+        /// The argument **tokens**, verbatim from the command line; each becomes a string
+        /// element of the one list argument when the action runs.
         args: Vec<String>,
     },
     /// Load a `.beam` file, run `module:function/arity` and print the result
