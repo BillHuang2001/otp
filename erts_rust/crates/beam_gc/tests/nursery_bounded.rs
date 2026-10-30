@@ -281,22 +281,30 @@ fn a_live_heavy_round_grows_the_nursery_to_the_live_set_target() {
                 CollectionKind::Minor => MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * target),
                 CollectionKind::Major => YOUNG_SHRINK_FACTOR * target,
             };
+            // A minor's shrink arm is gated by the mature generation's capacity: when the nursery
+            // is no larger than the mature space (the legacy C's `HEAP_SIZE > OLD_HEND - OLD_HEAP`
+            // conjunct), the next minor *keeps* it instead of handing the fullsweep-sized nursery
+            // straight back — so a kept capacity may legitimately sit above the band.
             assert!(
-                cap <= band,
+                cap <= band || (cap == previous && cap <= c.mature_capacity_words()),
                 "{kind:?} round {round}: {cap} words is past the {band}-word band around its \
-                 {target}-word target"
+                 {target}-word target and is not a young-vs-old keep of the previous \
+                 {previous}-word nursery"
             );
             // The rule is a fixed point at the live set it measured: a collection can never be
-            // the start of a per-collection ratchet.
+            // the start of a per-collection ratchet. The one exception is the young-vs-old keep
+            // above — a deliberate non-shrink the plain rule does not reproduce.
             let reapplied = match collection.kind {
                 CollectionKind::Minor => policy.young_after_collection(cap, promoted),
                 CollectionKind::Major => policy.young_after_fullsweep(cap, promoted),
             };
-            assert_eq!(
-                reapplied, cap,
-                "{kind:?} round {round}: re-applying the rule at {cap} words / {promoted} live \
-                 words answered {reapplied}, so {cap} is not a fixed point"
-            );
+            if cap <= band {
+                assert_eq!(
+                    reapplied, cap,
+                    "{kind:?} round {round}: re-applying the rule at {cap} words / {promoted} live \
+                     words answered {reapplied}, so {cap} is not a fixed point"
+                );
+            }
             young_caps.push(cap);
             targets.push(target);
         }
@@ -309,11 +317,15 @@ fn a_live_heavy_round_grows_the_nursery_to_the_live_set_target() {
         );
 
         // ... the nursery followed it to the final round's target — the capacity the rule
-        // answers for the live set that round measured ...
-        assert_eq!(
-            *young_caps.last().expect("non-empty"),
-            *targets.last().expect("non-empty"),
-            "{kind:?}: the nursery settles on the live set's target, got {young_caps:?}"
+        // answers for the live set that round measured — or, when the final round is a minor
+        // that keeps the fullsweep-sized nursery (the young-vs-old gate), the capacity it
+        // already had.
+        let final_cap = *young_caps.last().expect("non-empty");
+        let final_target = *targets.last().expect("non-empty");
+        assert!(
+            final_cap == final_target || final_cap == young_caps[young_caps.len() - 2],
+            "{kind:?}: the nursery settles on the live set's target or keeps the \
+             fullsweep-sized nursery it already had, got {young_caps:?}"
         );
         // ... and it never ran ahead of the whole live set's scale: every capacity the nursery
         // ever took is a live-set target of some round (or the birth size).
@@ -386,7 +398,7 @@ fn a_garbage_heavy_collection_shrinks_the_nursery() {
 
     let big = HeapPolicy {
         initial_young_words: 4096,
-        initial_mature_words: 4096,
+        initial_mature_words: 1024,
         ..policy()
     };
 
