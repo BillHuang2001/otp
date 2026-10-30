@@ -243,6 +243,38 @@ impl Fixture {
             )
         }
     }
+    /// The **capacity-carrying** accumulator shape (`bs_init_writable`): a 0-bit
+    /// `[BinRef][ErlSubBits]` window over a `RefcBinary::with_capacity` payload,
+    /// together with the payload's `capacity` and `reserved` words — the two words
+    /// whose *difference* is the BIF-layer divergence pinned separately.
+    ///
+    /// The words are read before the handle joins `payloads` (as in `Fixture::refc`),
+    /// so the returned `(term, capacity, reserved)` describes the very payload the term
+    /// names; the 0-bit window is exactly C's `erts_bs_init_writable` shape
+    /// (`build_writable_bitstring` passes `current_size = 0`).
+    fn refc_accumulator(&mut self, capacity: usize) -> (Eterm, usize, usize) {
+        let payload = RefcBinary::with_capacity(capacity).expect("the off-heap payload allocates");
+        let cap = payload.capacity();
+        let reserved = payload.reserved_bytes();
+        let base = payload.data_ptr();
+        self.payloads.push(payload);
+        // SAFETY: as `refc` — `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8)
+        // exclusively-owned, writable words for the pair; `base` is the first byte of the
+        // (now fixture-owned) payload's live data area and the 0-bit window covers nothing.
+        let hp = unsafe { self.heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
+            .expect("the 8-word pair fits");
+        let term = unsafe {
+            beam_term::refc::write_refc_binary(
+                hp,
+                base.cast::<Eterm>(),
+                core::ptr::null_mut(),
+                base,
+                0,
+                0,
+            )
+        };
+        (term, cap, reserved)
+    }
 }
 /// The bytes of a byte-aligned binary result.
 fn bytes_of(term: Eterm) -> Vec<u8> {
@@ -871,6 +903,90 @@ fn referenced_byte_size_answers_the_parent_payload_for_a_real_refc_window() {
     let list = fx.ints(&[1, 2]);
     let list = fx.list(&list);
     fx.badarg("binary", "referenced_byte_size", &[list]);
+}
+/// The divergence-class-D2 pin at the **BIF layer**: a real 1025-byte refc parent, its
+/// `binary:part/3` windows driven through the registry (no host copy-out), must answer
+/// the parent payload's width — `{byte_size 510, referenced 1025}` for the oracle's
+/// `binary:part(<<"z", (binary:copy(<<255>>,1024))/binary>>, 1, 510)`.
+///
+/// This is the `br != NULL` arm C's `referenced_byte_size` walks
+/// (`ERTS_GET_BITSTRING_REF` → `(br->val)->orig_size`): the answer is a property of the
+/// *parent payload*, not of the window, so a 65-byte window and a window-of-a-window
+/// both report the root parent's 1025. The host's later flattening of the window (the
+/// program-level `{510,510}`) is `beam_rt`/`beam_message`'s result copy-out, not this
+/// crate.
+#[test]
+fn binary_part_of_a_1025_byte_refc_parent_answers_the_parent_payload_width() {
+    let mut fx = Fixture::new();
+    let parent = fx.refc(&oracle_payload(), 0, 1025 * 8);
+    // The oracle's own row: `binary:part(B, 1, 510)` is 510 bytes that still reference
+    // the 1025-byte parent payload.
+    let part = fx.ok("binary", "part", &[parent, make_small(1), make_small(510)]);
+    assert_eq!(bytes_of(part), vec![255u8; 510], "the part's bytes");
+    assert_eq!(
+        signed_value(fx.ok("erlang", "byte_size", &[part])),
+        510,
+        "the part's own byte size"
+    );
+    assert_eq!(
+        referenced(&mut fx, part),
+        1025,
+        "the part must reference the parent payload's 1025 bytes"
+    );
+    // A 65-byte window (520 bits, the first size above the 512-bit on-heap arm) over the
+    // same parent references it too.
+    let part65 = fx.ok("binary", "part", &[parent, make_small(0), make_small(65)]);
+    assert_eq!(referenced(&mut fx, part65), 1025, "a 65-byte window reports 1025");
+    // A window of a window composes to the **root** parent's payload width.
+    let wow = fx.ok("binary", "part", &[part, make_small(254), make_small(100)]);
+    assert_eq!(bytes_of(wow), vec![255u8; 100], "the window-of-window bytes");
+    assert_eq!(
+        signed_value(fx.ok("erlang", "byte_size", &[wow])),
+        100,
+        "the window-of-window byte size"
+    );
+    assert_eq!(
+        referenced(&mut fx, wow),
+        1025,
+        "a part of a part reports the root parent's width"
+    );
+}
+/// The one BIF-layer misreport this crate can *observe* but cannot fix: for a
+/// capacity-carrying payload (`bs_init_writable`'s `with_capacity` shape) the
+/// `capacity` word and the allocated width diverge, and
+/// `crate::access::refc_payload_bytes` reads `capacity` while C's `orig_size` is the
+/// **allocated** width.
+///
+/// C's `Binary.orig_size` is "the size of `orig_bytes`" (`erl_binary.h:75`) — the byte
+/// count `erts_bin_nrml_alloc`/`erts_bin_realloc` were given, i.e. the allocation's
+/// width. The frozen analogue is `beam_alloc::RefcBinary::reserved_bytes` ("the payload
+/// allocation's actual size"), **not** `beam_alloc::payload_capacity` (the writable
+/// ceiling a later in-place grow can still raise). A `with_capacity(1024)` payload has
+/// `capacity == 1024` but `reserved > capacity` (the 4x `DEFAULT_RESERVATION_FACTOR`
+/// reservation), so the BIF layer's `capacity` answer diverges from the oracle there.
+///
+/// The correction needs a raw-pointer accessor `beam_alloc::payload_reserved_bytes(*const
+/// u8) -> usize` (the sibling of `beam_alloc::payload_capacity`) because this crate only
+/// holds the live `BinRef.val` pointer, never a `RefcBinary` handle — a **`beam_alloc`
+/// sibling need**, reported rather than papered over here. This pin documents the current
+/// figure and the word it must flip to.
+#[test]
+fn a_with_capacity_accumulator_reads_capacity_not_the_allocated_width() {
+    let mut fx = Fixture::new();
+    let (term, capacity, reserved) = fx.refc_accumulator(1024);
+    assert!(
+        reserved > capacity,
+        "the divergence precondition: `with_capacity` reserves spare room, so the \
+         capacity word under-reports the allocated width"
+    );
+    // Current BIF-layer figure: `payload_capacity` = the `capacity` header word.
+    assert_eq!(
+        referenced(&mut fx, term),
+        capacity as i64,
+        "the BIF layer currently answers the payload's `capacity` word"
+    );
+    // The C-faithful figure is the allocated width (`reserved`), which is unreachable
+    // from the raw `BinRef.val` pointer without a new `beam_alloc` accessor.
 }
 /// The `binary:copy` family's own figures, and the one place a *whole* binary past the
 /// 64-byte limit could report a different width: the crate keeps every binary it builds
