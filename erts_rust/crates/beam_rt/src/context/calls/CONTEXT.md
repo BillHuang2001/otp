@@ -295,3 +295,26 @@ stacktrace with the opaque payload dropped (`Runtime::degrade_live_reason`, reco
 two refusal classes are `../../../runtime/CONTEXT.md` *the raise's escape boundary*; the producer
 defect (a caught reason whose graph outlives the region that held it) is unchanged and still the
 real fix.
+
+## D1c (`binary_module_SUITE:error_info/1` at N=70/N=73) — the death-boundary reason is `'exit <structured reason>'`
+Same producer defect as D1, surfaced at the **death boundary** rather than the refusal: the child
+`ct_runner` case exits `exit({ct_case_result,{ok,ok}})`, `beam_bifs`' `exit/1` (`reason.rs::raise`
+→ `error::raise_term`) attaches the tuple as `Raise::live_reason` (a raw `Eterm` into the child's
+young heap), and by the time the runner's `Err` arm calls `Runtime::stabilize_error_live_reason`
+(`run.rs:1749`) that word is **stale** — measured under `BEAM_RT_BOOT_TRACE=1` the raw word is a
+boxed pointer (`0x7…`) whose unbounded `size_object_bounded` prices as a ~4.4e13-word garbage DAG
+("term graph exceeds the size limit"), so the price gate refuses, the payload is dropped, and
+`runner/reason.rs`' `exit_reason` falls back to `intern(reason.to_string())` = `'exit <structured
+reason>'`. The oracle answers `{ok,ok}`.
+
+Root cause: a GC relocates the child's young heap **inside the engine**, between `beam_bifs`
+attaching `live_reason` and the runner seeing the `Err` — the engine's BIF-error funnel
+(`beam_engine/src/machine/catch.rs::raise_bif_error` / `interpreter/bif.rs`) does not park the
+raise's `live_reason` term into the machine's published root set the way `pending_exception`'s
+reason is parked (`beam_engine/src/machine/CONTEXT.md` *the pending exception's reason is parked*),
+so a collection during `call_ext`/`call_ext_only` propagation relocates the heap out from under the
+raw word. The fix belongs at that producer seam (beam_engine — sibling, escalate writes to the
+parent): root `live_reason` (and the `saved_args`/`error_info`/`supplied_trace` siblings) across the
+raise-funnel's allocation doors exactly as `pending_exception` is. The escape-boundary copy in
+`beam_rt` is already correct — it faithfully degrades a term that is already dangling, and a fix
+there would only mask a term the producer never rooted.
