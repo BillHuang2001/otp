@@ -66,13 +66,13 @@
 //! growth serves many calls. A `+hmax` (`max_heap_words`) ceiling still refuses growth below it,
 //! exactly as before: that case is a configured limit, and the call keeps today's `system_limit`.
 //!
-//! # What is *not* done: a mid-BIF retry
+//! # The mid-BIF retry, and why it is one entry wide
 //!
 //! A BIF that exhausts the region raises `BeamError::Alloc(AllocKind::Heap)` — its words are gone
 //! with the `BifContext` and there is no resume point — so the only recovery shape available here
-//! would be to re-run the whole BIF on a wider frontier. That is **not** implemented, because no
-//! seam exposes "this BIF has not yet mutated observable state", and a large share of the
-//! registry *does* mutate it before it can fail:
+//! is to re-run the whole BIF on a wider frontier. That is **not** safe in general, because no seam
+//! exposes "this BIF has not yet mutated observable state", and a large share of the registry
+//! *does* mutate it before it can fail:
 //!
 //! * the `SendHook`/`PortHook` families (`erlang:send/2,3`, `!`, `port_command/2,3`) — a message
 //!   sent twice is a duplicated signal the oracle never produces;
@@ -89,18 +89,24 @@
 //!   `lists`/`maps` BIFs, whose fun may itself send or write.
 //!
 //! The remaining ones — the pure constructors (`lists:duplicate/2`, `make_tuple/2`,
-//! `binary:copy/2`, `lists:seq/2`, the `maps:*` rebuild arms) — *are* retry-safe in isolation, but
-//! keying a retry on a BIF roster would put the answer in a hand-maintained table that the next
-//! BIF added to `beam_bifs` silently lands on the wrong side of. So the reservation is what must
-//! be right, and it is: with the learned figure, the measured shape reserves its own demand and
-//! never re-fails.
+//! `binary:copy/2`, `lists:seq/2`, the `maps:*` rebuild arms) — *are* retry-safe in isolation. Of
+//! those, exactly **one** is retried: `super::is_retryable_pure_constructor` admits
+//! `lists:duplicate/2` only, the shape the D1 defect nests behind a higher-order `lists` BIF (a
+//! fresh 1 MiB nested region whose entitlement cannot foresee a single call that needs the whole
+//! region and more). Keying the retry on a sweeping "all pure constructors" roster would put the
+//! answer in a hand-maintained table that the next BIF added to `beam_bifs` silently lands on the
+//! wrong side of — one provably-pure entry keeps the blast radius of a future effect-bearing
+//! addition at a single key. The retry delegates its growth to [`grown_capacity`], so a `+hmax`
+//! refusal is preserved, and it only ever fires on a **nested** region (`bif_heaps_taken >= 2`),
+//! never the configured outermost one.
 //!
 //! # The honest residual
 //!
 //! A **first** call whose demand exceeds the entitlement *and* whose region lacks that much free
-//! space still raises `error:system_limit` once; the demand is learned from the failure and every
-//! later call of that shape is reserved for. The entitlement (64 MiB of transient words in one
-//! call, or a quarter of a smaller region) is what makes that a rarity rather than the rule.
+//! space still raises `error:system_limit` once — except for the one retried constructor above. For
+//! every other shape the demand is learned from the failure and every later call is reserved for.
+//! The entitlement (64 MiB of transient words in one call, or a quarter of a smaller region) is
+//! what makes that a rarity rather than the rule.
 use crate::runtime::Runtime;
 /// The largest number of words a single call is guaranteed to find free in the region it is given,
 /// however large the region has grown.

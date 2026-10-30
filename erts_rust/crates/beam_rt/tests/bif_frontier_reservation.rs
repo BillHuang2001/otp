@@ -67,16 +67,19 @@
 //! host before and after the change, at a round budget four times the observed pre-fix failure
 //! point. The only nondeterminism the shape has is the very `error:system_limit` it forbids.
 //!
-//! # The documented residual (not asserted away)
+//! # The nested first-call gap, and the one retried constructor
 //!
-//! A **nested** run whose single call needs more than its whole seeded region still fails until
-//! the nested seed's own doubling climbs past it, because the learned figure saturates at the
-//! region's capacity and so cannot teach the reservation a demand the region cannot hold — e.g.
-//! `lists:map(fun(_) -> length(lists:duplicate(1 bsl E, gurka)) end, lists:seq(1,8))` against the
-//! 2^17-word nested seed fails its first call at `E = 17`, its first three at `E = 19`, and none
-//! at `E = 16` — **identically before and after this change** (a retry would be the only way to
-//! close it, and a retry is what the families above forbid). The cases here are therefore all
-//! outermost calls, which is the shape the defect report named.
+//! A **nested** run whose single call needs more than its whole seeded region cannot be taught by
+//! the learned figure — the learned demand saturates at the region's capacity, so the reservation
+//! can never foresee a call the region cannot hold (e.g. `lists:map(fun(_) ->
+//! length(lists:duplicate(1 bsl E, gurka)) end, lists:seq(1,8))` against the 2^17-word nested
+//! seed). `lists:duplicate/2` is the one exception: the registered-call tail now **retries** that
+//! single provably-pure constructor on a wider frontier when a **nested** call exhausts its region
+//! (`is_retryable_pure_constructor` in `src/context/calls.rs`), so the D1 shape —
+//! `lists:foreach(fun(_) -> length(lists:duplicate(N, x)) end, [1])` — returns `ok` for every `N`,
+//! where it used to raise a catchable `error:system_limit` for `N >= 65537`. The cases here remain
+//! all **outermost** calls, which is the shape the original defect report named; the nested retry
+//! is pinned by `a_large_list_built_inside_a_lists_foreach_fun_returns_ok`.
 //!
 //! # Budget
 //!
@@ -271,6 +274,25 @@ fn a_large_map_iterates_and_folds_like_the_oracle() {
         LARGE_MAP,
     );
     assert_prints(&probe, LARGE_MAP_GOLDEN, "the large-map walk");
+}
+/// The D1 shape: a large list built **inside a fun invoked by a higher-order `lists` BIF** — the
+/// nested-region first-call gap. `lists:foreach/2` takes the outermost region, its fun's
+/// `lists:duplicate/2` takes a fresh 1 MiB nested region, and a `200000`-element result (400 000
+/// words) needs more than the whole seed at once: the pure-constructor retry re-runs it on a wider
+/// frontier, so the call returns `ok` where it used to raise a catchable `error:system_limit` for
+/// `N >= 65537`. The oracle already returns `ok`, so `differential_eval` pins agreement in both
+/// exit code and stdout bytes.
+#[test]
+fn a_large_list_built_inside_a_lists_foreach_fun_returns_ok() {
+    const BANNER: &str = "bif_frontier_reservation";
+    let expr = "io:format(\"~p~n\", \
+                 [lists:foreach(fun(_) -> length(lists:duplicate(200000, x)) end, [1])]).";
+    let probe = support::differential_eval(
+        BANNER,
+        "a 200000-element list built inside a lists:foreach fun",
+        expr,
+    );
+    assert_prints(&probe, "ok", "the nested lists:foreach/duplicate shape");
 }
 /// The fixture the full 50-round probe runs: the pre-fix failure at round 4 came from exactly
 /// this shape (a spawned process, one `1 bsl 21` call per round, the failing iterations returned

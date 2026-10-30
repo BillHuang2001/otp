@@ -64,7 +64,7 @@ use std::rc::Rc;
 use beam_abi::nif::loader::NifCallError;
 use beam_alloc::Heap;
 use beam_bifs::{AtomInterner, BifContext, BifFn, TableRegistry};
-use beam_common::{BeamError, Result};
+use beam_common::{AllocKind, BeamError, Result};
 use beam_process::ProcessTable;
 use beam_term::{AtomTable, Eterm};
 
@@ -106,6 +106,24 @@ use super::runtime_hooks::RuntimeHooksBridge;
 #[inline(never)]
 fn cold_term_heap_limit(failure: BeamError) -> BeamError {
     error::enforce_term_heap_limit(failure)
+}
+
+/// Whether `(module, function, arity)` is a **pure constructor** registered BIF — one whose body
+/// is *only* building its result term on `ctx.heap()` from its arguments, so a mid-call
+/// [`AllocKind::Heap`](beam_common::AllocKind::Heap) exhaustion can be recovered by re-running the
+/// whole BIF on a wider frontier without repeating any observable side effect.
+///
+/// Membership must stay **deliberately conservative** and restricted to BIFs that provably do not
+/// intern atoms, read or mutate a seam (`tables`/`dict`/`port`/`send`/`persistent_term`/`nif`), or
+/// apply a fun argument — the exact set of effects a re-run would duplicate. Adding a key here for a
+/// BIF that later learns an effect would silently turn that effect into a doubled side effect, which
+/// is why the roster is one entry (`lists:duplicate/2`, the D1 repro's builder) rather than a
+/// sweeping "all pure constructors" list: every other such BIF already gets a reservation that
+/// covers its observed demand ([`frontier`]) before it runs, while this one is the shape a
+/// higher-order `lists` BIF nests behind a fresh, smallest-possible region whose entitlement cannot
+/// foresee a single call that exceeds the whole region.
+fn is_retryable_pure_constructor(module: &str, function: &str, arity: u32) -> bool {
+    matches!((module, function, arity), ("lists", "duplicate", 2))
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -332,7 +350,7 @@ impl<'a> RuntimeContext<'a> {
         // exactly `[mark..used)` (this call's own words) and keeps every word below it that
         // another owner still holds. `mark == 0` (a heap taken clean) makes that the plain
         // `reset()` it used to be. See [`Self::call_registered`]'s copy-out rule.
-        let mark = heap.used();
+        let mut mark = heap.used();
         if mark != 0 {
             perf_counters::bump(|c| &mut c.pool_dirty);
         }
@@ -404,70 +422,129 @@ impl<'a> RuntimeContext<'a> {
         if held_tables.is_some() {
             perf_counters::bump(|c| &mut c.tables_held);
         }
-        // The local-node identity: **this runtime's own node**, paired with its **live** creation,
-        // read per call and never snapshotted — see [`NodeIdentity`] and the longer note in
-        // [`Self::call_registered_full`], whose arms read the same pair the same way.
-        let mut local_node = NodeIdentity {
-            node: Some(self.runtime.local_node()),
-            creation: self.runtime.node_creation(),
-        };
-        let mut ports = RuntimePorts::new(Rc::clone(&ports_handle), Rc::clone(&atoms), self_pid);
-        let result = {
-            perf_counters::bump(|c| &mut c.arm_fun_caller);
-            let RuntimeContext {
-                runtime,
-                output,
-                mailbox_pid,
-                mailbox_table,
-                may_pump_scheduler,
-                current_module: caller_module,
-                engines,
-                // Neither latch can be armed across a dispatch, the memo is not consulted here,
-                // no registry is lent on this path and the copy-out hint is the process's own.
-                gc_armed: _,
-                suspend_requested: _,
-                dispatch_memo: _,
-                lent_tables: _,
-                copy_out_hint: _,
-            } = self;
-            // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies writes to
-            // the caller's sink (not stdout), and it inherits the caller's module name **borrowed**
-            // (never cloned) so a nested call still knows its call site.
-            let mut bridge = FunBridge {
-                runtime,
-                output: output.clone(),
-                mailbox_pid: *mailbox_pid,
-                mailbox_table: mailbox_table.as_deref_mut(),
-                may_pump_scheduler: *may_pump_scheduler,
-                current_module: caller_module.as_deref(),
-                engines: *engines,
+        // The local-node identity and the port provider are rebuilt **per attempt**, not per call,
+        // because a retry (below) re-enters the invoke block on a fresh frontier and must start
+        // from the same per-attempt state. The node identity is this runtime's own node, paired
+        // with its **live** creation and read per attempt, never snapshotted — see [`NodeIdentity`]
+        // and the longer note in [`Self::call_registered_full`], whose arms read the same pair the
+        // same way.
+        let result = loop {
+            let mut local_node = NodeIdentity {
+                node: Some(self.runtime.local_node()),
+                creation: self.runtime.node_creation(),
             };
-            let mut context = BifContext::new(&mut heap, &atoms, self_pid)
-                .with_table_aliasing(&alias)
-                .with_atom_interner(&mut pending)
-                .with_fun_caller(&mut bridge)
-                .with_port_hook(&mut ports)
-                .with_local_node(&mut local_node);
-            if let Some(sink) = output.as_mut() {
-                context = context.with_output(sink);
+            let mut ports =
+                RuntimePorts::new(Rc::clone(&ports_handle), Rc::clone(&atoms), self_pid);
+            let attempt = {
+                perf_counters::bump(|c| &mut c.arm_fun_caller);
+                let RuntimeContext {
+                    runtime,
+                    output,
+                    mailbox_pid,
+                    mailbox_table,
+                    may_pump_scheduler,
+                    current_module: caller_module,
+                    engines,
+                    // Neither latch can be armed across a dispatch, the memo is not consulted here,
+                    // no registry is lent on this path and the copy-out hint is the process's own.
+                    gc_armed: _,
+                    suspend_requested: _,
+                    dispatch_memo: _,
+                    lent_tables: _,
+                    copy_out_hint: _,
+                } = self;
+                // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies writes
+                // to the caller's sink (not stdout), and it inherits the caller's module name
+                // **borrowed** (never cloned) so a nested call still knows its call site.
+                let mut bridge = FunBridge {
+                    runtime,
+                    output: output.clone(),
+                    mailbox_pid: *mailbox_pid,
+                    mailbox_table: mailbox_table.as_deref_mut(),
+                    may_pump_scheduler: *may_pump_scheduler,
+                    current_module: caller_module.as_deref(),
+                    engines: *engines,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
+                    .with_atom_interner(&mut pending)
+                    .with_fun_caller(&mut bridge)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = held_tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                invoke_registered(bif, arity, &mut context, args)
+            };
+            // `ports` holds an `Rc<AtomTable>` clone ([`RuntimePorts::atoms`]), and it is declared
+            // **outside** the invoke block above, so it is still alive here. The tail's atom commit
+            // ([`CodeServer::intern_pending`]) only takes its append-only `Rc::get_mut` fast path
+            // while this runtime's code server is the table's **only** owner: an outstanding handle
+            // pins the strong count at 2 and makes the commit `Rc::make_mut` — a deep clone of the
+            // whole `AtomTable`, one `String` allocation per atom, on every interning call. The
+            // provider is dropped explicitly (with the `BifContext`/bridge borrows the block above
+            // already released) — and before the retry decision below — so the commit really
+            // appends in place; `src/codeserver.rs`'s `intern_pending` documents that contract,
+            // and `tests/atom_table_commit_alloc.rs` pins it. The full path builds its
+            // `RuntimePorts` **inside** its invoke block, so it already reaches the tail with one
+            // owner.
+            drop(ports);
+
+            // ---- the pure-constructor mid-call retry ------------------------------------------
+            //
+            // A BIF that exhausted its pooled region raises `BeamError::Alloc(AllocKind::Heap)`
+            // **here, before the tail converts it** to `error:system_limit`
+            // ([`Self::finish_registered_call`]). For the one pure constructor in the roster
+            // ([`is_retryable_pure_constructor`]) that failure has produced no observable effect —
+            // the BIF only builds its result on `ctx.heap()` from its arguments — so the whole call
+            // can be re-run on a wider frontier instead of surfacing a `system_limit` the oracle has
+            // no analogue for.
+            //
+            // The shape this exists for is the **first** large allocation a higher-order `lists`
+            // BIF (`lists:foreach/2`, `lists:map/2`) nests: the nested region is seeded at
+            // `NESTED_BIF_HEAP_SEED_WORDS` (1 MiB) and its frontier reservation ([`frontier`]) is
+            // only a quarter of that — too small for a single call that needs the whole region and
+            // more, and the self-tuning seed ([`Runtime::put_bif_heap`]) only rises *after* a call
+            // completes, so the first such call used to die. The retry closes that first-call gap
+            // with the **same** geometric growth the frontier applies ([`frontier::grown_capacity`]),
+            // so a configured `+hmax` still refuses (the ordinary `system_limit` is kept) and the
+            // nesting-depth retention the small seed prevents is unchanged.
+            //
+            // Only nested calls are retried (`bif_heaps_taken >= 2`): the outermost region is
+            // already the configured `bif_heap_words`, whose reservation covers the single-call
+            // demand the entitlement guarantees.
+            if self.runtime.bif_heaps_taken >= 2
+                && is_retryable_pure_constructor(module, function, arity)
+            {
+                if let Err(BeamError::Alloc(failure)) = &attempt {
+                    if failure.kind == AllocKind::Heap {
+                        let demand = heap.used().saturating_sub(mark);
+                        let max = self.runtime.config().heap_options().policy().max_heap_words;
+                        if let Some(grown) =
+                            frontier::grown_capacity(heap.capacity(), demand, max)
+                        {
+                            // Retire the exhausted region and re-run on a wider one — the same
+                            // "never freed, never moved, never rewound" growth step
+                            // [`Self::grow_bif_frontier`] takes. The replacement is allocated
+                            // **before** the old region is retired, so a refused allocation still
+                            // falls through and hands the old region back in the tail (the loan
+                            // counter stays balanced either way).
+                            perf_counters::bump(|c| &mut c.pool_grown);
+                            if let Ok(fresh) = self.runtime.take_fresh_bif_heap(grown) {
+                                self.runtime.put_bif_heap(heap);
+                                heap = fresh;
+                                mark = 0;
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
-            if let Some(tables) = held_tables.as_deref_mut() {
-                context = context.with_tables(tables);
-            }
-            invoke_registered(bif, arity, &mut context, args)
+            break attempt;
         };
-        // `ports` holds an `Rc<AtomTable>` clone ([`RuntimePorts::atoms`]), and it is declared
-        // **outside** the invoke block above, so it is still alive here. The tail's atom commit
-        // ([`CodeServer::intern_pending`]) only takes its append-only `Rc::get_mut` fast path
-        // while this runtime's code server is the table's **only** owner: an outstanding handle
-        // pins the strong count at 2 and makes the commit `Rc::make_mut` — a deep clone of the
-        // whole `AtomTable`, one `String` allocation per atom, on every interning call. The
-        // provider is dropped explicitly (with the `BifContext`/bridge borrows the block above
-        // already released) so the commit really appends in place; `src/codeserver.rs`'s
-        // `intern_pending` documents that contract, and `tests/atom_table_commit_alloc.rs` pins
-        // it. The full path builds its `RuntimePorts` **inside** its invoke block, so it already
-        // reaches the tail with one owner.
-        drop(ports);
         let outcome = self.finish_registered_call(
             result,
             &mut heap,
