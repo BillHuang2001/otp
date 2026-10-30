@@ -102,6 +102,20 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// module-name equality (`prim_tty`, `prim_file`, `prim_buffer`, `zlib`) over exactly these
     /// four names, so no other module can reach their `true` and the guard can never mask one.
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        // A loaded NIF library's unexported local NIF stubs are reached by a local `call`/`call_only`
+        // — `crypto.erl`'s `strong_rand_bytes_nif/1` is a `?nif_stub` body that raises
+        // `erlang:nif_error({nif_not_loaded,...})`, so without this leg the stub body runs instead of
+        // the loaded library. `try_call_nif` already keys the same `(module, function, arity)` through
+        // `NifRegistry::lookup` (after its `is_empty` fast path), so answering `true` here routes the
+        // call through `call_bif` and the loaded NIF answers it — the same interception `zlib`'s local
+        // stubs get from the `beam_bifs::serves_local_call` leg below, but for a *dynamically* loaded
+        // library whose names are only known at load time. The `is_empty()` guard keeps the common
+        // (NIF-less) runtime answering `false` with a length compare and no `HashMap` SipHash.
+        if !self.runtime.nifs.borrow().is_empty()
+            && self.runtime.nifs.borrow().lookup(module, function, arity)
+        {
+            return Ok(true);
+        }
         if !matches!(module, "prim_tty" | "prim_file" | "prim_buffer" | "zlib") {
             return Ok(false);
         }
