@@ -1,17 +1,17 @@
 {
   "schema": "suites/1",
-  "generated_at": 1793266383,
+  "generated_at": 1793387656,
   "run_command": "suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib",
   "host": {
-    "loadavg_before": "3.98 5.95 17.43 3/843 3605",
-    "loadavg_after": "6.28 6.20 16.28 2/881 4701",
+    "loadavg_before": "4.63 5.47 5.82 13/900 3",
+    "loadavg_after": "5.30 5.59 5.83 2/848 1099",
     "nproc": 16,
     "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
     "oracle_version": "29/17.1.1"
   },
   "rust": {
-    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt",
-    "sha": "e18f151ba89a30f3dffb39d68805b985a1c98133",
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt",
+    "sha": "8e8e0ad5d96a11931ff6972779a3b5adbe90bfca",
     "version": "30/17.1",
     "tier": null
   },
@@ -21,8 +21,8 @@
       "kind": "ct",
       "source": {
         "repo": "otp",
-        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A648/lib/stdlib/test",
-        "sha": "e18f151ba89a30f3dffb39d68805b985a1c98133",
+        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A18/lib/stdlib/test",
+        "sha": "8e8e0ad5d96a11931ff6972779a3b5adbe90bfca",
         "staged": "/tmp/erts-suites-stage/stdlib/src"
       },
       "build": {
@@ -44,7 +44,7 @@
         {
           "side": "rust",
           "purpose": "ct binary_module_SUITE",
-          "command": "cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 10000, 300000, \"/tmp/erts-suites-stage/stdlib/src\"), halt(0).'"
+          "command": "cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 10000, 300000, \"/tmp/erts-suites-stage/stdlib/src\"), halt(0).'"
         },
         {
           "side": "build",
@@ -54,16 +54,16 @@
       ],
       "tally": {
         "measured": 214,
-        "agree": 177,
+        "agree": 183,
         "agree_fail_identical": 5,
-        "divergence": 32,
+        "divergence": 26,
         "oracle_only_fail": 0,
         "rust_gap": 0,
         "not_run": 0,
         "sys_passed": 209,
         "sys_failed": 5,
-        "rust_passed": 177,
-        "rust_failed": 37
+        "rust_passed": 183,
+        "rust_failed": 31
       },
       "rows": [
         {
@@ -376,7 +376,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,'-random_parts/1-lc$^1/1-1-',2,...}}"
           },
           "verdict": "divergence",
           "note": ""
@@ -2409,13 +2409,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_from_keys,1,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2476,7 +2476,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,badarg,{erlang,trace_delivered,[...],...}}"
+            "detail": "{exception,error,{badmatch,false},{maps_SUITE,t_from_list_check_trapping,1,...}}"
           },
           "verdict": "divergence",
           "note": ""
@@ -2556,13 +2556,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2686,7 +2686,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": "{exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}}"
           },
           "verdict": "divergence",
           "note": ""
@@ -2724,13 +2724,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_merge_opt,1,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2745,13 +2745,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2787,13 +2787,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
-            "failed": 0,
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": ""
+            "detail": "timeout"
           },
-          "verdict": "agree",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -2896,7 +2896,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": "{exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}}"
           },
           "verdict": "divergence",
           "note": ""
@@ -2913,13 +2913,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_with_2,1,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2934,13 +2934,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_without_2,1,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -4446,13 +4446,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,<<0,0,...>>},{unicode_SUITE,ex_latin1,1,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -4513,7 +4513,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,{{badmatch,...},[...]}},{unicode_SUITE,'-ex_roundtrips/1-lc$^2/1-1-',1,...}}"
+            "detail": "timeout"
           },
           "verdict": "divergence",
           "note": ""
@@ -4569,11 +4569,11 @@
         "binary_module_SUITE: 20 cases — sys 18/2 pass/fail, rust 9/11 pass/fail",
         "dict_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail",
         "lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 77/1 pass/fail",
-        "maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 20/12 pass/fail",
+        "maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 25/7 pass/fail",
         "proplists_SUITE: 4 cases — sys 4/0 pass/fail, rust 4/0 pass/fail",
         "queue_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail",
         "string_SUITE: 46 cases — sys 45/1 pass/fail, rust 45/1 pass/fail",
-        "unicode_SUITE: 20 cases — sys 18/2 pass/fail, rust 8/12 pass/fail"
+        "unicode_SUITE: 20 cases — sys 18/2 pass/fail, rust 9/11 pass/fail"
       ]
     }
   ]

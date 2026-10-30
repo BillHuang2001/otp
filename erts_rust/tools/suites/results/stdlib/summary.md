@@ -1,24 +1,24 @@
 # Test-suite parity sweep
 
-Generated at `1793266383` (Unix seconds) by `suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib`.
+Generated at `1793387656` (Unix seconds) by `suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib`.
 
 ## Environment
 
 - oracle: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` — `29/17.1.1`
-- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt` — `30/17.1`
-- rust workspace commit: `e18f151ba89a30f3dffb39d68805b985a1c98133`
+- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt` — `30/17.1`
+- rust workspace commit: `8e8e0ad5d96a11931ff6972779a3b5adbe90bfca`
 - tier: `default`
-- loadavg before/after: `3.98 5.95 17.43 3/843 3605` / `6.28 6.20 16.28 2/881 4701` on 16 logical CPUs
+- loadavg before/after: `4.63 5.47 5.82 13/900 3` / `5.30 5.59 5.83 2/848 1099` on 16 logical CPUs
 - the host is **shared**: only pass/fail counts are portable, never a wall time
 
 ### Target `stdlib` (ct)
 
-- source: `/home/bill/Source/otp/.genesis/workers/worker_T1_A648/lib/stdlib/test` (otp) at `e18f151ba89a`
+- source: `/home/bill/Source/otp/.genesis/workers/worker_T1_A18/lib/stdlib/test` (otp) at `8e8e0ad5d96a`
 - staged copy: `/tmp/erts-suites-stage/stdlib/src`
 - build: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …` — ok (reused a completed build)
 - build detail: compiled 8 suites + 6 helpers + runner with the oracle's erlc
-- tally: measured 214 · agree 177 · agree-fail-identical (excluded) 5 · divergence 32 · oracle-only-fail 0 · rust-gap 0 · not-run 0
-- totals: sys 209/5 passed/failed · rust 177/37 passed/failed
+- tally: measured 214 · agree 183 · agree-fail-identical (excluded) 5 · divergence 26 · oracle-only-fail 0 · rust-gap 0 · not-run 0
+- totals: sys 209/5 passed/failed · rust 183/31 passed/failed
 
 Notes:
 - drive (identical on both sides): `ct_runner:run('{suite}', {case_timeout_ms}, {suite_budget_ms}, "{data_root}"), halt(0).`
@@ -28,11 +28,11 @@ Notes:
 - binary_module_SUITE: 20 cases — sys 18/2 pass/fail, rust 9/11 pass/fail
 - dict_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail
 - lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 77/1 pass/fail
-- maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 20/12 pass/fail
+- maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 25/7 pass/fail
 - proplists_SUITE: 4 cases — sys 4/0 pass/fail, rust 4/0 pass/fail
 - queue_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail
 - string_SUITE: 46 cases — sys 45/1 pass/fail, rust 45/1 pass/fail
-- unicode_SUITE: 20 cases — sys 18/2 pass/fail, rust 8/12 pass/fail
+- unicode_SUITE: 20 cases — sys 18/2 pass/fail, rust 9/11 pass/fail
 
 | row | sys (P/F) | rust (P/F) | verdict | first divergence / note |
 |---|---|---|---|---|
@@ -50,7 +50,7 @@ Notes:
 | `binary_module_SUITE:join` | 1/0 | 1/0 | agree |  |
 | `binary_module_SUITE:list_to_bin` | 1/0 | 1/0 | agree |  |
 | `binary_module_SUITE:longest_common_trap` | 1/0 | 0/1 | divergence | {exception,error,unsupported_bif,{erlang,bump_reductions,[...],...}} |
-| `binary_module_SUITE:parts` | 1/0 | 0/1 | divergence | timeout |
+| `binary_module_SUITE:parts` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,false},{binary_module_SUITE,'-random_parts/1-lc$^1/1-1-',2,...}} |
 | `binary_module_SUITE:random_ref_comp` | 1/0 | 0/1 | divergence | timeout |
 | `binary_module_SUITE:random_ref_fla_comp` | 1/0 | 0/1 | divergence | timeout |
 | `binary_module_SUITE:random_ref_sr_comp` | 1/0 | 0/1 | divergence | timeout |
@@ -147,32 +147,32 @@ Notes:
 | `maps_SUITE:t_filtermap_2` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_fold_3` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_foreach_2` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_from_keys` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_from_keys,1,...}} |
+| `maps_SUITE:t_from_keys` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_from_keys_check_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}} |
 | `maps_SUITE:t_from_keys_kill_process` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_from_list_check_trapping` | 1/0 | 0/1 | divergence | {exception,error,badarg,{erlang,trace_delivered,[...],...}} |
+| `maps_SUITE:t_from_list_check_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,false},{maps_SUITE,t_from_list_check_trapping,1,...}} |
 | `maps_SUITE:t_from_list_kill_process` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_get_3` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_groups_from_list` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_intersect` | 1/0 | 0/1 | divergence | timeout |
+| `maps_SUITE:t_intersect` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_intersect_with` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_iterator_1` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_iterator_2` | 1/0 | 0/1 | divergence | timeout |
 | `maps_SUITE:t_iterator_valid` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_keys_kill_process` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_keys_trapping` | 1/0 | 0/1 | divergence | timeout |
+| `maps_SUITE:t_keys_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}} |
 | `maps_SUITE:t_map_2` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_merge_opt` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_merge_opt,1,...}} |
-| `maps_SUITE:t_merge_with` | 1/0 | 0/1 | divergence | timeout |
+| `maps_SUITE:t_merge_opt` | 1/0 | 1/0 | agree |  |
+| `maps_SUITE:t_merge_with` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_order_consistency` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_put_opt` | 1/0 | 1/0 | agree |  |
+| `maps_SUITE:t_put_opt` | 1/0 | 0/1 | divergence | timeout |
 | `maps_SUITE:t_size_1` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_update_with_3` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_update_with_4` | 1/0 | 1/0 | agree |  |
 | `maps_SUITE:t_values_kill_process` | 1/0 | 1/0 | agree |  |
-| `maps_SUITE:t_values_trapping` | 1/0 | 0/1 | divergence | timeout |
-| `maps_SUITE:t_with_2` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_with_2,1,...}} |
-| `maps_SUITE:t_without_2` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{'EXIT',{...}}},{maps_SUITE,t_without_2,1,...}} |
+| `maps_SUITE:t_values_trapping` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}} |
+| `maps_SUITE:t_with_2` | 1/0 | 1/0 | agree |  |
+| `maps_SUITE:t_without_2` | 1/0 | 1/0 | agree |  |
 | `proplists_SUITE:examples` | 1/0 | 1/0 | agree |  |
 | `proplists_SUITE:map_conversion` | 1/0 | 1/0 | agree |  |
 | `proplists_SUITE:map_conversion_normalize` | 1/0 | 1/0 | agree |  |
@@ -244,10 +244,10 @@ Notes:
 | `unicode_SUITE:incomplete_utf32_to_latin1` | 1/0 | 1/0 | agree |  |
 | `unicode_SUITE:is_id` | 0/1 | 0/1 | agree-fail-identical | {exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}} |
 | `unicode_SUITE:is_whitespace` | 0/1 | 0/1 | agree-fail-identical | {exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}} |
-| `unicode_SUITE:latin1` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,<<0,0,...>>},{unicode_SUITE,ex_latin1,1,...}} |
+| `unicode_SUITE:latin1` | 1/0 | 1/0 | agree |  |
 | `unicode_SUITE:normalize` | 1/0 | 1/0 | agree |  |
 | `unicode_SUITE:random_lists` | 1/0 | 0/1 | divergence | timeout |
-| `unicode_SUITE:roundtrips` | 1/0 | 0/1 | divergence | {exception,error,{badmatch,{{badmatch,...},[...]}},{unicode_SUITE,'-ex_roundtrips/1-lc$^2/1-1-',1,...}} |
+| `unicode_SUITE:roundtrips` | 1/0 | 0/1 | divergence | timeout |
 | `unicode_SUITE:utf16_illegal_sequences_bif` | 1/0 | 1/0 | agree |  |
 | `unicode_SUITE:utf8_illegal_sequences_bif` | 1/0 | 0/1 | divergence | timeout |
 
@@ -257,7 +257,7 @@ Recorded invocations (the two sides get the *same* `-pa` set and the *same* `-ev
 # ct binary_module_SUITE [sys]
 cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/erts-suites-stage/stdlib/src"), halt(0).'
 # ct binary_module_SUITE [rust]
-cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A648/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/erts-suites-stage/stdlib/src"), halt(0).'
+cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\''binary_module_SUITE'\'', 10000, 300000, "/tmp/erts-suites-stage/stdlib/src"), halt(0).'
 # erlc [build]
 /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …
 ```
