@@ -352,10 +352,11 @@ pub(super) fn big_parts_safe(t: Eterm) -> Option<(bool, Vec<u64>)> {
 /// [`ERL_ONHEAP_BINARY_LIMIT`] bytes.
 ///
 /// The safe read side of [`beam_term::refc::is_refc_binary`], mirroring
-/// [`big_parts_safe`]: the family's `#[cfg(test)]` modules live under the crate-wide
+/// [`big_parts_safe`]: the family's modules live under the crate-wide
 /// `#![deny(unsafe_code)]` and so cannot call the `unsafe` predicate themselves, so the
-/// single dereference stays here in the node's marked module.
-#[cfg(test)]
+/// single dereference stays here in the node's marked module. The matching command
+/// bodies use it to decide whether a matched-out window can alias the subject's
+/// off-heap payload instead of copying it.
 #[inline]
 pub(super) fn is_refc_binary(t: Eterm) -> bool {
     // SAFETY: `is_refc_binary` checks `is_boxed` before it dereferences the header and
@@ -476,6 +477,50 @@ pub(super) fn make_binary(
             nbits,
         )
     })
+}
+
+/// Build a sub-binary window of `nbits` bits at `bit_offset` of a **refc** subject
+/// by aliasing the subject's payload — [`beam_term::refc::write_sub_binary`]'s
+/// window arm, the Rust port of the C `erts_build_sub_bitstring` above
+/// `ERL_ONHEAP_BITS_LIMIT` bits.
+///
+/// The caller has already gated `nbits > ERL_ONHEAP_BITS_LIMIT` and
+/// [`is_refc_binary`] on the subject, so the writer always takes its 8-word
+/// `[BinRef][ErlSubBits]` arm and the result's `BinRef.val` names the **parent's**
+/// payload — which is why `binary:referenced_byte_size/1` of the result answers the
+/// parent's referenced size rather than the window's own byte size.
+///
+/// The pair is reserved **rooted** first (the one collecting allocation, which may
+/// relocate the subject's match context), then `read_parent` re-reads the live
+/// subject term from the machine's post-collection state and the pair is written
+/// over it — the frozen reserve-then-read-then-write ordering [`make_ctx`] and
+/// [`make_binary`] follow.
+pub(super) fn make_sub_binary<R>(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    bit_offset: usize,
+    nbits: usize,
+    read_parent: R,
+) -> Result<Eterm>
+where
+    R: FnOnce(&mut Machine, &mut dyn ExecutionContext) -> Result<Eterm>,
+{
+    let hp = reserve(
+        machine,
+        ctx,
+        beam_term::refc::ERL_REFC_BITS_SIZE,
+        RootSet::ALL_LIVE,
+    )?;
+    let parent = read_parent(machine, ctx)?;
+    // SAFETY: `hp` addresses the `ERL_REFC_BITS_SIZE` (8) exclusively-owned, writable
+    // words `reserve` just returned; `parent` is the freshly re-read live refc subject
+    // (the caller's gate plus the writer's own shape validation), whose off-heap
+    // payload the machine keeps alive and unmoved; and the range
+    // `bit_offset .. bit_offset + nbits` is inside the parent's window — the match
+    // context's bounds — which the writer re-checks and refuses (writing nothing)
+    // rather than overrunning.
+    unsafe { beam_term::refc::write_sub_binary(hp, parent, bit_offset, nbits) }
+        .map_err(|_| error::unsupported("bitstring: cannot alias the matched-out window"))
 }
 
 /// Build the empty writable binary `bs_init_writable` produces.

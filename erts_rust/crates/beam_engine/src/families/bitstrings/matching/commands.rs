@@ -33,6 +33,7 @@ use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
+use beam_term::refc::ERL_ONHEAP_BITS_LIMIT;
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
@@ -76,7 +77,7 @@ pub(crate) fn run_commands(
     // `subject_bytes`, and only one `commit` re-read at most. The default is the
     // re-read: a false `stale` is UB (a relocated block), a false `true` is one wasted
     // read.
-    let (mut term, orig, start, mut end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
+    let (mut term, mut orig, start, mut end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
     let (mut bytes, mut off) = raw::subject_bytes(orig)?;
     let mut pos = start;
     // `true` when the previous command may have relocated the context block, so the
@@ -88,6 +89,7 @@ pub(crate) fn run_commands(
             let (fresh, fresh_orig, _, fresh_end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
             let (fresh_bytes, fresh_off) = raw::subject_bytes(fresh_orig)?;
             term = fresh;
+            orig = fresh_orig;
             end = fresh_end;
             bytes = fresh_bytes;
             off = fresh_off;
@@ -166,7 +168,7 @@ pub(crate) fn run_commands(
                     BinaryWidth::Dynamic { size: size_op, unit }
                 };
                 match binary_cmd(
-                    machine, ctx, width, dst, &mut pos, end, bytes, off, term, ctx_op,
+                    machine, ctx, width, dst, &mut pos, end, bytes, off, term, orig, ctx_op,
                 )? {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done => {}
@@ -180,7 +182,7 @@ pub(crate) fn run_commands(
             // command, `bs_translate_fixup`).
             "get_tail" => {
                 let dst = cmd_at(commands, i + 3)?;
-                match get_tail_cmd(machine, ctx, dst, pos, end, bytes, off)? {
+                match get_tail_cmd(machine, ctx, dst, pos, end, bytes, off, orig, ctx_op)? {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done => {}
                     CmdFlow::Relocated => stale = true,
@@ -284,6 +286,7 @@ pub(super) fn binary_cmd(
     bytes: &[u8],
     off: usize,
     term: Eterm,
+    orig: Eterm,
     ctx_op: &Operand,
 ) -> Result<CmdFlow> {
     let nbits = match width {
@@ -300,16 +303,29 @@ pub(super) fn binary_cmd(
     if nbits > end.saturating_sub(*pos) {
         return Ok(CmdFlow::Fail);
     }
-    let out = extract_bits(bytes, *pos + off, nbits)?;
     // `i_bs_get_fixed_binary` builds the window through `erts_build_sub_bitstring`
-    // for an arbitrary bit count (no 64-byte limit), so the result goes through
-    // `raw::make_binary`, which picks the frozen on-heap/off-heap representation by
-    // size.
-    let value = raw::make_binary(machine, ctx, &out, nbits)?;
+    // for an arbitrary bit count (no 64-byte limit). Above `ERL_ONHEAP_BITS_LIMIT`
+    // bits over a refc subject it **aliases** the subject's payload, so
+    // `referenced_byte_size/1` answers the parent's referenced size; otherwise the
+    // result goes through `raw::make_binary` (on-heap at/below the limit, a fresh
+    // off-heap refc above it over a non-refc subject).
+    let value = if nbits > ERL_ONHEAP_BITS_LIMIT && raw::is_refc_binary(orig) {
+        // `pos` is the window's bit offset within the subject; `write_sub_binary`
+        // folds in the subject's own window offset. The pair is reserved rooted
+        // first, then the subject is re-read (the reserve may have relocated it).
+        raw::make_sub_binary(machine, ctx, *pos, nbits, |m, c| {
+            let (_, orig, _, _) = read_ctx(m, c, ctx_op, "bs_match")?;
+            Ok(orig)
+        })?
+    } else {
+        let out = extract_bits(bytes, *pos + off, nbits)?;
+        raw::make_binary(machine, ctx, &out, nbits)?
+    };
     *pos += nbits;
     // `i_bs_get_fixed_binary` does `sb->start += size;` *before* `$Dst = result;` —
     // mirror the advance first (`Dst` may be the context's own operand).
-    // `raw::make_binary` reserves on **every** build, so the commit always re-reads.
+    // `raw::make_binary`/`raw::make_sub_binary` reserve on **every** build, so the
+    // commit always re-reads.
     commit(machine, ctx, ctx_op, term, true, *pos)?;
     write_operand(machine, dst, value)?;
     Ok(CmdFlow::Relocated)
@@ -327,13 +343,24 @@ pub(super) fn get_tail_cmd(
     end: usize,
     bytes: &[u8],
     off: usize,
+    orig: Eterm,
+    ctx_op: &Operand,
 ) -> Result<CmdFlow> {
     let nbits = end.saturating_sub(pos);
-    let out = extract_bits(bytes, pos + off, nbits)?;
-    // `i_bs_get_tail` builds an arbitrary bit count (no 64-byte limit), so the
-    // result goes through `raw::make_binary` (on-heap at/below
-    // `ERL_ONHEAP_BINARY_LIMIT`, off-heap refc above).
-    let value = raw::make_binary(machine, ctx, &out, nbits)?;
+    // `i_bs_get_tail` builds an arbitrary bit count (no 64-byte limit): above
+    // `ERL_ONHEAP_BITS_LIMIT` bits over a refc subject it aliases the subject's
+    // payload, so `referenced_byte_size/1` answers the parent's referenced size;
+    // otherwise the result goes through `raw::make_binary` (on-heap at/below the
+    // limit, a fresh off-heap refc above it over a non-refc subject).
+    let value = if nbits > ERL_ONHEAP_BITS_LIMIT && raw::is_refc_binary(orig) {
+        raw::make_sub_binary(machine, ctx, pos, nbits, |m, c| {
+            let (_, orig, _, _) = read_ctx(m, c, ctx_op, "bs_match")?;
+            Ok(orig)
+        })?
+    } else {
+        let out = extract_bits(bytes, pos + off, nbits)?;
+        raw::make_binary(machine, ctx, &out, nbits)?
+    };
     write_operand(machine, dst, value)?;
     Ok(CmdFlow::Relocated)
 }

@@ -446,7 +446,7 @@ fn run_prepared(
     cmds: &[MatchCmd],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    let (mut term, orig, start, mut end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
+    let (mut term, mut orig, start, mut end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
     let (mut bytes, mut off) = raw::subject_bytes(orig)?;
     let mut pos = start;
     // `true` when the previous command may have relocated the context block.
@@ -456,6 +456,7 @@ fn run_prepared(
             let (fresh, fresh_orig, _, fresh_end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
             let (fresh_bytes, fresh_off) = raw::subject_bytes(fresh_orig)?;
             term = fresh;
+            orig = fresh_orig;
             end = fresh_end;
             bytes = fresh_bytes;
             off = fresh_off;
@@ -496,7 +497,7 @@ fn run_prepared(
                     Some(nbits) => BinaryWidth::Static(*nbits),
                     None => BinaryWidth::All,
                 };
-                match binary_cmd(machine, ctx, width, dst, &mut pos, end, bytes, off, term, ctx_op)?
+                match binary_cmd(machine, ctx, width, dst, &mut pos, end, bytes, off, term, orig, ctx_op)?
                 {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done => {}
@@ -504,7 +505,7 @@ fn run_prepared(
                 }
             }
             MatchCmd::GetTail { dst } => {
-                match get_tail_cmd(machine, ctx, dst, pos, end, bytes, off)? {
+                match get_tail_cmd(machine, ctx, dst, pos, end, bytes, off, orig, ctx_op)? {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done => {}
                     CmdFlow::Relocated => stale = true,

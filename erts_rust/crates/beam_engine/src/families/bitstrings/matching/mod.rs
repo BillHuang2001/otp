@@ -67,6 +67,7 @@ use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{BsGetArgs, Instr, Module};
+use beam_term::refc::ERL_ONHEAP_BITS_LIMIT;
 
 use crate::context::ExecutionContext;
 use crate::machine::Machine;
@@ -79,6 +80,8 @@ mod commands;
 mod match_ctx;
 pub(super) mod prepared;
 mod reads;
+#[cfg(test)]
+mod alias_tests;
 #[cfg(test)]
 mod rooted;
 #[cfg(test)]
@@ -251,14 +254,26 @@ fn exec_other(
             // `i_bs_get_tail` builds the remaining bits from `start` to `end` and
             // deliberately leaves the position unchanged. The C build is
             // `erts_build_sub_bitstring` over an arbitrary bit count (no 64-byte
-            // limit), so the result goes through `raw::make_binary`, which picks the
-            // frozen representation (on-heap `ErlHeapBits` at/below
-            // `ERL_ONHEAP_BINARY_LIMIT`, off-heap refc binary above).
+            // limit): above `ERL_ONHEAP_BITS_LIMIT` bits over a refc subject it
+            // **aliases** the subject's payload, so `referenced_byte_size/1` of the
+            // result answers the parent's referenced size; at/below the limit it is
+            // an on-heap `ErlHeapBits` copy (`raw::make_binary`).
             let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_tail")?;
             let nbits = end.saturating_sub(start);
-            let (bytes, off) = raw::subject_bytes(orig)?;
-            let out = extract_bits(bytes, start + off, nbits)?;
-            let value = raw::make_binary(machine, ctx, &out, nbits)?;
+            let value = if nbits > ERL_ONHEAP_BITS_LIMIT && raw::is_refc_binary(orig) {
+                // The window's bit offset within the subject is the context's
+                // position `start`; `write_sub_binary` folds in the subject's own
+                // window offset. Reserve the 8-word pair rooted first, then re-read
+                // the subject term (the reserve may have relocated the context).
+                raw::make_sub_binary(machine, ctx, start, nbits, |m, c| {
+                    let (_, orig, _, _) = read_ctx(m, c, ctx_op, "bs_get_tail")?;
+                    Ok(orig)
+                })?
+            } else {
+                let (bytes, off) = raw::subject_bytes(orig)?;
+                let out = extract_bits(bytes, start + off, nbits)?;
+                raw::make_binary(machine, ctx, &out, nbits)?
+            };
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
         }
@@ -338,20 +353,31 @@ fn exec_other(
             if nbits > remaining {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
-            let (bytes, off) = raw::subject_bytes(orig)?;
-            let out = extract_bits(bytes, start + off, nbits)?;
-            // `i_bs_get_binary_2` builds the window through
-            // `erts_build_sub_bitstring` for an arbitrary bit count (no 64-byte
-            // limit), so the result goes through `raw::make_binary`, which picks the
-            // frozen on-heap/off-heap representation by size.
-            let value = raw::make_binary(machine, ctx, &out, nbits)?;
-            // `raw::make_binary` reserves through the rooted seam, so a moving collector
-            // may have relocated the context read above: re-read the context operand and
-            // commit the new position **before** binding `Dst`. The C advances `sb->start`
-            // inside `erts_bs_get_binary_2` *before* the instruction's `$Dst = _result`,
-            // and `Dst` may be the context's own operand (`beam_asm:filter_essentials/1`
-            // compiles to `ctx == dst == x(3)`), so binding first would clobber the context
-            // the commit re-reads (the frozen reserve, then read, then write ordering).
+            let value = if nbits > ERL_ONHEAP_BITS_LIMIT && raw::is_refc_binary(orig) {
+                // Above the on-heap limit over a refc subject, alias the subject's
+                // payload (`referenced_byte_size/1` then answers the parent's
+                // referenced size); otherwise the copy path stays byte-faithful.
+                raw::make_sub_binary(machine, ctx, start, nbits, |m, c| {
+                    let (_, orig, _, _) = read_ctx(m, c, ctx_op, "bs_get_binary2")?;
+                    Ok(orig)
+                })?
+            } else {
+                let (bytes, off) = raw::subject_bytes(orig)?;
+                let out = extract_bits(bytes, start + off, nbits)?;
+                // `i_bs_get_binary_2` builds the window through
+                // `erts_build_sub_bitstring` for an arbitrary bit count (no 64-byte
+                // limit), so the result goes through `raw::make_binary`, which picks the
+                // frozen on-heap/off-heap representation by size.
+                raw::make_binary(machine, ctx, &out, nbits)?
+            };
+            // `raw::make_binary`/`raw::make_sub_binary` reserve through the rooted
+            // seam, so a moving collector may have relocated the context read above:
+            // re-read the context operand and commit the new position **before**
+            // binding `Dst`. The C advances `sb->start` inside `erts_bs_get_binary_2`
+            // *before* the instruction's `$Dst = _result`, and `Dst` may be the
+            // context's own operand (`beam_asm:filter_essentials/1` compiles to
+            // `ctx == dst == x(3)`), so binding first would clobber the context the
+            // commit re-reads (the frozen reserve, then read, then write ordering).
             let term = reread_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             raw::set_ctx_start(term, start + nbits);
             write_operand(machine, dst, value)?;
