@@ -93,6 +93,7 @@ mod machine_pool;
 pub(crate) mod memo_pool;
 mod module_info;
 mod node_hash;
+mod on_load;
 mod persistent_term;
 mod pool;
 mod position;

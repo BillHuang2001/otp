@@ -2439,6 +2439,12 @@ impl RuntimeContext<'_> {
                 return Err(error::call_load_failure(err));
             }
         };
+        // A module whose image carries an `-on_load` entry must run it (and observe its
+        // return) before the requested function executes; on failure the module is forgotten
+        // and the call raises, the same fold the loader failure below takes.
+        if let Err(err) = self.run_module_on_load(module) {
+            return Err(error::call_load_failure(err));
+        }
         self.run_export(&loaded, function, arity, args)
     }
 

@@ -126,6 +126,7 @@ use crate::runtime::Runtime;
 use crate::timers::{self, TimerTarget};
 
 use super::signal;
+use super::RuntimeContext;
 
 /// The [`RuntimeHooks`] provider over the running runtime.
 ///
@@ -912,19 +913,98 @@ impl<'a> RuntimeHooksBridge<'a> {
         atom_term(atoms, "ok")
     }
 
-    /// `erlang:call_on_load_function/1`, `erlang:has_prepared_code_on_load/1` and
-    /// `erlang:finish_after_on_load/2` — the on-load-hook primitives.
+    /// `erlang:call_on_load_function/1` — run `Mod:on_load/arity` and answer its return term.
     ///
-    /// Oracle-verified (OTP 29/`erts-17.1`, a BEAMASM build): all three always answer
-    /// `badarg`. They require an internal prepared-code term that only `prepare_loading/2`
-    /// can mint (and on BEAMASM `call_on_load_function` rejects even that form,
-    /// `beam_bif_load.c:793-799`), so `badarg` is the honest, complete answer.
+    /// Adapted to this runtime's single-generation code store: the argument is the **module
+    /// name** (not the oracle's internal prepared-code term), and the loaded image must carry
+    /// an `-on_load` entry (else `badarg`, the C's `!modp->on_load`). The hook runs through
+    /// the real engine ([`RuntimeContext::run_on_load_function`]), so its own raise propagates.
     ///
     /// # Errors
     ///
-    /// Always `badarg`.
-    fn badarg_always(&self) -> Result<Eterm> {
-        Err(BeamError::BadArg)
+    /// `badarg` for a non-atom argument, a name not held by the code server, or a module with
+    /// no `-on_load` entry.
+    fn call_on_load_function(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(BeamError::BadArg);
+        }
+        let Some(name) = atoms.name(atom_val(module)).map(str::to_string) else {
+            return Err(BeamError::BadArg);
+        };
+        let mut context = RuntimeContext::new(&mut *self.runtime);
+        context.run_on_load_function(&name)
+    }
+
+    /// `erlang:has_prepared_code_on_load/1` — whether a loaded module has an `-on_load` entry.
+    ///
+    /// Adapted to this runtime's single-generation store: the argument is the module **name**
+    /// (the oracle's form is an internal magic ref from `prepare_loading/2`). A loaded module
+    /// answers `true`/`false`; a non-atom, or a name the code server does not hold (not in any
+    /// loadable state), is `badarg`.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom argument or an unloaded module.
+    fn has_prepared_code_on_load(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(BeamError::BadArg);
+        }
+        let Some(name) = atoms.name(atom_val(module)) else {
+            return Err(BeamError::BadArg);
+        };
+        let Some(module) = self.runtime.code_server.module(name) else {
+            return Err(BeamError::BadArg);
+        };
+        atom_term(atoms, if module.on_load.is_some() { "true" } else { "false" })
+    }
+
+    /// `erlang:finish_after_on_load/2` — commit (`true`) or abort (`false`) a loaded module's
+    /// `-on_load` outcome.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`, `beam_bif_load.c:819-941`): arg2 must be the atom
+    /// `true` or `false`, else `badarg`; arg1 must name a loaded module that carries an
+    /// `-on_load` entry, else `badarg`. Both outcomes answer the atom `true`. Adapted to the
+    /// single-generation store: `true` records the hook done
+    /// ([`CodeServer::mark_on_load_done`]) and `false` forgets the module
+    /// ([`CodeServer::forget_module`]) — there is no separate prepared/finish two-phase slot.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom argument, an arg2 that is neither `true` nor `false`, or a
+    /// module that is not loaded with an `-on_load` entry.
+    fn finish_after_on_load(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let keep = *args.get(1).ok_or(BeamError::BadArg)?;
+        if !is_atom(keep) {
+            return Err(BeamError::BadArg);
+        }
+        let keep = match atoms.name(atom_val(keep)) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(BeamError::BadArg),
+        };
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(BeamError::BadArg);
+        }
+        let Some(name) = atoms.name(atom_val(module)).map(str::to_string) else {
+            return Err(BeamError::BadArg);
+        };
+        if !self
+            .runtime
+            .code_server
+            .module(&name)
+            .is_some_and(|m| m.on_load.is_some())
+        {
+            return Err(BeamError::BadArg);
+        }
+        if keep {
+            self.runtime.code_server.mark_on_load_done(&name);
+        } else {
+            self.runtime.code_server.forget_module(&name);
+        }
+        atom_term(atoms, "true")
     }
 
     /// `erts_internal:is_system_process/1` and `erts_internal:is_process_executing_dirty/1`
@@ -1551,9 +1631,11 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             // unconditional `notsup` raise.
             ("erlang", "delete_module", 1) => self.delete_module(atoms, args),
             ("erts_internal", "purge_module", 2) => self.purge_module(),
-            ("erlang", "call_on_load_function", 1)
-            | ("erlang", "has_prepared_code_on_load", 1)
-            | ("erlang", "finish_after_on_load", 2) => self.badarg_always(),
+            ("erlang", "call_on_load_function", 1) => self.call_on_load_function(atoms, args),
+            ("erlang", "has_prepared_code_on_load", 1) => {
+                self.has_prepared_code_on_load(atoms, args)
+            }
+            ("erlang", "finish_after_on_load", 2) => self.finish_after_on_load(atoms, args),
             // Internal process-state predicates and the persistent-term reset hook.
             ("erts_internal", "is_system_process", 1) => {
                 self.is_process_predicate(atoms, args, "is_system_process")

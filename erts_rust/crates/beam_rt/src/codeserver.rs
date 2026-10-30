@@ -79,7 +79,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -144,6 +144,15 @@ pub struct CodeServer {
     /// verbatim because the oracle's `code:which/1`/`code:is_loaded/1` report it as given.
     /// Absent for a module loaded from a `.beam` file (its location is `module_paths`).
     module_files: HashMap<String, RecordedName>,
+    /// The names of loaded modules whose `-on_load/0` hook has already run to `ok`.
+    ///
+    /// This is the idempotency guard for the `-on_load` entry point: a hook must run
+    /// **exactly once per cached image** — the image is memoized across the several
+    /// load routes (`code:ensure_loaded/1`, `code:load_file/1`, `code:load_binary/3`,
+    /// the on-demand call load), so a shared helper consults this set rather than
+    /// re-running the hook on every route. A name leaves the set whenever its cached
+    /// image is re-recorded (a reload) or dropped, so a fresh image runs its hook again.
+    on_load_done: HashSet<String>,
     /// A **generation** for the loaded-module set, bumped every time the module cache above
     /// changes — the invalidation trigger for the cached fun-resolution snapshot
     /// ([`CodeServer::fun_module_snapshot`]).
@@ -250,6 +259,7 @@ impl CodeServer {
             modules: HashMap::new(),
             module_paths: HashMap::new(),
             module_files: HashMap::new(),
+            on_load_done: HashSet::new(),
             loaded_generation: 0,
             fun_modules: RefCell::new(None),
             #[cfg(test)]
@@ -710,6 +720,16 @@ impl CodeServer {
         self.modules.get(name).cloned()
     }
 
+    /// Whether `name`'s `-on_load/0` hook has already run to `ok` for its cached image.
+    pub fn on_load_done(&self, name: &str) -> bool {
+        self.on_load_done.contains(name)
+    }
+
+    /// Records that `name`'s `-on_load/0` hook ran to `ok` (see [`CodeServer::on_load_done`]).
+    pub fn mark_on_load_done(&mut self, name: &str) {
+        self.on_load_done.insert(name.to_string());
+    }
+
     /// Every loaded module (for fun resolution).
     pub fn modules(&self) -> impl Iterator<Item = &Arc<Module>> {
         self.modules.values()
@@ -858,6 +878,8 @@ impl CodeServer {
     /// loaded from — the shared tail of the two file-load entry points.
     fn insert_from_file(&mut self, name: String, module: Module, path: &Path) -> Arc<Module> {
         let module = Arc::new(module);
+        // A re-recorded image must re-run its `-on_load/0` hook (see `on_load_done`).
+        self.on_load_done.remove(&name);
         self.modules.insert(name.clone(), module.clone());
         self.module_paths.insert(name, path.to_path_buf());
         // The loaded-module set changed — a new module, or a reload that replaced one — so the
@@ -880,6 +902,8 @@ impl CodeServer {
         recorded: RecordedName,
     ) -> Arc<Module> {
         let module = Arc::new(module);
+        // A re-recorded image must re-run its `-on_load/0` hook (see `on_load_done`).
+        self.on_load_done.remove(name);
         self.modules.insert(name.to_string(), module.clone());
         self.module_paths.remove(name);
         self.module_files.insert(name.to_string(), recorded);
@@ -908,6 +932,8 @@ impl CodeServer {
         let held = self.modules.remove(name).is_some();
         let path = self.module_paths.remove(name).is_some();
         let recorded = self.module_files.remove(name).is_some();
+        // A forgotten module's hook state goes with it (see `on_load_done`).
+        self.on_load_done.remove(name);
         if held || path || recorded {
             self.loaded_generation += 1;
         }

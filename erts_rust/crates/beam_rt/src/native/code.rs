@@ -303,7 +303,10 @@ impl RuntimeContext<'_> {
             return self.no_file();
         }
         match self.runtime.code_server.load(&name) {
-            Ok(_) => self.module_pair(&name),
+            Ok(_) => match self.run_module_on_load(&name) {
+                Ok(()) => self.module_pair(&name),
+                Err(_) => self.error_pair("on_load_failure"),
+            },
             Err(_) => self.error_pair("badfile"),
         }
     }
@@ -378,7 +381,10 @@ impl RuntimeContext<'_> {
             let reason = match self.module_file(&name) {
                 None => "nofile",
                 Some(_) => match self.runtime.code_server.load(&name) {
-                    Ok(_) => continue,
+                    Ok(_) => match self.run_module_on_load(&name) {
+                        Ok(()) => continue,
+                        Err(_) => "on_load_failure",
+                    },
                     Err(_) => "badfile",
                 },
             };
@@ -452,7 +458,10 @@ impl RuntimeContext<'_> {
             return self.no_file();
         }
         match self.runtime.code_server.load(&name) {
-            Ok(_) => self.module_pair(&name),
+            Ok(_) => match self.run_module_on_load(&name) {
+                Ok(()) => self.module_pair(&name),
+                Err(_) => self.error_pair("on_load_failure"),
+            },
             Err(_) => self.error_pair("badfile"),
         }
     }
@@ -549,7 +558,10 @@ impl RuntimeContext<'_> {
         self.runtime
             .code_server
             .insert_loaded(&name, module, recorded);
-        self.module_pair(&name)
+        match self.run_module_on_load(&name) {
+            Ok(()) => self.module_pair(&name),
+            Err(_) => self.error_pair("on_load_failure"),
+        }
     }
 
     /// The `{module, Module}` pair [`Self::code_ensure_loaded`] answers with.
