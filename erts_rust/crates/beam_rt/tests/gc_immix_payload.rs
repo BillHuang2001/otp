@@ -68,9 +68,10 @@
 //! Both runs: the payload came back **intact** element by element (the witness that the
 //! collections the runtime's own doors drove did not relocate the heap out from under the live
 //! terms); `gc_stats().collections > 0`, `gc_stats().major > 0` and the process's own collector
-//! performed both fullsweeps and minors; the nursery **really cycled** (the mean sampled capacity
-//! lies strictly below the sampled maximum — see
-//! [the nursery-cycle pin](#the-nursery-cycle-pin-is-a-statement-about-the-series)); and every
+//! performed both fullsweeps and minors; the nursery **stays at one capacity** — the fullsweep
+//! target is kept through the following minors by the young-vs-old shrink gate, so every sampled
+//! capacity equals the single settled one (see
+//! [the nursery pin](#the-nursery-pin-is-a-statement-about-the-non-collapsing-gate)); and every
 //! failure counter (`errors`/`halted`/`valve_trips`/`disabled`) is clean. Each strategy is run
 //! **twice on the same runtime** and the two runs must report **identical** load-invariant counts
 //! — the load-invariance assertion (the host is heavily loaded, so wall-clock is meaningless and
@@ -135,31 +136,25 @@
 //! that stopped collecting, and either residual growing (a larger per-request overshoot, or a
 //! coarser sampling of a wider capacity span).
 //!
-//! # The nursery-cycle pin is a statement about the series
+//! # The nursery pin is a statement about the non-collapsing gate
 //!
-//! The two sizing rules each **keep** a capacity that is already inside their band, so the
-//! nursery's capacity is a *fixed point* of whichever rule ran last rather than a value that must
-//! move in any particular direction:
+//! A **minor** collapse no longer hands a fullsweep-sized nursery straight back to the young-only
+//! target. `beam_gc::Nursery::minor_collapse_target` applies the young-vs-old shrink gate — the
+//! legacy C's third shrink conjunct (`erl_gc.c`: shrink only when
+//! `HEAP_SIZE(p) > OLD_HEND(p) - OLD_HEAP(p)`, the mature generation's *reserved* capacity): when
+//! the policy's shrink arm would shrink the capacity *and* that capacity is not large compared
+//! with the mature generation (`capacity_words <= mature_capacity_words`), the minor **keeps** the
+//! capacity it found instead of installing the smaller young-only target. A nursery a fullsweep
+//! sized from the whole-heap live set therefore survives into the following minors instead of
+//! being discarded the first time the young-only live set reads as a trough.
 //!
-//! * `HeapPolicy::young_after_fullsweep_with_need` installs `young_target_words(live)` — twice the
-//!   whole-heap live set — only when the current capacity is below `⌈4/3 × target⌉`
-//!   (`should_grow`: `capacity < target` or `3 × capacity < 4 × target`) or above
-//!   `YOUNG_SHRINK_FACTOR` (8) × the target, and **keeps** it otherwise;
-//! * `HeapPolicy::young_after_collection_with_need` does the same against
-//!   `young_minor_target_words_with_need(live, need)` — the young live set once over plus the
-//!   growth request a copy-out's forced growth recorded — clamped above by the keep band's edge
-//!   `max(MINOR_SHRINK_FLOOR_WORDS /* 3 000 */, 8 × young_minor_target_words(live))`, so its band
-//!   is `[target, that edge]`.
-//!
-//! Both runs below come to rest **on** the same capacity (4 185 words) — the **carried** minor
-//! target, i.e. the `need`-augmented minor rule clamped by the keep band's upper edge, which the
-//! fullsweep rule keeps unchanged as well (the plain fullsweep target of this workload's ~768-word
-//! live set is 2 586 words, one growth-table step below it) — so "the capacity a run settles on
-//! must be smaller than the largest it ever held" is not a law of the policy and never was. What
-//! *is* a consequence of the mechanism is that the **series** takes
-//! more than one value: the workload runs both kinds of collection, each installs its own target,
-//! so the mean of the per-slice samples lies strictly below the largest sample. That — with
-//! `settled <= peak` beside it — is what `assert_measured` pins.
+//! On this workload that makes the nursery come to rest on a **single constant capacity**: the
+//! capacity a fullsweep keeps (4 185 words — the carried minor target, one growth-table step above
+//! the plain 2 586-word live-set target) is the one the run settles on and keeps, because each
+//! following minor keeps it through the gate instead of collapsing back to the young-only target
+//! between fullsweeps. What `assert_measured` pins is therefore the **non-collapsing** behavior,
+//! not movement: `settled == peak`, and the settled capacity accounts for the majority of the
+//! samples (a lower sample is only the ramp up to it, never an oscillation back down).
 //!
 //! # The measured verdict
 //!
@@ -356,7 +351,9 @@ struct Measured {
     /// space than the plain live-set target. Both sizing rules keep that capacity unchanged (the
     /// fullsweep band `[⌈4/3 × target⌉, YOUNG_SHRINK_FACTOR × target]` and the minor band
     /// `[target, max(3 000, 8 × target)]` each reproduce a capacity inside them), which is
-    /// why the pin is on the sampled series rather than on `peak > settled`.
+    /// why the pin is on the **non-collapsing** behavior — `settled == peak` with the settled
+    /// capacity the majority of the samples in
+    /// [`nursery_capacities`](Measured::nursery_capacities) — rather than on `peak > settled`.
     peak_nursery_words: usize,
     /// The distinct nursery capacities the per-slice samples took, as `(words, samples)` in
     /// ascending word order — the shape behind [`Measured::nursery_words`],
@@ -613,42 +610,38 @@ fn assert_measured(m: &Measured, expected: MatureKind) {
         "the process's nursery was observable while it lived; {m:?}"
     );
     // `fullsweep_after = 2` runs two minors between fullsweeps, so a run that reached a fullsweep
-    // (the assertion above) also ran the **other** sizing rule — the two are what make the
-    // nursery a series rather than a constant.
+    // (the assertion above) also ran the **other** sizing rule — a fullsweep sizes the nursery
+    // from the whole-heap live set, and the following minors keep that size through the
+    // young-vs-old shrink gate.
     assert!(
         m.stats.minor_collections > 0,
         "the cadence runs minors between its fullsweeps; {m:?}"
     );
-    // The nursery really cycles: its capacity is **not** a frozen constant. Every capacity the
-    // policy installs is a curated growth-table step chosen by one of two three-way rules, and
-    // each one **keeps** a capacity that is already inside its band:
-    //
-    // * a fullsweep's `HeapPolicy::young_after_fullsweep_with_need` installs
-    //   `young_target_words(live)` (`YOUNG_TARGET_LIVE_MULTIPLE` = 2 × the whole-heap live set)
-    //   only when that target is `should_grow(capacity, target)` (`capacity < target` or
-    //   `3 × capacity < 4 × target`) or when the capacity exceeds `YOUNG_SHRINK_FACTOR` (8) × the
-    //   target — so its keep band is `[⌈4/3 × target⌉, 8 × target]`;
-    // * a minor's `HeapPolicy::young_after_collection_with_need` does the same against
-    //   `young_minor_target_words_with_need(live, need)` (1 × the young live set plus the
-    //   growth request a copy-out's forced growth recorded), clamped above by
-    //   `MINOR_SHRINK_FLOOR_WORDS`/`YOUNG_SHRINK_FACTOR` × that target — its keep band is
-    //   `[target, max(3 000, 8 × target)]`.
-    //
-    // A capacity equal to either target therefore reproduces itself: it is a **fixed
-    // point** of the rule, so a run legitimately comes to rest *on* the carried minor target and
-    // `peak == settled` is a convergence, not a defect. What the mechanism does guarantee is
-    // movement — the samples are the run's own history of installed capacities, and a workload
-    // that reaches both kinds of collection visits more than one of them — so the mean over the
-    // series lies strictly below the series' maximum. That is the pin; `settled <= peak` is
-    // restated beside it because it is what makes the two readings comparable at all.
-    assert!(
-        m.settled_nursery_words <= m.peak_nursery_words,
-        "the settled capacity is one of the sampled ones; {m:?}"
+    // The nursery now stays on its fullsweep-sized capacity: the young-vs-old shrink gate in
+    // `beam_gc::Nursery::minor_collapse_target` keeps a capacity that is not large compared with
+    // the mature generation's reserved capacity (the legacy C's
+    // `HEAP_SIZE(p) > OLD_HEND(p) - OLD_HEAP(p)` shrink conjunct in `erl_gc.c`), so the
+    // fullsweep-sized nursery survives into the following minors instead of collapsing to the
+    // young-only target. The pin is therefore on the **non-collapsing** behavior: the run ends on
+    // its largest capacity and spends the majority of its samples there (a lower sample can only
+    // be the initial ramp up to that capacity, never an oscillation back down).
+    assert_eq!(
+        m.settled_nursery_words, m.peak_nursery_words,
+        "the nursery ends on its largest (fullsweep-sized) capacity; {m:?}"
+    );
+    let (peak_words, peak_samples) = m
+        .nursery_capacities
+        .last()
+        .copied()
+        .expect("the nursery was sampled at least once (asserted above)");
+    assert_eq!(
+        peak_words, m.settled_nursery_words,
+        "the largest sampled capacity is the settled one; {m:?}"
     );
     assert!(
-        m.nursery_words < m.peak_nursery_words,
-        "the sampled nursery series must take more than one value — a mean strictly below the \
-         maximum — or the run drained one frozen capacity instead of cycling the nursery; {m:?}"
+        peak_samples * 2 > m.nursery_samples,
+        "the nursery spends the majority of its samples on the settled fullsweep target — it \
+         stays there rather than cycling between the young-only and fullsweep capacities; {m:?}"
     );
 }
 
@@ -727,15 +720,14 @@ fn the_runtime_shaped_workload_under_both_strategies() {
     // **quantity**: a minor's exact promoted word count, `GcStats::words_copied`
     // (`collector.rs::collect_minor`'s copier and `immix_collector.rs::run_minor`'s atomic
     // promotion both count object words, never lines).
-    // Their collection **counts** differ, and the cause is the minor/major *mix*, because the two
-    // rules behind the mix are not the same rule: a minor sizes the nursery from the young live
-    // set once over (`young_minor_target_words`), a fullsweep from the whole-heap live set twice
-    // over (`young_target_words`), so a run that reaches more fullsweeps drives its nursery to the
-    // larger fullsweep target more often — a larger **mean** capacity, and therefore fewer
-    // collections to admit the same words. The mature generation reaches the nursery's sizing only
-    // through that escalation decision. (Both runs' *settled* capacity is the carried minor
-    // target, 4 185; what the mix moves is the series' mean, not the end state — see
-    // [the nursery-cycle pin](#the-nursery-cycle-pin-is-a-statement-about-the-series).)
+    // Their collection **counts** differ in the minor/major *split*: a mark-region minor whose
+    // promotion would not fit the mature space's free lines escalates to a major
+    // (`immix_collector.rs::collect`'s `tight` arm), so the mark-region run reaches a fullsweep
+    // more often while running fewer minors. The young-vs-old shrink gate keeps the nursery on its
+    // single fullsweep-sized capacity for both runs (4 185 — see
+    // [the nursery pin](#the-nursery-pin-is-a-statement-about-the-non-collapsing-gate)), so the
+    // mean capacity — and with it the per-collection word count — is the same; the mature
+    // generation reaches the nursery's sizing only through that escalation decision.
     //
     // So the two counts are *not* compared to each other: a percentage band on them was a number
     // fitted to the data, and it moves whenever a `beam_gc` sizing change shifts one run by a
