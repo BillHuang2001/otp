@@ -134,10 +134,16 @@ impl RuntimeContext<'_> {
             runtime.note_escaped_store_roots(term);
             return Some(term);
         }
+        // One source-payload snapshot for both attempts, built once and borrowed at each call site
+        // (`SourcePayloads` is not `Copy`): the BIF-built refc-binary handles now held in
+        // `eval_off_heap` (adopted before this copy-out) plus the runtime process's retained
+        // mailbox families.
+        let payloads = runtime.source_payloads(runtime.self_pid(), &[]);
         let needed = match copy_result_fresh(
             &mut runtime.eval_heap,
             &mut runtime.eval_off_heap,
             term,
+            &payloads,
         ) {
             Ok(copied) => {
                 runtime.note_escaped_store_roots(copied);
@@ -159,6 +165,7 @@ impl RuntimeContext<'_> {
             &mut runtime.eval_heap,
             &mut runtime.eval_off_heap,
             term,
+            &payloads,
         )
         .ok()?;
         runtime.note_escaped_store_roots(copied);
