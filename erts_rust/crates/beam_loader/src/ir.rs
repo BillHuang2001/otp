@@ -331,6 +331,18 @@ pub struct Module {
     /// `[{enabled_features,[maybe_expr]}]`. The C only feeds the raw bytes to the module
     /// checksum (`erts/emulator/beam/beam_file.c:1811-1815`); they stay raw here too.
     pub meta: Option<Vec<u8>>,
+    /// The module's `-on_load` entry point, if it declares one.
+    ///
+    /// `-on_load(F/0)` is lowered by the compiler to an `on_load/0` instruction at
+    /// the head of `F`'s body (`lib/compiler/src/beam_asm.erl` `on_load/1`: the
+    /// `on_load` attribute is deleted and the marker is inserted right after the
+    /// entry label). The loader derives this field from the function whose body
+    /// carries [`Instr::OnLoad`]: the entry point's name atom (interned in this
+    /// module's atom table) and its arity — `Some(("on_load", 0))` for the standard
+    /// `-on_load(on_load/0)`. `None` for the common no-`-on_load` case. The C loader
+    /// records the same marker as the code's on_load offset
+    /// (`erts/emulator/beam/emu/emu_load.c` `op_on_load`).
+    pub on_load: Option<(Atom, u32)>,
     /// The module **checksum**: the 16-byte MD5 over a fixed subset of the container.
     ///
     /// Computed at load time by [`crate::checksum::module_md5`] exactly as the C loader
@@ -375,6 +387,7 @@ impl Default for Module {
             attributes: None,
             compile_info: None,
             meta: None,
+            on_load: None,
             checksum: [0u8; 16],
             label_map: SharedLabelMap::empty(),
         }

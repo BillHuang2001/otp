@@ -46,7 +46,7 @@ use crate::chunk::record::{RawRecord, RawRecordDefault};
 use crate::chunk::Chunks;
 use crate::decode::RawInstr;
 use crate::error::bad_file;
-use crate::ir::{Export, FunDescriptor, Import, Module, RecordDefinition, RecordField};
+use crate::ir::{Export, FunDescriptor, Import, Instr, Module, RecordDefinition, RecordField};
 use crate::labels::SharedLabelMap;
 use crate::literal::LiteralArea;
 use crate::operand::{Label, Operand};
@@ -230,6 +230,17 @@ pub fn build_module(
     // area they point into exists.
     let records = resolve_records(pending_records, &literals)?;
 
+    // The `-on_load(F/0)` entry point is marked by the `on_load/0` instruction the
+    // compiler emits at the head of `F`'s body (`beam_asm.erl` `on_load/1`: the
+    // attribute is deleted and the marker inserted after the entry label). The marker
+    // is already a typed [`Instr::OnLoad`] inside the function's body, so the owning
+    // function's name/arity is the entry point — exactly what the C loader records
+    // from `op_on_load` (`emu_load.c`).
+    let on_load = functions
+        .iter()
+        .find(|function| function.code.iter().any(|instr| matches!(instr, Instr::OnLoad)))
+        .map(|function| (function.name, function.arity));
+
     // The `Attr`/`CInf`/`Meta` payloads are single external terms, but they are *not*
     // decoded here: nothing in this crate reads the decoded terms, and the runtime's
     // `get_module_info/1,2` bridge decodes the retained raw bytes on demand
@@ -260,6 +271,7 @@ pub fn build_module(
         attributes: chunks.attributes.clone(),
         compile_info: chunks.compile_info.clone(),
         meta: chunks.meta.clone(),
+        on_load,
         checksum,
         label_map: SharedLabelMap::empty(),
     })
