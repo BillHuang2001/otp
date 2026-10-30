@@ -111,6 +111,24 @@ fn bytes_of(term: Eterm) -> Vec<u8> {
     assert_eq!(size_bits % 8, 0, "the result must be a whole number of bytes");
     bytes[offset / 8..offset / 8 + size_bits / 8].to_vec()
 }
+/// The byte-aligned contents of a bitstring (MSB-first), independent of its internal
+/// bit offset — the bits `offset..offset + size_bits` repacked into a fresh byte
+/// vector, so an `ErlSubBits` window that starts mid-byte still reads back cleanly.
+fn contents(term: Eterm) -> Vec<u8> {
+    let (bytes, offset, size_bits) = codec_term::bitstring_bytes(term).expect("a bitstring result");
+    assert_eq!(size_bits % 8, 0, "the contents must be a whole number of bytes");
+    let mut out = Vec::with_capacity(size_bits / 8);
+    for i in 0..size_bits {
+        let bit = (bytes[(offset + i) / 8] >> (7 - ((offset + i) % 8))) & 1;
+        if i % 8 == 0 {
+            out.push(0);
+        }
+        if bit != 0 {
+            *out.last_mut().expect("the byte just pushed") |= 1 << (7 - (i % 8));
+        }
+    }
+    out
+}
 /// `binary:referenced_byte_size/1` through the real registry.
 fn referenced(fx: &mut Fixture, term: Eterm) -> i64 {
     signed_value(fx.ok("binary", "referenced_byte_size", &[term]))
@@ -281,23 +299,23 @@ fn oracle_tool(name: &str) -> Option<PathBuf> {
     }
     on_path(name)
 }
-/// A `$TMPDIR` scratch directory holding the compiled `refcproducer` fixture.
+/// A `$TMPDIR` scratch directory holding one compiled oracle fixture module.
 struct Scratch {
     dir: PathBuf,
 }
 impl Scratch {
-    fn build(erlc: &Path) -> Scratch {
+    fn build(erlc: &Path, module: &str, source: &str) -> Scratch {
         let dir = std::env::temp_dir()
-            .join(format!("beam_bifs_refcproducer_{}", std::process::id()));
+            .join(format!("beam_bifs_{module}_{}", std::process::id()));
         std::fs::create_dir_all(&dir)
             .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
-        let source = dir.join("refcproducer.erl");
-        std::fs::write(&source, REFCPRODUCER_ERL)
-            .unwrap_or_else(|e| panic!("cannot write {}: {e}", source.display()));
+        let source_path = dir.join(format!("{module}.erl"));
+        std::fs::write(&source_path, source)
+            .unwrap_or_else(|e| panic!("cannot write {}: {e}", source_path.display()));
         let output = Command::new(erlc)
             .arg("-o")
             .arg(&dir)
-            .arg(&source)
+            .arg(&source_path)
             .output()
             .unwrap_or_else(|e| panic!("cannot run `{}`: {e}", erlc.display()));
         assert!(
@@ -318,13 +336,14 @@ impl Drop for Scratch {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
-/// Runs `refcproducer:run()` in the oracle, panicking on spawn failure or non-zero exit.
-fn run_refcproducer(erl: &Path, dir: &Path) -> String {
+/// Runs `<module>:run()` in the oracle, panicking on spawn failure or non-zero exit.
+fn run_module(erl: &Path, dir: &Path, module: &str) -> String {
     let output = Command::new(erl)
         .arg("-noshell")
         .arg("-pa")
         .arg(dir)
-        .args(["-eval", "refcproducer:run()."])
+        .arg("-eval")
+        .arg(format!("{module}:run()."))
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn the oracle `{}`: {e}", erl.display()));
     assert!(
@@ -357,8 +376,8 @@ fn the_copy_based_shapes_agree_with_the_oracle_row_for_row() {
         eprintln!("===============================================================");
         return;
     };
-    let scratch = Scratch::build(&erlc);
-    let out = run_refcproducer(&erl, scratch.path());
+    let scratch = Scratch::build(&erlc, "refcproducer", REFCPRODUCER_ERL);
+    let out = run_module(&erl, scratch.path(), "refcproducer");
 
     // 1. The oracle's own figures, against the task's recorded rows.
     assert_eq!(oracle_int(&out, "copy_ref"), 1024);
@@ -377,4 +396,77 @@ fn the_copy_based_shapes_agree_with_the_oracle_row_for_row() {
     let one = fx.binary(&[1]);
     let copy1000 = fx.ok("binary", "copy", &[one, make_small(1000)]);
     assert_eq!(referenced(&mut fx, copy1000), oracle_int(&out, "copy1000_ref"));
+}
+
+// ---------------------------------------------------------------------------
+// `erts_debug:unaligned_bitstring/2` — the unaligned window, off-heap
+// ---------------------------------------------------------------------------
+//
+// The C mints a fresh refc payload of `MAX(source_size + offset,
+// ERL_ONHEAP_BITS_LIMIT + 1)` **bits**, copies the source's bits into it at bit
+// `offset`, and returns an `ErlSubBits` window starting at that same `offset`
+// (`beam_debug.c:100-167`). For the 2048-bit source below with `offset = 3` the
+// payload is `MAX(2051, 513) = 2051` bits = 257 bytes, so the window — and a later
+// `binary:part(U, 1, 100)` of it — reports `referenced_byte_size == 257` while the
+// part's own `byte_size` is 100.
+
+/// The oracle fixture: the task's exact shape, printed as `key=value` lines.
+const UNALIGNED_ERL: &str = r#"
+-module(unaligned_producer).
+-export([run/0]).
+run() ->
+    B = list_to_binary(lists:seq(0, 255)),
+    U = erts_debug:unaligned_bitstring(B, 3),
+    P = binary:part(U, 1, 100),
+    io:format("u_size=~p~n", [byte_size(U)]),
+    io:format("u_ref=~p~n", [binary:referenced_byte_size(U)]),
+    io:format("part_size=~p~n", [byte_size(P)]),
+    io:format("part_ref=~p~n", [binary:referenced_byte_size(P)]),
+    halt().
+"#;
+
+#[test]
+fn unaligned_bitstring_windows_an_off_heap_payload_and_matches_the_oracle() {
+    // The direct-registry leg: the seam is installed, so `U` is the `[BinRef][ErlSubBits]`
+    // window over a fresh 257-byte payload, and the part's window shares that payload.
+    let mut fx = Fixture::new();
+    let source: Vec<u8> = (0u8..=255).collect();
+    let bin = fx.binary(&source);
+    let u = fx.ok("erts_debug", "unaligned_bitstring", &[bin, make_small(3)]);
+    // Exactly one payload was minted — the window's; the part's window is a new
+    // on-heap term over the same payload, not a second payload.
+    assert_eq!(fx.host.payloads.len(), 1, "one payload for the unaligned window");
+    assert_eq!(byte_size(&mut fx, u), 256, "the window's own byte size");
+    assert_eq!(referenced(&mut fx, u), 257, "the window reports its 257-byte payload");
+    assert_eq!(contents(u), source, "the window reproduces the source bits");
+    let part = fx.ok("binary", "part", &[u, make_small(1), make_small(100)]);
+    assert_eq!(byte_size(&mut fx, part), 100, "the 100-byte part");
+    assert_eq!(
+        referenced(&mut fx, part),
+        257,
+        "the part shares the 257-byte payload"
+    );
+    assert_eq!(
+        contents(part),
+        (1u8..=100).collect::<Vec<u8>>(),
+        "the part carries source bytes 1..=100"
+    );
+    assert_eq!(fx.host.payloads.len(), 1, "no payload minted for the part");
+
+    // The oracle leg: the same shape in a compiled module, skipping loudly (never a
+    // silent pass) when no `erl`/`erlc` oracle is available.
+    let (Some(erl), Some(erlc)) = (oracle_tool("erl"), oracle_tool("erlc")) else {
+        eprintln!("===============================================================");
+        eprintln!("[beam_bifs unaligned_bitstring] No usable `erl`/`erlc` oracle found.");
+        eprintln!("The unaligned-window figure is UNVERIFIED — NOT a pass.");
+        eprintln!("Set $ERTS_ORACLE (or install Erlang/OTP) and re-run.");
+        eprintln!("===============================================================");
+        return;
+    };
+    let scratch = Scratch::build(&erlc, "unaligned_producer", UNALIGNED_ERL);
+    let out = run_module(&erl, scratch.path(), "unaligned_producer");
+    assert_eq!(oracle_int(&out, "u_size"), 256, "the oracle's window byte size");
+    assert_eq!(oracle_int(&out, "u_ref"), 257, "the oracle's window referenced size");
+    assert_eq!(oracle_int(&out, "part_size"), 100, "the oracle's part byte size");
+    assert_eq!(oracle_int(&out, "part_ref"), 257, "the oracle's part referenced size");
 }

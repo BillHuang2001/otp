@@ -723,25 +723,29 @@ fn boolean_of(ctx: &BifContext<'_>, term: Eterm) -> Option<bool> {
 /// source is **not** an error — `unaligned_bitstring(<<>>, 1)` ⇒ `<<>>`, because
 /// `<<>>` *is* a bitstring (`is_not_bitstring` is false for it).
 ///
-/// # Representational deviation (Milestone-1)
+/// # Representation
 ///
 /// What the C returns is a `refc` bitstring: a heap `ErlSubBits` whose bit pointer
 /// sits `offset` bits **below** the byte start of a freshly minted off-heap refc
 /// binary — i.e. a deliberately **unaligned** internal representation, which is the
 /// whole point of the BIF (it exists to exercise consumers of an unaligned bit
-/// pointer). This runtime builds a plain on-heap `ErlHeapBits` instead (every M1
-/// binary is on-heap, see [`crate::bits`]), so the below-byte-start placement is not
-/// reproducible: the **bit pattern and shape agree** (same bit size, same bits, the
-/// result `=:=` the source) while the internal representation differs. The observable
-/// consequence is `binary:referenced_byte_size/1`, which reports the C's oversized
-/// refc buffer (65 for `unaligned_bitstring(<<1,2,3>>, 1)`) where this runtime reports
-/// the on-heap binary's own size.
+/// pointer). When a host installs the [`crate::OffHeapBinaries`] seam the same shape
+/// is built here ([`access::make_refc_window`]): the fresh payload is
+/// `MAX(source_size + offset, ERL_ONHEAP_BITS_LIMIT + 1)` bits wide (`beam_debug.c`'s
+/// `target_size`), the source's bits sit at bit `offset`, and the `ErlSubBits` window
+/// starts at that same `offset` — so `binary:referenced_byte_size/1` reports the C's
+/// oversized payload (65 for `unaligned_bitstring(<<1,2,3>>, 1)`, 257 for the
+/// 256-byte source below), and a `binary:part/2,3` above 512 bits windows that same
+/// payload. With **no** seam installed the on-heap `ErlHeapBits` shape is kept: the
+/// **bit pattern and shape agree** (same bit size, same bits, the result `=:=` the
+/// source) while only the interior representation (and hence
+/// `referenced_byte_size/1`) differs.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-bitstring source
-/// or a non-small / out-of-range offset; otherwise propagates the heap-profile failure
-/// when the result bitstring does not fit the destination heap.
+/// or a non-small / out-of-range offset; otherwise propagates the heap-profile or
+/// host-seam failure when the result bitstring does not fit the destination heap.
 fn unaligned_bitstring(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let source = args[0];
     if !access::is_bitstring(source) {
@@ -763,7 +767,44 @@ fn unaligned_bitstring(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm
     // follows a `BinRef`/match-context indirection.
     let bit_len = access::bitstring_bit_size(source)?;
     let bytes = access::bitstring_bits(source)?;
-    access::make_heap_bitstring(ctx.heap(), &bytes, bit_len)
+    if !ctx.has_off_heap() {
+        return access::make_heap_bitstring(ctx.heap(), &bytes, bit_len);
+    }
+    let offset_bits = offset as usize;
+    // `beam_debug.c:140-145`: the fresh payload is
+    // `MAX(source_size + offset, ERL_ONHEAP_BITS_LIMIT + 1)` **bits** — always above
+    // the on-heap limit, so `erts_new_bitstring` places it off-heap — and the source's
+    // bits are copied into it at bit `offset`. The window over it starts at that same
+    // `offset`, so the leading bits are deterministic (zero) and never observed; the
+    // window's `orig_size` is the payload's byte width, which is what a later
+    // `binary:part` + `binary:referenced_byte_size/1` report.
+    let target_bits = bit_len
+        .checked_add(offset_bits)
+        .map(|n| n.max(beam_term::refc::ERL_ONHEAP_BITS_LIMIT + 1))
+        .ok_or_else(system_limit)?;
+    let mut payload = vec![0u8; beam_term::bitstring::bit_count_to_bytes(target_bits)];
+    copy_bits(&mut payload, offset_bits, &bytes, bit_len);
+    access::make_refc_window(ctx, &payload, offset_bits, bit_len)
+}
+
+/// Copies `size` bits from `src` (MSB-first, starting at bit 0) into `dst` at bit
+/// `dst_bit` — the C's `copy_binary_to_buffer(dst, dst_bit, src, 0, size)`.
+///
+/// Bits are MSB-first within each byte (the frozen `beam_term` convention), so source
+/// bit `i` is bit `7 - (i % 8)` of `src[i / 8]` and lands in destination bit
+/// `dst_bit + i`. Destination bits outside the copied range are left as the caller
+/// initialised them; the unaligned-bitstring producer zeroes the buffer, so the
+/// `dst_bit` leading bits stay zero and are never observed by the window that starts
+/// there.
+fn copy_bits(dst: &mut [u8], dst_bit: usize, src: &[u8], size: usize) {
+    debug_assert!(dst.len() >= (dst_bit + size).div_ceil(8));
+    debug_assert!(src.len() >= size.div_ceil(8));
+    for i in 0..size {
+        if (src[i / 8] >> (7 - (i % 8))) & 1 != 0 {
+            let j = dst_bit + i;
+            dst[j / 8] |= 1 << (7 - (j % 8));
+        }
+    }
 }
 
 /// `erts_debug:map_info/1` — `hashmap_info/2`'s traversal statistics
