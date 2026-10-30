@@ -1711,7 +1711,7 @@ impl Machine {
     /// an *accumulator* payload is allocated by
     /// [`Machine::alloc_refc_binary_with_capacity`] instead: only a capacity-carrying
     /// payload (spare reservation included) can grow.
-    pub(crate) fn alloc_refc_binary(&mut self, bytes: &[u8]) -> Result<*mut u8> {
+    pub fn alloc_refc_binary(&mut self, bytes: &[u8]) -> Result<*mut u8> {
         let binary = beam_alloc::RefcBinary::new(bytes)?;
         let data = binary.data_ptr();
         self.refc_binaries.push(binary);
