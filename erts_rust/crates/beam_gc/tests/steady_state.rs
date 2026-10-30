@@ -573,34 +573,27 @@ fn a_monotonically_growing_live_set_follows_the_live_set_target() {
             );
             // The shrink band holds: never more than `YOUNG_SHRINK_FACTOR` times the target — or,
             // for a minor, never more than the larger of that and the legacy C's minor-shrink
-            // floor (`HEAP_SIZE(p) > 3000`, `erts/emulator/beam/erl_gc.c:1517-1529`). A minor
-            // that keeps a fullsweep-sized nursery (the young-vs-old gate: the nursery is no
-            // larger than the mature space) may sit above the band — the keep is the C's third
-            // shrink conjunct, not a per-collection creep.
+            // floor (`HEAP_SIZE(p) > 3000`, `erts/emulator/beam/erl_gc.c:1517-1529`).
             let band = match collection.kind {
                 CollectionKind::Minor => MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * target),
                 CollectionKind::Major => YOUNG_SHRINK_FACTOR * target,
             };
             assert!(
-                after <= band || (after == before && after <= c.mature_capacity_words()),
+                after <= band,
                 "{kind:?}: round {round} left the nursery at {after} words, past the {band}-word \
-                 band around its {target}-word target and not a young-vs-old keep of the \
-                 {before}-word nursery"
+                 band around its {target}-word target"
             );
             // The rule is a fixed point at the live set it measured: re-applying it reproduces
-            // the capacity, so it can never ratchet. The young-vs-old keep is the one deliberate
-            // non-fixed-point.
+            // the capacity, so it can never ratchet.
             let reapplied = match collection.kind {
                 CollectionKind::Minor => policy.young_after_collection(after, promoted),
                 CollectionKind::Major => policy.young_after_fullsweep(after, promoted),
             };
-            if after <= band {
-                assert_eq!(
-                    reapplied, after,
-                    "{kind:?}: round {round}: re-applying the rule at {after} words / {promoted} live \
-                     words answered {reapplied}, so {after} is not a fixed point"
-                );
-            }
+            assert_eq!(
+                reapplied, after,
+                "{kind:?}: round {round}: re-applying the rule at {after} words / {promoted} live \
+                 words answered {reapplied}, so {after} is not a fixed point"
+            );
 
             young_caps.push(after);
             mature_caps.push(mature_words(&c).1);
@@ -651,15 +644,12 @@ fn a_monotonically_growing_live_set_follows_the_live_set_target() {
             "{kind:?}: the capacity maximum is installed by the run's largest fullsweep, got one \
              at {live_words} words live against the largest {largest_fullsweep}"
         );
-        // The last round leaves it at its own kind's target, or keeps the fullsweep-sized nursery
-        // it already had (the young-vs-old gate: a trailing minor does not hand the fullsweep's
-        // nursery straight back).
-        let final_cap = *young_caps.last().expect("non-empty");
-        let final_target = *targets.last().expect("one target per round");
-        assert!(
-            final_cap == final_target || final_cap == young_caps[young_caps.len() - 2],
-            "{kind:?}: the final round leaves the nursery at its kind's live-set target or keeps \
-             the fullsweep-sized nursery it already had, got {young_caps:?}"
+        // The last round leaves it at its own kind's target.
+        assert_eq!(
+            *young_caps.last().expect("non-empty"),
+            *targets.last().expect("one target per round"),
+            "{kind:?}: the final round leaves the nursery at its kind's live-set target, got \
+             {young_caps:?}"
         );
 
         // Every capacity it ever took is its default or one of the rounds' live-set targets.

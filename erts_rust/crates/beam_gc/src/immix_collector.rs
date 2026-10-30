@@ -678,11 +678,7 @@ impl GenImmixCollector {
         // used: it is line-granular (`used_lines() * LINE_WORDS`, up to `LINE_WORDS` too large for
         // one small object) and it holds the garbage the minors since the last fullsweep
         // promoted.
-        self.nursery.collapse(
-            &self.policy,
-            stats.words_copied,
-            self.mature.capacity_words(),
-        )?;
+        self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(PromoteOutcome::Done(stats))
     }
     /// Reclaims the mature generation in place, then promotes the nursery into it.

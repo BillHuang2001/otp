@@ -190,10 +190,7 @@ pub const YOUNG_SHRINK_FACTOR: usize = 8;
 ///
 /// # What is deliberately **not** mirrored
 ///
-/// The C's gate is a conjunction of three tests. Two are reproduced: the floor below, and the
-/// young-vs-old relation as a gate in the minor collapse (`Nursery::collapse` /
-/// `minor_collapse_target` in `src/nursery.rs`), which is where the mature generation's capacity
-/// is actually in scope.
+/// The C's gate is a conjunction of three tests; only the floor is reproduced here.
 ///
 /// * `4 * need_after < HEAP_SIZE(p)` — the C shrinks once the post-collection need is under a
 ///   quarter of the young heap. This crate's band is **stricter**:
@@ -202,15 +199,10 @@ pub const YOUNG_SHRINK_FACTOR: usize = 8;
 ///   more). The floor is the one place the crate would otherwise be *less* conservative than the
 ///   C, which is why it is the conjunct added here.
 /// * `HEAP_SIZE(p) > 8000 || HEAP_SIZE(p) > (OLD_HEND(p) - OLD_HEAP(p))` — the C keeps a young
-///   heap that is not large compared with the **old** heap. The `> old heap` half **is**
-///   reproduced: a minor keeps a nursery whose capacity is not larger than the mature generation's
-///   reserved capacity (`OLD_HEND(p) - OLD_HEAP(p)`, the old heap's *size*), so a nursery a
-///   fullsweep sized from the whole-heap live set survives into the following minors instead of
-///   being handed back the first time the young-only live set reads as a trough. The `> 8000`
-///   half is deliberately **dropped**: a fullsweep already sizes the nursery to
-///   `next_words(2·live + 64)`, so for a large live set the nursery is above 8000 and the literal
-///   `> 8000` arm would re-open exactly that regression; the `> 3000` floor and the `8×` band
-///   subsume it for the small-mature case the disjunct was written for.
+///   heap that is not large compared with the **old** heap. There is no counterpart here: the
+///   mature generation is sized by [`HeapPolicy::mature_target_words`] from the live set a
+///   fullsweep measured ([`MATURE_TARGET_LIVE_MULTIPLE`]), never from the nursery's own scale, so
+///   a young-vs-old size relation carries no information the band does not already encode.
 ///
 /// The **fullsweep** resizer is a different rule (`adjust_after_fullsweep`,
 /// `erts/emulator/beam/erl_gc.c:2061-2098`) gated on `HEAP_SIZE(p) > H_MIN_SIZE` — a

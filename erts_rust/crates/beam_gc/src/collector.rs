@@ -420,11 +420,7 @@ impl Collector {
         // a fullsweep does), so it carries the garbage the minors since the last fullsweep
         // promoted and would inflate the target until the capacity tracked the run's total
         // allocation instead of the live set.
-        self.nursery.collapse(
-            &self.policy,
-            stats.words_copied,
-            self.mature.capacity_words(),
-        )?;
+        self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(stats)
     }
 

@@ -160,40 +160,18 @@ fn minor_carriage_bound(policy: &HeapPolicy, live_words: usize) -> usize {
 
 /// The capacity a **minor** collapse installs: the policy's `need`-augmented rule, bounded above
 /// by [`minor_carriage_bound`] — the one expression both [`Nursery::collapse`] and any reader of
-/// "what would the collapse install" share — and **gated by the mature generation's capacity**.
+/// "what would the collapse install" share.
 ///
 /// This is the **only** collapse that spends the carried request; see [`Nursery::collapse_after_fullsweep`].
-///
-/// # The young-vs-old shrink gate
-///
-/// The legacy C's third shrink conjunct (`erl_gc.c:1528-1529`) keeps a young heap that is not
-/// large compared with the **old** (mature) heap: it only shrinks when
-/// `HEAP_SIZE(p) > OLD_HEND(p) - OLD_HEAP(p)`, the mature generation's **reserved** capacity. The
-/// C's `HEAP_SIZE(p) > 8000` alternative is deliberately **not** mirrored: a fullsweep sizes a
-/// nursery to `next_words(2·live + 64)`, so for a large live set the nursery is already above
-/// 8000 and the literal `> 8000` arm would hand it straight back on the very next minor — exactly
-/// the regression this gate removes. The `> 3000` floor ([`MINOR_SHRINK_FLOOR_WORDS`]) and the
-/// `8×` band ([`YOUNG_SHRINK_FACTOR`]) already subsume that alternative for the small-mature case
-/// the disjunct was written for.
-///
-/// `raw < capacity_words` is precisely the policy's own shrink arm (it returns the target below
-/// the capacity only there); the carriage bound's cap of a band *keep*
-/// (`raw == capacity_words > minor_carriage_bound`) is **not** a shrink and stays capped. The gate
-/// keep returns the full `capacity_words` **uncapped**, because it is the C's keep, not a carried
-/// request the bound must clamp.
 fn minor_collapse_target(
     policy: &HeapPolicy,
     capacity_words: usize,
     live_words: usize,
     need_words: usize,
-    mature_capacity_words: usize,
 ) -> usize {
-    let raw = policy.young_after_collection_with_need(capacity_words, live_words, need_words);
-    if raw < capacity_words && capacity_words <= mature_capacity_words {
-        capacity_words
-    } else {
-        raw.min(minor_carriage_bound(policy, live_words))
-    }
+    policy
+        .young_after_collection_with_need(capacity_words, live_words, need_words)
+        .min(minor_carriage_bound(policy, live_words))
 }
 
 /// The young nursery: the space the mutator allocates in (`current`) plus every space a
@@ -819,34 +797,14 @@ impl Nursery {
     /// taken, but it may never buy capacity the shrink rule would take straight back — so the
     /// installed capacity stays a function of the live set even when the request itself scales
     /// with the capacity it replaced.
-    ///
-    /// # The young-vs-old shrink gate
-    ///
-    /// `mature_capacity_words` is the mature generation's **reserved** capacity — the C's
-    /// `OLD_HEND(p) - OLD_HEAP(p)`. A minor keeps the capacity it found (instead of handing it
-    /// back to the live-set target) when that capacity is not large compared with the mature
-    /// generation, so a nursery a fullsweep sized from the whole-heap live set survives into the
-    /// following minors rather than being discarded the first time the young-only live set reads
-    /// as a trough. [`minor_collapse_target`] applies the gate only to the band's own shrink arm.
-    pub(crate) fn collapse(
-        &mut self,
-        policy: &HeapPolicy,
-        live_words: usize,
-        mature_capacity_words: usize,
-    ) -> Result<()> {
+    pub(crate) fn collapse(&mut self, policy: &HeapPolicy, live_words: usize) -> Result<()> {
         let collected_capacity = self.capacity_words();
         // The `need` term: the largest room request a growth had to retire a space for since the
         // last collection. Taken (not merely read), so it is **one-shot** — a following
         // collection with no intervening growth sizes exactly as it does without the term, and
         // the capacity stays a function of the live set and one request rather than a ratchet.
         let need = core::mem::take(&mut self.pending_growth_need);
-        let target = minor_collapse_target(
-            policy,
-            collected_capacity,
-            live_words,
-            need,
-            mature_capacity_words,
-        );
+        let target = minor_collapse_target(policy, collected_capacity, live_words, need);
         // The growth seam's upper bound stays the **plain** live-set target: it must not be
         // inflated by a one-off request the collection has now paid for.
         let live_target = policy.young_minor_target_words(live_words);

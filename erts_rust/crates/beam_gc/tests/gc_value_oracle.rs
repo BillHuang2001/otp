@@ -80,7 +80,7 @@ use beam_codec::encode_term;
 use beam_gc::prelude::{AnyCollector, GcConfig, GcStats, HeapPolicy, MatureKind, OffHeap};
 use beam_term::prelude::{
     big_size_words, bin_ref_parts, boxed_val, is_arity_value, is_boxed, is_list, is_refc_binary,
-    make_atom, make_small, map_words_capacity, refc_bytes, write_big, write_map,
+    make_atom, make_small, map_words_capacity, ptr_val, refc_bytes, write_big, write_map,
     write_refc_binary, AtomTable, Eterm, ERL_REFC_BITS_SIZE, NIL,
 };
 
@@ -528,12 +528,9 @@ fn gc_preserves_every_shape_byte_identically_to_the_oracle() {
                 shape.name
             );
 
-            // A movable root must end the churn in the mature generation; that fact alone is
-            // the relocation proof — a term built in the young nursery and later resident in
-            // the mature generation was necessarily copied there. The final *address* is not
-            // asserted: the allocator may reuse the young space's address for a later mature
-            // space, so the post-churn address can coincide with the pre-collection one.
+            // Address before any collection (only a movable term has one).
             let movable = is_boxed(root) || is_list(root);
+            let addr_before = if movable { ptr_val(root) as usize } else { 0 };
 
             let mut roots = vec![root];
             let stats = churn(&mut c, &mut roots, CHURN_ROUNDS);
@@ -555,7 +552,7 @@ fn gc_preserves_every_shape_byte_identically_to_the_oracle() {
             );
 
             // The term was *relocated* (not merely left in place): a movable root left the
-            // nursery for the mature generation.
+            // nursery for the mature generation and its address changed.
             if movable {
                 assert!(
                     !c.young().contains_term(roots[0]),
@@ -565,6 +562,12 @@ fn gc_preserves_every_shape_byte_identically_to_the_oracle() {
                 assert!(
                     in_mature(&c, roots[0]),
                     "{kind:?} {}: the root was not relocated into the mature generation",
+                    shape.name
+                );
+                assert_ne!(
+                    ptr_val(roots[0]) as usize,
+                    addr_before,
+                    "{kind:?} {}: the root must have moved to a new address",
                     shape.name
                 );
             }

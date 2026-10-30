@@ -790,11 +790,10 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
     );
 
     // (d) A nursery the round left almost entirely dead does shrink — the memory really is given
-    // back — when it is **larger than the mature generation** (the C's young-vs-old conjunct,
-    // `HEAP_SIZE(p) > OLD_HEND - OLD_HEAP`, `erts/emulator/beam/erl_gc.c:1528-1529`).
+    // back.
     let mut c = Collector::new(HeapPolicy {
         initial_young_words: 4_185,
-        initial_mature_words: 1_024,
+        initial_mature_words: 8_192,
         ..policy
     })
     .expect("collector");
@@ -806,31 +805,7 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
     assert_eq!(
         c.young().capacity_words(),
         EMPTY_LIVE_TARGET,
-        "a nursery larger than the mature generation and holding 3 live words of garbage shrinks \
-         to the empty live set's target"
-    );
-
-    // (e) The young-vs-old gate: the same dead nursery is **kept** when it is not larger than the
-    // mature generation — the C's third shrink conjunct, which a fullsweep-sized nursery relies on
-    // to survive into the following minors. This is the live-set-protected (`live/1`) shape: the
-    // mature generation holds the resident live set, so the nursery must stay comparable to its
-    // capacity or every minor re-promotes the whole live set.
-    let mut c = Collector::new(HeapPolicy {
-        initial_young_words: 4_185,
-        initial_mature_words: 8_192,
-        ..HeapPolicy::default()
-    })
-    .expect("collector");
-    let elems: Vec<Eterm> = (0..2).map(|i| make_small(i as i64)).collect();
-    let mut roots = vec![tuple_in(c.young_mut(), &elems)];
-    fill_with_garbage(&mut c, 4);
-    let collection = c.collect(&mut roots).expect("minor");
-    assert_eq!(collection.kind, CollectionKind::Minor);
-    assert_eq!(
-        c.young().capacity_words(),
-        4_185,
-        "a nursery not larger than the mature generation is kept — the fullsweep-sized young heap \
-         survives the following minor instead of being handed back"
+        "a nursery holding 3 live words of garbage shrinks to the empty live set's target"
     );
 }
 
