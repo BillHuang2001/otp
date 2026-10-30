@@ -1,0 +1,111 @@
+{
+  "schema": "suites/1",
+  "generated_at": 1793376607,
+  "run_command": "suites run --target khepri --module triggers",
+  "host": {
+    "loadavg_before": "0.83 3.02 3.47 1/862 1722",
+    "loadavg_after": "0.75 2.20 3.11 1/814 1867",
+    "nproc": 16,
+    "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
+    "oracle_version": "29/17.1.1"
+  },
+  "rust": {
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A5/erts_rust/target/release/beam_rt",
+    "sha": "b0099f43e31275a3802a8cd4702574002a765b85",
+    "version": "30/17.1",
+    "tier": null
+  },
+  "targets": [
+    {
+      "id": "khepri",
+      "kind": "eunit",
+      "source": {
+        "repo": "khepri",
+        "path": "/home/bill/Source/khepri",
+        "sha": "2ac09291bac7c2fee099380ec1e26d8c9452f776",
+        "staged": "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj"
+      },
+      "build": {
+        "command": "/nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile",
+        "ok": true,
+        "reused": true,
+        "detail": "reused a completed `rebar3 as test compile` in the staged copy"
+      },
+      "code_path": [
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin"
+      ],
+      "invocations": [
+        {
+          "side": "sys",
+          "purpose": "eunit advanced_delete",
+          "command": "cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/advanced_delete && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
+        },
+        {
+          "side": "rust",
+          "purpose": "eunit advanced_delete",
+          "command": "cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A5/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
+        },
+        {
+          "side": "build",
+          "purpose": "rebar3 as test compile",
+          "command": "cd <stage>/proj && /nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile"
+        }
+      ],
+      "tally": {
+        "measured": 1,
+        "agree": 1,
+        "agree_fail_identical": 0,
+        "divergence": 0,
+        "oracle_only_fail": 0,
+        "rust_gap": 0,
+        "not_run": 0,
+        "sys_passed": 118,
+        "sys_failed": 0,
+        "rust_passed": 118,
+        "rust_failed": 0
+      },
+      "rows": [
+        {
+          "id": "triggers",
+          "suite": null,
+          "kind": "eunit",
+          "sys": {
+            "status": "pass",
+            "passed": 118,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 118,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        }
+      ],
+      "notes": [
+        "drive (identical on both sides): `eunit:test('{module}',[verbose]), halt(0).` — the module name is substituted per row",
+        "`rebar3 as test compile` is used for the build only; the numbers come from running `eunit:test/2` directly on both runtimes",
+        "code path: 11 entries (every `_build/test/lib/*/ebin` plus `_build/test/lib/khepri/test`)",
+        "jobs: 4 concurrent module runs (each in its own OS process and working directory)",
+        "per-module working directory: `/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd` (khepri's tests create `_test.<name>` dirs relative to the cwd; both sides of a module share one)",
+        "sys: `cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/triggers && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''triggers'\\'',[verbose]), halt(0).'`",
+        "rust: `cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/triggers && /home/bill/Source/otp/.genesis/workers/worker_T1_A5/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''triggers'\\'',[verbose]), halt(0).'`"
+      ]
+    }
+  ]
+}
