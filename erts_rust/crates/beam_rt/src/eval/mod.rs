@@ -103,6 +103,7 @@ mod native_stack;
 mod nesting;
 mod parse;
 pub(crate) mod reclaim;
+mod refc;
 pub(crate) mod scratch;
 mod trace;
 use std::collections::HashMap;
@@ -888,14 +889,28 @@ impl Evaluator<'_, '_> {
     ///
     /// A small byte-aligned binary goes on the engine arena
     /// ([`terms::make_heap_binary`], which is limited to `ERL_ONHEAP_BINARY_LIMIT` — 64 —
-    /// bytes); anything else — a non-byte-aligned bitstring, or a payload past that limit
-    /// (e.g. `<<0:2048>>`) — is written by [`beam_codec::term::make_bitstring`] on the
-    /// runtime's long-lived [`eval_heap`](crate::context::RuntimeContext::eval_heap),
-    /// which has no size limit. Both are pointer-stable, so the term stays valid for the
+    /// bytes); a small non-byte-aligned bitstring is written by
+    /// [`beam_codec::term::make_bitstring`] on the runtime's long-lived
+    /// [`eval_heap`](crate::context::RuntimeContext::eval_heap). A result past 64 bytes
+    /// is a **refc binary** built by [`refc::make_refc_binary`] with a grown-capacity
+    /// payload — the C `erl_eval` writable accumulator's shape — so
+    /// `binary:referenced_byte_size/1` answers the grown capacity, not the apparent byte
+    /// size. The payload handle is retained in the runtime's off-heap store for the
     /// runtime's lifetime.
     fn materialize_bits(&mut self, buf: &BitBuf) -> EResult<Eterm> {
         if buf.bits % 8 == 0 && buf.bytes.len() <= 64 {
             Ok(heap!(terms::make_heap_binary(self.ctx, &buf.bytes)))
+        } else if buf.bytes.len() > 64 {
+            let (term, handle) = {
+                let heap = self.ctx.eval_heap();
+                heap!(refc::make_refc_binary(heap, &buf.bytes, buf.bits))
+            };
+            // The payload is owned by `handle`, not the heap: retain it in the
+            // runtime's long-lived off-heap store so the returned term's `BinRef.val`
+            // stays live for the runtime's lifetime. Scoped above so the `heap` borrow
+            // is released before `self.ctx.runtime` is re-borrowed here.
+            self.ctx.runtime.adopt_escaped_binaries(&[handle]);
+            Ok(term)
         } else {
             let heap = self.ctx.eval_heap();
             Ok(heap!(beam_codec::term::make_bitstring(

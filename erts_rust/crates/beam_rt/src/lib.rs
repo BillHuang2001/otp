@@ -69,7 +69,8 @@
 //!   `context/gc/{bin_vheap,valve_bounds}.rs` and `context/calls.rs` (the GC root/valve raw reads),
 //!   `eval/reclaim.rs` + `eval/reclaim/resource.rs` (the `-eval` term-graph read),
 //!   `runtime/reclaim/{compact,holder}.rs` (the store move), `eval/native_stack.rs` (the three glibc
-//!   pthread attribute calls behind the walker's stack-headroom probe), `nif.rs` (`enif_compare`/
+//!   pthread attribute calls behind the walker's stack-headroom probe), `eval/refc.rs` (the two raw
+//!   term writes of the `-eval` refc-binary writer), `nif.rs` (`enif_compare`/
 //!   `enif_hash` `unsafe extern "C"` calls) and `malloc.rs` (one `malloc_trim` call, the allocator's
 //!   free-page release).
 //! * **Call down, never duplicate**: BIFs come from `beam_bifs`, terms/heaps from `beam_term`/
