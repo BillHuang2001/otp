@@ -29,7 +29,6 @@
 //!
 //! | key | why it is a gap |
 //! |---|---|
-//! | `build_type` | this runtime's own build tier is not the oracle's release tag |
 //! | `allocator` | this runtime does not identify the host C allocator (`{glibc, …}`) |
 //! | `time_offset`/`time_correction`/`time_warp_mode`/`tolerant_timeofday` | no time-correction service |
 //! | `os_monotonic_time_source` / `os_system_time_source` | no time-source introspection |
@@ -53,13 +52,6 @@
 //! C's answer is not a constant of the *interface* (unlike `hipe_architecture`'s
 //! `undefined` or `endian`'s host byte order, which are served) — so each is the honest
 //! typed capability gap rather than a copied oracle figure.
-//!
-//! `build_type` is the exception. This runtime is not missing the facility: it *does* have
-//! a build tier (`opt` for a release build, `debug` for one with debug assertions — the
-//! Rust analogue of the C's `ERTS_DEBUG`/`NDEBUG`). It is a gap because that truthful value
-//! is this runtime's **own** tier and does **not** match the oracle's release tag (`opt`):
-//! a stable-but-disagreeing own-state value must not be traded for the oracle's `opt`, so
-//! the honest typed gap is reported instead.
 
 use beam_common::Result;
 
@@ -77,7 +69,6 @@ pub(crate) fn try_value(key: &str, _rt: &Runtime) -> Option<Result<InfoValue>> {
         return None;
     }
     let reason = match key {
-        "build_type" => "this runtime's own build tier is not the oracle's release tag",
         "allocator" => "this runtime does not identify the host C allocator",
         "time_offset" | "time_correction" | "time_warp_mode" | "tolerant_timeofday" => {
             "this runtime has no time-correction service"

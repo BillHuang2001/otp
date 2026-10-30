@@ -90,15 +90,18 @@
 //!
 //! The remaining ones — the pure constructors (`lists:duplicate/2`, `make_tuple/2`,
 //! `binary:copy/2`, `lists:seq/2`, the `maps:*` rebuild arms) — *are* retry-safe in isolation. Of
-//! those, exactly **one** is retried: `super::is_retryable_pure_constructor` admits
-//! `lists:duplicate/2` only, the shape the D1 defect nests behind a higher-order `lists` BIF (a
-//! fresh 1 MiB nested region whose entitlement cannot foresee a single call that needs the whole
-//! region and more). Keying the retry on a sweeping "all pure constructors" roster would put the
-//! answer in a hand-maintained table that the next BIF added to `beam_bifs` silently lands on the
-//! wrong side of — one provably-pure entry keeps the blast radius of a future effect-bearing
-//! addition at a single key. The retry delegates its growth to [`grown_capacity`], so a `+hmax`
-//! refusal is preserved, and it only ever fires on a **nested** region (`bif_heaps_taken >= 2`),
-//! never the configured outermost one.
+//! those, a handful are retried: `super::is_retryable_pure_constructor` admits `lists:duplicate/2`
+//! (the shape the D1 defect nests behind a higher-order `lists` BIF — a fresh 1 MiB nested region
+//! whose entitlement cannot foresee a single call that needs the whole region and more) plus the
+//! `maps:*` rebuild arms (`from_keys/2`, `from_list/1`, `merge/2`), whose CHAMP layout's
+//! ~21-words-per-pair cost makes a million-pair map overflow even the **outermost** configured
+//! region. Keying the retry on a sweeping "all pure constructors" roster would put the answer in a
+//! hand-maintained table that the next BIF added to `beam_bifs` silently lands on the wrong side of
+//! — a short, provably-pure list keeps the blast radius of a future effect-bearing addition small.
+//! The retry delegates its growth to [`grown_capacity`], so a `+hmax` refusal is preserved, and it
+//! fires at **any** depth: the outermost region's entitlement (64 MiB of transient words in one
+//! call, or a quarter of a smaller region) is what a map build of several hundred thousand pairs
+//! outgrows, and the doubling floor of `grown_capacity` is what serves it on the retry.
 //!
 //! # The honest residual
 //!

@@ -144,6 +144,9 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "wordsize" => Some(Ok(InfoValue::Int(std::mem::size_of::<usize>() as i64))),
         "emu_flavor" => Some(Ok(InfoValue::Atom(rt.config().emulator.flavor.as_str()))),
         "emu_type" => Some(Ok(emu_type())),
+        // `build_type` shares the C arm with `emu_type` (`erl_bif_info.c:2800`,
+        // `am_build_type || am_emu_type`), so it reports the same build tag.
+        "build_type" => Some(Ok(emu_type())),
         "machine" => Some(Ok(InfoValue::Str("BEAM".to_string()))),
         "threads" => Some(Ok(InfoValue::Bool(true))),
         "smp_support" => Some(Ok(InfoValue::Bool(rt.config().emulator.features.smp))),
@@ -556,11 +559,13 @@ mod tests {
     #[test]
     fn the_build_and_implementation_flags_are_this_runtime_s_own() {
         let rt = runtime();
-        // `build_type` is a typed `unsupported` gap now (see `super::unsupported`): it
-        // shares the C arm with `emu_type`, but this runtime's own build tier
-        // (`cfg!(debug_assertions)`) is not the oracle's release tag (`opt`), so the
-        // `system` family no longer claims it.
-        assert!(try_value("build_type", &rt).is_none());
+        // `build_type` shares the C arm with `emu_type` (`am_build_type || am_emu_type`),
+        // so it answers this runtime's own build tier — the same `opt`/`debug` value —
+        // rather than the oracle's release tag (a `crypto:on_load/0` first thing reads it).
+        assert_eq!(
+            try_value("build_type", &rt).unwrap().unwrap(),
+            try_value("emu_type", &rt).unwrap().unwrap()
+        );
         // `compat_rel` is the emulator's own release number by default.
         assert_eq!(
             try_value("compat_rel", &rt).unwrap().unwrap(),

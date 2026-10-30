@@ -275,6 +275,25 @@ fn a_large_map_iterates_and_folds_like_the_oracle() {
     );
     assert_prints(&probe, LARGE_MAP_GOLDEN, "the large-map walk");
 }
+/// The D1 residual's exact symptom: `maps:from_keys(lists:seq(1, 1000000), ok)` and
+/// `maps:from_list([{I,I} || I <- lists:seq(1, 1000000)])` build a map whose CHAMP layout needs
+/// ~21M words — more than the 16.7M-word **outermost** BIF region, so the *outermost* retry
+/// ([`is_retryable_pure_constructor`](crate::context::calls::is_retryable_pure_constructor))
+/// must re-run them on a wider frontier. They answer the oracle's 1 000 000-key maps instead of a
+/// catchable `error:system_limit`.
+#[test]
+fn a_million_key_map_built_by_maps_from_keys_and_from_list_does_not_raise() {
+    const BANNER: &str = "bif_frontier_reservation";
+    let expr = "A = maps:from_keys(lists:seq(1, 1000000), ok), \
+                B = maps:from_list([{I, I} || I <- lists:seq(1, 1000000)]), \
+                io:format(\"~p~n\", [{maps:size(A), maps:size(B)}]).";
+    let probe = support::differential_eval(
+        BANNER,
+        "a million-key map built by maps:from_keys/2 and maps:from_list/1",
+        expr,
+    );
+    assert_prints(&probe, "{1000000,1000000}", "the million-key map builds");
+}
 /// The D1 shape: a large list built **inside a fun invoked by a higher-order `lists` BIF** — the
 /// nested-region first-call gap. `lists:foreach/2` takes the outermost region, its fun's
 /// `lists:duplicate/2` takes a fresh 1 MiB nested region, and a `200000`-element result (400 000

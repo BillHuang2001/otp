@@ -117,13 +117,21 @@ fn cold_term_heap_limit(failure: BeamError) -> BeamError {
 /// intern atoms, read or mutate a seam (`tables`/`dict`/`port`/`send`/`persistent_term`/`nif`), or
 /// apply a fun argument — the exact set of effects a re-run would duplicate. Adding a key here for a
 /// BIF that later learns an effect would silently turn that effect into a doubled side effect, which
-/// is why the roster is one entry (`lists:duplicate/2`, the D1 repro's builder) rather than a
-/// sweeping "all pure constructors" list: every other such BIF already gets a reservation that
-/// covers its observed demand ([`frontier`]) before it runs, while this one is the shape a
-/// higher-order `lists` BIF nests behind a fresh, smallest-possible region whose entitlement cannot
-/// foresee a single call that exceeds the whole region.
+/// is why the roster is deliberately a handful of provably-pure constructors rather than a sweeping
+/// "all pure constructors" list: every other such BIF already gets a reservation that covers its
+/// observed demand ([`frontier`]) before it runs, while the two shapes below are the ones whose
+/// single-call demand can exceed the *entire* region at their depth — `lists:duplicate/2` nested
+/// behind a higher-order `lists` BIF (a fresh 1 MiB nested region), and the `maps:*` rebuild arms
+/// (`from_keys/2`, `from_list/1`, `merge/2`) whose ~21-word-per-pair CHAMP layout makes a million-pair
+/// map (21M words) overflow even the **outermost** 16.7M-word region.
 fn is_retryable_pure_constructor(module: &str, function: &str, arity: u32) -> bool {
-    matches!((module, function, arity), ("lists", "duplicate", 2))
+    matches!(
+        (module, function, arity),
+        ("lists", "duplicate", 2)
+            | ("maps", "from_keys", 2)
+            | ("maps", "from_list", 1)
+            | ("maps", "merge", 2)
+    )
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -513,12 +521,15 @@ impl<'a> RuntimeContext<'a> {
             // so a configured `+hmax` still refuses (the ordinary `system_limit` is kept) and the
             // nesting-depth retention the small seed prevents is unchanged.
             //
-            // Only nested calls are retried (`bif_heaps_taken >= 2`): the outermost region is
-            // already the configured `bif_heap_words`, whose reservation covers the single-call
-            // demand the entitlement guarantees.
-            if self.runtime.bif_heaps_taken >= 2
-                && is_retryable_pure_constructor(module, function, arity)
-            {
+            // Every depth is retried, the outermost included: the entitlement caps a single
+            // reservation at [`frontier::BIF_FRONTIER_MAX_WORDS`] (64 MiB), so a pure constructor
+            // whose one-shot demand exceeds **both** the entitlement and the configured outermost
+            // region — a `maps:from_keys`/`from_list`/`merge` over a million pairs builds ~21M
+            // words against a 16.7M-word outermost region — used to die with a `system_limit` the
+            // oracle never raises. Re-running it on a wider frontier is safe for exactly the pure
+            // constructors in the roster ([`is_retryable_pure_constructor`]); a configured `+hmax`
+            // still refuses below ([`frontier::grown_capacity`] returns `None` under the cap).
+            if is_retryable_pure_constructor(module, function, arity) {
                 if let Err(BeamError::Alloc(failure)) = &attempt {
                     if failure.kind == AllocKind::Heap {
                         let demand = heap.used().saturating_sub(mark);
