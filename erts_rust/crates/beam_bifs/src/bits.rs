@@ -35,12 +35,16 @@
 //!
 //! # M1 scope and deviations
 //!
-//! * **Every binary this module *builds* stays on the heap.** C keeps a binary of
-//!   more than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes off-heap behind a `BinRef`, and
+//! * **This module's builders stay on the heap.** C keeps a binary of more than
+//!   `ERL_ONHEAP_BINARY_LIMIT` (64) bytes off-heap behind a `BinRef`, and
 //!   [`make_bitstring`] follows C's *layout* byte-for-byte (the on-heap block) while
 //!   deliberately ignoring the 64-byte *placement* rule — the heap is an arena that
-//!   never moves, so the limit buys nothing here. This is a deviation from C's
-//!   placement policy, not from its layout.
+//!   never moves, so the limit buys nothing here. The **whole-binary producers**
+//!   (`binary:copy/1,2`, `list_to_bin/1`, `iolist_to_binary/1`'s list form) do *not*
+//!   use this module's builders: they route a result above 64 bytes through
+//!   `crate::access::make_binary_result`, which places it off-heap when the host
+//!   installs the `crate::OffHeapBinaries` seam. This module remains the on-heap
+//!   `ErlHeapBits` builder the seam's copy arm and every ≤64-byte result use.
 //! * **Readers accept *both* representations.** The engine's own
 //!   `bs_create_bin`/`bs_init_writable` path (`beam_engine`'s
 //!   `families/bitstrings/raw.rs::make_binary`) DOES build the off-heap

@@ -509,6 +509,68 @@ pub(crate) fn make_heap_bitstring(heap: &mut Heap, bytes: &[u8], bit_len: usize)
     Ok(make_boxed(p as *const Eterm))
 }
 
+/// Builds the result binary of a **producing** BIF (`binary:copy/1,2`,
+/// `binary:list_to_bin/1`, `erlang:iolist_to_binary/1`) on the context heap, placing
+/// its payload **off-heap** when `bytes` exceeds
+/// [`ERL_ONHEAP_BINARY_LIMIT`](beam_term::refc::ERL_ONHEAP_BINARY_LIMIT) (64 bytes)
+/// and a host [`crate::OffHeapBinaries`] seam is installed; otherwise the on-heap
+/// `ErlHeapBits` block.
+///
+/// This is the crate's one producer of a whole (non-window) binary result, the
+/// analogue of C's `erts_new_bitstring` arm choice
+/// (`../../erts/emulator/beam/erl_bits.c:2810-2838`): above 64 bytes ERTS allocates
+/// an off-heap payload (`erts_bin_nrml_alloc(NBYTES(size))`) and wraps it in the
+/// `[BinRef][ErlSubBits]` pair, whose `orig_size` is the payload's byte width — the
+/// figure `binary:referenced_byte_size/1` reports and a later `binary:part/2,3`
+/// window over 512 bits shares. At or below 64 bytes (or with no host) the result
+/// stays an `ErlHeapBits`, byte-identical to [`make_heap_bitstring`].
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when the host returns a null or misaligned payload pointer
+/// (a non-conforming host is rejected rather than allowed to corrupt the base
+/// pointer); otherwise propagates the host's or heap's failure.
+pub(crate) fn make_binary_result(
+    ctx: &mut crate::BifContext<'_>,
+    bytes: &[u8],
+) -> Result<Eterm> {
+    let bit_len = bytes.len().saturating_mul(8);
+    if bytes.len() <= beam_term::refc::ERL_ONHEAP_BINARY_LIMIT || !ctx.has_off_heap() {
+        return make_heap_bitstring(ctx.heap(), bytes, bit_len);
+    }
+    // The payload is the host's: it copies `bytes` and owns the result (retained in
+    // its off-heap store), returning the `BinRef.val` word — the first data byte.
+    let val = ctx.alloc_refc_payload(bytes)?;
+    // The payload's first byte becomes the `ErlSubBits` base, so it must be non-null
+    // and word-aligned. `beam_alloc::RefcBinary::data_ptr` guarantees both; a host
+    // that violates the contract is rejected rather than allowed to set flag bits in
+    // (or null out) the base pointer.
+    if val.is_null() || (val as usize) & beam_term::bitstring::BITSTRING_POINTER_FLAG_MASK != 0 {
+        return Err(BeamError::BadArg);
+    }
+    // Only once the payload exists is the on-heap pair allocated, so a failed payload
+    // allocation leaves the heap untouched.
+    // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
+    // writable words.
+    let hp = unsafe { ctx.heap().alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)? };
+    // SAFETY: `hp` owns the 8 words the `[BinRef][ErlSubBits]` pair occupies — the
+    // layout `write_refc_binary` documents. `val` is a non-null, word-aligned pointer
+    // to the host's payload (kept alive by the host for as long as the term), which
+    // the guard above checked, and `base = val` means the window starts at the
+    // payload's first data byte covering `bit_len` bits. `next = null` is a valid
+    // chain link (nothing in this workspace walks the MSO chain).
+    unsafe {
+        Ok(beam_term::refc::write_refc_binary(
+            hp,
+            val.cast::<Eterm>(),
+            core::ptr::null_mut(),
+            val,
+            0,
+            bit_len,
+        ))
+    }
+}
+
 /// The bit size of a bitstring (heap or sub bits).
 ///
 /// # Errors
