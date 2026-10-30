@@ -1,94 +1,484 @@
 {
   "schema": "suites/1",
-  "generated_at": 1793376607,
-  "run_command": "suites run --target khepri --module triggers",
+  "generated_at": 1793390485,
+  "run_command": "suites run --target stdlib --suite binary_module_SUITE --runtime all --json",
   "host": {
-    "loadavg_before": "0.83 3.02 3.47 1/862 1722",
-    "loadavg_after": "0.75 2.20 3.11 1/814 1867",
+    "loadavg_before": "2.86 5.40 4.70 3/856 4",
+    "loadavg_after": "8.99 5.94 5.12 17/1011 397",
     "nproc": 16,
     "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
     "oracle_version": "29/17.1.1"
   },
   "rust": {
-    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A5/erts_rust/target/release/beam_rt",
-    "sha": "b0099f43e31275a3802a8cd4702574002a765b85",
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A21/erts_rust/target/release/beam_rt",
+    "sha": "6423575cf85cf33ea85ee73c8826d177d5930ea2",
     "version": "30/17.1",
     "tier": null
   },
   "targets": [
     {
-      "id": "khepri",
-      "kind": "eunit",
+      "id": "stdlib",
+      "kind": "ct",
       "source": {
-        "repo": "khepri",
-        "path": "/home/bill/Source/khepri",
-        "sha": "2ac09291bac7c2fee099380ec1e26d8c9452f776",
-        "staged": "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj"
+        "repo": "otp",
+        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A21/lib/stdlib/test",
+        "sha": "6423575cf85cf33ea85ee73c8826d177d5930ea2",
+        "staged": "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/src"
       },
       "build": {
-        "command": "/nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile",
+        "command": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …",
         "ok": true,
-        "reused": true,
-        "detail": "reused a completed `rebar3 as test compile` in the staged copy"
+        "reused": false,
+        "detail": "compiled 1 suites + 6 helpers + runner with the oracle's erlc"
       },
       "code_path": [
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin",
-        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin"
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/ebin",
+        "/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/ctl"
       ],
       "invocations": [
         {
           "side": "sys",
-          "purpose": "eunit advanced_delete",
-          "command": "cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/advanced_delete && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
+          "purpose": "ct binary_module_SUITE",
+          "command": "cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 300000, 600000, \"/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/src\"), halt(0).'"
         },
         {
           "side": "rust",
-          "purpose": "eunit advanced_delete",
-          "command": "cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A5/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''advanced_delete'\\'',[verbose]), halt(0).'"
+          "purpose": "ct binary_module_SUITE",
+          "command": "cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A21/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 300000, 600000, \"/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/stdlib/src\"), halt(0).'"
         },
         {
           "side": "build",
-          "purpose": "rebar3 as test compile",
-          "command": "cd <stage>/proj && /nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile"
+          "purpose": "erlc",
+          "command": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erlc -o <stage>/ebin -I <stage>/src <suite>.erl …"
         }
       ],
       "tally": {
-        "measured": 1,
-        "agree": 1,
-        "agree_fail_identical": 0,
-        "divergence": 0,
+        "measured": 20,
+        "agree": 14,
+        "agree_fail_identical": 1,
+        "divergence": 5,
         "oracle_only_fail": 0,
         "rust_gap": 0,
         "not_run": 0,
-        "sys_passed": 118,
-        "sys_failed": 0,
-        "rust_passed": 118,
-        "rust_failed": 0
+        "sys_passed": 19,
+        "sys_failed": 1,
+        "rust_passed": 14,
+        "rust_failed": 6
       },
       "rows": [
         {
-          "id": "triggers",
-          "suite": null,
-          "kind": "eunit",
+          "id": "binary_module_SUITE:ac_simd_root_skip",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
           "sys": {
             "status": "pass",
-            "passed": 118,
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
             "detail": ""
           },
           "rust": {
             "status": "pass",
-            "passed": 118,
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:badargs",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:bin_to_list",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:check_no_invalid_read_bug",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:copy",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:doctests",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{1,errors},{ct_doctest,run_module_docs,3,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:encode_decode",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:error_info",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "'exit <structured reason>'"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:guard",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:hex_encoding",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:interesting",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,do_interesting,1,...}}"
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,do_interesting,1,...}}"
+          },
+          "verdict": "agree-fail-identical",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:join",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:list_to_bin",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:longest_common_trap",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,unsupported_bif,{erlang,bump_reductions,[...],...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:parts",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:random_ref_comp",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "timeout"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:random_ref_fla_comp",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:random_ref_sr_comp",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "verdict": "agree",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:referenced",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
+            "skipped": 0,
+            "detail": "{exception,error,{badmatch,1023},{binary_module_SUITE,referenced,1,...}}"
+          },
+          "verdict": "divergence",
+          "note": ""
+        },
+        {
+          "id": "binary_module_SUITE:scope_return",
+          "suite": "binary_module_SUITE",
+          "kind": "ct_case",
+          "sys": {
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "detail": ""
+          },
+          "rust": {
+            "status": "pass",
+            "passed": 1,
             "failed": 0,
             "skipped": 0,
             "detail": ""
@@ -98,13 +488,11 @@
         }
       ],
       "notes": [
-        "drive (identical on both sides): `eunit:test('{module}',[verbose]), halt(0).` — the module name is substituted per row",
-        "`rebar3 as test compile` is used for the build only; the numbers come from running `eunit:test/2` directly on both runtimes",
-        "code path: 11 entries (every `_build/test/lib/*/ebin` plus `_build/test/lib/khepri/test`)",
-        "jobs: 4 concurrent module runs (each in its own OS process and working directory)",
-        "per-module working directory: `/tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd` (khepri's tests create `_test.<name>` dirs relative to the cwd; both sides of a module share one)",
-        "sys: `cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/triggers && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''triggers'\\'',[verbose]), halt(0).'`",
-        "rust: `cd /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/cwd/triggers && /home/bill/Source/otp/.genesis/workers/worker_T1_A5/erts_rust/target/release/beam_rt -noshell -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/genesis/task_3a94b23b77a88346/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\\''triggers'\\'',[verbose]), halt(0).'`"
+        "drive (identical on both sides): `ct_runner:run('{suite}', {case_timeout_ms}, {suite_budget_ms}, \"{data_root}\"), halt(0).`",
+        "each case runs in its own `spawn_monitor` with a per-case timeout; `init_per_group`/`end_per_group`/`init_per_testcase` hooks are NOT executed",
+        "cases that fail identically on both sides (missing `ct` config/data dirs, group-hook dependencies) are `agree-fail-identical`: excluded from both numerators, never counted as passes",
+        "per-case timeout: 300 s · suite budget: 600 s (the runner stops launching cases when the budget expires and prints `SUITE_DEADLINE <not-run>`, so the remaining cases are reported as *not measured*, never as failures)",
+        "binary_module_SUITE: 20 cases — sys 19/1 pass/fail, rust 14/6 pass/fail"
       ]
     }
   ]

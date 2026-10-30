@@ -725,21 +725,42 @@ pub(crate) fn part_slice(
         bits::with_bytes(subject, |bytes| iolist::part_range(bytes.len(), epos, elen))?;
     let bit_offset = start.checked_mul(8).ok_or_else(system_limit)?;
     let bit_size = len.checked_mul(8).ok_or_else(system_limit)?;
-    // The builder's window arm needs a parent payload to share; above the on-heap
-    // limit an `ErlHeapBits` parent has none, and that arm is the documented residual
-    // (see the doc comment) — so it is gated here, before the builder can refuse it.
-    if bit_size > beam_term::refc::ERL_ONHEAP_BITS_LIMIT
-        && access::refc_payload_bytes(subject).is_none()
-    {
+    // Only an above-limit window over a refc parent mints the `[BinRef][ErlSubBits]`
+    // pair through the builder; every other shape is the byte copy, taken directly
+    // here rather than through the builder's heap arm:
+    //
+    // * a window at or below `ERL_ONHEAP_BITS_LIMIT` is the builder's **heap arm**
+    //   (a fresh `ErlHeapBits` copy of the selected bytes — `binary:part`/
+    //   `erlang:binary_part` take integer offsets, so the window is always byte
+    //   aligned and `make_binary`'s bytes are identical to `write_heap_bits`'s), and
+    // * an above-limit window over an `ErlHeapBits` parent has no payload to share,
+    //   the documented placement residual (see the doc comment).
+    //
+    // NB the at-or-below-limit heap arm is copied rather than delegated to
+    // `make_sub_binary` because `beam_term::refc::write_sub_binary` chooses its arm on
+    // the **word count** (`words == ERL_REFC_BITS_SIZE`), which collides with the heap
+    // arm's own 8-word count for a 41..48-byte window and wrongly takes the refc arm
+    // (failing on a parent with no payload). That upstream collision is reported; the
+    // copy here is byte-identical, never reaches it, and — because the slice is lent
+    // straight to the writer, never materialised into a `Vec` — still costs nothing,
+    // exactly as the builder's stack-buffer heap arm did.
+    if bit_size <= beam_term::refc::ERL_ONHEAP_BITS_LIMIT {
+        return bits::with_bytes(subject, |bytes| {
+            bits::make_binary(ctx.heap(), &bytes[start..start + len])
+        });
+    }
+    // An above-limit window over an `ErlHeapBits` parent has no payload to share — the
+    // documented placement residual (see the doc comment) — and keeps the copy route.
+    if access::refc_payload_bytes(subject).is_none() {
         let slice =
             bits::with_bytes(subject, |bytes| Ok(bytes[start..start + len].to_vec()))?;
         return bits::make_binary(ctx.heap(), &slice);
     }
-    // `badarg` (the builder's only refusal) is unreachable here — the byte range was
-    // validated against the subject's own byte size, which is exactly the parent
-    // window `write_sub_binary` re-checks, and the arm above already covers the one
-    // reachable shape refusal — so it maps to the same `badarg` a wrong range would,
-    // never to a silently wrong size.
+    // Only an above-limit window over a refc parent mints the `[BinRef][ErlSubBits]`
+    // pair. `badarg` (the builder's only refusal) is unreachable here — the byte range
+    // was validated against the subject's own byte size, which is exactly the parent
+    // window `write_sub_binary` re-checks — so it maps to the same `badarg` a wrong
+    // range would, never to a silently wrong size.
     access::make_sub_binary(ctx.heap(), subject, bit_offset, bit_size)
 }
 
@@ -1787,6 +1808,84 @@ mod tests {
             let part = part_3(ctx, &[parent, one, five_ten]).unwrap();
             assert_eq!(bytes(part), data[1..511], "the bytes are still the window's");
             assert_eq!(referenced(ctx, part), 510, "the copy answers its own size");
+        });
+    }
+
+    /// The 41..48-byte at-or-below-limit window is the one shape whose heap-arm word
+    /// count (`2 + ceil(n_bytes/8)` = 8) equals `ERL_REFC_BITS_SIZE`, the count
+    /// `beam_term::refc::write_sub_binary` once used to select its refc arm — so such
+    /// a window over an on-heap parent answered `badarg` where the oracle returns the
+    /// bytes (the stdlib D13 / khepri RC-G divergence). `part_slice` now takes the
+    /// byte copy route for every at-or-below-limit window, so that collision is
+    /// unreachable; this sweep pins every window size of an on-heap parent.
+    #[test]
+    fn part_of_an_onheap_parent_sweeps_every_window_size() {
+        with_ctx(|ctx| {
+            let data: Vec<u8> = (0..63u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+            let parent = bin(ctx, &data);
+            let zero = ctx.int(0).unwrap();
+            // Every window size 1..=63 over a 63-byte parent is in range; 41..=48 is
+            // the historical collision band, the rest the plain copy.
+            for len in 1..=63i64 {
+                let part = part_3(ctx, &[parent, zero, ctx.int(len).unwrap()]).unwrap();
+                assert_eq!(bytes(part), data[..len as usize], "a {len}-byte window");
+            }
+            // The same band from a non-zero offset (start + len stays in range).
+            let one = ctx.int(1).unwrap();
+            for len in 41..=48i64 {
+                let part = part_3(ctx, &[parent, one, ctx.int(len).unwrap()]).unwrap();
+                assert_eq!(
+                    bytes(part),
+                    data[1..1 + len as usize],
+                    "an offset {len}-byte window"
+                );
+            }
+        });
+    }
+
+    /// Boundary shapes at the byte-size frontier, mirroring the oracle's
+    /// `erts_binary_part` rule: a zero-length `Len` at any in-range `Start` (including
+    /// `Start == byte_size`) is the empty binary, `Start + Len == byte_size` is the
+    /// in-range tail, and only a genuinely out-of-range or non-integer argument is
+    /// `badarg`.
+    #[test]
+    fn part_boundary_shapes() {
+        with_ctx(|ctx| {
+            let data: Vec<u8> = vec![0x11, 0x22, 0x33];
+            let parent = bin(ctx, &data);
+            let (zero, one, two, three, neg1) = (
+                ctx.int(0).unwrap(),
+                ctx.int(1).unwrap(),
+                ctx.int(2).unwrap(),
+                ctx.int(3).unwrap(),
+                ctx.int(-1).unwrap(),
+            );
+
+            // A zero-length `Len` at 0 and at `byte_size` (== 3) is `<<>>`.
+            assert!(bytes(part_3(ctx, &[parent, zero, zero]).unwrap()).is_empty());
+            assert!(bytes(part_3(ctx, &[parent, three, zero]).unwrap()).is_empty());
+            // `Start + Len == byte_size` is the in-range tail.
+            assert_eq!(bytes(part_3(ctx, &[parent, one, two]).unwrap()), data[1..3]);
+            assert_eq!(bytes(part_3(ctx, &[parent, zero, three]).unwrap()), data[0..3]);
+            assert_eq!(bytes(part_3(ctx, &[parent, two, one]).unwrap()), data[2..3]);
+            // The reverse form `(Start, -Len)` counts `Len` bytes ending at `Start`.
+            assert_eq!(bytes(part_3(ctx, &[parent, three, neg1]).unwrap()), data[2..3]);
+            // Just past the boundary is `badarg`, forward and reverse.
+            assert!(matches!(
+                part_3(ctx, &[parent, zero, ctx.int(4).unwrap()]),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(part_3(ctx, &[parent, one, three]), Err(BeamError::BadArg)));
+            assert!(matches!(part_3(ctx, &[parent, three, one]), Err(BeamError::BadArg)));
+            assert!(matches!(
+                part_3(ctx, &[parent, three, ctx.int(-4).unwrap()]),
+                Err(BeamError::BadArg)
+            ));
+            // An empty subject: `(0, 0)` is `<<>>`, a non-zero length is `badarg`.
+            let empty = bin(ctx, &[]);
+            assert!(bytes(part_3(ctx, &[empty, zero, zero]).unwrap()).is_empty());
+            assert!(matches!(part_3(ctx, &[empty, zero, one]), Err(BeamError::BadArg)));
+            assert!(matches!(part_3(ctx, &[empty, zero, neg1]), Err(BeamError::BadArg)));
         });
     }
 
