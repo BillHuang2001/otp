@@ -409,6 +409,53 @@ mod tests {
     }
 
     #[test]
+    fn a_compiled_spec_survives_its_source_heap_being_clobbered() {
+        let (mut source_heap, atoms, mut reg) = parts();
+
+        // Build the spec on a source heap and compile it. The handle the BIF
+        // returns is a 4-word ref thing on the *source* heap, so only its id is
+        // kept — the handle term itself must be rebuilt on the fresh heap below.
+        let handle_id = {
+            let mut ctx = BifContext::new(&mut source_heap, &atoms, ProcessId::new(1, 0))
+                .with_tables(&mut reg);
+            let spec = pick_first_spec(&mut ctx);
+            let handle =
+                match_spec_compile_1(&mut ctx, &[spec]).expect("ets:match_spec_compile/1");
+            ref_thing_id(handle).expect("a compiled spec must be a ref thing")
+        };
+
+        // Clobber every word the source heap ever handed out. The registry must
+        // have deep-copied the spec into its own `TermStore`: if the stored root
+        // still aliased these words (RC-F), the run below would decode poison —
+        // `[[]]` from the clobbered first cons cell — and either crash or fail the
+        // `[a,c]` assertion, never silently agree.
+        for word in source_heap.used_words_mut() {
+            *word = beam_term::NIL;
+        }
+
+        // A fresh heap, the same registry, and a rebuilt handle carrying the same
+        // id. The input list is built on the fresh heap, so every term the run
+        // reaches is live; the only thing that could still name the source heap is
+        // a retained alias in the registry.
+        let mut fresh_heap = Heap::new(65536).expect("fresh heap");
+        let handle = make_ref_thing(&mut fresh_heap, handle_id).expect("rebuild the handle");
+        let mut ctx =
+            BifContext::new(&mut fresh_heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let t_a = keyed_pair(&mut ctx, 1, "a");
+        let t_b = keyed_pair(&mut ctx, 2, "b");
+        let t_c = keyed_pair(&mut ctx, 1, "c");
+        let input = ctx.list(&[t_a, t_b, t_c]).expect("fits");
+        let got = match_spec_run_2(&mut ctx, &[input, handle]).expect("ets:match_spec_run/2");
+        let a = ctx.atom("a").expect("seeded");
+        let c = ctx.atom("c").expect("seeded");
+        let expected = ctx.list(&[a, c]).expect("fits");
+        assert!(
+            beam_term::compare::eq(got, expected, &atoms),
+            "a compiled spec must not alias its source heap"
+        );
+    }
+
+    #[test]
     fn match_spec_run_serves_a_compiled_handle_and_rejects_everything_else() {
         let (mut heap, atoms, mut reg) = parts();
         let mut ctx =

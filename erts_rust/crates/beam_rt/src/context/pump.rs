@@ -598,11 +598,16 @@ impl<'a> RuntimeContext<'a> {
             if self.runtime.ports_awaiting_async() {
                 return self.wait_for_port_event(machine, module, func, pc);
             }
-            // No port owes anything: one pump, and a pump that changed nothing ends the drive
-            // with the typed gap (the mailbox cannot have changed).
+            // No port owes anything: one pump. A pump that changed nothing still leaves one
+            // producer — a pending runtime timer (`erlang:send_after`'s `gen_server`/
+            // `gen_statem` housekeeping or state timeout, a `dets`/batch-server flush) that a
+            // waiting peer armed. Folding straight to the typed gap here is what turned a
+            // `gen_statem:call`'s bare `receive` into `blocked()` even though the reply only
+            // needed the peer's timer to fire, so [`RuntimeContext::wait_for_timer_event`]
+            // sits that deadline out (once) instead.
             let ran = self.runtime.pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)?;
             if ran == 0 {
-                return Ok(None);
+                return self.wait_for_timer_event(machine, module, func, pc);
             }
             return Ok(Some(machine.resume_outcome(module, func, pc, self)?));
         };
@@ -750,6 +755,73 @@ impl<'a> RuntimeContext<'a> {
             }
         }
     }
+
+    /// Sits out a nested `receive` whose only remaining producer is a **pending runtime timer**
+    /// — the `erlang:send_after` half of [`RuntimeContext::pump_once`].
+    ///
+    /// A `gen_statem:call`/`gen_server:call` from the `-eval` process parks in a bare `receive`
+    /// (an `infinity` call), while every process that owes the reply is itself `Waiting` with a
+    /// timer armed (`gen_statem`'s state timeout, `gen_server`'s `send_after` housekeeping, a
+    /// `dets` flush, a `gen_batch_server` wait). Nothing is runnable *because* the peers are all
+    /// waiting out their own timers, so the ordinary "a pump that ran nothing cannot have changed
+    /// the mailbox" rule ([`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot)
+    /// answering `0`) is too strong: the only thing that can advance the peers is the timer heap
+    /// firing. This is the loop that replaces the fold — it sleeps to the earliest pending
+    /// deadline and runs the one bounded pass that fires it, so the woken peer sends its reply and
+    /// the receive completes.
+    ///
+    /// # Why it does not spin
+    ///
+    /// Every iteration consumes at least one timer (the one it slept to), so the loop is bounded
+    /// by the size of the timer heap; an iteration whose deadline fired but advanced nothing (its
+    /// target had died) reads the **next** deadline, and the loop ends when the heap is exhausted
+    /// — that is the genuine deadlock, folded to the typed [`beam_engine::blocked`] gap. The
+    /// sleep is exactly the remaining time to the deadline (never longer, so a deadline cannot be
+    /// overshot), and the outer [`BLOCKING_PUMP_DEADLINE`] still caps a peer that keeps re-arming
+    /// timers without ever replying. A pass that *did* run something returns the resume to the
+    /// driver, so the 900 s cap is re-checked between timer wakes, never inside one wait.
+    ///
+    /// # Re-execution safety
+    ///
+    /// Nothing is armed, latched or consumed by this method itself: the timer was armed by the
+    /// peer's own execution, and a resume only re-scans the mailbox at the reported `(func, pc)`.
+    /// A machine that re-parks at the same receive therefore re-enters this wait for the *same*
+    /// peer chain rather than issuing anything twice.
+    fn wait_for_timer_event(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        func: u32,
+        pc: u32,
+    ) -> Result<Option<RunOutcome>> {
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            // The earliest live deadline. With none, nothing can ever wake the receive: the honest
+            // `blocked` gap, never a spin.
+            let Some(deadline) = self.runtime.timers_mut().next_deadline() else {
+                return Ok(None);
+            };
+            if crate::debug_trace::enabled() && rounds <= 8 {
+                crate::debug_trace::trace(format_args!(
+                    "wait_for_timer_event round {rounds}: deadline in {:?}",
+                    deadline.saturating_duration_since(Instant::now())
+                ));
+            }
+            let now = Instant::now();
+            if now < deadline {
+                std::thread::sleep(deadline.saturating_duration_since(now));
+            }
+            // One bounded pass fires the deadline (delivering into the peer's mailbox) and runs
+            // the woken peer's reply. A pass that still changed nothing means the deadline's
+            // target had gone — its timer is consumed either way, so the loop proceeds to the
+            // next deadline.
+            let ran = self.runtime.pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)?;
+            if ran > 0 {
+                return Ok(Some(machine.resume_outcome(module, func, pc, self)?));
+            }
+        }
+    }
 }
 /// The **discriminator** for [`RuntimeContext::run_label_blocking`]: applying a local
 /// (`make_fun3`) closure whose body blocks in a `receive` must **suspend and resume**, not
@@ -889,6 +961,87 @@ call(F) -> F().
             error.to_string(),
             beam_engine::blocked().to_string(),
             "a context that may not pump reports the typed `blocked` gap, never a value"
+        );
+    }
+}
+
+/// Pins the nested pump's **timer wait** ([`RuntimeContext::wait_for_timer_event`]): a bare
+/// `receive` satisfied only by a peer's `erlang:send_after` timer must complete, not fold to the
+/// typed [`beam_engine::blocked`] gap.
+///
+/// This is the Khepri RC-E shape — a `gen_statem:call`'s reply is owed by a server that parks on
+/// its own state timeout, so a pump round that ran nothing ([`Runtime::pump_scheduler_boot`]
+/// answering `0` because the deadline is >`TIMER_PUMP_SLICE` out) must still wait out that
+/// deadline once and resume, rather than folding to `blocked` (exit 3) on an empty round.
+#[cfg(test)]
+mod nested_timer_wait {
+    use super::super::RuntimeContext;
+    use crate::context::test_support::{compile_fixture, find_on_path, resolve_erlc, skip_loudly};
+    use crate::runtime::Runtime;
+
+    /// `bftimer:call/0` spawns a server, asks it to reply and parks in a **bare** `receive`.
+    /// The server arms a 300 ms `send_after` and parks on it; its reply is produced only when the
+    /// timer heap fires, so nothing else can wake the receive.
+    const TIMER_SRC: &str = r#"
+-module(bftimer).
+-export([call/0, server/1]).
+
+call() ->
+    Self = self(),
+    Pid = spawn(?MODULE, server, [Self]),
+    Pid ! go,
+    receive
+        {done, Pid} -> ok
+    end.
+
+server(Parent) ->
+    receive
+        go ->
+            erlang:send_after(300, self(), reply),
+            receive
+                reply -> Parent ! {done, self()}
+            end
+    end.
+"#;
+
+    #[test]
+    fn a_bare_receive_waits_out_the_peers_timer() {
+        // `Runtime::with_defaults` boots the runtime on demand (`scheduler_pass` →
+        // `boot_if_needed`), which resolves the system code path (natively from the filesystem,
+        // else `$ERTS_STDLIB_DIR` or the system `erl`). A missing toolchain is a loud skip.
+        if std::env::var_os("ERTS_STDLIB_DIR").is_none() && find_on_path("erl").is_none() {
+            skip_loudly("nested timer wait", "no `erl` on $PATH and no $ERTS_STDLIB_DIR");
+            return;
+        }
+        let Some(erlc) = resolve_erlc() else {
+            skip_loudly(
+                "nested timer wait",
+                "no `erlc` (and none beside $ERTS_ORACLE either)",
+            );
+            return;
+        };
+
+        let dir = compile_fixture(&erlc, "timwait", "bftimer", TIMER_SRC);
+
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        rt.boot().expect("the boot sequence");
+        let module = rt
+            .code_server
+            .load_path(dir.join("bftimer.beam"))
+            .expect("load bftimer.beam");
+
+        // `ok` is interned in the shared table the module was lowered against, so the atom the
+        // nested machine returns is index-identical to the one this intern yields.
+        let ok = rt.intern("ok");
+
+        let result = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.run_export(&module, "call", 0, &[])
+        };
+        assert_eq!(
+            result.expect("`call/0`'s bare receive is satisfied by the server's timer-fired reply"),
+            ok,
+            "the nested pump must wait out the peer's `send_after` deadline, not fold to `blocked`"
         );
     }
 }

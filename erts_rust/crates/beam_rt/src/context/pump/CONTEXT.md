@@ -20,6 +20,12 @@ That drives the blocking pass until one of **three** progress signals moves: an 
 The wait is bounded by `crate::port::PORT_EVENT_DEADLINE` (5 s of consecutive **no-progress** rounds, re-armed at now on every round that made some); an expiry is the typed `unsupported` capability gap, never a hang.
 The wait arms, latches and consumes nothing, so a re-park waits on the same queued operation and never issues a second one.
 Detail: [`../../port/CONTEXT.md`](../../port/CONTEXT.md) *The nested port wait*.
+### A nested timer wait — `wait_for_timer_event`
+When the ordinary no-deadline pump (`Runtime::pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)`) reports `ran == 0`, `pump_once` hands the wait to `wait_for_timer_event` instead of gaping it — because a `gen_statem:call`/`gen_server:call` from the `-eval` route parks in a bare `receive` while every peer that owes the reply is `Waiting` with a timer armed (`gen_statem`'s state timeout, `gen_server`'s `send_after` housekeeping, a `dets` flush, a `gen_batch_server` wait), so nothing is runnable *because* the peers are waiting out their own timers and only the timer heap can advance them.
+It sleeps exactly to the earliest live deadline (`Runtime::timers_mut().next_deadline` — never longer, so a deadline is not overshot), runs one bounded pass that fires it, and resumes the machine when the pass made progress; a fired deadline whose target had died is consumed either way, so the loop is bounded by the timer-heap size and ends — folding to the honest `blocked()` gap — only when no deadline remains (the genuine deadlock).
+The wait arms, latches and consumes nothing (the timer was armed by the peer's own execution), so a re-park waits on the same peer chain rather than issuing a second timer.
+The outer `BLOCKING_PUMP_DEADLINE` still caps a peer that keeps re-arming timers without replying.
+This is what makes khepri's `gen_statem:call`-based eunit modules (e.g. `simple_get`, `simple_put`, `advanced_get`, `triggers`) complete on the `-eval` route instead of exiting 3 with `blocked()`.
 ### Entry is tier-free
 A nested run enters through `Machine::run_export_outcome`/`run_label_outcome` → the tier-free `run_loop`/`run_loop_with_map` → `Machine::drive`.
 **No `Tier` is passed anywhere on this path**, so a nested callee never runs on the default baseline JIT and `BEAM_RT_TIER` does not change its tier; the `*_with_tier` entries are the runner slice's.
@@ -104,7 +110,7 @@ The `in_process_compile` suite is the long one (shard it); the pump suites are f
 * **The measured per-call cost of this route (callgrind on `lib/stdlib/src/ordsets.erl`) is the parent's**, and its remaining hot items are sibling levers (`gc_walk`'s valve descent, libc `malloc`/`free`, `build_label_map`, the JIT cache's `HashWriter`) — [`../gc/CONTEXT.md`](../gc/CONTEXT.md), [`../../../PERF_DISPATCH.md`](../../../PERF_DISPATCH.md).
 * **Sample host memory with `/proc/<pid>/status` `VmHWM` plus `BEAM_RT_MEM_TRACE=1`** and, when attributing a page to a mechanism, `/proc/<pid>/smaps` per mapping plus an `LD_PRELOAD` `mallinfo2` sampler — the `strace -f -k` attribution is what distinguishes a glibc thread-arena heap from a beam region (glibc's first words decode as `heap_info { ar_ptr, prev, size = 0x4000000, mprotect_size }`).
 ## Routing Table
-* `../pump.rs` → the nested-run pump (`run_export`/`run_export_blocking`/`run_label_blocking`, `pump_until_returned`/`pump_once`/`wait_for_port_event`, `RUN_EXPORT_PUMP_SLICES`/`BLOCKING_PUMP_DEADLINE`), `adopt_nested_payloads` and the three inline test modules.
+* `../pump.rs` → the nested-run pump (`run_export`/`run_export_blocking`/`run_label_blocking`, `pump_until_returned`/`pump_once`/`wait_for_port_event`/`wait_for_timer_event`, `RUN_EXPORT_PUMP_SLICES`/`BLOCKING_PUMP_DEADLINE`), `adopt_nested_payloads` and the four inline test modules.
 * `fun_apply_matrix.rs` → the fun-application matrix suite (four `lists` keys × four fun kinds, scheduled-process cells against the oracle, plus the two controls).
 * `../machine_pool.rs` → the thread-local module-affine pool of finished nested-run `Machine`s (`acquire`/`release`, `Pool`/`Slot`, the three ceilings), its `perf` reuse census and the `pooled_*` census/support surface.
 ## See Also
