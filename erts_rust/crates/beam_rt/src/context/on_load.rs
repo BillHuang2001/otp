@@ -24,10 +24,13 @@
 //!
 //! The entry point is the loader's `Module::on_load: Option<(Atom, u32)>` — the
 //! `(function_atom, arity)` derived from the `on_load/0` instruction marker, interned in that
-//! module's own atom table. It is run through [`RuntimeContext::run_export`], which lowers the
-//! real engine IR (never the tree walker), sets `current_module` to the module's name for the
-//! whole run (so `erlang:load_nif/2` inside the hook registers its library under the right
-//! owner), and observes the return term synchronously.
+//! module's own atom table. `-on_load(F/A)` names a **local** function (the `on_load` chunk
+//! carries only name/arity, never an export — `crypto:on_load/0` is not in `crypto`'s `ExpT`
+//! chunk), so the hook is entered by function index through the module's **function** table
+//! (`Module::function(..).entry_label`) via [`RuntimeContext::run_label_blocking`], never
+//! [`RuntimeContext::run_export`]. The run sets `current_module` to the module's name for the
+//! whole hook (so `erlang:load_nif/2` inside it registers its library under the right owner)
+//! and observes the return term synchronously.
 
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{atom_val, is_atom};
@@ -41,9 +44,10 @@ impl RuntimeContext<'_> {
     ///
     /// # Errors
     ///
-    /// `badarg` when `name` is not loaded, or the loaded image has no `-on_load` entry (or its
-    /// function atom has no name in the module's atom table). The hook's own raise propagates
-    /// unchanged (after [`RuntimeContext::run_export`] names the reason atom).
+    /// `badarg` when `name` is not loaded, the loaded image has no `-on_load` entry, or the
+    /// entry's `(function, arity)` is not defined by the module's function table. The hook's own
+    /// raise propagates unchanged (after [`RuntimeContext::run_label_blocking`] names the reason
+    /// atom).
     pub(crate) fn run_on_load_function(&mut self, name: &str) -> Result<Eterm> {
         let handle = self
             .runtime
@@ -51,11 +55,24 @@ impl RuntimeContext<'_> {
             .module_handle(name)
             .ok_or(BeamError::BadArg)?;
         let (function, arity) = handle.on_load.ok_or(BeamError::BadArg)?;
-        let function = handle
-            .atom_name(function)
-            .ok_or(BeamError::BadArg)?
-            .to_string();
-        self.run_export(&handle, &function, arity, &[])
+        // `-on_load(F/A)` names a *local* function — the `on_load` chunk carries only the
+        // name/arity, and ERTS runs it by function index, never through the export table:
+        // `crypto:on_load/0` is not in `crypto`'s `ExpT` chunk yet still runs. Resolve the
+        // entry label from the module's **function** table (locals included), not `exports`.
+        let entry_label = handle
+            .function(function, arity)
+            .map(|function| function.entry_label)
+            .ok_or(BeamError::BadArg)?;
+        // Everything the hook executes is this module's code, so `erlang:load_nif/2` reached
+        // from it must see this name (the same identity `run_export` establishes for an export).
+        let previous = self
+            .current_module
+            .replace(handle.atom_name(handle.name).unwrap_or_default().to_string());
+        let result = self
+            .run_label_blocking(&handle, entry_label, arity, &[])
+            .map_err(|err| error::name_atom_raise(err, self.runtime.atoms()));
+        self.current_module = previous;
+        result
     }
 
     /// Runs `name`'s `-on_load` hook **once per cached image**: `Ok(())` on `ok` (recorded in
