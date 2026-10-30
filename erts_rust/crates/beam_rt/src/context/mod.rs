@@ -111,6 +111,8 @@ pub(crate) mod nif_send;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
+mod on_load_tests;
+#[cfg(test)]
 mod tests;
 
 pub use self::runtime_context::RuntimeContext;
