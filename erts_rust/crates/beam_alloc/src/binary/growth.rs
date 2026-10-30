@@ -223,14 +223,17 @@ impl RefcBinary {
 
     /// Grows the payload so that its capacity is **at least** `capacity` bytes.
     ///
-    /// Three outcomes, all leaving `len()` (and therefore the payload's bytes) untouched:
+    /// Four outcomes, all leaving `len()` (and therefore the payload's bytes) untouched:
     ///
     /// 1. The request already fits: [`GrowOutcome::InPlace`] with the *current* capacity —
     ///    no allocation and no counter bump (the capacity did not rise).
-    /// 2. The grown target fits the existing reservation: the capacity is committed in
-    ///    place ([`GrowOutcome::InPlace`], `in_place_grows` bumped); `data_ptr()` does not
-    ///    move.
-    /// 3. Otherwise the payload is reallocated, copied and freed
+    /// 2. The grown target fits the existing reservation: the grown capacity is committed
+    ///    in place ([`GrowOutcome::InPlace`], `in_place_grows` bumped); `data_ptr()` does
+    ///    not move.
+    /// 3. The reservation holds the *request* but not the grown target: just the requested
+    ///    capacity is committed in place ([`GrowOutcome::InPlace`], `in_place_grows`
+    ///    bumped); `data_ptr()` does not move.
+    /// 4. Otherwise the payload is reallocated, copied and freed
     ///    ([`GrowOutcome::Moved`], `moves`/`bytes_copied` bumped).
     ///
     /// The grown target is
@@ -257,18 +260,25 @@ impl RefcBinary {
         if capacity > max_capacity {
             return Err(error::large_object_failure(capacity));
         }
-        // `capacity <= target <= max_capacity`, so the request is always covered.
-        let target = grow_span(capacity).max(capacity).min(max_capacity);
+        // `capacity <= grown <= max_capacity`, so the request is always covered.
+        let grown = grow_span(capacity).max(capacity).min(max_capacity);
         let reserved = self.reserved_bytes();
-        if target <= reserved {
-            self.header_mut().capacity = target;
+        if grown <= reserved {
+            self.header_mut().capacity = grown;
             self.in_place_grows += 1;
-            return Ok(GrowOutcome::InPlace { capacity: target });
+            return Ok(GrowOutcome::InPlace { capacity: grown });
         }
-        // `target <= max_capacity <= MAX_PAYLOAD_BYTES`, so the rounded-up reservation is
+        if capacity <= reserved {
+            // The reservation holds the request even though it does not hold the grown
+            // target: commit just the requested capacity in place instead of forcing a move.
+            self.header_mut().capacity = capacity;
+            self.in_place_grows += 1;
+            return Ok(GrowOutcome::InPlace { capacity });
+        }
+        // `grown <= max_capacity <= MAX_PAYLOAD_BYTES`, so the rounded-up reservation is
         // clamped only by the policy cap and can never exceed what the allocator serves.
-        let new_reserved = round_up_unit(grow_span(reserved).max(target)).min(max_capacity);
-        Ok(GrowOutcome::Moved(self.relocate(new_reserved, target)?))
+        let new_reserved = round_up_unit(grow_span(reserved).max(grown)).min(max_capacity);
+        Ok(GrowOutcome::Moved(self.relocate(new_reserved, grown)?))
     }
 
     /// Grows the payload so that it can hold `extra` more bytes than it currently does
