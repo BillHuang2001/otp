@@ -799,13 +799,15 @@ fn an_empty_retired_space_is_re_adopted_rather_than_replaced() {
 /// **retired** space.
 #[test]
 fn a_collection_collapses_the_chain_onto_its_live_set_target() {
-    /// A mature generation large enough for the whole chain's occupancy, so the minor path of
-    /// the collapse seam is reachable at all (a minor that cannot fit its promotion is the
-    /// typed heap exhaustion, and `collect` escalates it to a fullsweep).
+    /// A mature generation sized so the **shrink branch** of the collapse seam is reachable at
+    /// all: it must hold the establishing promotions (up to the 401-word term in (6c)) — a minor
+    /// that cannot fit its promotion is the typed heap exhaustion — yet stay **below the chain**
+    /// the growth loop installs, so the young-vs-old shrink gate (`HEAP_SIZE(p) >
+    /// OLD_HEND - OLD_HEAP`) permits the collapse to hand the chain back onto its live-set target.
     fn policy() -> HeapPolicy {
         HeapPolicy {
             initial_young_words: 90,
-            initial_mature_words: 32768,
+            initial_mature_words: 1024,
             ..HeapPolicy::default()
         }
     }

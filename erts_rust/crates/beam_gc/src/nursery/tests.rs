@@ -470,7 +470,7 @@ fn the_aggregate_extent_covers_every_space_and_tracks_the_geometry_epoch() {
     // The collapse re-seeds the aggregate from the single remaining space — a stale
     // widening would keep claiming the retired spaces' neighbourhood — and advances the
     // epoch. The safety property holds again over the same neighbourhood.
-    nursery.collapse(&policy, 0).expect("the collapse");
+    nursery.collapse(&policy, 0, 0).expect("the collapse");
     assert_eq!(nursery.space_count(), 1, "the chain is one space again");
     let collapsed = nursery.bounds();
     assert_eq!(
@@ -547,7 +547,7 @@ fn the_aggregate_extent_stays_exact_over_a_chain_no_reachable_growth_produces() 
 
     // The collapse re-seeds the aggregate from the surviving space and keeps the safety
     // property over the retired neighbourhood.
-    nursery.collapse(&policy, 0).expect("the collapse");
+    nursery.collapse(&policy, 0, 0).expect("the collapse");
     assert_eq!(nursery.space_count(), 1, "the chain is one space again");
     let collapsed = nursery.bounds();
     assert_eq!(
@@ -832,7 +832,7 @@ fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     // A collected nursery remembers the target its round derived ...
     let live = 401;
     let mut nursery = Nursery::new(default_allocator().clone(), 233).expect("nursery");
-    nursery.collapse(&policy, live).expect("the collapse");
+    nursery.collapse(&policy, live, 0).expect("the collapse");
     let live_target = policy.young_minor_target_words(live);
     assert_eq!(live_target, 610);
     assert_eq!(nursery.live_target_words, Some(live_target));
@@ -905,7 +905,7 @@ fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     // of occupancy plus request alone grants it (`next_words(606 + 5 000) = 6 772`), so the bound
     // is not a ceiling.
     let mut large = Nursery::new(default_allocator().clone(), 233).expect("nursery");
-    large.collapse(&policy, live).expect("the collapse");
+    large.collapse(&policy, live, 0).expect("the collapse");
     fill(large.current_mut());
     let used = large.current().used_words();
     let need = 5_000;
