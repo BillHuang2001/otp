@@ -28,7 +28,7 @@
 use beam_bifs::NullSink;
 use beam_common::BeamError;
 use beam_engine::{terms, ExecutionContext};
-use beam_process::ProcessId;
+use beam_process::{MonitorRef, ProcessId};
 use beam_rt::{Runtime, RuntimeContext};
 use beam_term::{signed_value, Eterm, NIL};
 
@@ -250,6 +250,43 @@ fn trace_delivered_returns_a_ref_and_delivers_the_barrier_message() {
     );
 }
 
+/// `erlang:trace_delivered/1` accepts a well-formed internal pid that is **not** in the process
+/// table (its process already terminated): it returns a reference and still delivers the
+/// `{trace_delivered, Pid, Ref}` barrier message to the caller — never `badarg`.
+#[test]
+fn trace_delivered_accepts_a_terminated_pid() {
+    let mut rt = runtime();
+    let ghost = ProcessId::new(9_999_999, 0).to_eterm();
+    let tag = rt.intern("trace_delivered");
+
+    let mut sink = NullSink;
+    let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+
+    let reference = ctx
+        .call_bif("erlang", "trace_delivered", 1, &[ghost])
+        .expect("trace_delivered/1 for a terminated pid");
+    assert!(
+        MonitorRef::from_eterm(reference).is_ok(),
+        "a terminated pid returns a reference, not badarg"
+    );
+
+    let message = ctx
+        .receive_next()
+        .expect("receive_next")
+        .expect("the barrier message was delivered");
+    assert_eq!(terms::tuple_arity(message).expect("a tuple"), 3);
+    assert_eq!(pair_value(message, 0), tag);
+    assert_eq!(pair_value(message, 1), ghost);
+    let delivered = pair_value(message, 2);
+
+    drop(ctx);
+    let atoms = rt.code_server().atoms();
+    assert!(
+        beam_term::compare::eq(delivered, reference, atoms),
+        "the delivered ref is the returned ref"
+    );
+}
+
 /// `erts_internal:trace/3` targets: a pid, and the group atoms `all`/`existing`/
 /// `existing_processes`/`processes` select the whole process table; the port/`new` PidSpecs are
 /// the honest typed capability gap.
@@ -358,14 +395,20 @@ fn the_badarg_paths() {
         );
     }
 
-    // `trace_delivered/1`: a non-atom target and an unknown pid are both badarg.
-    for target in [unknown_atom, ghost] {
-        assert!(
-            matches!(
-                ctx.call_bif("erlang", "trace_delivered", 1, &[target]),
-                Err(BeamError::BadArg)
-            ),
-            "trace_delivered is badarg for {target:?}"
-        );
-    }
+    // `trace_delivered/1`: a non-pid target is badarg, but a well-formed internal pid — dead or
+    // alive — returns a reference (the C's `trace_delivered_1` accepts any internal pid).
+    assert!(
+        matches!(
+            ctx.call_bif("erlang", "trace_delivered", 1, &[unknown_atom]),
+            Err(BeamError::BadArg)
+        ),
+        "trace_delivered is badarg for {unknown_atom:?}"
+    );
+    let reference = ctx
+        .call_bif("erlang", "trace_delivered", 1, &[ghost])
+        .expect("trace_delivered of a dead pid");
+    assert!(
+        MonitorRef::from_eterm(reference).is_ok(),
+        "a dead pid still returns a reference"
+    );
 }

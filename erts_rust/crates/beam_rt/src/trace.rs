@@ -898,10 +898,10 @@ impl RuntimeContext<'_> {
 
     /// `erlang:trace_delivered(Tracee)` — a delivery barrier for `Tracee`.
     ///
-    /// `Tracee` must be a pid the process table holds, or the atom `all`; anything else is
-    /// `badarg`. A fresh reference is minted from the runtime's one ref id space, the message
-    /// `{trace_delivered, Tracee, Ref}` is delivered to the **calling** process (delivery is
-    /// synchronous in this single-threaded runtime) and `Ref` is returned.
+    /// `Tracee` must be an internal pid (alive or already terminated), or the atom `all`;
+    /// anything else is `badarg`. A fresh reference is minted from the runtime's one ref id space,
+    /// the message `{trace_delivered, Tracee, Ref}` is delivered to the **calling** process
+    /// (delivery is synchronous in this single-threaded runtime) and `Ref` is returned.
     ///
     /// # Errors
     ///
@@ -910,10 +910,7 @@ impl RuntimeContext<'_> {
         let target = *args.first().ok_or(BeamError::BadArg)?;
         let is_all = self.atom_name(target).as_deref() == Some("all");
         if !is_all {
-            let pid = ProcessId::from_eterm(target).map_err(|_| BeamError::BadArg)?;
-            if !self.process_table().contains(pid) {
-                return Err(BeamError::BadArg);
-            }
+            ProcessId::from_eterm(target).map_err(|_| BeamError::BadArg)?;
         }
         // The reference comes from the runtime's **own** id space (the one `make_ref/0` and the
         // timers draw from) — not the process table's monitor/alias space. This `trace_delivered`
