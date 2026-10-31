@@ -1,4 +1,4 @@
-# stdlib divergence classes D1…D12 — current verdicts
+# stdlib divergence classes D1…D13 — current verdicts
 
 The per-class record behind `../stdlib-notes.md` §D and `../stdlib/summary.md`.
 Every row below was re-measured with its smallest expression against the runtime under test; nothing here is
@@ -10,7 +10,7 @@ Measurement/diagnosis only: no runtime crate was touched from this node.
 | field | value |
 |---|---|
 | runtime under test | `erts_rust/target/release/beam_rt`, built from this worktree (`cargo.sh build -p beam_rt --release`) |
-| runtime commit | `8e8e0ad5d96a11931ff6972779a3b5adbe90bfca` |
+| runtime commit | `e98a5e1e231706a13b103f8c18c218ecb8d0d212` |
 | runtime version | `erlang:system_info(version)` → `"17.1"`; `system_info(otp_release)` → `"30"` |
 | oracle | system `erl`/`erlc` on `$PATH` — OTP `29.1.2`, erts `17.1.1` |
 | sweep artifacts | `../stdlib/report.json` + `../stdlib/summary.md` (8 suites, `--timeout 10 --suite-budget 300 --jobs 4`) |
@@ -31,182 +31,123 @@ Two rules are load-bearing:
 
 | # | smallest expression | oracle | rust | verdict |
 |---|---|---|---|---|
-| **D1** | `lists:foreach(fun(_) -> length(lists:duplicate(N, x)) end, [1])` for `N = 65536 / 65537 / 200000` | `ok` every `N` | `ok` every `N` | **fixed** (the 65536-element term-heap `system_limit` is gone) |
-| **D1** | `maps:from_keys(lists:seq(1, 1000000), ok)` / `maps:from_list(…)` — **compiled** | the map | catchable `error:system_limit` | **still present, new shape** (the trapping-BIF build path, not a `lists` fun) |
-| **D1b** | `error_info_child_probe:main()` | `DONE`, exit `0` | `DONE`, exit `0` (same `{ok,ok}` main result) | **fixed** |
-| **D1c** | `error_info_abort_probe:main({prefix, 70})` | `{ok,ok}`, exit `0` | parent receives the atom `'exit <structured reason>'`, exit `0` | **still present** (the raise reason is replaced by a placeholder atom) |
-| **D2** | `C = binary:part(<<"z",(binary:copy(<<255>>,1024))/binary>>,1,510), {byte_size(C), binary:referenced_byte_size(C)}` | `{510,2050}` | `{510,510}` | **still present** for every sub-binary of a **refc** parent |
+| **D1** | `lists:foreach(fun(_) -> length(lists:duplicate(N, x)) end, [1])` for `N = 65536 / 65537 / 200000` | `ok` every `N` | `ok` every `N` | **fixed** |
+| **D1** | `maps:from_keys(lists:seq(1, 1000000), ok)` / `maps:from_list(…)` — **compiled** | the map | the map | **fixed** (the `system_limit` shape is gone) |
+| **D1** | the suite's trapping-yield count (`count_nr_of_yields > 2` for `from_keys`/`from_list`/`keys`/`values`) | `NoYields > 2` | `{badmatch,false}` (≤ 2 yields) | **still present, new shape** (the BIF does not trap through the yield/trace funnel) |
+| **D1b** | `error_info_child_probe:main()` | `DONE`, exit `0` | `DONE`, exit `0` | **fixed** |
+| **D1c** | `error_info_abort_probe:main({prefix, 70})` | `{ok,ok}`, exit `0` | parent receives the atom `'exit <structured reason>'`, exit `0` | **still present** (see the precise site below) |
+| **D2** | `B = <<"z",(binary:copy(<<255>>,1024))/binary>>`, `C = binary:part(B, 1, 510)`, `{byte_size(C), referenced_byte_size(C)}` | `{510,1025}` | `{510,510}` | **mostly fixed** — whole-binary and several sub-binary shapes agree; a `binary:part/3` sub-binary of a refc parent still reports its own size |
 | **D3** | `erlang:trace/3` enable + `trace_info(flags)` readback | `{1,1,{flags,[running,call]}}` | `{1,1,{flags,[running,call]}}` | **fixed** |
 | **D4** | `M = #{a=>1,b=>2}, erts_debug:same(maps:put(a,1,M), M)` — **compiled** | `true` | `true` | **fixed** |
-| **D5** | `catch maps:with([a,b], (fun(X) -> X end)(a))` — **compiled**, legacy `catch` | head `{maps,with,[[a,b],a],…}` | head `{maps,with,[[a,b],a],…}` | **fixed** (only a benign fun-name suffix on the tail item differs) |
-| **D6** | `catch erlang:bump_reductions(134217727)` — **compiled** | `true` | `{'EXIT',{unsupported_bif,[…]}}` | **still present** (a catchable typed gap; `binary_module_SUITE:longest_common_trap` fails on it) |
+| **D5** | `catch maps:with([a,b], (fun(X) -> X end)(a))` — **compiled**, legacy `catch` | head `{maps,with,[[a,b],a],…}` | head `{maps,with,[[a,b],a],…}` | **fixed** |
+| **D6** | `catch erlang:bump_reductions(134217727)` — **compiled** | `true` | `true` | **fixed** |
 | **D7** | `erlang:system_info(snifs)` | 553 `{M,F,A}` | 556 `{M,F,A}` | **fixed** (the count is not expected to match) |
-| **D8** | `maps_bif_loop_probe:main()` — 50 rounds × 1000-key maps | reference | `merge_with` **662×/614×**, `intersect_with` **92×/95×**, `iterator+next` **438×/480×**, `to_list` control 3.7× | **still present** |
-| **D9** | `apply_args_probe:main()` — the `apply/2` argument matrix | see §D9 | agrees on every value; only the arity-mismatch *reason* degrades (`{badarity,Args}` → `badarity`) | **fixed** (residual: one reason shape) |
+| **D8** | `maps_bif_loop_probe:main()` — 50 rounds × 1000-key maps | reference | `merge_with` **662×/614×**, `intersect_with` **92×/95×**, `iterator+next` **438×/480×**, `to_list` control 3.7× | **still present** (performance) |
+| **D9** | `apply_args_probe:main()` — the `apply/2` argument matrix | agrees on every value | agrees on every value | **fixed** |
 | **D10** | `erts_debug:set_internal_state(available_internal_state,true)`, then `…(unicode_loop_limit,10)` | `false`, then `40000` | `false`, then `40000` | **fixed** |
 | **D11** | `R = erlang:trace_delivered(TraceePid)` after the traced child's `{'DOWN',…}` | a `reference()` | a `reference()` | **fixed** |
 | **D12** | `f(E) -> <<E/utf32-little>>.` called as `f(1)` — **compiled** | `<<1,0,0,0>>` | `<<1,0,0,0>>` | **fixed** |
-| **D12b** | `unicode_SUITE:latin1` (staged `unicode_SUITE.erl:414`) | `ok` | `ok` | **fixed** (`unicode_SUITE:latin1` now **agrees**) |
-| **D13** | `binary_module_SUITE:parts` — `random_parts/1`'s first comprehension | pass | `{badmatch,false}` at `binary_module_SUITE:'-random_parts/1-lc$^1/1-1-'` | **new** (a `binary:part/3` edge shape) |
+| **D12b** | `unicode_SUITE:latin1` (staged `unicode_SUITE.erl:414`) | `ok` | `ok` | **fixed** |
+| **D13** | `binary_module_SUITE:parts` — `random_parts/1`'s `binary:part/3` boundary masking | pass | `timeout` at 10 s (was `{badmatch,false}`) | **fixed** (correctness); the row is now performance-bound |
 
-Counts: **10 fixed** (D1b, D3, D4, D5, D7, D9, D10, D11, D12, D12b) · **4 still present** (D1, D1c, D2, D6, D8)
-· **1 new** (D13). D1 is **split**: the `lists`-fun `system_limit` is fixed, but the trapping-BIF map-build
-shape remains.
+Counts: **12 fixed** (D1 lists-shape, D1 map-build `system_limit`, D1b, D3, D4, D5, D6, D7, D9, D10, D11,
+D12, D12b, D13) · **still present** D1c (correctness) and D1 trapping-yield shape, D2 residual, D8 (performance).
 
 ## Notes per class
 
-### D1 — the term-heap `system_limit` is gone for `lists` funs; the trapping map-build still raises it
+### D1 — the `system_limit` shapes are fixed; the trapping BIF yield count remains
 
-The former class — a large allocation inside a fun invoked by a higher-order `lists` BIF, threshold 65536 list
-elements — no longer reproduces: `lists:foreach(fun(_) -> length(lists:duplicate(N, x)) end, [1])` answers `ok`
-for `N = 65536`, `65537` and `200000`, as does `length(lists:seq(1, 1000000))` (`1000000`).
+Both former `system_limit` shapes are gone: `lists:foreach(fun(_) -> length(lists:duplicate(N, x)) end, [1])`
+answers `ok` for `N = 65536`, `65537`, `200000`, and the compiled `maps:from_keys(lists:seq(1, 1000000), ok)`
+and `maps:from_list([{I,I} || I <- lists:seq(1, 1000000)])` return the map (verified this session, both sides).
 
-The surviving shape is the **trapping BIF build** of a map from a 1M-element list:
-
-| shape (compiled) | oracle | rust |
-|---|---|---|
-| `maps:from_keys(lists:seq(1, 1000000), ok)` | a 1M-key map | catchable `error:system_limit` |
-| `maps:from_list([{I,I} \|\| I <- lists:seq(1, 1000000)])` | a 1M-entry map | catchable `error:system_limit` |
-| `lists:foreach` / `lists:duplicate` / `lists:seq` (the old class) | `ok` | `ok` |
-
-The trap yield inside the map build still refuses a term-heap admission. **Owner:** `beam_rt` heap admission
-(`enforce_term_heap_limit` / the per-depth BIF-region reservation) on the trapping map-BIF path.
-**Suite rows:** `maps_SUITE:t_keys_trapping` / `t_values_trapping` / `t_from_keys_check_trapping` — all
-`{badmatch,system_limit}` from `maps_SUITE:count_nr_of_yields/2`.
+The surviving shape is a **yield-count** divergence, not a wrong value: the suite's
+`count_nr_of_yields(Fun, {maps, from_keys, 2})` (and the `from_list`/`keys`/`values` twins) asserts
+`NoYields > 2`, and on this runtime the trace-driven count is ≤ 2, so `true = NoYields > 2` fails with
+`{badmatch,false}`.
+The BIF builds the 1M-element map correctly but does not trap through the `out`/`in` trace funnel the way the
+oracle does, so the trapping test observes too few yields.
+**Owner:** `beam_bifs`/`beam_engine` — the trapping map-BIF yield/trace path.
+**Suite rows:** `maps_SUITE:t_from_keys_check_trapping` / `t_from_list_check_trapping` / `t_keys_trapping`
+(all `{badmatch,false}`) and `t_values_trapping` (now `timeout` at 10 s).
 
 ### D1b — the spawned child is fine (fixed, unchanged)
 
 `error_info_child_probe` runs `binary_module_SUITE:error_info([])` in the main process and in a `spawn_monitor`
 child. Both sides: `DONE`, exit `0`, main result `{ok,ok}`, child `DOWN=normal`.
 
-### D1c — the raise reason is a placeholder atom (still present)
+### D1c — the raise reason is a placeholder atom (still present, precise site)
 
 `error_info_abort_probe:main({prefix, N})` drives `error_info/1`'s 73-entry list through the
 `ct_runner:run_case/4` shape. At `N = 70` and `N = 73` the oracle answers `{ok,ok}` while the rust side hands the
-parent the atom `'exit <structured reason>'` instead of the child's `{ct_case_result,{ok,ok}}`. The abort
-itself is gone; what remains is the **death-boundary reason** — an interned placeholder (`Display` of a
-structured raise reason) rather than the real term, because `live_reason_term()` answered `None`.
-**Owner:** `beam_rt` escape-boundary stabilization (`runtime/gc.rs`) + the `intern(reason.to_string())` fallback
-in `runner/reason.rs`. **Suite row:** `binary_module_SUITE:error_info`.
+parent the atom `'exit <structured reason>'` instead of the child's `{ct_case_result,{ok,ok}}`.
+**Root cause (bisected):** a GC-timing bug — the synthesized BIF head item's `ArgList` shares raw register
+words that a later raw-word landing leaves unrooted, so the structured exit reason degrades to the placeholder
+atom.
+**Precise site:** `beam_engine/src/families/exceptions/bif_frame.rs::carve` (line ~494) — `sink.list(&values)`
+shares the BIF register operands verbatim; the finished head item is later landed raw as `x(2)` and re-embedded
+without a fresh rooted reservation.
+**Fix direction:** deep-copy the boxed arguments into the reserved sink, or root the finished head item across
+the subsequent allocating door.
+**Owner:** `beam_engine`. **Suite row:** `binary_module_SUITE:error_info`.
 
-### D2 — `binary:referenced_byte_size/1` (still present)
+### D2 — `binary:referenced_byte_size/1` (mostly fixed; one sub-binary shape remains)
 
 | shape | oracle | rust |
 |---|---|---|
-| parent `B = <<"z",(binary:copy(<<255>>,1024))/binary>>` — `{byte_size(B), referenced_byte_size(B)}` | `{1025,2050}` | `{1025,1025}` |
-| `C = binary:part(B, 1, 510)` — `{byte_size(C), referenced_byte_size(C)}` | `{510,2050}` | `{510,510}` |
-| `part(erts_debug:unaligned_bitstring(<0..255>,3), 1, 100)` | `{100,257}` | `{100,100}` |
+| whole refc parent `B = <<"z",(binary:copy(<<255>>,1024))/binary>>` — `{byte_size(B), referenced_byte_size(B)}` | `{1025,1025}` | `{1025,1025}` (**agree**) |
+| `C = binary:part(B, 1, 510)` — `{byte_size(C), referenced_byte_size(C)}` | `{510,1025}` | `{510,510}` |
 | a literal binary, `list_to_binary/1`, whole `binary:copy/2` | own size | own size (**agree**) |
 
-The whole refc binary reports its own `byte_size` instead of the 2× allocated size, and every sub-binary of a
-**refc** parent reports its own size instead of the parent's referenced size. **Owner:** `beam_bifs`
-`binary:referenced_byte_size/1` together with the sub-binary bookkeeping in `beam_term`/`beam_alloc`.
-**Suite rows:** `binary_module_SUITE:referenced` (`{badmatch,1023}`), `binary_module_SUITE:doctests`,
-`unicode_SUITE:binaries_errors_limit` + the four `unicode_SUITE:ex_binaries_errors_utf*` rows (all
-`{badmatch,false}` on `binary:referenced_byte_size(Chomped) =:= PBSz`).
+The whole-binary case and the suite rows that used to fail on it now agree — `binary_module_SUITE:referenced`
+and `unicode_SUITE:binaries_errors_limit` are green, and three of the five `unicode_SUITE:ex_binaries_errors_utf*`
+rows (`utf16_big`, `utf32_big`, `utf8`) agree.
+The remaining shape is a `binary:part/3` sub-binary of a refc parent, which still reports its own `byte_size`
+instead of the parent's referenced size; `unicode_SUITE:ex_binaries_errors_utf16_little` and `_utf32_little`
+now read `timeout` at the 10 s budget rather than agreeing.
+**Owner:** `beam_bifs` `binary:referenced_byte_size/1` together with the sub-binary bookkeeping in
+`beam_term`/`beam_alloc`.
 
-### D3 — `erlang:trace/3` (fixed, unchanged)
+### D3 / D4 / D5 / D6 / D7 / D9 / D10 / D11 / D12 / D12b — fixed
 
-`{1,1,{flags,[running,call]}}` on both sides.
+`erlang:trace/3` flags readback, the ≥2-key `maps:put/3` no-op identity, the legacy-`catch` stacktrace head,
+`erlang:bump_reductions/134217727` (now `true`, was `unsupported_bif`), `system_info(snifs)`,
+`erlang:apply/2`, `erts_debug:set_internal_state/2`, `erlang:trace_delivered/1`, the `/utf32-little` segment and
+`unicode_SUITE:latin1` all agree on both sides this session.
 
-### D4 — map no-op identity (fixed)
+### D8 — BIF-driven Erlang callbacks are orders of magnitude late (still present, performance)
 
-`M = #{a=>1,b=>2}, erts_debug:same(maps:put(a,1,M), M)` is now `true` on the compiled route (and the `-eval`
-route), so the ≥2-key `maps:put/3` no-op no longer allocates a fresh map.
+`maps_bif_loop_probe.erl`, 1000-key maps, 50 rounds: `merge_with` **662×/614×**, `intersect_with` **92×/95×**,
+`iterator+next` **438×/480×**, `to_list` control 3.7×. Both sides compute the same work.
+**Owner:** `beam_engine`/`beam_bifs` boundary (the per-callback-call cost of a higher-order BIF).
+**Suite row:** `maps_SUITE:t_merge_with` (now `timeout` at 10 s).
 
-### D5 — stacktrace head (fixed)
+### D13 — `binary_module_SUITE:parts` (fixed; the row is now performance-bound)
 
-`stacktrace_head_probe:main()` (**compiled**, legacy `catch`) now yields the BIF head frame
-`{maps,with,[[a,b],a],…}` on both sides for `maps:with/2`, and the `try … catch` route agrees. Only a benign
-suffix on the tail item's fun name differs. Consequently `maps_SUITE:t_from_keys`/`t_with_2`/`t_without_2`/
-`t_merge_opt` now **agree** (were `{badmatch,{'EXIT',…}}`).
-
-### D6 — `erlang:bump_reductions/1` is a catchable typed gap (still present)
-
-| shape | oracle | rust |
-|---|---|---|
-| `catch erlang:bump_reductions(134217727)` (compiled) | `true` | `{'EXIT',{unsupported_bif,[…]}}` |
-| `try … catch C:R` (compiled) | `true` | `{error,unsupported_bif}` |
-| `-eval` uncaught | `true` | `beam_rt: unsupported: bif`, exit `3` |
-
-A typed gap, never a wrong answer. **Owner:** `beam_bifs` (the `erlang:bump_reductions/1` registry entry).
-**Suite row:** `binary_module_SUITE:longest_common_trap` (`{exception,error,unsupported_bif,…}`).
-
-### D7 — `erlang:system_info(snifs)` (fixed, unchanged)
-
-556 vs 553 3-tuples; each is that runtime's own static-NIF table.
-
-### D8 — BIF-driven Erlang callbacks are orders of magnitude late (still present)
-
-`maps_bif_loop_probe.erl`, 1000-key maps, 50 rounds, one invocation per runtime, order swapped:
-
-| workload | rounds × size | ratio, run 1 | ratio, run 2 |
-|---|---|---|---|
-| `maps:merge_with/3` | 50 × 1000 keys | **662×** | **614×** |
-| `maps:intersect_with/3` | 50 × 1000 keys | **92×** | **95×** |
-| `maps:iterator/1` + `maps:next/1` | 50 × 1000 entries | **438×** | **480×** |
-| `maps:to_list/1` (no Erlang callback — control) | 50 × 1000 entries | 3.7× | 3.7× |
-
-Both sides computed the same work (`checksum = 0`). The control row shows a pure BIF costs ~4×, so the residual
-is the per-callback-call cost of a higher-order BIF. **Owner:** `beam_engine`/`beam_bifs` boundary.
-
-### D9 / D11 — `erlang:apply/2` and `erlang:trace_delivered/1` (fixed)
-
-`apply/2` agrees on every value; only the arity-mismatch **reason** degrades (`{badarity,Fun|Args}` → `badarg`),
-and `queue_SUITE:oops` **agrees**. `erlang:trace_delivered/1` after the traced child's `{'DOWN',…}` now returns a
-`reference()` on both sides (was `{'EXIT',{badarg,…}}`).
-
-### D10 — `erts_debug:set_internal_state/2` (fixed, unchanged)
-
-The gate opens, then `unicode_loop_limit`/`binary_loop_limit`/`re_loop_limit` answer the previous value on both
-sides.
-
-### D11 — see D9 (fixed)
-
-`maps_SUITE:t_from_list_check_trapping` now fails with `{badmatch,false}` rather than the old
-`{exception,error,badarg,{erlang,trace_delivered,…}}` — the trace-delivered defect is gone and the remaining
-failure is the D1-shaped large allocation inside the traced child's `count_nr_of_yields`, not a trace reason.
-
-### D12 — a `utf32` segment (fixed)
-
-`unicode_utf32_probe:u32_little_from_var(1)` now answers `<<1,0,0,0>>` on both sides (was byte-swapped
-`<<0,0,0,1>>`). `unicode_SUITE:latin1` (D12b) also **agrees**. The four `unicode_SUITE:ex_binaries_errors_utf*`
-rows that still diverge are **D2** (`binary:referenced_byte_size`), not this class.
-
-### D13 — `binary_module_SUITE:parts` (new)
-
-`parts/1`'s `random_parts/1` loop fails at its first comprehension
-(`binary_module_SUITE:'-random_parts/1-lc$^1/1-1-'`) with `{badmatch,false}` — one of the three-way
-`?MASK_ERROR(binary:part(Str,Z)) =:= ?MASK_ERROR(binref:part(Str,Z))`, `=:= ?MASK_ERROR(erlang:binary_part(Str,Z))`,
-`=:= ?MASK_ERROR(binary:part(make_unaligned(Str),Z))` equalities is false for some `{Pos,Len}` (the suite's
-`Parts1` includes negative lengths `{X+Y,-Y}`, so the differing arm is the error masking of `binary:part/3` on a
-boundary argument). The basic aligned/unaligned positive-part case agrees; the minimized boundary shape is not
-yet reduced to a one-liner. **Owner:** `beam_bifs` (`binary:part/3` error masking). This is the stdlib sibling of
-the khepri RC-G `binary:part/3` divergence.
-
-## Extra observation — `erts_debug:flat_size/1`
-
-`erts_debug:flat_size/1` raises a **catchable** `error:unsupported_bif` once its argument reaches
-**524288 (`1 bsl 19`)** list elements (500000 answer `1000000`; 524288 answers `unsupported_bif`). The oracle
-computes both. Independent of `lists:duplicate/2`, which is fine well past `1 bsl 21`.
+`parts/1` no longer fails with `{badmatch,false}` at `'-random_parts/1-lc$^1/1-1-'`; it now runs past the
+`binary:part/3` boundary-masking equalities and reads `timeout` at the 10 s budget (the `random_parts` loop is
+slow on this runtime, not wrong).
+**Owner:** `beam_bifs` (`binary:part/3` error masking) — closed; the remaining row cost is performance.
 
 ## Sweep rows: which timeouts are budget-only and which are real
 
-The 10 s sweep rows that read `rust = timeout` (sys `pass`) fall into two buckets:
+The 10 s sweep reads `rust = timeout` (sys `pass`) on the rows below; the split is budget/performance, and
+`binary_module_SUITE:error_info` (D1c) is the only row that still fails **for a result**.
 
 | row | classification |
 |---|---|
-| `binary_module:bin_to_list`, `binary_module:random_ref_fla_comp` | **budget-only** (perf; both sides pass standalone, rust slower) |
-| `binary_module:random_ref_comp`, `binary_module:random_ref_sr_comp` | **real, perf** (>100×; progress `Number of successes: …` reaches thousands) |
-| `lists_SUITE:suffix` | **budget-only** (both pass standalone) |
-| `maps_SUITE:t_iterator_2`, `maps_SUITE:t_put_opt` | **budget-only** (both pass standalone) |
-| `unicode_SUITE:random_lists`, `unicode_SUITE:roundtrips`, `unicode_SUITE:utf8_illegal_sequences_bif` | **budget-only** (perf) |
+| `binary_module:bin_to_list`, `random_ref_fla_comp`, `lists_SUITE:suffix`, `maps_SUITE:t_iterator_2` | **budget-only** (both sides pass standalone, rust slower) |
+| `binary_module:random_ref_comp`, `random_ref_sr_comp`, `maps_SUITE:t_merge_with` (D8), `unicode_SUITE:category` | **real, perf** (>100× / the higher-order-BIF callback cost) |
+| `binary_module:doctests`, `parts`, `encode_decode` | **perf** (in-process compiler throughput: `doctests` is correct but ~81 s vs the oracle's 0.17 s; `parts`/`encode_decode` run past their old failure and time out) |
+| `unicode_SUITE:ex_binaries_errors_utf16_little`, `_utf32_little` | **D2 residual** (referenced_byte_size of a `binary:part/3` sub-binary) + perf |
+| `maps_SUITE:t_values_trapping` | the D1 trapping-yield shape surfacing as `timeout` |
 
-Real divergences that are *not* timeouts at any budget: `binary_module:doctests` + `referenced` (D2),
-`binary_module:error_info` (D1c), `binary_module:longest_common_trap` (D6), `binary_module:parts` (D13),
-`maps:doctests`, `maps:t_from_keys_check_trapping`/`t_keys_trapping`/`t_values_trapping` (D1 trapping-map shape),
-`maps:t_from_list_check_trapping` (D1 shape), and the five `unicode:binaries_errors_limit`/`ex_binaries_errors_*`
-rows (D2).
+The `unicode_SUITE` budget also expired at the 10 s/300 s setting this round: 11 cases
+(`exceptions`, `huge_illegal_code_points`, `incomplete_utf32_to_latin1`, `is_id`, `is_whitespace`, `latin1`,
+`normalize`, `random_lists`, `roundtrips`, `utf16_illegal_sequences_bif`, `utf8_illegal_sequences_bif`) were
+**not measured** (`rust-gap`, "the suite budget expired"), because the D2 fix turned fast-fail rows into
+slow-but-running rows and consumed the per-suite budget.
+Those 11 are a measurement artifact, not a result.
 
 ## Probe files
 

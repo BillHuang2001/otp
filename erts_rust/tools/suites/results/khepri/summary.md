@@ -1,24 +1,24 @@
 # Test-suite parity sweep
 
-Generated at `1793387508` (Unix seconds) by `suites run --target khepri --jobs 4 --out results/khepri`.
+Generated at `1793414076` (Unix seconds) by `suites run --target khepri --jobs 4 --out results/khepri`.
 
 ## Environment
 
 - oracle: `/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl` — `29/17.1.1`
-- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt` — `30/17.1`
-- rust workspace commit: `8e8e0ad5d96a11931ff6972779a3b5adbe90bfca`
+- rust runtime: `/home/bill/Source/otp/.genesis/workers/worker_T1_A60/erts_rust/target/release/beam_rt` — `30/17.1`
+- rust workspace commit: `e98a5e1e231706a13b103f8c18c218ecb8d0d212`
 - tier: `default`
-- loadavg before/after: `5.49 6.30 6.10 3/840 3` / `3.74 5.45 5.83 2/853 3601` on 16 logical CPUs
+- loadavg before/after: `9.62 5.53 2.58 3/844 3` / `8.28 7.25 3.74 2/834 3601` on 16 logical CPUs
 - the host is **shared**: only pass/fail counts are portable, never a wall time
 
 ### Target `khepri` (eunit)
 
 - source: `/home/bill/Source/khepri` (khepri) at `2ac09291bac7`
 - staged copy: `/tmp/erts-suites-stage/khepri/proj`
-- build: `/nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile` — ok (reused a completed build)
+- build: `/home/bill/.mix/elixir/1-20-otp-29/rebar3 as test compile` — ok (reused a completed build)
 - build detail: reused a completed `rebar3 as test compile` in the staged copy
-- tally: measured 43 · agree 39 · agree-fail-identical (excluded) 9 · divergence 2 · oracle-only-fail 0 · rust-gap 1 · not-run 0
-- totals: sys 1500/1 passed/failed · rust 1437/3 passed/failed
+- tally: measured 43 · agree 40 · agree-fail-identical (excluded) 9 · divergence 2 · oracle-only-fail 0 · rust-gap 0 · not-run 0
+- totals: sys 1500/1 passed/failed · rust 1497/4 passed/failed
 
 Notes:
 - drive (identical on both sides): `eunit:test('{module}',[verbose]), halt(0).` — the module name is substituted per row
@@ -27,7 +27,7 @@ Notes:
 - jobs: 4 concurrent module runs (each in its own OS process and working directory)
 - per-module working directory: `/tmp/erts-suites-stage/khepri/cwd` (khepri's tests create `_test.<name>` dirs relative to the cwd; both sides of a module share one)
 - sys: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\''advanced_delete'\'',[verbose]), halt(0).'`
-- rust: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\''advanced_delete'\'',[verbose]), halt(0).'`
+- rust: `cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A60/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\''advanced_delete'\'',[verbose]), halt(0).'`
 
 | row | sys (P/F) | rust (P/F) | verdict | first divergence / note |
 |---|---|---|---|---|
@@ -39,7 +39,7 @@ Notes:
 | `advanced_tx_put` | 43/0 | 43/0 | agree |  |
 | `app` | 36/0 | 36/0 | agree |  |
 | `async_option` | 20/0 | 20/0 | agree |  |
-| `bang_functions` | 85/0 | cancelled | rust-gap | **throw:{error, |
+| `bang_functions` | 85/0 | 85/0 | agree |  |
 | `cluster_SUITE` | no_tests | no_tests | agree-fail-identical | a common_test suite: it carries no eunit tests (0/0 would be a lie) |
 | `conditions` | 23/0 | 23/0 | agree |  |
 | `cth_log_redirect_any_domains` | no_tests | no_tests | agree-fail-identical | no eunit tests (common_test suite or helper module) |
@@ -59,7 +59,7 @@ Notes:
 | `path_operations` | 51/0 | 51/0 | agree |  |
 | `pattern_tree` | 5/0 | 5/0 | agree |  |
 | `prefix_tree` | 4/0 | 4/0 | agree |  |
-| `projections` | 134/0 | 133/1 | divergence | projections:1146: -projection_with_custom_horus_options_test_/0-fun-3- (The projection contains the expected record): **error:{assertMatch,[{module,projections}… |
+| `projections` | 134/0 | 132/2 | divergence | projections:1130: -projection_with_custom_horus_options_test_/0-fun-7- (Register the projection): **throw:{horus,call_to_unexported_function,#{mfa => {crypto,st… |
 | `prop_path_operations` | no_tests | no_tests | agree-fail-identical | no eunit tests (common_test suite or helper module) |
 | `prop_state_machine` | no_tests | no_tests | agree-fail-identical | no eunit tests (common_test suite or helper module) |
 | `protect_against_dups_option` | 13/0 | 13/0 | agree |  |
@@ -89,8 +89,8 @@ Recorded invocations (the two sides get the *same* `-pa` set and the *same* `-ev
 # eunit advanced_delete [sys]
 cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\''advanced_delete'\'',[verbose]), halt(0).'
 # eunit advanced_delete [rust]
-cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\''advanced_delete'\'',[verbose]), halt(0).'
+cd /tmp/erts-suites-stage/khepri/cwd/advanced_delete && /home/bill/Source/otp/.genesis/workers/worker_T1_A60/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/aten/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cf/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/cth_readable/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/gen_batch_server/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/horus/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/khepri/test -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/meck/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/proper/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/ra/ebin -pa /tmp/erts-suites-stage/khepri/proj/_build/test/lib/seshat/ebin -eval 'eunit:test('\''advanced_delete'\'',[verbose]), halt(0).'
 # rebar3 as test compile [build]
-cd <stage>/proj && /nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin/rebar3 as test compile
+cd <stage>/proj && /home/bill/.mix/elixir/1-20-otp-29/rebar3 as test compile
 ```
 

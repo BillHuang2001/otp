@@ -1,17 +1,17 @@
 {
   "schema": "suites/1",
-  "generated_at": 1793387656,
-  "run_command": "suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out results/stdlib",
+  "generated_at": 1793414606,
+  "run_command": "suites run --target stdlib --suite lists_SUITE,maps_SUITE,proplists_SUITE,dict_SUITE,queue_SUITE,binary_module_SUITE,string_SUITE,unicode_SUITE --timeout 10 --suite-budget 300 --jobs 4 --out erts_rust/tools/suites/results/stdlib",
   "host": {
-    "loadavg_before": "4.63 5.47 5.82 13/900 3",
-    "loadavg_after": "5.30 5.59 5.83 2/848 1099",
+    "loadavg_before": "3.35 5.04 3.45 6/885 3",
+    "loadavg_after": "2.89 4.34 3.73 2/819 1099",
     "nproc": 16,
     "oracle": "/nix/store/lljrlcd2cqv64a6xz4cyaz723x2nwpnl-erlang-29.1.2/lib/erlang/erts-17.1.1/bin/erl",
     "oracle_version": "29/17.1.1"
   },
   "rust": {
-    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt",
-    "sha": "8e8e0ad5d96a11931ff6972779a3b5adbe90bfca",
+    "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A60/erts_rust/target/release/beam_rt",
+    "sha": "e98a5e1e231706a13b103f8c18c218ecb8d0d212",
     "version": "30/17.1",
     "tier": null
   },
@@ -21,8 +21,8 @@
       "kind": "ct",
       "source": {
         "repo": "otp",
-        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A18/lib/stdlib/test",
-        "sha": "8e8e0ad5d96a11931ff6972779a3b5adbe90bfca",
+        "path": "/home/bill/Source/otp/.genesis/workers/worker_T1_A60/lib/stdlib/test",
+        "sha": "e98a5e1e231706a13b103f8c18c218ecb8d0d212",
         "staged": "/tmp/erts-suites-stage/stdlib/src"
       },
       "build": {
@@ -44,7 +44,7 @@
         {
           "side": "rust",
           "purpose": "ct binary_module_SUITE",
-          "command": "cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A18/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 10000, 300000, \"/tmp/erts-suites-stage/stdlib/src\"), halt(0).'"
+          "command": "cd /tmp/erts-suites-stage/stdlib/cwd/binary_module_SUITE && /home/bill/Source/otp/.genesis/workers/worker_T1_A60/erts_rust/target/release/beam_rt -noshell -pa /tmp/erts-suites-stage/stdlib/ebin -pa /tmp/erts-suites-stage/stdlib/ctl -eval 'ct_runner:run('\\''binary_module_SUITE'\\'', 10000, 300000, \"/tmp/erts-suites-stage/stdlib/src\"), halt(0).'"
         },
         {
           "side": "build",
@@ -54,16 +54,16 @@
       ],
       "tally": {
         "measured": 214,
-        "agree": 183,
-        "agree_fail_identical": 5,
-        "divergence": 26,
+        "agree": 182,
+        "agree_fail_identical": 3,
+        "divergence": 20,
         "oracle_only_fail": 0,
-        "rust_gap": 0,
+        "rust_gap": 9,
         "not_run": 0,
         "sys_passed": 209,
         "sys_failed": 5,
-        "rust_passed": 183,
-        "rust_failed": 31
+        "rust_passed": 182,
+        "rust_failed": 21
       },
       "rows": [
         {
@@ -187,7 +187,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{1,errors},{ct_doctest,run_module_docs,3,...}}"
+            "detail": "timeout"
           },
           "verdict": "divergence",
           "note": ""
@@ -204,13 +204,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
-            "failed": 0,
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": ""
+            "detail": "timeout"
           },
-          "verdict": "agree",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -351,13 +351,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,unsupported_bif,{erlang,bump_reductions,[...],...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -376,7 +376,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,false},{binary_module_SUITE,'-random_parts/1-lc$^1/1-1-',2,...}}"
+            "detail": "timeout"
           },
           "verdict": "divergence",
           "note": ""
@@ -456,13 +456,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,1023},{binary_module_SUITE,referenced,1,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2283,13 +2283,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{1,errors},{ct_doctest,run_module_docs,3,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2434,7 +2434,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}}"
+            "detail": "{exception,error,{badmatch,false},{maps_SUITE,t_from_keys_check_trapping,1,...}}"
           },
           "verdict": "divergence",
           "note": ""
@@ -2686,7 +2686,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}}"
+            "detail": "{exception,error,{badmatch,false},{maps_SUITE,t_keys_trapping,1,...}}"
           },
           "verdict": "divergence",
           "note": ""
@@ -2745,13 +2745,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
-            "failed": 0,
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": ""
+            "detail": "timeout"
           },
-          "verdict": "agree",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -2787,13 +2787,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -2896,7 +2896,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,system_limit},{maps_SUITE,count_nr_of_yields,2,...}}"
+            "detail": "timeout"
           },
           "verdict": "divergence",
           "note": ""
@@ -4173,13 +4173,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,'-ex_binaries_errors_utf8/1-lc$^1/1-1-',6,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -4194,13 +4194,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
-            "failed": 0,
+            "status": "fail",
+            "passed": 0,
+            "failed": 1,
             "skipped": 0,
-            "detail": ""
+            "detail": "timeout"
           },
-          "verdict": "agree",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -4236,13 +4236,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf16_inner_loop,6,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -4261,7 +4261,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf16_inner_loop,6,...}}"
+            "detail": "timeout"
           },
           "verdict": "divergence",
           "note": ""
@@ -4278,13 +4278,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf32_inner_loop,6,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -4303,7 +4303,7 @@
             "passed": 0,
             "failed": 1,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,utf32_inner_loop,6,...}}"
+            "detail": "timeout"
           },
           "verdict": "divergence",
           "note": ""
@@ -4320,13 +4320,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
-            "passed": 0,
-            "failed": 1,
+            "status": "pass",
+            "passed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,false},{unicode_SUITE,'-ex_binaries_errors_utf8/1-lc$^1/1-1-',6,...}}"
+            "detail": ""
           },
-          "verdict": "divergence",
+          "verdict": "agree",
           "note": ""
         },
         {
@@ -4341,13 +4341,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
+            "status": "timeout",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4362,13 +4362,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
+            "status": "timeout",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4383,13 +4383,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
+            "status": "timeout",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4404,13 +4404,13 @@
             "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
           },
           "rust": {
-            "status": "fail",
+            "status": "timeout",
             "passed": 0,
-            "failed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree-fail-identical",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -4425,13 +4425,13 @@
             "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
           },
           "rust": {
-            "status": "fail",
+            "status": "timeout",
             "passed": 0,
-            "failed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "{exception,error,{badmatch,{error,enoent}},{unicode_SUITE,parse_properties,1,...}}"
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree-fail-identical",
+          "verdict": "divergence",
           "note": ""
         },
         {
@@ -4446,13 +4446,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
+            "status": "timeout",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4467,13 +4467,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
+            "status": "timeout",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4488,13 +4488,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
+            "status": "timeout",
             "passed": 0,
-            "failed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "divergence",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4509,13 +4509,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
+            "status": "timeout",
             "passed": 0,
-            "failed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "divergence",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4530,13 +4530,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "pass",
-            "passed": 1,
+            "status": "timeout",
+            "passed": 0,
             "failed": 0,
             "skipped": 0,
-            "detail": ""
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "agree",
+          "verdict": "rust-gap",
           "note": ""
         },
         {
@@ -4551,13 +4551,13 @@
             "detail": ""
           },
           "rust": {
-            "status": "fail",
+            "status": "timeout",
             "passed": 0,
-            "failed": 1,
+            "failed": 0,
             "skipped": 0,
-            "detail": "timeout"
+            "detail": "not measured: the suite budget expired before this case (11 cases not run)"
           },
-          "verdict": "divergence",
+          "verdict": "rust-gap",
           "note": ""
         }
       ],
@@ -4566,14 +4566,14 @@
         "each case runs in its own `spawn_monitor` with a per-case timeout; `init_per_group`/`end_per_group`/`init_per_testcase` hooks are NOT executed",
         "cases that fail identically on both sides (missing `ct` config/data dirs, group-hook dependencies) are `agree-fail-identical`: excluded from both numerators, never counted as passes",
         "per-case timeout: 10 s · suite budget: 300 s (the runner stops launching cases when the budget expires and prints `SUITE_DEADLINE <not-run>`, so the remaining cases are reported as *not measured*, never as failures)",
-        "binary_module_SUITE: 20 cases — sys 18/2 pass/fail, rust 9/11 pass/fail",
+        "binary_module_SUITE: 20 cases — sys 18/2 pass/fail, rust 10/10 pass/fail",
         "dict_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail",
         "lists_SUITE: 78 cases — sys 78/0 pass/fail, rust 77/1 pass/fail",
-        "maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 25/7 pass/fail",
+        "maps_SUITE: 32 cases — sys 32/0 pass/fail, rust 26/6 pass/fail",
         "proplists_SUITE: 4 cases — sys 4/0 pass/fail, rust 4/0 pass/fail",
         "queue_SUITE: 7 cases — sys 7/0 pass/fail, rust 7/0 pass/fail",
         "string_SUITE: 46 cases — sys 45/1 pass/fail, rust 45/1 pass/fail",
-        "unicode_SUITE: 20 cases — sys 18/2 pass/fail, rust 9/11 pass/fail"
+        "unicode_SUITE: 20 cases — sys 18/2 pass/fail, rust 6/3 pass/fail"
       ]
     }
   ]
