@@ -74,11 +74,14 @@
 //! Two shapes still are not the oracle's, and each carries its own pin instead of a
 //! line of prose:
 //!
-//! * **This crate's own producers are on-heap.** `binary:copy/1,2`, `list_to_bin/1` and
-//!   `iolist_to_binary/1` hand back an `ErlHeapBits` however large the binary is
-//!   (`src/bits.rs`'s placement policy), so a part of one above 64 bytes keeps the copy
-//!   arm and answers its own size where the oracle windows the payload and answers
-//!   `100`/`1024`/`1025`. See `an_on_heap_parent_above_the_limit_still_copies_the_range`
+//! * **With no host installed, this crate's whole-binary producers are on-heap.** The
+//!   `OffHeapBinaries` seam (`src/context.rs`) closes the producer gap: with it
+//!   installed, `binary:copy/1,2`, `list_to_bin/1` and `iolist_to_binary/1` place a
+//!   result above 64 bytes off-heap (pinned in `tests/referenced_byte_size.rs`). The
+//!   rows below install no seam, so those producers hand back an `ErlHeapBits` however
+//!   large the binary is and a part above 64 bytes keeps the copy arm where the
+//!   oracle windows the payload — the no-host fallback, preserved as the additive
+//!   seam's unchanged baseline. See `an_on_heap_parent_above_the_limit_still_copies_the_range`
 //!   (and the oracle's own `q_part_*` rows, which are exactly that divergence).
 //! * **The host's result copy-out flattens a window.** `beam_rt`'s
 //!   `context/calls.rs::copy_result_fresh` hands `beam_message::copy_struct` an **empty**
@@ -677,19 +680,21 @@ fn the_window_arm_switches_at_64_bytes_of_window() {
     fx.badarg("binary", "part", &[odd, make_small(0), make_small(1)]);
 }
 
-/// The **documented residual**: an on-**heap** parent above 64 bytes keeps the copy
-/// route, because every binary this crate's own producers build is an `ErlHeapBits`
-/// (`src/bits.rs`'s placement policy) and a block has no payload to share.
+/// The **no-host fallback**: with the `OffHeapBinaries` seam **not** installed (this
+/// fixture installs none), an on-**heap** parent above 64 bytes keeps the copy route,
+/// because every binary the whole-binary producers build is then an `ErlHeapBits`
+/// (`src/bits.rs`'s on-heap builder) and a block has no payload to share.
 ///
 /// The oracle answers the payload's width for these shapes (`part(binary:copy(<<1>>,100),
 /// 0,65)` ⇒ `100`, `part(...,0,64)` ⇒ `64`, `part(...,10,5)` ⇒ `5` — the `q_part_*` rows
-/// of the compiled fixture), so this test is the pin that a later refc-producing seam
-/// cannot change the figure here silently.
+/// of the compiled fixture), so this test pins that the additive seam's **unchanged
+/// baseline** cannot drift: with the seam installed the same producers place the result
+/// off-heap and these rows move to `tests/referenced_byte_size.rs`.
 #[test]
 fn an_on_heap_parent_above_the_limit_still_copies_the_range() {
     let mut fx = Fixture::new();
     let one = fx.binary(&[1]);
-    // Every producer of a > 64-byte binary in this crate places it on-heap.
+    // With no seam installed, every producer of a > 64-byte binary places it on-heap.
     let copied = fx.ok("binary", "copy", &[one, make_small(1025)]);
     let listed = fx.ok("binary", "bin_to_list", &[copied]);
     let relisted = fx.ok("binary", "list_to_bin", &[listed]);

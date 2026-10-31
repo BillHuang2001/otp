@@ -697,15 +697,14 @@ fn part_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// while the BIF layer itself answers the parent payload's width (pinned by
 /// `tests/binary_copy_cost.rs`).
 ///
-/// # Documented placement residual
+/// # The whole-binary producers' placement arm
 ///
-/// Every binary **this crate builds** stays on-heap ([`crate::bits`]'s placement
-/// policy), so `binary:copy/1,2`, `list_to_bin/1` and `iolist_to_binary/1` produce
-/// `ErlHeapBits` parents however large they are, and their parts above 64 bytes take
-/// the copy arm (the figure stays the part's own size). C never sees that shape: it
-/// places a binary above `ERL_ONHEAP_BINARY_LIMIT` off-heap, so the same source text
-/// there windows over a payload. Closing it needs a refc-producing seam in
-/// `beam_rt`/`beam_engine` (this crate cannot allocate off-heap).
+/// `binary:copy/1,2`, `list_to_bin/1` and `iolist_to_binary/1`'s list form now route
+/// a result above `ERL_ONHEAP_BINARY_LIMIT` through [`access::make_binary_result`],
+/// which places it off-heap when a host installs the [`crate::OffHeapBinaries`] seam.
+/// With no host the result stays on-heap (`ErlHeapBits`, the previous behaviour), so
+/// the producers' parts above 64 bytes take this copy arm only in that no-host
+/// configuration — the seam is purely additive and `beam_rt` implements the host half.
 ///
 /// [`ERL_ONHEAP_BITS_LIMIT`]: beam_term::refc::ERL_ONHEAP_BITS_LIMIT
 pub(crate) fn part_slice(
@@ -794,7 +793,7 @@ fn do_copy(ctx: &mut BifContext<'_>, subject: Eterm, count: u64) -> Result<Eterm
     for _ in 0..count {
         out.extend_from_slice(&source);
     }
-    bits::make_binary(ctx.heap(), &out)
+    access::make_binary_result(ctx, &out)
 }
 
 /// `list_to_bin(List)` — an iolist flattened into a binary.
@@ -802,7 +801,7 @@ fn list_to_bin_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // `list_to_bitstring` requires a list at the top level: a bare binary is
     // `badarg` (`list_to_bin(<<1,2>>)` ⇒ `badarg`).
     let bytes = iolist::bytes(args[0], iolist::TopLevel::List)?;
-    bits::make_binary(ctx.heap(), &bytes)
+    access::make_binary_result(ctx, &bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -964,7 +963,7 @@ fn iolist_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm>
     // The list form goes through the crate's one iolist walk: one buffer, reserved to
     // the iolist's exact byte count (see [`crate::iolist::bytes`]).
     let bytes = iolist::bytes(root, iolist::TopLevel::List)?;
-    bits::make_binary(ctx.heap(), &bytes)
+    access::make_binary_result(ctx, &bytes)
 }
 
 /// `iolist_size(IoListOrBinary)` (`erl_iolist.c:1084`) — the byte size of the
@@ -1048,14 +1047,53 @@ fn split_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(badarg());
     }
     let split_bits = (split_at as usize) * 8;
-    let (bytes, offset, _) = codec_term::bitstring_bytes(args[0])?;
-    let mut before = BitBuf::new();
-    before.push_bitstring(bytes, offset, split_bits);
-    let mut after = BitBuf::new();
-    after.push_bitstring(bytes, offset + split_bits, size_bits - split_bits);
-    let before = bits::make_bitstring(ctx.heap(), &before.bytes, before.len)?;
-    let after = bits::make_bitstring(ctx.heap(), &after.bytes, after.len)?;
+    // The C's `split_binary_2` builds the two halves with
+    // `erts_build_sub_bitstring` (`../../erts/emulator/beam/binary.c:500-511`) — the
+    // same window-or-copy routing `binary:part/2,3` uses — so a half above 512 bits
+    // over an off-heap parent is a `[BinRef][ErlSubBits]` window naming that parent's
+    // payload, and every other shape is a copy. `Before` is byte aligned (the first
+    // `split_at` bytes); `After` may keep a trailing partial byte.
+    let before = sub_binary_of(ctx, args[0], 0, split_bits)?;
+    let after = sub_binary_of(ctx, args[0], split_bits, size_bits - split_bits)?;
     ctx.tuple(&[before, after])
+}
+
+/// The `erts_build_sub_bitstring` routing shared by `split_binary/2` and
+/// `binary:part/2,3`: a window of `subject`'s bits
+/// `bit_offset..bit_offset + bit_size`.
+///
+/// * `bit_size <= ERL_ONHEAP_BITS_LIMIT` (512 bits / 64 bytes) is a fresh
+///   `ErlHeapBits` **copy** — the C's copy arm, taken here rather than through
+///   [`access::make_sub_binary`] because `write_sub_binary` chooses its arm on the
+///   **word count** (`words == ERL_REFC_BITS_SIZE`), which collides with the heap
+///   arm's own 8-word count for a 41..48-byte window (see [`part_slice`]).
+/// * above it, over a parent **with an off-heap payload**, the 8-word
+///   `[BinRef][ErlSubBits]` window naming the parent's payload (no byte copied).
+/// * above it, over an `ErlHeapBits` parent, the copy — there is no payload to share.
+fn sub_binary_of(
+    ctx: &mut BifContext<'_>,
+    subject: Eterm,
+    bit_offset: usize,
+    bit_size: usize,
+) -> Result<Eterm> {
+    if bit_size <= beam_term::refc::ERL_ONHEAP_BITS_LIMIT
+        || access::refc_payload_bytes(subject).is_none()
+    {
+        // The copy arm: the selected bits are packed into a fresh `ErlHeapBits`
+        // (the `BitBuf` MSB-first image, exactly what `write_sub_binary`'s heap arm
+        // writes and what the oracle's `erts_extracted_bitstring_size` copy arm
+        // produces).
+        let (bytes, offset, _) = codec_term::bitstring_bytes(subject)?;
+        let mut buf = BitBuf::new();
+        buf.push_bitstring(bytes, offset + bit_offset, bit_size);
+        return bits::make_bitstring(ctx.heap(), &buf.bytes, buf.len);
+    }
+    // Only an above-limit window over a refc parent mints the `[BinRef][ErlSubBits]`
+    // pair. `badarg` (the builder's only refusal) is unreachable here — the byte
+    // range was validated against the subject's own bit size, which is exactly the
+    // parent window `write_sub_binary` re-checks — so it maps to the same `badarg` a
+    // wrong range would, never to a silently wrong size.
+    access::make_sub_binary(ctx.heap(), subject, bit_offset, bit_size)
 }
 
 /// Builds the list `[B0, B1, …]` of the bytes in `bytes`.

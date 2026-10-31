@@ -260,26 +260,27 @@ fn insert_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///   which does build real refc binaries — `bs_create_bin` for any payload above
 ///   `ERL_ONHEAP_BINARY_LIMIT` (`beam_engine/src/families/bitstrings/raw.rs`) and a
 ///   matched-out `/binary` tail — so this arm is live, not hypothetical;
-/// * **`br == NULL`** — an on-heap `ErlHeapBits` (every binary *this crate* builds,
-///   `crate::bits`) or a match context: the argument's own **byte size**,
-///   `BYTE_SIZE(size)`, which truncates a partial trailing byte exactly like
-///   `size/1`. Verified against the oracle for a runtime-built on-heap binary
-///   (`binary:referenced_byte_size(list_to_binary([1,2,3]))` ⇒ `3`) and for a large
-///   one off the 64-byte on-heap limit
+/// * **`br == NULL`** — an on-heap `ErlHeapBits` or a match context: the argument's
+///   own **byte size**, `BYTE_SIZE(size)`, which truncates a partial trailing byte
+///   exactly like `size/1`. Verified against the oracle for a runtime-built on-heap
+///   binary (`binary:referenced_byte_size(list_to_binary([1,2,3]))` ⇒ `3`) and for a
+///   large one off the 64-byte on-heap limit
 ///   (`binary:referenced_byte_size(binary:copy(<<1>>, 100000))` ⇒ `100000`).
 ///
-/// This crate's own window producers now feed the first arm: `binary:part/2,3` and
+/// This crate's own producers now feed the first arm: `binary:part/2,3` and
 /// `erlang:binary_part/2,3` mint a real `[BinRef][ErlSubBits]` window over a refc
 /// parent above 64 bytes ([`crate::binary::part_slice`] →
 /// [`access::make_sub_binary`]), so a part of a large *refc* binary answers the parent
-/// payload's width exactly as the oracle does. Two residuals stay on the *producer*
-/// side and are documented at [`crate::binary::part_slice`]: a window that is itself
-/// ≤ 64 bytes is an on-heap copy (the C's own `ERL_ONHEAP_BITS_LIMIT` arm, so it
-/// agrees), and a >64-byte part of an **on-heap** parent (`ErlHeapBits`, which is
-/// every binary this crate builds) is still a copy, because there is no payload to
-/// share. A **literal-area** binary (`<<1,2,3>>` of a compiled module) is likewise
-/// unmodelled: the oracle reports the literal chunk's allocated width (`256`), this
-/// runtime materializes no such literal.
+/// payload's width exactly as the oracle does; and the **whole-binary producers**
+/// (`binary:copy/1,2`, `list_to_bin/1`, `iolist_to_binary/1`'s list form,
+/// `split_binary/2`) place a result above 64 bytes off-heap through
+/// [`access::make_binary_result`] when the host installs the
+/// [`crate::OffHeapBinaries`] seam, so their parts and `split_binary` halves window
+/// the parent payload. With no host installed the whole-binary producers stay on-heap
+/// (the previous behaviour) and their >64-byte parts keep the copy arm — the seam is
+/// purely additive. A **literal-area** binary (`<<1,2,3>>` of a compiled module) is
+/// likewise unmodelled: the oracle reports the literal chunk's allocated width
+/// (`256`), this runtime materializes no such literal.
 ///
 /// # Errors
 ///

@@ -916,6 +916,63 @@ pub trait MemoryHook {
     }
 }
 
+/// The **off-heap binary seam**: the host hook that lets a BIF place a large binary's
+/// payload outside the process heap.
+///
+/// ERTS does not copy a binary larger than
+/// [`ERL_ONHEAP_BINARY_LIMIT`](beam_term::refc::ERL_ONHEAP_BINARY_LIMIT) (64 bytes)
+/// onto the process heap: C's `erts_new_bitstring` (`../../erts/emulator/beam/erl_bits.c`)
+/// allocates an off-heap payload and wraps it in an on-heap `[BinRef][ErlSubBits]`
+/// pair (`erts_wrap_refc_bitstring`). The **on-heap** half is frozen and owned by
+/// [`beam_term::refc`] (the pair written by
+/// [`beam_term::refc::write_refc_binary`]); the **off-heap payload** — its allocation,
+/// its reference count and its release — is [`beam_alloc::RefcBinary`]'s, which is
+/// *runtime* state this crate must not own: a built binary has to outlive the BIF
+/// call, and reclamation follows the owning process's heap, not the BIF's destination
+/// arena.
+///
+/// This seam is the producer-side mirror of `beam_codec::OffHeapBinaries` (the
+/// decoder's equivalent). A host that installs one with
+/// [`BifContext::with_off_heap`] hands the payload's lifetime to itself; a BIF that
+/// builds a binary above the limit routes the payload through
+/// [`alloc_refc_payload`](OffHeapBinaries::alloc_refc_payload) and materializes the
+/// term as the off-heap pair. A caller that installs none keeps the previous
+/// behaviour unchanged (the binary materialized on-heap, `ErlHeapBits`), so the seam
+/// is purely additive — the observable term (`is_binary/1`, `byte_size/1`, contents)
+/// is identical either way; only the interior representation differs.
+pub trait OffHeapBinaries {
+    /// Copies `bytes` into a fresh off-heap refcounted payload and returns the value
+    /// the on-heap `BinRef.val` word receives: a raw pointer to the payload's **first
+    /// data byte**.
+    ///
+    /// An implementation typically builds a [`beam_alloc::RefcBinary`] over `bytes`
+    /// ([`RefcBinary::new`](beam_alloc::RefcBinary::new), no spare room), retains the
+    /// handle in a store of its own (so the payload survives the BIF call, the host's
+    /// result copy-out and any collection) and returns
+    /// [`RefcBinary::data_ptr`](beam_alloc::RefcBinary::data_ptr).
+    ///
+    /// # Contract
+    ///
+    /// * **Ownership.** The host retains the payload; the returned pointer stays valid,
+    ///   unmoved and readable for as long as any term built from it is reachable. The
+    ///   BIF keeps no record of the payload — the host's store *is* the ownership
+    ///   record — so releasing it too early would dangle.
+    /// * **Contents.** The payload must hold `bytes`, exactly (`len == capacity`).
+    /// * **Alignment.** The first data byte must be word-aligned: the low
+    ///   `ERL_SUB_BITS_FLAG_MASK` bits of the `ErlSubBits::base_flags` pointer are
+    ///   flag bits, so a misaligned payload would corrupt the base pointer.
+    ///   [`beam_alloc::RefcBinary`] guarantees this.
+    /// * **Immutability.** The payload is never mutated after this call.
+    ///
+    /// # Errors
+    ///
+    /// Defaults to the typed `unsupported_bif` capability gap; a provider propagates
+    /// its own failure (e.g. out of memory).
+    fn alloc_refc_payload(&mut self, _bytes: &[u8]) -> Result<*mut u8> {
+        Err(crate::error::unsupported_bif())
+    }
+}
+
 /// The runtime-coupled BIF escape hatch (the Stage-5 machine).
 ///
 /// A large part of the `bif.tab` surface can only be answered by the *running*
@@ -981,6 +1038,7 @@ pub struct BifContext<'a> {
     module_info: Option<&'a mut dyn ModuleInfo>,
     process: Option<&'a mut dyn ProcessHook>,
     memory: Option<&'a mut dyn MemoryHook>,
+    off_heap: Option<&'a mut dyn OffHeapBinaries>,
     runtime: Option<&'a mut dyn RuntimeHooks>,
 }
 
@@ -1010,6 +1068,7 @@ impl<'a> BifContext<'a> {
             module_info: None,
             process: None,
             memory: None,
+            off_heap: None,
             runtime: None,
         }
     }
@@ -1130,6 +1189,14 @@ impl<'a> BifContext<'a> {
     /// Installs the memory-accounting hook used by `erlang:memory/0,1`.
     pub fn with_memory_hook(mut self, hook: &'a mut dyn MemoryHook) -> Self {
         self.memory = Some(hook);
+        self
+    }
+
+    /// Installs the off-heap binary hook used by the binary-producing BIFs
+    /// (`binary:copy/1,2`, `binary:list_to_bin/1`, `erlang:iolist_to_binary/1`) when
+    /// their result exceeds 64 bytes.
+    pub fn with_off_heap(mut self, host: &'a mut dyn OffHeapBinaries) -> Self {
+        self.off_heap = Some(host);
         self
     }
 
@@ -1802,6 +1869,31 @@ impl<'a> BifContext<'a> {
     pub fn memory(&mut self) -> Result<Vec<(&'static str, u64)>> {
         match self.memory.as_deref_mut() {
             Some(hook) => hook.memory(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Whether an [`OffHeapBinaries`] host is installed.
+    ///
+    /// A binary-producing BIF consults this to choose its interior representation: a
+    /// result above 64 bytes goes off-heap only when a host is present, and stays
+    /// on-heap otherwise (the previous behaviour), so the seam is additive and never
+    /// turns an otherwise-valid call into a failure.
+    pub fn has_off_heap(&self) -> bool {
+        self.off_heap.is_some()
+    }
+
+    /// Copies `bytes` into a fresh off-heap refcounted payload through the installed
+    /// [`OffHeapBinaries`] host, returning the payload's first data byte (the value
+    /// the on-heap `BinRef.val` word receives).
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no [`OffHeapBinaries`];
+    /// otherwise propagates the host's own failure.
+    pub fn alloc_refc_payload(&mut self, bytes: &[u8]) -> Result<*mut u8> {
+        match self.off_heap.as_deref_mut() {
+            Some(host) => host.alloc_refc_payload(bytes),
             None => Err(crate::error::unsupported_bif()),
         }
     }

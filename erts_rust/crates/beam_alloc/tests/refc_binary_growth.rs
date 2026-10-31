@@ -178,12 +178,17 @@ fn append_loop_to_64_kib_is_linear_not_quadratic() {
 /// **Test 2 (in-place only).** A reservation wide enough for the whole accumulation is
 /// consumed **entirely in place**: no allocation, no copy, and — the frozen-contract point —
 /// `data_ptr()` never changes, so no on-heap `BinRef.val` word needs republishing.
+///
+/// The reservation must cover the final grown target, which — faithfully to the C — is
+/// `GROW_PROC_BIN_SIZE` of the *requested* size (`used_size`), so the last 64-byte append
+/// into a just-exceeded capacity doubles to ~72 KiB. 128 KiB is therefore the generous
+/// reservation here, not exactly 64 KiB.
 #[test]
 fn a_generous_reservation_grows_entirely_in_place() {
     let alloc = test_allocator("growth-in-place");
-    let payload = RefcBinary::with_limits(alloc, 1024, 64 * 1024, 1 << 20).expect("reserve");
+    let payload = RefcBinary::with_limits(alloc, 1024, 128 * 1024, 1 << 20).expect("reserve");
     assert_eq!(payload.capacity(), 1024);
-    assert_eq!(payload.reserved_bytes(), 64 * 1024);
+    assert_eq!(payload.reserved_bytes(), 128 * 1024);
     assert_eq!(payload.len(), 0);
     let before = payload.data_ptr();
 
@@ -733,4 +738,59 @@ fn the_growth_surface_is_exported_under_non_colliding_names() {
         core::mem::size_of::<fn(Relocation) -> Relocation>()
     );
     let _ = same_relocation;
+}
+
+/// **Growth regression.** `ensure_capacity` must grow from the *requested* size (the C's
+/// `used_size`), never the current capacity: a request one byte past a 1024-byte capacity
+/// doubles 1025 → 2050, not 1024 → 2048.
+#[test]
+fn ensure_capacity_grows_from_the_requested_size_not_the_current_capacity() {
+    let alloc = test_allocator("growth-requested-size");
+    let mut payload =
+        RefcBinary::with_capacity_and_allocator(alloc, 1024).expect("reserve");
+    let outcome = payload.ensure_capacity(1025).expect("grows in place");
+    assert_eq!(outcome, GrowOutcome::InPlace { capacity: 2050 });
+    assert_eq!(payload.capacity(), 2050);
+}
+
+/// `pin_writable` shrinks the reported width to the apparent size when the spare is at
+/// least 8 bytes, exactly like the C's realloc-to-apparent arm.
+#[test]
+fn pin_writable_shrinks_the_reported_width_when_spare_is_at_least_8() {
+    let alloc = test_allocator("pin-shrink");
+    let mut payload =
+        RefcBinary::with_capacity_and_allocator(alloc, 1024).expect("reserve");
+    payload.ensure_capacity(1025).expect("grows to 2050");
+    payload.set_len(1025).expect("publish the live bytes");
+    payload.pin_writable().expect("pins");
+    assert_eq!(payload.capacity(), 1025);
+    assert_eq!(payload.len(), 1025);
+    assert!(payload.reserved_bytes() >= payload.capacity());
+}
+
+/// `pin_writable` keeps the grown width when the spare is under 8 bytes: the C skips the
+/// realloc in that case, leaving `orig_size` unchanged.
+#[test]
+fn pin_writable_keeps_the_grown_width_when_spare_is_under_8() {
+    let alloc = test_allocator("pin-skip");
+    let mut payload =
+        RefcBinary::with_capacity_and_allocator(alloc, 1024).expect("reserve");
+    payload.set_len(1022).expect("publish the live bytes");
+    payload.pin_writable().expect("pins");
+    assert_eq!(payload.capacity(), 1024);
+    assert_eq!(payload.len(), 1022);
+}
+
+/// `pin_writable` refuses a payload another handle still shares, like every other mutator.
+#[test]
+fn pin_writable_refuses_a_shared_payload() {
+    let alloc = test_allocator("pin-shared");
+    let mut payload =
+        RefcBinary::with_capacity_and_allocator(alloc, 1024).expect("reserve");
+    let clone = payload.clone();
+    let error = payload
+        .pin_writable()
+        .expect_err("a shared payload refuses pinning");
+    assert!(matches!(error, BeamError::BadArg), "got {error:?}");
+    drop(clone);
 }

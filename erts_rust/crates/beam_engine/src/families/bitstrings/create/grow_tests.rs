@@ -235,19 +235,21 @@ fn a_64_kib_monotone_append_is_amortised_not_quadratic() {
 /// term, its window and its every written byte survive, and the registry re-keys so the
 /// next append is in place again.
 ///
-/// The shape: an 8-byte capacity on a 32-byte reservation, then a 32-byte append (an
-/// in-place grow that commits the reservation) and an 8-byte append (which exceeds both, so
-/// `beam_alloc` relocates). The third append then fits the relocated payload outright.
+/// The shape: an 8-byte capacity on a 32-byte reservation, then a 16-byte append (an
+/// in-place grow — `grow_span(16) == 32` exactly fills the reservation) and a 17-byte
+/// append (whose 33-byte total doubles to 66 bytes, past the reservation, so
+/// `beam_alloc` relocates). The third append then fits the relocated capacity outright.
 #[test]
 fn a_move_mid_accumulation_preserves_every_accumulated_byte() {
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     let acc = raw::make_writable(&mut machine, &mut ctx, 8).expect("a writable accumulator");
-    let before: Vec<u8> = (0..32u8).collect();
-    let moving: Vec<u8> = (0xA0..0xA8u8).collect();
+    let before: Vec<u8> = (0..16u8).collect();
+    let moving: Vec<u8> = (0xA0..0xB1u8).collect();
     let after_move: Vec<u8> = (0xC0..0xC8u8).collect();
 
-    // (a) 32 bytes into an 8-byte capacity: the reservation absorbs it in place.
+    // (a) 16 bytes into an 8-byte capacity: `grow_span(16) == 32` exactly fills the
+    // reservation, so the payload grows in place.
     let first = append_chunk(&mut machine, acc, &before, 0);
     assert_eq!(first, acc, "the first append publishes the accumulator");
     let (base_before, start, end) = window(first);
@@ -259,14 +261,15 @@ fn a_move_mid_accumulation_preserves_every_accumulated_byte() {
     let index = payload_index(&machine, first);
     assert_eq!(
         machine.refc_binaries()[index].capacity(),
-        before.len(),
-        "the capacity was committed to the reservation, not past it"
+        32,
+        "the in-place grow committed `grow_span(16) == 32` bytes"
     );
     let counters = machine.refc_binaries()[index].growth_counters();
     assert_eq!(counters.moves, 0, "the first append did not have to move");
     let live_before_move = machine.refc_binaries()[index].len();
 
-    // (b) 8 more bytes exceed both the capacity and the reservation: a move.
+    // (b) 17 more bytes make 33 total, whose doubled span (66) exceeds the 32-byte
+    // reservation: a move.
     let second = append_chunk(&mut machine, acc, &moving, 1);
     assert_eq!(
         second, acc,
@@ -288,8 +291,8 @@ fn a_move_mid_accumulation_preserves_every_accumulated_byte() {
     assert_eq!(counters.moves, 1, "exactly one move");
     assert_eq!(
         counters.bytes_copied, live_before_move,
-        "a move copies the payload's whole live length (its reservation), which is why the \
-         written prefix survives it"
+        "a move copies the payload's whole live length (its previous capacity), which is why \
+         the written prefix survives it"
     );
     assert!(
         raw::is_refc_binary(second),

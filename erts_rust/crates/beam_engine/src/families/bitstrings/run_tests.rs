@@ -161,7 +161,7 @@ pub(super) fn bitstring(term: Eterm) -> (Vec<u8>, usize) {
 /// `BinRef.val` points into: the caller must keep it alive (and unmoved) for as long
 /// as the term is read — the frozen `write_refc_binary` ownership contract — hence
 /// it is returned rather than dropped.
-fn refc_window(
+pub(super) fn refc_window(
     ctx: &mut MinimalContext,
     payload_bytes: &[u8],
     offset_bits: usize,

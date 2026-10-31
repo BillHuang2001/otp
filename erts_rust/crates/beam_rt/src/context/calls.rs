@@ -63,7 +63,7 @@ use std::rc::Rc;
 
 use beam_abi::nif::loader::NifCallError;
 use beam_alloc::Heap;
-use beam_bifs::{AtomInterner, BifContext, BifFn, TableRegistry};
+use beam_bifs::{AtomInterner, BifContext, BifFn, OffHeapBinaries, TableRegistry};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_process::ProcessTable;
 use beam_term::{AtomTable, Eterm};
@@ -132,6 +132,32 @@ fn is_retryable_pure_constructor(module: &str, function: &str, arity: u32) -> bo
             | ("maps", "from_list", 1)
             | ("maps", "merge", 2)
     )
+}
+
+/// The off-heap payload host a registered BIF call installs on its [`BifContext`].
+///
+/// The whole-binary producers (`binary:copy/1,2`, `erlang:list_to_binary/1`,
+/// `erlang:iolist_to_binary/1`, `erlang:split_binary/2`) route a result above
+/// `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` through
+/// `beam_bifs::OffHeapBinaries::alloc_refc_payload` when a host is installed, materializing the
+/// term as the off-heap `[BinRef][ErlSubBits]` pair instead of an on-heap `ErlHeapBits`.
+///
+/// The host retains each payload in a `Vec` for the duration of the call; the caller then adopts
+/// the accumulated handles into [`Runtime::eval_off_heap`](crate::Runtime::eval_off_heap) **before**
+/// the result copy-out runs, so the copy's SOURCE table can resolve the very payloads this call
+/// built (see [`Runtime::source_payloads`](crate::Runtime::source_payloads)).
+///
+/// It deliberately holds no runtime borrow: the dispatch arms each already borrow `&mut Runtime`,
+/// and a `Vec`-backed host needs none, so the two cannot conflict.
+struct RefcPayloadHost(Vec<beam_alloc::RefcBinary>);
+
+impl OffHeapBinaries for RefcPayloadHost {
+    fn alloc_refc_payload(&mut self, bytes: &[u8]) -> Result<*mut u8> {
+        let handle = beam_alloc::RefcBinary::new(bytes)?;
+        let data = handle.data_ptr();
+        self.0.push(handle);
+        Ok(data)
+    }
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -373,6 +399,10 @@ impl<'a> RuntimeContext<'a> {
         // the three facts that make the pair sound, are in [`Self::call_registered_full`], whose
         // arms install the same cell).
         let alias = std::cell::Cell::new(false);
+        // The off-heap payload host this call installs on its [`BifContext`]: binary-producing
+        // BIFs retain each payload here for the call's duration, and whichever path runs adopts the
+        // accumulated handles into `eval_off_heap` before the tail's copy-out.
+        let mut off_heap = RefcPayloadHost(Vec::new());
         // The one-bit arm test. A **lent** `TableRegistry` is exclusive by construction, so its
         // presence also has to send the call to the full path: the shared cell must not be
         // consulted while one is lent, and only the full path installs the lent one.
@@ -392,6 +422,7 @@ impl<'a> RuntimeContext<'a> {
                 alias,
                 tables_handle,
                 ports_handle,
+                off_heap,
             );
         }
         // ---- the hook-free fast path ---------------------------------------------------------
@@ -478,7 +509,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_fun_caller(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -556,6 +588,13 @@ impl<'a> RuntimeContext<'a> {
             }
             break attempt;
         };
+        // Adopt any off-heap payloads the BIF built, before the tail's copy-out runs: the copy
+        // reads `eval_off_heap` as its source table, so the very payloads this call created must
+        // be resolvable there (see [`Self::move_result_into_process_heap`]). Only a non-empty host
+        // pays the adoption, keeping the immediate/on-heap fast path free.
+        if !off_heap.0.is_empty() {
+            self.runtime.adopt_escaped_binaries(&off_heap.0);
+        }
         let outcome = self.finish_registered_call(
             result,
             &mut heap,
@@ -605,6 +644,7 @@ impl<'a> RuntimeContext<'a> {
         alias: std::cell::Cell<bool>,
         tables_handle: Rc<std::cell::RefCell<TableRegistry>>,
         ports_handle: Rc<std::cell::RefCell<crate::port::PortRegistry>>,
+        mut off_heap: RefcPayloadHost,
     ) -> Result<Eterm> {
         // Whether this is a process-dictionary BIF, which needs the running process's
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
@@ -857,7 +897,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_dict_hook(&mut dict)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -890,7 +931,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_process_hook(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -926,7 +968,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_nif_loader(&mut bridge)
                     .with_current_module(caller_module.as_deref().unwrap_or(""))
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -954,7 +997,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_record_source(&mut source)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -984,7 +1028,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_export_gate(&gate)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -1022,7 +1067,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_sender(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -1049,7 +1095,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_module_info(&mut source)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -1100,7 +1147,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_persistent_term(&mut store)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -1133,7 +1181,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_runtime_hooks(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -1169,7 +1218,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_fun_caller(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_off_heap(&mut off_heap);
                 if let Some(fun_identity) = fun_identity.as_mut() {
                     context = context.with_local_fun_identity(fun_identity);
                 }
@@ -1185,6 +1235,12 @@ impl<'a> RuntimeContext<'a> {
                 invoke_registered(bif, arity, &mut context, args)
             }
         };
+        // Adopt any off-heap payloads the BIF built, before the tail's copy-out runs — the same
+        // flush the hook-free fast path performs, and for the same reason: the copy reads
+        // `eval_off_heap` as its source table, so these handles must be resolvable there.
+        if !off_heap.0.is_empty() {
+            self.runtime.adopt_escaped_binaries(&off_heap.0);
+        }
         let outcome = self.finish_registered_call(
             result,
             &mut heap,
@@ -2063,10 +2119,20 @@ impl<'a> RuntimeContext<'a> {
             if republishable {
                 hint_grow_gate(process, hint);
             }
+            // One source-payload snapshot for both attempts, built once and borrowed at each call
+            // site (`SourcePayloads` is not `Copy`): the BIF-built refc-binary handles now held in
+            // `eval_off_heap` (adopted before this copy-out) plus `pid`'s retained mailbox
+            // families. See [`Runtime::source_payloads`].
+            let payloads = runtime.source_payloads(pid, &[]);
             // One fresh destination table per attempt (see the docs above): a refused attempt's
             // partial state is never rolled into the retry, so both attempts hand the copier an
             // empty destination and take the single-traversal fast path.
-            let needed = match copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term) {
+            let needed = match copy_result_fresh(
+                process.heap_mut(),
+                &mut runtime.eval_off_heap,
+                term,
+                &payloads,
+            ) {
                 Ok(copied) => return Some(copied),
                 Err(error) if !beam_message::is_message_heap_exhaustion(&error) => {
                     // A refusal that is **not** the destination running out of room — above all the
@@ -2149,7 +2215,13 @@ impl<'a> RuntimeContext<'a> {
                     notes::note_grow();
                     process.grow_nursery(needed.max(256)).ok()?;
                 }
-                copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term).ok()
+                copy_result_fresh(
+                    process.heap_mut(),
+                    &mut runtime.eval_off_heap,
+                    term,
+                    &payloads,
+                )
+                .ok()
             }
         };
         if stabilize {
@@ -2507,34 +2579,51 @@ impl RuntimeContext<'_> {
 /// The table is also where the copier registers the off-heap objects the copy referenced, and each
 /// family is adopted into `store` **only when it holds something** — three `Vec::len` tests and
 /// nothing else for the overwhelmingly common result, a graph with no off-heap reference at all
-/// (its MSO list can never fill — see below — and its refc binaries are flattened, so only a node
-/// entry of an external pid/port/reference can ever appear). On **failure** nothing is adopted: the
-/// local table is dropped, its `Drop` releasing the node references the abandoned attempt took.
-/// Because every attempt calls this with its own new table, no partial state can be carried into a
-/// retry.
+/// (an on-heap-only graph adopts nothing; a refc binary is shared only when the source table owns
+/// its payload, and a node entry appears only for an external pid/port/reference). On **failure**
+/// nothing is adopted: the local table is dropped, its `Drop` releasing the node references the
+/// abandoned attempt took. Because every attempt calls this with its own new table, no partial
+/// state can be carried into a retry.
 ///
 /// A table-free entry point would have to be exactly this shape, and
 /// [`beam_message::copy_struct_simple`] is not it: it builds these very two tables internally (so it
 /// removes no work) and keeps the destination one private, which would leave a successful copy's
 /// node entries to be released by its `Drop` instead of adopted into `store`.
 ///
-/// The SOURCE table is empty and stays empty: the pooled BIF heap owns no off-heap handle, so a
-/// refc binary whose payload no source handle owns is **flattened** into an on-heap bitstring (the
-/// copier's fallback) and an off-heap MSO container has no resolvable source slot at all
-/// (`clone_slot` is `None` ⇒ the copier's `bad_term`). That is why the adopted MSO list is
-/// provably empty on success — `push` can never re-slot a container whose on-heap `val` word would
-/// then name the wrong slot. See [`RuntimeContext::move_result_into_process_heap`].
+/// The SOURCE table is rebuilt from `src` — the off-heap payloads the caller vouches the term can
+/// reference — exactly as [`Runtime::stabilize_term_with`] does: each refc-binary handle is pushed
+/// via [`OffHeapTable::push_binary`](beam_message::OffHeapTable::push_binary) and each MSO handle
+/// via [`OffHeapTable::push`](beam_message::OffHeapTable::push), while the `nodes` family is
+/// deliberately **not** pushed (the copier registers a fresh node entry for each external thing and
+/// never reads a source node list). With `src` empty the source table stays empty and the previous
+/// behaviour is unchanged: a refc binary whose payload no source handle owns is **flattened** into
+/// an on-heap bitstring (the copier's fallback) and an off-heap MSO container has no resolvable
+/// source slot at all (`clone_slot` is `None` ⇒ the copier's `bad_term`). See
+/// [`RuntimeContext::move_result_into_process_heap`].
 pub(super) fn copy_result_fresh(
     heap: &mut Heap,
     store: &mut beam_message::OffHeapTable,
     term: Eterm,
+    src: &crate::runtime::SourcePayloads,
 ) -> Result<Eterm> {
-    let src = beam_message::OffHeapTable::new();
+    // The copy's SOURCE table: the off-heap payloads the caller vouches the term can reference.
+    // Rebuilt exactly as [`Runtime::stabilize_term_with`] does — refc-binary handles then MSO
+    // handles, the `nodes` family deliberately left out (the copier registers fresh node entries) —
+    // and left at the documented empty-source form when `src` holds nothing.
+    let mut source = beam_message::OffHeapTable::new();
+    if !src.is_empty() {
+        for handle in &src.binaries {
+            source.push_binary(handle.clone());
+        }
+        for handle in &src.off_heap {
+            source.push(handle.clone());
+        }
+    }
     let mut local = beam_message::OffHeapTable::new();
     #[cfg(test)]
     notes::note_attempt(&local);
     let outcome = {
-        let mut ctx = beam_message::CopyContext::new(&src, &mut local);
+        let mut ctx = beam_message::CopyContext::new(&source, &mut local);
         beam_message::copy_struct(term, heap, &mut ctx)
     };
     if outcome.is_ok() {

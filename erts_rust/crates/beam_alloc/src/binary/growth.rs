@@ -233,8 +233,10 @@ impl RefcBinary {
     /// 3. Otherwise the payload is reallocated, copied and freed
     ///    ([`GrowOutcome::Moved`], `moves`/`bytes_copied` bumped).
     ///
-    /// The grown target is `min(max(grow_span(current_capacity), capacity), max_capacity)`
-    /// — the C's `GROW_PROC_BIN_SIZE` schedule, capped by the handle's
+    /// The grown target is
+    /// `min(max(grow_span(requested_capacity), requested_capacity), max_capacity)` — the
+    /// C's `GROW_PROC_BIN_SIZE` schedule applied to the **requested** size (the C's
+    /// `used_size`, `erl_bits.c`), never the current capacity, capped by the handle's
     /// [`max_capacity`](RefcBinary::max_capacity). A request beyond that cap is the typed
     /// `AllocKind::LargeObject` failure and changes **nothing at all**.
     ///
@@ -256,7 +258,7 @@ impl RefcBinary {
             return Err(error::large_object_failure(capacity));
         }
         // `capacity <= target <= max_capacity`, so the request is always covered.
-        let target = grow_span(current).max(capacity).min(max_capacity);
+        let target = grow_span(capacity).max(capacity).min(max_capacity);
         let reserved = self.reserved_bytes();
         if target <= reserved {
             self.header_mut().capacity = target;
@@ -408,6 +410,35 @@ impl RefcBinary {
             return Ok(GrowOutcome::InPlace { capacity: len });
         }
         Ok(GrowOutcome::Moved(self.relocate(tight, len)?))
+    }
+
+    /// Pins a writable payload: once pinned it is immutable, mirroring the C's
+    /// `erts_pin_writable_binary` (`../../erts/emulator/beam/erl_bits.c:2051-2080`).
+    ///
+    /// The C clears the writable flags and, when the spare width
+    /// (`orig_size - apparent_size`) is at least 8 bytes, reallocates to the apparent size
+    /// so that `orig_size` shrinks to it; a smaller spare skips the realloc and leaves
+    /// `orig_size` unchanged. Here [`capacity`](RefcBinary::capacity) is the `orig_size`
+    /// analogue and [`len`](RefcBinary::len) the apparent size; the physical `reserved` is
+    /// Rust's spare-room bookkeeping (it is the free size [`Drop`] records, never a
+    /// reported width), so it is deliberately left alone in both arms.
+    ///
+    /// Both arms preserve the `len <= capacity <= reserved` invariant: the shrink arm only
+    /// lowers the capacity word to `len`, and the skip arm changes nothing. No counter is
+    /// bumped, exactly like [`compact`](RefcBinary::compact)'s in-place arm (a *reduction*
+    /// of a header word, never an allocation).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] if the payload is still shared; the payload is unchanged.
+    pub fn pin_writable(&mut self) -> Result<()> {
+        self.require_unique()?;
+        let len = self.len();
+        let capacity = self.capacity();
+        if capacity - len >= 8 {
+            self.header_mut().capacity = len;
+        }
+        Ok(())
     }
 
     /// Reallocates the payload into a block of `new_reserved` payload bytes and installs a

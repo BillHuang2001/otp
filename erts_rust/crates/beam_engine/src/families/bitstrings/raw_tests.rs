@@ -324,8 +324,10 @@ fn grow_writable_payload_grows_in_place_then_moves_and_rekeys() {
     let reserved = machine.refc_binaries()[0].reserved_bytes();
     assert!(reserved >= 8, "the reservation covers the hint");
 
-    // (a) Still inside the reservation: same address, raised capacity.
-    let committed = reserved.min(20).max(9);
+    // (a) A request whose doubled span still fits the reservation grows in place:
+    // same address, capacity raised to `grow_span(requested)` (`2 * requested`
+    // below 16 MiB) — the in-place bound is `grow_span(requested) <= reserved`.
+    let committed = (reserved / 2).max(9);
     let (in_place_base, in_place_capacity) = machine
         .grow_writable_payload(base, committed)
         .unwrap()

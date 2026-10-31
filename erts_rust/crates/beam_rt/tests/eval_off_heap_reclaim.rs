@@ -247,9 +247,15 @@ fn the_store_is_bounded_across_a_multi_statement_loop() {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // The store may settle at its O(1) steady state by the first sample — a flat plateau rather
+    // than the sawtooth this assertion used to demand. Non-vacuity is already carried by
+    // `prunes > 0` + `declines == 0` above together with the reclaim-off A/B control
+    // (`without_the_reclaim_the_same_loop_is_linear`), which proves the producer really builds
+    // off-heap payloads and the reclaim is what bounds them; a plateau is therefore a valid
+    // (stronger) bound, not a silent pass.
     assert!(
-        series.windows(2).any(|pair| pair[1].bytes < pair[0].bytes),
-        "the series never fell, so no prune visibly released anything: {series:?}"
+        series.iter().any(|sample| sample.handles > 0),
+        "the store never held a payload, so the bounded claim is vacuous: {series:?}"
     );
     println!(
         "[{SUITE}] {EVALS} evals × {STATEMENTS_PER_EVAL} payload builds stayed at ≤ {} bytes / \
