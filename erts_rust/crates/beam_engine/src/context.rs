@@ -690,6 +690,41 @@ pub trait ExecutionContext: ReduceHookSource {
             .map(BifOutcome::Return)
     }
 
+    /// The **outcome-aware** BIF door with the machine's **off-heap handle slice**
+    /// handed in: [`call_bif_outcome`](ExecutionContext::call_bif_outcome) plus the
+    /// payload handles of the machine the BIF is dispatching inside.
+    ///
+    /// `off_heap` is the in-flight
+    /// [`Machine::refc_binaries`](crate::machine::Machine::refc_binaries) slice — the
+    /// [`beam_alloc::RefcBinary`] handles the machine keeps alive for the refc terms
+    /// it built (a `bs_init_writable` / `bs_create_bin` result larger than
+    /// `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` bytes). A host that moves a term
+    /// off the machine while the BIF runs — a send, a process return — clones the
+    /// handles the copy needs into the copy's source off-heap table, exactly as
+    /// [`send_message_with_off_heap`](ExecutionContext::send_message_with_off_heap)
+    /// hands them to a send.
+    ///
+    /// The engine takes this door on the **plain** (non-in-machine) dispatch path, so
+    /// the suspend contract is
+    /// [`call_bif_outcome`](ExecutionContext::call_bif_outcome)'s verbatim.
+    ///
+    /// The default body discards `off_heap` and forwards to
+    /// [`call_bif_outcome`](ExecutionContext::call_bif_outcome), so **every existing
+    /// implementor compiles and behaves byte-identically** — a host that overrides
+    /// only [`call_bif_outcome`](ExecutionContext::call_bif_outcome) (e.g. to suspend
+    /// or price a dispatch) keeps that override.
+    fn call_bif_outcome_with_off_heap(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+        off_heap: &[beam_alloc::RefcBinary],
+    ) -> Result<BifOutcome> {
+        let _ = off_heap;
+        self.call_bif_outcome(module, function, arity, args)
+    }
+
     /// The **in-machine outcome-aware** BIF door: the
     /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine) dispatch that is
     /// also allowed to answer [`BifOutcome::Suspend`].
@@ -3817,6 +3852,79 @@ mod tests {
             BifOutcome::Return(beam_term::make_small(7)),
             "the defaulted outcome door must forward to `call_bif` and wrap its value"
         );
+    }
+
+    /// A host that records every plain `call_bif` and answers a known value, overriding
+    /// only the two required trait methods (so both the outcome door and the off-heap
+    /// door keep their trait defaults).
+    struct RecordingPlainBifHost {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<(String, String, u32, Vec<Eterm>)>>>,
+    }
+
+    impl ExecutionContext for RecordingPlainBifHost {
+        fn call_bif(
+            &mut self,
+            module: &str,
+            function: &str,
+            arity: u32,
+            args: &[Eterm],
+        ) -> Result<Eterm> {
+            self.calls.borrow_mut().push((
+                module.to_string(),
+                function.to_string(),
+                arity,
+                args.to_vec(),
+            ));
+            Ok(beam_term::make_small(7))
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_off_heap_outcome_door_defaults_to_the_plain_bif_door() {
+        // The defaulted `call_bif_outcome_with_off_heap` forwards to
+        // `call_bif_outcome`, whose own default forwards to `call_bif`: a host that
+        // overrides `call_bif` but neither the outcome door nor the new off-heap door
+        // still observes the call with the same arguments and returns its value.
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut ctx = RecordingPlainBifHost {
+            calls: std::rc::Rc::clone(&calls),
+        };
+        let off_heap: &[beam_alloc::RefcBinary] = &[];
+        let args = [beam_term::make_small(2), beam_term::make_small(3)];
+        assert_eq!(
+            ExecutionContext::call_bif_outcome_with_off_heap(
+                &mut ctx,
+                "erlang",
+                "'+'",
+                2,
+                &args,
+                off_heap,
+            )
+            .unwrap(),
+            BifOutcome::Return(beam_term::make_small(7)),
+            "the defaulted off-heap door must forward to `call_bif` and wrap its value"
+        );
+        let recorded = calls.borrow();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the plain BIF door observes exactly one call"
+        );
+        assert_eq!(
+            (recorded[0].0.as_str(), recorded[0].1.as_str(), recorded[0].2),
+            ("erlang", "'+'", 2)
+        );
+        assert_eq!(recorded[0].3, vec![beam_term::make_small(2), beam_term::make_small(3)]);
     }
 
     /// A host that opted into the **in-machine** door but knows nothing about the
