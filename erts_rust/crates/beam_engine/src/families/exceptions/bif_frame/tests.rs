@@ -31,10 +31,12 @@ use beam_common::{BeamError, ExitReason, Raise};
 use beam_loader::{Atom, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, NO_FAIL};
 use beam_term::{cmp, make_small, AtomTable};
 
-use crate::context::MinimalContext;
+use crate::context::{MinimalContext, RootSet};
 use crate::families::exceptions::tests::oracle::render_error_info_extension;
 use crate::jit::Tier;
 use crate::machine::CatchFrame;
+use crate::terms::alloc_tests::MovingContext;
+use crate::terms::make_tuple_rooted;
 use crate::terms::test_support as terms;
 use crate::terms::{list_elements, tuple_element};
 
@@ -315,6 +317,88 @@ fn a_zero_arity_bif_cooks_an_empty_argument_list() {
         tuple_element(item, 2).unwrap(),
         NIL,
         "a 0-arity BIF's ArgList is the empty list"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a structured argument survives a collecting allocation (regression)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_boxed_argument_in_the_head_item_is_self_contained() {
+    // Regression: `carve` used to store the post-reservation argument terms verbatim
+    // in the item's `ArgList`, so the item's argument-list cells named the argument's
+    // *own* heap block rather than a copy that lives inside the item's reservation.
+    // `MovingContext` is a conservative collector (it traces and rebases any word that
+    // points into a live block), so it keeps such a verbatim pointer alive — which is
+    // exactly what makes the two paths distinguishable: the verbatim path keeps the
+    // `ArgList` element *identical* to the relocated original argument, while the
+    // deep-copy path makes it a distinct, self-contained object that moves **with**
+    // the item.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MovingContext::new();
+
+    // A boxed argument — `{1, 2}` — parked in x(0). `MovingContext` collects on every
+    // rooted allocation, so each builder below runs a real collection first.
+    let arg = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 2, 0, |_, _| {
+        Ok(vec![make_small(1), make_small(2)])
+    })
+    .expect("the moving arena serves the first rooted allocation");
+    machine.set_x(0, arg).expect("x(0) is a live register");
+
+    // Building the item reserves once — collecting the argument block into the other
+    // semi-space — and then deep-copies the re-read argument into that reservation.
+    let item = bif_head_item(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "erlang",
+        "hd",
+        &[Operand::X(0)],
+        &BeamError::BadArg,
+    )
+    .expect("the arena serves the item reservation")
+    .expect("a live catch frame and a nameable BIF synthesize the item");
+
+    // Park the item in a root slot; the original argument stays rooted in x(0) so we
+    // can compare the `ArgList` element's identity against the relocated original.
+    machine.set_x(1, item).expect("x(1) is a live register");
+
+    // Force a SECOND collecting allocation after the item is built: both the rooted
+    // original argument and the rooted item block are relocated.
+    let _ = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 1, 0, |_, _| {
+        Ok(vec![make_small(99)])
+    })
+    .expect("the moving arena serves the second rooted allocation");
+
+    assert!(ctx.moved_any, "the collector must have relocated something");
+    assert!(ctx.collections >= 3, "the second collection must really have run");
+
+    let item = machine.x(1).expect("the item is rooted");
+    let original = machine.x(0).expect("the original argument is rooted");
+    let arg_list = tuple_element(item, 2).expect("the item's ArgList");
+    let args = list_elements(arg_list).expect("a proper argument list");
+    assert_eq!(args.len(), 1, "hd/1 names exactly one argument");
+
+    // The `ArgList` names the item's own deep copy, never the original argument's
+    // block: the copy is self-contained inside the item's reservation, so it moves
+    // with the item instead of riding a pointer the next collection relocates.
+    assert_ne!(
+        args[0], original,
+        "the ArgList must name a self-contained copy, not the original argument block"
+    );
+
+    // The relocated copy still reads as `{1, 2}`.
+    assert_eq!(
+        tuple_element(args[0], 0).expect("field 0"),
+        make_small(1),
+        "the relocated argument's first field"
+    );
+    assert_eq!(
+        tuple_element(args[0], 1).expect("field 1"),
+        make_small(2),
+        "the relocated argument's second field"
     );
 }
 

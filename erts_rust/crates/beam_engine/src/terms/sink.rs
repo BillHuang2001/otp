@@ -48,6 +48,7 @@ use beam_term::{make_arityval, make_tuple, AtomTable, Eterm, NIL};
 
 use super::Slack;
 use crate::context::ExecutionContext;
+use crate::error::unsupported;
 
 /// Reject a tuple arity the frozen header cannot encode.
 ///
@@ -208,6 +209,160 @@ impl Sink for ContextSink<'_> {
         // this sink does, and `alloc_words` never collects — the precondition
         // `write_map` documents.
         unsafe { write_map_at(hp, pairs, atoms) }
+    }
+}
+
+/// The words [`deep_copy`] reserves for a boxed object headed by `header` at `ptr` —
+/// the **copy** shape, which differs from
+/// [`beam_term::layout::object_words`] for an `ErlSubBits` exactly as that module
+/// documents: a refc binary's `ErlSubBits` block is copied verbatim as its own
+/// [`beam_term::ERL_SUB_BITS_SIZE`] words while its `orig` (the `BinRef`) is re-pointed
+/// at a separately deep-copied `BinRef` — so the pair still costs
+/// [`beam_term::ERL_REFC_BITS_SIZE`] in total, but is carved as two blocks.
+fn copy_words(header: Eterm, ptr: *const Eterm) -> usize {
+    if header.raw() & beam_term::TAG_HEADER_MASK == beam_term::SUB_BITS_SUBTAG {
+        beam_term::ERL_SUB_BITS_SIZE
+    } else {
+        // SAFETY: `ptr` addresses a live object headed by `header` — the caller
+        // (`deep_copy`) only invokes this for a live, boxed term, which is the same
+        // caller contract `object_words` documents.
+        unsafe { beam_term::layout::object_words(header, ptr) }
+    }
+}
+
+/// Whether `term` is a **match context** — an `ErlSubBits` whose `orig` is boxed and
+/// not a `BinRef` ([`beam_term::HEADER_BIN_REF`]).
+///
+/// [`deep_copy_budget`] declines these (see there). [`deep_copy`] is never handed one
+/// by a caller that has sized with that budget: a match context nested inside a bigger
+/// argument graph instead surfaces as a slack overrun (the sizing shape under-counts
+/// the copy shape), which is still a typed decline rather than a short block.
+fn is_match_context(term: Eterm) -> bool {
+    if !beam_term::is_boxed_term(term) {
+        return false;
+    }
+    let src = beam_term::boxed_val(term);
+    // SAFETY: `term` is a live boxed term, so its header word is readable.
+    let header = unsafe { *src };
+    if header.raw() & beam_term::TAG_HEADER_MASK != beam_term::SUB_BITS_SUBTAG {
+        return false;
+    }
+    // SAFETY: an `ErlSubBits` header proves word `SUB_BITS_ORIG_WORD` is initialized.
+    let orig = unsafe { *src.add(beam_term::SUB_BITS_ORIG_WORD) };
+    beam_term::is_boxed_term(orig)
+        && {
+            // SAFETY: `orig` is boxed, so its header word is live.
+            unsafe { *beam_term::boxed_val(orig) != beam_term::HEADER_BIN_REF }
+        }
+}
+
+/// The words [`deep_copy`] will carve out of `slack` for `term` — its copy budget — or
+/// `None` when the graph cannot be sized to the copy shape.
+///
+/// Sized from [`beam_term::size::size_object`] (the `size_object_x(t, NULL)` source
+/// occupancy count): an immediate and a literal are **shared verbatim** by
+/// [`deep_copy`], so they cost `0`, while every compound object is priced once per
+/// occurrence — the same count the deep copy's per-occurrence carve needs, so the
+/// budget is never **below** what the copy actually carves.
+///
+/// The one graph whose sizing shape disagrees with the copy shape is a **match
+/// context** — an `ErlSubBits` whose `orig` is boxed and not a `BinRef`:
+/// `size_object` prices its fresh copied window
+/// (`heap_bits_size_words(end - start)`, `copy.c:232-239`) while [`deep_copy`] copies
+/// the 5-word block plus the **full** underlying heap-bits — an under-reserve. It is
+/// declined here (a typed `None`) rather than trusted.
+pub(crate) fn deep_copy_budget(term: Eterm) -> Option<usize> {
+    match beam_term::primary_tag(term) {
+        // An immediate is shared verbatim and costs nothing.
+        beam_term::PrimaryTag::Immed1 => Some(0),
+        // A literal is shared verbatim (it is never relocated by a moving collector).
+        beam_term::PrimaryTag::List if beam_term::is_literal(term) => Some(0),
+        beam_term::PrimaryTag::Boxed if beam_term::is_literal(term) => Some(0),
+        beam_term::PrimaryTag::List => Some(beam_term::size::size_object(term)),
+        beam_term::PrimaryTag::Boxed => {
+            if is_match_context(term) {
+                None
+            } else {
+                Some(beam_term::size::size_object(term))
+            }
+        }
+        // Not a term (a bare header word): nothing to copy, and never a valid argument.
+        beam_term::PrimaryTag::Header => None,
+    }
+}
+
+/// Deep-copy `term` into `slack`, making its whole graph self-contained inside the
+/// slack's reserved region so it moves **with** the item that references it.
+///
+/// * an **immediate** and a **literal** ([`beam_term::is_literal`]) are shared
+///   verbatim — neither is ever relocated by a moving collector;
+/// * a **cons cell** is copied as its header-less 2-word `[CAR, CDR]` pair, with the
+///   two words re-pointed at their own deep copies;
+/// * a **boxed object** is copied verbatim as [`copy_words`] words and every copy
+///   child slot (via [`beam_term::layout::for_each_child_slot`]) re-pointed at its own
+///   deep copy.
+///
+/// The caller has reserved at least [`deep_copy_budget`]`(term)` words, so no carve
+/// overruns the slack; an overrun is the typed `unsupported` from [`Slack::alloc_words`],
+/// never a short block. This is the engine's own **copy shape** — the sibling of
+/// `beam_gc::copy`'s move/copy, which is `pub(crate)` to that crate and therefore not
+/// reachable here — used where a baked term must carry its boxed subgraphs with it.
+pub(crate) fn deep_copy(slack: &mut Slack, term: Eterm) -> Result<Eterm> {
+    match beam_term::primary_tag(term) {
+        beam_term::PrimaryTag::Immed1 => Ok(term),
+        beam_term::PrimaryTag::List if beam_term::is_literal(term) => Ok(term),
+        beam_term::PrimaryTag::Boxed if beam_term::is_literal(term) => Ok(term),
+        beam_term::PrimaryTag::List => {
+            let src = beam_term::list_val(term);
+            let hp = slack.alloc_words(2)?;
+            // SAFETY: `hp` is 2 exclusively-owned words inside the slack's reserved
+            // region, and `src` is a live 2-word cons cell; the two ranges are distinct
+            // (the slack's region is freshly reserved, never the source term's block).
+            unsafe { core::ptr::copy_nonoverlapping(src, hp, 2) };
+            // SAFETY: the 2 words at `hp` are now the verbatim `[CAR, CDR]` pair.
+            let (car, cdr) = unsafe { (*hp, *hp.add(1)) };
+            let car = deep_copy(slack, car)?;
+            let cdr = deep_copy(slack, cdr)?;
+            // SAFETY: the 2 words at `hp` are exclusively owned by this cell.
+            unsafe {
+                *hp = car;
+                *hp.add(1) = cdr;
+            }
+            Ok(beam_term::make_list(hp))
+        }
+        beam_term::PrimaryTag::Boxed => {
+            let src = beam_term::boxed_val(term);
+            // SAFETY: `term` is a live boxed term, so its header word is readable.
+            let header = unsafe { *src };
+            let words = copy_words(header, src);
+            let hp = slack.alloc_words(words)?;
+            // SAFETY: `hp` is `words` exclusively-owned words inside the slack's reserved
+            // region, and `src` is a live object of `header`'s shape of exactly `words`
+            // words; the ranges are distinct for the same reason as the cons arm.
+            unsafe { core::ptr::copy_nonoverlapping(src, hp, words) };
+
+            // Re-point each copy child slot at its own deep copy. The offsets are
+            // collected first, so the copy and the recursion borrow the slack disjointly.
+            let mut offsets = Vec::new();
+            // SAFETY: `hp` now holds a verbatim copy of the live object headed by
+            // `header`, so its child-slot offsets are the source's too.
+            unsafe {
+                beam_term::layout::for_each_child_slot(header, hp, |offset| {
+                    offsets.push(offset);
+                });
+            }
+            for offset in offsets {
+                // SAFETY: `offset` is one of the object's copy child-slot offsets, so
+                // `hp.add(offset)` addresses a slot of the copied object.
+                let child = unsafe { *hp.add(offset) };
+                let copied = deep_copy(slack, child)?;
+                // SAFETY: as above — the slot is exclusively owned by the copied object.
+                unsafe { *hp.add(offset) = copied };
+            }
+            Ok(beam_term::make_boxed(hp))
+        }
+        // Not a term (a bare header word): nothing to copy, and never a valid argument.
+        beam_term::PrimaryTag::Header => Err(unsupported("deep_copy: not a boxed/list term")),
     }
 }
 
