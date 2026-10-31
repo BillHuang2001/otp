@@ -33,11 +33,26 @@
 //! and observes the return term synchronously.
 
 use beam_common::{BeamError, Result};
+use beam_engine;
 use beam_term::prelude::{atom_val, is_atom};
 use beam_term::Eterm;
 
 use crate::context::RuntimeContext;
 use crate::error;
+
+/// Whether `err` is one of the engine's two **non-completion folds** — a `receive` with an
+/// empty mailbox ([`beam_engine::blocked`]) or a BIF that parked ([`beam_engine::suspended`]) —
+/// that a non-pumpable scheduler slice folds a `-on_load` body into.
+///
+/// The two reason atoms are owned strings with no stable identity, so this compares the
+/// normalized [`crate::error::unsupported_reason`] forms against the constructors' own
+/// normalized forms (the single definitions of those strings) rather than hard-coding
+/// literals.
+fn is_non_completion_fold(err: &BeamError) -> bool {
+    let reason = error::unsupported_reason(err);
+    reason == error::unsupported_reason(&beam_engine::blocked())
+        || reason == error::unsupported_reason(&beam_engine::suspended())
+}
 
 impl RuntimeContext<'_> {
     /// Runs `name`'s `-on_load` entry point synchronously and answers its return term.
@@ -96,20 +111,17 @@ impl RuntimeContext<'_> {
         // A `-on_load` body that must `receive` cannot run inline inside a scheduler slice: the
         // slice's nested machine cannot pump the scheduler (`pump_once` answers `Ok(None)` under
         // `may_pump_scheduler() == false`), so the hook's `receive` suspends and the load folds
-        // into `blocked()`. Instead, defer the hook to the scheduler boundary's drain
-        // ([`Runtime::drain_pending_on_loads`], called from `pump_run_to_completion`), which runs
-        // it on a pumpable context exactly like the `-eval` route. A previously failed drain
-        // consumed here makes the re-executing `code:ensure_loaded/1` answer `on_load_failure`
-        // rather than deferring forever.
+        // into `blocked()`. A hook that **completes** (crypto's `load_nif`, and any
+        // side-effect-only hook) must still run inline even inside a slice — ERTS runs the hook
+        // synchronously before `code:ensure_loaded/1` returns, so deferring it would leave the
+        // NIF unregistered and the module's BIFs uncallable until the scheduler boundary. Only a
+        // hook that genuinely cannot complete inline (`blocked`/`suspended`) defers to the
+        // scheduler boundary's drain ([`Runtime::drain_pending_on_loads`], called from
+        // `pump_run_to_completion`), which runs it on a pumpable context exactly like the
+        // `-eval` route. A previously failed drain consumed here makes the re-executing
+        // `code:ensure_loaded/1` answer `on_load_failure` rather than deferring forever.
         if self.runtime.on_load_failed.remove(name) {
             return Err(error::message("on_load_failure"));
-        }
-        if !self.may_pump_scheduler() {
-            if !self.runtime.pending_on_loads.iter().any(|n| n == name) {
-                self.runtime.pending_on_loads.push(name.to_string());
-            }
-            self.request_suspend();
-            return Ok(());
         }
         match self.run_on_load_function(name) {
             Ok(term) if is_atom(term) && self.runtime.atoms().name(atom_val(term)) == Some("ok") => {
@@ -119,6 +131,13 @@ impl RuntimeContext<'_> {
             Ok(_) => {
                 self.runtime.code_server.forget_module(name);
                 Err(error::message("on_load_failure"))
+            }
+            Err(err) if !self.may_pump_scheduler() && is_non_completion_fold(&err) => {
+                if !self.runtime.pending_on_loads.iter().any(|n| n == name) {
+                    self.runtime.pending_on_loads.push(name.to_string());
+                }
+                self.request_suspend();
+                Ok(())
             }
             Err(err) => {
                 self.runtime.code_server.forget_module(name);

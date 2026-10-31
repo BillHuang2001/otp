@@ -72,6 +72,21 @@ const ONLOAD_DRIVER: &str =
      main() -> {code:ensure_loaded(onload_block), \
                 erlang:function_exported(onload_block, hello, 0)}.\n";
 
+/// A driver whose `main/0` loads `onload_ok` through the scheduler and reports
+/// `{code:ensure_loaded/1, get(onload_side_effect)}` — the proof the hook body ran **inline**
+/// (its process-dictionary side effect is visible in the same scheduled run, not deferred).
+const ONLOAD_SYNC_DRIVER: &str =
+    "-module(onload_sync_driver).\n-export([main/0]).\n\
+     main() -> {code:ensure_loaded(onload_ok), get(onload_side_effect)}.\n";
+
+/// A driver whose `main/0` loads `onload_ok` through the scheduler and reports
+/// `{code:ensure_loaded/1, erlang:function_exported/3}` — the freshly-loaded module is
+/// immediately usable on the scheduled route.
+const ONLOAD_EXPORTED_DRIVER: &str =
+    "-module(onload_exported_driver).\n-export([main/0]).\n\
+     main() -> {code:ensure_loaded(onload_ok), \
+                erlang:function_exported(onload_ok, load, 0)}.\n";
+
 /// The loud skip banner for a missing toolchain — never a silent pass.
 fn skip(banner: &str, why: &str) {
     eprintln!();
@@ -373,4 +388,67 @@ fn a_blocking_on_load_hook_loads_through_the_scheduled_route() {
         .expect("erlang:function_exported(onload_block, hello, 0)");
     assert_eq!(runtime.atom_name_of(exported), Some("true"));
     assert_loaded(&mut runtime, "onload_block");
+}
+
+/// A **non-blocking** `-on_load` hook runs synchronously on the **scheduled** route: the hook
+/// body's process-dictionary side effect is observable in the very `run_scheduled` run that
+/// loaded it, proving the hook ran inline during `code:ensure_loaded/1` rather than being
+/// deferred to the scheduler boundary's drain.
+#[test]
+fn a_non_blocking_on_load_hook_runs_synchronously_on_the_scheduled_route() {
+    let Some(erlc) = erlc_or_skip() else {
+        return;
+    };
+    let mut runtime = runtime();
+    let fixture = compile_fixture(&erlc, "onload_ok_sched", "onload_ok", ONLOAD_OK);
+    let driver = compile_fixture(
+        &erlc,
+        "onload_sync_driver",
+        "onload_sync_driver",
+        ONLOAD_SYNC_DRIVER,
+    );
+    runtime.code_server.add_path(fixture.path().to_path_buf());
+    runtime.code_server.add_path(driver.path().to_path_buf());
+
+    let driver_beam = driver.path().join("onload_sync_driver.beam");
+    let answer = runtime
+        .run_scheduled(driver_beam, "main", 0, &[])
+        .expect("main/0 through the scheduler");
+
+    assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2, "{answer:?}");
+    let ensure = terms::tuple_element(answer, 0).expect("element 0");
+    assert_module_pair(&runtime, ensure, "onload_ok");
+    let effect = terms::tuple_element(answer, 1).expect("element 1");
+    assert_eq!(runtime.atom_name_of(effect), Some("done"), "{effect:?}");
+}
+
+/// `erlang:function_exported/3` answers `true` immediately after `code:ensure_loaded/1` in the
+/// same **scheduled** run — the freshly-loaded module is immediately usable, which is the
+/// load-order a NIF-hosting module's consumers rely on (`ensure_loaded` then `function_exported`).
+#[test]
+fn function_exported_answers_true_immediately_after_load_on_the_scheduled_route() {
+    let Some(erlc) = erlc_or_skip() else {
+        return;
+    };
+    let mut runtime = runtime();
+    let fixture = compile_fixture(&erlc, "onload_ok_exported", "onload_ok", ONLOAD_OK);
+    let driver = compile_fixture(
+        &erlc,
+        "onload_exported_driver",
+        "onload_exported_driver",
+        ONLOAD_EXPORTED_DRIVER,
+    );
+    runtime.code_server.add_path(fixture.path().to_path_buf());
+    runtime.code_server.add_path(driver.path().to_path_buf());
+
+    let driver_beam = driver.path().join("onload_exported_driver.beam");
+    let answer = runtime
+        .run_scheduled(driver_beam, "main", 0, &[])
+        .expect("main/0 through the scheduler");
+
+    assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2, "{answer:?}");
+    let ensure = terms::tuple_element(answer, 0).expect("element 0");
+    assert_module_pair(&runtime, ensure, "onload_ok");
+    let exported = terms::tuple_element(answer, 1).expect("element 1");
+    assert_eq!(runtime.atom_name_of(exported), Some("true"), "{exported:?}");
 }
