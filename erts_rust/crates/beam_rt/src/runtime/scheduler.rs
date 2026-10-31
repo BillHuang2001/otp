@@ -583,7 +583,7 @@ impl Runtime {
     /// real (re-published) process tables. [`RuntimeContext::run_label_blocking`] already wraps the
     /// nested machine in a relocation-exemption window and `BLOCKING_PUMP_DEADLINE` bounds the run,
     /// so there is no unbounded spin and no GC-moves-under-a-nested-machine hazard.
-    fn drain_pending_on_loads(&mut self) -> Result<()> {
+    pub(crate) fn drain_pending_on_loads(&mut self) -> Result<()> {
         let pending = std::mem::take(&mut self.pending_on_loads);
         if pending.is_empty() {
             return Ok(());

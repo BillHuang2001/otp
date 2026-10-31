@@ -294,7 +294,18 @@ impl<'a> RuntimeContext<'a> {
             let mut machine = super::machine_pool::acquire(module);
             let result = match machine.run_export_outcome(module, function, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
-                    this.pump_once(&mut machine, module, func, pc)
+                    let stepped = this.pump_once(&mut machine, module, func, pc);
+                    // The step just handed the process tables back to the runtime, so any
+                    // `-on_load` hook a slice deferred ([`Runtime::pending_on_loads`]) can now
+                    // run on a pumpable context — the `-eval` route's counterpart of the drain in
+                    // `run_scheduled`. Gated on `may_pump_scheduler` because a nested run inside a
+                    // scheduler slice must not re-enter the scheduler (see the type docs), and
+                    // the drain's own hook run goes through [`RuntimeContext::run_label_blocking`],
+                    // not this method, so there is no nested drain.
+                    if this.may_pump_scheduler() {
+                        this.runtime.drain_pending_on_loads()?;
+                    }
+                    stepped
                 }),
                 Err(err) => Err(err),
             };

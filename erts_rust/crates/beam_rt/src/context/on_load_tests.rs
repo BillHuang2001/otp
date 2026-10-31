@@ -72,6 +72,17 @@ const ONLOAD_DRIVER: &str =
      main() -> {code:ensure_loaded(onload_block), \
                 erlang:function_exported(onload_block, hello, 0)}.\n";
 
+/// A driver whose `main/0` **spawns** a worker that loads the blocking hook inside a scheduled
+/// slice and reports `{code:ensure_loaded/1, erlang:function_exported/3}` back, then waits for
+/// that reply — the shape the `-eval` route's `run_export_blocking` pump must drain.
+const ONLOAD_SPAWN_DRIVER: &str =
+    "-module(onload_spawn_driver).\n-export([main/0]).\n\
+     main() -> Self = self(), \
+     spawn(fun() -> Self ! {onload_spawn_done, code:ensure_loaded(onload_block), \
+                            erlang:function_exported(onload_block, hello, 0)} end), \
+     receive {onload_spawn_done, Ensure, Exported} -> {Ensure, Exported} \
+     after 20000 -> error(onload_spawn_timeout) end.\n";
+
 /// A driver whose `main/0` loads `onload_ok` through the scheduler and reports
 /// `{code:ensure_loaded/1, get(onload_side_effect)}` — the proof the hook body ran **inline**
 /// (its process-dictionary side effect is visible in the same scheduled run, not deferred).
@@ -387,6 +398,43 @@ fn a_blocking_on_load_hook_loads_through_the_scheduled_route() {
     let exported = call(&mut runtime, "erlang", "function_exported", &[module, hello, make_small(0)])
         .expect("erlang:function_exported(onload_block, hello, 0)");
     assert_eq!(runtime.atom_name_of(exported), Some("true"));
+    assert_loaded(&mut runtime, "onload_block");
+}
+
+/// A blocking `-on_load` hook deferred **inside a spawned scheduler slice** is drained on the
+/// pumpable (`-eval`-equivalent) route too, not only `run_scheduled`: the worker's
+/// `code:ensure_loaded/1` defers to `pending_on_loads`, and the enclosing `call`'s
+/// `run_export_blocking` pump loop must drain it so the worker observes `{module, _}` and
+/// `erlang:function_exported/3` answers `true`.
+#[test]
+fn a_blocking_on_load_hook_loads_through_the_pumpable_eval_route() {
+    let Some(erlc) = erlc_or_skip() else {
+        return;
+    };
+    let mut runtime = runtime();
+    let block = compile_fixture(&erlc, "onload_block", "onload_block", ONLOAD_BLOCK);
+    let driver = compile_fixture(
+        &erlc,
+        "onload_spawn_driver",
+        "onload_spawn_driver",
+        ONLOAD_SPAWN_DRIVER,
+    );
+    runtime.code_server.add_path(block.path().to_path_buf());
+    runtime.code_server.add_path(driver.path().to_path_buf());
+
+    // `call` drives `call_bif` on a `RuntimeContext::with_output` context (pumpable), which is
+    // the `-eval` route's shape: `main/0` spawns a scheduled worker whose `code:ensure_loaded/1`
+    // runs the hook inside a slice (`may_pump_scheduler() == false`) and therefore defers it.
+    let answer = call(&mut runtime, "onload_spawn_driver", "main", &[])
+        .expect("main/0 via the pumpable route");
+
+    assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2, "{answer:?}");
+    let ensure = terms::tuple_element(answer, 0).expect("element 0");
+    assert_module_pair(&runtime, ensure, "onload_block");
+    let exported = terms::tuple_element(answer, 1).expect("element 1");
+    assert_eq!(runtime.atom_name_of(exported), Some("true"), "{exported:?}");
+
+    // The drain also leaves `onload_block` loaded, so the introspection BIFs agree afterwards.
     assert_loaded(&mut runtime, "onload_block");
 }
 

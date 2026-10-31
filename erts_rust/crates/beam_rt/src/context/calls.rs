@@ -2536,6 +2536,17 @@ impl RuntimeContext<'_> {
         if let Err(err) = self.run_module_on_load(module) {
             return Err(error::call_load_failure(err));
         }
+        // A hook that **deferred** (it must `receive`, and this context cannot pump the
+        // scheduler — i.e. inside a scheduler slice) leaves the module's NIF unregistered:
+        // `run_module_on_load` recorded the name on [`Runtime::pending_on_loads`] and set the
+        // `suspend_requested` latch. Running the requested export now would execute its
+        // `erlang:nif_error({nif_not_loaded, …})` stub body, so instead hand back a discarded
+        // value with the latch still set: the outcome door folds it into `BifOutcome::Suspend`
+        // and parks the machine on this call, and the drain re-runs the hook on a pumpable
+        // context before the machine resumes — so the re-executed call finds the NIF loaded.
+        if self.suspend_requested {
+            return Ok(Eterm::nil());
+        }
         self.run_export(&loaded, function, arity, args)
     }
 
