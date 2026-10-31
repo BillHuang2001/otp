@@ -555,6 +555,14 @@ impl Runtime {
                 false,
                 TimerWait::AtMostWhenIdle(crate::port::PORT_POLL_SLICE),
             )?;
+            // The pass just returned the tables to `self`, so the deferred `-on_load` hooks a
+            // slice BIF door recorded ([`Runtime::pending_on_loads`]) can now run on a pumpable
+            // context. Doing this here — and **not** at the tail of `scheduler_pass` itself —
+            // keeps the drain out of the pass body: the drain's `run_module_on_load` →
+            // `run_label_blocking` → `pump_once` → `pump_scheduler_boot` → `scheduler_pass`
+            // re-enters `scheduler_pass`, and a caller that re-suspended inside that nested pass
+            // would re-push its name and trigger a nested drain.
+            self.drain_pending_on_loads()?;
             // Nothing ran, nothing was delivered and nothing is left that could produce a
             // wake: stop with the same honest diagnostic the single-pass path reports rather
             // than spinning out the deadline.
@@ -562,6 +570,31 @@ impl Runtime {
                 return Err(beam_engine::blocked());
             }
         }
+    }
+
+    /// Runs every deferred `-on_load` hook recorded in
+    /// [`Runtime::pending_on_loads`](crate::runtime::Runtime::pending_on_loads) on a **pumpable**
+    /// context, recording each failure in
+    /// [`Runtime::on_load_failed`](crate::runtime::Runtime::on_load_failed) so a re-executing
+    /// `code:ensure_loaded/1` observes `on_load_failure` instead of deferring forever.
+    ///
+    /// The context is [`RuntimeContext::new`], whose `may_pump_scheduler` is `true` — exactly the
+    /// `-eval` route — so the hook body's `receive` is driven by `pump_scheduler_boot` against the
+    /// real (re-published) process tables. [`RuntimeContext::run_label_blocking`] already wraps the
+    /// nested machine in a relocation-exemption window and `BLOCKING_PUMP_DEADLINE` bounds the run,
+    /// so there is no unbounded spin and no GC-moves-under-a-nested-machine hazard.
+    fn drain_pending_on_loads(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_on_loads);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut ctx = crate::context::RuntimeContext::new(self);
+        for name in pending {
+            if let Err(_) = ctx.run_module_on_load(&name) {
+                ctx.runtime.on_load_failed.insert(name);
+            }
+        }
+        Ok(())
     }
 
     /// The error a process spawned with [`Runtime::spawn_process`] raised, once it has

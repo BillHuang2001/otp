@@ -351,6 +351,20 @@ pub struct Runtime {
     /// recorded here; [`Runtime::scheduler_pass`] absorbs it into the real run queue at the
     /// same points it absorbs the table's own wake list.
     fragment_wakes: Vec<ProcessId>,
+    /// The module names whose `-on_load` hook was deferred at a scheduler-slice BIF door and
+    /// awaits the scheduler boundary's drain (see [`Runtime::drain_pending_on_loads`]).
+    ///
+    /// A `-on_load` body that must `receive` cannot run inline inside a scheduler slice (the
+    /// slice's nested machine cannot pump the scheduler), so [`RuntimeContext::run_module_on_load`]
+    /// records the name here, suspends the caller, and lets the slice boundary run it on a
+    /// pumpable context.
+    pub(crate) pending_on_loads: Vec<String>,
+    /// The modules whose deferred `-on_load` hook failed during a drain, so a re-executing
+    /// `code:ensure_loaded/1` observes `on_load_failure` instead of deferring forever.
+    ///
+    /// The entry is consumed ([`RuntimeContext::run_module_on_load`] removes it) the first time
+    /// the re-executing BIF door sees it, mirroring the single-shot nature of the failure fold.
+    pub(crate) on_load_failed: FastHashSet<String>,
     /// The **process-tracing** state (contract A.8, item 1): one trace entry (flags + tracer)
     /// per traced pid, plus the monotonic delivery counter behind `erlang:trace_delivered/1`.
     ///
@@ -1746,6 +1760,8 @@ impl Runtime {
             processes,
             mailboxes: FastHashMap::default(),
             fragment_wakes: Vec::new(),
+            pending_on_loads: Vec::new(),
+            on_load_failed: FastHashSet::default(),
             trace: TraceState::new(),
             preloaded: PreloadedModules::standard(),
             bif_heaps: vec![Heap::new(heap_words)?],

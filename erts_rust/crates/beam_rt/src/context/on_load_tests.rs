@@ -56,6 +56,22 @@ const ONLOAD_FAIL: &str =
 const PLAIN_MODULE: &str =
     "-module(plainmod).\n-export([hello/0]).\nhello() -> ok.\n";
 
+/// `-on_load(load/0)` whose `load/0` **blocks** on a scheduler-produced reply: the hook body
+/// parks in a `receive`, so the inline nested-machine path (the regression) folds the load into
+/// `blocked()` while the scheduler-boundary drain satisfies it.
+const ONLOAD_BLOCK: &str =
+    "-module(onload_block).\n-export([load/0, hello/0]).\n-on_load(load/0).\n\
+     load() -> Self = self(), spawn(fun() -> Self ! onload_reply end), \
+     receive onload_reply -> ok after 10000 -> error(onload_timeout) end.\n\
+     hello() -> ok.\n";
+
+/// A driver whose `main/0` loads the blocking hook through the scheduler and reports
+/// `{code:ensure_loaded/1, erlang:function_exported/3}`.
+const ONLOAD_DRIVER: &str =
+    "-module(onload_driver).\n-export([main/0]).\n\
+     main() -> {code:ensure_loaded(onload_block), \
+                erlang:function_exported(onload_block, hello, 0)}.\n";
+
 /// The loud skip banner for a missing toolchain — never a silent pass.
 fn skip(banner: &str, why: &str) {
     eprintln!();
@@ -320,4 +336,41 @@ fn crypto_on_load_end_to_end_strong_rand_bytes() {
         .expect("crypto:strong_rand_bytes(16)");
     let size = call(&mut runtime, "erlang", "byte_size", &[bytes]).expect("erlang:byte_size/1");
     assert_eq!(signed_value(size), 16, "strong_rand_bytes(16) is 16 bytes");
+}
+
+/// A module whose `-on_load` body blocks on a scheduler-produced reply loads through the
+/// **scheduled** `run_scheduled` route: the hook is deferred to the scheduler boundary's drain
+/// (a pumpable context, exactly the `-eval` route) instead of folding into `blocked()` inside the
+/// slice, so `code:ensure_loaded/1` answers `{module, _}` and `erlang:function_exported/3`
+/// answers `true`.
+#[test]
+fn a_blocking_on_load_hook_loads_through_the_scheduled_route() {
+    let Some(erlc) = erlc_or_skip() else {
+        return;
+    };
+    let mut runtime = runtime();
+    let block = compile_fixture(&erlc, "onload_block", "onload_block", ONLOAD_BLOCK);
+    let driver = compile_fixture(&erlc, "onload_driver", "onload_driver", ONLOAD_DRIVER);
+    runtime.code_server.add_path(block.path().to_path_buf());
+    runtime.code_server.add_path(driver.path().to_path_buf());
+
+    let driver_beam = driver.path().join("onload_driver.beam");
+    let answer = runtime
+        .run_scheduled(driver_beam, "main", 0, &[])
+        .expect("main/0 through the scheduler");
+
+    assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2, "{answer:?}");
+    let ensure = terms::tuple_element(answer, 0).expect("element 0");
+    assert_module_pair(&runtime, ensure, "onload_block");
+    let exported = terms::tuple_element(answer, 1).expect("element 1");
+    assert_eq!(runtime.atom_name_of(exported), Some("true"), "{exported:?}");
+
+    // The deferred hook also leaves `onload_block` loaded after the scheduled run, so both the
+    // export predicate and the introspection BIFs agree through the pumpable route too.
+    let module = atom(&mut runtime, "onload_block");
+    let hello = atom(&mut runtime, "hello");
+    let exported = call(&mut runtime, "erlang", "function_exported", &[module, hello, make_small(0)])
+        .expect("erlang:function_exported(onload_block, hello, 0)");
+    assert_eq!(runtime.atom_name_of(exported), Some("true"));
+    assert_loaded(&mut runtime, "onload_block");
 }

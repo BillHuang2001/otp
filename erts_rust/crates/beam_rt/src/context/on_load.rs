@@ -93,6 +93,24 @@ impl RuntimeContext<'_> {
         if handle.on_load.is_none() {
             return Ok(());
         }
+        // A `-on_load` body that must `receive` cannot run inline inside a scheduler slice: the
+        // slice's nested machine cannot pump the scheduler (`pump_once` answers `Ok(None)` under
+        // `may_pump_scheduler() == false`), so the hook's `receive` suspends and the load folds
+        // into `blocked()`. Instead, defer the hook to the scheduler boundary's drain
+        // ([`Runtime::drain_pending_on_loads`], called from `pump_run_to_completion`), which runs
+        // it on a pumpable context exactly like the `-eval` route. A previously failed drain
+        // consumed here makes the re-executing `code:ensure_loaded/1` answer `on_load_failure`
+        // rather than deferring forever.
+        if self.runtime.on_load_failed.remove(name) {
+            return Err(error::message("on_load_failure"));
+        }
+        if !self.may_pump_scheduler() {
+            if !self.runtime.pending_on_loads.iter().any(|n| n == name) {
+                self.runtime.pending_on_loads.push(name.to_string());
+            }
+            self.request_suspend();
+            return Ok(());
+        }
         match self.run_on_load_function(name) {
             Ok(term) if is_atom(term) && self.runtime.atoms().name(atom_val(term)) == Some("ok") => {
                 self.runtime.code_server.mark_on_load_done(name);
