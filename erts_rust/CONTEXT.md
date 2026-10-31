@@ -276,6 +276,14 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `INET_REQ_*`/`TCP_REQ_*`/`UDP_REQ_*`/`PACKET_REQ_*` opcodes; `ram_file_drv`'s reply matrix (77/77
   encodings) and `udp_inet`'s option/control surface agree with the oracle.
 
+## Known Issues
+- khepri `projections` eunit segfaults under `beam_rt` (reproducible in debug+release and JIT+interpreter tiers): SIGSEGV in `beam_term::list::car` ← `beam_engine::families::lists::get_list` on the `beam_rt-driver` thread at the `simple_projection_follows_updates_and_deletes` delete/update step — a stale/unrooted list-cell BIF argument (GC-rooting); owning crate `beam_engine` (or the `beam_rt` copy-out path).
+- `binary_module_SUITE:error_info` diverges: oracle `{ok,ok}` vs rust `'exit <structured reason>'` (`error_info_abort_probe:main({prefix,70})`) — a structured-raise-reason degradation (D1c residual).
+- `binary:referenced_byte_size/1` diverges for a `binary:part/3` sub-binary of a refc parent: rust `{510,510}` vs oracle `{510,1025}`; the whole refc parent agrees (`{1025,1025}`) (D2 residual).
+- khepri `keep_while_fanout_probe` is correct (`deleted_count=2502` both sides) with a ~88× fun-apply residual (`delete_us_per_dependent` 797 vs 9 us).
+- `crypto` NIFs load on the `-eval` route and are visible to spawned processes (RC-H), so A.3 NIF-visibility is closed; the residual above is the projections segfault, not NIF visibility.
+- The differential gate passes with no `mismatch`, but its corpus does not pin `binary:referenced_byte_size/1` (bitbin) or khepri `projections`, so the above real-world divergences are not gate-caught.
+
 ## Future workstreams
 - **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
   (`../lib/compiler`), per Part II §E/§H. Language-agnostic (Erlang/Elixir/LFE). Not part of the Rust
