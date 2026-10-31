@@ -32,13 +32,17 @@ use beam_loader::{Atom, Export, Function, HeapNeed, Import, ImportRef, Instr, La
 use beam_term::{cmp, make_small, AtomTable};
 
 use crate::context::{MinimalContext, RootSet};
+use crate::families::exceptions::stacktrace::symbolic_stacktrace;
 use crate::families::exceptions::tests::oracle::render_error_info_extension;
 use crate::jit::Tier;
 use crate::machine::CatchFrame;
+use crate::step::Step;
 use crate::terms::alloc_tests::MovingContext;
-use crate::terms::make_tuple_rooted;
+use crate::terms::{
+    cons_head, cons_tail, list_elements, make_cons_rooted, make_list_rooted, make_map_rooted,
+    make_tuple_rooted, tuple_element,
+};
 use crate::terms::test_support as terms;
-use crate::terms::{list_elements, tuple_element};
 
 /// The names a fixture interns: every BIF module/function a test asserts on, the
 /// extension's own names, and the two atoms a landing raise needs (`badarg`,
@@ -401,6 +405,318 @@ fn a_boxed_argument_in_the_head_item_is_self_contained() {
         "the relocated argument's second field"
     );
 }
+
+#[test]
+fn a_proper_list_argument_in_the_head_item_is_self_contained() {
+    // Same regression family as `a_boxed_argument_in_the_head_item_is_self_contained`,
+    // but the argument is a *proper list*: its cons spine must be deep-copied into the
+    // item's reservation and re-pointed cell by cell, so the `ArgList` element reads
+    // `[1, 2, 3]` after every collection instead of naming the original argument's
+    // spine (whose `CDR` links the collector rebases independently).
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MovingContext::new();
+
+    let arg = make_list_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 3, 0, |_, _| {
+        Ok(vec![make_small(1), make_small(2), make_small(3)])
+    })
+    .expect("the moving arena serves the first rooted allocation");
+    machine.set_x(0, arg).expect("x(0) is a live register");
+
+    let item = bif_head_item(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "erlang",
+        "hd",
+        &[Operand::X(0)],
+        &BeamError::BadArg,
+    )
+    .expect("the arena serves the item reservation")
+    .expect("a live catch frame and a nameable BIF synthesize the item");
+    machine.set_x(1, item).expect("x(1) is a live register");
+
+    let _ = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 1, 0, |_, _| {
+        Ok(vec![make_small(99)])
+    })
+    .expect("the moving arena serves the second rooted allocation");
+
+    assert!(ctx.moved_any, "the collector must have relocated something");
+    assert!(ctx.collections >= 3, "the second collection must really have run");
+
+    let item = machine.x(1).expect("the item is rooted");
+    let original = machine.x(0).expect("the original argument is rooted");
+    let arg_list = tuple_element(item, 2).expect("the item's ArgList");
+    let args = list_elements(arg_list).expect("a proper argument list");
+    assert_eq!(args.len(), 1, "hd/1 names exactly one argument");
+
+    assert_ne!(
+        args[0], original,
+        "the ArgList must name a self-contained copy, not the original argument spine"
+    );
+    assert_eq!(
+        list_elements(args[0]).expect("the copied argument is a proper list"),
+        vec![make_small(1), make_small(2), make_small(3)],
+        "the relocated argument's elements"
+    );
+}
+
+#[test]
+fn an_improper_list_argument_in_the_head_item_is_self_contained() {
+    // An improper list (`[1 | 2]`) exercises the list arm's non-list `CDR` branch:
+    // the head is deep-copied as an immediate, the tail is shared verbatim, and the
+    // one cons cell still moves with the item.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MovingContext::new();
+
+    let arg = make_cons_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 0, |_, _| {
+        Ok((make_small(1), make_small(2)))
+    })
+    .expect("the moving arena serves the first rooted allocation");
+    machine.set_x(0, arg).expect("x(0) is a live register");
+
+    let item = bif_head_item(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "erlang",
+        "hd",
+        &[Operand::X(0)],
+        &BeamError::BadArg,
+    )
+    .expect("the arena serves the item reservation")
+    .expect("a live catch frame and a nameable BIF synthesize the item");
+    machine.set_x(1, item).expect("x(1) is a live register");
+
+    let _ = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 1, 0, |_, _| {
+        Ok(vec![make_small(99)])
+    })
+    .expect("the moving arena serves the second rooted allocation");
+
+    assert!(ctx.moved_any, "the collector must have relocated something");
+    assert!(ctx.collections >= 3, "the second collection must really have run");
+
+    let item = machine.x(1).expect("the item is rooted");
+    let original = machine.x(0).expect("the original argument is rooted");
+    let arg_list = tuple_element(item, 2).expect("the item's ArgList");
+    let args = list_elements(arg_list).expect("a proper argument list");
+    assert_eq!(args.len(), 1, "hd/1 names exactly one argument");
+
+    assert_ne!(
+        args[0], original,
+        "the ArgList must name a self-contained copy, not the original argument spine"
+    );
+    assert_eq!(
+        cons_head(args[0]).expect("the copied argument's CAR"),
+        make_small(1),
+        "the relocated argument's head"
+    );
+    assert_eq!(
+        cons_tail(args[0]).expect("the copied argument's CDR"),
+        make_small(2),
+        "the relocated argument's improper tail"
+    );
+}
+
+#[test]
+fn a_list_nested_in_a_tuple_and_map_argument_is_self_contained() {
+    // A list reached *through* a boxed parent — here `{[1, 2], #{error => [3, 4]}}` —
+    // must be re-pointed from the parent's copied child slot, not just at the top
+    // level. The boxed copy arm walks every child slot and deep-copies each child, so
+    // both the tuple element and the map value must read as lists after collection.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MovingContext::new();
+
+    let list_a = make_list_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 2, 0, |_, _| {
+        Ok(vec![make_small(1), make_small(2)])
+    })
+    .expect("list A");
+    machine.set_x(10, list_a).expect("x(10) roots list A");
+
+    let list_b = make_list_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 2, 0, |_, _| {
+        Ok(vec![make_small(3), make_small(4)])
+    })
+    .expect("list B");
+    machine.set_x(11, list_b).expect("x(11) roots list B");
+
+    let map = make_map_rooted(
+        &mut machine,
+        &module,
+        &mut ctx,
+        RootSet::ALL_LIVE,
+        1,
+        0,
+        |machine, _slack, _atoms| {
+            Ok(vec![(
+                atom_of(&module, "error"),
+                machine.x(11).expect("list B is rooted"),
+            )])
+        },
+    )
+    .expect("the map");
+    machine.set_x(12, map).expect("x(12) roots the map");
+
+    let arg = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 2, 0, |machine, _| {
+        Ok(vec![
+            machine.x(10).expect("list A is rooted"),
+            machine.x(12).expect("the map is rooted"),
+        ])
+    })
+    .expect("the tuple argument");
+    machine.set_x(0, arg).expect("x(0) is a live register");
+
+    let item = bif_head_item(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "erlang",
+        "hd",
+        &[Operand::X(0)],
+        &BeamError::BadArg,
+    )
+    .expect("the arena serves the item reservation")
+    .expect("a live catch frame and a nameable BIF synthesize the item");
+    machine.set_x(1, item).expect("x(1) is a live register");
+
+    let _ = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 1, 0, |_, _| {
+        Ok(vec![make_small(99)])
+    })
+    .expect("the moving arena serves the second rooted allocation");
+
+    assert!(ctx.moved_any, "the collector must have relocated something");
+    assert!(ctx.collections >= 4, "several collections must really have run");
+
+    let item = machine.x(1).expect("the item is rooted");
+    let original = machine.x(0).expect("the original argument is rooted");
+    let arg_list = tuple_element(item, 2).expect("the item's ArgList");
+    let args = list_elements(arg_list).expect("a proper argument list");
+    assert_eq!(args.len(), 1, "hd/1 names exactly one argument");
+
+    assert_ne!(
+        args[0], original,
+        "the ArgList must name a self-contained copy, not the original argument block"
+    );
+
+    let copied_list = tuple_element(args[0], 0).expect("the tuple's list element");
+    assert_eq!(
+        list_elements(copied_list).expect("the copied tuple element is a proper list"),
+        vec![make_small(1), make_small(2)],
+        "the relocated nested list's elements"
+    );
+
+    let copied_map = tuple_element(args[0], 1).expect("the tuple's map element");
+    let value = beam_term::map::map_get(
+        copied_map,
+        atom_of(&module, "error"),
+        &module.atom_table,
+    )
+    .expect("map_get resolves the copied map")
+    .expect("the key is present");
+    assert_eq!(
+        list_elements(value).expect("the map value is a proper list"),
+        vec![make_small(3), make_small(4)],
+        "the relocated map value's elements"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the landed head item survives the cooked trace's reservation (regression)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_landed_bif_head_item_survives_the_cooked_trace_reservation() {
+    // Regression: part (a) made `carve`'s `ArgList` self-contained, but the finished
+    // head item is still landed raw as the raise's `x(2)` trace word and later
+    // re-embedded by `symbolic_stacktrace` with only that register as a root. Drive
+    // the full caught raise path — `carve` → `raise_bif_error_with_head` (the landing)
+    // → `symbolic_stacktrace` (the cooked-trace reservation + re-embedding) — under
+    // `MovingContext`, which collects on **every** rooted allocation, and then force
+    // one more collection with the cooked trace parked in `x(0)`. The head item (and
+    // its relocated `ArgList`) must still read back intact.
+    let module = fixture();
+    let mut machine = machine_with_a_catch_frame();
+    let mut ctx = MovingContext::new();
+
+    // A boxed argument `{1, 2}` in x(0), rooted across every collection below.
+    let arg = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 2, 0, |_, _| {
+        Ok(vec![make_small(1), make_small(2)])
+    })
+    .expect("the moving arena serves the argument reservation");
+    machine.set_x(0, arg).expect("x(0) is a live register");
+
+    // Building the item reserves once (collecting the argument block) and deep-copies
+    // the re-read argument into that reservation.
+    let head = bif_head_item(
+        &mut machine,
+        &mut ctx,
+        &module,
+        "erlang",
+        "hd",
+        &[Operand::X(0)],
+        &BeamError::BadArg,
+    )
+    .expect("the arena serves the item reservation")
+    .expect("a live catch frame and a nameable BIF synthesize the item");
+
+    // Land the raise through the real funnel: this consumes the one-shot head latch
+    // and publishes the head item as the handler's raw trace in x(2).
+    let step = machine
+        .raise_bif_error_with_head(&module, BeamError::BadArg, Some(head), &mut ctx)
+        .expect("the raise lands in the live catch frame");
+    assert!(
+        matches!(step, Step::Goto { .. }),
+        "the landing transfers to the handler"
+    );
+
+    // The handler cooks the trace: `symbolic_stacktrace` reserves once (collecting the
+    // x(2) root and relocating the head item's whole graph) and conses the re-read
+    // head word in front of the (empty) snapshot list.
+    let cooked = symbolic_stacktrace(&mut machine, &module, &mut ctx, &Operand::X(2), true)
+        .expect("the cooked trace reservation succeeds");
+
+    // Park the cooked trace in a root slot and force a third collection, so the
+    // `[Item]` list and everything it names must be relocated one more time.
+    machine.set_x(0, cooked).expect("x(0) is a live register");
+    let _ = make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 1, 0, |_, _| {
+        Ok(vec![make_small(99)])
+    })
+    .expect("the moving arena serves the follow-up reservation");
+
+    assert!(ctx.moved_any, "the collector must have relocated something");
+    assert!(ctx.collections >= 3, "the follow-up collection must really have run");
+
+    let cooked = machine.x(0).expect("the cooked trace is rooted in x(0)");
+    let items = list_elements(cooked).expect("the cooked trace is a proper list");
+    assert_eq!(items.len(), 1, "the head item plus an empty snapshot list");
+
+    let item = items[0];
+    assert_eq!(
+        tuple_element(item, 0).expect("the item's module"),
+        atom_of(&module, "erlang"),
+        "the relocated item names the failing BIF's module"
+    );
+    assert_eq!(
+        tuple_element(item, 1).expect("the item's function"),
+        atom_of(&module, "hd"),
+        "the relocated item names the failing BIF"
+    );
+    let arg_list = tuple_element(item, 2).expect("the item's ArgList");
+    let args = list_elements(arg_list).expect("a proper argument list");
+    assert_eq!(args.len(), 1, "hd/1 names exactly one argument");
+    assert_eq!(
+        tuple_element(args[0], 0).expect("field 0"),
+        make_small(1),
+        "the relocated argument's first field"
+    );
+    assert_eq!(
+        tuple_element(args[0], 1).expect("field 1"),
+        make_small(2),
+        "the relocated argument's second field"
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // the shape rule: only a DECLARED BIF gets the `error_info` extension
