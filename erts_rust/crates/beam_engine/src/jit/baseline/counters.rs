@@ -152,6 +152,15 @@ pub(crate) struct Counters {
     pub(crate) ext_call_declined: u64,
     /// `jit_ext_call` invocations that fell back to the full interpreter step.
     pub(crate) ext_call_fallback: u64,
+    /// `jit_call_fun` invocations (the native arm the emitter emitted for
+    /// `call_fun`/`call_fun2`).
+    pub(crate) call_fun_entered: u64,
+    /// `jit_call_fun` invocations that hit the impossible `Ok(None)` defensive
+    /// fallback and re-ran the instruction through `jit_step_one`.
+    pub(crate) call_fun_fallback: u64,
+    /// `call_fun2` arms the emitter declined to the generic family helper because
+    /// the fun operand was not a plain (or typed) x register.
+    pub(crate) call_fun_declined: u64,
     /// `enter_compiled_cached` lookups (one per driver iteration that asked for native code).
     pub(crate) block_entry_lookups: u64,
     /// Of those, how many found a compiled entry (an IR block start or a sub-block).
@@ -406,6 +415,23 @@ pub(crate) fn record_ext_declined() {
 /// A `jit_ext_call` that fell back to the full interpreter step.
 pub(crate) fn record_ext_fallback() {
     with(|c| c.ext_call_fallback += 1);
+}
+
+/// A `jit_call_fun` invocation (the native arm the emitter emitted for
+/// `call_fun`/`call_fun2`).
+pub(crate) fn record_call_fun_entered() {
+    with(|c| c.call_fun_entered += 1);
+}
+
+/// A `jit_call_fun` invocation that hit the defensive `Ok(None)` fallback.
+pub(crate) fn record_call_fun_fallback() {
+    with(|c| c.call_fun_fallback += 1);
+}
+
+/// A `call_fun2` arm the emitter declined to the generic family helper (a fun
+/// operand that is not a plain — or typed — x register).
+pub(crate) fn record_call_fun_declined() {
+    with(|c| c.call_fun_declined += 1);
 }
 
 /// A **cross-function** in-block transfer that had to resolve its target function

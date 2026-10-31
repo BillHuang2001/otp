@@ -662,6 +662,13 @@ pub(crate) type AllocateHeapHelper =
 /// instruction's own `(func, pc)`, the `ImportRef` index, the [`EXT_CALL`]-family
 /// kind and — for `call_ext_last` — the frame size to pop).
 pub(crate) type ExtCallHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32, u32) -> i64;
+
+/// The `jit_call_fun` helper's native signature (the block ABI plus the
+/// instruction's own `(func, pc)`, the x-register holding the fun, and the call
+/// arity).
+pub(crate) type CallFunHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32) -> i64;
+
 /// The [`jit_publish_y`] helper's native signature (the block ABI plus the block's own
 /// `(func, pc)`); it returns nothing — a position store and a window re-derivation
 /// cannot fail.

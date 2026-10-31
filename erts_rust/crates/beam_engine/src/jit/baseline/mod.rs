@@ -206,6 +206,7 @@ use crate::Step;
 mod bif_helper;
 mod bitstr;
 mod call;
+mod call_fun;
 mod code;
 mod cons;
 mod emit;
@@ -266,6 +267,7 @@ pub use runtime::{
 };pub(crate) use runtime::{
     jit_ext_call, jit_local_call, jit_step_one, JitRuntime,
 };
+pub(crate) use call_fun::jit_call_fun;
 
 use runtime::NativeBlock;
 

@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use beam_common::Result;
-use beam_loader::{ImportRef, Instr, Module};
+use beam_loader::{ImportRef, Instr, Module, Operand};
 
 use crate::families::bitstrings;
 use crate::interpreter::LabelMap;
@@ -69,10 +69,10 @@ use super::select::try_inline_select_val;
 use super::super::call::{jit_call_store, jit_call_store_linked, CALL_STORED};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
-    encode_local_call, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
-    EXT_CALL_ONLY, LOCAL_CALL_LAST, LOCAL_CALL_ONLY, LOCAL_DECLINE,
+    encode_local_call, CallFunHelper, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL,
+    EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_CALL_LAST, LOCAL_CALL_ONLY, LOCAL_DECLINE,
 };
-use super::super::{jit_ext_call, jit_local_call};
+use super::super::{jit_call_fun, jit_ext_call, jit_local_call};
 use super::test::try_inline_test;
 use super::{
     emit_continue_check, emit_helper_call, emit_step_and_continue, Allocation, MOVE_SCRATCH,
@@ -827,6 +827,35 @@ pub(crate) fn emit_block(
                     *deallocate,
                 )?;
             }
+            // The fun-application pair (`call_fun`/`call_fun2`): the fun family's
+            // own body, run in ONE emitted `jit_call_fun` helper instead of the
+            // generic `jit_family` deopt + `families::dispatch` variant re-match.
+            //
+            // The emitter resolves the fun's register slot and the call arity at
+            // compile time and bakes them as immediates: `call_fun`'s fun is always
+            // `x(arity)`, and `call_fun2`'s is its `Func` operand when that operand
+            // is a plain `x` register (or a `z,5` typed register the interpreter
+            // reads identically — `read_operand`'s `Typed` arm is a pure register
+            // load, so the two are byte-identical). Every other `call_fun2` operand
+            // form declines and keeps the generic family arm, which IS the
+            // interpreter's per-instruction step.
+            Instr::CallFun { arity } => {
+                emit_call_fun(buffer, allocation, done, func, pc, *arity, *arity)?;
+            }
+            Instr::CallFun2 {
+                arity,
+                func: fun_operand,
+                ..
+            } => match call_fun_register_operand(fun_operand) {
+                Some(fun_register) => {
+                    emit_call_fun(buffer, allocation, done, func, pc, fun_register, *arity)?;
+                }
+                None => {
+                    #[cfg(test)]
+                    super::super::counters::record_call_fun_declined();
+                    family::emit_family(buffer, allocation, done, func, pc)?;
+                }
+            },
             // The word-level `test` subset (see the section below): a native
             // predicate plus a branch to the resolved fail label. Any other shape —
             // a `NO_FAIL` test, an unresolved fail label, a boxed-term type test, an
@@ -1395,7 +1424,7 @@ pub(crate) fn emit_block(
             | Instr::UpdateRecord(_) | Instr::IsAnyNativeRecord { .. } | Instr::IsNativeRecord { .. }
             | Instr::GetRecordElements { .. } | Instr::GetRecordElementsId { .. } | Instr::PutRecord(_)
             | Instr::IsRecordAccessible { .. } | Instr::GetRecordField(_) | Instr::UpdateRecordId(_)
-            | Instr::MakeFun3 { .. } | Instr::CallFun { .. } | Instr::CallFun2 { .. }
+            | Instr::MakeFun3 { .. }
             | Instr::Apply { .. } | Instr::ApplyLast { .. }
             | Instr::Try { .. } | Instr::Catch { .. } | Instr::Badmatch { .. } | Instr::CaseEnd { .. }
             | Instr::TryCaseEnd { .. } | Instr::Badrecord { .. } | Instr::IfEnd | Instr::Raise { .. }
@@ -1563,6 +1592,64 @@ fn emit_ext_call(
         ],
     pc)?;
     emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// Emit the native arm for one fun application (`call_fun`/`call_fun2`): the
+/// [`jit_call_fun`] helper followed by the same continuation check a deopt uses.
+///
+/// The helper has [`CallFunHelper`]'s exact signature — the instruction's own
+/// `(func, pc)`, the x-register holding the fun and the call arity — so it reuses
+/// [`emit_helper_call`] + [`emit_continue_check`] (the spill-then-call contract and
+/// the refill after the call included), exactly as `emit_ext_call` does.
+///
+/// The outcomes the emitted code distinguishes are the block ABI's:
+///
+/// * `encode_target(func, pc + 1)` — the host's `apply_fun` fallback returned a
+///   value (`Step::Next`), so the block continues in-block;
+/// * anything else — the `ENTER` word of a closure the host runs in this machine, a
+///   `Suspend`, and every raise (`ERROR`) — leaves the block with the word in `rax`,
+///   which the driver decodes exactly as it decodes a deopt's.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_fun(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    fun_register: u32,
+    arity: u32,
+) -> Result<()> {
+    let helper: CallFunHelper = jit_call_fun;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[
+            i64::from(func),
+            i64::from(pc),
+            i64::from(fun_register),
+            i64::from(arity),
+        ],
+    pc)?;
+    emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// The x register a `call_fun2`'s `Func` operand names, when it is a plain `x`
+/// register or a `z,5` typed register the interpreter reads identically.
+///
+/// Every other operand form (`y`, an immediate, a literal, …) is left to the
+/// generic family arm, whose `jit_family` helper reaches the exact interpreter
+/// read of that operand — so a decline is a change of emitter, never a change of
+/// semantics.
+fn call_fun_register_operand(operand: &Operand) -> Option<u32> {
+    match operand {
+        Operand::X(n) => Some(*n),
+        Operand::Typed {
+            reg: beam_loader::Reg::X(n),
+            ..
+        } => Some(*n),
+        _ => None,
+    }
 }
 
 /// Emit the native arm for one `send`/receive-control instruction: the `jit_receive`

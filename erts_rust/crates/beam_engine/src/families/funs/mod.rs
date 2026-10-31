@@ -557,6 +557,36 @@ fn call_fun(
         CallFunOutcome::Raised(step) => Ok(Some(step)),
     }
 }
+
+/// [`call_fun`] for the **register source** the `call_fun`/`call_fun2` instructions
+/// name, exposed for the baseline tier's dedicated
+/// [`jit_call_fun`](crate::jit::baseline::jit_call_fun) helper.
+///
+/// This is the *same* body the interpreter's fun-family arm reaches (the wrapper
+/// builds the [`FunSource::Register`] source and delegates verbatim), so a native
+/// lowering that calls it is interpreter-identical by construction: classification,
+/// the [`ExecutionContext::resolve_local_fun`] seam, the free-variable copy, the
+/// continuation store and the raise funnel all stay the one definition in
+/// [`call_fun`].
+pub(crate) fn call_fun_register(
+    machine: &mut Machine,
+    module: &Module,
+    arity: u32,
+    fun_register: u32,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    call_fun(
+        machine,
+        module,
+        FunSource::Register(fun_register),
+        arity,
+        func,
+        pc,
+        ctx,
+    )
+}
 /// `erlang:apply(Fun, Args)`'s closure application, sharing [`call_fun_target`]'s
 /// classification and both seams.
 ///
