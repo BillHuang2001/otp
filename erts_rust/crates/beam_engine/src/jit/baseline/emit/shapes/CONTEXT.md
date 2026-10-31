@@ -40,14 +40,15 @@ Logical groups:
 | Cross-module call | `CallExt`,`CallExtOnly`,`CallExtLast` | `block.rs::emit_ext_call` (an `emit_helper_call` to `jit_ext_call`) | n/a — the helper resolves the import and reports `ENTER` |
 | Receive/send control | `Send`,`LoopRec`,`LoopRecEnd`,`Wait`,`WaitTimeout`,`Timeout`,`RemoveMessage` | `block.rs::emit_receive` (an `emit_helper_call` to `jit_receive`) | n/a — the helper runs the family body and reports the block-ABI word |
 | Cons construction | `PutList` | `cons.rs::emit_put_list` (an `emit_positioned_helper_call` to `jit_put_list`) — the refusal-only `put_list_shape` decides at compile time and emits **zero bytes** when it declines, so the family arm below still owns the instruction | n/a — the helper runs the family body's own rooted `make_cons_rooted` reserve → read → write and reports the block-ABI word; `dst`/`head`/`tail` carry the same `guard_load`/`guard_store` refusals a `Y` operand always does |
-| Family-owned surface | `PutTuple2`, the native-record set, `MakeFun3`,`CallFun`,`CallFun2`,`Apply`,`ApplyLast`, the try/catch/raise set, the float set, the map set, `RecvMarker*` | `family.rs::emit_family` (an `emit_helper_call` to `jit_family`) | n/a — the helper runs the owning family's own body and reports the block-ABI word |
+| Family-owned surface | `PutTuple2`, the native-record set, `MakeFun3`,`Apply`,`ApplyLast`, the try/catch/raise set, the float set, the map set, `RecvMarker*` | `family.rs::emit_family` (an `emit_helper_call` to `jit_family`) | n/a — the helper runs the owning family's own body and reports the block-ABI word |
+| Fun application | `CallFun`,`CallFun2` | `block.rs::emit_call_fun` (an `emit_helper_call` to `jit_call_fun`) | n/a — the helper runs the fun family's own `call_fun` body (classification + `resolve_local_fun` + continuation + `ENTER`) and reports the block-ABI word; a `CallFun2` whose fun operand is not a plain x-register declines to the generic family arm |
 | Bitstring family | exactly the variants `families::bitstrings::claimed` names (20: `BsStartMatch3/4`, `BsGetPosition`, `BsSetPosition`, `BsGetTail`, `BsTestTail2`, `BsGetInteger2`, `BsGetBinary2`, `BsSkipBits2`, `BsMatch`, `BsMatchString`, `BsGetFloat2`, `BsGetUtf8/16/32`, `BsSkipUtf8/16/32`, `BsInitWritable`, `BsCreateBin`) | `family.rs::emit_bitstr` (the **guard** arm `_ if bitstrings::claimed(instr)`) | n/a — the same `emit_step_helper` sequence as `emit_family`, plus the inline position store (`emit_positioned_helper_call`) because `jit_bitstr` stores no position itself |
 | Everything else | -- | `_` arm -> `emit_deopt` | -- (`FuncInfo` is deliberately here, never a no-op) |
 
 `emit_block`'s family arm names every variant `crate::families::dispatch` claims and the core arms
 above do not: `put_tuple2`, `update_record`/`is_any_native_record`/`is_native_record`/
 `get_record_elements`/`get_record_elements_id`/`put_record`/`is_record_accessible`/`get_record_field`/
-`update_record_id`, `make_fun3`/`call_fun`/`call_fun2`/`apply`/`apply_last`,
+`update_record_id`, `make_fun3`/`apply`/`apply_last`,
 `try`/`catch`/`badmatch`/`case_end`/`try_case_end`/`badrecord`/`if_end`/`raise`/`try_case`/`try_end`/
 `catch_end`/`build_stacktrace`/`raw_raise`, `fmove`/`fconv`/`fadd`/`fsub`/`fmul`/`fdiv`/`fnegate`,
 `get_map_elements`/`has_map_fields`/`put_map_assoc`/`put_map_exact`, the `bs_*` bitstring family and

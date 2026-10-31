@@ -28,8 +28,9 @@ The driver, block ABI and the helpers (`jit_step_one`, `jit_ext_call`, `jit_loca
 `jit_call_store`, `jit_call_store_linked`, `jit_tail_call`, `jit_deallocate`, `jit_return`,
 `jit_deallocate_return`,
 `jit_allocate`, `jit_allocate_heap`, `jit_test_heap`, `jit_trim`, `jit_receive`, `jit_family`,
+`jit_call_fun`,
 `jit_publish_y`, `jit_refresh_y`, and the inline position store `emit_position_store`) live one level up in `../mod.rs`,
-`../runtime.rs`, `../call.rs`, `../receive.rs` and `../family.rs`; this node only *emits calls* to
+`../runtime.rs`, `../call.rs`, `../receive.rs`, `../call_fun.rs` and `../family.rs`; this node only *emits calls* to
 them.
 
 ## Core model (do not break)
@@ -406,7 +407,7 @@ Each of these either re-derives the Y window before the block continues, or is f
 driver-side (re)publication before any emitted code can use a store:
 
 - Re-derive the window in place (they never hand out a store pointer): `jit_allocate`, `jit_allocate_heap`, `jit_test_heap`, `jit_trim`, `jit_deallocate`, `jit_deallocate_return`, `jit_tail_call`, `jit_return`, `jit_call_store`/`jit_call_store_linked`/`call_store_impl` (`call.rs`), `jit_publish_y`, `jit_refresh_y`, `refresh_y_base`, `publish_y_window`.
-- Run interpreted instructions (which may push/pop/trim/`with_parked_loose_terms`) and return a block-ABI word the driver folds: `jit_step_one`, `jit_step_ext`, `jit_ext_call`, `jit_local_call`/`probe_local_call`, `jit_bif_value`, `jit_family`, `jit_receive`, `jit_bitstr`.
+- Run interpreted instructions (which may push/pop/trim/`with_parked_loose_terms`) and return a block-ABI word the driver folds: `jit_step_one`, `jit_step_ext`, `jit_ext_call`, `jit_local_call`/`probe_local_call`, `jit_bif_value`, `jit_family`, `jit_call_fun`, `jit_receive`, `jit_bitstr`.
 - Never touch the stores: `enter_in_block`/`commit_in_block_entry`/`cross_function_enter`, which only switch the entry tables.
 - Driver-side: `drive` (`mod.rs`) publishes the runtime before the loop and `JitRuntime::refresh_literals` runs at every module rebind; `code.enter_cached` and the deopt arm run inside an iteration. A `traced` run never builds a `JitRuntime`.
 
