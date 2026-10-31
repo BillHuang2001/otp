@@ -126,12 +126,33 @@ impl RuntimeContext<'_> {
         fun: Eterm,
         args: &[Eterm],
     ) -> Result<Option<LocalFunTarget>> {
+        let Some((module, label, arity)) = self.local_fun_entry(fun, args)? else {
+            return Ok(None);
+        };
+        self.closure_target(fun, module, label, arity, args)
+    }
+
+    /// Resolves `fun` to the in-machine entry of a `.beam` **local** closure — the defining
+    /// module, the lambda's entry label and the arity to enter the body with — **without**
+    /// materializing the combined argument vector.
+    ///
+    /// This is the resolution/validation half of [`Self::local_fun_target`] (the fun-kind
+    /// test, the `-eval`-closure decline, the descriptor search, the arity guard and the
+    /// served-local-key decline all live here once); the engine's in-machine `call_fun` seam
+    /// ([`ExecutionContext::resolve_local_fun`]) needs only the entry, because it places the
+    /// free variables and call arguments itself. [`Self::local_fun_target`] adds the one
+    /// allocation this path skips ([`Self::closure_target`]).
+    pub(crate) fn local_fun_entry(
+        &self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label, u32)>> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
         }
         // The fun's **encoding** decides which identity words are readable. Only a
         // `make_fun3` closure is this arm's business: an imported (`NEW_FUN_EXT`) closure is
-        // resolved by [`RuntimeContext::imported_fun_target`] (it additionally names its
+        // resolved by [`RuntimeContext::imported_fun_entry`] (it additionally names its
         // defining module), and an external fun by
         // [`RuntimeContext::external_fun_target`]. Reading `terms::fun_uniq` on either of
         // those would be a typed `BadArg` — the kind test must come first.
@@ -149,7 +170,7 @@ impl RuntimeContext<'_> {
         let (found, descriptor) = self
             .local_fun_descriptor(uniq, index)
             .ok_or(BeamError::BadArg)?;
-        self.closure_target(fun, found, descriptor, args)
+        self.closure_entry(fun, &found, &descriptor, args)
     }
 
     /// Resolves a **`NEW_FUN_EXT`-decoded** ([`beam_codec::FunKind::Imported`]) closure to
@@ -178,7 +199,7 @@ impl RuntimeContext<'_> {
     ///   which is the very pair a `make_fun3` closure's own `uniq`/`index` words carry
     ///   (`beam_asm.erl`'s `finalize_fun_table/2` stamps the 27-bit MD5 prefix into every
     ///   `FunT` entry's `old_uniq`, `emu_load.c:645-651` keys the entry on it);
-    /// * `arity` — the closure arity, checked by [`Self::closure_target`] against the
+    /// * `arity` — the closure arity, checked by [`Self::closure_entry`] against the
     ///   descriptor exactly as for a local closure.
     ///
     /// A module the code server has not cached is loaded on demand (the same
@@ -207,6 +228,29 @@ impl RuntimeContext<'_> {
         fun: Eterm,
         args: &[Eterm],
     ) -> Result<Option<LocalFunTarget>> {
+        let Some((module, label, arity)) = self.imported_fun_entry(fun, args)? else {
+            return Ok(None);
+        };
+        self.closure_target(fun, module, label, arity, args)
+    }
+
+    /// Resolves a **`NEW_FUN_EXT`-decoded** ([`beam_codec::FunKind::Imported`]) closure to the
+    /// in-machine entry of the lambda it names — the defining module, the lambda's entry label
+    /// and the arity to enter the body with — **without** materializing the combined argument
+    /// vector.
+    ///
+    /// This is the resolution/validation half of [`Self::imported_fun_target`] (the fun-kind
+    /// test, the wire-field read, the on-demand module load, the checksum guard, the
+    /// descriptor search, the arity guard and the served-local-key decline all live here once);
+    /// the engine's in-machine `call_fun` seam ([`ExecutionContext::resolve_local_fun`]) needs
+    /// only the entry, because it places the free variables and call arguments itself.
+    /// [`Self::imported_fun_target`] adds the one allocation this path skips
+    /// ([`Self::closure_target`]).
+    pub(crate) fn imported_fun_entry(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label, u32)>> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
         }
@@ -250,23 +294,30 @@ impl RuntimeContext<'_> {
         }
         let descriptor =
             descriptor_of(&callee, uniq, index).ok_or_else(crate::error::bad_fun)?;
-        self.closure_target(fun, callee, descriptor, args)
+        self.closure_entry(fun, &callee, &descriptor, args)
     }
 
-    /// Builds the launch target of a closure whose `FunT` `descriptor` (in `found`) the caller
-    /// has already resolved — the half a local (`make_fun3`) and an imported
-    /// (`NEW_FUN_EXT`) closure share.
+    /// The validation half of a closure entry shared by the local (`make_fun3`) and imported
+    /// (`NEW_FUN_EXT`) encodings — the arity guard and the served-local-stub decline —
+    /// returning the entry `(module, label, arity)` **without** materializing the combined
+    /// argument vector.
     ///
-    /// The arity guard, the served-local-stub decline and the arg layout are identical for
-    /// both encodings, so they live here once (module docs of
-    /// [`RuntimeContext::local_fun_target`] carry the details).
-    fn closure_target(
+    /// The engine's in-machine `call_fun` seam ([`ExecutionContext::resolve_local_fun`]) places
+    /// the free variables and call arguments itself, so its resolution needs only this entry;
+    /// [`Self::closure_target`] builds the combined `args ++ free` vector on top for the
+    /// value-returning [`Self::apply_fun`] and fun-bodied-process paths, which enter the body
+    /// through [`LocalFunTarget`].
+    ///
+    /// The arity guard runs before the served-key decline, so a wrong argument count is
+    /// [`BeamError::BadArity`] whatever the descriptor names; tested **before** the argument
+    /// vector is built, so a declined reference allocates nothing.
+    fn closure_entry(
         &self,
         fun: Eterm,
-        found: Arc<Module>,
-        descriptor: FunDescriptor,
+        found: &Arc<Module>,
+        descriptor: &FunDescriptor,
         args: &[Eterm],
-    ) -> Result<Option<LocalFunTarget>> {
+    ) -> Result<Option<(Arc<Module>, Label, u32)>> {
         let free = terms::fun_free(fun)?;
         if args.len() + free.len() != descriptor.arity as usize {
             return Err(BeamError::BadArity);
@@ -276,25 +327,41 @@ impl RuntimeContext<'_> {
         // `erlang:nif_error(undef)` (see the doc comment above). The arity guard runs first, so a
         // mismatched call answers `BadArity` whether or not the key is served; tested **before**
         // the argument vector is built, so a declined reference allocates nothing.
-        if served_local_key(&found, &descriptor).is_some() {
+        if served_local_key(found, descriptor).is_some() {
             return Ok(None);
         }
-        // Calling convention for a closure body (see `erts/emulator/beam/beam_common.c::call_fun`):
-        // the call arguments occupy `x(0..arity)`, the captured free variables follow at
-        // `x(arity..arity+free)`. The compiler emits exactly this layout — for
-        // `fun({K,V}) -> {N,K,V} end` the body is `-f-fun-0-/2` and reads its *argument* from
-        // `{x,0}` and its free variable `N` from `{x,1}`.
-        //
-        // One allocation of exactly the entry arity: `args.to_vec()` followed by an
-        // `extend_from_slice` reallocated on **every** applied fun, which a `lists:foldl/3` pays
-        // once per element.
-        let mut combined = Vec::with_capacity(descriptor.arity as usize);
+        Ok(Some((Arc::clone(found), descriptor.label, descriptor.arity)))
+    }
+
+    /// Builds the launch target of a closure whose entry the caller has already resolved
+    /// ([`Self::closure_entry`] — `module`, `label`, `arity`).
+    ///
+    /// Calling convention for a closure body (see `erts/emulator/beam/beam_common.c::call_fun`):
+    /// the call arguments occupy `x(0..arity)`, the captured free variables follow at
+    /// `x(arity..arity+free)`. The compiler emits exactly this layout — for
+    /// `fun({K,V}) -> {N,K,V} end` the body is `-f-fun-0-/2` and reads its *argument* from
+    /// `{x,0}` and its free variable `N` from `{x,1}`.
+    ///
+    /// One allocation of exactly the entry arity: `args.to_vec()` followed by an
+    /// `extend_from_slice` reallocated on **every** applied fun, which a `lists:foldl/3` pays
+    /// once per element. This is the **only** path that builds the vector — the in-machine
+    /// `resolve_local_fun` seam resolves through [`Self::closure_entry`] and skips it.
+    fn closure_target(
+        &self,
+        fun: Eterm,
+        module: Arc<Module>,
+        label: Label,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Option<LocalFunTarget>> {
+        let free = terms::fun_free(fun)?;
+        let mut combined = Vec::with_capacity(arity as usize);
         combined.extend_from_slice(args);
         combined.extend_from_slice(free);
         Ok(Some(LocalFunTarget {
-            module: found,
-            label: descriptor.label,
-            arity: descriptor.arity,
+            module,
+            label,
+            arity,
             args: combined,
         }))
     }
@@ -410,7 +477,7 @@ impl RuntimeContext<'_> {
     /// is an `erlang:nif_error(undef)` stub.
     ///
     /// [`RuntimeContext::imported_fun_target`] declines such a fun
-    /// ([`RuntimeContext::closure_target`]'s served-key test), so it reaches the host here,
+    /// ([`RuntimeContext::closure_entry`]'s served-key test), so it reaches the host here,
     /// through the same [`RuntimeContext::call_bif`] its locally built twin uses
     /// ([`RuntimeContext::apply_non_local_fun`]).
     ///
@@ -440,7 +507,7 @@ impl RuntimeContext<'_> {
             .ok_or(BeamError::BadArg)?;
         let descriptor = descriptor_of(&module, uniq, index).ok_or_else(crate::error::bad_fun)?;
         // The **served** half only: any other decoded closure is unresolvable here (it was not
-        // declined by `closure_target`'s arity guard, so this cannot mask a `BadArity`).
+        // declined by `closure_entry`'s arity guard, so this cannot mask a `BadArity`).
         let Some((module_name, function)) = served_local_key(&module, &descriptor) else {
             return Err(BeamError::BadArg);
         };

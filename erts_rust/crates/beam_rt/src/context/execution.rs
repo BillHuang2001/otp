@@ -619,10 +619,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// ([`RuntimeContext::for_process`], `may_pump_scheduler() == false`) cannot resume, since a
     /// slice may never re-enter the scheduler.
     ///
-    /// The resolution is the shared [`RuntimeContext::local_fun_target`] seam, so a closure
-    /// resolves through exactly the lookup a fun-bodied process entry uses. The `module` it
-    /// hands back is the **same** `Arc<Module>` the code server caches, which the engine
-    /// requires because it dedups module contexts by `Arc::ptr_eq`.
+    /// The resolution is the shared [`RuntimeContext::local_fun_entry`] /
+    /// [`RuntimeContext::imported_fun_entry`] seam, so a closure resolves through exactly the
+    /// lookup a fun-bodied process entry uses. The `module` it hands back is the **same**
+    /// `Arc<Module>` the code server caches, which the engine requires because it dedups module
+    /// contexts by `Arc::ptr_eq`.
     ///
     /// # An **external** fun has an in-machine entry too
     ///
@@ -652,22 +653,22 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// byte-identical to a host without the seam.
     ///
     /// The engine places the free variables itself (`x(arity..)`, C's `call_fun` order), so
-    /// `local_fun_target` is consulted purely for resolution/validation — its combined
-    /// `args ++ free` argument list is **not** used here.
+    /// `local_fun_entry` / `imported_fun_entry` are consulted purely for resolution/validation —
+    /// their combined `args ++ free` argument list is **not** built here.
     fn resolve_local_fun(
         &mut self,
         fun: Eterm,
         args: &[Eterm],
     ) -> Result<Option<(Arc<Module>, Label)>> {
-        if let Some(target) = self.local_fun_target(fun, args)? {
-            return Ok(Some((target.module, target.label)));
+        if let Some((module, label, _arity)) = self.local_fun_entry(fun, args)? {
+            return Ok(Some((module, label)));
         }
         // A `NEW_FUN_EXT`-decoded closure is the wire image of the same lambda (its
         // `old_uniq`/`index` are the `FunT` entry's identity), so it gets the same in-machine
         // entry — the C's `call_fun` cannot tell the two encodings apart either
         // (`beam_common.c:1604-1621` dispatches whatever `funp->entry` names).
-        if let Some(target) = self.imported_fun_target(fun, args)? {
-            return Ok(Some((target.module, target.label)));
+        if let Some((module, label, _arity)) = self.imported_fun_entry(fun, args)? {
+            return Ok(Some((module, label)));
         }
         self.external_fun_target(fun, args)
     }
