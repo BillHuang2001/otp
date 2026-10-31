@@ -289,15 +289,21 @@ fn the_copy_out_grows_the_nursery_with_headroom_not_by_the_bare_shortfall() {
     }
     drop(ctx);
     let (attempts, grows, empties) = notes::snapshot();
+    let sharing = notes::sharing_reuse();
     assert_eq!(
         empties, attempts,
-        "every attempt — refused or not — is handed a fully empty destination table"
+        "every full-copy attempt — refused or not — is handed a fully empty destination table"
+    );
+    assert!(
+        sharing > attempts,
+        "the sharing-aware copier handles the bulk: {sharing} sharing reuses against {attempts} \
+         full-copy attempts over {copies} copies"
     );
     assert_eq!(
-        attempts,
+        sharing + attempts,
         copies + grows,
-        "exactly one refused attempt per growth: {attempts} attempts over {copies} copies with \
-         {grows} growths"
+        "every copy is a sharing reuse or a full-copy attempt, and every growth adds one re-attempt: \
+         {sharing} reuses + {attempts} attempts = {copies} copies + {grows} growths"
     );
     assert!(
         grows * 8 < copies,
@@ -1007,9 +1013,14 @@ fn a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound() {
             "the copyable result is a real container on the process heap"
         );
         assert_eq!(
+            notes::sharing_reuse(),
+            1,
+            "the sharing-aware copier re-homed the copyable container (no full-copy attempt, no walk)"
+        );
+        assert_eq!(
             notes::snapshot(),
-            (1, 0, 1),
-            "the copy-out ran once on the empty-destination fast path"
+            (0, 0, 0),
+            "the sharing copy paid no full-copy attempt"
         );
         pool_used(ctx.runtime)
     };
@@ -1198,6 +1209,25 @@ fn the_reference_walk_visits_a_bench_shaped_payload_without_hashing_or_spilling(
     let rebuilt = ctx
         .call_bif("erlang", "binary_to_term", 1, &[image])
         .expect("binary_to_term/1 of the image");
+    // The sharing-aware copier now re-homes this container: the reference walk never runs during
+    // the copy-out (it is the fallback a declining graph pays).
+    assert_eq!(
+        notes::sharing_reuse(),
+        1,
+        "the sharing-aware copier re-homed the container result"
+    );
+    assert_eq!(
+        notes::walk_snapshot().calls,
+        0,
+        "no reference walk runs during the sharing copy-out"
+    );
+    // The walk's own properties are still pinned directly (it is the fallback path): one walk,
+    // one visit per object, hash-free, spill-free.
+    notes::reset();
+    assert!(
+        !RuntimeContext::graph_holds_reference(rebuilt),
+        "the bench payload holds no reference"
+    );
     let counts = notes::walk_snapshot();
     assert_eq!(
         counts,
@@ -1207,10 +1237,10 @@ fn the_reference_walk_visits_a_bench_shaped_payload_without_hashing_or_spilling(
             hash_inserts: 0,
             spills: 0
         },
-        "one container result: one walk, one visit per object, hash-free, spill-free"
+        "one container: one walk, one visit per object, hash-free, spill-free"
     );
-    // The walk saw the real payload: re-encoding the rebuilt graph reproduces the image byte for
-    // byte, i.e. every object the walk visited is the payload's own object.
+    // The copier saw the real payload: re-encoding the rebuilt graph reproduces the image byte for
+    // byte, i.e. every object the sharing copier moved is the payload's own object.
     let re_encoded = ctx
         .call_bif("erlang", "term_to_binary", 1, &[rebuilt])
         .expect("term_to_binary/1 of the rebuilt payload");
@@ -1874,9 +1904,14 @@ fn a_binary_rooted_result_is_re_homed_with_no_walk() {
         "a binary root answers the root test, so the reference walk never runs"
     );
     assert_eq!(
+        notes::sharing_reuse(),
+        1,
+        "the sharing-aware copier re-homed the binary root (no full-copy attempt, no walk)"
+    );
+    assert_eq!(
         notes::snapshot(),
-        (1, 0, 1),
-        "the copy-out still ran once on the empty-destination fast path"
+        (0, 0, 0),
+        "the sharing copy paid no full-copy attempt"
     );
     assert_eq!(
         beam_engine::terms::binary_bytes(image).expect("a binary result"),
@@ -1921,5 +1956,105 @@ fn the_walk_worklist_keeps_lifo_order_across_the_inline_to_spill_boundary() {
     assert!(
         work.pop().is_none(),
         "an exhausted worklist answers `None` rather than reading a stale slot"
+    );
+}
+
+/// **The sharing-aware copy-out reuses a scanned child verbatim while copying the pool-local root.**
+///
+/// A path-copying map BIF allocates only the new spine on the pooled BIF heap and shares the
+/// untouched subtrees (which live on the caller's scanned heap). This pins that rule directly: the
+/// pool-local `{Scanned}` tuple is copied onto the process heap, its `Scanned` child is reused
+/// word-for-word (identity preserved — the very word the caller's map already held), and the result
+/// never references the pool, so the caller's rewind stays sound.
+#[test]
+#[allow(unsafe_code)]
+fn the_sharing_copy_copies_pool_local_nodes_and_reuses_scanned_children_verbatim() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    // A caller-built tuple on the process's own scanned young heap.
+    let scanned = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        process
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("a scanned tuple")
+    };
+    // A pool-local 1-tuple `{Scanned}` built on a separate, clean pool heap (mark == 0).
+    let mut pool = beam_alloc::Heap::new(16).expect("a local pool heap");
+    let pool_term = pool.tuple(&[scanned]).expect("a pool-local tuple");
+    let copied = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        copy_shared::sharing_copy(process, pool_term, &pool, 0, false)
+    };
+    let copied = copied.expect("the pool-local tuple copies, its scanned child is reused");
+    assert_ne!(
+        copied, pool_term,
+        "the root is a fresh process-heap copy, not the pool word"
+    );
+    assert!(
+        beam_term::boxed::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+        "the re-rooted term is a boxed container"
+    );
+    // SAFETY: `copied` is the freshly copied 1-tuple; element 0 is live and in bounds.
+    let element = unsafe { beam_term::tuple::tuple_element(copied, 0) };
+    assert_eq!(
+        element, scanned,
+        "the scanned child is reused verbatim (identity preserved, nothing dangling)"
+    );
+}
+
+/// **A pool-local reference declines the sharing copy** — a reference's identity is its address, so
+/// copying it would produce a different timer/monitor. The caller then falls back to the full walk,
+/// finds the reference, and leaves the result on the pool un-rewound (leak, never a dangle).
+#[test]
+#[allow(unsafe_code)]
+fn a_pool_local_reference_declines_the_sharing_copy() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let mut pool = beam_alloc::Heap::new(16).expect("a local pool heap");
+    // SAFETY: four fresh words for the frozen 4-word M1 internal-reference block.
+    let reference = unsafe {
+        let hp = pool.alloc_words(4).expect("four words");
+        beam_term::boxed::write_internal_ref(hp, 7).expect("a reference")
+    };
+    let pool_term = pool.tuple(&[reference]).expect("a pool-local tuple holding a reference");
+    let outcome = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        copy_shared::sharing_copy(process, pool_term, &pool, 0, false)
+    };
+    assert!(
+        outcome.is_none(),
+        "a reference's identity is its address: the sharing copy must decline rather than copy it"
+    );
+}
+
+/// **A scanned root is handed through verbatim** — no copy, no allocation — which is what keeps a
+/// no-op container BIF (`maps:put/3` with the bound value) returning its argument word, and what
+/// `erts_debug:same/2` observes.
+#[test]
+fn a_scanned_root_is_reused_verbatim_without_a_copy() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let scanned = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        process
+            .heap_mut()
+            .tuple(&[make_small(3)])
+            .expect("a scanned tuple")
+    };
+    let used_before = table.get(pid).expect("the spawned process").heap().used();
+    let pool = beam_alloc::Heap::new(8).expect("an empty pool");
+    let outcome = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        copy_shared::sharing_copy(process, scanned, &pool, 0, false)
+    };
+    assert_eq!(outcome, Some(scanned), "a scanned root is handed through verbatim");
+    let used_after = table.get(pid).expect("the spawned process").heap().used();
+    assert_eq!(
+        used_before, used_after,
+        "reusing a scanned root allocates nothing"
     );
 }

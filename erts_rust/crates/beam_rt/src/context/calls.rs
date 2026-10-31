@@ -88,6 +88,10 @@ pub(super) mod dest;
 /// single-call demand that depth has ever made — so one BIF building a large term is reserved for
 /// instead of raising a spurious `error:system_limit`.
 pub(super) mod frontier;
+/// The **sharing-aware copy-out** (see [`copy_shared`]): a Θ(pool delta) fast path for
+/// path-copying container BIFs that shallow-copies only the pool window `[mark, used)` and reuses
+/// the untouched, already-scanned subtrees verbatim, instead of the full walk + re-copy.
+pub(super) mod copy_shared;
 
 use super::memory_hook::RuntimeMemory;
 use super::module_info::ModuleInfoBridge;
@@ -1408,43 +1412,72 @@ impl<'a> RuntimeContext<'a> {
                             result = Err(BeamError::SystemLimit);
                         }
                     }
-                } else if move_container && Self::graph_holds_reference(term) {
-                    perf_counters::bump(|c| &mut c.ref_held);
-                    // A reference's identity **is** its address (see the comment above): the copy
-                    // would be a different term, so the result stays where it is and the pool is
-                    // not rewound.
-                    //
-                    // # Why the walk is gated on `move_container` — it is unobservable otherwise
-                    //
-                    // The walk's answer has exactly two consumers: this arm, which only sets
-                    // `rewind = false`, and the `move_container` arm below, which copies the result
-                    // **and then** sets `rewind = safe_to_rewind`. When `move_container == false` —
-                    // that is, `mailbox_table.is_none() && !safe_to_rewind` — the copy arm cannot run
-                    // either (it is gated on the same `move_container`), and `rewind` is already
-                    // `false`: `move_container == false` implies `!safe_to_rewind`, and `rewind` is
-                    // only ever assigned `safe_to_rewind`. So both possible answers of the walk
-                    // produce the **same** `result` and the same `rewind` — the walk is unobservable
-                    // in that state, and skipping it changes nothing but its own diagnostic counters.
-                    // (`result` is never modified by the walk, so no term moves either way.)
-                    //
-                    // Where this bites hardest is the table-less route's **reentrant** call — a
-                    // fun-applying BIF (`lists:foldl/3`, `lists:map/2`, `maps:map/2`, …) on
-                    // `RuntimeContext::new` (`-eval`/`-s`/`-run`, the single-pass `run_*` entries and
-                    // the in-process `compile:file/2` route of contract A.9): `!reentrant` is one
-                    // conjunct of `safe_to_rewind`, so such a call has `move_container == false` and
-                    // never walks its result. That is exactly the **accumulator** shape — a container
-                    // the applied fun returned, i.e. a whole intermediate compiler AST — so the
-                    // per-call walk of the entire accumulator disappears where it was quadratic
-                    // (measured on `lib/stdlib/src/string.erl`: `lists:foldl/3` + `lists:map/2` + a
-                    // share of `lists:foldr/3` were 236.5 M + 76.1 M of 408.5 M walk visits).
-                    rewind = false;
                 } else if move_container {
-                    // The copy first and, only once it succeeded, the rewind: a refused copy leaves
-                    // both the result and the pool exactly as they were.
-                    if let Some(copied) = self.rehome_container_result(term, Some(heap), machine_handles) {
-                        perf_counters::bump(|c| &mut c.rehomed);
-                        result = Ok(copied);
-                        rewind = safe_to_rewind;
+                    if self.mailbox_table.is_some() {
+                        // PROCESS route: the sharing-aware fast path first. It shallow-copies only
+                        // the pool window `[mark, used)` and reuses every scanned child verbatim
+                        // (see [`copy_shared`]), so a path-copying map BIF pays Θ(pool delta)
+                        // instead of the full walk + re-copy. On decline it falls through to
+                        // today's exact behavior below.
+                        let pid = self.mailbox_pid;
+                        let traced = super::gc_valve_trace::enabled();
+                        let shared = match self
+                            .mailbox_table
+                            .as_deref_mut()
+                            .and_then(|t| t.get_mut(pid))
+                        {
+                            Some(process) => copy_shared::sharing_copy(process, term, heap, mark, traced),
+                            None => None,
+                        };
+                        if let Some(copied) = shared {
+                            #[cfg(test)]
+                            notes::note_sharing_reuse();
+                            perf_counters::bump(|c| &mut c.rehomed);
+                            result = Ok(copied);
+                            rewind = safe_to_rewind;
+                        } else if Self::graph_holds_reference(term) {
+                            perf_counters::bump(|c| &mut c.ref_held);
+                            // A reference's identity **is** its address (see the comment above): the
+                            // copy would be a different term, so the result stays where it is and the
+                            // pool is not rewound.
+                            rewind = false;
+                        } else if let Some(copied) =
+                            self.rehome_container_result(term, Some(heap), machine_handles)
+                        {
+                            perf_counters::bump(|c| &mut c.rehomed);
+                            result = Ok(copied);
+                            rewind = safe_to_rewind;
+                        }
+                    } else {
+                        // Table-less route: today's exact behavior — the reference walk, then the
+                        // full copy.
+                        //
+                        // # Why the walk is gated on `move_container` — it is unobservable otherwise
+                        //
+                        // The walk's answer has exactly two consumers: this arm, which only sets
+                        // `rewind = false`, and the copy arm below, which copies the result **and
+                        // then** sets `rewind = safe_to_rewind`. When `move_container == false` —
+                        // that is, `mailbox_table.is_none() && !safe_to_rewind` — neither arm runs
+                        // and `rewind` is already `false`, so the walk is unobservable and skipped.
+                        // Where this bites hardest is the table-less route's **reentrant** call — a
+                        // fun-applying BIF (`lists:foldl/3`, `lists:map/2`, `maps:map/2`, …) on
+                        // `RuntimeContext::new` (`-eval`/`-s`/`-run`, the single-pass `run_*` entries
+                        // and the in-process `compile:file/2` route of contract A.9): `!reentrant` is
+                        // one conjunct of `safe_to_rewind`, so such a call never walks its result —
+                        // exactly the accumulator shape (a whole intermediate compiler AST) whose
+                        // per-call walk used to be quadratic (measured on `lib/stdlib/src/string.erl`:
+                        // `lists:foldl/3` + `lists:map/2` + a share of `lists:foldr/3` were 236.5 M +
+                        // 76.1 M of 408.5 M walk visits).
+                        if Self::graph_holds_reference(term) {
+                            perf_counters::bump(|c| &mut c.ref_held);
+                            rewind = false;
+                        } else if let Some(copied) =
+                            self.rehome_container_result(term, Some(heap), machine_handles)
+                        {
+                            perf_counters::bump(|c| &mut c.rehomed);
+                            result = Ok(copied);
+                            rewind = safe_to_rewind;
+                        }
                     }
                 }
             }
@@ -2944,6 +2977,7 @@ mod notes {
         static ALIAS_REFUSALS: Cell<usize> = const { Cell::new(0) };
         static ALIAS_COPY_POOL: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
         static DEST_CONTAINED: Cell<usize> = const { Cell::new(0) };
+        static SHARING_REUSE: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The reference walk's counters, in one value so a test can assert them as a unit.
@@ -3100,6 +3134,18 @@ mod notes {
         DEST_CONTAINED.with(Cell::get)
     }
 
+    /// Records one **successful sharing copy** ([`super::copy_shared::sharing_copy`]) — a container
+    /// result the sharing-aware copier re-homed by shallow-copying only its pool window, without the
+    /// reference walk or the full copier.
+    pub(super) fn note_sharing_reuse() {
+        SHARING_REUSE.with(|c| c.set(c.get() + 1));
+    }
+
+    /// This thread's count of successful sharing copies ([`note_sharing_reuse`]).
+    pub(super) fn sharing_reuse() -> usize {
+        SHARING_REUSE.with(Cell::get)
+    }
+
     /// This thread's count of calls whose `ets` **table-alias witness** fired
     /// ([`note_alias_mark`]).
     ///
@@ -3125,6 +3171,7 @@ mod notes {
         ALIAS_REFUSALS.with(|c| c.set(0));
         ALIAS_COPY_POOL.with(|c| c.set((0, 0)));
         DEST_CONTAINED.with(|c| c.set(0));
+        SHARING_REUSE.with(|c| c.set(0));
     }
 
     /// This thread's `(copy_attempts, grow_retries, empty_destination_attempts)`.
