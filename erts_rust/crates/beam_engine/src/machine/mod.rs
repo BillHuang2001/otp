@@ -629,55 +629,38 @@ pub struct Machine {
     /// [`Machine::retain_refc_binaries`] drops every entry whose base no longer names a
     /// live retained payload.
     pub(crate) writable_payloads: Vec<(usize, usize)>,
-    /// A **reusable argument scratch buffer** for the rare wide BIF call.
+    /// A **reusable argument scratch buffer** for the rare wide **operand** marshal.
     ///
-    /// The interpreter marshals the arguments of a `gc_bif`/`bif`/`bif0`/
-    /// `call_ext*` through a fixed stack array for every arity up to its
-    /// `STACK_ARGS` arity bound — the common case, which therefore allocates
-    /// nothing. A **wider** call (`arity > STACK_ARGS`) reuses this buffer instead of
-    /// minting a fresh `Vec` per call: the capacity is retained across calls, so the
-    /// steady state allocates nothing either. The tracing hook reuses it the same way
-    /// (`Interpreter::trace_call`).
+    /// Only [`Machine::exec_bif`]'s wide operand path (`gc_bif`/`bif`/`bif0` with more
+    /// than [`STACK_ARGS`](crate::interpreter::bif::STACK_ARGS) operands) and the
+    /// tracing hook fill this buffer. The `call_ext*`/served-local-call register path
+    /// ([`Machine::call_bif_named`]) no longer marshals through it — it hands the host
+    /// the live `x(0..arity)` register slice by reference, so its argument words stay
+    /// rooted for the whole dispatch.
     ///
-    /// # It is not a root, and the window that makes that sound
+    /// # It is not a root — and that is sound because its words are never re-read
+    ///   after a collection
     ///
     /// The dispatcher [`std::mem::take`]s the buffer out of the machine for the whole
     /// wide dispatch and gives it back **empty** (only the capacity survives), so for
-    /// the duration the argument words are in no root set: neither
-    /// [`Machine::with_roots`]'s hand-off nor [`Machine::for_each_root`]'s walk can
-    /// see them. Nothing here can move those words — which is why no re-derivation
-    /// from the registers, and no parking at the stack tail, is needed. The window is
-    /// **structurally** collection-free:
-    ///
-    /// * the dispatch itself is [`Machine::dispatch_bif_call`], which takes `&self`,
-    ///   so a host is handed the machine **immutably** (`call_bif_in_machine*`) and
-    ///   can neither reach a rooted door nor start a nested run on it;
-    /// * both rooted doors — [`ExecutionContext::alloc_words_rooted`] and
-    ///   [`ExecutionContext::ensure_heap_full`] — take `&mut self` (the *context*) and
-    ///   a [`RootSet`](crate::context::RootSet) whose slices come **from this machine**,
-    ///   so the borrow checker forbids crossing either one while the machine is
-    ///   borrowed immutably;
-    /// * the only allocation the marshalling itself performs is a non-small integer
-    ///   operand, through the **unrooted** [`ExecutionContext::alloc_words`], which
-    ///   takes no roots and (per its contract) must never collect.
-    ///
-    /// **What a future change must preserve.** (1) `dispatch_bif_call` stays `&self`
-    /// and no in-window route reaches a `&mut Machine` (a host callback taking
-    /// `&mut Machine` would break it); (2) no rooted door is called from the
-    /// marshalling (`exec_bif`/`call_bif_named`/`dispatch_wide`) or from a host seam
-    /// reached inside the window; (3) `alloc_words` stays non-collecting. Break any of
-    /// the three and the argument words must be rooted — the durable fix is to keep
-    /// the filled buffer **in** the machine and enumerate it (or park it at the stack
-    /// tail), not to widen this comment. Pinned by `tests/bif_args_window.rs`.
+    /// the duration the marshalled **operand** words are in no root set: neither
+    /// [`Machine::with_roots`]'s hand-off nor [`Machine::for_each_root`]'s walk can see
+    /// them. That is sound because those copied words are **never read again once the
+    /// BIF returns**: the BIF-error funnel re-reads its operands from their rooted
+    /// sources (`read_operand` against the register file / the literal area), and
+    /// arithmetic/guard BIFs do not collect during dispatch. [`Machine::dispatch_bif_call`]
+    /// is `&self`, so the **engine** itself cannot cross a rooted door while the buffer
+    /// is out; a nested collection the host drives must re-read the rooted registers,
+    /// never these copied operand words.
     ///
     /// # Left empty on every exit path
     ///
-    /// `dispatch_wide` clears the buffer and reinstalls it before returning; it has
-    /// **no `?`** between the `take` and the reinstall (the marshalling outcome is
-    /// only *stored*, and the BIF outcome is wrapped rather than propagated), so a
-    /// bad operand, a BIF failure, a guard failure and a suspension all leave the
-    /// field empty. [`Machine::reset`](crate::machine::Machine::reset) therefore has
-    /// nothing to clear, and the buffer never keeps a term alive.
+    /// [`Machine::dispatch_wide`] clears the buffer and reinstalls it before returning;
+    /// it has **no `?`** between the `take` and the reinstall (the marshalling outcome is
+    /// only *stored*, and the BIF outcome is wrapped rather than propagated), so a bad
+    /// operand, a BIF failure, a guard failure and a suspension all leave the field
+    /// empty. [`Machine::reset`](crate::machine::Machine::reset) therefore has nothing to
+    /// clear, and the buffer never keeps a term alive.
     pub(crate) args_scratch: Vec<Eterm>,
     /// The **per-run tracing gate** (contract A.8): the cached answer of
     /// [`ExecutionContext::trace_enabled`](crate::context::ExecutionContext::trace_enabled)
@@ -1304,14 +1287,13 @@ impl Machine {
     ///
     /// # What it does NOT cover
     ///
-    /// **`args_scratch`** — the `call_bif` argument window is `mem::take`n *out* of the
-    /// machine for the whole wide dispatch (`arity > STACK_ARGS`), so it is unreachable
-    /// from any door and is not enumerated here. That is sound because the same dispatch
-    /// holds the machine **immutably** ([`Machine::dispatch_bif_call`] is `&self`), so
-    /// neither of the two rooted doors (`alloc_words_rooted`, `ensure_heap_full`) — whose
-    /// receivers are `&mut self` and whose root slices come from this machine — can be
-    /// crossed while it is out; the invariant is stated on the field and pinned by
-    /// `tests/bif_args_window.rs`.
+    /// **`args_scratch`** — the wide **operand** marshal (the `exec_bif` wide arm and
+    /// the tracing hook) `mem::take`s it *out* of the machine for the whole dispatch, so
+    /// it is unreachable from any door and is not enumerated here. That is sound because
+    /// those marshalled **operand** words are never re-read after a collection (the
+    /// raise funnel re-reads its operands from their rooted sources); the `call_ext*`
+    /// register path ([`Machine::call_bif_named`]) marshals nothing — it hands the host
+    /// the live `x(0..arity)` slice, which IS enumerated here.
     /// `class_atoms` is not a gap: those are immediates. A foreign (`literal`-area) term
     /// and any host-side structure holding engine terms are likewise outside this walk.
     ///
@@ -1416,11 +1398,11 @@ impl Machine {
     /// # What it does NOT cover
     ///
     /// **`args_scratch`**, for the reason stated on [`Machine::for_each_root`]: the wide
-    /// `call_bif` argument window is `mem::take`n *out* of the machine for the whole dispatch,
-    /// and [`Machine::dispatch_bif_call`] holds the machine immutably, so no `&mut self` door
-    /// can be crossed while it is out — this door least of all. `class_atoms` (immediates), a
-    /// foreign (`literal`-area) term and any host-side structure holding engine terms are
-    /// likewise outside, identically to the census.
+    /// **operand** marshal `mem::take`s it *out* of the machine for the whole dispatch, and
+    /// its marshalled words are never re-read after a collection. The `call_ext*` register
+    /// path marshals nothing — the host is handed the live `x(0..arity)` slice, which IS a
+    /// root. `class_atoms` (immediates), a foreign (`literal`-area) term and any host-side
+    /// structure holding engine terms are likewise outside, identically to the census.
     ///
     /// # Errors
     ///

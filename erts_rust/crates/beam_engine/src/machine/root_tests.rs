@@ -37,7 +37,8 @@
 //!   same machine state, so the two doors can never disagree about *what* is rooted.
 //! * **Parity of the two doors** — the mutable door enumerates the same root words, and a
 //!   write through it lands in the very slots the census reports (and is observed by the
-//!   census afterwards), while both doors keep the same `args_scratch` exclusion.
+//!   census afterwards), while both doors keep the same `args_scratch` exclusion (the raw
+//!   operand-marshal `Vec`, never the live `call_ext*` register arguments).
 //!
 //! Plus the re-seat pin: a `with_roots` hand-off whose visitor **moves** the parked words
 //! leaves both supplied-trace latches holding the *moved* terms.
@@ -839,13 +840,16 @@ fn for_each_root_mut_writes_are_observed_by_for_each_root() {
 /// The `args_scratch` exclusion holds for the writable door, and an `Err`-returning visitor
 /// still leaves the machine's parking state exactly as it was.
 ///
-/// The argument window is `mem::take`n out of the machine for the whole wide `call_bif`
-/// dispatch, so no root door can see it — least of all a `&mut self` one. The exclusion is
-/// pinned by **width and by address range**, not by comparing term words: the handed slices
-/// must cover exactly the X prefix plus the stack (with the armed loose words parked in it),
-/// and none of their byte ranges may overlap the `args_scratch` buffer. A failure in the
-/// middle of the hand-off must still truncate the parked loose words off the stack and
-/// re-seat every loose field; only the visitor's own error travels on.
+/// `args_scratch` is now the **operand** marshal's scratch buffer (the `exec_bif` wide arm
+/// and the tracing hook), never a carrier of live `call_ext*` *argument* words: register
+/// arguments are handed to the host by reference from the live `x(0..arity)` slice
+/// ([`Machine::call_bif_named`]), so they are enumerated here — only the raw `Vec` field
+/// itself is outside every root door. The exclusion is pinned by **width and by address
+/// range**, not by comparing term words: the handed slices must cover exactly the X prefix
+/// plus the stack (with the armed loose words parked in it), and none of their byte ranges
+/// may overlap the `args_scratch` buffer. A failure in the middle of the hand-off must
+/// still truncate the parked loose words off the stack and re-seat every loose field; only
+/// the visitor's own error travels on.
 #[test]
 fn for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error() {
     let (mut machine, _) = roots_fixture();

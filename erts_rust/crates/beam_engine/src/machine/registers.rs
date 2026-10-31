@@ -120,6 +120,21 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         self.x.get(n as usize).copied()
     }
 
+    /// Read the X-register **slice** `x[0..n]` by shared reference — the live
+    /// register-file words, already inside [`Machine::used_x_extent`] once written.
+    ///
+    /// Unlike [`Machine::x`] (a single-slot copy), this hands back a borrow so the
+    /// BIF-dispatch funnel ([`Machine::call_bif_named`]) can pass the **live** argument
+    /// registers to a `&self` door without copying a single word: a collecting host that
+    /// relocates the file through [`Machine::with_roots`] relocates the very words the
+    /// BIF reads. Returns [`crate::error::bad_register`] if `n` exceeds the file length.
+    #[inline]
+    pub fn x_slice(&self, n: u32) -> Result<&[Eterm]> {
+        self.x
+            .get(..n as usize)
+            .ok_or_else(|| error::bad_register(n))
+    }
+
     /// The whole X-register file as a mutable slice — the **root-set hand-off**.
     ///
     /// The engine's live roots are `x[0..live)` plus the whole Erlang stack plus the

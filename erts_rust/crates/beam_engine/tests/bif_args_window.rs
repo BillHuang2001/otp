@@ -18,32 +18,38 @@
 //
 // %CopyrightEnd%
 
-//! **The BIF argument window is collection-free** — the invariant that makes the
-//! dispatcher's argument slice sound even though it is in no root set.
+//! **The BIF dispatch window is `&self`: the ENGINE crosses no rooted door during a
+//! register-marshalled dispatch, and the argument slice is the live register file.**
 //!
 //! # The window
 //!
-//! A BIF dispatch hands the host a `&[Eterm]` of arguments that is **not** part of the
-//! machine's frozen [`RootSet`](beam_engine::context::RootSet). The common arities use a
-//! fixed stack array (`EMPTY_ARGS`, [`STACK_ARGS`] = 2 words) and a wider one
-//! (`arity >= 3`) the machine's reusable `args_scratch`, which
-//! `Machine::dispatch_wide` `mem::take`s **out of the machine** for the whole dispatch
-//! and gives back empty. Either way the words are outside every root set while the host
-//! runs, so a collection in that window would strand them.
+//! A `call_ext*` BIF dispatch hands the host the **live** `x(0..arity)` register slice by
+//! reference ([`beam_engine::Machine::call_bif_named`] → [`beam_engine::Machine::x_slice`])
+//! — no copy, no `args_scratch` marshal. The slice is therefore already inside the
+//! machine's frozen [`RootSet`](beam_engine::context::RootSet), so a collection that
+//! relocates the register file relocates the very words the BIF reads.
 //!
-//! Nothing collects there, and the reason is structural rather than incidental:
+//! The operand path ([`beam_engine::Machine::exec_bif`], a `gc_bif`/`bif`/`bif0`) still
+//! marshals its **operands** through a fixed stack array (`EMPTY_ARGS`, [`STACK_ARGS`] = 2
+//! words) and a wider one through the machine's reusable `args_scratch`, which
+//! `Machine::dispatch_wide` `mem::take`s **out of the machine** for the whole dispatch
+//! and gives back empty. Those marshalled operand words are never re-read after a
+//! collection — the BIF-error funnel re-reads its operands from their rooted sources.
+//!
 //! `Machine::dispatch_bif_call` takes **`&self`**, so the host never gets the machine
-//! mutably — while both rooted doors (`alloc_words_rooted`, `ensure_heap_full`) take
-//! `&mut self` (the *context*) plus a root set whose slices come **from this machine**.
-//! The engine therefore makes **zero** rooted-allocation / heap-admission calls for the
-//! duration, which is exactly what this suite pins.
+//! mutably from the dispatch itself — the ENGINE therefore makes **zero**
+//! rooted-allocation / heap-admission calls for the duration, which is exactly what this
+//! suite pins. (A nested collection the host drives through its own rooted door is fine
+//! and expected — the register slice is rooted, so it is relocated in place.)
 //!
 //! # What a future change must not break
 //!
 //! * `dispatch_bif_call` stays `&self`, and no route inside the window regains a `&mut
-//!   Machine` (a host callback that took one would re-open the hole);
-//! * the marshalling helpers (`exec_bif`, `call_bif_named`, `dispatch_wide`) call no
-//!   rooted door;
+//!   Machine` from the dispatch itself;
+//! * `call_bif_named` keeps handing the host the **live** `x(0..arity)` slice (never a
+//!   copied buffer);
+//! * the operand marshalling helpers (`exec_bif`, `dispatch_wide`) never re-read a copied
+//!   operand word after a collection — the raise funnel re-reads from rooted sources;
 //! * `ExecutionContext::alloc_words` — the only heap door a BIF can legally reach, and
 //!   the one the marshalling uses for a non-small integer operand — stays
 //!   non-collecting.
@@ -175,6 +181,19 @@ impl ExecutionContext for WindowProbe {
     ) -> Result<BifOutcome> {
         assert_eq!((module, function), (BIF_MODULE, BIF_FUNCTION));
         self.in_dispatch = true;
+        // The register path is **zero-copy**: the slice the host is handed IS the live
+        // register file, not a marshalled buffer. A relocation done through
+        // `Machine::for_each_root_mut`/`with_roots` therefore rewrites the very words
+        // this BIF reads — a copied buffer (the pre-fix behaviour) would be stranded.
+        assert_eq!(
+            args.as_ptr(),
+            machine
+                .x_slice(arity)
+                .expect("the register file is wide enough")
+                .as_ptr(),
+            "the in-machine door must be handed the LIVE x(0..arity) register slice, \
+             not a marshalled copy"
+        );
         let mut registers = Vec::with_capacity(arity as usize);
         for index in 0..arity {
             registers.push(machine.x(index).expect("the register is in range"));
@@ -268,9 +287,10 @@ fn finish_module(mut module: Module, name: &str, arity: u32, body: Vec<Instr>) -
 /// `bifwindow_call/arity` = `label 1 | call_ext arity host:pair_sum/arity | return`.
 ///
 /// A plain `call_ext` (never `call_ext_last`), so the module keeps exactly one import,
-/// one entry label and one BIF dispatch at every arity. `arity <= STACK_ARGS` marshals
-/// through the fixed stack array; a larger one through the machine's reusable
-/// `args_scratch`.
+/// one entry label and one BIF dispatch at every arity. The register path marshals
+/// **nothing** at any arity: the host is handed the live `x(0..arity)` register slice by
+/// reference, so the two arities either side of `STACK_ARGS` prove the hand-off is
+/// uniform.
 fn call_ext_module(arity: u32) -> (Module, Atom) {
     let mut module = Module::default();
     let import = intern_import(&mut module, arity);
@@ -304,11 +324,11 @@ fn args_for(arity: u32) -> Vec<Eterm> {
 }
 
 // ---------------------------------------------------------------------------
-// (a) no rooted door is crossed while the argument slice is out of the root set
+// (a) the `&self` dispatch window crosses no rooted door
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_wide_dispatch_crosses_no_rooted_door_while_the_scratch_is_out() {
+fn a_call_ext_dispatch_crosses_no_rooted_door() {
     for arity in [NARROW_ARITY, WIDE_ARITY] {
         let (module, function) = call_ext_module(arity);
         let args = args_for(arity);
@@ -335,11 +355,11 @@ fn a_wide_dispatch_crosses_no_rooted_door_while_the_scratch_is_out() {
         assert_eq!(
             ctx.rooted_doors, 0,
             "arity {arity}: the engine crossed a rooted-allocation/heap-admission door \
-             during a run whose only heap-relevant step is a BIF dispatch. The argument \
-             slice (`EMPTY_ARGS` for arity <= 2, `Machine::args_scratch` beyond) is in no \
-             root set, so a collection there strands every argument: if this fires, the \
-             argument words must be rooted (kept in the machine and enumerated, or parked \
-             at the stack tail) before the change lands"
+             during a run whose only heap-relevant step is a BIF dispatch. The dispatch \
+             window is `&self`, so the ENGINE crossing no rooted door is expected — the \
+             argument slice is the live `x(0..arity)` register file (already rooted), not \
+             a detached buffer, so a host-driven collection would relocate it in place \
+             rather than strand it"
         );
         assert_eq!(
             ctx.during_dispatch, 0,
@@ -386,7 +406,8 @@ fn both_arities_hand_the_host_exactly_the_live_registers() {
         assert_eq!(
             ctx.rooted_doors, 0,
             "arity {arity}: the in-machine door is still a `&self` dispatch and must \
-             cross no rooted door"
+             cross no rooted door — `rooted_doors == 0` is expected and correct because \
+             the argument slice is the live register file, never a detached buffer"
         );
     }
 }

@@ -20,10 +20,12 @@
 
 //! BIF-argument marshalling and the BIF error/raise path (`impl Machine`).
 //!
-//! `exec_bif`/`call_import` marshal a `gc_bif`/`bif`/`call_ext*`'s arguments and
-//! call the BIF through [`ExecutionContext::call_bif_outcome_with_off_heap`] (the
-//! off-heap-aware twin of [`ExecutionContext::call_bif_outcome`]); `raise_bif_error`
-//! folds a BIF error into the catch-aware raise the dispatch loop expects.
+//! `exec_bif` marshals a `gc_bif`/`bif`/`bif0`'s **operand** arguments and
+//! `call_import`/`call_bif_named` hand a `call_ext*`'s live **register** arguments
+//! through by reference; both call the BIF through
+//! [`ExecutionContext::call_bif_outcome_with_off_heap`] (the off-heap-aware twin of
+//! [`ExecutionContext::call_bif_outcome`]); `raise_bif_error` folds a BIF error into
+//! the catch-aware raise the dispatch loop expects.
 //!
 //! The BIF door is **outcome-aware** ([`BifOutcome`]), so a BIF that cannot complete
 //! without waiting can answer [`BifOutcome::Suspend`]: each call site decides whether it
@@ -34,24 +36,27 @@ use beam_loader::{ImportRef, Label, Module, Operand, NO_FAIL};
 use beam_term::{is_list, is_nil, make_atom, Eterm, NIL};
 
 use crate::context::{BifOutcome, ExecutionContext};
-use crate::error;
 use crate::families::exceptions::bif_frame;
 use crate::machine::{namespace_atom, Machine};
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
 use super::{resolve, LabelMap};
 
-/// The argument count up to which a BIF/`call_ext` marshals its arguments through
-/// a **stack array** instead of the machine's reusable scratch buffer.
+/// The **operand**-argument count up to which a `gc_bif`/`bif`/`bif0` marshals its
+/// arguments through a **stack array** instead of the machine's reusable scratch
+/// buffer.
 ///
-/// `gc_bif`/`bif`/`call_ext` used to build a fresh `Vec` (one heap allocation and
+/// `gc_bif`/`bif` used to build a fresh `Vec` (one heap allocation and
 /// free) for **every** BIF call, which a micro-benchmark showed to be the single
 /// largest per-instruction cost of the interpreter. arities in `0..=STACK_ARGS`
 /// (every arity the compiler actually emits for arithmetic/guard BIFs) now fill a
 /// fixed stack array — no `Vec` is even constructed, let alone allocated — and a
 /// larger arity reuses [`Machine::args_scratch`], so **no** arity allocates per
-/// call. The observable behaviour and the `ctx.call_bif(.., &[Eterm])` signature
-/// are unchanged.
+/// call. This bound applies to **operand** marshalling only
+/// ([`Machine::exec_bif`]): the `call_ext*` register path
+/// ([`Machine::call_bif_named`]) marshals nothing — it hands the host the live
+/// `x(0..arity)` register slice by reference. The observable behaviour and the
+/// `ctx.call_bif(.., &[Eterm])` signature are unchanged.
 pub(crate) const STACK_ARGS: usize = 2;
 
 /// A stack array sized for the common BIF/`call_ext` arities ([`STACK_ARGS`]).
@@ -181,8 +186,13 @@ impl Machine {
             }
         }
     }
-    /// Marshal a **wide** argument list (more than [`STACK_ARGS`] arguments) into
-    /// the machine's reusable scratch buffer and dispatch it.
+    /// Marshal a **wide** operand-argument list (more than [`STACK_ARGS`] operands)
+    /// into the machine's reusable scratch buffer and dispatch it.
+    ///
+    /// This is the **operand** path only — [`Machine::exec_bif`]'s wide arm for a
+    /// `gc_bif`/`bif`/`bif0`. The register path ([`Machine::call_bif_named`]) no longer
+    /// marshals through here: it hands the host the live `x(0..arity)` register slice by
+    /// reference, so its argument words stay rooted for the whole dispatch.
     ///
     /// The buffer is taken out of the machine (so the operand reader can borrow the
     /// machine immutably while the terms are pushed), cleared, filled and given
@@ -190,18 +200,20 @@ impl Machine {
     /// call of any arity allocates nothing once the buffer has grown to fit it.
     ///
     /// **No `?` sits between the `take` and the reinstall.** The marshalling outcome is
-    /// only *stored* (a bad operand, an out-of-range register) and the BIF outcome is
-    /// *wrapped*, so the buffer is cleared and given back on every exit path —
-    /// successful dispatch, marshalling error, BIF failure, gate failure and
-    /// [`BifOutcome::Suspend`] alike. That is what keeps
-    /// [`Machine::args_scratch`] empty between dispatches (and
+    /// only *stored* (a bad operand) and the BIF outcome is *wrapped*, so the buffer is
+    /// cleared and given back on every exit path — successful dispatch, marshalling
+    /// error, BIF failure, gate failure and [`BifOutcome::Suspend`] alike. That is what
+    /// keeps [`Machine::args_scratch`] empty between dispatches (and
     /// [`Machine::reset`](crate::machine::Machine::reset) with nothing to clear), and it
-    /// is pinned by `tests/bif_args_window.rs` + the `bif` unit test beside the wide
-    /// marshalling proof.
+    /// is pinned by the `bif` unit test beside the wide marshalling proof.
     ///
-    /// While the buffer **is** out, the argument words are in no root set. That is
-    /// sound because the dispatch cannot collect — the field doc on
-    /// [`Machine::args_scratch`] states the invariant a future change must preserve.
+    /// The marshalled operand words are **never re-read after a collection**: the
+    /// BIF-error funnel (`exec_bif`'s `Err` arm) re-reads its operands from their rooted
+    /// sources (the register file / the literal area / `read_operand`), and
+    /// arithmetic/guard BIFs do not collect during dispatch. The dispatch window is
+    /// `&self`, so the **engine** crosses no rooted door while the buffer is out — but a
+    /// nested collection the host drives must not re-read these copied words. See the
+    /// [`Machine::args_scratch`] field doc.
     ///
     /// The return shape mirrors the stack-array path exactly: the **outer**
     /// [`Result`] is the *marshalling* outcome (a bad operand, propagated by the
@@ -234,7 +246,7 @@ impl Machine {
     /// Call an imported BIF with the `arity` register arguments `x(0..arity)`.
     ///
     /// The import's `(module, function, arity)` comes from the per-run cache
-    /// ([`LabelMap::import_target`], `labels`) and the marshalling is
+    /// ([`LabelMap::import_target`], `labels`) and the register hand-off is
     /// [`Machine::call_bif_named`]'s. Note the two arities it passes on: the
     /// **registers** are the *instruction's* `arity` operand while the BIF is
     /// dispatched with the **import table's** declared arity — the split an
@@ -266,32 +278,34 @@ impl Machine {
         )
     }
 
-    /// Marshal the register arguments `x(0..nregs)` and dispatch
-    /// `module_name:function_name/bif_arity` through
-    /// [`ExecutionContext::call_bif_outcome`].
+    /// Hand the host the **live register arguments** `x(0..nregs)` — by shared
+    /// reference, no copy — and dispatch `module_name:function_name/bif_arity`
+    /// through [`ExecutionContext::call_bif_outcome`].
     ///
-    /// The **one** definition of the register-marshalling shape every BIF-dispatching
+    /// The **one** definition of the register hand-off shape every BIF-dispatching
     /// seam shares — a `call_ext*` ([`Machine::call_import`]) and the *local-call*
     /// seam's synchronous route (the three local call arms, which serve a same-module
     /// callee through this helper when the host's
     /// [`ExecutionContext::resolve_local_call`] answers `true`).
     ///
     /// The two arities are deliberately separate: `nregs` is how many register
-    /// arguments to marshal (the instruction's own `arity` operand) while `bif_arity`
+    /// arguments to hand over (the instruction's own `arity` operand) while `bif_arity`
     /// is what the BIF is dispatched with (the import table's declared arity). For a
     /// well-formed call they are equal; a `call_ext 3 erlang:apply/3`-shaped import is
     /// where they differ — which is exactly the distinction the local-call route must
     /// not lose.
     ///
-    /// Like [`Machine::exec_bif`] the arguments are marshalled through a **stack
-    /// array** for the common arities ([`STACK_ARGS`]) and through the machine's
-    /// reusable scratch buffer beyond it, so no arity allocates a heap block per call
-    /// (after the first wide one). A marshalling error (an out-of-range register) is an
-    /// `Err`, exactly as the call sites expect.
+    /// **The slice is the live register file, not a copy**: [`Machine::x_slice`] hands
+    /// back `&self.x[..nregs]`, which a `call_ext N` has already written (so the
+    /// used-extent high-water mark covers it), and a collecting host relocates those
+    /// very words through [`Machine::with_roots`]. A BIF that re-reads an argument after
+    /// a nested collection (e.g. `lists:foldl/3` walking `args[2]` across a fun
+    /// application that collects) therefore sees the relocated term, never a stale copy.
+    /// An out-of-range register is an `Err`, exactly as the call sites expect.
     ///
-    /// The register reads `x(0..nregs)` are pure and nothing is written, so every one of
-    /// its callers may honour a [`BifOutcome::Suspend`] by re-executing the *calling*
-    /// instruction — which is why the outcome (not a bare value) is what it returns.
+    /// The register reads are pure and nothing is written, so every one of its callers
+    /// may honour a [`BifOutcome::Suspend`] by re-executing the *calling* instruction —
+    /// which is why the outcome (not a bare value) is what it returns.
     pub(crate) fn call_bif_named(
         &mut self,
         entry_module: &Module,
@@ -301,40 +315,8 @@ impl Machine {
         nregs: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<BifOutcome> {
-        if nregs as usize <= STACK_ARGS {
-            let mut buf = EMPTY_ARGS;
-            for (i, slot) in buf.iter_mut().enumerate().take(nregs as usize) {
-                *slot = self
-                    .x(i as u32)
-                    .ok_or_else(|| error::bad_register(i as u32))?;
-            }
-            self.dispatch_bif_call(
-                entry_module,
-                module_name,
-                function_name,
-                bif_arity,
-                &buf[..nregs as usize],
-                ctx,
-            )
-        } else {
-            // A marshalling error and a BIF failure are the same `Err` to this
-            // function's callers (both are raised), so the two are flattened.
-            self.dispatch_wide(
-                entry_module,
-                module_name,
-                function_name,
-                bif_arity,
-                nregs as usize,
-                ctx,
-                |machine, _ctx, scratch| {
-                    for i in 0..nregs {
-                        scratch.push(machine.x(i).ok_or_else(|| error::bad_register(i))?);
-                    }
-                    Ok(())
-                },
-            )
-            .and_then(|result| result)
-        }
+        let args = self.x_slice(nregs)?;
+        self.dispatch_bif_call(entry_module, module_name, function_name, bif_arity, args, ctx)
     }
 
     /// Dispatch a BIF through the host, taking the **in-machine** door when the
@@ -393,9 +375,14 @@ impl Machine {
     /// `memcmp`s on the cold path of an ordinary BIF dispatch, and the flag write is a
     /// single store on the rare `load_nif` path.
     ///
-    /// The dispatch window is **not** a collection window either: it hands the host the
-    /// machine only through the `&self` in-machine door, so the marshalled argument slice
-    /// stays unreachable from both rooted doors (`tests/bif_args_window.rs`).
+    /// The `&self` receiver means the **engine** crosses no rooted door during the
+    /// dispatch window — but a nested collection the host itself drives is possible, so
+    /// the argument slice must be **rooted**. [`Machine::call_bif_named`] hands the host
+    /// the live `x(0..nregs)` register slice (already inside the used extent), so a
+    /// collection relocates those words in place; [`Machine::exec_bif`]'s
+    /// operand-marshalled words are never re-read after a collection (the raise funnel
+    /// re-reads its operands from their rooted sources). See `tests/bif_args_window.rs`
+    /// and `tests/bif_arg_rooting.rs`.
     ///
     /// `entry_module` is the module the run was entered at — the same one
     /// [`Machine::drive`](crate::machine::Machine::drive) threads down from its own
@@ -1016,7 +1003,23 @@ mod tests {
         let mut machine = Machine::with_max_register(2);
         let mut ctx = MinimalContext::with_bif_hook(Box::new(sum_hook));
         let err = machine
-            .call_bif_named(&module, "host", "sum", 5, 5, &mut ctx)
+            .dispatch_wide(
+                &module,
+                "host",
+                "sum",
+                5,
+                5,
+                &mut ctx,
+                |machine, _ctx, scratch| {
+                    for index in 0..5u32 {
+                        match machine.x(index) {
+                            Some(value) => scratch.push(value),
+                            None => return Err(crate::error::bad_register(index)),
+                        }
+                    }
+                    Ok(())
+                },
+            )
             .expect_err("marshalling x(0..5) out of a 2-slot register file fails");
         assert!(matches!(err, BeamError::BadArg), "got {err:?}");
         assert!(
@@ -1039,7 +1042,21 @@ mod tests {
                 .expect("the register is in range");
         }
         let outcome = machine
-            .call_bif_named(&module, "host", "sum", 5, 5, &mut ctx)
+            .dispatch_wide(
+                &module,
+                "host",
+                "sum",
+                5,
+                5,
+                &mut ctx,
+                |machine, _ctx, scratch| {
+                    for index in 0..5u32 {
+                        scratch.push(machine.x(index).expect("the register is in range"));
+                    }
+                    Ok(())
+                },
+            )
+            .expect("the marshal succeeds")
             .expect("the dispatch returns");
         assert!(
             matches!(outcome, BifOutcome::Return(value) if value == make_small(10)),
