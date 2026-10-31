@@ -538,6 +538,17 @@ impl ProcessHook for ProcessBridge<'_> {
         // pid when nothing has been set (see [`Runtime::group_leader_of`]).
         Ok(self.runtime.group_leader_of(self.self_pid))
     }
+
+    fn bump_reductions(&mut self, n: u64) -> Result<()> {
+        let pid = self.self_pid;
+        let Some(process) = self.table_mut().get_mut(pid) else {
+            return Err(error::unsupported(
+                "erlang:bump_reductions/1: the calling process is not in the process table",
+            ));
+        };
+        process.bump_reductions(n);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -762,6 +773,32 @@ mod tests {
         let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
 
         assert_eq!(bridge.group_leader().unwrap(), self_pid);
+    }
+
+    #[test]
+    fn bump_reductions_adds_to_the_calling_process_counter_and_a_missing_process_is_the_typed_gap() {
+        let mut rt = runtime();
+        let self_pid = rt.self_pid();
+        let before = rt.processes.get(self_pid).unwrap().reductions();
+        let ports = Rc::clone(&rt.ports);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        bridge.bump_reductions(100).unwrap();
+        drop(bridge);
+
+        let after = rt.processes.get(self_pid).unwrap().reductions();
+        assert_eq!(after - before, 100);
+
+        // A bridge whose `self_pid` names no live process reports the typed capability gap
+        // (never fabricates the oracle's `true`).
+        let ports = Rc::clone(&rt.ports);
+        let ghost = ProcessId::new(999_999, 0);
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, ghost);
+        let error = bridge.bump_reductions(1).expect_err("no process to bump");
+        assert!(
+            crate::error::unsupported_reason(&error).is_some(),
+            "expected a typed capability gap, got {error:?}"
+        );
     }
 
     #[test]
