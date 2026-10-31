@@ -28,8 +28,9 @@ The driver, block ABI and the helpers (`jit_step_one`, `jit_ext_call`, `jit_loca
 `jit_call_store`, `jit_call_store_linked`, `jit_tail_call`, `jit_deallocate`, `jit_return`,
 `jit_deallocate_return`,
 `jit_allocate`, `jit_allocate_heap`, `jit_test_heap`, `jit_trim`, `jit_receive`, `jit_family`,
+`jit_call_fun`,
 `jit_publish_y`, `jit_refresh_y`, and the inline position store `emit_position_store`) live one level up in `../mod.rs`,
-`../runtime.rs`, `../call.rs`, `../receive.rs` and `../family.rs`; this node only *emits calls* to
+`../runtime.rs`, `../call.rs`, `../receive.rs`, `../call_fun.rs` and `../family.rs`; this node only *emits calls* to
 them.
 
 ## Core model (do not break)
