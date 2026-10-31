@@ -362,6 +362,7 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
         hooks: DispatchHooks,
+        machine_handles: &[beam_alloc::RefcBinary],
     ) -> Result<Eterm> {
         // Cheap handles that do NOT borrow the runtime: the runtime stays free for the
         // fun-caller bridge.
@@ -423,6 +424,7 @@ impl<'a> RuntimeContext<'a> {
                 tables_handle,
                 ports_handle,
                 off_heap,
+                machine_handles,
             );
         }
         // ---- the hook-free fast path ---------------------------------------------------------
@@ -604,6 +606,7 @@ impl<'a> RuntimeContext<'a> {
             atoms,
             None,
             pending,
+            machine_handles,
         );
         // The frontier goes back to the pool **here**, not in the tail, so the tail borrows it
         // instead of owning it: one borrow at the call boundary instead of a by-value
@@ -645,6 +648,7 @@ impl<'a> RuntimeContext<'a> {
         tables_handle: Rc<std::cell::RefCell<TableRegistry>>,
         ports_handle: Rc<std::cell::RefCell<crate::port::PortRegistry>>,
         mut off_heap: RefcPayloadHost,
+        machine_handles: &[beam_alloc::RefcBinary],
     ) -> Result<Eterm> {
         // Whether this is a process-dictionary BIF, which needs the running process's
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
@@ -1250,6 +1254,7 @@ impl<'a> RuntimeContext<'a> {
             atoms,
             memory,
             pending,
+            machine_handles,
         );
         // The frontier returns to the pool here, the tail having only **borrowed** it (`drop(atoms)`
         // above already released the other owners the atom commit needed). See the hot path's note.
@@ -1278,6 +1283,7 @@ impl<'a> RuntimeContext<'a> {
         atoms: Rc<AtomTable>,
         memory: Option<RuntimeMemory>,
         pending: PendingInterner,
+        machine_handles: &[beam_alloc::RefcBinary],
     ) -> Result<Eterm> {
         // The result is still on the pooled BIF heap. A **container** result must not stay there on
         // a **process route**: the pool is a region no process collector scans, so Erlang code that
@@ -1389,7 +1395,7 @@ impl<'a> RuntimeContext<'a> {
                     notes::note_alias_copy();
                     #[cfg(test)]
                     notes::note_alias_copy_pool(mark, heap.used());
-                    match self.rehome_container_result(term, None) {
+                    match self.rehome_container_result(term, None, machine_handles) {
                         Some(copied) => {
                             perf_counters::bump(|c| &mut c.rehomed);
                             result = Ok(copied);
@@ -1435,7 +1441,7 @@ impl<'a> RuntimeContext<'a> {
                 } else if move_container {
                     // The copy first and, only once it succeeded, the rewind: a refused copy leaves
                     // both the result and the pool exactly as they were.
-                    if let Some(copied) = self.rehome_container_result(term, Some(heap)) {
+                    if let Some(copied) = self.rehome_container_result(term, Some(heap), machine_handles) {
                         perf_counters::bump(|c| &mut c.rehomed);
                         result = Ok(copied);
                         rewind = safe_to_rewind;
@@ -1893,7 +1899,7 @@ impl<'a> RuntimeContext<'a> {
             // An immediate or a frozen literal names nothing on the scratch region.
             return term;
         }
-        match self.rehome_container_result(term, None) {
+        match self.rehome_container_result(term, None, &[]) {
             Some(copied) => copied,
             None => {
                 self.runtime.taint_info_scratch();
@@ -1934,9 +1940,10 @@ impl<'a> RuntimeContext<'a> {
         &mut self,
         term: Eterm,
         pool: Option<&beam_alloc::Heap>,
+        machine_handles: &[beam_alloc::RefcBinary],
     ) -> Option<Eterm> {
         if self.mailbox_table.is_some() {
-            self.move_result_into_process_heap(term)
+            self.move_result_into_process_heap(term, machine_handles)
         } else {
             self.move_result_into_runtime_store(term, pool)
         }
@@ -2036,20 +2043,25 @@ impl<'a> RuntimeContext<'a> {
     /// node entry is pushed once per counted reference, so the store's `push_node` dedup restores
     /// exactly the count the local table held.
     ///
-    /// # The EMPTY source table is load-bearing (and is what makes the adoption sound)
+    /// # The source table is the machine's handles + the escaped store + the mailbox
     ///
-    /// The copy's source [`OffHeapTable`](beam_message::OffHeapTable) is empty because the BIF
-    /// heap owns no off-heap handle. `beam_message`'s copier resolves a refc binary's payload
-    /// through `ctx.src_off_heap().binary_by_data_ptr(val)`; with no owner it falls back to
-    /// **flattening** the window into a self-contained on-heap bitstring — byte-faithful, nothing
-    /// registered in the destination table, no refcount to lose. An off-heap **MSO** reference
-    /// with no resolvable owner is the copier's typed `bad_term` instead, so this function returns
-    /// `None` (the caller then does not rewind the pool) — never a dangling payload. The empty
-    /// source table can therefore only ever produce a *complete* copy, and it is also *why the
-    /// adoption is sound*: no off-heap **MSO container** can be copied (its source slot never
-    /// resolves — `clone_slot` is `None` ⇒ `bad_term`), so the local table's MSO list is provably
-    /// empty on every success and `drain_handles` can never re-slot a container whose on-heap
-    /// `val` word would then name the wrong slot.
+    /// The copy's source [`OffHeapTable`](beam_message::OffHeapTable) is
+    /// [`Runtime::source_payloads`] over the executing machine's
+    /// [`Machine::refc_binaries`](beam_engine::Machine::refc_binaries) handles
+    /// (`machine_handles`), the runtime's escaped-payload store and `pid`'s retained mailbox
+    /// families. `beam_message`'s copier resolves a refc binary's payload through
+    /// `ctx.src_off_heap().binary_by_data_ptr(val)`, so a window whose parent payload the running
+    /// machine still holds is **shared** (one refcount) instead of flattened into a
+    /// self-contained on-heap bitstring. A handle missing from every family falls back to
+    /// **flattening** the window — byte-faithful, nothing registered in the destination table, no
+    /// refcount to lose. An off-heap **MSO** reference with no resolvable owner is the copier's
+    /// typed `bad_term` instead, so this function returns `None` (the caller then does not rewind
+    /// the pool) — never a dangling payload. The `-eval`/single-pass route and the direct test
+    /// callers pass an empty slice (`&[]`), the documented empty-source form, and on that form the
+    /// adoption below is sound for the same reason as before: no off-heap **MSO container** can be
+    /// copied (its source slot never resolves — `clone_slot` is `None` ⇒ `bad_term`), so the local
+    /// table's MSO list is provably empty on every success and `drain_handles` can never re-slot a
+    /// container whose on-heap `val` word would then name the wrong slot.
     ///
     /// # The copy is hinted, not guessed
     ///
@@ -2073,7 +2085,11 @@ impl<'a> RuntimeContext<'a> {
     /// function behaves exactly as it did before, and the grow-and-retry below remains the
     /// fallback for every refusal the gate cannot pre-empt (a result larger than the hint, a
     /// `max_heap_size` ceiling, a destination that is not an exhaustion).
-    fn move_result_into_process_heap(&mut self, term: Eterm) -> Option<Eterm> {
+    fn move_result_into_process_heap(
+        &mut self,
+        term: Eterm,
+        machine_handles: &[beam_alloc::RefcBinary],
+    ) -> Option<Eterm> {
         // `ProcessId` is `Copy`, so read it before the destructure (match ergonomics, as the
         // dispatch block above does). The hint is `Copy` for the same reason — and reading it
         // here keeps it a *disjoint field* loan from `runtime`/`mailbox_table`, which is also
@@ -2120,10 +2136,12 @@ impl<'a> RuntimeContext<'a> {
                 hint_grow_gate(process, hint);
             }
             // One source-payload snapshot for both attempts, built once and borrowed at each call
-            // site (`SourcePayloads` is not `Copy`): the BIF-built refc-binary handles now held in
-            // `eval_off_heap` (adopted before this copy-out) plus `pid`'s retained mailbox
+            // site (`SourcePayloads` is not `Copy`): the executing machine's own refc-binary
+            // handles (`machine_handles`, so a `binary:part/3`-shaped window over an engine-built
+            // payload is shared rather than flattened), plus the BIF-built handles now held in
+            // `eval_off_heap` (adopted before this copy-out) and `pid`'s retained mailbox
             // families. See [`Runtime::source_payloads`].
-            let payloads = runtime.source_payloads(pid, &[]);
+            let payloads = runtime.source_payloads(pid, machine_handles);
             // One fresh destination table per attempt (see the docs above): a refused attempt's
             // partial state is never rolled into the retry, so both attempts hand the copier an
             // empty destination and take the single-traversal fast path.
@@ -2391,6 +2409,7 @@ impl RuntimeContext<'_> {
         function: &str,
         arity: u32,
         args: &[Eterm],
+        machine_handles: &[beam_alloc::RefcBinary],
     ) -> Result<Eterm> {
         // A loaded NIF library wins over every other route: a NIF replaces the Erlang stub of
         // the same `{module, function, arity}`. On a miss this is a no-op (`Ok(None)`).
@@ -2446,7 +2465,7 @@ impl RuntimeContext<'_> {
                     .map(beam_term::atom_val);
                 let before = name.and_then(|atom| self.runtime.tables.borrow().lookup_name(atom));
                 let result =
-                    self.call_registered(bif, module, function, arity, args, dispatch.hooks);
+                    self.call_registered(bif, module, function, arity, args, dispatch.hooks, machine_handles);
                 if let (Some(atom), Ok(_)) = (name, &result) {
                     let after = self.runtime.tables.borrow().lookup_name(atom);
                     if let Some(handle) = after.filter(|handle| Some(*handle) != before) {
@@ -2458,7 +2477,7 @@ impl RuntimeContext<'_> {
                 }
                 return result;
             }
-            return self.call_registered(bif, module, function, arity, args, dispatch.hooks);
+            return self.call_registered(bif, module, function, arity, args, dispatch.hooks, machine_handles);
         }
         if module == "erlang" {
             // The **effective** gap set: the curated list intersected with what the live

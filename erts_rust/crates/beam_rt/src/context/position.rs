@@ -81,7 +81,7 @@
 //! nothing prunes it while a BIF runs), so the pointer, length and refcount are live figures,
 //! and the reply's integers are built from them afterwards rather than from the payload.
 use beam_common::Result;
-use beam_engine::{ExecutionContext, Machine, terms};
+use beam_engine::{Machine, terms};
 use beam_loader::Module;
 use beam_process::ProcessId;
 use beam_term::{atom_val, is_atom, make_small, Eterm};
@@ -179,16 +179,18 @@ impl RuntimeContext<'_> {
         function: &str,
         arity: u32,
         args: &[Eterm],
+        machine_handles: &[beam_alloc::RefcBinary],
     ) -> Result<Eterm> {
         if function == "process_info" && module == "erlang" && (arity == 1 || arity == 2) {
             if let Some(position) = self.machine_position(machine, entry_module, args)? {
                 self.runtime.in_machine = Some(position);
-                let result = self.call_bif(module, function, arity, args);
+                let result =
+                    self.call_bif_with_handles(module, function, arity, args, machine_handles);
                 self.runtime.in_machine = None;
                 return result;
             }
         }
-        self.call_bif(module, function, arity, args)
+        self.call_bif_with_handles(module, function, arity, args, machine_handles)
     }
 
     /// The executing process's machine-sourced position, or `None` when this call must take

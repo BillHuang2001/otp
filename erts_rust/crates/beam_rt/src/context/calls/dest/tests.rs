@@ -57,7 +57,7 @@ fn a_result_already_on_the_process_heap_is_handed_through_unchanged() {
     notes::reset();
     let answer = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        ctx.move_result_into_process_heap(term)
+        ctx.move_result_into_process_heap(term, &[])
     };
     assert_eq!(
         answer,
@@ -94,7 +94,7 @@ fn a_result_on_another_region_is_still_copied() {
     notes::reset();
     let answer = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        ctx.move_result_into_process_heap(term)
+        ctx.move_result_into_process_heap(term, &[])
     };
     let copied = answer.expect("a foreign container is re-homed");
     assert_ne!(

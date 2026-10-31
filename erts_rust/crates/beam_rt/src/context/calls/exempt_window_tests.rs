@@ -243,7 +243,7 @@ fn an_exempt_copy_out_never_replaces_the_young_space() {
         // first attempt, which is itself a replacement — so the window must decline that too.
         ctx.copy_out_hint = graph_words;
         notes::reset();
-        ctx.move_result_into_process_heap(container)
+        ctx.move_result_into_process_heap(container, &[])
     };
     let copy = copy.expect(
         "an exempt window STABILIZES a result it may not grow the space for: the answer must be \
@@ -432,7 +432,7 @@ fn an_exempt_copy_out_still_moves_a_container_that_fits() {
     let copy = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         notes::reset();
-        ctx.move_result_into_process_heap(container)
+        ctx.move_result_into_process_heap(container, &[])
     };
     let copy = copy.expect("a graph that fits is copied out even inside an exempt window");
     assert!(
@@ -487,7 +487,7 @@ fn the_same_copy_out_grows_once_the_window_closes() {
     let copy = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         notes::reset();
-        ctx.move_result_into_process_heap(container)
+        ctx.move_result_into_process_heap(container, &[])
     };
     let copy = copy.expect("a published-root caller may replace the space, so the retry fits");
     assert!(

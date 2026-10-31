@@ -87,7 +87,7 @@ fn a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing() {
         // destination cannot make it succeed, so the retry must not run: no space is
         // retired, no word is written, and the caller gets `None` (so `call_registered`
         // leaves both the result and the pooled BIF heap exactly as they were).
-        ctx.move_result_into_process_heap(make_header(0, 0))
+        ctx.move_result_into_process_heap(make_header(0, 0), &[])
     };
     assert!(
         copy.is_none(),
@@ -648,8 +648,8 @@ fn the_copy_out_always_hands_the_copier_an_empty_destination_table() {
     let (first, second) = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         (
-            ctx.move_result_into_process_heap(term),
-            ctx.move_result_into_process_heap(term),
+            ctx.move_result_into_process_heap(term, &[]),
+            ctx.move_result_into_process_heap(term, &[]),
         )
     };
     assert!(
@@ -693,7 +693,7 @@ fn a_refused_copy_adopts_nothing_into_the_runtime_store() {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         // The `make_header(0, 0)` malformed graph is refused **permanently** (see
         // `a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing`).
-        ctx.move_result_into_process_heap(make_header(0, 0))
+        ctx.move_result_into_process_heap(make_header(0, 0), &[])
     };
     assert!(copy.is_none(), "the malformed graph is not re-homed");
     assert_eq!(
@@ -801,7 +801,7 @@ fn a_container_holding_an_off_heap_refc_binary_is_copied_out_as_an_on_heap_binar
     notes::reset();
     let copied = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        ctx.move_result_into_process_heap(term)
+        ctx.move_result_into_process_heap(term, &[])
             .expect("the container is re-homed")
     };
     assert!(
@@ -827,6 +827,64 @@ fn a_container_holding_an_off_heap_refc_binary_is_copied_out_as_an_on_heap_binar
         (attempts, grows, empties),
         (1, 0, 1),
         "one attempt, on the empty-destination fast path, with nothing to grow"
+    );
+}
+
+/// The sharing counterpart of the flattening case above: with the executing machine's
+/// [`Machine::refc_binaries`](beam_engine::Machine::refc_binaries) handles passed through
+/// (`machine_handles`), a container holding an off-heap refc binary is copied out **shared** —
+/// the payload's handle is adopted into the runtime store (one refcount) and the
+/// `[BinRef][ErlSubBits]` pair is preserved instead of being flattened onto the process heap.
+///
+/// This is the copy-out half of the D2 (`referenced_byte_size`) fix: a `binary:part/3` window
+/// over an engine-built parent must keep naming the parent payload, so
+/// `referenced_byte_size(C)` answers the parent's size rather than the window's.
+#[test]
+fn a_container_holding_an_off_heap_refc_binary_is_shared_when_the_machine_handles_are_passed() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let bytes = payload_bytes();
+    let mut source = beam_alloc::Heap::new(64).expect("the source heap");
+    let mut payloads = Payloads(Vec::new());
+    let binary = beam_codec::term::make_refc_binary(
+        &mut source,
+        &mut payloads,
+        &bytes,
+        0,
+        bytes.len() * 8,
+    )
+    .expect("the source refc binary");
+    let term = source
+        .tuple(&[binary, make_small(1)])
+        .expect("the source tuple");
+    // What the shared copy must still read back as: the same bytes as an on-heap binary.
+    let mut reference_heap = beam_alloc::Heap::new(64).expect("the reference heap");
+    let reference_binary =
+        beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference binary");
+    let reference = reference_heap
+        .tuple(&[reference_binary, make_small(1)])
+        .expect("the reference tuple");
+
+    notes::reset();
+    let copied = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.move_result_into_process_heap(term, &payloads.0)
+            .expect("the container is re-homed")
+    };
+    assert!(
+        beam_term::prelude::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+        "the result is a real tuple built on the process's own heap"
+    );
+    assert!(
+        beam_term::compare::eq(copied, reference, rt.atoms()),
+        "the shared copy still reads back byte-identical to the payload it names"
+    );
+    assert_eq!(
+        rt.eval_off_heap.binaries().len(),
+        1,
+        "the machine's payload handle is adopted into the runtime store, so the copy is shared \
+         rather than flattened"
     );
 }
 
@@ -856,7 +914,7 @@ fn an_off_heap_reference_with_no_owner_is_refused_and_adopts_nothing() {
     notes::reset();
     let copy = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        ctx.move_result_into_process_heap(term)
+        ctx.move_result_into_process_heap(term, &[])
     };
     assert!(
         copy.is_none(),

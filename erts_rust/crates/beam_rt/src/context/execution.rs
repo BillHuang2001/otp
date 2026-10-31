@@ -197,39 +197,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        if crate::debug_trace::enabled() {
-            crate::debug_trace::trace(format_args!(
-                "ENTER [{:?}] {module}:{function}/{arity}",
-                self.mailbox_pid
-            ));
-        }
-        let result = match self.call_bif_routed(module, function, arity, args) {
-            Ok(result) => result,
-            Err(error) => {
-                if crate::debug_trace::enabled() {
-                    let rendered: Vec<String> = args
-                        .iter()
-                        .map(|arg| match self.atom_name(*arg) {
-                            Some(name) => format!("'{name}'"),
-                            None => format!("{arg:?}"),
-                        })
-                        .collect();
-                    crate::debug_trace::trace(format_args!(
-                        "call_bif [{:?}] {module}:{function}/{arity} {rendered:?} -> {error:?}",
-                        self.mailbox_pid
-                    ));
-                }
-                // A raise's reason may be an atom **name** rather than an atom term
-                // (`beam_bifs`'s `zlib` surface raises `error:not_initialized` exactly so).
-                // Name it in the shared table before the engine sees the error, so the
-                // engine's live-namespace resolution can land it in a catch frame —
-                // see [`RuntimeContext::name_raise_reason_atom`].
-                self.name_raise_reason_atom(&error);
-                return Err(error);
-            }
-        };
-        self.open_gate_for_foreign_result(result);
-        Ok(result)
+        self.call_bif_with_handles(module, function, arity, args, &[])
     }
 
     /// The **outcome-aware** BIF door: [`Self::call_bif`] plus the
@@ -1120,7 +1088,15 @@ impl ExecutionContext for RuntimeContext<'_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        self.dispatch_in_machine(machine, entry_module, module, function, arity, args)
+        self.dispatch_in_machine(
+            machine,
+            entry_module,
+            module,
+            function,
+            arity,
+            args,
+            machine.refc_binaries(),
+        )
     }
 
     /// The **in-machine outcome-aware** BIF door — `RuntimeContext`'s one load-bearing override
@@ -1176,6 +1152,58 @@ impl ExecutionContext for RuntimeContext<'_> {
 }
 
 impl RuntimeContext<'_> {
+    /// [`ExecutionContext::call_bif`] with the executing machine's off-heap payload handles.
+    ///
+    /// The scheduled path's in-machine door ([`Self::call_bif_in_machine`]) hands the live
+    /// [`Machine::refc_binaries`] slice through here, so a registered BIF's copy-out
+    /// ([`Self::move_result_into_process_heap`]) resolves an engine-built refc binary by data
+    /// pointer and **shares** it instead of flattening the `[BinRef][ErlSubBits]` window into a
+    /// fresh on-heap bitstring. Every other route (the engine's ordinary
+    /// [`ExecutionContext::call_bif`] door, and the table-less single-pass entries) passes an
+    /// empty slice, which is the documented empty-source form.
+    pub(super) fn call_bif_with_handles(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+        machine_handles: &[beam_alloc::RefcBinary],
+    ) -> Result<Eterm> {
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "ENTER [{:?}] {module}:{function}/{arity}",
+                self.mailbox_pid
+            ));
+        }
+        let result = match self.call_bif_routed(module, function, arity, args, machine_handles) {
+            Ok(result) => result,
+            Err(error) => {
+                if crate::debug_trace::enabled() {
+                    let rendered: Vec<String> = args
+                        .iter()
+                        .map(|arg| match self.atom_name(*arg) {
+                            Some(name) => format!("'{name}'"),
+                            None => format!("{arg:?}"),
+                        })
+                        .collect();
+                    crate::debug_trace::trace(format_args!(
+                        "call_bif [{:?}] {module}:{function}/{arity} {rendered:?} -> {error:?}",
+                        self.mailbox_pid
+                    ));
+                }
+                // A raise's reason may be an atom **name** rather than an atom term
+                // (`beam_bifs`'s `zlib` surface raises `error:not_initialized` exactly so).
+                // Name it in the shared table before the engine sees the error, so the
+                // engine's live-namespace resolution can land it in a catch frame —
+                // see [`RuntimeContext::name_raise_reason_atom`].
+                self.name_raise_reason_atom(&error);
+                return Err(error);
+            }
+        };
+        self.open_gate_for_foreign_result(result);
+        Ok(result)
+    }
+
     /// Whether the runtime's **host dispatch chain** serves this MFA — a runtime-native-floor
     /// name, a NIF-loaded module, or a registered `beam_bifs` key.
     ///
