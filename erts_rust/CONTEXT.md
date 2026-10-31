@@ -111,8 +111,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
   --all-targets` (**warning-free: 0 warnings**); test with `scripts/cargo.sh test --manifest-path
-  erts_rust/Cargo.toml --workspace --no-fail-fast`. The suite is green — **0 failed** (`15 124 passed /
-  97 ignored` across the 18 packages). No test is red on account of the host oracle: the tree's frozen
+  erts_rust/Cargo.toml --workspace --no-fail-fast`. The suite is green — **0 failed** (`14 685 passed /
+  99 ignored` across the crates + `bench`, with `tools/differential`'s multi-hour corpus-sweep ratchet
+  tests excluded — see the caveat below). No test is red on account of the host oracle: the tree's frozen
   values (`system_info(version)` `17.1`, `stdlib` `8.1`, the 248-row instruction roster) are asserted
   unconditionally, and only the *oracle* leg tolerates a different `erts` patch, so an `erts-17.1.1`
   host is green. Two caveats: `tools/differential/tests/cli.rs` carries four end-to-end ratchet tests
