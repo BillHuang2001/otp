@@ -173,9 +173,10 @@ impl Machine {
     /// Build the `call` event's argument slice from `x(0..arity)` and report it.
     ///
     /// The slice is marshalled through the machine's reusable argument scratch
-    /// buffer — the same one the wide `gc_bif`/`call_ext` marshalling uses — cleared
-    /// and given back empty, so a traced call allocates nothing once the buffer has
-    /// grown to fit its widest arity.
+    /// buffer — the same one the wide **operand** (`gc_bif`/`bif`/`bif0`)
+    /// marshalling uses (the `call_ext*` register path marshals nothing — it hands
+    /// the live `x(0..arity)` slice) — cleared and given back empty, so a traced
+    /// call allocates nothing once the buffer has grown to fit its widest arity.
     ///
     /// This is a second, independent window in which argument words live outside the
     /// root set (the buffer is `mem::take`n out of the machine, so neither

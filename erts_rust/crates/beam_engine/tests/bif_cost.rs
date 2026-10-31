@@ -40,7 +40,7 @@
 //!    from the [`ImportTarget`] table (`Box<str>` module, `Box<str>` function,
 //!    `u32` arity). On a miss it falls back to the uncached `import_target` (two
 //!    atom-table lookups);
-//! 3. it marshals the arguments: an arity `<= STACK_ARGS` (= 2) fills a fixed
+//! 3. it marshals the **operands**: an arity `<= STACK_ARGS` (= 2) fills a fixed
 //!    `[Eterm; 2]` **stack array** (no `Vec`); a wider arity reuses
 //!    `Machine::args_scratch` through `dispatch_wide` (no allocation after the
 //!    first such call). Each argument is one `read_operand` call;
@@ -48,9 +48,11 @@
 //!    dispatch into `src/context.rs` (the boundary crossing itself);
 //! 5. on `Ok`, `exec_bif` writes the result with `write_operand(dst, value)`.
 //!
-//! `call_ext`/`call_ext_only`/`call_ext_last` reach the same marshalling through
-//! `Machine::call_import` (arguments read from `x(0..arity)`), so the per-call cost
-//! is the same shape. `test_heap HeapNeed Live` reaches the *other* context seam:
+//! `call_ext`/`call_ext_only`/`call_ext_last` reach the dispatch through
+//! `Machine::call_import` → `call_bif_named`, which marshals **nothing** — it hands
+//! the host the live `x(0..arity)` register slice by reference (`Machine::x_slice`),
+//! so the per-call cost is the same shape minus the operand reads. `test_heap
+//! HeapNeed Live` reaches the *other* context seam:
 //! `machine/frames.rs::Machine::ensure_heap` constructs `(&mut self.x, &mut self.stack)`
 //! and calls `ctx.ensure_heap(heap_need, live, x, stack)` (again a vtable call).
 //!

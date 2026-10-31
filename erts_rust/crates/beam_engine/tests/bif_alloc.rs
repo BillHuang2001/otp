@@ -22,9 +22,9 @@
 //!
 //! `tests/engine_bench.rs` measures the *time* of an interpreted `gc_bif`; this
 //! suite pins the complementary, load-independent property its `CONTEXT.md`
-//! claims — that a `gc_bif`/`bif`/`bif0`/`call_ext*` instruction marshals its
-//! arguments and dispatches the BIF **without touching the heap allocator**, at
-//! *every* arity.
+//! claims — that a `gc_bif`/`bif`/`bif0` instruction marshals its **operands** and
+//! that a `call_ext*` instruction hands over its **register** arguments, both
+//! dispatching the BIF **without touching the heap allocator**, at *every* arity.
 //!
 //! # Method — a counting global allocator, gated to the measured region
 //!
@@ -47,11 +47,9 @@
 //!   (same module shape: one import, one entry label) must allocate **exactly** the
 //!   same number of times — if a BIF call allocated, the second body would show
 //!   `N` extra allocations, not zero;
-//! * a `call_ext` of arity 8 (which marshals through the interpreter's fixed stack
-//!   array) and one of arity 9 (which marshals through the machine's reusable
-//!   scratch buffer) must allocate **exactly** the same number of times — if the
-//!   wide path minted a `Vec` per call, the arity-9 module would show one extra
-//!   allocation per run.
+//! * a `call_ext` of arity 8 and one of arity 9 must allocate **exactly** the same
+//!   number of times — the register path marshals nothing at any arity (the live
+//!   `x(0..arity)` slice is handed over by reference), so no arity mints a buffer.
 //!
 //! Both bodies are also *checked for the value they must produce*, so a path that
 //! silently did nothing cannot pass by not running.
@@ -265,8 +263,8 @@ fn call_ext_module(arity: u32) -> (Module, Atom) {
 /// second). Large enough that one allocation per BIF would be unmissable.
 const CHAIN_OPS: usize = 512;
 
-/// The `call_ext` arities of the second comparison: 8 marshals through the
-/// interpreter's fixed stack array, 9 through the machine's scratch buffer.
+/// The `call_ext` arities of the second comparison: 8 and 9 are the same zero-copy
+/// register hand-off (the live `x(0..arity)` slice), so they must allocate equally.
 const NARROW_ARITY: u32 = 8;
 const WIDE_ARITY: u32 = NARROW_ARITY + 1;
 
