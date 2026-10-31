@@ -148,10 +148,12 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   (`GET /` → 200 with the 12-byte `text/plain` body, plus HEAD/404/keep-alive/206) with **0 transport
   errors** and is the one two-sided benchmark row (§10; 8.39× to close, §B9 of `BOTTLENECKS.md`);
   `khepri`'s eunit modules and eight OTP `stdlib` `common_test` suites are driven under **both** runtimes
-  with per-module/per-case counts (`tools/suites/RESULTS.md`, whose RC-*/D* classes are the remaining
-  divergences); `plb` runs 8 of 10 kernels and `elixirc` compiles through the `elixir` stage. The
-  remaining per-project limits are recorded as `Known Issues` in the owning crate's `CONTEXT.md` — the
-  largest is that `cowboy_websocket` can only answer 500 because a `crypto.so` load callback vetoes.
+  with per-module/per-case counts (`tools/suites/RESULTS.md`: khepri rust `1497/4`, stdlib rust `182/21` —
+  the RC-*/D* classes are the remaining divergences); `plb` runs 8 of 10 kernels and `elixirc` compiles
+  through the `elixir` stage. The **`-on_load` module hook is implemented**, so `crypto` loads and
+  `crypto:strong_rand_bytes/16`/`crypto:hash/2` match the oracle. Remaining per-project limits are
+  recorded as `Known Issues` in the owning crate's `CONTEXT.md`: the largest is that a NIF loaded in one
+  process is not yet visible to spawned processes (A.3), which caps `cowboy_websocket`.
 - **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3524 agree=3520 mismatch=0
   unsupported=1 skipped=0 oracle_drift=3`** with `ratchet: allowlist=known-gaps.txt allowed=1
   unauthorized=0 stale=0` and `drift: allowlist=known-drift.txt allowed=3 unauthorized=0 stale=0`
