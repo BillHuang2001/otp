@@ -121,6 +121,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// The executable under test, exactly as the other contract suites drive it.
 const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
@@ -183,15 +184,44 @@ fn run(program: &Path, args: &[&str]) -> Run {
     Run::from_output(output)
 }
 
+/// The in-process `erl_tar.erl` compile's budget. The bignum-segment fix made the full
+/// `compile:file/2` finish under `beam_rt` instead of failing early, so the compile no longer
+/// fits the shared 30 s [`support::PROBE_TIMEOUT`]; 180 s leaves the debug runtime headroom on
+/// a loaded host.
+const COMPILE_PROBE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Runs `program args` bounded by [`COMPILE_PROBE_TIMEOUT`]: a compile probe's runtime is the
+/// work being measured, not a hang guard, so it gets a budget sized to the compile.
+fn run_compile_probe(program: &Path, args: &[&str]) -> Run {
+    let output: Output =
+        support::run_bounded_for(program, args, COMPILE_PROBE_TIMEOUT).unwrap_or_else(|| {
+            panic!(
+                "`{}` {args:?} could not be run to completion",
+                program.display()
+            )
+        });
+    Run::from_output(output)
+}
+
 /// `beam_rt -noshell -eval <expr>` through the built binary.
 fn beam_rt_eval(expr: &str) -> Run {
     run(Path::new(BINARY), &["-noshell", "-eval", expr])
+}
+
+/// `beam_rt -noshell -eval <expr>` through the built binary, on the compile-probe budget.
+fn beam_rt_compile_probe(expr: &str) -> Run {
+    run_compile_probe(Path::new(BINARY), &["-noshell", "-eval", expr])
 }
 
 /// `erl -noshell -eval <expr> -s init stop` through the oracle (the node is bounded: the probe
 /// always gets a terminator, and the shared runner kills it at the bound).
 fn oracle_eval(oracle: &Path, expr: &str) -> Run {
     run(oracle, &["-noshell", "-eval", expr, "-s", "init", "stop"])
+}
+
+/// `erl -noshell -eval <expr> -s init stop` through the oracle, on the compile-probe budget.
+fn oracle_compile_probe(oracle: &Path, expr: &str) -> Run {
+    run_compile_probe(oracle, &["-noshell", "-eval", expr, "-s", "init", "stop"])
 }
 
 /// `erl -noshell -pa <dir> -eval <expr> -s init stop` — the oracle with the fixture directory on
@@ -709,7 +739,7 @@ fn the_in_process_erl_tar_compile_reports_a_real_outcome() {
     }
 
     // ---- the oracle: the source really is compilable (identical option list) ----
-    let theirs = oracle_eval(&oracle, &compile_probe(&src, &oracle_out));
+    let theirs = oracle_compile_probe(&oracle, &compile_probe(&src, &oracle_out));
     assert_eq!(
         theirs.code, 0,
         "the oracle must complete the compile probe: exit {} — {}",
@@ -726,7 +756,7 @@ fn the_in_process_erl_tar_compile_reports_a_real_outcome() {
     );
 
     // ---- this runtime: a reported outcome, with no masked reason ----
-    let ours = beam_rt_eval(&compile_probe(&src, &rust_out));
+    let ours = beam_rt_compile_probe(&compile_probe(&src, &rust_out));
     assert_eq!(
         ours.code, 0,
         "the probe must reach its own halt(0) — exit {} — {}",

@@ -200,6 +200,24 @@ pub fn run_bounded(program: &Path, args: &[&str]) -> Option<Output> {
     run_bounded_with_env(program, args, &[])
 }
 
+/// As [`run_bounded`], but bounded by `timeout` instead of the shared [`PROBE_TIMEOUT`].
+///
+/// This is for a probe whose runtime **is** the work — a full in-process `compile:file/2` of
+/// a real stdlib module — rather than for the no-hang bound a `-eval` probe gets. A caller
+/// that sizes a compile probe down to the shared bound would kill a slow-but-successful
+/// compile and report a false failure.
+///
+/// `#[allow(dead_code)]`: this shared module is compiled into **every** integration-test
+/// binary, and the ones that never run a long probe would otherwise warn.
+#[allow(dead_code)]
+pub fn run_bounded_for(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Output> {
+    run_bounded_with_env_for(program, args, &[], timeout)
+}
+
 /// As [`run_bounded`], but with `env` applied to the child's environment: a `Some` value
 /// **sets** the variable and a `None` value **removes** it.
 ///
@@ -216,6 +234,18 @@ pub fn run_bounded_with_env(
     args: &[&str],
     env: &[(&str, Option<&str>)],
 ) -> Option<Output> {
+    run_bounded_with_env_for(program, args, env, PROBE_TIMEOUT)
+}
+
+/// The shared body behind [`run_bounded_with_env`] and [`run_bounded_for`]: run `program`
+/// with `env`, bounded by `timeout`.
+#[allow(dead_code)]
+fn run_bounded_with_env_for(
+    program: &Path,
+    args: &[&str],
+    env: &[(&str, Option<&str>)],
+    timeout: Duration,
+) -> Option<Output> {
     let mut command = Command::new(program);
     command.args(args);
     for (key, value) in env {
@@ -225,7 +255,7 @@ pub fn run_bounded_with_env(
             command.env_remove(key);
         }
     }
-    match run_probe(command) {
+    match run_probe_for(command, timeout) {
         Probe::Exited(output) => Some(output),
         Probe::TimedOut | Probe::Failed => None,
     }
@@ -237,7 +267,12 @@ pub fn run_bounded_with_env(
 /// reaped at [`PROBE_TIMEOUT`] instead of hanging the caller. The pipes are drained after
 /// the child exits, so a probe must not write more than a pipe buffer (~64 KiB) before it
 /// exits — every probe here prints a handful of bytes.
-fn run_probe(mut command: Command) -> Probe {
+fn run_probe(command: Command) -> Probe {
+    run_probe_for(command, PROBE_TIMEOUT)
+}
+
+/// As [`run_probe`], but bounded by `timeout` instead of [`PROBE_TIMEOUT`].
+fn run_probe_for(mut command: Command, timeout: Duration) -> Probe {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -250,7 +285,7 @@ fn run_probe(mut command: Command) -> Probe {
             return Probe::Failed;
         }
     };
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             // The child has exited: collect what the pipes hold (and reap it).
@@ -265,7 +300,7 @@ fn run_probe(mut command: Command) -> Probe {
                 if Instant::now() >= deadline {
                     eprintln!(
                         "warning: `{program}` outlived the {}s probe bound and was killed",
-                        PROBE_TIMEOUT.as_secs()
+                        timeout.as_secs()
                     );
                     let _ = child.kill();
                     let _ = child.wait();

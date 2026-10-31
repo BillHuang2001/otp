@@ -68,33 +68,35 @@
 //!
 //! # Why an invariant and not a fixed outcome
 //!
-//! Both outcomes are legitimate here, because this runtime's in-process compile is *not* yet
-//! oracle-complete: `lib/stdlib/src/erl_tar.erl` currently fails in
-//! `beam_core_to_ssa:function/2` (`{crash,core_to_ssa,badarg,…}`) — a **separate, out-of-scope
-//! defect** in the compiler-runtime surface, *not* an io defect: the engine's `bs_create_bin`
-//! `"integer"` arm rejects a **bignum** in a segment of `<= 64` bits instead of masking it into
-//! the field, so the compiler's own synthesized `<<Int:Size>>` constructions fail
-//! (`erts_rust/crates/beam_engine/src/families/bitstrings/create/mod.rs`; the contract is pinned
-//! by `tests/bignum_bit_segment.rs`). An earlier version of this
-//! probe asserted the `Function: ` line **unconditionally**, i.e. it depended on that foreign
-//! defect still being present and would have started failing the moment it was fixed —
-//! blocking the agent fixing it. The assertion is therefore re-pointed at the invariant the
-//! `io` floor is responsible for, over a set that **spans both outcomes** today
-//! ([`PROBED`]): at least one module that compiles cleanly on both runtimes, and at least one
-//! that currently fails here. Whichever way the out-of-scope residual moves — closed entirely
-//! (both modules compile), partially (one of each), or with the failure re-appearing elsewhere
-//! — this probe keeps pinning "the compiler's diagnostics are not replaced by
-//! `calling_self`" without constraining the outcome.
+//! Both outcomes are legitimate here, because this runtime's in-process compile is *not*
+//! guaranteed to be oracle-complete for every stdlib module. `lib/stdlib/src/erl_tar.erl`
+//! used to fail in `beam_core_to_ssa:function/2` (`{crash,core_to_ssa,badarg,…}`) — a
+//! **separate, out-of-scope defect** in the compiler-runtime surface, *not* an io defect: the
+//! engine's `bs_create_bin` `"integer"` arm rejected a **bignum** in a segment of `<= 64` bits
+//! instead of masking it into the field, so the compiler's own synthesized `<<Int:Size>>`
+//! constructions failed (`erts_rust/crates/beam_engine/src/families/bitstrings/create/mod.rs`;
+//! the contract is pinned by `tests/bignum_bit_segment.rs`). That defect is now fixed, so
+//! `erl_tar.erl` compiles cleanly under `beam_rt` too — its full in-process compile is the
+//! slow probe this suite budgets for below. An earlier version of this probe asserted the
+//! `Function: ` line **unconditionally**, i.e. it depended on that foreign defect still being
+//! present and would have started failing the moment it was fixed — blocking the agent fixing
+//! it. The assertion is therefore re-pointed at the invariant the `io` floor is responsible
+//! for ([`PROBED`]): a compile that fails must print the pass's own diagnostic, while a
+//! cleanly-compiling module has no `catch` handler to report and is simply checked for the
+//! absence of the masked reason. Whichever way a future residual moves — closed entirely (the
+//! modules compile), or with a failure re-appearing elsewhere — this probe keeps pinning "the
+//! compiler's diagnostics are not replaced by `calling_self`" without constraining the
+//! outcome.
 //!
 //! # The probe budget
 //!
-//! A single in-process compile must stay well inside the shared
-//! `support::PROBE_TIMEOUT` (30 s), because a probe killed at the bound is a test failure.
-//! Measured on this host against a debug `beam_rt`: `math.erl` ≈ 0.9 s, `ordsets.erl` ≈ 1.2 s,
-//! `erl_tar.erl` ≈ 4.8 s — whereas `string.erl` takes ≈ 20 s and `erl_lint.erl` ≈ 23 s, i.e.
-//! margins too thin for a loaded CI host (they carry the same invariant but are not worth the
-//! risk). The compilable module in [`PROBED`] is therefore one of the small ones, not
-//! `string.erl`/`json.erl`.
+//! A single in-process compile must stay inside its probe budget, because a probe killed at the
+//! bound is a test failure. The shared `support::PROBE_TIMEOUT` (30 s) is now too small for
+//! `erl_tar.erl`: once the bignum-segment fix let the full compile finish, a debug `beam_rt`
+//! needs well past 30 s on a loaded host, so this suite sizes its compile probes with
+//! [`COMPILE_PROBE_TIMEOUT`] instead. The small `ordsets.erl` probe stays ≈ 1.2 s; `string.erl`
+//! (≈ 20 s) and `erl_lint.erl` (≈ 23 s) are deliberately not probed — they carry the same
+//! invariant but were only marginally inside the old bound on a loaded CI host.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape
@@ -106,6 +108,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// The executable under test, exactly as the other contract suites drive it.
 const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
@@ -150,12 +153,9 @@ const PROBED: &[Probed] = &[
     Probed {
         source: "lib/stdlib/src/erl_tar.erl",
         module: "erl_tar",
-        today: "compiles on the oracle but NOT yet under this runtime (~4.8 s in process here; it \
-                crashes in `beam_core_to_ssa:function/2` because of the separate, out-of-scope \
-                bignum-in-a-narrow-bit-segment defect in the engine's `bs_create_bin` \
-                `\"integer\"` arm, `crates/beam_engine/src/families/bitstrings/create/mod.rs`) — \
-                its job is to show a compiler pass's own `Function: <name>/<arity>` diagnostic \
-                reaches the output",
+        today: "compiles cleanly under both runtimes now that the out-of-scope \
+                bignum-in-a-narrow-bit-segment defect is fixed; its full in-process compile is \
+                the slow probe this suite budgets with COMPILE_PROBE_TIMEOUT",
     },
 ];
 
@@ -186,15 +186,23 @@ impl Run {
     }
 }
 
-/// Runs `program args` under the shared bounded runner (`/dev/null` stdin, killed at
-/// `support::PROBE_TIMEOUT`), failing loudly when the probe could not be run at all.
+/// One in-process compile's budget. `erl_tar.erl` now compiles cleanly under `beam_rt`
+/// (the out-of-scope bignum-segment defect that made it fail early is fixed), so its full
+/// debug-runtime compile no longer fits the shared 30 s [`support::PROBE_TIMEOUT`]; 180 s
+/// leaves headroom on a loaded host.
+const COMPILE_PROBE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Runs `program args` bounded by [`COMPILE_PROBE_TIMEOUT`] (`/dev/null` stdin): a compile
+/// probe's runtime is the work being measured, not a hang guard. Fails loudly when the probe
+/// could not be run at all.
 fn run(program: &Path, args: &[&str]) -> Run {
-    let output: Output = support::run_bounded(program, args).unwrap_or_else(|| {
-        panic!(
-            "`{}` {args:?} could not be run to completion",
-            program.display()
-        )
-    });
+    let output: Output =
+        support::run_bounded_for(program, args, COMPILE_PROBE_TIMEOUT).unwrap_or_else(|| {
+            panic!(
+                "`{}` {args:?} could not be run to completion",
+                program.display()
+            )
+        });
     Run {
         code: output.status.code().unwrap_or(-1),
         out: output.stdout,
