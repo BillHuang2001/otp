@@ -409,6 +409,33 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         Ok(outcome)
     }
 
+    /// The **off-heap-aware** outcome door, forwarded and priced exactly like
+    /// [`call_bif_outcome`](ExecutionContext::call_bif_outcome).
+    ///
+    /// Forwarding reaches [`RuntimeContext`]'s own override, which threads the executing
+    /// machine's refc-binary handles into the copy-out source table instead of discarding
+    /// them — the same load-bearing reason
+    /// [`send_message_with_off_heap`](ExecutionContext::send_message_with_off_heap) is forwarded.
+    fn call_bif_outcome_with_off_heap(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+        off_heap: &[beam_alloc::RefcBinary],
+    ) -> Result<BifOutcome> {
+        let outcome = ExecutionContext::call_bif_outcome_with_off_heap(
+            self.inner,
+            module,
+            function,
+            arity,
+            args,
+            off_heap,
+        )?;
+        self.spend_if_returned(outcome);
+        Ok(outcome)
+    }
+
     /// The **in-machine outcome-aware** BIF door — the one the slice's machine actually reaches
     /// ([`wants_bif_in_machine`](ExecutionContext::wants_bif_in_machine) is `true`), so this is
     /// where a parked `erlang:port_command/2,3` meets the budget.

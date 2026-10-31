@@ -230,6 +230,28 @@ impl ExecutionContext for RuntimeContext<'_> {
         let value = self.call_bif(module, function, arity, args)?;
         Ok(self.take_bif_outcome(value))
     }
+    /// The **off-heap-aware** outcome door: [`Self::call_bif_outcome`] plus the executing
+    /// machine's refc-binary handles threaded into the dispatch.
+    ///
+    /// [`Machine::dispatch_bif_call`](beam_engine::Machine) takes this door on the plain
+    /// (non-in-machine) path, handing the running machine's
+    /// [`refc_binaries`](beam_engine::Machine::refc_binaries) slice through. The plain
+    /// [`Self::call_bif`] discards that slice (`&[]`), so a BIF result whose term windows an
+    /// engine-built refc binary would be flattened by the copy-out instead of sharing the
+    /// payload. This override routes the slice into the same
+    /// [`Self::call_bif_with_handles`] machinery the in-machine door uses, then folds the
+    /// suspend latch exactly as [`Self::call_bif_outcome`] does.
+    fn call_bif_outcome_with_off_heap(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+        off_heap: &[beam_alloc::RefcBinary],
+    ) -> Result<BifOutcome> {
+        let value = self.call_bif_with_handles(module, function, arity, args, off_heap)?;
+        Ok(self.take_bif_outcome(value))
+    }
     /// The engine's **cross-module call seam**
     /// ([`ExecutionContext::resolve_external_call`]): run a `call_ext*` callee's export **in
     /// the running machine** instead of recursing through [`Self::call_bif`].
