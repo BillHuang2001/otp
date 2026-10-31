@@ -48,7 +48,7 @@ Logical groups:
 `emit_block`'s family arm names every variant `crate::families::dispatch` claims and the core arms
 above do not: `put_tuple2`, `update_record`/`is_any_native_record`/`is_native_record`/
 `get_record_elements`/`get_record_elements_id`/`put_record`/`is_record_accessible`/`get_record_field`/
-`update_record_id`, `make_fun3`/`call_fun`/`call_fun2`/`apply`/`apply_last`,
+`update_record_id`, `make_fun3`/`apply`/`apply_last`,
 `try`/`catch`/`badmatch`/`case_end`/`try_case_end`/`badrecord`/`if_end`/`raise`/`try_case`/`try_end`/
 `catch_end`/`build_stacktrace`/`raw_raise`, `fmove`/`fconv`/`fadd`/`fsub`/`fmul`/`fdiv`/`fnegate`,
 `get_map_elements`/`has_map_fields`/`put_map_assoc`/`put_map_exact`, the `bs_*` bitstring family and
