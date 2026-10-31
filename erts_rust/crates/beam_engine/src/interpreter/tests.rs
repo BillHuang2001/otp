@@ -291,11 +291,11 @@ fn gc_bif_bif_error_follows_the_fail_label_or_raises() {
         .is_err());
 }
 
-/// An arity above [`STACK_ARGS`] takes the heap fallback; every operand must
-/// still arrive, in order.
+/// A wide operand marshal still delivers every operand, in order (the marshalled words
+/// now live on the Erlang stack tail, not a separate buffer).
 #[test]
-fn gc_bif_beyond_stack_args_uses_the_vec_fallback() {
-    const N: usize = STACK_ARGS + 1;
+fn gc_bif_delivers_every_operand_in_order() {
+    const N: usize = 3;
     let module = gc_bif_module(NO_FAIL, (0..N as u32).map(Operand::X).collect());
     let labels = build_label_map(&module);
     let mut machine = Machine::new();

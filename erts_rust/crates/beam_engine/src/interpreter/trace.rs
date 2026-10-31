@@ -170,25 +170,13 @@ impl Machine {
         }
     }
 
-    /// Build the `call` event's argument slice from `x(0..arity)` and report it.
+    /// Report the `call` event with the **live** `x(0..arity)` register slice.
     ///
-    /// The slice is marshalled through the machine's reusable argument scratch
-    /// buffer — the same one the wide **operand** (`gc_bif`/`bif`/`bif0`)
-    /// marshalling uses (the `call_ext*` register path marshals nothing — it hands
-    /// the live `x(0..arity)` slice) — cleared and given back empty, so a traced
-    /// call allocates nothing once the buffer has grown to fit its widest arity.
-    ///
-    /// This is a second, independent window in which argument words live outside the
-    /// root set (the buffer is `mem::take`n out of the machine, so neither
-    /// [`Machine::with_roots`](crate::machine::Machine::with_roots) nor
-    /// [`Machine::for_each_root`](crate::machine::Machine::for_each_root) sees it). It
-    /// is sound under exactly the invariant the `Machine::args_scratch` field doc states:
-    /// `trace_event` is a `&mut self` call on the **context** and is handed the machine
-    /// only where the seam says so, and no rooted door (`alloc_words_rooted`,
-    /// `ensure_heap_full`) can be crossed while the buffer is out. The buffer is
-    /// reinstated empty on every path (there is no `?` between the `take` and the
-    /// reinstall, and the `break` on an out-of-range register still reaches it), so a
-    /// traced run leaves the field exactly as it found it.
+    /// No copy is made: the slice is handed straight through to
+    /// [`ExecutionContext::trace_event`](crate::context::ExecutionContext::trace_event),
+    /// the same live register file the `call_ext*` register path hands to a BIF. An
+    /// out-of-range register (a malformed module) skips the event rather than raising —
+    /// the trace hook must never change a run's outcome.
     fn trace_call(
         &mut self,
         module_name: &str,
@@ -196,31 +184,15 @@ impl Machine {
         arity: u32,
         ctx: &mut dyn ExecutionContext,
     ) {
-        let mut scratch = std::mem::take(&mut self.args_scratch);
-        scratch.clear();
-        scratch.reserve(arity as usize);
-        let mut complete = true;
-        for index in 0..arity {
-            match self.x(index) {
-                Some(value) => scratch.push(value),
-                None => {
-                    // An out-of-range register index can only come from a malformed
-                    // module. Skip the event rather than raising: the trace hook
-                    // must never change a run's outcome.
-                    complete = false;
-                    break;
-                }
-            }
-        }
-        if complete {
-            ctx.trace_event(TraceEvent::Call {
-                module: module_name,
-                function: function_name,
-                arity,
-                args: &scratch,
-            });
-        }
-        scratch.clear();
-        self.args_scratch = scratch;
+        // An out-of-range register index can only come from a malformed module.
+        let Ok(args) = self.x_slice(arity) else {
+            return;
+        };
+        ctx.trace_event(TraceEvent::Call {
+            module: module_name,
+            function: function_name,
+            arity,
+            args,
+        });
     }
 }

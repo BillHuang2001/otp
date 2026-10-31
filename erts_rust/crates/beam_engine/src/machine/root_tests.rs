@@ -37,8 +37,10 @@
 //!   same machine state, so the two doors can never disagree about *what* is rooted.
 //! * **Parity of the two doors** — the mutable door enumerates the same root words, and a
 //!   write through it lands in the very slots the census reports (and is observed by the
-//!   census afterwards), while both doors keep the same `args_scratch` exclusion (the raw
-//!   operand-marshal `Vec`, never the live `call_ext*` register arguments).
+//!   census afterwards). Every marshalled BIF/trace argument word is now a root by
+//!   construction — the `call_ext*` register slice and the operand stack-tail slice both
+//!   live inside one of the three rooted files — so the two doors exclude no argument
+//!   buffer, only the raw `Vec` fields that are not part of the frozen root set.
 //!
 //! Plus the re-seat pin: a `with_roots` hand-off whose visitor **moves** the parked words
 //! leaves both supplied-trace latches holding the *moved* terms.
@@ -837,32 +839,16 @@ fn for_each_root_mut_writes_are_observed_by_for_each_root() {
     );
 }
 
-/// The `args_scratch` exclusion holds for the writable door, and an `Err`-returning visitor
-/// still leaves the machine's parking state exactly as it was.
+/// An `Err`-returning visitor still leaves the machine's parking state exactly as it was.
 ///
-/// `args_scratch` is now the **operand** marshal's scratch buffer (the `exec_bif` wide arm
-/// and the tracing hook), never a carrier of live `call_ext*` *argument* words: register
-/// arguments are handed to the host by reference from the live `x(0..arity)` slice
-/// ([`Machine::call_bif_named`]), so they are enumerated here — only the raw `Vec` field
-/// itself is outside every root door. The exclusion is pinned by **width and by address
-/// range**, not by comparing term words: the handed slices must cover exactly the X prefix
-/// plus the stack (with the armed loose words parked in it), and none of their byte ranges
-/// may overlap the `args_scratch` buffer. A failure in the middle of the hand-off must
-/// still truncate the parked loose words off the stack and re-seat every loose field; only
-/// the visitor's own error travels on.
+/// The writable door IS one `with_roots` hand-off, so its error path is the parking's: a
+/// failure in the middle of the hand-off must still truncate the parked loose words off the
+/// stack and re-seat every loose field; only the visitor's own error travels on. The walk
+/// covers exactly the X prefix and the stack (loose words parked in it) up to the failing
+/// slice, and never reaches the FR prefix.
 #[test]
-fn for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error() {
+fn for_each_root_mut_restores_the_parking_on_error() {
     let (mut machine, _) = roots_fixture();
-    let mut ctx = MinimalContext::new();
-    // A boxed term held **only** by `args_scratch`. (A word-level comparison against the
-    // handed slices would be a coincidence trap here: the fixture's own `MinimalContext` is
-    // dropped when it returns, so this context's arena can hand out the same addresses.)
-    let window = terms::make_tuple(&mut ctx, &[make_small(21)]).expect("a boxed tuple");
-    assert!(
-        pointer_bearing(window),
-        "the window's term must be relocatable"
-    );
-    machine.args_scratch.push(window);
 
     let x_live = machine.used_x_extent() as usize;
     let fr_live = machine.used_fr_extent() as usize;
@@ -874,16 +860,11 @@ fn for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error() {
     let loose_before = machine.loose_heap_terms();
     let armed = loose_before.iter().filter(|slot| slot.is_some()).count();
     assert_eq!(armed, Machine::LOOSE_HEAP_TERMS, "the fixture arms them all");
-    let word_bytes = std::mem::size_of::<Eterm>();
-    let window_start = machine.args_scratch.as_ptr() as usize;
-    let window_end = window_start + machine.args_scratch.len() * word_bytes;
 
     let mut words: Vec<Eterm> = Vec::new();
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut handed = 0usize;
     let outcome = machine.for_each_root_mut(&mut |slice| {
         handed += 1;
-        ranges.push((slice.as_ptr() as usize, slice.len() * word_bytes));
         words.extend_from_slice(slice);
         if handed == 2 {
             // Fail on the stack slice — the one carrying the parked loose terms.
@@ -904,24 +885,12 @@ fn for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error() {
         "the walk covers the X prefix and the stack (loose words parked in it) and nothing \
          else — the failed walk never reached the FR prefix"
     );
-    for &(start, len) in &ranges {
-        assert!(
-            start + len <= window_start || window_end <= start,
-            "no handed slice may overlap the call_bif argument window ({start:#x}..{:#x})",
-            start + len
-        );
-    }
-    assert_eq!(machine.args_scratch.len(), 1);
-    assert_eq!(
-        machine.args_scratch[0], window,
-        "the argument window is untouched by the walk"
-    );
     let mut census = Vec::new();
     machine.for_each_root(|term| census.push(term));
     assert_eq!(
         census.len(),
         4 + Machine::LOOSE_HEAP_TERMS,
-        "the census agrees: `args_scratch` contributes no root beyond the fixture's own"
+        "the census agrees on the fixture's own roots plus the armed loose terms"
     );
     assert_eq!(
         machine.stack_mut().len(),

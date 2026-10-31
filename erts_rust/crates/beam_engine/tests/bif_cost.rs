@@ -40,10 +40,9 @@
 //!    from the [`ImportTarget`] table (`Box<str>` module, `Box<str>` function,
 //!    `u32` arity). On a miss it falls back to the uncached `import_target` (two
 //!    atom-table lookups);
-//! 3. it marshals the **operands**: an arity `<= STACK_ARGS` (= 2) fills a fixed
-//!    `[Eterm; 2]` **stack array** (no `Vec`); a wider arity reuses
-//!    `Machine::args_scratch` through `dispatch_wide` (no allocation after the
-//!    first such call). Each argument is one `read_operand` call;
+//! 3. it marshals the **operands**: each argument is one `read_operand` call, and the
+//!    marshalled words are written **onto the Erlang stack tail** (`dispatch_operand_bif`,
+//!    no detached `Vec`/stack array);
 //! 4. it calls `ctx.call_bif(..)` - a `&mut dyn ExecutionContext` **vtable**
 //!    dispatch into `src/context.rs` (the boundary crossing itself);
 //! 5. on `Ok`, `exec_bif` writes the result with `write_operand(dst, value)`.
@@ -334,8 +333,8 @@ fn bif0_module(name: &str, ops: usize) -> (Module, Atom) {
 
 /// `ops` chained `bif`s of `arity` register arguments `x(0)..x(arity)`.
 ///
-/// Arity `<= 2` marshals through the interpreter's fixed stack array; a wider
-/// arity goes through the machine's reusable `args_scratch` buffer. The function
+/// Every arity marshals its operands onto the Erlang stack tail (`dispatch_operand_bif`);
+/// there is no fixed stack array / detached `args_scratch` split any more. The function
 /// is exported at `arity` so `run_export` seeds that many registers.
 fn wide_bif_module(name: &str, arity: u8, ops: usize) -> (Module, Atom) {
     let mut module = Module::default();
@@ -635,8 +634,8 @@ fn bench_gcbif_arith() -> Report {
     report
 }
 
-/// The **arity-9** BIF path with the trivial hook: the wide marshalling path
-/// (`args_scratch` reuse, no per-call allocation). Priced against the arity-0 and
+/// The **arity-9** BIF path with the trivial hook: the operand marshalling onto the
+/// Erlang stack tail (no per-call allocation). Priced against the arity-0 and
 /// arity-2 rows, the slope with arity is the per-argument `read_operand` cost.
 fn bench_wide_trivial() -> Report {
     const WIDE: u8 = 9;

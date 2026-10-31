@@ -18,20 +18,27 @@
 //
 // %CopyrightEnd%
 
-//! **The `call_ext*` BIF argument slice is the LIVE register file — the GC-rooting fix.**
+//! **Every BIF argument slice is handed the host from INSIDE the frozen root set.**
 //!
-//! The defect this suite pins: [`Machine::call_bif_named`] used to **copy** the
-//! `call_ext*` argument registers into a stack array (`STACK_ARGS` words) or a detached
-//! `args_scratch` Vec, and hand the host that copy. The copy is in **no root set** (the
-//! dispatch door is `&self`, so the machine's collecting doors are not crossed), and a
-//! nested collection the host drives itself would relocate the real `x(0..arity)`
-//! registers while the BIF kept reading a stale, freed copy — the khepri `projections`
-//! segfault shape (`beam_term::list::car` on a stranded cons cell).
+//! This suite pins the two GC-rooting fixes on BIF argument marshalling:
 //!
-//! The fix: `call_bif_named` now hands the host the **live** `x(0..arity)` slice by
-//! reference ([`Machine::x_slice`]), never a copy. That slice IS inside the machine's
-//! frozen [`RootSet`](beam_engine::context::RootSet) (`x[0..used_x_extent]`), so a
-//! collection relocates the very words the BIF reads.
+//! * The **`call_ext*` register path** ([`Machine::call_bif_named`]) used to **copy** the
+//!   argument registers into a stack array or a detached `args_scratch` Vec and hand the
+//!   host that copy. The copy was in **no root set** (the dispatch door is `&self`, so the
+//!   machine's collecting doors are not crossed), and a nested collection the host drives
+//!   itself would relocate the real `x(0..arity)` registers while the BIF kept reading a
+//!   stale, freed copy. It now hands the host the **live** `x(0..arity)` slice by reference
+//!   ([`Machine::x_slice`]), never a copy.
+//!
+//! * The **`gc_bif`/`bif`/`bif0` operand path** ([`Machine::exec_bif`]'s marshalling arm)
+//!   had the same defect: it marshalled the operand terms into a detached stack `buf` or a
+//!   detached `args_scratch` Vec outside the root set. It now materializes them **onto the
+//!   Erlang stack tail** — a location every root door hands over in full — so a collecting
+//!   allocation the host drives during dispatch relocates the very words the BIF reads.
+//!
+//! The first shape is the khepri `projections` segfault (`beam_term::list::car` on a
+//! stranded cons cell); the second is the same defect's operand half, which produced the
+//! D1c `'exit <structured reason>'` placeholder.
 //!
 //! # Why these tests prove relocation, not just pointer equality
 //!
@@ -41,21 +48,20 @@
 //! `&Machine` would be UB). These tests therefore prove the two links of the equivalent
 //! guarantee, which is stronger because it does not rely on the dispatch internals:
 //!
-//! 1. **The relocation rewrites the register file in place.** A term is built on the
-//!    arena, rooted in `x(0)`, and a real Tier-B [`MinimalContext::reclaim_heap`] is
-//!    driven through [`Machine::for_each_root_mut`] — the same door a collecting host
-//!    uses. The test observes `x(0)` change address while its shape is preserved, so the
-//!    `x` register-file slots are provably the relocation target.
-//! 2. **The BIF reads those same slots.** The in-machine door asserts
-//!    `args.as_ptr() == machine.x_slice(arity).as_ptr()` — the slice handed to the host
-//!    IS the live register file, not a marshalled buffer. A relocation therefore updates
-//!    the very words the BIF reads.
+//! 1. **The relocation rewrites the source slot in place.** A term is built on the arena,
+//!    rooted in `x(0)`, and a real Tier-B [`MinimalContext::reclaim_heap`] is driven
+//!    through [`Machine::for_each_root_mut`] — the same door a collecting host uses. The
+//!    test observes `x(0)` change address while its shape is preserved.
+//! 2. **The BIF reads a slot the root set covers.** The in-machine door asserts the handed
+//!    slice points INTO a rooted location: `args.as_ptr() == machine.x_slice(arity).as_ptr()`
+//!    for the register path, and `args` inside `machine.stack()` for the operand path. A
+//!    relocation therefore updates the very words the BIF reads.
 //!
-//! The pointer-equality assertion is the regression guard: before the fix `args` pointed
-//!   at a stack-local `buf` (narrow) or a detached `args_scratch` (wide) — a different
-//!   allocation — so it fails. After the fix it points at `self.x` and passes. A stale
-//!   read is never fabricated: the BIF is handed the **already-relocated** term and must
-//!   observe its intact structure.
+//! The pointer-location assertion is the regression guard: before the fixes `args` pointed
+//!   at a stack-local `buf` or a detached `args_scratch` — a different allocation — so it
+//!   fails. After the fixes it points at `self.x` (register path) or the stack tail
+//!   (operand path) and passes. A stale read is never fabricated: the BIF is handed the
+//!   **already-relocated** term and must observe its intact structure.
 //!
 //! # Running it
 //!
@@ -68,7 +74,7 @@ use std::collections::BTreeMap;
 
 use beam_common::Result;
 use beam_engine::{BifOutcome, ExecutionContext, Machine, MinimalContext};
-use beam_loader::{Export, Function, Import, ImportRef, Instr, Label, Module};
+use beam_loader::{Export, Function, Import, ImportRef, Instr, Label, Module, NO_FAIL, Operand};
 use beam_term::{
     arityval, is_nil, is_small, list_val, make_arityval, make_list, make_small, make_tuple,
     primary_tag, signed_value, tuple_val, Atom, Eterm, PrimaryTag, NIL,
@@ -233,6 +239,86 @@ impl ExecutionContext for RelocatingProbe {
     }
 }
 
+/// A [`ExecutionContext`] whose in-machine BIF door asserts the handed argument slice
+/// lives **inside the machine's Erlang stack** — the rooted location the operand path
+/// marshals onto — and records `shape(args[0])`. Identical to [`RelocatingProbe`] except
+/// for *which* rooted location the pointer guard pins (stack for the operand path, the
+/// live register file for the `call_ext*` path).
+struct OperandRootingProbe {
+    arena: MinimalContext,
+    observed: Option<String>,
+}
+
+impl OperandRootingProbe {
+    fn new() -> Self {
+        Self {
+            arena: MinimalContext::new(),
+            observed: None,
+        }
+    }
+}
+
+impl ExecutionContext for OperandRootingProbe {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        _arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        assert_eq!((module, function), (BIF_MODULE, BIF_FUNCTION));
+        self.observed = args.first().map(|arg| shape(*arg));
+        Ok(args.first().copied().unwrap_or(NIL))
+    }
+
+    fn wants_bif_in_machine(&self) -> bool {
+        true
+    }
+
+    fn call_bif_in_machine_outcome(
+        &mut self,
+        machine: &Machine,
+        _entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        assert_eq!((module, function), (BIF_MODULE, BIF_FUNCTION));
+        assert_eq!(args.len(), arity as usize, "the operand slice is the full arity");
+        // THE regression guard: the operand path marshals onto the Erlang stack tail.
+        // The slice the host is handed must be INSIDE the machine's stack — a location
+        // every root door hands over in full — never a detached `buf`/`args_scratch`
+        // copy the pre-fix marshalling held outside the root set (and which a
+        // collecting allocation during dispatch would strand).
+        let stack = machine.stack();
+        let word = std::mem::size_of::<Eterm>();
+        let stack_span = (stack.as_ptr() as usize)..(stack.as_ptr() as usize + stack.len() * word);
+        let args_span = (args.as_ptr() as usize)..(args.as_ptr() as usize + args.len() * word);
+        assert!(
+            stack_span.start <= args_span.start && args_span.end <= stack_span.end,
+            "the in-machine operand slice must be INSIDE the machine's Erlang stack \
+             (a rooted location), not a detached marshalling buffer"
+        );
+        self.observed = args.first().map(|arg| shape(*arg));
+        Ok(BifOutcome::Return(args.first().copied().unwrap_or(NIL)))
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.arena.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.arena.alloc_words(n)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The fixture
 // ---------------------------------------------------------------------------
@@ -293,13 +379,31 @@ fn call_ext_module(arity: u32) -> (Module, Atom) {
     finish_module(module, "bifroot_call", arity, body)
 }
 
+/// `bifroot_gc/arity` = `label 1 | gc_bif arity host:id/arity (NO_FAIL) | return`,
+/// whose `arity` operands are all `X(0..arity)` so `args[0]` is the boxed term under
+/// test and the marshalled slice still spans the full arity.
+fn gcbif_module(arity: u32) -> (Module, Atom) {
+    let mut module = Module::default();
+    let import = intern_import(&mut module, arity);
+    let operands: Vec<Operand> = (0..arity).map(Operand::X).collect();
+    let body = vec![Instr::GcBif {
+        arity: arity as u8,
+        bif: import,
+        fail: NO_FAIL,
+        live: arity,
+        args: operands,
+        dst: Operand::X(0),
+    }];
+    finish_module(module, "bifroot_gc", arity, body)
+}
+
 // ---------------------------------------------------------------------------
 // (1) a list argument — the khepri `projections` segfault shape
 // ---------------------------------------------------------------------------
 
 #[test]
 fn a_call_ext_list_argument_is_read_from_the_live_register_file_and_survives_relocation() {
-    // Both sides of `STACK_ARGS = 2`: arity 1 is the narrow path, arity 3 the wide path.
+    // A single-register and a multi-register arity, both the zero-copy register hand-off.
     for arity in [1u32, 3] {
         let mut ctx = RelocatingProbe::new();
 
@@ -383,6 +487,108 @@ fn a_call_ext_tuple_argument_is_read_from_the_live_register_file_and_survives_re
 
     // Dispatch `call_ext 1 host:id/1`; the BIF reads x(0) as a boxed tuple.
     let (module, function) = call_ext_module(1);
+    let mut dispatch_machine = Machine::new();
+    let value = dispatch_machine
+        .run_export(&module, function, 1, &[moved], &mut ctx)
+        .expect("the identity BIF returns");
+    assert_eq!(value, moved, "the identity BIF returns x(0)");
+    assert_eq!(
+        ctx.observed.as_deref(),
+        Some(expected.as_str()),
+        "the BIF observed the intact, already-relocated nested tuple"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (3) the OPERAND path — a `gc_bif` argument marshalled onto the stack tail
+// ---------------------------------------------------------------------------
+
+/// The operand marshalling (the fixed defect) must place a boxed argument **on the
+/// Erlang stack tail** — a location every root door hands over in full — so a
+/// collecting allocation the host drives during dispatch relocates the very word the
+/// BIF reads. The pointer guard in [`OperandRootingProbe`] fails against the pre-fix
+/// detached `buf`/`args_scratch` marshalling (which was outside the root set).
+#[test]
+fn a_gc_bif_list_operand_is_rooted_on_the_stack_and_survives_relocation() {
+    for arity in [1u32, 3] {
+        let mut ctx = OperandRootingProbe::new();
+
+        // Build a cons list of small ints on the arena and root it in x(0).
+        let list = list_of(
+            &mut ctx.arena,
+            &[make_small(1), make_small(2), make_small(3)],
+        );
+        let expected = shape(list);
+
+        // Drive a REAL Tier-B relocation through the machine's writable root door, so
+        // the list's cons cells move while the operand source register is rewritten.
+        let mut machine = Machine::new();
+        machine.x_mut()[0] = list;
+        let report = ctx
+            .arena
+            .reclaim_heap(|reloc| {
+                machine.for_each_root_mut(&mut |slots| reloc.forward_roots(slots))
+            })
+            .expect("the reclaim copies the machine's root set")
+            .expect("there was work to do");
+        assert_eq!(report.live_words, 6, "three cons cells, two words each");
+        let moved = machine.x(0).expect("x(0) is inside the register file");
+        assert_ne!(moved, list, "the relocation moved the list");
+        assert_eq!(shape(moved), expected, "the list is intact after relocation");
+
+        // Dispatch `gc_bif arity host:id/arity` whose operands are `X(0..arity)`; the
+        // probe's in-machine door asserts the handed slice is inside the machine's
+        // Erlang stack and records what the BIF observed for `args[0]`.
+        let (module, function) = gcbif_module(arity);
+        let mut args = vec![moved];
+        for n in 2..=arity {
+            args.push(make_small(i64::from(n)));
+        }
+        let mut dispatch_machine = Machine::new();
+        let value = dispatch_machine
+            .run_export(&module, function, arity, &args, &mut ctx)
+            .expect("the identity BIF returns");
+        assert_eq!(value, moved, "arity {arity}: the identity BIF returns x(0)");
+        assert_eq!(
+            ctx.observed.as_deref(),
+            Some(expected.as_str()),
+            "arity {arity}: the BIF observed the intact, already-relocated list"
+        );
+    }
+}
+
+/// The same pointer guard for the D1c shape — a nested boxed tuple handed to a `gc_bif`
+/// operand — proving the operand marshalling roots boxed structure, not just cons cells.
+#[test]
+fn a_gc_bif_tuple_operand_is_rooted_on_the_stack_and_survives_relocation() {
+    let mut ctx = OperandRootingProbe::new();
+
+    // `{1, {2, 3}}` — the boxed structure a relocation moves.
+    let inner = tuple_of(&mut ctx.arena, &[make_small(2), make_small(3)]);
+    let tuple = tuple_of(&mut ctx.arena, &[make_small(1), inner]);
+    let expected = shape(tuple);
+    assert_eq!(expected, "{#1,{#2,#3}}");
+
+    // Root + relocate through the machine's writable root door.
+    let mut machine = Machine::new();
+    machine.x_mut()[0] = tuple;
+    let report = ctx
+        .arena
+        .reclaim_heap(|reloc| {
+            machine.for_each_root_mut(&mut |slots| reloc.forward_roots(slots))
+        })
+        .expect("the reclaim copies the machine's root set")
+        .expect("there was work to do");
+    assert_eq!(
+        report.live_words, 6,
+        "the inner tuple is 3 words and the outer tuple is 3 words"
+    );
+    let moved = machine.x(0).expect("x(0) is inside the register file");
+    assert_ne!(moved, tuple, "the relocation moved the tuple");
+    assert_eq!(shape(moved), expected, "the nested tuple is intact after relocation");
+
+    // Dispatch `gc_bif 1 host:id/1`; the BIF reads x(0) as a boxed tuple operand.
+    let (module, function) = gcbif_module(1);
     let mut dispatch_machine = Machine::new();
     let value = dispatch_machine
         .run_export(&module, function, 1, &[moved], &mut ctx)

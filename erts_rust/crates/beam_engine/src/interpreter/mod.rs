@@ -94,8 +94,6 @@ use beam_loader::{Instr, NO_FAIL, Operand};
 use crate::machine::Machine;
 #[cfg(test)]
 use crate::Step;
-#[cfg(test)]
-use self::bif::STACK_ARGS;
 
 // The label/import index was **lifted to the image it describes**: `beam_loader`'s
 // `labels` module now owns `LabelMap`, the whole-module `build_label_map` and the

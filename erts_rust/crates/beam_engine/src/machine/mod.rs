@@ -75,7 +75,8 @@
 //!   ([`Machine::for_each_root`], the read-only pointer-bearing census, and its writable
 //!   twin [`Machine::for_each_root_mut`]): coverage of every rooted file plus the loose
 //!   terms, the immediate filter, agreement with the [`RootSet`] hand-off, and the parity
-//!   between the two doors (same root words, same slots, shared `args_scratch` exclusion).
+//!   between the two doors (same root words, same slots, no root-buffer exclusion — every
+//!   marshalled BIF/trace argument now lives inside one of the three rooted files).
 //! * `deadline_tests` — the parked-`receive` deadline driven to completion on a real
 //!   compiled module (`erlc`) and cross-checked against the system `erl`, including the
 //!   nested / blocking run path a fired `after T` has to work through.
@@ -629,39 +630,6 @@ pub struct Machine {
     /// [`Machine::retain_refc_binaries`] drops every entry whose base no longer names a
     /// live retained payload.
     pub(crate) writable_payloads: Vec<(usize, usize)>,
-    /// A **reusable argument scratch buffer** for the rare wide **operand** marshal.
-    ///
-    /// Only [`Machine::exec_bif`]'s wide operand path (`gc_bif`/`bif`/`bif0` with more
-    /// than [`STACK_ARGS`](crate::interpreter::bif::STACK_ARGS) operands) and the
-    /// tracing hook fill this buffer. The `call_ext*`/served-local-call register path
-    /// ([`Machine::call_bif_named`]) no longer marshals through it — it hands the host
-    /// the live `x(0..arity)` register slice by reference, so its argument words stay
-    /// rooted for the whole dispatch.
-    ///
-    /// # It is not a root — and that is sound because its words are never re-read
-    ///   after a collection
-    ///
-    /// The dispatcher [`std::mem::take`]s the buffer out of the machine for the whole
-    /// wide dispatch and gives it back **empty** (only the capacity survives), so for
-    /// the duration the marshalled **operand** words are in no root set: neither
-    /// [`Machine::with_roots`]'s hand-off nor [`Machine::for_each_root`]'s walk can see
-    /// them. That is sound because those copied words are **never read again once the
-    /// BIF returns**: the BIF-error funnel re-reads its operands from their rooted
-    /// sources (`read_operand` against the register file / the literal area), and
-    /// arithmetic/guard BIFs do not collect during dispatch. [`Machine::dispatch_bif_call`]
-    /// is `&self`, so the **engine** itself cannot cross a rooted door while the buffer
-    /// is out; a nested collection the host drives must re-read the rooted registers,
-    /// never these copied operand words.
-    ///
-    /// # Left empty on every exit path
-    ///
-    /// [`Machine::dispatch_wide`] clears the buffer and reinstalls it before returning;
-    /// it has **no `?`** between the `take` and the reinstall (the marshalling outcome is
-    /// only *stored*, and the BIF outcome is wrapped rather than propagated), so a bad
-    /// operand, a BIF failure, a guard failure and a suspension all leave the field
-    /// empty. [`Machine::reset`](crate::machine::Machine::reset) therefore has nothing to
-    /// clear, and the buffer never keeps a term alive.
-    pub(crate) args_scratch: Vec<Eterm>,
     /// The **per-run tracing gate** (contract A.8): the cached answer of
     /// [`ExecutionContext::trace_enabled`](crate::context::ExecutionContext::trace_enabled)
     /// for the run currently executing.
@@ -973,7 +941,6 @@ impl Machine {
             raise_supplied_term_verbatim: false,
             refc_binaries: Vec::new(),
             writable_payloads: Vec::new(),
-            args_scratch: Vec::new(),
             trace_on: false,
             reduce_on: false,
             bif_in_machine_on: false,
@@ -1024,6 +991,14 @@ impl Machine {
     #[inline]
     pub fn stack_mut(&mut self) -> &mut [Eterm] {
         &mut self.stack
+    }
+
+    /// The whole Erlang stack as a shared slice — the `&self` twin of
+    /// [`Machine::stack_mut`], for a reader (a BIF-argument-marshalling test, the trace
+    /// hook) that must observe which words are live without taking the mutable hand-off.
+    #[inline]
+    pub fn stack(&self) -> &[Eterm] {
+        &self.stack
     }
 
     /// Run `f` with the engine's **whole live root set** handed over as a
@@ -1287,15 +1262,12 @@ impl Machine {
     ///
     /// # What it does NOT cover
     ///
-    /// **`args_scratch`** — the wide **operand** marshal (the `exec_bif` wide arm and
-    /// the tracing hook) `mem::take`s it *out* of the machine for the whole dispatch, so
-    /// it is unreachable from any door and is not enumerated here. That is sound because
-    /// those marshalled **operand** words are never re-read after a collection (the
-    /// raise funnel re-reads its operands from their rooted sources); the `call_ext*`
-    /// register path ([`Machine::call_bif_named`]) marshals nothing — it hands the host
-    /// the live `x(0..arity)` slice, which IS enumerated here.
-    /// `class_atoms` is not a gap: those are immediates. A foreign (`literal`-area) term
-    /// and any host-side structure holding engine terms are likewise outside this walk.
+    /// `class_atoms` (immediates), a foreign (`literal`-area) term and any host-side
+    /// structure holding engine terms are outside this walk. Every BIF/trace argument word
+    /// the engine marshals is now a root by construction: the `call_ext*` register path
+    /// ([`Machine::call_bif_named`]) hands the host the live `x(0..arity)` slice and the
+    /// operand path ([`Machine::exec_bif`]) parks its marshalled words at the **stack
+    /// tail**, both of which this walk enumerates.
     ///
     /// # Why it is read-only
     ///
@@ -1312,8 +1284,8 @@ impl Machine {
     /// enumeration sets, `for_each_root_mut_relocates_the_very_slots_for_each_root_reports`
     /// and `for_each_root_mut_writes_are_observed_by_for_each_root` prove a write through
     /// the writable door lands in the very slots this walk reports, and
-    /// `for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error` pins the
-    /// shared `args_scratch` exclusion. A change to either door that is not mirrored in the
+    /// `for_each_root_mut_restores_the_parking_on_error` pins the shared parking
+    /// restoration on a visitor's `Err`. A change to either door that is not mirrored in the
     /// other fails one of them.
     pub fn for_each_root(&self, mut f: impl FnMut(Eterm)) {
         let x_live = self.used_x_extent() as usize;
@@ -1397,12 +1369,12 @@ impl Machine {
     ///
     /// # What it does NOT cover
     ///
-    /// **`args_scratch`**, for the reason stated on [`Machine::for_each_root`]: the wide
-    /// **operand** marshal `mem::take`s it *out* of the machine for the whole dispatch, and
-    /// its marshalled words are never re-read after a collection. The `call_ext*` register
-    /// path marshals nothing — the host is handed the live `x(0..arity)` slice, which IS a
-    /// root. `class_atoms` (immediates), a foreign (`literal`-area) term and any host-side
-    /// structure holding engine terms are likewise outside, identically to the census.
+    /// `class_atoms` (immediates), a foreign (`literal`-area) term and any host-side
+    /// structure holding engine terms are outside this walk, identically to the census.
+    /// Every BIF/trace argument word the engine marshals is a root by construction — the
+    /// `call_ext*` register path ([`Machine::call_bif_named`]) hands the live `x(0..arity)`
+    /// slice and the operand path ([`Machine::exec_bif`]) parks its marshalled words at the
+    /// stack tail — so a collecting visitor rewrites the very words the BIF reads.
     ///
     /// # Errors
     ///

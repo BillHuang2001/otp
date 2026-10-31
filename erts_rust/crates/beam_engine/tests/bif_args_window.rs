@@ -19,28 +19,28 @@
 // %CopyrightEnd%
 
 //! **The BIF dispatch window is `&self`: the ENGINE crosses no rooted door during a
-//! register-marshalled dispatch, and the argument slice is the live register file.**
+//! register-marshalled dispatch, and the argument slice is a rooted location.**
 //!
 //! # The window
 //!
 //! A `call_ext*` BIF dispatch hands the host the **live** `x(0..arity)` register slice by
 //! reference ([`beam_engine::Machine::call_bif_named`] → [`beam_engine::Machine::x_slice`])
-//! — no copy, no `args_scratch` marshal. The slice is therefore already inside the
-//! machine's frozen [`RootSet`](beam_engine::context::RootSet), so a collection that
-//! relocates the register file relocates the very words the BIF reads.
+//! — no copy, no detached marshal. The slice is therefore already inside the machine's
+//! frozen [`RootSet`](beam_engine::context::RootSet), so a collection that relocates the
+//! register file relocates the very words the BIF reads.
 //!
-//! The operand path ([`beam_engine::Machine::exec_bif`], a `gc_bif`/`bif`/`bif0`) still
-//! marshals its **operands** through a fixed stack array (`EMPTY_ARGS`, [`STACK_ARGS`] = 2
-//! words) and a wider one through the machine's reusable `args_scratch`, which
-//! `Machine::dispatch_wide` `mem::take`s **out of the machine** for the whole dispatch
-//! and gives back empty. Those marshalled operand words are never re-read after a
-//! collection — the BIF-error funnel re-reads its operands from their rooted sources.
+//! The operand path ([`beam_engine::Machine::exec_bif`], a `gc_bif`/`bif`/`bif0`)
+//! materializes its **operands** **onto the Erlang stack tail** — inside the whole
+//! `stack` every root door hands over in full — so a collection the host drives during
+//! dispatch relocates the very words the BIF reads (there is no detached `args_scratch`
+//! or fixed stack array any more).
 //!
 //! `Machine::dispatch_bif_call` takes **`&self`**, so the host never gets the machine
 //! mutably from the dispatch itself — the ENGINE therefore makes **zero**
 //! rooted-allocation / heap-admission calls for the duration, which is exactly what this
 //! suite pins. (A nested collection the host drives through its own rooted door is fine
-//! and expected — the register slice is rooted, so it is relocated in place.)
+//! and expected — both the register slice and the stack-tail operand slice are rooted,
+//! so they are relocated in place.)
 //!
 //! # What a future change must not break
 //!
@@ -48,8 +48,9 @@
 //!   Machine` from the dispatch itself;
 //! * `call_bif_named` keeps handing the host the **live** `x(0..arity)` slice (never a
 //!   copied buffer);
-//! * the operand marshalling helpers (`exec_bif`, `dispatch_wide`) never re-read a copied
-//!   operand word after a collection — the raise funnel re-reads from rooted sources;
+//! * the operand marshalling helper (`dispatch_operand_bif`) keeps materializing its
+//!   operand words **onto the stack tail** — never into a detached buffer outside the
+//!   root set;
 //! * `ExecutionContext::alloc_words` — the only heap door a BIF can legally reach, and
 //!   the one the marshalling uses for a non-small integer operand — stays
 //!   non-collecting.
@@ -289,8 +290,7 @@ fn finish_module(mut module: Module, name: &str, arity: u32, body: Vec<Instr>) -
 /// A plain `call_ext` (never `call_ext_last`), so the module keeps exactly one import,
 /// one entry label and one BIF dispatch at every arity. The register path marshals
 /// **nothing** at any arity: the host is handed the live `x(0..arity)` register slice by
-/// reference, so the two arities either side of `STACK_ARGS` prove the hand-off is
-/// uniform.
+/// reference, so the two arities prove the hand-off is uniform.
 fn call_ext_module(arity: u32) -> (Module, Atom) {
     let mut module = Module::default();
     let import = intern_import(&mut module, arity);
@@ -313,7 +313,8 @@ fn test_heap_module() -> (Module, Atom) {
     finish_module(module, "bifwindow_heap", 0, body)
 }
 
-/// The narrow and wide arities either side of `STACK_ARGS = 2`.
+/// A narrow and a wide arity, to exercise both the single-register and the multi-register
+/// hand-off shapes (the register path is a uniform zero-copy slice at every arity).
 const NARROW_ARITY: u32 = 2;
 const WIDE_ARITY: u32 = 5;
 

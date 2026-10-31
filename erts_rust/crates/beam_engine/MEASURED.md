@@ -52,7 +52,7 @@ The synthetic probe rows prove a variant *executes*; this suite proves it on **r
 
 ## Measured (engine-side per-BIF-call boundary -- `tests/bif_cost.rs`)
 `... -p beam_engine --test bif_cost -- --nocapture` isolates the ENGINE's side of a BIF call:
-- arity-2 `gc_bif` (the `STACK_ARGS` stack-array path, trivial hook): **11-12 ns**; arity-0 `bif0` **7.5-11**; arity-9 (the reused `args_scratch` wide path) **44-50** -> ~**4.2 ns per argument**; `test_heap` (one `ensure_heap` vtable call + root-set slice) **1.7-2.4 ns**.
+- arity-2 `gc_bif` (the stack-tail operand path, trivial hook): **11-12 ns**; arity-0 `bif0` **7.5-11**; arity-9 (the stack-tail operand path) **44-50** -> ~**4.2 ns per argument**; `test_heap` (one `ensure_heap` vtable call + root-set slice) **1.7-2.4 ns**.
 - `&mut dyn ExecutionContext::call_bif` round trip (trivial hook, 2 args) **~6.0 ns** (about half the arity-2 figure); `Module::atom_table.lookup` **~24 ns** / `Module::atom_name` **~1.4 ns** bound the uncached import fallback.
 - **Allocation-free per call** (counting-global-allocator proof): 2048 and 4096 `gc_bif`s both give 4 allocations / 71 bytes per run.
 - **Attribution:** the engine's own side is **~11-12 ns (<= 0.15%)** of the runtime's **~10.5 us** per registered BIF call, so **~99.85% is HOST-side** (`beam_rt`'s `ExecutionContext::call_bif`).
