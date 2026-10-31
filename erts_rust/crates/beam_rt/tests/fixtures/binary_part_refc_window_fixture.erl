@@ -30,9 +30,12 @@
 %% `-eval` route's grown-capacity accumulator, which reports 2050.
 -module(binary_part_refc_window_fixture).
 
--export([go/0]).
+-export([go/0, parent/0]).
 
 go() ->
     B = <<"z",(binary:copy(<<255>>,1024))/binary>>,
     C = binary:part(B, 1, 510),
     {byte_size(C), binary:referenced_byte_size(C)}.
+
+parent() ->
+    <<"z",(binary:copy(<<255>>,1024))/binary>>.
