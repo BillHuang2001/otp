@@ -427,9 +427,11 @@ impl Args<'_> {
 /// or `None` for the empty-list location; `cause` is the host's `cause` value when
 /// [`extension`]'s [`cause_key`](Extension::cause_key) is `Some`.
 ///
-/// The whole graph is **one** rooted reservation, sized from metadata only —
+/// The whole graph is **one** rooted reservation, sized before allocating —
 /// `2 * argc` words for the argument list (one cons cell per argument), `5` for the
-/// item tuple, and [`Extension::words`] more when the location carries the extension.
+/// item tuple, [`Extension::words`] more when the location carries the extension, and
+/// the [`terms::deep_copy_budget`] of every argument (so each argument's boxed
+/// subgraph is **self-contained** inside the reservation and moves with the item).
 /// Children are written before parents, in that order, and every argument is read
 /// **after** the reservation (the frozen reserve → read → write discipline: a moving
 /// collector may run under it).
@@ -437,7 +439,9 @@ impl Args<'_> {
 /// An argument that cannot be read is **not** a runtime value (it comes from the
 /// instruction or from the BIF's declared arity), so the honest answer is
 /// `Ok(None)` — synthesize nothing and keep the raise as it was — never a
-/// fabricated `[]` in that slot.
+/// fabricated `[]` in that slot. The same decline covers an argument whose subgraph
+/// cannot be deep-copied into the reservation (a match context, or a sizing/copy
+/// failure): the raise stays unmodified.
 fn carve(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
@@ -448,7 +452,21 @@ fn carve(
     args: Args<'_>,
 ) -> Result<Option<Eterm>> {
     let argc = args.len();
-    let total = 2 * argc + ITEM_WORDS + extension.map_or(0, |ext| ext.words());
+    // Sizing pass, before the reservation: the deep-copy budget must be part of the
+    // single rooted reservation. The argument words read here are used only for their
+    // size (an `Operand::Integer` read may materialize a bignum through the unrooted
+    // seam, which never collects); they are discarded and re-read after the reserve.
+    let mut copy_budget = 0usize;
+    for index in 0..argc {
+        let Ok(value) = args.read(machine, ctx, index) else {
+            return Ok(None);
+        };
+        let Some(words) = terms::deep_copy_budget(value) else {
+            return Ok(None);
+        };
+        copy_budget += words;
+    }
+    let total = 2 * argc + ITEM_WORDS + extension.map_or(0, |ext| ext.words()) + copy_budget;
     // A host that cannot serve the reservation — a minimal embedding host with no
     // `alloc_words` at all, or a genuinely exhausted heap — must **not** have the
     // BIF's own raise replaced by this marshalling failure (the one outcome the
@@ -483,11 +501,16 @@ fn carve(
         }
         None => NIL,
     };
-    // Post-collection read: the BIF's real arguments, in order.
+    // Post-collection read: the BIF's real arguments, in order. Each one is then
+    // deep-copied into the reserved region so the `ArgList` it names is never left
+    // pointing at a boxed operand the next collection relocates out from under it.
     let mut values = Vec::with_capacity(argc);
     for index in 0..argc {
         match args.read(machine, ctx, index) {
-            Ok(value) => values.push(value),
+            Ok(value) => match terms::deep_copy(&mut sink, value) {
+                Ok(copied) => values.push(copied),
+                Err(_) => return Ok(None),
+            },
             Err(_) => return Ok(None),
         }
     }

@@ -21,8 +21,9 @@
 //! BIF-argument marshalling and the BIF error/raise path (`impl Machine`).
 //!
 //! `exec_bif`/`call_import` marshal a `gc_bif`/`bif`/`call_ext*`'s arguments and
-//! call the BIF through [`ExecutionContext::call_bif_outcome`]; `raise_bif_error` folds a
-//! BIF error into the catch-aware raise the dispatch loop expects.
+//! call the BIF through [`ExecutionContext::call_bif_outcome_with_off_heap`] (the
+//! off-heap-aware twin of [`ExecutionContext::call_bif_outcome`]); `raise_bif_error`
+//! folds a BIF error into the catch-aware raise the dispatch loop expects.
 //!
 //! The BIF door is **outcome-aware** ([`BifOutcome`]), so a BIF that cannot complete
 //! without waiting can answer [`BifOutcome::Suspend`]: each call site decides whether it
@@ -351,8 +352,10 @@ impl Machine {
     /// Cranelift tier all end at the same place. The two doors can never drift:
     ///
     /// * gate **off** (the default, every existing host): the plain
-    ///   [`ExecutionContext::call_bif_outcome`](crate::context::ExecutionContext::call_bif_outcome)
-    ///   — which defaults to `call_bif` and the value wrapped, byte-identical to the
+    ///   [`ExecutionContext::call_bif_outcome_with_off_heap`](crate::context::ExecutionContext::call_bif_outcome_with_off_heap)
+    ///   — the off-heap twin of
+    ///   [`call_bif_outcome`](crate::context::ExecutionContext::call_bif_outcome), which
+    ///   defaults to `call_bif` and the value wrapped, byte-identical to the
     ///   pre-seam engine, one `bool` load and no extra vtable crossing;
     /// * gate **on**: [`ExecutionContext::call_bif_in_machine_outcome`](crate::context::ExecutionContext::call_bif_in_machine_outcome)
     ///   with `self` (the live machine) and `entry_module` (the run's entry module,
@@ -413,7 +416,13 @@ impl Machine {
         if self.bif_in_machine_on {
             ctx.call_bif_in_machine_outcome(self, entry_module, module, function, arity, args)
         } else {
-            ctx.call_bif_outcome(module, function, arity, args)
+            ctx.call_bif_outcome_with_off_heap(
+                module,
+                function,
+                arity,
+                args,
+                self.refc_binaries(),
+            )
         }
     }
     /// Raise a BIF/`call_ext` error on the **no-fail-label** path, landing it in a
@@ -1042,5 +1051,72 @@ mod tests {
             machine.args_scratch
         );
         assert!(machine.args_scratch.capacity() >= 5);
+    }
+
+    /// A host that records the length of the off-heap handle slice the **plain**
+    /// dispatch path hands it, answering a fixed value through the new seam.
+    struct OffHeapRecordingHost {
+        seen: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl ExecutionContext for OffHeapRecordingHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            panic!("the plain dispatch path must take the off-heap seam, not `call_bif`")
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn call_bif_outcome_with_off_heap(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+            off_heap: &[beam_alloc::RefcBinary],
+        ) -> Result<BifOutcome> {
+            self.seen.borrow_mut().push(off_heap.len());
+            Ok(BifOutcome::Return(make_small(7)))
+        }
+    }
+
+    #[test]
+    fn the_plain_dispatch_path_hands_over_the_machines_off_heap_handles() {
+        // The gate is off on a fresh machine, so `dispatch_bif_call` takes the new
+        // off-heap-aware plain door: an empty reservoir hands over an empty slice, and
+        // one live refc binary hands over a one-handle slice.
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut ctx = OffHeapRecordingHost {
+            seen: std::rc::Rc::clone(&seen),
+        };
+        let entry = Module::default();
+
+        let empty_machine = Machine::new();
+        empty_machine
+            .dispatch_bif_call(&entry, "erlang", "self", 0, &[], &mut ctx)
+            .expect("a plain dispatch returns");
+
+        let mut machine = Machine::new();
+        machine
+            .alloc_refc_binary(b"payload")
+            .expect("a payload allocates");
+        machine
+            .dispatch_bif_call(&entry, "erlang", "self", 0, &[], &mut ctx)
+            .expect("a plain dispatch returns");
+
+        assert_eq!(*seen.borrow(), vec![0usize, 1usize]);
     }
 }
