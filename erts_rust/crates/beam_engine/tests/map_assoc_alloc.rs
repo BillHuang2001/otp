@@ -64,13 +64,17 @@
 //! `Vec<(Eterm, Eterm)>` per instruction, growing with `n`.
 
 //!
-//! # Method — a counting global allocator, per-thread armed
+//! # Method — a counting global allocator, per-thread counters
 //!
 //! This integration test is its own binary, so it installs its own
 //! `#[global_allocator]`: `System` plus an allocation counter that only counts while
-//! the current thread is *armed*. Unlike `tests/bif_alloc.rs` (a process-global flag)
-//! the flag here is **per-thread**, so a sibling `#[test]` in this binary — or
-//! libtest's own result collection — cannot contaminate a measurement.
+//! the current thread is *armed*. Both the arming flag **and** the counters are
+//! **per-thread** (unlike `tests/bif_alloc.rs`'s process-global flag), so a sibling
+//! `#[test]` in this binary — which libtest runs on another thread, concurrently by
+//! default — or libtest's own result collection cannot contaminate a measurement.
+//! A process-global counter with per-thread arming still lets two measuring threads
+//! increment one counter, which surfaced as a load-dependent one-event flake in the
+//! read pin; the per-thread counter pair removes that overlap.
 //!
 //! The band is **calibrated in this same binary** from the three parts a rebuilding
 //! update is made of, all measured with the same counter:
@@ -109,7 +113,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use beam_engine::{terms, Machine, MinimalContext};
 use beam_loader::{Function, Instr, Label, MapWriteArgs, Module, Operand, NO_FAIL};
@@ -119,35 +122,39 @@ use beam_term::{cmp, make_small, Eterm};
 // The counting allocator
 // ---------------------------------------------------------------------------
 
-/// Allocation calls observed while the current thread is armed.
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-/// Bytes requested by those calls.
-static BYTES: AtomicUsize = AtomicUsize::new(0);
-
 thread_local! {
-    /// Set only on the thread that is currently measuring: the counters are
-    /// process-global but *arming* is per-thread, so libtest's own allocations and a
-    /// sibling test on another thread can never perturb a measurement.
-    static ARMED: Cell<bool> = const { Cell::new(false) };
+    /// The counter pair of the thread that is currently measuring, armed only while
+    /// a measurement window is open: `Some((allocations, bytes))` counts, `None`
+    /// disarmed. Arming and the counters live in **one** thread-local so `record`
+    /// updates them as a pair, and — the reason they are per-thread rather than
+    /// process-global — two measuring threads (libtest runs this binary's two
+    /// `#[test]`s concurrently by default) each observe only their own allocations.
+    /// A process-global counter would let one test's measured allocation land in the
+    /// other test's window whenever their windows overlap, which is exactly the
+    /// load-dependent `6→7` flake this fixed.
+    static COUNTERS: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
-/// Records one allocation of `bytes` bytes. Atomics only — it allocates nothing.
+/// Records one allocation of `bytes` bytes on the thread that issued it. Touches
+/// only thread-local state, so it allocates nothing.
 #[inline]
 fn record(bytes: usize) {
-    let _ = ARMED.try_with(|armed| {
-        if armed.get() {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(bytes, Ordering::Relaxed);
+    // `try_with`, never `with`: the global allocator is also called on threads that
+    // never opened a measurement window (libtest's own bookkeeping threads), and
+    // those threads must not initialise — let alone count into — a counter.
+    let _ = COUNTERS.try_with(|counters| {
+        if let Some((allocations, total)) = counters.get() {
+            counters.set(Some((allocations + 1, total + bytes)));
         }
     });
 }
 
-/// `System` plus per-thread opt-in counting.
+/// `System` plus the per-thread opt-in counting above.
 struct CountingAllocator;
 
 // SAFETY: every method forwards to the `System` allocator with the same `Layout`, so
 // the (ptr, layout) pairing the callers released is preserved exactly; the counters
-// are plain atomics and allocate nothing.
+// are thread-local cells and allocate nothing.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record(layout.size());
@@ -179,18 +186,19 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// Runs `body` with the counters armed on this thread, returning
+/// Runs `body` with this thread's counters armed, returning
 /// `(allocations, bytes, body's value)`.
 fn measure<T>(body: impl FnOnce() -> T) -> (usize, usize, T) {
-    // Force the TLS to initialize *before* the window opens.
-    ARMED.with(|armed| armed.set(false));
-    let before_alloc = ALLOCATIONS.load(Ordering::Relaxed);
-    let before_bytes = BYTES.load(Ordering::Relaxed);
-    ARMED.with(|armed| armed.set(true));
+    // Initialize the TLS and arm (reset to zero) before the window opens. Setting
+    // `Some((0, 0))` also clears a counter a previous panic left armed, so a
+    // measurement never inherits stale values from the same thread.
+    COUNTERS.with(|counters| counters.set(Some((0, 0))));
     let value = body();
-    ARMED.with(|armed| armed.set(false));
-    let allocations = ALLOCATIONS.load(Ordering::Relaxed).wrapping_sub(before_alloc);
-    let bytes = BYTES.load(Ordering::Relaxed).wrapping_sub(before_bytes);
+    let (allocations, bytes) = COUNTERS.with(|counters| {
+        let (allocations, bytes) = counters.get().unwrap_or((0, 0));
+        counters.set(None);
+        (allocations, bytes)
+    });
     (allocations, bytes, value)
 }
 
@@ -317,8 +325,10 @@ const BYTE_SLACK: usize = 1_024;
 /// The regression test: one `put_map_assoc` per size, with the allocation
 /// decomposition and the produced map both pinned.
 ///
-/// The counters are process-global, so every measurement lives in **one** `#[test]`
-/// (libtest would otherwise run the sizes concurrently in the same process).
+/// Every measurement still lives in **one** `#[test]` so the size loop and its
+/// `harness`/`build`/`walk` decomposition run in a single, deterministic order. The
+/// counters are per-thread, so the sibling read test cannot contaminate them even
+/// when libtest runs the two tests concurrently.
 ///
 /// The whole measurement fits in the `MinimalContext`'s reserved regions (a source,
 /// a reference and a few path-copying reservations per size), so no region
