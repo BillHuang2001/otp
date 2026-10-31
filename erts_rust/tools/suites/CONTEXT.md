@@ -89,16 +89,17 @@ difference is the binary (`erl` vs `beam_rt`).
 ## Status
 - Harness complete: 29 unit tests green, zero build warnings; both targets run end to end against a
   real oracle and a real `beam_rt`.
-- Both sweeps are measured at runtime source commit `71ffbbb379`, tier `default`, and no file under `erts_rust/crates` differs between that sha and HEAD.
-  `RESULTS.md` §1–§3 is the authoritative table set (both sides, per module and per suite, with each run's loadavg); its headline is Khepri `1500/1` oracle vs `403/1` rust, stdlib at the 10 s budget `209/5` vs `177/37`, and the 120 s re-check `129/1` vs `114/16`.
+- Both sweeps are measured at runtime source commit `e98a5e1e2`, tier `default`, and no file under `erts_rust/crates` differs between that sha and HEAD.
+  `RESULTS.md` §1–§3 is the authoritative table set (both sides, per module and per suite, with each run's loadavg); its headline is Khepri `1500/1` oracle vs `1497/4` rust, stdlib at the 10 s budget `209/5` vs `182/21`.
 - The per-row analysis — smallest failing expression per class, both sides' observations, owning crate — lives in `results/{khepri,stdlib}-notes.md` next to the artifacts, and each class's current verdict in `results/{khepri,stdlib}-diagnostics/FINDINGS.md`, which supersedes a notes section it re-checks.
-- A single Khepri sweep is a *sample* of an intermittently blocking runtime: two runs at the same commit read `412/1` and `403/1`, three rows swapping each way (`RESULTS.md` §2 *Run-to-run variance*).
+- A single Khepri sweep is a *sample* on a shared host: the divergence set is stable at this commit (`keep_while_conditions` RC-D and `projections` RC-H), but individual pass counts can shift ±1–2 between runs under load.
 - Each row's cwd is cleared before it runs (`target::fresh_dir`): a staged `_test.*`/`data_dir` tree
   left by an earlier sweep made fixtures fail on **both** sides, which silently reddened green rows.
-- The sweeps surface **real runtime defects**, and some are not a typed gap: khepri's nested-run pump
-  block (RC-E, 20 rows) and a SIGSEGV on a stale compiled match spec (RC-F, 1 row) are khepri rows; on the
-  stdlib side D1c's placeholder raise reason is an observable wrong value. Recording that is this crate's
-  job; fixing any of it belongs to the owning crate, not here.
+- The sweeps surface **real runtime defects**, and some are not a typed gap: khepri's keep-while delete
+  fan-out (RC-D, 1 row, ≈210×, performance) and the crypto export-table order in `projections` (RC-H, 2 rows)
+  are khepri rows; on the stdlib side D1c's placeholder raise reason (an unrooted shared register word) and
+  the D1 trapping-yield count are the only correctness rows, the rest being perf/budget timeouts.
+  Recording that is this crate's job; fixing any of it belongs to the owning crate, not here.
 
 ## Routing Table
 - `data/` → the committed Erlang runner `ct_runner.erl` (embedded with `include_str!`).
