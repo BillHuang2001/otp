@@ -6,6 +6,28 @@ of *decisions and structural changes*, complementing `git log` (which holds ever
 
 Format: one entry per major change — date, area, what changed and why. Newest first.
 ---
+## 2026-10-31 — The `-on_load` module hook, crypto NIF loading, and refc sub-binary windows through the copy boundary
+Scope: the correctness round that made a NIF-loading OTP application (`crypto`) actually load and run.
+Headline changes: (a) the runtime implements the **`-on_load` module hook** end-to-end — a loader surface,
+the three `erlang:call_on_load_function/1` / `has_prepared_code_on_load/1` / `finish_after_on_load/2`
+primitives, and a scheduled-route deferral so a hook that blocks (e.g. `application:get_env` via
+`gen_server:call`) runs in a pumpable context rather than folding to `on_load_failure`; (b) the
+BIF-result copy path now **carries the executing machine's refc-payload handles**
+(`Machine::refc_binaries`) through `source_payloads`, so a `binary:part/3` sub-binary window survives
+the copy and `referenced_byte_size/1` reports the parent payload width instead of the window's own size.
+- **Area:** `erts_rust/crates/beam_loader/src/{ir.rs,lower.rs}`, `beam_rt/src/context/on_load.rs` + `runtime_hooks.rs` + `codeserver.rs` — **a loader/execution feature**
+- **Change:** `-on_load(F/A)` is surfaced from the `on_load/0` instruction marker (the compiler strips
+  the `{on_load,{F,A}}` attribute, so the marker is the reliable source), the hook is entered by function
+  index with `current_module` set so `erlang:load_nif/2` registers under the right owner, and a blocking
+  hook is deferred to a pumpable scheduler pass (`pending_on_loads` → `drain_pending_on_loads`) instead
+  of running in a nested non-pumpable context. `code:ensure_loaded/1` folds a hook failure into
+  `{error,on_load_failure}`. This is what makes `crypto:strong_rand_bytes/16` and `crypto:hash/2` answer.
+- **Area:** `erts_rust/crates/beam_rt/src/context/{calls.rs,execution.rs,position.rs}` — **a copy-boundary data model**
+- **Change:** the BIF-result copy-out threads the executing machine's `Machine::refc_binaries()` slice
+  down through `call_bif_in_machine` → `call_registered` → `finish_registered_call` →
+  `move_result_into_process_heap` into `source_payloads`, mirroring the `send` path, so engine-built
+  refc sub-binary windows are shared (not flattened) and `referenced_byte_size/1` agrees with the oracle.
+
 ## 2026-10-30 — Real-workload round 2 (Cowboy HTTP, Khepri), path-copying map writes, a phase-scoped execution tier, per-image label maps, and the copy-path rework
 Scope: the milestone that made the runtime serve a **real HTTP application** (`cowboy`'s
 `hello_world`, 0 transport errors, now a two-sided benchmark row) and run Khepri's eunit modules, and
