@@ -158,6 +158,10 @@ impl Machine {
             // raising BIFs, for a raise that cannot land, and for anything it cannot
             // name. A guard failure (`fail != NO_FAIL`, the arm below) arms nothing.
             Err(e) if fail == NO_FAIL => {
+                // Root the incoming raise's term payloads **before** the head item is
+                // carved (an allocating door that may collect) — see
+                // [`Machine::park_bif_raise_payloads`].
+                self.park_bif_raise_payloads(&e);
                 let head = bif_frame::bif_head_item(
                     self,
                     ctx,
@@ -468,6 +472,57 @@ impl Machine {
     /// Shared with the instruction families (e.g. `families::receive`'s `send`,
     /// which carries no fail label either), so the landing convention stays defined
     /// in exactly one place.
+    /// Park the four term payloads an incoming BIF raise may carry onto the
+    /// machine's loose-heap-term latches **before** any allocating door on the
+    /// raise path (the cooked-stacktrace head synthesis in
+    /// [`Machine::call_ext_dispatch`]/[`Machine::serve_local_callee`]/the `send`
+    /// family).
+    ///
+    /// The head item is carved out of ONE rooted reservation
+    /// ([`crate::terms::reserve_slack`] → [`Machine::alloc_rooted`] →
+    /// [`Machine::with_roots`]), which may collect. At that instant the incoming
+    /// [`BeamError::Raise`] — and the raw [`Eterm`]s in its `live_reason`/
+    /// `saved_args`/`error_info`/`supplied_trace` slots — is a Rust local outside
+    /// the frozen root set, so a collection relocates the young heap out from
+    /// under it. Parking each slot on its machine latch (all of which
+    /// [`Machine::loose_heap_terms`] roots) closes the window; the raise funnel
+    /// ([`Machine::raise_error`]) then takes the parked (relocated) word in
+    /// preference to the stale one still sitting in `error`.
+    ///
+    /// Fills only `None` slots: a latch already armed belongs to the raise in
+    /// flight and is never overwritten. The caller invokes this on the `Err` arm
+    /// **before** the head synthesis, then passes the same `error` on to
+    /// [`Machine::raise_bif_error_with_head`] unchanged.
+    pub(crate) fn park_bif_raise_payloads(&mut self, error: &BeamError) {
+        let BeamError::Raise(raise) = error else {
+            return;
+        };
+        if self.pending_live_reason.is_none() {
+            self.pending_live_reason = raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied();
+        }
+        if self.pending_function_clause_args.is_none() {
+            self.pending_function_clause_args = raise
+                .saved_args()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied();
+        }
+        if self.pending_error_info.is_none() {
+            self.pending_error_info = raise
+                .error_info()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied();
+        }
+        if self.pending_supplied_term.is_none() {
+            self.pending_supplied_term = raise
+                .supplied_trace()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied();
+        }
+    }
+
     pub(crate) fn raise_bif_error(
         &mut self,
         module: &Module,
@@ -547,14 +602,21 @@ impl Machine {
         // (`:1005-1032`) — the caller of `error/1,2,3`, never the BIF itself.
         let (saved_args, error_info, supplied_term) = match &error {
             BeamError::Raise(raise) => (
-                raise
-                    .saved_args()
-                    .and_then(|live| live.downcast_ref::<Eterm>())
-                    .copied(),
-                raise
-                    .error_info()
-                    .and_then(|live| live.downcast_ref::<Eterm>())
-                    .copied(),
+                // Prefer the **parked** word (relocated by any collection the head
+                // synthesis ran) over the stale one still in `error`; fall back to
+                // extraction for a caller that did not park.
+                self.pending_function_clause_args.take().or_else(|| {
+                    raise
+                        .saved_args()
+                        .and_then(|live| live.downcast_ref::<Eterm>())
+                        .copied()
+                }),
+                self.pending_error_info.take().or_else(|| {
+                    raise
+                        .error_info()
+                        .and_then(|live| live.downcast_ref::<Eterm>())
+                        .copied()
+                }),
                 // The **trace term** an `erlang:raise/3` raise arrives carrying: the
                 // third argument verbatim (`Raise::supplied_trace`). It is the only
                 // representation an explicitly empty trace (`[]`) or a frame whose `A`
@@ -562,24 +624,35 @@ impl Machine {
                 // (`build_stacktrace`'s `is_raised_exc` arm,
                 // `../../erts/emulator/beam/beam_common.c:1219-1223`; `raise_3`'s
                 // `must_copy == 0` path is literally `c_p->ftrace = stacktrace`,
-                // `bif.c:1641-1643`). Read here — no allocation may run between this
-                // word and the latch that roots it.
-                raise
-                    .supplied_trace()
-                    .and_then(|live| live.downcast_ref::<Eterm>())
-                    .copied(),
+                // `bif.c:1641-1643`). No allocation may run between the word and the
+                // latch that roots it — the parked word is already rooted, and the
+                // fallback extraction is used only when the caller did not park.
+                self.pending_supplied_term.take().or_else(|| {
+                    raise
+                        .supplied_trace()
+                        .and_then(|live| live.downcast_ref::<Eterm>())
+                        .copied()
+                }),
             ),
             _ => (None, None, None),
         };
         // A raise whose reason is a compound term lands (or propagates) with the
         // term, mirroring C's `handle_error` → `next_catch` for every reason shape.
         if let BeamError::Raise(raise) = &error {
-            if let Some(reason) = raise
-                .live_reason()
-                .and_then(|live| live.downcast_ref::<Eterm>())
+            // Prefer the parked (relocated) live-reason word over the stale one still
+            // in `error`, with extraction as the fallback for a caller that did not
+            // park ([`Machine::park_bif_raise_payloads`]).
+            if let Some(reason) = self
+                .pending_live_reason
+                .take()
+                .or_else(|| {
+                    raise
+                        .live_reason()
+                        .and_then(|live| live.downcast_ref::<Eterm>())
+                        .copied()
+                })
             {
                 let class = raise.class;
-                let reason = *reason;
                 if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
                     self.set_class_atom(class, make_atom(class_atom));
                 }
@@ -850,6 +923,60 @@ mod tests {
         assert_eq!(step, Step::Goto { func: 0, pc: 9 });
         assert_eq!(machine.x(1), Some(reason), "the compound reason lands verbatim");
         assert_eq!(machine.x(3), Some(make_atom(error)));
+    }
+
+    #[test]
+    fn park_bif_raise_payloads_extracts_every_slot_into_its_latch() {
+        // The four opaque term slots a BIF raise can carry are parked onto their
+        // machine latches, so a later allocating head synthesis (whose rooted
+        // reservation may collect) relocates them instead of stranding the raw words.
+        let mut reason_ctx = MinimalContext::new();
+        let reason = crate::terms::make_tuple(&mut reason_ctx, &[make_small(1)]).unwrap();
+        let args = crate::terms::make_tuple(&mut reason_ctx, &[make_small(2)]).unwrap();
+        let info = crate::terms::make_tuple(&mut reason_ctx, &[make_small(3)]).unwrap();
+        let trace = crate::terms::make_tuple(&mut reason_ctx, &[make_small(4)]).unwrap();
+
+        let error = BeamError::Raise(
+            beam_common::Raise::new(ExceptionClass::Error, beam_common::ExitReason::Structured)
+                .with_live_reason(beam_common::LiveReason::new(reason))
+                .with_saved_args(beam_common::LiveReason::new(args))
+                .with_error_info(beam_common::LiveReason::new(info))
+                .with_supplied_trace(beam_common::LiveReason::new(trace)),
+        );
+
+        let mut machine = Machine::new();
+        machine.park_bif_raise_payloads(&error);
+        assert_eq!(machine.pending_live_reason, Some(reason));
+        assert_eq!(machine.pending_function_clause_args, Some(args));
+        assert_eq!(machine.pending_error_info, Some(info));
+        assert_eq!(machine.pending_supplied_term, Some(trace));
+    }
+
+    #[test]
+    fn the_raise_funnel_prefers_a_parked_live_reason_over_the_errors_word() {
+        // The D1c regression: once a caller parked the live reason (before the head
+        // synthesis), the funnel must land that relocated word — never the stale one
+        // still sitting in `error`'s `live_reason` slot.
+        let module = Module::default();
+        let live = namespace_with(&module, &["error"]);
+        let mut machine = machine_with_a_catch_frame(0, 9);
+        let mut ctx = MinimalContext::with_shared_atoms(live);
+        let mut reason_ctx = MinimalContext::new();
+        let stale = crate::terms::make_tuple(&mut reason_ctx, &[make_small(1)]).unwrap();
+        let parked = crate::terms::make_tuple(&mut reason_ctx, &[make_small(2)]).unwrap();
+        assert_ne!(stale, parked, "the two words must be distinguishable");
+
+        let error = BeamError::Raise(
+            beam_common::Raise::new(ExceptionClass::Error, beam_common::ExitReason::Structured)
+                .with_live_reason(beam_common::LiveReason::new(stale)),
+        );
+        machine.pending_live_reason = Some(parked);
+
+        let step = machine
+            .raise_bif_error(&module, error, &mut ctx)
+            .expect("a live catch frame must catch the term-carrying raise");
+        assert_eq!(step, Step::Goto { func: 0, pc: 9 });
+        assert_eq!(machine.x(1), Some(parked), "the parked (relocated) word wins");
     }
 
     /// The wide marshalling window's **exit discipline**: [`Machine::dispatch_wide`] takes

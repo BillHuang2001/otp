@@ -363,6 +363,11 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         self.frames.clear();
         self.catch_frames.clear();
         self.pending_exception = None;
+        // The parked BIF-raise live-reason term belongs to the raise in flight (see
+        // `Machine::park_bif_raise_payloads`), so a fresh run begins with it clear:
+        // a stale term would let the first cooked trace of the new run name a
+        // reason no raise in it published.
+        self.pending_live_reason = None;
         // The class atoms belong to the module being run, so a reset (the start of
         // every `run_*`) invalidates them; the exceptions family reinstalls them. The
         // `class_atoms_live` latch records that they were resolved from the live atom

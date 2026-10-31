@@ -1146,6 +1146,10 @@ impl Machine {
             // import may have been written with (measured: `erlang:'!'(1,hi)` cooks
             // `{erlang,send,[1,hi],…}`), with the destination and message in `x(0)`/`x(1)`.
             Err(e) => {
+                // Root the incoming raise's term payloads **before** the head item is
+                // carved (an allocating door that may collect) — see
+                // [`Machine::park_bif_raise_payloads`].
+                self.park_bif_raise_payloads(&e);
                 let head =
                     bif_frame::bif_head_item_regs(self, ctx, module, "erlang", "send", 2, &e)?;
                 Ok(Some(ApplyTarget::Raised(
@@ -1255,6 +1259,11 @@ impl Machine {
                             // `undef` item takes precedence: it names a callee that does
                             // not exist, whose `Location` is the empty list, and C never
                             // reaches the BIF arm for it.
+                            // Root the incoming raise's term payloads **before** the
+                            // head synthesis below allocates: that carve may collect,
+                            // and `e`'s raw `Eterm`s are outside the root set until
+                            // they are parked (see [`Machine::park_bif_raise_payloads`]).
+                            self.park_bif_raise_payloads(&e);
                             let head = match callee::import_callee_head_item(
                                 self, ctx, module, target, arity, &e,
                             )? {
@@ -1627,6 +1636,10 @@ impl Machine {
             // re-issues the BIF with the same registers.
             Ok(BifOutcome::Suspend) => return Ok(Some(Step::Suspend { func, pc })),
             Err(e) => {
+                // Root the incoming raise's term payloads **before** the head item is
+                // carved (an allocating door that may collect) — see
+                // [`Machine::park_bif_raise_payloads`].
+                self.park_bif_raise_payloads(&e);
                 // This seam **is** a BIF dispatch (`call_bif_named`), so its failure
                 // cooks the same innermost item a `call_ext` BIF failure does: the
                 // callee named with its real argument registers and the

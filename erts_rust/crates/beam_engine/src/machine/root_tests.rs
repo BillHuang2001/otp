@@ -102,6 +102,7 @@ fn roots_fixture() -> (Machine, Vec<Eterm>) {
     let live_trace = terms::make_tuple(&mut ctx, &[make_small(9)]).expect("a boxed tuple");
     let live_error_info = terms::make_list(&mut ctx, &[make_small(10)]).expect("a cons cell");
     let pending_error_info = terms::make_tuple(&mut ctx, &[make_small(11)]).expect("a boxed tuple");
+    let pending_live_reason = terms::make_tuple(&mut ctx, &[make_small(12)]).expect("a boxed tuple");
 
     let mut fixture = Fixture::new("m");
     let an_atom = make_atom(fixture.atom("an_atom"));
@@ -122,6 +123,7 @@ fn roots_fixture() -> (Machine, Vec<Eterm>) {
     machine.raise_supplied_term = Some(live_trace);
     machine.raise_error_info = Some(live_error_info);
     machine.pending_error_info = Some(pending_error_info);
+    machine.pending_live_reason = Some(pending_live_reason);
 
     (
         machine,
@@ -137,6 +139,7 @@ fn roots_fixture() -> (Machine, Vec<Eterm>) {
             live_trace,
             live_error_info,
             pending_error_info,
+            pending_live_reason,
         ],
     )
 }
@@ -148,12 +151,12 @@ fn for_each_root_enumerates_registers_stack_frames_and_the_loose_terms() {
     machine.for_each_root(|term| seen.push(term));
     assert_eq!(
         seen, expected,
-        "every rooted file and all seven loose terms, in the documented order"
+        "every rooted file and all eight loose terms, in the documented order"
     );
     assert_eq!(
         seen.len(),
-        11,
-        "two x registers, one Y slot, one FR slot, seven loose"
+        12,
+        "two x registers, one Y slot, one FR slot, eight loose"
     );
 }
 
@@ -349,6 +352,7 @@ fn loose_slot(machine: &Machine, slot: usize) -> Option<Eterm> {
         4 => machine.raise_supplied_term,
         5 => machine.raise_error_info,
         6 => machine.pending_error_info,
+        7 => machine.pending_live_reason,
         _ => unreachable!("the machine has exactly {} loose fields", Machine::LOOSE_HEAP_TERMS),
     }
 }
@@ -363,6 +367,7 @@ fn arm_loose_slot(machine: &mut Machine, slot: usize, term: Eterm) {
         4 => machine.raise_supplied_term = Some(term),
         5 => machine.raise_error_info = Some(term),
         6 => machine.pending_error_info = Some(term),
+        7 => machine.pending_live_reason = Some(term),
         _ => unreachable!("the machine has exactly {} loose fields", Machine::LOOSE_HEAP_TERMS),
     }
 }

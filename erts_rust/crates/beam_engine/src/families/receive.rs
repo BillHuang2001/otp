@@ -126,6 +126,10 @@ pub(crate) fn exec(
                 // The registers are untouched by the failed delivery, so the item is
                 // built from `x(0)`/`x(1)` like any other `call_ext` BIF failure.
                 Err(e) => {
+                    // Root the incoming raise's term payloads **before** the head item
+                    // is carved (an allocating door that may collect) — see
+                    // [`crate::Machine::park_bif_raise_payloads`].
+                    machine.park_bif_raise_payloads(&e);
                     let head = bif_frame::bif_head_item_regs(
                         machine, ctx, module, "erlang", "send", 2, &e,
                     )?;

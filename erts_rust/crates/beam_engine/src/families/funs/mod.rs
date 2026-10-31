@@ -745,6 +745,10 @@ fn fun_apply_error(
     if crate::error::is_bad_fun(&error) {
         return raise_badfun(machine, module, source, ctx);
     }
+    // Root the incoming raise's term payloads **before** the head item is carved (an
+    // allocating door that may collect) — see
+    // [`crate::Machine::park_bif_raise_payloads`].
+    machine.park_bif_raise_payloads(&error);
     let head = lambda_head_item(machine, source, arity, &error, ctx)?;
     machine.raise_bif_error_with_head(module, error, head, ctx)
 }
@@ -952,6 +956,10 @@ pub(crate) fn apply_target(
             "bif suspend at a non-idempotent dispatch site: apply/3 rewrites x(0..arity)",
         )),
         Err(e) => {
+            // Root the incoming raise's term payloads **before** the head item is
+            // carved (an allocating door that may collect) — see
+            // [`crate::Machine::park_bif_raise_payloads`].
+            machine.park_bif_raise_payloads(&e);
             let module_term = machine.x(arity).ok_or_else(|| error::bad_register(arity))?;
             let function_term = machine
                 .x(arity + 1)

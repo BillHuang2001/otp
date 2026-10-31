@@ -225,6 +225,23 @@ pub struct Machine {
     /// rooted here (C's `setup_rootset` roots `fvalue`/`ftrace` for exactly the window it
     /// exists — `../../erts/emulator/beam/erl_gc.c:2676-2693`).
     pub(crate) pending_exception: Option<(ExceptionClass, Eterm)>,
+    /// The **live reason term** a BIF raise (`erlang:exit/1`, `erlang:error/1,2,3`,
+    /// `erlang:throw/1` with a non-atom reason) arrived carrying, parked here by
+    /// [`Machine::park_bif_raise_payloads`] **before** the caller synthesizes the
+    /// BIF cooked-stacktrace head item.
+    ///
+    /// The head synthesis is the one allocating door on the `Err` path of
+    /// `call_ext_dispatch`/`serve_local_callee`/the `send` family, and its rooted
+    /// reservation may collect. At that instant the incoming [`BeamError::Raise`]
+    /// (with its `live_reason` raw [`Eterm`]) is a Rust local outside the root set,
+    /// so the collector would relocate the young heap out from under it. Parking
+    /// the term here — one of [`Machine::loose_heap_terms`] — closes that window:
+    /// [`Machine::with_roots`] roots (and re-seats) it like every other loose field.
+    ///
+    /// It is a one-shot latch: [`Machine::raise_error`] takes it in preference to
+    /// re-extracting the now-stale word from the error, with extraction as the
+    /// fallback for a caller that did not park. Cleared by [`Machine::reset`].
+    pub(crate) pending_live_reason: Option<Eterm>,
     /// The exception-class atoms (`error`, `exit`, `throw`) resolved from the
     /// running module's atom table, indexed by [`exception_class_index`];
     /// `THE_NON_VALUE` means "not resolved yet".
@@ -950,6 +967,7 @@ impl Machine {
             frames: Vec::with_capacity(FRAMES_RESERVE),
             catch_frames: Vec::with_capacity(CATCH_FRAMES_RESERVE),
             pending_exception: None,
+            pending_live_reason: None,
             class_atoms: UNRESOLVED_CLASS_ATOMS,
             class_atoms_live: false,            max_register,
             literals: None,
@@ -1162,9 +1180,9 @@ impl Machine {
     /// How many loose heap-term slots [`Machine::with_roots`] can park.
     ///
     /// The length of [`Machine::loose_heap_terms`]: the two failed-clause argument
-    /// latches, the pending exception's reason, the two supplied-trace term latches and
-    /// the two `{error_info, Map}` latches.
-    const LOOSE_HEAP_TERMS: usize = 7;
+    /// latches, the pending exception's reason, the two supplied-trace term latches,
+    /// the two `{error_info, Map}` latches and the parked BIF-raise live-reason term.
+    const LOOSE_HEAP_TERMS: usize = 8;
 
     /// The machine's **loose heap terms**: the `Eterm`-typed fields that hold a
     /// process-heap term but are **not** part of the frozen [`RootSet`].
@@ -1187,6 +1205,7 @@ impl Machine {
             self.raise_supplied_term,
             self.raise_error_info,
             self.pending_error_info,
+            self.pending_live_reason,
         ]
     }
 
@@ -1254,6 +1273,9 @@ impl Machine {
         }
         if let Some(term) = terms[6] {
             self.pending_error_info = Some(term);
+        }
+        if let Some(term) = terms[7] {
+            self.pending_live_reason = Some(term);
         }
     }
 
