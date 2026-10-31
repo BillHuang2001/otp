@@ -163,6 +163,17 @@ fn shallow_copy(
         // names. Decline rather than fabricate a different term.
         return None;
     }
+    // A pool-local `ErlSubBits` must never be shallow-copied. `object_words` deliberately
+    // over-sizes a sub-binary relative to the 5-word `ErlSubBits` block `addr` addresses: a
+    // refc-binary `orig` reports the whole 8-word `[BinRef][ErlSubBits]` pair, and a match
+    // context reports the materialized heap-bits window. Copying `object_words` words from
+    // `addr` would read past the 5-word block into adjacent pool words, while
+    // `for_each_child_slot` fixes up only offset 4 (`orig`), leaving the over-read words
+    // dangling. Declining makes the caller fall back to the full copier, which copies the
+    // block's own `ERL_SUB_BITS_SIZE` words and forwards `orig` correctly.
+    if header.raw() & beam_term::tag::TAG_HEADER_MASK == beam_term::tag::SUB_BITS_SUBTAG {
+        return None;
+    }
     // SAFETY: `header` heads the live object at `addr`; `object_words` reads its shape.
     let words = unsafe { beam_term::layout::object_words(header, addr as *const Eterm) };
     *budget = budget.checked_sub(words)?;

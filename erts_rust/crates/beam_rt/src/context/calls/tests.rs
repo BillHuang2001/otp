@@ -2030,6 +2030,54 @@ fn a_pool_local_reference_declines_the_sharing_copy() {
     );
 }
 
+/// **A pool-local `ErlSubBits` declines the sharing copy** — `object_words` over-sizes a
+/// sub-binary block relative to the 5-word `ErlSubBits` the pointer addresses (a refc-binary
+/// `orig` reports the whole 8-word pair, a match context the materialized heap-bits window), so
+/// shallow-copying it would read past the block and leave the over-read words never fixed up.
+/// The caller then falls back to the full copier, which copies the block's own 5 words and
+/// forwards `orig`.
+#[test]
+#[allow(unsafe_code)]
+fn a_pool_local_sub_bits_block_declines_the_sharing_copy() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let mut pool = beam_alloc::Heap::new(16).expect("a local pool heap");
+    // The frozen `orig` target: an ordinary scanned tuple, tagged as a literal the way a
+    // `bs_create_bin`-free splice leaves it. A literal is never relocated, so the sub-bits
+    // block is inert — but it must still decline the sharing copy.
+    let orig = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let tuple = process
+            .heap_mut()
+            .tuple(&[make_small(5)])
+            .expect("a scanned 1-tuple");
+        beam_term::literal::make_literal(tuple)
+    };
+    // SAFETY: five fresh words for the 5-word `ErlSubBits` block, every word written before the
+    // term escapes.
+    let sub_bits = unsafe {
+        let hp = pool.alloc_words(5).expect("five words");
+        beam_term::bitstring::write_sub_bits(
+            hp,
+            make_small(0),
+            make_small(0),
+            make_small(0),
+            orig,
+        )
+    };
+    let pool_term = pool.tuple(&[sub_bits]).expect("a pool-local tuple holding a sub-bits");
+    let outcome = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        copy_shared::sharing_copy(process, pool_term, &pool, 0, false)
+    };
+    assert!(
+        outcome.is_none(),
+        "a sub-binary block must never be shallow-copied: object_words over-sizes it relative \
+         to the 5-word ErlSubBits block, so the sharing copy must decline"
+    );
+}
+
 /// **A scanned root is handed through verbatim** — no copy, no allocation — which is what keeps a
 /// no-op container BIF (`maps:put/3` with the bound value) returning its argument word, and what
 /// `erts_debug:same/2` observes.
