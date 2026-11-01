@@ -58,7 +58,7 @@ The system `erl` prints **nothing** when a `-eval` expression raises (it exits 1
 | `deleted_count` | 2 502 | 2 502 | agree |
 | the suite's `?assert(DeletionTime < 1000)` | passes | **fails** (`keep_while_conditions` reads 26/1 vs the oracle's 27/0) | — |
 
-The cost is per-dependent work in the keep-while sweep, not the delete's result set; the owning crate is **`beam_ets`** (the `keep_while` condition index walk) with the engine tier as a multiplier — the shape is a full scan per dependent, so the fix must be an index lookup, not a faster loop.
+The cost is per-dependent work in the keep-while sweep, not the delete's result set; the owning crate is **`beam_rt`** — the result-move path (`move_result_into_runtime_store` → `graph_reaches_scanned_heap`, ~65 % self on `perf`) plus the unconditional `copy_result_fresh` deep-copy of each `khepri_machine:apply/3` result — not `beam_ets` (the v1 `khepri_prefix_tree` reverse index is already an index lookup, not a full scan).
 This is the only khepri row that fails on the current runtime **for a result**, and it is performance, not correctness: both sides agree on `deleted_count`.
 
 ## RC-G — `bang_functions` now agrees (fixed)
