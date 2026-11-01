@@ -277,7 +277,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   encodings) and `udp_inet`'s option/control surface agree with the oracle.
 
 ## Known Issues
-- khepri `keep_while_fanout_probe` is correct (`deleted_count=2502` both sides) with a ~88× fun-apply residual (`delete_us_per_dependent` 797 vs 9 us).
+- khepri `keep_while_fanout_probe` is correct (`deleted_count=2502` both sides); the residual is NOT fun application — it is `beam_rt`'s result-move path, not `beam_ets`.
+- After hoisting a merged `ScannedBounds` fast-reject in `beam_rt::context::calls::dest::graph_reaches_scanned_heap` (the per-node `ProcessTable::pids()` scan is gone), `delete_us_per_dependent` ≈ 720 us vs the oracle ≈ 10 us (~70×), now dominated by the unconditional `copy_result_fresh` deep-copy of every `khepri_machine:apply/3` result (fix seam (a) in `beam_rt/src/context/IMPLEMENTATION.md`).
 - The differential gate corpus does not pin `binary:referenced_byte_size/1` (bitbin) or khepri `projections`; those shapes are pinned instead by `beam_rt` workspace tests (`binary_part_refc_window`, `binary_part_refc_window_eval`) and the `tools/suites` harness probes (`error_info_abort_probe`, `keep_while_fanout_probe`).
 
 ## Future workstreams
