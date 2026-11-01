@@ -130,7 +130,9 @@ pub use number::{float_value, make_float, make_float_rooted, make_integer, make_
 pub(crate) use number::make_integer_unrooted;
 pub use read::{binary_bytes, cons_head, cons_tail, list_elements, tuple_arity, tuple_element};
 pub use sink::{ContextSink, Sink};
-pub(crate) use sink::{deep_copy, deep_copy_budget, write_list_at, write_tuple_at};
+pub(crate) use sink::{
+    bounded_copy, bounded_copy_budget, deep_copy, deep_copy_budget, write_list_at, write_tuple_at,
+};
 pub use slack::Slack;
 pub(crate) use slack::reserve;
 pub use slack::reserve_slack;

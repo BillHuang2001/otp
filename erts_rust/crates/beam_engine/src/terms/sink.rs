@@ -366,6 +366,187 @@ pub(crate) fn deep_copy(slack: &mut Slack, term: Eterm) -> Result<Eterm> {
     }
 }
 
+/// The typed refusal [`bounded_copy_budget`]/[`bounded_copy`] return for a term their
+/// bounded graph cannot represent — bignums, floats, funs, records, internal/external
+/// pid/port/ref, catch terms, off-heap refc binaries/sub-bits and hash maps.
+///
+/// The bounded copier exists for the two stacktrace payloads the cooked item embeds
+/// (the failed-clause argument list and the `{error_info, Map}` map), whose graphs are
+/// flat maps, cons lists, tuples and on-heap heap-bits bitstrings — every other shape is
+/// a typed decline, never a wrong term.
+fn bounded_copy_unsupported() -> BeamError {
+    unsupported("build_stacktrace: unsupported term in saved_args/error_info copy")
+}
+
+/// The words [`bounded_copy`] will carve out of `slack` for `term` — its copy budget —
+/// or the typed [`crate::error::unsupported`] naming the unsupported kind.
+///
+/// Unlike [`deep_copy_budget`], which trusts [`beam_term::size::size_object`] for every
+/// compound shape, this copier is **bounded to the kinds a cooked stacktrace payload may
+/// carry**, and the budget therefore mirrors the carve **exactly**, occurrence by
+/// occurrence:
+///
+/// * an immediate (small int, atom, `NIL`) and a literal are shared verbatim and cost `0`;
+/// * a cons cell costs `2 + budget(car) + budget(cdr)`;
+/// * a tuple costs `1 + arity + Σ budget(element)`;
+/// * a flat map (≤ [`beam_term::MAP_SMALL_MAP_LIMIT`] pairs) costs
+///   [`beam_term::map_words_capacity`]`(pairs)` plus the budget of every key and value;
+/// * an on-heap heap-bits bitstring/binary costs its exact object word count (copied
+///   verbatim, no child slots).
+///
+/// Anything else — a bignum, float, fun, record, internal/external pid/port/reference,
+/// catch term, off-heap refc binary/sub-bits or hash map — is refused with the same
+/// typed error the carve reports, so a caller sizing with this function can never
+/// reserve for a graph the carve will then decline (the two agree on the accepted set).
+pub(crate) fn bounded_copy_budget(term: Eterm) -> Result<usize> {
+    match beam_term::primary_tag(term) {
+        beam_term::PrimaryTag::Immed1 => {
+            if beam_term::is_small(term) || beam_term::is_atom(term) || beam_term::is_nil(term) {
+                Ok(0)
+            } else {
+                Err(bounded_copy_unsupported())
+            }
+        }
+        beam_term::PrimaryTag::List if beam_term::is_literal(term) => Ok(0),
+        beam_term::PrimaryTag::Boxed if beam_term::is_literal(term) => Ok(0),
+        beam_term::PrimaryTag::List => {
+            let src = beam_term::list_val(term);
+            // SAFETY: `term` is a live LIST term, so `src` addresses its 2-word
+            // header-less `[CAR, CDR]` cons cell.
+            let (car, cdr) = unsafe { (*src, *src.add(1)) };
+            Ok(2 + bounded_copy_budget(car)? + bounded_copy_budget(cdr)?)
+        }
+        beam_term::PrimaryTag::Boxed => {
+            let src = beam_term::boxed_val(term);
+            // SAFETY: `term` is a live boxed term, so its header word is readable.
+            let header = unsafe { *src };
+            if beam_term::is_arity_value(header) {
+                let arity = beam_term::arityval(header);
+                let mut total = 1 + arity;
+                for i in 0..arity {
+                    // SAFETY: an `arityval` header fixes `arity` element words after the
+                    // header; `src.add(1 + i)` addresses element `i`.
+                    total += bounded_copy_budget(unsafe { *src.add(1 + i) })?;
+                }
+                Ok(total)
+            } else if beam_term::is_flatmap_header(header) {
+                let pairs = beam_term::map_pairs_storage_order(term)?;
+                let mut total = beam_term::map_words_capacity(pairs.len());
+                for (key, value) in &pairs {
+                    total += bounded_copy_budget(*key)?;
+                    total += bounded_copy_budget(*value)?;
+                }
+                Ok(total)
+            } else if header.raw() & beam_term::TAG_HEADER_MASK == beam_term::HEAP_BITS_SUBTAG {
+                // SAFETY: a heap-bits object is never an `ErlSubBits`, so `object_words`
+                // takes its ordinary (non-sub-bits) arm and returns the exact word count.
+                Ok(unsafe { beam_term::layout::object_words(header, src) })
+            } else {
+                Err(bounded_copy_unsupported())
+            }
+        }
+        // Not a term (a bare header word): never a valid argument.
+        beam_term::PrimaryTag::Header => Err(bounded_copy_unsupported()),
+    }
+}
+
+/// Copy `term` into `slack`, making its whole graph self-contained inside the slack's
+/// reserved region so it moves **with** the item that references it.
+///
+/// This is the bounded sibling of [`deep_copy`] for the two stacktrace payloads: the
+/// accepted kinds and the per-occurrence carve are exactly [`bounded_copy_budget`]'s, so
+/// a region sized by that function is consumed exactly:
+///
+/// * an immediate (small int, atom, `NIL`) and a literal are shared verbatim (neither is
+///   relocated by a moving collector);
+/// * a cons cell is copied as its header-less 2-word `[CAR, CDR]` pair, both words
+///   re-pointed at their own copies;
+/// * a tuple is copied header-verbatim with every element re-pointed at its own copy;
+/// * a flat map's key/value pairs are each copied, then the map is rebuilt through
+///   [`Sink::map`] (so the atom order of the live namespace is the produced map's);
+/// * an on-heap heap-bits bitstring/binary is copied **verbatim** as its exact object
+///   word count — it has no term child slots to recurse.
+///
+/// The caller has reserved at least [`bounded_copy_budget`]`(term)` words, so no carve
+/// overruns the slack; an overrun is the typed `unsupported` from [`Slack::alloc_words`],
+/// never a short block.
+pub(crate) fn bounded_copy(slack: &mut Slack, term: Eterm, atoms: &AtomTable) -> Result<Eterm> {
+    match beam_term::primary_tag(term) {
+        beam_term::PrimaryTag::Immed1 => {
+            if beam_term::is_small(term) || beam_term::is_atom(term) || beam_term::is_nil(term) {
+                Ok(term)
+            } else {
+                Err(bounded_copy_unsupported())
+            }
+        }
+        beam_term::PrimaryTag::List if beam_term::is_literal(term) => Ok(term),
+        beam_term::PrimaryTag::Boxed if beam_term::is_literal(term) => Ok(term),
+        beam_term::PrimaryTag::List => {
+            let src = beam_term::list_val(term);
+            // SAFETY: `term` is a live LIST term, so `src` addresses its 2-word cons cell.
+            let (car, cdr) = unsafe { (*src, *src.add(1)) };
+            let hp = slack.alloc_words(2)?;
+            let car = bounded_copy(slack, car, atoms)?;
+            let cdr = bounded_copy(slack, cdr, atoms)?;
+            // SAFETY: `hp` addresses 2 exclusively-owned words inside the slack's reserved
+            // region, which this cell alone writes.
+            unsafe {
+                *hp = car;
+                *hp.add(1) = cdr;
+            }
+            Ok(beam_term::make_list(hp))
+        }
+        beam_term::PrimaryTag::Boxed => {
+            let src = beam_term::boxed_val(term);
+            // SAFETY: `term` is a live boxed term, so its header word is readable.
+            let header = unsafe { *src };
+            if beam_term::is_arity_value(header) {
+                let arity = beam_term::arityval(header);
+                let hp = slack.alloc_words(1 + arity)?;
+                // SAFETY: `hp` addresses `1 + arity` exclusively-owned words; the header
+                // is written verbatim and each element slot receives its own deep copy.
+                unsafe { *hp = header };
+                for i in 0..arity {
+                    // SAFETY: an `arityval` header fixes `arity` element words after the
+                    // header; `src.add(1 + i)` addresses element `i`.
+                    let elem = unsafe { *src.add(1 + i) };
+                    let copied = bounded_copy(slack, elem, atoms)?;
+                    // SAFETY: `hp.add(1 + i)` is an element slot exclusively owned by this
+                    // tuple.
+                    unsafe { *hp.add(1 + i) = copied };
+                }
+                Ok(beam_term::make_tuple(hp))
+            } else if beam_term::is_flatmap_header(header) {
+                let pairs = beam_term::map_pairs_storage_order(term)?;
+                let mut copied = Vec::with_capacity(pairs.len());
+                for (key, value) in &pairs {
+                    copied.push((
+                        bounded_copy(slack, *key, atoms)?,
+                        bounded_copy(slack, *value, atoms)?,
+                    ));
+                }
+                slack.map(&copied, atoms)
+            } else if header.raw() & beam_term::TAG_HEADER_MASK == beam_term::HEAP_BITS_SUBTAG {
+                // SAFETY: a heap-bits object is never an `ErlSubBits`, so `object_words`
+                // returns its exact word count.
+                let words = unsafe { beam_term::layout::object_words(header, src) };
+                let hp = slack.alloc_words(words)?;
+                // SAFETY: `hp` addresses `words` exclusively-owned words inside the slack's
+                // reserved region, and `src` is a live heap-bits object of exactly `words`
+                // words; the ranges are distinct (the slack's region is freshly reserved).
+                // A heap-bits object carries no term child slots, so the verbatim copy is
+                // the whole copy.
+                unsafe { core::ptr::copy_nonoverlapping(src, hp, words) };
+                Ok(beam_term::make_boxed(hp))
+            } else {
+                Err(bounded_copy_unsupported())
+            }
+        }
+        // Not a term (a bare header word): never a valid argument.
+        beam_term::PrimaryTag::Header => Err(bounded_copy_unsupported()),
+    }
+}
+
 /// Write the tuple `{elems…}` into `1 + elems.len()` words at `hp`.
 ///
 /// # Safety

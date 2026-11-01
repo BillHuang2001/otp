@@ -45,14 +45,14 @@ use std::sync::Arc;
 
 use beam_common::{Result, StackFrame, StackTrace};
 use beam_loader::{Atom, Instr, LineEntry, Module, Operand};
-use beam_term::{is_list, is_nil, make_atom, make_small, Eterm, NIL};
+use beam_term::{is_list, is_nil, make_atom, make_small, AtomTable, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::machine::{namespace_atom, Machine};
 use crate::operand::read_operand;
 use crate::terms;
-use crate::terms::{ContextSink, Sink};
+use crate::terms::{ContextSink, Sink, Slack};
 
 // ---------------------------------------------------------------------------
 // `build_stacktrace` — the symbolic (cooked) stacktrace
@@ -285,6 +285,7 @@ pub(crate) fn symbolic_stacktrace(
     };
     let mut args_item: Option<usize> = None;
     let mut error_info_item: Option<usize> = None;
+    let mut error_info_map_words: Option<usize> = None;
     let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
     for (index, ((_context, func, pc), owner)) in frames.iter().zip(plan.iter()).enumerate() {
         // Both slots belong to the innermost item, so a head-bearing cooking leaves them
@@ -300,11 +301,18 @@ pub(crate) fn symbolic_stacktrace(
         if shape.args.is_some() {
             args_item = Some(shapes.len());
         }
-        // The map word is only a **sizing** witness here (it says "charge 5 more
-        // words"); the carve re-reads it from the re-seated latch below.
+        // The map is a **sizing** witness here: its word count is charged now (before
+        // the reservation) and the carve re-reads the term from the re-seated latch
+        // below, where the count is invariant under the move.
         if index == 0 {
             if let (Some(atom), Some(map)) = (error_info_atom, live_error_info) {
-                shape.error_info = Some(ErrorInfoShape { atom, map });
+                let map_words = terms::bounded_copy_budget(map)?;
+                shape.error_info = Some(ErrorInfoShape {
+                    atom,
+                    map,
+                    map_words,
+                });
+                error_info_map_words = Some(map_words);
                 error_info_item = Some(shapes.len());
             }
         }
@@ -322,9 +330,10 @@ pub(crate) fn symbolic_stacktrace(
     // parks that latch (and re-seats it from the slot a conforming host wrote the
     // relocated word back through) for exactly this reason. The word captured before
     // the reservation is therefore finished with — the list is re-read HERE, from the
-    // re-seated latch, and its elements are carved straight out of it by `write_item`,
-    // so no element word is held across a collection either. The element count is
-    // invariant under a move, so the region sized above is still exactly right.
+    // re-seated latch, and `write_item` deep-copies its elements out of it into the
+    // same reservation, so no element word is held across a collection either. The
+    // element count is invariant under a move, so the region sized above is still
+    // exactly right.
     if live_clause_args.is_some() {
         let list = machine.take_raise_function_clause_args();
         if let Some(index) = args_item {
@@ -339,17 +348,21 @@ pub(crate) fn symbolic_stacktrace(
         }
     }
     // The `{error_info, Map}` **map** rides the same split — read half before the
-    // reservation (presence only, for sizing), consumed after it, so the word the carve
-    // writes into the location tail is the one the collector left in the re-seated latch
-    // and never a pre-move address. The map's own nodes are **shared, not copied** (C
-    // writes `c_p->fvalue` itself into the `{error_info, Map}` tuple), so the extension
-    // costs the region exactly the `5` words `ItemShape::words` charges it.
+    // reservation (presence + word count, for sizing), consumed after it, so the word
+    // the carve deep-copies into the location tail is the one the collector left in the
+    // re-seated latch and never a pre-move address. The map's own nodes are **copied
+    // now** (the raise's latch backing store may be rewound), so the extension costs the
+    // region the `5`-word tuple shell plus the map words `ItemShape::words` charges.
     if live_error_info.is_some() {
         let map = machine.take_raise_error_info();
         if let Some(index) = error_info_item {
-            match (map, error_info_atom) {
-                (Some(map), Some(atom)) => {
-                    shapes[index].error_info = Some(ErrorInfoShape { atom, map });
+            match (map, error_info_atom, error_info_map_words) {
+                (Some(map), Some(atom), Some(map_words)) => {
+                    shapes[index].error_info = Some(ErrorInfoShape {
+                        atom,
+                        map,
+                        map_words,
+                    });
                 }
                 _ => {
                     return Err(error::unsupported(
@@ -359,10 +372,13 @@ pub(crate) fn symbolic_stacktrace(
             }
         }
     }
+    // The live atom namespace the map's flat-map sort compares keys against; `sink` is
+    // owned, so this immutable borrow of `ctx` cannot conflict with anything below.
+    let atoms = ctx.atoms(entry_module);
     let mut items = Vec::with_capacity(shapes.len());
     for shape in &shapes {
         // Child nodes before the parent, in the order `ItemShape::words` counts.
-        items.push(write_item(&mut sink, shape)?);
+        items.push(write_item(&mut sink, shape, atoms)?);
     }
     // An empty (or wholly skipped) snapshot is the honest empty list — unless the
     // raise published a callee head item, which is always the FIRST item.
@@ -418,10 +434,14 @@ pub(crate) fn carve_supplied_frames(
     // reservation, exactly as the snapshot path does.
     let total = 2 * shapes.len() + shapes.iter().map(ItemShape::words).sum::<usize>();
     let mut sink = terms::reserve_slack(machine, ctx, total)?;
+    // Supplied frames carry neither an argument list nor an error-info map, so this
+    // table is only threaded through `write_item` for signature uniformity; it is never
+    // consulted by the carve below.
+    let atoms = ctx.atoms(module);
     let mut items = Vec::with_capacity(shapes.len());
     for shape in &shapes {
         // Child nodes before the parent, in the order `ItemShape::words` counts.
-        items.push(write_item(&mut sink, shape)?);
+        items.push(write_item(&mut sink, shape, atoms)?);
     }
     sink.list(&items)
 }
@@ -463,6 +483,7 @@ fn supplied_frame_shape<'a>(
         function: function_atom,
         arity: u32::from(frame.arity),
         args: None,
+        args_words: 0,
         error_info: None,
         location,
     })
@@ -539,7 +560,20 @@ pub(crate) fn stacktrace_item(
 ) -> Result<Eterm> {
     let shape = item_shape(module, func, pc, None)?;
     let mut sink = ContextSink::new(ctx);
-    write_item(&mut sink, &shape)
+    // `stacktrace_item` never carries an argument list or an error-info map (`item_shape`
+    // is handed `None` for both), so the rooted `write_item` (which deep-copies those
+    // payloads) is not needed here; this inline carve reproduces the exact
+    // `{M,F,A,Location}` layout on the unrooted sink.
+    let location = match &shape.location {
+        Some(location) => write_location_unrooted(&mut sink, location)?,
+        None => NIL,
+    };
+    sink.tuple(&[
+        make_atom(shape.module),
+        make_atom(shape.function),
+        make_small(shape.arity as i64),
+        location,
+    ])
 }
 
 /// The metadata **shape** of a stacktrace item: everything [`write_item`] needs to
@@ -568,15 +602,20 @@ struct ItemShape<'a> {
     /// `{Mod, Fun, [Arg, …], Location}` for that function while every outer frame keeps
     /// its declared arity.
     ///
-    /// The **list term itself** is written into the tuple and its elements are **not**
-    /// re-carved: C hands the `args` term to `TUPLE4` verbatim, so a proper list, an
-    /// **improper** list (`erlang:error(foo, [1|2])` keeps its tail) and `[]` all ride
-    /// through unchanged — and [`ItemShape::words`] charges the region nothing for them.
+    /// The **list term itself** is deep-copied into the reservation (self-contained) and
+    /// written into the tuple: a proper list, an **improper** list
+    /// (`erlang:error(foo, [1|2])` keeps its tail) and `[]` all copy through unchanged —
+    /// and [`ItemShape::words`] charges their real words via [`ItemShape::args_words`].
     ///
     /// The word is a machine-held term, so it is read by [`write_item`] **after** the one
     /// reservation, from the re-seated latch (`Machine::with_roots` parks and re-seats
-    /// it); nothing allocates between that read and the store.
+    /// it); nothing allocates between that read and the deep copy into the reservation.
     args: Option<Eterm>,
+    /// The words [`write_item`] must carve for the deep-copied `args` list, sized
+    /// **before** the reservation by [`terms::bounded_copy_budget`]. The list is now
+    /// copied into the reserved region (self-contained), so this charges its real words;
+    /// `0` when there is no argument list.
+    args_words: usize,
     /// The `{error_info, Map}` extension of this item's `Location`: the **caller
     /// frame** of an `erlang:error/3` raise, and `None` for every other item —
     /// including a synthesized head item, which carries its own extension and is
@@ -594,8 +633,8 @@ struct ItemShape<'a> {
 }
 
 /// The `{error_info, Map}` tail of a cooked item's location: the `error_info` **key
-/// atom** (resolved before the reservation) and the **map term**, which is shared with
-/// the raise rather than copied — exactly as C stores `c_p->fvalue` itself.
+/// atom** (resolved before the reservation) and the **map term**, which is deep-copied
+/// into the reservation rather than shared — the map's own nodes now ride the item.
 #[derive(Clone, Copy)]
 struct ErrorInfoShape {
     /// The `error_info` key atom, resolved through the live namespace first and the
@@ -604,6 +643,9 @@ struct ErrorInfoShape {
     /// The map term, re-read from the re-seated raise latch **after** the one
     /// reservation, so a collecting host's relocation is what the carve writes.
     map: Eterm,
+    /// The words [`write_error_info_pair`] carves for the deep-copied map, sized
+    /// **before** the reservation by [`terms::bounded_copy_budget`].
+    map_words: usize,
 }
 
 impl ItemShape<'_> {
@@ -616,17 +658,23 @@ impl ItemShape<'_> {
     ///
     /// The extension's derivation: the `{error_info,Map}` 2-tuple is `3` words
     /// (`Sink::tuple` charges `elems.len() + 1`) and the outer list grows from 2 to 3
-    /// cells, `+2` — and the **map word is shared, not copied**, so the map's own nodes
-    /// are charged nothing. With **no** location the extension is the whole location: a
-    /// 1-element list (`2`) around the tuple (`3`), i.e. the same `5`.
+    /// cells, `+2` — and the **map is deep-copied now**, so [`terms::bounded_copy_budget`]
+    /// charges its real words on top of that shell. With **no** location the extension is
+    /// the whole location: a 1-element list (`2`) around the tuple (`3`), i.e. the same
+    /// `5` shell plus the copied map's words.
     ///
-    /// The argument list ([`ItemShape::args`]) is shared verbatim, so it is charged
-    /// nothing either: C writes the `args` term itself into the tuple.
+    /// The argument list ([`ItemShape::args`]) is also deep-copied into the reservation,
+    /// so [`ItemShape::args_words`] charges its real words.
     fn words(&self) -> usize {
-        5 + match &self.location {
-            Some(location) => 2 * location.file.chars().count() + 10,
-            None => 0,
-        } + if self.error_info.is_some() { 5 } else { 0 }
+        5 + self.args_words
+            + match &self.location {
+                Some(location) => 2 * location.file.chars().count() + 10,
+                None => 0,
+            }
+            + match &self.error_info {
+                Some(info) => 5 + info.map_words,
+                None => 0,
+            }
     }
 }
 
@@ -671,17 +719,25 @@ fn item_shape(
         .get(func as usize)
         .ok_or_else(|| error::unsupported("build_stacktrace: function index out of range"))?;
     // C's `is_list(args) || is_nil(args)` test, and no length read: the list term is
-    // shared into the `A` slot, so an improper list needs no walking (and is never
+    // deep-copied into the `A` slot, so an improper list is walked (and never
     // rejected — `erlang:error(foo, [1|2])` keeps its tail verbatim in the oracle too).
     let args = match failed_clause_args {
         Some(list) if is_list(list) || is_nil(list) => Some(list),
         _ => None,
+    };
+    // Size the argument-list copy **before** the reservation: the structure (and thus the
+    // word count) is invariant under the reservation's move, and `ItemShape::words`
+    // charges exactly what `write_item` will carve.
+    let args_words = match args {
+        Some(list) => terms::bounded_copy_budget(list)?,
+        None => 0,
     };
     Ok(ItemShape {
         module: function.module,
         function: function.name,
         arity: function.arity,
         args,
+        args_words,
         error_info: None,
         location: location_shape(module, func, pc)?,
     })
@@ -733,23 +789,23 @@ fn location_shape(module: &Module, func: u32, pc: u32) -> Result<Option<Location
 /// by that method is consumed exactly; a region that is somehow too small is the
 /// typed [`crate::error::unsupported`] from [`crate::terms::Slack::alloc_words`],
 /// never a wrong term.
-fn write_item(sink: &mut dyn Sink, shape: &ItemShape<'_>) -> Result<Eterm> {
+fn write_item(sink: &mut Slack, shape: &ItemShape<'_>, atoms: &AtomTable) -> Result<Eterm> {
     let location = match (&shape.location, shape.error_info) {
-        (Some(location), error_info) => write_location(sink, location, error_info)?,
+        (Some(location), error_info) => write_location(sink, location, error_info, atoms)?,
         // A frame with no source location (C's `LINE_INVALID_LOCATION`) still reports
         // the extension: `erts_build_mfa_item` starts `loc` from the `{error_info,Map}`
         // cons and only *prepends* the file/line pairs, so the location is the
         // one-element list `[{error_info,Map}]`.
-        (None, Some(error_info)) => write_error_info_only(sink, error_info)?,
+        (None, Some(error_info)) => write_error_info_only(sink, error_info, atoms)?,
         (None, None) => NIL,
     };
     // The `A` slot: the innermost item's argument list when the raise published one,
-    // else the declared arity. The list **term** is stored verbatim (C's
-    // `TUPLE4(.., args, loc)`), so its elements are neither read nor copied here — the
-    // word was re-seated from the raise latch after the rooted allocation, so it cannot
-    // address a pre-move cell, and nothing allocates between this store and the tuple.
+    // else the declared arity. The list is **deep-copied** into the same reservation,
+    // so its graph is self-contained and survives a later collection or the host's
+    // rewind of the latch backing store (the word was re-seated from the raise latch
+    // after the rooted allocation, but the cells behind it are copied here).
     let arity = match shape.args {
-        Some(list) => list,
+        Some(list) => terms::bounded_copy(sink, list, atoms)?,
         None => make_small(shape.arity as i64),
     };
     sink.tuple(&[make_atom(shape.module), make_atom(shape.function), arity, location])
@@ -762,9 +818,10 @@ fn write_item(sink: &mut dyn Sink, shape: &ItemShape<'_>) -> Result<Eterm> {
 /// `{error_info,Map}`, then the outer list) is exactly [`ItemShape::words`]'s, so a
 /// region sized by that method is consumed exactly.
 fn write_location(
-    sink: &mut dyn Sink,
+    sink: &mut Slack,
     location: &LocationShape<'_>,
     error_info: Option<ErrorInfoShape>,
+    atoms: &AtomTable,
 ) -> Result<Eterm> {
     // An Erlang file name term is a list of code points (the oracle prints
     // `{file,"m.erl"}`); the `Line` chunk carries the name as UTF-8.
@@ -783,25 +840,56 @@ fn write_location(
         // C's `erts_build_mfa_item` prepends the pairs to the extension cons, so the
         // extension is the **third** element.
         Some(error_info) => {
-            let pair = write_error_info_pair(sink, error_info)?;
+            let pair = write_error_info_pair(sink, error_info, atoms)?;
             sink.list(&[file_pair, line_pair, pair])
         }
         None => sink.list(&[file_pair, line_pair]),
     }
 }
 
+/// The **unrooted** location carve for [`stacktrace_item`]: the
+/// `[{file,File},{line,N}]` list on a [`ContextSink`], which never carries an
+/// `{error_info, Map}` tail (that item has no raise payloads).
+fn write_location_unrooted(
+    sink: &mut dyn Sink,
+    location: &LocationShape<'_>,
+) -> Result<Eterm> {
+    let chars: Vec<Eterm> = location
+        .file
+        .chars()
+        .map(|ch| make_small(ch as i64))
+        .collect();
+    let file_name = sink.list(&chars)?;
+    let file_pair = sink.tuple(&[make_atom(location.file_atom), file_name])?;
+    let line_pair = sink.tuple(&[
+        make_atom(location.line_atom),
+        make_small(location.line as i64),
+    ])?;
+    sink.list(&[file_pair, line_pair])
+}
+
 /// The location of an item whose frame has **no** source location but whose raise did
 /// carry the extension: `[{error_info, Map}]` (C starts `loc` from the extension and
 /// prepends nothing when `fi->loc == LINE_INVALID_LOCATION`).
-fn write_error_info_only(sink: &mut dyn Sink, error_info: ErrorInfoShape) -> Result<Eterm> {
-    let pair = write_error_info_pair(sink, error_info)?;
+fn write_error_info_only(
+    sink: &mut Slack,
+    error_info: ErrorInfoShape,
+    atoms: &AtomTable,
+) -> Result<Eterm> {
+    let pair = write_error_info_pair(sink, error_info, atoms)?;
     sink.list(&[pair])
 }
 
-/// Carve the `{error_info, Map}` 2-tuple; the **map word is written verbatim** (shared
-/// with the raise, never copied, exactly as C stores `c_p->fvalue`).
-fn write_error_info_pair(sink: &mut dyn Sink, error_info: ErrorInfoShape) -> Result<Eterm> {
-    sink.tuple(&[make_atom(error_info.atom), error_info.map])
+/// Carve the `{error_info, Map}` 2-tuple; the **map is deep-copied** into the same
+/// reservation so it is self-contained (never a pointer into the raise's latch backing
+/// store, which the host may rewind after this carve).
+fn write_error_info_pair(
+    sink: &mut Slack,
+    error_info: ErrorInfoShape,
+    atoms: &AtomTable,
+) -> Result<Eterm> {
+    let map = terms::bounded_copy(sink, error_info.map, atoms)?;
+    sink.tuple(&[make_atom(error_info.atom), map])
 }
 
 /// The source location in effect at code offset `pc` of the function at index
