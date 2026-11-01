@@ -63,6 +63,14 @@
 //! also opens the escape-store descent gate ([`Runtime::note_escaped_store_roots`], the same call
 //! [`Runtime::stabilize_term`] makes) — over-approximate by design, and free of charge for the
 //! overwhelmingly common case where the latch is already set.
+//!
+//! A **hand-through** (the short-circuit above) is sound for the rewind by the same argument, but
+//! it is not sound for the **GC** on the root test alone: the store and the arena are never-scanned,
+//! so a container handed through with scanned-heap children would be relocated out from under
+//! itself. The short-circuit therefore also runs
+//! [`super::calls::dest::graph_reaches_scanned_heap`] and hands a term through only when its whole
+//! reachable graph is pointer-stable; a graph that names any scanned word falls through to the deep
+//! copy, which re-roots it on this store.
 
 use beam_term::Eterm;
 
@@ -117,9 +125,18 @@ impl RuntimeContext<'_> {
         // (the aliased-ETS `TermStore`, the `system_info` scratch region): then only the store half
         // can answer, and the copy runs as it always did.
         //
-        // The escape-store descent gate is opened exactly as on the copy path below: the store is
-        // outside every process's scanned heap, so a handed-through container must keep the
-        // over-approximate "an escaped store may hold roots" latch set just the same.
+        // A hand-through on either answer is **not** enough on its own: the store and the arena are
+        // pointer-stable but never-scanned, so a container whose root stands there but whose
+        // children live on a scanned young heap would be relocated out from under itself by that
+        // process's next collection (the copier hands such a root `Target::Foreign` and does not
+        // descend). The guard below descends the whole reachable graph instead
+        // ([`super::calls::dest::graph_reaches_scanned_heap`]): a graph that names **any** scanned
+        // word falls through to the deep copy (which re-roots it on this never-reset store), while
+        // a fully self-contained graph is handed through unchanged — which is what keeps a no-op
+        // BIF's term identity observable. The escape-store descent gate is opened exactly as on the
+        // copy path below: the store is outside every process's scanned heap, so a handed-through
+        // container must keep the over-approximate "an escaped store may hold roots" latch set just
+        // the same.
         let nothing_to_move = match pool {
             // Known region: hand through what the store already holds, and anything that is not on
             // a pooled region.
@@ -130,7 +147,7 @@ impl RuntimeContext<'_> {
             // Unknown origin: only the store half can answer.
             None => super::calls::dest::store_holds(runtime, term),
         };
-        if nothing_to_move {
+        if nothing_to_move && !super::calls::dest::graph_reaches_scanned_heap(runtime, term) {
             runtime.note_escaped_store_roots(term);
             return Some(term);
         }

@@ -50,7 +50,7 @@
 //!   whole graph it reaches then predates this call, so not one word of it can be a word the
 //!   rewind frees.
 //!
-//! # Why handing the word through is sound
+//! # Why handing the word through is sound — the rewind, and now the GC
 //!
 //! The workspace law is that a raw `Eterm` in a long-lived slot roots nothing and that a
 //! pointer-stable, never-scanned store must not hold a container whose children live on a scanned
@@ -68,15 +68,21 @@
 //! * and the arena/literal words the [`pool_holds`] arm hands through are pointer-stable too: the
 //!   engine's arena is never moved and a literal region is frozen at load time.
 //!
-//! A **mixed-heap** container never needs a different answer, and it is not classified by a tag
-//! heuristic: the pool is a region, so "the root is on no pooled region" is decided with the exact
-//! block test [`term_in_heap_block`](super::gc::term_in_heap_block) the GC hoists into
-//! [`Geometry`](super::gc::Geometry). Two structural facts make it airtight: (a) every word a
-//! returned container reaches either **predates the call** — so it cannot be a word this call
-//! allocated into `[mark, used)` — or the root is in the pool, which is the copied arm; and (b) a
-//! container holding a **reference** never reaches either arm — the tail's `graph_holds_reference`
-//! check runs first on the process route and keeps its conservative "never copy, never rewind"
-//! answer, because a reference's identity *is* its address.
+//! Those three facts make the **rewind** decision airtight — a container whose root is on no pooled
+//! region predates the call, so the rewind cannot free a word of it. They do **not**, by
+//! themselves, make the **GC** decision airtight: a store/arena/literal root can have children that
+//! live on a scheduled process's scanned young heap (a `-eval` route reaching a nested run or a
+//! spawned closure), and a collection hands such a root the `Target::Foreign` verdict and does not
+//! descend into it — relocating the children out from under it. So the table-less arm no longer
+//! hands a word through on the root test alone: it also runs [`graph_reaches_scanned_heap`], which
+//! walks the whole reachable graph and answers `true` when any readable container word (root
+//! included) lives inside a scanned region of **any** live process. A hand-through is therefore
+//! taken only for a graph that is **fully self-contained** on pointer-stable regions (or nothing
+//! but immediates); a mixed-heap graph falls through to the deep copy, which re-roots the whole
+//! graph on the never-reset store. A container holding a **reference** still never reaches either
+//! arm — the tail's `graph_holds_reference` check runs first on the process route and keeps its
+//! conservative "never copy, never rewind" answer, because a reference's identity *is* its
+//! address.
 //!
 //! The information only a caller has — *which* region this call allocated from — is a parameter
 //! (`Option<&Heap>`): `None` means "this result came from somewhere the caller cannot vouch for"
@@ -140,6 +146,110 @@ pub(crate) fn pool_holds(runtime: &crate::runtime::Runtime, pool: &Heap, term: E
             .bif_heaps
             .iter()
             .any(|heap| super::super::gc::term_in_heap_block(heap, term))
+}
+
+/// Whether **any** word reachable from `term` lives on a region some live process's collector
+/// **scans** — a scheduled process's young heap, a growth-retired nursery space, or the mature
+/// generation.
+///
+/// # Why the table-less short-circuit must ask this
+///
+/// [`store_holds`] and [`pool_holds`] classify only the **root** object, which is the exact answer
+/// the **rewind** decision needs ("does the rewind free the root?"). It is not the answer the
+/// **GC** decision needs: the store and the engine arena are pointer-stable but never-scanned, so a
+/// collection hands a container standing on either the `Target::Foreign` verdict and does not
+/// descend into it. A container whose root stands there but whose **child** stands on a scanned
+/// young heap is therefore relocated out from under itself the next time that process collects —
+/// the `0x3f` forwarding-header CAR the `error_info_abort_probe` D1c residual shows. This walk
+/// closes that hole: it answers `true` when any readable container word in the graph (root
+/// included) lives inside a scanned region of **any** live process, and `false` only when the whole
+/// graph is pointer-stable (the store, the arena, a literal area, or nothing but immediates), in
+/// which case handing the word through unchanged is sound and keeps a no-op BIF's term identity
+/// observable.
+///
+/// # Safety
+///
+/// The walk reads only words reachable from a live `term` through the workspace's canonical child
+/// enumeration ([`beam_term::layout::for_each_child_slot`]), guarded exactly as
+/// [`super::RuntimeContext::graph_holds_reference`] guards its reads: a literal, an immediate and a
+/// non-term `HEADER` word are skipped, and a word whose pointer names no address a term can live at
+/// ([`super::super::gc::dereferenceable_pointer`]) is skipped. A forged cycle exhausts
+/// [`super::WALK_VISIT_BUDGET`] and answers `true` — "assume it reaches a scanned heap" — whose
+/// only consequence is a deep copy, never a wrong move.
+#[allow(unsafe_code)]
+pub(crate) fn graph_reaches_scanned_heap(
+    runtime: &crate::runtime::Runtime,
+    term: Eterm,
+) -> bool {
+    fn scanned_by_any(runtime: &crate::runtime::Runtime, word: Eterm) -> bool {
+        runtime.processes().pids().any(|pid| {
+            let Some(process) = runtime.processes().get(pid) else {
+                return false;
+            };
+            super::super::gc::Geometry::of(process).word_is_scanned(process, word, false)
+        })
+    }
+
+    let mut work = super::Walklist::new();
+    let mut budget = super::WALK_VISIT_BUDGET;
+    work.push(term);
+    while let Some(popped) = work.pop() {
+        if !super::RuntimeContext::walk_may_lead_further(popped) {
+            continue;
+        }
+        let Some(mut address) = super::super::gc::dereferenceable_pointer(popped) else {
+            continue;
+        };
+        let mut item = popped;
+        loop {
+            if budget == 0 {
+                return true;
+            }
+            budget -= 1;
+            if scanned_by_any(runtime, item) {
+                return true;
+            }
+            if !beam_term::prelude::is_list(item) {
+                let ptr = address as *const Eterm;
+                // SAFETY: `item` passed the walk's admission test and is not a cons, so it is a
+                // boxed **term** word whose object pointer is non-null and aligned; the word at
+                // that address is its live header, and `for_each_child_slot` visits exactly that
+                // shape's term-reference slots.
+                unsafe {
+                    let header = *ptr;
+                    beam_term::layout::for_each_child_slot(header, ptr, |offset| {
+                        let child = *ptr.add(offset);
+                        if super::RuntimeContext::walk_may_lead_further(child) {
+                            work.push(child);
+                        }
+                    });
+                }
+                break;
+            }
+            let cell = address as *const Eterm;
+            // SAFETY: `item` is a term word with the `LIST` primary tag whose cell pointer is
+            // non-null and aligned, so the two words at that address are its live `car` and `cdr`.
+            let (car, cdr) = unsafe { (*cell, *cell.add(1)) };
+            if super::RuntimeContext::walk_may_lead_further(car) {
+                work.push(car);
+            }
+            if super::RuntimeContext::walk_may_lead_further(cdr) {
+                if beam_term::prelude::is_list(cdr) {
+                    match super::super::gc::dereferenceable_pointer(cdr) {
+                        Some(next) => {
+                            item = cdr;
+                            address = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                work.push(cdr);
+            }
+            break;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

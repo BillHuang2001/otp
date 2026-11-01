@@ -214,3 +214,72 @@ fn the_store_arm_hands_through_a_result_that_is_on_no_pooled_region() {
     );
     assert!(!crate::context::calls::dest::pool_holds(&rt, &pool, elsewhere));
 }
+/// A3 — the **store** arm's GC guard: a container whose root already lives on the never-scanned
+/// store but whose **child** lives on a scheduled process's scanned young heap is **never** handed
+/// through. It is deep-copied whole, so a later collection of that process relocates the young heap
+/// and leaves the returned term intact (the old code handed the word through, and the collection
+/// left its slot naming a `0x3f` forwarding header — the D1c `error_info_abort_probe` from-space
+/// CAR).
+#[test]
+fn a_store_root_with_scanned_heap_children_is_deep_copied_and_survives_a_forced_collection() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    // A real scheduled process's young heap holds the child list; it is published as a root so the
+    // forced collection relocates it (a garbage child would be overwritten, not forwarded).
+    let child = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        int_list(process.heap_mut(), 4).expect("four cells fit the nursery")
+    };
+    table
+        .get_mut(pid)
+        .expect("the spawned process")
+        .registers_mut()
+        .extra_roots_mut()
+        .push(child);
+    // The spawned process must be in the runtime's table before the guard runs: the walk classifies
+    // "scanned" against the live processes.
+    rt.put_processes(table);
+    // The outer container stands on the runtime's store — the hand-through's positive root test —
+    // but names a child on the scanned young heap.
+    let outer = rt
+        .eval_heap
+        .tuple(&[child])
+        .expect("the outer container on the store");
+    assert!(
+        crate::context::calls::dest::store_holds(&rt, outer),
+        "the root really is on the store"
+    );
+    assert!(
+        crate::context::calls::dest::graph_reaches_scanned_heap(&rt, outer),
+        "the guard really sees the scanned-heap child"
+    );
+    let copied = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.move_result_into_runtime_store(outer, None)
+            .expect("a mixed-heap graph is re-homed")
+    };
+    assert_ne!(
+        copied, outer,
+        "a store root with scanned-heap children must be deep-copied, never handed through"
+    );
+    // Force the spawned process's collection: its young heap moves, so the pre-fix hand-through
+    // would have left `outer` (and therefore `copied`) pointing at the from-space.
+    let mut table = rt.take_processes();
+    rt.request_gc(pid);
+    let collected = rt.serve_gc_request(&mut table, pid);
+    rt.put_processes(table);
+    assert!(collected, "the forced collection of the spawned process really ran");
+    // The returned term is a self-contained structural twin of `{ [1,2,3,4] }`: its child was
+    // deep-copied onto the store, so the collection moved no word it names.
+    let atoms = rt.code_server().atoms_handle();
+    let mut expected_heap = beam_alloc::Heap::new(32).expect("a local heap");
+    let expected_child = int_list(&mut expected_heap, 4).expect("four cells fit");
+    let expected = expected_heap
+        .tuple(&[expected_child])
+        .expect("the expected shape");
+    assert!(
+        beam_term::compare::eq(copied, expected, &atoms),
+        "the re-homed container's contents are intact after the collection"
+    );
+}
