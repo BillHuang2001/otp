@@ -89,6 +89,7 @@
 //! (the aliased-ETS table's own `TermStore`, or the `system_info` scratch region), and that arm
 //! always copies.
 use beam_alloc::Heap;
+use beam_gc::ScannedBounds;
 use beam_term::Eterm;
 
 /// Whether `term`'s root object already lives on a region `process`'s collector **scans** — the
@@ -181,6 +182,15 @@ pub(crate) fn graph_reaches_scanned_heap(
     runtime: &crate::runtime::Runtime,
     term: Eterm,
 ) -> bool {
+    // Hoist the per-process scanned geometry into ONE merged aggregate, read once per call. The
+    // walk below visits every node of the result graph, and re-deriving each process's
+    // `Geometry::of`/`scanned_bounds` per node (millions of times on a fan-out-heavy workload)
+    // was the dominant cost. The merged interval is a **superset** of every process's scanned
+    // regions — a process's mutator block (`Process::heap`) lies inside its nursery's reserved
+    // extent, so `scanned_bounds` covers the block exactly the way `word_is_scanned`'s
+    // `block_contains` does — so a word the merged interval rejects is in no scanned region of
+    // ANY process, and a word it accepts falls through to the exact per-process check. See
+    // `beam_gc::ScannedBounds` for why only the reject direction is sound.
     fn scanned_by_any(runtime: &crate::runtime::Runtime, word: Eterm) -> bool {
         runtime.processes().pids().any(|pid| {
             let Some(process) = runtime.processes().get(pid) else {
@@ -189,6 +199,18 @@ pub(crate) fn graph_reaches_scanned_heap(
             super::super::gc::Geometry::of(process).word_is_scanned(process, word, false)
         })
     }
+
+    let mut merged_base = usize::MAX;
+    let mut merged_limit = 0usize;
+    for pid in runtime.processes().pids() {
+        let Some(process) = runtime.processes().get(pid) else {
+            continue;
+        };
+        let bounds = process.collector().scanned_bounds();
+        merged_base = merged_base.min(bounds.base());
+        merged_limit = merged_limit.max(bounds.limit());
+    }
+    let merged = ScannedBounds::new(merged_base, merged_limit);
 
     let mut work = super::Walklist::new();
     let mut budget = super::WALK_VISIT_BUDGET;
@@ -206,7 +228,13 @@ pub(crate) fn graph_reaches_scanned_heap(
                 return true;
             }
             budget -= 1;
-            if scanned_by_any(runtime, item) {
+            // Fast reject: `address` is `dereferenceable_pointer(item)` (==
+            // `foreign_shape_pointer(item)` for every word the walk admits), so
+            // `merged.may_contain(address) == false` proves the word is unscanned by every
+            // process and the exact per-process check is skipped. `true` is never treated as
+            // containment — the exact check still decides, exactly like the existing two-tier
+            // `outside_bounds` logic.
+            if merged.may_contain(address) && scanned_by_any(runtime, item) {
                 return true;
             }
             if !beam_term::prelude::is_list(item) {
