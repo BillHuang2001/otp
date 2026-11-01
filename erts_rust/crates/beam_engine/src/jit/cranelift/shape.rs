@@ -34,7 +34,7 @@ use std::mem;
 use beam_loader::{Label, Operand, NO_FAIL};
 use beam_term::{
     Eterm, ARITYVAL_SUBTAG, HEADER_ARITY_OFFS, TAG_HEADER_MASK, TAG_PRIMARY_BOXED,
-    TAG_PRIMARY_MASK, TAG_PTR_MASK,
+    TAG_PRIMARY_LIST, TAG_PRIMARY_MASK, TAG_PTR_MASK,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{types, FuncRef, InstBuilder, MemFlags, Value};
@@ -45,7 +45,7 @@ use crate::machine::MAX_REGISTER;
 use super::codegen::{
     emit_helper_dispatch, emit_target_branch, goto_or_leave, x_offset, Cfg, XREGS_DISP,
 };
-use super::inline::{cmp_src, constant_word, load_cmp_src, x_register, CmpSrc, LIST_MASK};
+use super::inline::{cmp_src, constant_word, load_cmp_src, x_register, CmpSrc};
 use super::report::CodegenReport;
 
 // ---------------------------------------------------------------------------
@@ -434,9 +434,11 @@ pub(super) fn emit_inline_select_tuple_arity(
 //
 // All three read a cons cell's `CAR`/`CDR`. The interpreter's family
 // (`crate::families::lists`) is the *safety net*: it requires `terms::cons_head`/
-// `cons_tail` — with `beam_term::is_list` (the C bit trick `(word & 0x2) == 0`;
-// **`NIL` is not a list**) as the guard — and raises `{badmatch, Source}` for
-// anything else (`[]`, an integer, a tuple, …).
+// `cons_tail` — with `beam_term::is_list` **and** `beam_term::is_term_word` (the
+// full primary tag must be `LIST`; the C bit trick `(word & 0x2) == 0` would also
+// accept a bare `HEADER` word like `THE_NON_VALUE`; **`NIL` is not a list**) as the
+// guard — and raises `{badmatch, Source}` for anything else (`[]`, an integer, a
+// tuple, a header, …).
 //
 // The native path reproduces exactly that: a run-time guard accepts only a cons
 // cell, and a rejected source branches to the helper, whose interpreter step raises
@@ -501,10 +503,13 @@ pub(super) fn emit_inline_list_read(
         .ins()
         .load(types::I64, MemFlags::trusted(), x_regs, x_offset(plan.src_x));
 
-    // `is_list(word)`: `(word & 0x2) == 0` (and `NIL`, whose low two bits are `0b11`,
-    // fails it).
-    let not_list = builder.ins().band_imm(word, LIST_MASK);
-    let is_list = builder.ins().icmp_imm(IntCC::Equal, not_list, 0);
+    // `is_list(word) && is_term_word(word)`: the full primary tag must be `LIST`
+    // (`(word & 0x3) == 0x1`). `NIL` (low two bits `0b11`) fails it, and a bare
+    // `HEADER` word (tag `0b00`, e.g. `beam_term::THE_NON_VALUE`) — which the
+    // `(word & 0x2) == 0` bit trick would accept — fails it too, so the `CAR`/`CDR`
+    // load below only ever dereferences a true cons cell.
+    let primary = builder.ins().band_imm(word, TAG_PRIMARY_MASK as i64);
+    let is_list = builder.ins().icmp_imm(IntCC::Equal, primary, TAG_PRIMARY_LIST as i64);
     let read = builder.create_block();
     let slow = builder.create_block();
     builder.ins().brif(is_list, read, &[], slow, &[]);

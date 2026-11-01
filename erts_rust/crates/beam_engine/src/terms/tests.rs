@@ -125,6 +125,21 @@ fn improper_list_is_rejected_by_list_elements() {
 }
 
 #[test]
+fn a_bare_header_word_is_rejected_by_the_list_readers() {
+    // `is_list`'s C bit trick (`x & 0x2 == 0`) is ALSO true for a bare `HEADER` word —
+    // `THE_NON_VALUE` in a debug build and raw `0` in a release build — so the readers
+    // must additionally gate the dereference with `is_term_word` and answer `BadArg`
+    // rather than dereferencing address `0x18` / `NULL` (the khepri `projections`
+    // SIGSEGV shape).
+    assert_bad_arg(cons_head(beam_term::THE_NON_VALUE));
+    assert_bad_arg(cons_tail(beam_term::THE_NON_VALUE));
+    assert_bad_arg(list_elements(beam_term::THE_NON_VALUE));
+    assert_bad_arg(cons_head(Eterm::from_raw(0)));
+    assert_bad_arg(cons_tail(Eterm::from_raw(0)));
+    assert_bad_arg(list_elements(Eterm::from_raw(0)));
+}
+
+#[test]
 fn cons_cell_layout_is_car_then_cdr() {
     let mut c = ctx();
     let l = make_list(&mut c, &[make_small(7)]).unwrap();

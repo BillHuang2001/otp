@@ -903,6 +903,33 @@ fn get_list_on_nil_raises_badmatch() {
 }
 
 #[test]
+fn get_list_on_a_bare_header_word_raises_badmatch() {
+    // `is_list`'s C bit trick (`x & 0x2 == 0`) is ALSO true for a bare `HEADER` word,
+    // so a `get_list` whose source register still holds the landing marker must raise
+    // `{badmatch, Value}` instead of dereferencing the word — the khepri `projections`
+    // SIGSEGV shape (`beam_term::list::car` on `THE_NON_VALUE`, address `0x18`).
+    // The two forms are the debug `THE_NON_VALUE` (`0x18`) and the release `0`.
+    for value in [beam_term::THE_NON_VALUE, Eterm::from_raw(0)] {
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::X(0),
+                tail: Operand::X(1),
+            },
+            Instr::Return,
+        ];
+        let mut fixture = Fixture::new();
+        let badmatch = fixture.atom("badmatch");
+        let entry = fixture.add_function("f", 1, code);
+        let module = fixture.finish();
+        let mut ctx = MinimalContext::new();
+        let (result, machine) = run_inspected(&module, entry, &[value], &mut ctx);
+        assert_badmatch(result, &machine, badmatch, value);
+    }
+}
+
+#[test]
 fn get_hd_on_a_non_list_raises_badmatch() {
     let code = vec![
         Instr::Label(Label(1)),

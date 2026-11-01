@@ -52,22 +52,27 @@ pub fn tuple_element(t: Eterm, i: usize) -> Result<Eterm> {
 /// The head (`CAR`) of a cons cell; `NIL` or a non-list yields
 /// [`BeamError::BadArg`].
 pub fn cons_head(t: Eterm) -> Result<Eterm> {
-    // `is_list` reads only the primary tag, never dereferences.
-    if !beam_term::is_list(t) {
+    // `is_list` reads only the primary tag, never dereferences, but the C bit trick
+    // (`x & 0x2 == 0`) is ALSO true for a bare `HEADER` word (`THE_NON_VALUE`), so the
+    // "is a term" test must gate the dereference exactly as `is_boxed_term` does.
+    if !beam_term::is_list(t) || !beam_term::is_term_word(t) {
         return Err(BeamError::BadArg);
     }
-    // SAFETY: `is_list` established that `t` is a header-less 2-word cons cell.
+    // SAFETY: `is_list && is_term_word` established that `t` is a header-less 2-word
+    // cons cell, not a bare header word.
     Ok(unsafe { beam_term::car(t) })
 }
 
 /// The tail (`CDR`) of a cons cell; `NIL` or a non-list yields
 /// [`BeamError::BadArg`].
 pub fn cons_tail(t: Eterm) -> Result<Eterm> {
-    // `is_list` reads only the primary tag, never dereferences.
-    if !beam_term::is_list(t) {
+    // `is_list` reads only the primary tag, never dereferences, but the C bit trick is
+    // ALSO true for a bare `HEADER` word (`THE_NON_VALUE`); gate it like `cons_head`.
+    if !beam_term::is_list(t) || !beam_term::is_term_word(t) {
         return Err(BeamError::BadArg);
     }
-    // SAFETY: `is_list` established that `t` is a header-less 2-word cons cell.
+    // SAFETY: `is_list && is_term_word` established that `t` is a header-less 2-word
+    // cons cell, not a bare header word.
     Ok(unsafe { beam_term::cdr(t) })
 }
 
@@ -83,11 +88,11 @@ pub fn list_elements(t: Eterm) -> Result<Vec<Eterm>> {
         if beam_term::is_nil(cur) {
             return Ok(out);
         }
-        if !beam_term::is_list(cur) {
-            // Improper tail, or a non-list to begin with.
+        if !beam_term::is_list(cur) || !beam_term::is_term_word(cur) {
+            // Improper tail, a non-list, or a bare `HEADER` word to begin with.
             return Err(BeamError::BadArg);
         }
-        // SAFETY: `is_list` established that `cur` is a live cons cell.
+        // SAFETY: `is_list && is_term_word` established that `cur` is a live cons cell.
         unsafe {
             out.push(beam_term::car(cur));
             cur = beam_term::cdr(cur);

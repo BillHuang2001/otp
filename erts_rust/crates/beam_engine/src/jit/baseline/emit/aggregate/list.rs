@@ -53,13 +53,14 @@ use super::super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATC
 //   addressable `Y` slot ([`Loc`]): a register index past the bound would read out
 //   of `machine.x`, and a `Y` slot is addressed through the guarded frame window —
 //   both refused kinds deopt, so the interpreter step reports the faithful error;
-// * the guard is `is_list` itself, the C bit trick
-//   `(word & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0`: the emitted `and`
-//   leaves `0` for a cons cell (primary tag `LIST`) and the mask itself for
-//   everything else — `NIL`, a small int, an atom, a boxed term (`[]`, `1`,
-//   `foo`, a tuple, …) — so the comparison against the mask is exactly
-//   "not a cons cell" and branches to the helper, whose interpreter step raises
-//   the exact `{badmatch, Source}`;
+// * the guard is `is_list` **and** `is_term_word` together — the full primary
+//   tag must be `LIST`. The emitted `and` masks with `TAG_PRIMARY_MASK` and
+//   compares against `TAG_PRIMARY_LIST`, so a cons cell (primary tag `LIST`)
+//   proceeds and everything else — `NIL`, a small int, an atom, a boxed term
+//   (`[]`, `1`, `foo`, a tuple, …) **and a bare header word** (primary tag
+//   `HEADER`, e.g. `THE_NON_VALUE`) — branches to the helper, whose interpreter
+//   step raises the exact `{badmatch, Source}`; the plain `is_list` bit trick
+//   would let a `HEADER` word through and the deref below would read address `0`;
 // * on success the cell's address is `list_val(word)` (`word & !TAG_PTR_MASK`),
 //   the CAR is the word at offset 0 and the CDR the word at the cons cell's
 //   second word (`beam_term::{CAR_OFFSET, CDR_OFFSET}`).
@@ -74,10 +75,6 @@ use super::super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATC
 // clobbered an operand the interpreter then re-reads (a destination that aliases the
 // source) would diverge — front-loading every guard makes a rejection leave the
 // machine exactly as the interpreter will re-run it.
-
-/// `TAG_PRIMARY_MASK - TAG_PRIMARY_LIST` as an `i64` — the mask of the
-/// `is_not_list` bit trick (`beam_term::list::is_not_list`), which is `0x2`.
-const NOT_LIST_MASK: i64 = (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST) as i64;
 
 /// `!TAG_PTR_MASK` as an `i64` — the mask `list_val` clears the pointer tag with.
 pub(crate) const POINTER_MASK: i64 = !(TAG_PTR_MASK as i64);
@@ -261,10 +258,12 @@ pub(crate) fn try_inline_get_tl(
 /// ```text
 ///   mov  r11, <source>      ; the source word: a cached register, `[rbx + x*8]`,
 ///                           ;   or a guarded Y read (r10 = the window bound)
-///   mov  r10, NOT_LIST_MASK ; the `is_not_list` bit
-///   and  r11, r10
-///   cmp  r11, r10           ; the masked word is 0 (a cons cell) or the mask itself
-///   je   fallback           ; not a cons cell: the helper raises `{badmatch,Source}`
+///   mov  r10, TAG_PRIMARY_MASK ; mask to the 2-bit primary tag
+///   and  r11, r10           ; r11 = source & 0x3
+///   mov  r10, TAG_PRIMARY_LIST
+///   cmp  r11, r10           ; the masked word is LIST (a cons cell) or not
+///   jne  fallback           ; not a cons cell (or a bare header): the helper
+///                           ;   raises `{badmatch,Source}`
 ///   mov  r11, <source>      ; reload (the mask consumed the word)
 ///   mov  r10, POINTER_MASK
 ///   and  r11, r10           ; r11 = the cons cell's address, `list_val(word)`
@@ -303,15 +302,21 @@ fn emit_list_read(
     let fallback: CodeLabel = buffer.label();
     let fast_done: CodeLabel = buffer.label();
 
-    // The guard: `is_not_list(source)` — a non-cons source (`[]`, a small int, an
-    // atom, a tuple) branches to the helper, which raises `{badmatch, Source}`.
+    // The guard: `!is_list(source) || !is_term_word(source)` — the full primary tag
+    // must be `LIST`. A non-cons source (`[]`, a small int, an atom, a tuple) AND a
+    // bare header word (primary tag `HEADER`, e.g. `beam_term::THE_NON_VALUE`) both
+    // branch to the helper, which raises `{badmatch, Source}`. The bit trick
+    // `(word & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0` is also true for a
+    // `HEADER` word (`0 & 0x2 == 0`), which `terms::cons_head`/`cons_tail` refuse;
+    // testing the full tag instead keeps the deref below on a true cons cell only.
     shape
         .source
         .load(buffer, allocation, MOVE_SCRATCH, MOVE_SCRATCH_2, fallback, highest_touched)?;
-    buffer.mov_ri(MOVE_SCRATCH_2, NOT_LIST_MASK)?;
+    buffer.mov_ri(MOVE_SCRATCH_2, TAG_PRIMARY_MASK as i64)?;
     buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
+    buffer.mov_ri(MOVE_SCRATCH_2, TAG_PRIMARY_LIST as i64)?;
     buffer.cmp_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
-    buffer.jcc(Cond::E, fallback)?;
+    buffer.jcc(Cond::Ne, fallback)?;
 
     // The cell's address: reload the source word (the mask above consumed it) and
     // clear the pointer tag — `list_val(word)`.

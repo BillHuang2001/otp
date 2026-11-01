@@ -7052,6 +7052,78 @@ fn the_heap_and_frame_admission_family_is_lowered_without_a_jit_step_one_deopt()
     );
 }
 
+/// `GetList`/`GetHd`/`GetTl` inline a cons-cell `CAR`/`CDR` deref behind the
+/// `is_list` bit trick (`x & 0x2 == 0`), which is ALSO true for a bare `HEADER`
+/// word (`beam_term::THE_NON_VALUE`, debug `0x18` / release `0`). The inline guard
+/// must therefore test the full primary tag (`== TAG_PRIMARY_LIST`) and branch a
+/// header word to the helper, whose interpreter step raises `{badmatch, Source}` —
+/// never dereference address `0` (the khepri `projections` SIGSEGV). Runs the same
+/// source on **both** native-adjacent tiers, so a header word reaching an inlined
+/// list read raises identically on the interpreter and the baseline JIT.
+#[test]
+fn list_reads_on_a_bare_header_word_raise_badmatch_on_every_tier() {
+    let bodies: [Vec<Instr>; 3] = [
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::X(0),
+                tail: Operand::X(1),
+            },
+            Instr::Return,
+        ],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::GetHd {
+                source: Operand::X(0),
+                head: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::GetTl {
+                source: Operand::X(0),
+                tail: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    ];
+    for body in bodies {
+        let mut module = build_module("deopt", &[], vec![("f", 1, body)], &[("f", 1, Label(2))]);
+        let badmatch = module.atom_table.intern("badmatch");
+        let name = export_atom(&module, "f");
+        for value in [beam_term::THE_NON_VALUE, beam_term::Eterm::from_raw(0)] {
+            for tier in [Tier::Interpreter, Tier::BaselineJit] {
+                let mut machine = Machine::new();
+                let mut ctx = MinimalContext::new();
+                let outcome =
+                    machine.run_export_outcome_with_tier(&module, name, 1, &[value], &mut ctx, tier);
+                assert!(
+                    matches!(outcome, Err(beam_common::BeamError::Raise(_))),
+                    "{tier:?} on {value:?}: expected a raise, got {outcome:?}"
+                );
+                let (class, reason) = machine.pending_exception().expect("a recorded exception");
+                assert_eq!(class, beam_common::ExceptionClass::Error, "{tier:?}");
+                assert_eq!(crate::terms::tuple_arity(reason).unwrap(), 2, "{tier:?}");
+                assert_eq!(
+                    crate::terms::tuple_element(reason, 0).unwrap(),
+                    beam_term::make_atom(badmatch),
+                    "{tier:?}"
+                );
+                assert_eq!(
+                    crate::terms::tuple_element(reason, 1).unwrap(),
+                    value,
+                    "{tier:?}"
+                );
+            }
+        }
+    }
+}
+
 // The lowering-specific test suites live in their own files, `#[path]`-included here so
 // they are children of this module and share its private harness (`with_both_tiers`,
 // `assert_same_outcome`, `body_module`, `build_module`).
