@@ -220,8 +220,8 @@ use beam_term::{atom_val, signed_value, Eterm};
 use crate::access::{
     bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
     is_external_pid, is_external_ref, is_float, is_function, is_internal_pid, is_internal_port,
-    is_internal_ref, is_list, is_map, is_nil, is_port, is_record, is_small, is_tuple, tuple_element,
-    tuple_size,
+    is_internal_ref, is_list, is_map, is_nil, is_port, is_record, is_small, is_term_word, is_tuple,
+    tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -556,7 +556,7 @@ pub(crate) fn term_chunk_order(
 pub(crate) fn proper_list(term: Eterm) -> Option<Vec<Eterm>> {
     let mut elems = Vec::new();
     let mut cur = term;
-    while is_list(cur) {
+    while is_list(cur) && is_term_word(cur) {
         elems.push(car(cur));
         cur = cdr(cur);
     }
@@ -611,7 +611,7 @@ fn render_chunk(
     if is_nil(term) {
         return Ok(Chunk::text("[]"));
     }
-    if is_list(term) {
+    if is_list(term) && is_term_word(term) {
         if depth == 1 {
             return Ok(Chunk::text("[...]"));
         }
@@ -774,7 +774,7 @@ fn render_tail_chunk(
             out.extend(['|', '.', '.', '.'].map(Chunk::Char));
             return Ok(());
         }
-        if !is_list(term) {
+        if !is_list(term) || !is_term_word(term) {
             out.push(Chunk::Char('|'));
             out.push(render_chunk(ctx, term, printable, depth - 1, order)?);
             return Ok(());
@@ -1134,7 +1134,7 @@ fn render_bitstring_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Ch
 fn printable_string(term: Eterm) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut cur = term;
-    while is_list(cur) {
+    while is_list(cur) && is_term_word(cur) {
         let head = car(cur);
         if !is_small(head) {
             return None;
@@ -1644,6 +1644,19 @@ mod tests {
             let backslash = ctx.list(&[ctx.int(92).expect("fits")]).expect("fits");
             assert_eq!(show(ctx, backslash, true), "\"\\\\\"");
         });
+    }
+
+    #[test]
+    fn a_bare_header_word_is_classified_as_non_list() {
+        // `is_list` is the C bit trick `(x & 0x2) == 0`, which is ALSO true for a
+        // bare `HEADER` word (`THE_NON_VALUE`); a list walk that trusts it derefs
+        // `THE_NON_VALUE` (`0x0`/`NULL`) and SIGSEGVs (the khepri `projections`
+        // crash). The full primary-tag gate must send it down the non-list path.
+        let nv = Eterm::non_value();
+        assert!(is_list(nv), "the C bit trick is what made the deref reachable");
+        assert!(!is_term_word(nv), "a HEADER word is not a term");
+        assert_eq!(proper_list(nv), None);
+        assert_eq!(printable_string(nv), None);
     }
 
     #[test]

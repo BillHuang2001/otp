@@ -78,6 +78,19 @@ pub(crate) fn is_list(x: Eterm) -> bool {
     beam_term::is_list(x)
 }
 
+/// `is_term_word(x)` — a term word at all (not a bare `HEADER` word; the full
+/// primary tag is not `HEADER`).
+///
+/// [`is_list`] mirrors the C bit trick `(x & 0x2) == 0`, which is **also** true for
+/// a bare `HEADER` word (the ABI's `THE_NON_VALUE`), so a guard that is about to
+/// call [`car`]/[`cdr`] must test `is_list` **and** `is_term_word` together — the
+/// full primary tag `== LIST` — or it dereferences a garbage (in release, `NULL`)
+/// pointer.
+#[inline]
+pub(crate) fn is_term_word(x: Eterm) -> bool {
+    beam_term::is_term_word(x)
+}
+
 /// `is_internal_pid(x)`.
 #[inline]
 pub(crate) fn is_internal_pid(x: Eterm) -> bool {
@@ -329,8 +342,10 @@ pub(crate) fn tuple_element(x: Eterm, i: usize) -> Eterm {
 /// `CAR(x)` — the head word of a cons cell.
 #[inline]
 pub(crate) fn car(x: Eterm) -> Eterm {
-    // SAFETY: `x` is a live non-`NIL` list term (caller invariant; the BIF modules
-    // call this only after [`is_list`] returned true).
+    // SAFETY: `x` is a live cons cell (caller invariant; the BIF modules call this
+    // only after [`is_list`] **and** [`is_term_word`] both returned true — the full
+    // primary tag `== LIST`, since [`is_list`] alone is also true for a bare
+    // `HEADER` word such as `THE_NON_VALUE`).
     unsafe { beam_term::car(x) }
 }
 
@@ -1615,6 +1630,16 @@ mod tests {
         assert!(is_list(list));
         assert_eq!(car(list), make_small(1));
         assert_eq!(cdr(list), NIL);
+    }
+
+    #[test]
+    fn a_bare_header_word_is_not_a_dereferenceable_list() {
+        // `is_list` is the C bit trick `(x & 0x2) == 0`, ALSO true for a bare
+        // `HEADER` word (`THE_NON_VALUE`); `car`/`cdr` are only sound behind the
+        // full primary-tag gate (`is_list && is_term_word`).
+        let nv = Eterm::non_value();
+        assert!(is_list(nv), "the C bit trick is what made the deref reachable");
+        assert!(!is_term_word(nv), "a HEADER word is not a term");
     }
 
     #[test]
