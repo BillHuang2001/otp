@@ -152,8 +152,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   the RC-*/D* classes are the remaining divergences); `plb` runs 8 of 10 kernels and `elixirc` compiles
   through the `elixir` stage. The **`-on_load` module hook is implemented**, so `crypto` loads and
   `crypto:strong_rand_bytes/16`/`crypto:hash/2` match the oracle. Remaining per-project limits are
-  recorded as `Known Issues` in the owning crate's `CONTEXT.md`: the largest is that a NIF loaded in one
-  process is not yet visible to spawned processes (A.3), which caps `cowboy_websocket`.
+  recorded as `Known Issues` in the owning crate's `CONTEXT.md`; the `crypto`/`-on_load` NIF-visibility
+  gap that capped `cowboy_websocket` is closed (RC-H: `-on_load` + NIF export registration).
 - **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3524 agree=3520 mismatch=0
   unsupported=1 skipped=0 oracle_drift=3`** with `ratchet: allowlist=known-gaps.txt allowed=1
   unauthorized=0 stale=0` and `drift: allowlist=known-drift.txt allowed=3 unauthorized=0 stale=0`
@@ -277,12 +277,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   encodings) and `udp_inet`'s option/control surface agree with the oracle.
 
 ## Known Issues
-- khepri `projections` eunit segfaults under `beam_rt` (reproducible in debug+release and JIT+interpreter tiers): SIGSEGV in `beam_term::list::car` ← `beam_engine::families::lists::get_list` on the `beam_rt-driver` thread at the `simple_projection_follows_updates_and_deletes` delete/update step — a stale/unrooted list-cell BIF argument (GC-rooting); owning crate `beam_engine` (or the `beam_rt` copy-out path).
-- `binary_module_SUITE:error_info` diverges: oracle `{ok,ok}` vs rust `'exit <structured reason>'` (`error_info_abort_probe:main({prefix,70})`) — a structured-raise-reason degradation (D1c residual).
-- `binary:referenced_byte_size/1` diverges for a `binary:part/3` sub-binary of a refc parent: rust `{510,510}` vs oracle `{510,1025}`; the whole refc parent agrees (`{1025,1025}`) (D2 residual).
 - khepri `keep_while_fanout_probe` is correct (`deleted_count=2502` both sides) with a ~88× fun-apply residual (`delete_us_per_dependent` 797 vs 9 us).
-- `crypto` NIFs load on the `-eval` route and are visible to spawned processes (RC-H), so A.3 NIF-visibility is closed; the residual above is the projections segfault, not NIF visibility.
-- The differential gate passes with no `mismatch`, but its corpus does not pin `binary:referenced_byte_size/1` (bitbin) or khepri `projections`, so the above real-world divergences are not gate-caught.
+- The differential gate corpus does not pin `binary:referenced_byte_size/1` (bitbin) or khepri `projections`; those shapes are pinned instead by `beam_rt` workspace tests (`binary_part_refc_window`, `binary_part_refc_window_eval`) and the `tools/suites` harness probes (`error_info_abort_probe`, `keep_while_fanout_probe`).
 
 ## Future workstreams
 - **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
