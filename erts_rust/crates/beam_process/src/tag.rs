@@ -275,7 +275,10 @@ pub(crate) fn copy_into_fragment(
 ///
 /// The scratch arena is sized from the two [`size_object`] figures (plus `extra_words` for the
 /// payload's own envelope) and re-sized **monotonically** from the staging copy's own refusal, for
-/// the same reason [`copy_into_fragment`] does it.
+/// the same reason [`copy_into_fragment`] does it. The copy prices only the staged tag+reason
+/// sub-graph, so the re-reserve adds `extra_words` back on top of that price: without it the
+/// arena would be exact for the staged words and the caller's envelope (a boxed monitor reference
+/// materialised from [`crate::monitor::MonitorRef::to_eterm`]) would have no headroom left.
 ///
 /// # Errors
 ///
@@ -310,7 +313,7 @@ pub(crate) fn stage_sources(
             }
             Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
                 match refused_words(failure.requested) {
-                    Some(words) if words > capacity => capacity = words,
+                    Some(words) if words > capacity => capacity = words.saturating_add(extra_words),
                     _ => return Err(BeamError::Alloc(failure)),
                 }
             }
@@ -369,6 +372,7 @@ mod tests {
         tuple_size, LiteralArea, ERL_REFC_BITS_SIZE,
     };
     use super::*;
+    use crate::monitor::MonitorRef;
     use crate::pid::ProcessId;
 
     /// A process with a default heap (the destination of a transfer).
@@ -589,5 +593,29 @@ mod tests {
             "the reason's refc sub-term is copied into the scratch arena as the same slice"
         );
         assert!(!is_list(staged_tag));
+    }
+
+    #[test]
+    fn the_staging_re_reserve_preserves_the_envelope_headroom() {
+        // A refc binary whose payload is deliberately NOT registered in the reason's source table:
+        // `size_object` prices the on-heap `[BinRef][ErlSubBits]` pair (8 words), while the copier
+        // finds no source handle and flattens the payload into an on-heap bitstring — so the copy's
+        // own refusal exceeds the initial arena and the monotonic re-reserve runs. That branch must
+        // still leave `extra_words` (the DOWN envelope) free, or the boxed monitor reference that
+        // follows fails.
+        let binary = RefcBinary::new(&[0xABu8; 2000]).expect("the payload allocates");
+        let mut reason_heap = Heap::new(ERL_REFC_BITS_SIZE + 4).expect("a test heap");
+        // SAFETY: the heap has the pair's words and `binary` keeps the payload alive.
+        let reason = unsafe { bin_ref_pair(&mut reason_heap, &binary) };
+
+        let reason_src = OffHeapTable::new();
+        let StagedSources { mut scratch, .. } = stage_sources(None, reason, &reason_src, 16)
+            .expect("the re-reserve prices the flattened payload");
+
+        // Without the headroom the arena is exact for the staged reason, so this 4-word reference
+        // fails with `Alloc(Heap, 32)`.
+        MonitorRef::from_id(1)
+            .to_eterm(&mut scratch)
+            .expect("the DOWN envelope's headroom survives the re-reserve");
     }
 }
