@@ -199,8 +199,6 @@ pub(crate) struct Counters {
     pub(crate) foreign_result: u64,
     /// Results moved out of the pool (`rehome_container_result`).
     pub(crate) rehomed: u64,
-    /// Results that held a reference (the pool was not rewound).
-    pub(crate) ref_held: u64,
     /// Calls whose pooled heap was rewound.
     pub(crate) rewound: u64,
     /// `graph_holds_reference` invocations and the objects they visited.
@@ -221,7 +219,7 @@ impl Drop for Counters {
         }
         let total = self.call_bif.max(1);
         let mut body = String::new();
-        let rows: [(&str, u64); 33] = [
+        let rows: [(&str, u64); 32] = [
             ("dispatch memo cold", self.dispatch_cold),
             ("dispatch memo collision", self.dispatch_evict),
             ("call_bif", self.call_bif),
@@ -250,7 +248,6 @@ impl Drop for Counters {
             ("intern commit", self.intern_commit),
             ("foreign container result", self.foreign_result),
             ("rehomed", self.rehomed),
-            ("reference held", self.ref_held),
             ("rewound", self.rewound),
             ("reference walk calls", self.walk_calls),
             ("reference walk visits", self.walk_visits),
@@ -305,6 +302,7 @@ pub(crate) fn bump(pick: impl FnOnce(&mut Counters) -> &mut u64) {
 /// 10^8 objects a large in-process compile visits.
 ///
 /// [`RuntimeContext::graph_holds_reference`]: super::RuntimeContext::graph_holds_reference
+#[cfg(test)]
 pub(crate) fn add_visits(visits: u64) {
     if !enabled() || visits == 0 {
         return;

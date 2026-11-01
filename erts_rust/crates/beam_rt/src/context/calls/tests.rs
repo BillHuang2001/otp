@@ -1531,6 +1531,18 @@ fn reference_holding_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result
     Ok(container)
 }
 
+/// A registered BIF whose result is the **D1c shape**: a tuple `{Ref, Arg}` whose reference is
+/// built on the pooled heap while `Arg` is a caller-supplied term — on the process route, a term on
+/// the caller's **scanned young heap**. The pre-fix `graph_holds_reference` exemption left this
+/// mixed graph on the never-scanned pool, so a later collection of the caller's young heap
+/// relocated the `Arg` child out from under it (a `0x3f…` forwarding header in the pool spine).
+fn mixed_reference_result(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let reference = internal_reference(ctx.heap(), 9999);
+    let container = ctx.heap().tuple(&[reference, args[0]])?;
+    FIXTURE_BUILT.with(|c| c.set(container.raw()));
+    Ok(container)
+}
+
 /// A registered BIF whose result is the **accumulator shape**: a cons spine of immediates ending in
 /// an internal reference (what a `lists:foldl/3` accumulator looks like to the walk — the measured
 /// 236.5 M + 76.1 M of the 408.5 M visits a `lib/stdlib/src/string.erl` compile used to pay).
@@ -1580,6 +1592,7 @@ fn fixture_runtime() -> crate::runtime::Runtime {
             2,
             reference_holding_result,
         );
+        let _ = registry.register("copy_out_fixture", "mixed_reference", 1, mixed_reference_result);
         let _ = registry.register("copy_out_fixture", "accumulator", 2, accumulator_result);
     }
     rt
@@ -1640,47 +1653,115 @@ fn rt_note(snapshot: &(usize, usize, usize)) -> bool {
     *snapshot == (0, 0, 0)
 }
 
-/// **The same result on a process route still walks, still finds the reference, and still declines
-/// the move.**
+/// **A process-route reference result is deep-copied with its id word intact, and the pool is
+/// rewound.**
 ///
-/// `RuntimeContext::for_process` supplies a `mailbox_table`, so `move_container` is true whatever
-/// `safe_to_rewind` answers: this is the case the gate must leave **exactly** as it was. The walk
-/// runs, answers "holds a reference", and the result is returned word-identical (not copied onto
-/// the process heap) with the pool un-rewound — a copied reference would stop being the term it
-/// names.
+/// The pre-fix `graph_holds_reference` exemption returned the `{Ref}` container word-identical on
+/// the pooled heap, on the theory that a copied reference would stop being the term it names. That
+/// theory was wrong: a reference's identity is its **id word** (`beam_common::next_ref_id`), and the
+/// copier copies the frozen 4-word reference block verbatim, so the id survives. Leaving the
+/// container on the never-scanned pool while its children could live on a scanned heap was the D1c
+/// from-space bug; now the result is re-homed onto the process's scanned heap and the pool rewound.
 #[test]
-fn a_process_route_still_walks_its_result_and_still_declines_the_move() {
+fn a_process_route_reference_result_is_deep_copied_with_its_id_word_intact() {
     let mut rt = fixture_runtime();
     let (mut table, pid) = process_table(&mut rt);
-    let mut witness = beam_alloc::Heap::new(16).expect("a scratch heap for the reentrancy witness");
-    let fun = reentrancy_witness(&mut witness);
     FIXTURE_BUILT.with(|c| c.set(0));
     let built = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        notes::reset();
         let result = ctx
-            .call_bif("copy_out_fixture", "reference_holding", 2, &[fun, make_small(0)])
+            .call_bif(
+                "copy_out_fixture",
+                "reference_holding",
+                2,
+                &[make_small(0), make_small(1)],
+            )
             .expect("the fixture BIF returns");
-        assert_eq!(
-            notes::walk_snapshot().calls,
-            1,
-            "a process route moves its container result, so the walk's answer is observable — it runs"
-        );
-        assert_eq!(
-            notes::walk_snapshot().visits,
-            2,
-            "the `{{Ref}}` container is two dereferenced objects: the tuple, then the reference block"
-        );
         result.raw()
     };
-    assert_eq!(
+    assert_ne!(
         built,
         FIXTURE_BUILT.with(core::cell::Cell::get),
-        "a reference-holding result is NOT copied — the walk's answer kept the term where it was"
+        "a reference-holding result is deep-copied onto the process heap, never left word-identical on the pool"
     );
+    let atoms = rt.code_server().atoms_handle();
+    let mut expected_heap = beam_alloc::Heap::new(16).expect("a local heap for the expected shape");
+    let expected_ref = internal_reference(&mut expected_heap, 4242);
+    let expected = expected_heap
+        .tuple(&[expected_ref])
+        .expect("the expected `{Ref}` shape");
     assert!(
-        rt.bif_heaps.last().expect("the pool keeps its region").used() > 0,
-        "and the pool is not rewound, exactly as before the gate"
+        beam_term::compare::eq(beam_term::prelude::Eterm::from_raw(built), expected, &atoms),
+        "the deep copy preserved the reference's id word — its identity — byte-for-byte"
+    );
+    assert_eq!(
+        rt.bif_heaps.last().expect("the pool keeps its region").used(),
+        0,
+        "and a non-reentrant process-route call rewinds the pool"
+    );
+}
+
+/// **The D1c regression: a reference-holding result whose child lives on a scanned young heap is
+/// deep-copied whole and survives a forced collection.**
+///
+/// The fixture returns `{Ref, Arg}` with `Ref` built on the pooled heap and `Arg` a term on a live
+/// spawned process's scanned young heap. The pre-fix `graph_holds_reference` exemption left this
+/// mixed graph on the never-scanned pool — its spine and reference on the pool, its child on the
+/// scanned heap — so a later collection relocated the child out from under the pool spine, leaving a
+/// `0x3f…` forwarding header (the `unsupported_opcode: build_stacktrace` the
+/// `error_info_abort_probe` observed). The fix re-homes the whole graph onto the runtime store, so a
+/// collection relocates no word it names.
+#[test]
+fn a_reference_holding_result_with_a_scanned_heap_child_survives_a_forced_collection() {
+    let mut rt = fixture_runtime();
+    let (mut table, pid) = process_table(&mut rt);
+    // A real scanned-heap child on the spawned process's young heap, published as a root so the
+    // forced collection relocates (rather than reclaims) it.
+    let child = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        int_list(process.heap_mut(), 4).expect("four cells fit the nursery")
+    };
+    table
+        .get_mut(pid)
+        .expect("the spawned process")
+        .registers_mut()
+        .extra_roots_mut()
+        .push(child);
+    // Put the live process into the runtime so the copier classifies `child` as scanned.
+    rt.put_processes(table);
+    FIXTURE_BUILT.with(|c| c.set(0));
+    // Table-less, non-reentrant: the result is deep-copied onto the pointer-stable runtime store.
+    let built = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif("copy_out_fixture", "mixed_reference", 1, &[child])
+            .expect("the fixture BIF returns")
+            .raw()
+    };
+    assert_ne!(
+        built,
+        FIXTURE_BUILT.with(core::cell::Cell::get),
+        "a reference-holding result with a scanned-heap child is deep-copied, never handed through on the pool"
+    );
+    // Force the spawned process's collection: its young heap moves, so the pre-fix pool-resident
+    // spine would have kept naming the from-space.
+    let mut table = rt.take_processes();
+    rt.request_gc(pid);
+    let collected = rt.serve_gc_request(&mut table, pid);
+    rt.put_processes(table);
+    assert!(collected, "the forced collection of the spawned process really ran");
+    // The returned term is a self-contained `{ Ref(9999), [1,2,3,4] }`: its reference id word
+    // survived the verbatim copy and its child was deep-copied, so the collection moved no word it
+    // names.
+    let atoms = rt.code_server().atoms_handle();
+    let mut expected_heap = beam_alloc::Heap::new(32).expect("a local heap");
+    let expected_ref = internal_reference(&mut expected_heap, 9999);
+    let expected_child = int_list(&mut expected_heap, 4).expect("four cells fit");
+    let expected = expected_heap
+        .tuple(&[expected_ref, expected_child])
+        .expect("the expected shape");
+    assert!(
+        beam_term::compare::eq(beam_term::prelude::Eterm::from_raw(built), expected, &atoms),
+        "the re-homed container's contents — reference id and child — are intact after the collection"
     );
 }
 

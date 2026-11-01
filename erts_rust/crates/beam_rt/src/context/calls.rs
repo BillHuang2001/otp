@@ -1435,12 +1435,6 @@ impl<'a> RuntimeContext<'a> {
                             perf_counters::bump(|c| &mut c.rehomed);
                             result = Ok(copied);
                             rewind = safe_to_rewind;
-                        } else if Self::graph_holds_reference(term) {
-                            perf_counters::bump(|c| &mut c.ref_held);
-                            // A reference's identity **is** its address (see the comment above): the
-                            // copy would be a different term, so the result stays where it is and the
-                            // pool is not rewound.
-                            rewind = false;
                         } else if let Some(copied) =
                             self.rehome_container_result(term, Some(heap), machine_handles)
                         {
@@ -1468,10 +1462,7 @@ impl<'a> RuntimeContext<'a> {
                         // per-call walk used to be quadratic (measured on `lib/stdlib/src/string.erl`:
                         // `lists:foldl/3` + `lists:map/2` + a share of `lists:foldr/3` were 236.5 M +
                         // 76.1 M of 408.5 M walk visits).
-                        if Self::graph_holds_reference(term) {
-                            perf_counters::bump(|c| &mut c.ref_held);
-                            rewind = false;
-                        } else if let Some(copied) =
+                        if let Some(copied) =
                             self.rehome_container_result(term, Some(heap), machine_handles)
                         {
                             perf_counters::bump(|c| &mut c.rehomed);
@@ -1698,6 +1689,7 @@ impl<'a> RuntimeContext<'a> {
     /// worklist construction plus a visit) purely to answer `false`. On the
     /// `copy_bound:etf_roundtrip` profile the reference walk was 6.36 % of the whole workload, and
     /// this is the half of it a root-shape test answers for free.
+    #[cfg(test)]
     #[allow(unsafe_code)]
     #[inline]
     fn root_is_reference_free(term: Eterm) -> bool {
@@ -1778,6 +1770,7 @@ impl<'a> RuntimeContext<'a> {
     /// a `NULL`- or mis-aligned address — is **skipped**, never dereferenced: its children are
     /// unknown, so it contributes no reference finding, and the caller then attempts the re-home
     /// itself and lets the copier refuse.
+    #[cfg(test)]
     #[allow(unsafe_code)]
     fn graph_holds_reference(term: Eterm) -> bool {
         // The **root-shape fast decline**: a binary, a bignum, a float or an external pid/port has
