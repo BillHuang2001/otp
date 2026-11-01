@@ -174,7 +174,7 @@ pub fn term_text(
                 let head = access::car(list);
                 let tail = access::cdr(list);
                 if !access::is_nil(tail) {
-                    let next = if access::is_list(tail) {
+                    let next = if access::is_list(tail) && access::is_term_word(tail) {
                         Item::OneCons(tail)
                     } else {
                         // `WSTACK_PUSH3(tl, PRT_TERM, PRT_BAR)` — the bar pops
@@ -295,7 +295,7 @@ fn render(
         push_seq(stack, &seq);
         return Ok(true);
     }
-    if access::is_list(obj) {
+    if access::is_list(obj) && access::is_term_word(obj) {
         if printable_string_len(obj).is_some() {
             return Ok(printable_list(obj, out, budget));
         }
@@ -392,7 +392,7 @@ fn record(
 fn printable_string_len(list: Eterm) -> Option<usize> {
     let mut cur = list;
     let mut len = 0usize;
-    while access::is_list(cur) {
+    while access::is_list(cur) && access::is_term_word(cur) {
         let head = access::car(cur);
         if !access::is_small(head) {
             return None;
@@ -429,7 +429,7 @@ fn is_space(c: i64) -> bool {
 fn printable_list(list: Eterm, out: &mut String, budget: &mut i64) -> bool {
     out.push('"');
     let mut cur = list;
-    while access::is_list(cur) {
+    while access::is_list(cur) && access::is_term_word(cur) {
         if *budget <= 0 {
             return false;
         }

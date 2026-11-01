@@ -76,8 +76,8 @@ use beam_common::Result;
 use beam_term::{signed_value, Eterm};
 
 use crate::access::{
-    car, cdr, is_atom, is_list, is_map, is_nil, is_record, is_small, is_tuple, tuple_element,
-    tuple_size,
+    car, cdr, is_atom, is_list, is_map, is_nil, is_record, is_small, is_term_word, is_tuple,
+    tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -102,7 +102,7 @@ pub(crate) fn is_reflowable(term: Eterm) -> bool {
     if bits::is_bitstring(term) {
         return !binary_printable(term);
     }
-    if is_list(term) {
+    if is_list(term) && is_term_word(term) {
         return !list_printable(term);
     }
     false
@@ -519,7 +519,7 @@ fn printable_latin1_list(term: Eterm, n: i64) -> PrintablePrefix {
                 PrintablePrefix::Prefix(n as usize)
             };
         }
-        if !is_list(cur) {
+        if !is_list(cur) || !is_term_word(cur) {
             return if is_nil(cur) {
                 PrintablePrefix::All
             } else {
@@ -544,7 +544,7 @@ fn list_prefix_bytes(term: Eterm, limit: usize) -> Vec<u8> {
     // length. The result is identical for every `limit` (the loop is the same).
     let mut bytes = Vec::with_capacity(limit.min(PREFIX_RESERVE));
     let mut cur = term;
-    while bytes.len() < limit && is_list(cur) {
+    while bytes.len() < limit && is_list(cur) && is_term_word(cur) {
         bytes.push(signed_value(car(cur)) as u8);
         cur = cdr(cur);
     }
@@ -599,7 +599,7 @@ fn build(
         }
         return build_map(ctx, term, printable, d, t, order);
     }
-    if is_list(term) {
+    if is_list(term) && is_term_word(term) {
         // `printable_list/4` is `false` at `D =:= 1`, so only a deeper printable
         // list becomes the escaped-string leaf.
         if printable && d != 1 {
@@ -755,7 +755,7 @@ fn list1(
                 tail: SeqTail::Dots(More::List1 { term, d }),
             });
         }
-        if !is_list(term) {
+        if !is_list(term) || !is_term_word(term) {
             // The oracle's last clause: the recursion's value *is* the tail's
             // template.
             return Ok(Seq {
