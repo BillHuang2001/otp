@@ -149,5 +149,6 @@ mod legacy_catch;
 pub(crate) mod oracle;
 mod propagation;
 mod raising;
+mod rooting;
 mod stacktrace;
 mod supplied;
