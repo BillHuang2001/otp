@@ -46,7 +46,10 @@ use beam_term::{
 };
 
 use crate::families::exceptions::stacktrace::symbolic_stacktrace;
-use crate::terms::{list_elements, tuple_element};
+use crate::terms::{list_elements, tuple_arity, tuple_element};
+
+use crate::context::{ExecutionContext, MinimalContext, RootSet};
+use beam_common::Result;
 
 /// A structural description of `term` with **no addresses in it**, enough for this
 /// test to tell a copied list/binary/flat map from a dangling or garbage word.
@@ -166,3 +169,121 @@ fn the_cooked_saved_args_and_error_info_are_copied_not_shared_and_survive_the_fo
     );
     assert_eq!(map_shape, "flatmap", "the cooked error_info map is a flat map");
 }
+
+/// A [`MinimalContext`] wrapper whose **rooted** allocation first runs a real
+/// relocating collection (Tier-B [`MinimalContext::reclaim_heap`]) over the root set,
+/// so the reservation [`symbolic_stacktrace`] takes actually **moves** the raise
+/// latches' terms before the carve reads them back.
+struct RelocatingContext {
+    inner: MinimalContext,
+    /// Whether the last rooted allocation really performed a copy (`Some` report), so
+    /// a test can fail loudly instead of silently passing a no-op arena.
+    moved: bool,
+}
+
+impl RelocatingContext {
+    fn new() -> RelocatingContext {
+        RelocatingContext {
+            inner: MinimalContext::new(),
+            moved: false,
+        }
+    }
+}
+
+impl ExecutionContext for RelocatingContext {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words_rooted(&mut self, n: usize, roots: RootSet<'_>) -> Result<*mut Eterm> {
+        // Move every term the root set reaches — including the loose raise latches
+        // `Machine::with_roots` parked on the stack for this hand-off — into a fresh
+        // survivor region before the inner arena serves the reservation.
+        let report = self.inner.reclaim_heap(|reloc| {
+            reloc.forward_roots(roots.x)?;
+            reloc.forward_roots(roots.stack)?;
+            reloc.forward_roots(roots.fr)?;
+            Ok(())
+        })?;
+        self.moved = report.is_some();
+        self.inner.alloc_words_rooted(n, roots)
+    }
+}
+
+/// A reference-bearing `saved_args` payload survives the reservation's forced
+/// relocating collection and cooks with the reference's minted id preserved — the
+/// latch is re-read post-move and `bounded_copy` copies the M1 reference verbatim,
+/// never a stale pointer or a typed `unsupported`.
+#[allow(unsafe_code)]
+#[test]
+fn a_reference_bearing_saved_args_survives_a_forced_relocating_collection() {
+    let mut fixture = Fixture::new(&[]);
+    fixture.add_function("run", 0, vec![Instr::Label(Label(0)), Instr::Return]);
+    let module = fixture.finish();
+
+    let mut host = RelocatingContext::new();
+    let mut atoms = beam_term::AtomTable::new();
+    let bm = atoms.intern("bm");
+
+    // Mint an M1 internal reference whose block lives outside the arena (a foreign
+    // pointer, like a runtime-minted reference the host would keep elsewhere).
+    let mut ref_words = [Eterm::default(); beam_term::INTERNAL_REF_WORDS];
+    // SAFETY: `ref_words` is a live, aligned, exclusively-owned block of exactly
+    // `INTERNAL_REF_WORDS` words — the writer's documented contract.
+    let reference =
+        unsafe { beam_term::write_internal_ref(ref_words.as_mut_ptr(), 42) }.unwrap();
+
+    // Build the payload on the *inner* (non-relocating) arena so the intermediate
+    // terms are not reclaimed while only held in Rust locals; the relocating host is
+    // used only for the final cook, whose reservation roots and moves the graph.
+    let binary = terms::make_heap_binary(&mut host.inner, &[1, 2, 3]).unwrap();
+    let pair = terms::make_tuple(&mut host.inner, &[make_atom(bm), reference]).unwrap();
+    let nil = terms::make_list(&mut host.inner, &[]).unwrap();
+    let saved_args = terms::make_list(&mut host.inner, &[binary, pair, nil]).unwrap();
+
+    let mut machine = Machine::new();
+    machine.raise_snapshot = vec![(0, 0, 0)];
+    machine.raise_function_clause_args = Some(saved_args);
+
+    let cooked = symbolic_stacktrace(&mut machine, &module, &mut host, &Operand::Nil, false)
+        .expect("the trace cooks");
+    assert!(
+        host.moved,
+        "the reservation must have performed a real relocating collection"
+    );
+
+    let items = list_elements(cooked).expect("the cooked trace is a proper list");
+    let item = items[0];
+    let a_slot = tuple_element(item, 2).expect("the A slot");
+    let a_elements = list_elements(a_slot).expect("the A slot is a proper list");
+    assert_eq!(a_elements.len(), 3);
+    let copied_pair = a_elements[1];
+    assert_eq!(tuple_arity(copied_pair).expect("a tuple"), 2);
+    let copied_ref = tuple_element(copied_pair, 1).expect("the pair's reference");
+
+    // SAFETY: `copied_ref` is the M1 block `bounded_copy` just carved into the
+    // reservation; the reference id word is the block's own immediate payload.
+    assert!(unsafe { beam_term::is_internal_ref(copied_ref) });
+    assert_eq!(
+        unsafe { beam_term::internal_ref_id(copied_ref) }.expect("an M1 reference"),
+        42
+    );
+    assert_ne!(copied_ref, reference, "the reference must be copied, not shared");
+}
+

@@ -367,13 +367,14 @@ pub(crate) fn deep_copy(slack: &mut Slack, term: Eterm) -> Result<Eterm> {
 }
 
 /// The typed refusal [`bounded_copy_budget`]/[`bounded_copy`] return for a term their
-/// bounded graph cannot represent — bignums, floats, funs, records, internal/external
-/// pid/port/ref, catch terms, off-heap refc binaries/sub-bits and hash maps.
+/// bounded graph cannot represent — bignums, floats, funs, records, external
+/// pid/port/ref, C-layout internal refs (header arity 2, three words), catch terms,
+/// off-heap refc binaries/sub-bits and hash maps.
 ///
 /// The bounded copier exists for the two stacktrace payloads the cooked item embeds
 /// (the failed-clause argument list and the `{error_info, Map}` map), whose graphs are
-/// flat maps, cons lists, tuples and on-heap heap-bits bitstrings — every other shape is
-/// a typed decline, never a wrong term.
+/// flat maps, cons lists, tuples, on-heap heap-bits bitstrings and M1 internal
+/// references — every other shape is a typed decline, never a wrong term.
 fn bounded_copy_unsupported() -> BeamError {
     unsupported("build_stacktrace: unsupported term in saved_args/error_info copy")
 }
@@ -392,10 +393,13 @@ fn bounded_copy_unsupported() -> BeamError {
 /// * a flat map (≤ [`beam_term::MAP_SMALL_MAP_LIMIT`] pairs) costs
 ///   [`beam_term::map_words_capacity`]`(pairs)` plus the budget of every key and value;
 /// * an on-heap heap-bits bitstring/binary costs its exact object word count (copied
-///   verbatim, no child slots).
+///   verbatim, no child slots);
+/// * an M1 internal reference costs [`beam_term::INTERNAL_REF_WORDS`] (copied verbatim,
+///   preserving its minted id word — no child slots).
 ///
-/// Anything else — a bignum, float, fun, record, internal/external pid/port/reference,
-/// catch term, off-heap refc binary/sub-bits or hash map — is refused with the same
+/// Anything else — a bignum, float, fun, record, external pid/port/reference,
+/// C-layout internal reference (header arity 2, three words), catch term, off-heap
+/// refc binary/sub-bits or hash map — is refused with the same
 /// typed error the carve reports, so a caller sizing with this function can never
 /// reserve for a graph the carve will then decline (the two agree on the accepted set).
 pub(crate) fn bounded_copy_budget(term: Eterm) -> Result<usize> {
@@ -441,6 +445,14 @@ pub(crate) fn bounded_copy_budget(term: Eterm) -> Result<usize> {
                 // SAFETY: a heap-bits object is never an `ErlSubBits`, so `object_words`
                 // takes its ordinary (non-sub-bits) arm and returns the exact word count.
                 Ok(unsafe { beam_term::layout::object_words(header, src) })
+            } else if unsafe { beam_term::is_internal_ref(term) }
+                && beam_term::header_arity(header) == beam_term::INTERNAL_REF_PAYLOAD_WORDS
+            {
+                // The M1 internal-reference block is `INTERNAL_REF_WORDS` words of
+                // immediates (header + zeroed node/serial + the small-integer id) — copied
+                // verbatim, so its cost is its exact block size. The C-layout 3-word ref
+                // (arity 2) fails the arity test and stays refused below.
+                Ok(beam_term::INTERNAL_REF_WORDS)
             } else {
                 Err(bounded_copy_unsupported())
             }
@@ -465,7 +477,11 @@ pub(crate) fn bounded_copy_budget(term: Eterm) -> Result<usize> {
 /// * a flat map's key/value pairs are each copied, then the map is rebuilt through
 ///   [`Sink::map`] (so the atom order of the live namespace is the produced map's);
 /// * an on-heap heap-bits bitstring/binary is copied **verbatim** as its exact object
-///   word count — it has no term child slots to recurse.
+///   word count — it has no term child slots to recurse;
+/// * an M1 internal reference is copied **verbatim** as
+///   [`beam_term::INTERNAL_REF_WORDS`] words, preserving its minted id word — the
+///   node/serial/id payload words are immediates, so there are no child slots to recurse
+///   (a C-layout 3-word reference is still refused).
 ///
 /// The caller has reserved at least [`bounded_copy_budget`]`(term)` words, so no carve
 /// overruns the slack; an overrun is the typed `unsupported` from [`Slack::alloc_words`],
@@ -537,6 +553,22 @@ pub(crate) fn bounded_copy(slack: &mut Slack, term: Eterm, atoms: &AtomTable) ->
                 // A heap-bits object carries no term child slots, so the verbatim copy is
                 // the whole copy.
                 unsafe { core::ptr::copy_nonoverlapping(src, hp, words) };
+                Ok(beam_term::make_boxed(hp))
+            } else if unsafe { beam_term::is_internal_ref(term) }
+                && beam_term::header_arity(header) == beam_term::INTERNAL_REF_PAYLOAD_WORDS
+            {
+                // The M1 internal-reference block is all immediates (header + zeroed
+                // node/serial + the small-integer id), so the verbatim copy preserves its
+                // minted id word; the arity test keeps the C-layout 3-word ref refused.
+                let hp = slack.alloc_words(beam_term::INTERNAL_REF_WORDS)?;
+                // SAFETY: `hp` addresses `INTERNAL_REF_WORDS` exclusively-owned words
+                // inside the slack's reserved region, and `src` is a live M1 internal
+                // reference of exactly that many words; the ranges are distinct (the
+                // slack's region is freshly reserved), and an internal reference has no
+                // term child slots.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src, hp, beam_term::INTERNAL_REF_WORDS)
+                };
                 Ok(beam_term::make_boxed(hp))
             } else {
                 Err(bounded_copy_unsupported())

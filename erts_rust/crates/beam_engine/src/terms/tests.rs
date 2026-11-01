@@ -963,3 +963,74 @@ fn a_sink_tuple_beyond_max_arityval_is_a_system_limit() {
     assert!(matches!(err, BeamError::SystemLimit), "got {err:?}");
     assert_eq!(slack.remaining(), 2);
 }
+
+// -- bounded copy of M1 internal references -------------------------------
+
+/// The bounded copier copies an M1 internal reference **verbatim**, preserving its
+/// minted id word: the D1c probe's `saved_args` (`[<<1,2,3>>, {bm, Ref}, []]`)
+/// carries a runtime-minted reference whose id must survive the cooked-stacktrace
+/// deep copy.
+#[test]
+fn bounded_copy_copies_an_m1_internal_reference_verbatim() {
+    let mut c = ctx();
+    let mut atoms = beam_term::AtomTable::new();
+    let bm = atoms.intern("bm");
+
+    // Mint an M1 internal reference with a chosen id.
+    let mut ref_words = [Eterm::default(); beam_term::INTERNAL_REF_WORDS];
+    // SAFETY: `ref_words` is a live, aligned, exclusively-owned block of exactly
+    // `INTERNAL_REF_WORDS` words — the writer's documented contract.
+    let reference =
+        unsafe { beam_term::write_internal_ref(ref_words.as_mut_ptr(), 42) }.unwrap();
+
+    // The saved-args-style payload: `[<<1,2,3>>, {bm, Ref}, []]`.
+    let binary = make_heap_binary(&mut c, &[1, 2, 3]).unwrap();
+    let pair = make_tuple(&mut c, &[make_atom(bm), reference]).unwrap();
+    let nil = make_list(&mut c, &[]).unwrap();
+    let saved_args = make_list(&mut c, &[binary, pair, nil]).unwrap();
+
+    // The budget and the carve must agree exactly, so a region of that size is
+    // consumed completely by the copy.
+    let budget = crate::terms::bounded_copy_budget(saved_args).unwrap();
+    let mut region = vec![Eterm::default(); budget];
+    // SAFETY: `region` is a live, aligned, exclusively-owned block of `budget`
+    // words, handed out once by the slack.
+    let mut slack = unsafe { crate::terms::Slack::new(region.as_mut_ptr(), region.len()) };
+    let copied = crate::terms::bounded_copy(&mut slack, saved_args, &atoms).unwrap();
+    assert_eq!(slack.remaining(), 0, "the budget and the carve disagree");
+
+    let elements = list_elements(copied).unwrap();
+    assert_eq!(elements.len(), 3);
+    let copied_pair = elements[1];
+    assert_eq!(tuple_arity(copied_pair).unwrap(), 2);
+    let copied_ref = tuple_element(copied_pair, 1).unwrap();
+    // SAFETY: `copied_ref` is the M1 block the carve just wrote into the region.
+    assert!(unsafe { beam_term::is_internal_ref(copied_ref) });
+    assert_eq!(
+        unsafe { beam_term::internal_ref_id(copied_ref) }.unwrap(),
+        42
+    );
+    // The source still carries the same id, and the copy is a distinct block (verbatim
+    // copy, never a shared pointer into the source reference's words).
+    assert_eq!(
+        unsafe { beam_term::internal_ref_id(reference) }.unwrap(),
+        42
+    );
+    assert_ne!(copied_ref, reference);
+}
+
+/// The C-layout 3-word reference (`make_header(2, REF_SUBTAG)`) shares the subtag
+/// with the M1 block but has a different id layout, so it must stay refused.
+#[test]
+fn bounded_copy_still_refuses_a_c_layout_internal_reference() {
+    let c_words = [
+        beam_term::make_header(2, beam_term::tag::REF_SUBTAG),
+        Eterm::from_raw(0xffff_ffff_0000_0000),
+        Eterm::from_raw(0x0000_0002_0000_0001),
+    ];
+    let c_layout = beam_term::make_boxed(c_words.as_ptr());
+    // SAFETY: `c_layout` is a live boxed term whose header is readable.
+    assert!(unsafe { beam_term::is_internal_ref(c_layout) });
+    assert_eq!(beam_term::header_arity(c_words[0]), 2);
+    assert!(crate::terms::bounded_copy_budget(c_layout).is_err());
+}
