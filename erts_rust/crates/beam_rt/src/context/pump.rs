@@ -117,6 +117,49 @@ pub(super) const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(900);
 /// nested run whose timer that heap never learns about.
 const DEADLINE_PUMP_SLEEP: Duration = Duration::from_millis(5);
 
+/// The minimum free words a receiver that is about to park in a `receive` keeps on its young
+/// heap, so an arriving signal's reason copies directly onto it instead of entering
+/// `beam_process`'s heap-fragment fallback.
+///
+/// `beam_process` copies a DOWN/EXIT signal's reason onto the receiver's heap first
+/// (`copy_reason_onto`); when the receiver is **relocation-exempt** (unpublished roots, which
+/// is exactly the state a nested `-eval` run is in — see [`RuntimeContext::with_relocation_exempt`])
+/// **and** its nursery is full, that copy refuses and the signal is routed to the heap-fragment
+/// fallback. That fallback drops the signal when its staging arena loses the envelope headroom
+/// (the sibling bug in `beam_process::tag::stage_sources`, which re-reserves the arena to exactly
+/// the reason's price and so cannot then materialise the boxed reference). Keeping this headroom
+/// on a receiver the pump is about to let block means the reason copy succeeds and the fragment
+/// path is never entered.
+///
+/// The size is deliberately generous: a DOWN's own envelope is 16 words plus the boxed reference
+/// (4), and the reason is the exit value — a `{ok, Mod, Bin}` compile result, a
+/// `{Reason, Stacktrace}` error exit, and so on. A fixed floor costs one nursery retirement when
+/// the heap is genuinely tight and nothing when it is not (`grow_nursery` is a no-op once the
+/// space already holds this much room).
+const RECEIVE_SIGNAL_HEADROOM_WORDS: usize = 256;
+
+/// Grows `ctx`'s own process nursery to retain at least [`RECEIVE_SIGNAL_HEADROOM_WORDS`] free
+/// words, using the **no-relocation** [`beam_process::Process::grow_nursery`] seam.
+///
+/// This is safe for a relocation-exempt process: `grow_nursery` retires the superseded space and
+/// **moves nothing**, so every live word stays at its original address; the retired space is
+/// collapsed only by a later collection, which the exemption already prevents while this process
+/// holds unpublishable roots (a live float register, a nested machine's x/stack, or the `-eval`
+/// `Env`). A `max_heap_size` ceiling that cannot reach the floor is ignored — the pre-existing
+/// fragment route then still applies, unchanged (a refusal costs the headroom, never a wrong
+/// result).
+fn ensure_receive_signal_headroom(ctx: &mut RuntimeContext<'_>) {
+    let pid = ctx.mailbox_pid;
+    let table = ctx.process_table_mut();
+    let Some(process) = table.get_mut(pid) else {
+        return;
+    };
+    if process.heap_mut().available() >= RECEIVE_SIGNAL_HEADROOM_WORDS {
+        return;
+    }
+    let _ = process.grow_nursery(RECEIVE_SIGNAL_HEADROOM_WORDS);
+}
+
 /// Drives a machine suspended in a `receive` to its `return`, one scheduler pump per wait.
 ///
 /// `step` performs exactly one pump-and-resume for the `(func, pc)` a [`RunOutcome::Wait`]
@@ -589,6 +632,13 @@ impl<'a> RuntimeContext<'a> {
         if !self.may_pump_scheduler() {
             return Ok(None);
         }
+        // The pump below may run a peer to termination, which delivers its `'DOWN'`/`{'EXIT', …}`
+        // to **this** process. This process is relocation-exempt for the whole nested run (its
+        // machine's x/stack are unpublished roots), so an exhausted nursery would route that
+        // signal into `beam_process`'s heap-fragment fallback — which drops a DOWN when its
+        // staging arena loses the envelope headroom. Keep a floor of free words so the reason
+        // copy lands on this heap directly and the fragment path is never entered.
+        ensure_receive_signal_headroom(self);
         // The parked `receive`'s statically readable finite deadline, when it has one: a bare
         // `wait`, an `after infinity`, an unreadable delay and "not parked at a wait_timeout at
         // all" all mean "no deadline" (the honest answer, never a guessed one).
@@ -1973,6 +2023,62 @@ mod nested_pump_bound {
              wall clock, ≈ 155 s of `user`, on a loaded host) with headroom for a slower one; got \
              {:?}",
             super::BLOCKING_PUMP_DEADLINE
+        );
+    }
+}
+
+#[cfg(test)]
+mod signal_headroom {
+    use beam_process::{ProcessTable, SignalAtoms};
+
+    use super::{ensure_receive_signal_headroom, RuntimeContext, RECEIVE_SIGNAL_HEADROOM_WORDS};
+
+    /// The no-relocation headroom seam the nested pump keeps under a parked receiver: a
+    /// relocation-exempt process whose nursery is tighter than the floor is grown by
+    /// [`RECEIVE_SIGNAL_HEADROOM_WORDS`], so an arriving DOWN/EXIT reason copies directly onto
+    /// its heap instead of entering `beam_process`'s (buggy) heap-fragment fallback.
+    #[test]
+    fn a_tight_relocation_exempt_receiver_is_grown_to_the_headroom_floor() {
+        let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+            .expect("the default runtime");
+        let signals = SignalAtoms::from_table(rt.code_server_atoms_mut());
+        let mut table = ProcessTable::new(signals);
+        let pid = table.spawn_default().expect("a default process");
+        table
+            .get_mut(pid)
+            .expect("the spawned process")
+            .set_relocation_exempt(true);
+
+        let before = table
+            .get(pid)
+            .expect("the spawned process")
+            .heap()
+            .available();
+        // The default process nursery (233 words) is tighter than the headroom floor, so the
+        // helper must actually grow. If this precondition ever stops holding, the floor is no
+        // longer larger than a default nursery and the test is a canary for that drift.
+        assert!(
+            before < RECEIVE_SIGNAL_HEADROOM_WORDS,
+            "precondition: the default nursery ({before} words) is tighter than the headroom floor \
+             ({RECEIVE_SIGNAL_HEADROOM_WORDS} words)"
+        );
+
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ensure_receive_signal_headroom(&mut ctx);
+        }
+
+        let process = table.get(pid).expect("the spawned process");
+        assert!(
+            process.heap().available() >= RECEIVE_SIGNAL_HEADROOM_WORDS,
+            "an exempt receiver is left with at least the headroom floor free, so a signal's \
+             reason copies onto its heap directly"
+        );
+        // The growth moved nothing and left the exemption untouched (it is the no-relocation
+        // `grow_nursery` seam, never a collection).
+        assert!(
+            process.is_relocation_exempt(),
+            "the exemption is untouched by the headroom growth"
         );
     }
 }
