@@ -164,6 +164,22 @@ impl OffHeapBinaries for RefcPayloadHost {
     }
 }
 
+/// The outcome of re-homing a registered BIF's **container** result off the pooled BIF heap
+/// ([`RuntimeContext::rehome_container_result`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rehomed {
+    /// The result was copied onto a region that outlives the call (the process's scanned
+    /// young heap, or the runtime's `-eval` store): the caller may rewind the pool.
+    RewindSafe(Eterm),
+    /// The result was left on the pooled BIF heap **by design**: its whole reachable graph is
+    /// pointer-stable there, so the caller hands it through by reference and must **not**
+    /// rewind the pool (the result's words are now the caller's).
+    KeepPool(Eterm),
+    /// The copy was refused for a reason capacity cannot fix; the result stays on the pool and
+    /// the caller leaves both it and the pool untouched (a leak, never a dangle).
+    Failed,
+}
+
 impl<'a> RuntimeContext<'a> {
     /// Takes the pooled BIF heap this call allocates on, **growing the frontier** when the region
     /// it hands back is (nearly) exhausted.
@@ -1400,12 +1416,12 @@ impl<'a> RuntimeContext<'a> {
                     #[cfg(test)]
                     notes::note_alias_copy_pool(mark, heap.used());
                     match self.rehome_container_result(term, None, machine_handles) {
-                        Some(copied) => {
+                        Rehomed::RewindSafe(copied) => {
                             perf_counters::bump(|c| &mut c.rehomed);
                             result = Ok(copied);
                             rewind = safe_to_rewind;
                         }
-                        None => {
+                        Rehomed::KeepPool(_) | Rehomed::Failed => {
                             // Never the un-copied term: it points into the table's `TermStore`.
                             #[cfg(test)]
                             notes::note_alias_refusal();
@@ -1435,7 +1451,7 @@ impl<'a> RuntimeContext<'a> {
                             perf_counters::bump(|c| &mut c.rehomed);
                             result = Ok(copied);
                             rewind = safe_to_rewind;
-                        } else if let Some(copied) =
+                        } else if let Rehomed::RewindSafe(copied) =
                             self.rehome_container_result(term, Some(heap), machine_handles)
                         {
                             perf_counters::bump(|c| &mut c.rehomed);
@@ -1462,12 +1478,24 @@ impl<'a> RuntimeContext<'a> {
                         // per-call walk used to be quadratic (measured on `lib/stdlib/src/string.erl`:
                         // `lists:foldl/3` + `lists:map/2` + a share of `lists:foldr/3` were 236.5 M +
                         // 76.1 M of 408.5 M walk visits).
-                        if let Some(copied) =
-                            self.rehome_container_result(term, Some(heap), machine_handles)
-                        {
-                            perf_counters::bump(|c| &mut c.rehomed);
-                            result = Ok(copied);
-                            rewind = safe_to_rewind;
+                        match self.rehome_container_result(term, Some(heap), machine_handles) {
+                            Rehomed::RewindSafe(copied) => {
+                                perf_counters::bump(|c| &mut c.rehomed);
+                                result = Ok(copied);
+                                rewind = safe_to_rewind;
+                            }
+                            Rehomed::KeepPool(kept) => {
+                                // Leave the result on the pool **by reference**: the graph is
+                                // pointer-stable there (see `move_result_into_runtime_store`), so
+                                // the caller hands it through unchanged and must NOT rewind — the
+                                // next call's mark sits above its words and nothing reclaims them.
+                                result = Ok(kept);
+                                // `rewind` stays `false`.
+                            }
+                            Rehomed::Failed => {
+                                // The result stays on the pool and the call does not rewind (the
+                                // same residual a refused copy always had).
+                            }
                         }
                     }
                 }
@@ -1926,8 +1954,8 @@ impl<'a> RuntimeContext<'a> {
             return term;
         }
         match self.rehome_container_result(term, None, &[]) {
-            Some(copied) => copied,
-            None => {
+            Rehomed::RewindSafe(copied) | Rehomed::KeepPool(copied) => copied,
+            Rehomed::Failed => {
                 self.runtime.taint_info_scratch();
                 term
             }
@@ -1935,8 +1963,7 @@ impl<'a> RuntimeContext<'a> {
     }
 
     /// Copies a container result off the pooled BIF heap onto a region that **outlives the call**,
-    /// returning the copy — or `None` when it cannot be re-homed, in which case the caller leaves
-    /// both the result and the pool exactly as they were.
+    /// returning the outcome as a [`Rehomed`].
     ///
     /// The destination depends on **who is running**:
     ///
@@ -1944,9 +1971,11 @@ impl<'a> RuntimeContext<'a> {
     ///   ([`Self::move_result_into_process_heap`]), so the copy is collectable;
     /// * nothing (`RuntimeContext::new` — the `-eval` evaluator, `-s`/`-run` and the single-pass
     ///   `run_*` entries) → the runtime's long-lived `-eval` store
-    ///   ([`Self::move_result_into_runtime_store`], the table-less arm in
-    ///   [`super::pool`]), a destination reached only for a call whose pool may be rewound: on that
-    ///   route the copy exists to license the rewind, and the store it lands in is never reset;
+    ///   ([`Self::move_result_into_runtime_store`], the table-less arm in [`super::pool`]), a
+    ///   destination reached only for a call whose pool may be rewound; on that route the copy
+    ///   exists to license the rewind, the store it lands in is never reset, and a result already
+    ///   on a **stable pooled region** is handed through by reference as [`Rehomed::KeepPool`]
+    ///   (no walk, no copy, no rewind);
     /// * a scheduled process **inside a relocation-exempt window** whose nursery cannot hold the
     ///   graph → that same runtime store: the window forbids replacing the young space, so the copy
     ///   is *stabilized* rather than grown for
@@ -1955,21 +1984,25 @@ impl<'a> RuntimeContext<'a> {
     /// `pool` is the **pooled region this call allocated from**, when the caller can vouch for it:
     /// the `-eval` store arm uses it to answer "is there anything to move at all?"
     /// ([`super::calls::dest::pool_holds`]) — a result on no pooled region predates the call, so
-    /// handing it through is sound and keeps its term identity observable. `None` means the result
+    /// handing it through is sound and keeps its term identity observable, and a result on a pooled
+    /// region whose graph is pointer-stable is kept there instead of copied. `None` means the result
     /// may have come from a region the caller cannot vouch for (the aliased-ETS `TermStore`, the
     /// `system_info` scratch region), and that arm always copies. The process arm ignores it: its
     /// containment test is the copier's own classification.
     ///
-    /// `None` on every route means the copy was refused for a reason capacity cannot fix, so the
+    /// [`Rehomed::Failed`] means the copy was refused for a reason capacity cannot fix, so the
     /// caller leaves the pool un-rewound and the result on it.
     pub(crate) fn rehome_container_result(
         &mut self,
         term: Eterm,
         pool: Option<&beam_alloc::Heap>,
         machine_handles: &[beam_alloc::RefcBinary],
-    ) -> Option<Eterm> {
+    ) -> Rehomed {
         if self.mailbox_table.is_some() {
-            self.move_result_into_process_heap(term, machine_handles)
+            match self.move_result_into_process_heap(term, machine_handles) {
+                Some(copied) => Rehomed::RewindSafe(copied),
+                None => Rehomed::Failed,
+            }
         } else {
             self.move_result_into_runtime_store(term, pool)
         }
@@ -2273,7 +2306,10 @@ impl<'a> RuntimeContext<'a> {
             // self-contained copy on the runtime's pointer-stable store, so this call can license
             // its pool rewind exactly as on the non-exempt route — `refuse ⇒ stabilize, never
             // dangle`.
-            return self.move_result_into_runtime_store(term, None);
+            return match self.move_result_into_runtime_store(term, None) {
+                Rehomed::RewindSafe(copied) => Some(copied),
+                Rehomed::KeepPool(_) | Rehomed::Failed => None,
+            };
         }
         outcome
     }

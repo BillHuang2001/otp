@@ -251,6 +251,7 @@ use beam_term::{make_small, Atom, Eterm, NIL};
 
 use super::RuntimeContext;
 use crate::config::MaxHeapSetting;
+use crate::context::Rehomed;
 use crate::runtime::HeapSizingFlag;
 
 mod binary;
@@ -1242,12 +1243,13 @@ impl RuntimeContext<'_> {
         // heap, so the copy-out's "nothing to move" question cannot be answered from a pool and
         // the result is always copied onto a destination that outlives this function.
         match self.rehome_container_result(list, None, &[]) {
-            Some(copied) => Ok(copied),
-            // Unreachable in practice: a refusal means the copier rejected a graph this runtime
-            // just built, or a destination that could not be grown. The scratch words are freed
-            // as this function returns, so handing the term back unchanged would be a dangling
-            // term — the typed limit is the honest answer.
-            None => Err(BeamError::SystemLimit),
+            Rehomed::RewindSafe(copied) => Ok(copied),
+            // Unreachable in practice: a refusal (or a keep-in-pool answer, which `pool == None`
+            // rules out) means the copier rejected a graph this runtime just built, or a
+            // destination that could not be grown. The scratch words are freed as this function
+            // returns, so handing the term back unchanged would be a dangling term — the typed
+            // limit is the honest answer.
+            Rehomed::KeepPool(_) | Rehomed::Failed => Err(BeamError::SystemLimit),
         }
     }
     /// The `links` value: a **bare list** of the linked pid/port terms — the oracle's own shape
@@ -1314,12 +1316,13 @@ impl RuntimeContext<'_> {
         // heap, so the copy-out's "nothing to move" question cannot be answered from a pool and
         // the result is always copied onto a destination that outlives this function.
         match self.rehome_container_result(list, None, &[]) {
-            Some(copied) => Ok(copied),
-            // Unreachable in practice: a refusal means the copier rejected a graph this runtime
-            // just built, or a destination that could not be grown. The scratch words are freed
-            // as this function returns, so handing the term back unchanged would be a dangling
-            // term — the typed limit is the honest answer.
-            None => Err(BeamError::SystemLimit),
+            Rehomed::RewindSafe(copied) => Ok(copied),
+            // Unreachable in practice: a refusal (or a keep-in-pool answer, which `pool == None`
+            // rules out) means the copier rejected a graph this runtime just built, or a
+            // destination that could not be grown. The scratch words are freed as this function
+            // returns, so handing the term back unchanged would be a dangling term — the typed
+            // limit is the honest answer.
+            Rehomed::KeepPool(_) | Rehomed::Failed => Err(BeamError::SystemLimit),
         }
     }
     /// The `dictionary` value: the stored `{Key, Value}` pairs, insertion order.
