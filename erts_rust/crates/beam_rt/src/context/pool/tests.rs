@@ -18,9 +18,10 @@
 //
 // %CopyrightEnd%
 
-//! Units for the **table-less** route's BIF-result store (see [`super`]): the copy onto
-//! [`Runtime::eval_heap`], the pool rewind it licenses, the region-replacement growth of the
-//! store, and the cases in which the pool must stay exactly where the call left it.
+//! Units for the **table-less** route's BIF-result store (see [`super`]): the hand-through by
+//! reference that replaced the copy onto [`Runtime::eval_heap`] and the pool rewind it licensed,
+//! the region-replacement growth of the store when a copy *is* still needed, and the cases in which
+//! the pool must stay exactly where the call left it.
 //!
 //! # Why nothing here asks for a tiny region
 //!
