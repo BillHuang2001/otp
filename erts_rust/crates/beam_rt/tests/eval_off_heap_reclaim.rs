@@ -25,17 +25,14 @@
 //!
 //! `Runtime::eval` runs the expression on a **table-less** route: there is no scheduled process,
 //! so a term that escapes an evaluation (the result, a bitstring, a BIF's container result) is
-//! handed through **by reference** to the pooled BIF heap (`Rehomed::KeepPool`, commit
-//! `c45f9a5c5b`) — the result stays where the BIF built it — and the off-heap refc payload such a
-//! term points at is **owned** by `Runtime::eval_off_heap`
+//! copied onto the runtime's never-reset store (`Runtime::eval_heap`) and the off-heap refc
+//! payload such a term points at is **owned** by `Runtime::eval_off_heap`
 //! ([`EvalOffHeapStats`]). Until `src/eval/reclaim.rs` existed the store only ever grew.
 //!
-//! The claim this suite exists to falsify used to be "the store grows with the number of payloads
-//! the expression builds". Under hand-through it does again: a handed-through result's off-heap
-//! payloads are no longer reclaimed by `eval_off_heap`, so the store grows ~linearly with the
-//! number of throw-away payloads — the KNOWN hand-through leak awaiting seam (b). The safety half,
-//! a payload a live term names must survive every prune byte-exactly, is unchanged and is the part
-//! that would catch an over-eager prune.
+//! The claim this suite exists to falsify is "the store grows with the number of payloads the
+//! expression builds". It does not: the reclamation releases every payload that nothing live
+//! reaches, at each top-level statement boundary, so an expression that builds *N* throw-away
+//! off-heap payloads holds **O(1)** of them.
 //!
 //! # The producer, and why 40 000 bytes of `<<1>>`
 //!
@@ -58,15 +55,15 @@
 //!
 //! # What each test pins
 //!
-//! 1. [`the_store_grows_linearly_awaiting_the_pool_frontier_reclaim`] — the headline: `EVALS`
-//!    evaluations, each a block of [`STATEMENTS_PER_EVAL`] throw-away payload builds plus a final
-//!    `ok`, on ONE runtime. Under hand-through the store **grows ~linearly** with the payload count
-//!    (the off-heap half of the KNOWN hand-through leak awaiting seam (b)): the run still shows
-//!    `prunes > 0` and `declines == 0`, but the retained payloads are no longer released.
-//! 2. [`without_the_reclaim_the_same_loop_is_linear`] — the A/B control: the *same* loop with the
-//!    reclaim switched off (`Runtime::set_eval_prune_enabled(false)`) is also linear in the payload
-//!    count (one handle per payload build, `EVALS × STATEMENTS_PER_EVAL` handles) — now the same
-//!    linear shape the hand-through leak has, so the pair no longer contrasts.
+//! 1. [`the_store_is_bounded_across_a_multi_statement_loop`] — the headline: `EVALS` evaluations,
+//!    each a block of [`STATEMENTS_PER_EVAL`] throw-away payload builds plus a final `ok`, on ONE
+//!    runtime. The store must stay under [`BOUND_BYTES`] and its handle count under
+//!    [`BOUND_HANDLES`] at **every** sample, must not drift upward across the run, and the run must
+//!    show `prunes > 0` — a suite that would pass with the reclaim disabled is a lie.
+//! 2. [`without_the_reclaim_the_same_loop_is_linear`] — the A/B: the *same* loop with the reclaim
+//!    switched off (`Runtime::set_eval_prune_enabled(false)`) must be linear in the payload count
+//!    (measured: one handle per payload build, `EVALS × STATEMENTS_PER_EVAL` handles). That pair is
+//!    what makes test 1 non-vacuous: it proves the *reclaim* is the reason the store is bounded.
 //! 3. [`a_retained_off_heap_binary_survives_every_prune_byte_exactly`] — the safety half: a payload
 //!    bound in the evaluator's environment stays live across many prune rounds and must come back
 //!    **byte-exact** (`=:=` against a fresh rebuild of the same bytes, plus `byte_size`), with
@@ -113,12 +110,11 @@ const STATEMENTS_PER_EVAL: usize = 6;
 /// How many evaluations test 1 and test 2 drive.
 const EVALS: usize = 20;
 
-/// The byte figure the headline test used to bound the store at — 8 × the ≈65 536 a single
-/// retained payload reserves. Under the hand-through leak the store now exceeds it, so the
-/// headline asserts the last sample blows **past** it rather than staying under it.
+/// The store bound test 1 asserts, in **bytes** (8 × the ≈65 536 a single retained payload
+/// reserves; the un-reclaimed series reaches ≈7.9 MB over the same loop).
 const BOUND_BYTES: usize = 8 * 65_536;
 
-/// The handle-count figure the headline test used to bound the store at (16).
+/// The handle-count bound test 1 asserts beside it.
 const BOUND_HANDLES: usize = 16;
 
 /// How many prune rounds the anti-dangle case must survive (each one is a real rewrite of the
@@ -200,66 +196,73 @@ fn drive(mut runtime: Runtime, evals: usize) -> (Runtime, Vec<Sample>) {
 // 1. The envelope.
 // ---------------------------------------------------------------------------------------------
 
-/// The headline evidence under hand-through: a long `-eval` block loop builds `EVALS ×
-/// STATEMENTS_PER_EVAL` throw-away off-heap payloads and the store **grows ~linearly** with them.
+/// The headline evidence: a long `-eval` block loop builds `EVALS × STATEMENTS_PER_EVAL`
+/// throw-away off-heap payloads and the store stays **O(1)**.
 ///
-/// This is the KNOWN hand-through leak (commit `c45f9a5c5b`) awaiting seam (b): a handed-through
-/// result's off-heap payloads are no longer reclaimed by `eval_off_heap`, so the store retains one
-/// payload per build instead of staying O(1). The reclaim still runs (`prunes > 0`) and still
-/// declines nothing (`declines == 0`), so the growth is the hand-through, not a disabled prune.
-/// The measured series is printed; the linear shape (monotone non-decreasing, blowing past the old
-/// [`BOUND_BYTES`] / [`BOUND_HANDLES`]) is what distinguishes the leak from the old bounded plateau.
+/// "Bounded" is asserted three ways, all structural: no sample exceeds [`BOUND_BYTES`] /
+/// [`BOUND_HANDLES`], the last sample is no larger than the largest of the first third (no
+/// upward drift with N), and the run's `prunes` counter is non-zero — so the bound can only be
+/// satisfied by a reclaim that actually ran. The measured series is printed; it also shows the
+/// **non-monotone** shape (the store rises while a block runs and falls back at the boundary
+/// prune) that distinguishes a sawtooth from a plateau.
 #[test]
-fn the_store_grows_linearly_awaiting_the_pool_frontier_reclaim() {
+fn the_store_is_bounded_across_a_multi_statement_loop() {
     let (runtime, series) = drive(runtime(), EVALS);
-    report("hand-through leak", &series);
+    report("bounded", &series);
     let stats = runtime.eval_off_heap_stats();
     assert!(
         stats.prunes > 0,
-        "the reclaim never ran, so the growth below would be a disabled-prune artefact: {stats:?}"
+        "the reclaim never ran, so the bound below would be vacuous: {stats:?}"
     );
     assert_eq!(
         stats.declines, 0,
         "a decline retains everything; this loop must be fully prunable: {stats:?}"
     );
-    // The store still holds payloads (the producer really builds off-heap), and it never releases
-    // them: both figures are monotone non-decreasing across the run.
+    for sample in &series {
+        assert!(
+            sample.bytes <= BOUND_BYTES,
+            "the store exceeded its bound at eval {}: {sample:?}",
+            sample.evals
+        );
+        assert!(
+            sample.handles <= BOUND_HANDLES,
+            "the store held too many handles at eval {}: {sample:?}",
+            sample.evals
+        );
+    }
+    let early_peak = series
+        .iter()
+        .take(EVALS / 3 + 1)
+        .map(|sample| sample.bytes)
+        .max()
+        .unwrap_or(0);
+    let last = series.last().copied().expect("the series has a last sample");
+    assert!(
+        last.bytes <= early_peak,
+        "the store drifted upward across the run (last {} bytes vs early peak {early_peak}): {}",
+        last.bytes,
+        series
+            .iter()
+            .map(|s| s.bytes.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // The store may settle at its O(1) steady state by the first sample — a flat plateau rather
+    // than the sawtooth this assertion used to demand. Non-vacuity is already carried by
+    // `prunes > 0` + `declines == 0` above together with the reclaim-off A/B control
+    // (`without_the_reclaim_the_same_loop_is_linear`), which proves the producer really builds
+    // off-heap payloads and the reclaim is what bounds them; a plateau is therefore a valid
+    // (stronger) bound, not a silent pass.
     assert!(
         series.iter().any(|sample| sample.handles > 0),
-        "the store never held a payload, so the growth claim is vacuous: {series:?}"
-    );
-    assert!(
-        series
-            .windows(2)
-            .all(|pair| pair[1].handles >= pair[0].handles),
-        "the store must not release handles under hand-through: {series:?}"
-    );
-    assert!(
-        series.windows(2).all(|pair| pair[1].bytes >= pair[0].bytes),
-        "the store must not release bytes under hand-through: {series:?}"
-    );
-    let first = series.first().copied().expect("the series has a first sample");
-    let last = series.last().copied().expect("the series has a last sample");
-    assert_eq!(first.handles, 0, "a fresh runtime holds no payloads");
-    // The leak is ~one payload per throw-away build: the last sample holds at least
-    // `(EVALS - 1) × STATEMENTS_PER_EVAL` handles (the first eval's block can carry a slightly
-    // different tail), and it blows past both of the old O(1) bounds.
-    assert!(
-        last.handles >= (EVALS - 1) * STATEMENTS_PER_EVAL,
-        "the store must grow ~linearly with the payload count: {series:?}"
-    );
-    assert!(
-        last.bytes > BOUND_BYTES,
-        "the store must blow the old byte bound: {last:?}"
-    );
-    assert!(
-        last.handles > BOUND_HANDLES,
-        "the store must blow the old handle bound: {last:?}"
+        "the store never held a payload, so the bounded claim is vacuous: {series:?}"
     );
     println!(
-        "[{SUITE}] {EVALS} evals × {STATEMENTS_PER_EVAL} payload builds grew to {} bytes / \
-         {} handles with {} prunes (KNOWN hand-through leak awaiting seam (b))",
-        last.bytes, last.handles, stats.prunes
+        "[{SUITE}] {EVALS} evals × {STATEMENTS_PER_EVAL} payload builds stayed at ≤ {} bytes / \
+         ≤ {} handles with {} prunes",
+        series.iter().map(|s| s.bytes).max().unwrap_or(0),
+        series.iter().map(|s| s.handles).max().unwrap_or(0),
+        stats.prunes
     );
 }
 
@@ -267,12 +270,12 @@ fn the_store_grows_linearly_awaiting_the_pool_frontier_reclaim() {
 // 2. The A/B: the same loop with the reclaim switched off is linear.
 // ---------------------------------------------------------------------------------------------
 
-/// The control half of the headline test: **the same loop** with the reclaim disabled
+/// The control half of test 1: **the same loop** with the reclaim disabled
 /// (`Runtime::set_eval_prune_enabled(false)`) retains one payload per build.
 ///
-/// The measured slope is decisive: `EVALS × STATEMENTS_PER_EVAL` handles, and the last sample is
-/// larger than the first. Under hand-through the headline loop has the same linear shape, so this
-/// control no longer contrasts with it — it documents the no-reclaim ceiling the leak approaches.
+/// Without this half, "the store is bounded" would be an assertion about a wire nobody could
+/// falsify. The measured slope is what makes it decisive: `EVALS × STATEMENTS_PER_EVAL` handles
+/// and the last sample is larger than the first sample of the same loop with the reclaim on.
 #[test]
 fn without_the_reclaim_the_same_loop_is_linear() {
     let mut control = runtime();

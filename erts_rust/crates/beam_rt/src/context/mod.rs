@@ -116,7 +116,6 @@ mod on_load_tests;
 mod tests;
 
 pub use self::runtime_context::RuntimeContext;
-pub(crate) use self::calls::Rehomed;
 pub(crate) use self::memo_pool::MemoPool;
 pub(crate) use self::position::InMachinePosition;
 pub(crate) use self::apply::LocalFunTarget;

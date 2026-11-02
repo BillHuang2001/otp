@@ -20,12 +20,11 @@
 
 //! The statement window's two claims, each pinned by its own test.
 //!
-//! **Claim 1 — a pure-container BIF result bypasses the store.** Since commit `c45f9a5c5b`, a
-//! `-eval`/`-s`/`-run` result whose whole graph sits on the pointer-stable pooled BIF heap is
-//! handed through **by reference** (`Rehomed::KeepPool`), so it never lands on the store: an
-//! expression whose top-level statements each build and discard a large container (`lists:seq/2`)
-//! leaves `eval_heap` **empty** (`used == 0`) and resets nothing, for ten statements exactly as
-//! for a thousand — regardless of the statement-window kill switch.
+//! **Claim 1 — the store is bounded.** A `-eval` expression whose top-level statements each build
+//! and discard a large term answers the *same* `used` for ten statements as for a thousand, and
+//! the same expression with the window switched off (the diagnostic kill switch,
+//! [`Runtime::set_eval_scratch_enabled`]) is linear in the statement count. The pre-fix
+//! measurement is in `PERF.md`.
 //!
 //! **Claim 2 — a reset never frees a live word.** Every holder family that can keep a store word
 //! across a boundary is exercised with a value big enough to *be* the window: a `persistent_term`
@@ -73,41 +72,60 @@ fn discarded_builds(n: usize) -> String {
 /// a linear mechanism would be unmistakable.
 const COUNTS: [usize; 3] = [10, 100, 1_000];
 
-/// A pure-container BIF result (`lists:seq/2`) is handed through **by reference** to the pooled
-/// BIF heap (`Rehomed::KeepPool`), so it never lands on the `-eval` store: the store stays empty
-/// and no window is reset or reclaimed, for ten statements exactly as for a thousand.
 #[test]
-fn pure_container_results_bypass_the_store() {
+fn the_store_does_not_grow_with_the_statement_count() {
+    let mut used = Vec::new();
     for n in COUNTS {
         let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
         let value = eval(&mut runtime, &discarded_builds(n)).expect("the expression evaluates");
         assert!(beam_term::is_atom(value), "the last statement is `ok`");
         let stats = runtime.eval_region_stats();
-        assert_eq!(
-            stats.used, 0,
-            "n={n}: the store must stay empty — the results live on the pool frontier"
+        // One reset per statement after the first: the window is taken before every statement,
+        // so the second statement's boundary reclaims the first's copy. The first boundary has
+        // nothing to reclaim (its window is empty), which is why the count is `n - 1`.
+        assert!(
+            stats.resets as usize >= n - 1,
+            "n={n}: only {} resets happened",
+            stats.resets
         );
-        assert_eq!(stats.resets, 0, "n={n}: no window may reset");
-        assert_eq!(stats.words_reclaimed, 0, "n={n}: nothing may be reclaimed");
+        assert!(stats.words_reclaimed > 0, "n={n}: nothing was reclaimed");
+        used.push(stats.used);
     }
+    assert_eq!(
+        used[0], used[1],
+        "the store grew from {} to {} words between {} and {} statements",
+        used[0], used[1], COUNTS[0], COUNTS[1]
+    );
+    assert_eq!(
+        used[1], used[2],
+        "the store grew from {} to {} words between {} and {} statements",
+        used[1], used[2], COUNTS[1], COUNTS[2]
+    );
 }
 
-/// The hand-through is the table-less route's copy-out policy, independent of the statement-window
-/// kill switch: with the window off the `lists:seq/2` results still bypass the store, so `used`
-/// stays empty at every statement count.
 #[test]
-fn the_store_is_bypassed_with_the_window_switched_off_too() {
+fn switching_the_window_off_restores_the_linear_growth() {
+    // The same two expressions with the window held out of the picture: this is the pre-fix
+    // shape, and the pair is what proves the window is doing the work rather than the expression
+    // being cheap.
+    let mut used = Vec::new();
     for n in [COUNTS[1], COUNTS[2]] {
         let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
         runtime.set_eval_scratch_enabled(false);
         eval(&mut runtime, &discarded_builds(n)).expect("the expression evaluates");
         let stats = runtime.eval_region_stats();
         assert_eq!(stats.resets, 0, "the window was switched off");
-        assert_eq!(
-            stats.used, 0,
-            "n={n}: the store must stay empty — the results live on the pool, not the store"
-        );
+        used.push(stats.used);
     }
+    assert!(
+        used[1] >= 5 * used[0],
+        "with the window off the store should be linear in the statement count: \
+         {} statements used {} words, {} used {}",
+        COUNTS[1],
+        used[0],
+        COUNTS[2],
+        used[1]
+    );
 }
 
 #[test]
@@ -138,11 +156,10 @@ fn a_persistent_term_value_survives_every_reset() {
 }
 
 #[test]
-fn an_environment_binding_survives_the_hand_through_window() {
-    // The binding is a root of the descent, so a false recycle would corrupt it in place and the
-    // reduce below would then read garbage. Under hand-through the interleaved `lists:seq/2`
-    // builds bypass the store entirely, so no window resets around the binding — the binding is
-    // live throughout and nothing reclaims it.
+fn an_environment_binding_survives_every_reset() {
+    // The binding is a root of the descent, so the boundary that sees it declines and every later
+    // boundary may reclaim. A false recycle would corrupt the binding in place, which the reduce
+    // below would then read.
     let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
     let expr = format!(
         "A = [{{I,I,I}} || I <- lists:seq(1,{ELEMENTS})], \
@@ -156,13 +173,11 @@ fn an_environment_binding_survives_the_hand_through_window() {
     assert_eq!(
         as_integer(value),
         3 * u64::from(ELEMENTS) * u64::from(ELEMENTS + 1) / 2,
-        "the environment binding was corrupted"
+        "the environment binding was corrupted by a reset"
     );
-    assert_eq!(
-        runtime.eval_region_stats().resets,
-        0,
-        "no window may reset: the discarded builds bypass the store, and the binding is live \
-         throughout"
+    assert!(
+        runtime.eval_region_stats().resets > 0,
+        "the window must have reset around the retained binding"
     );
 }
 
@@ -228,20 +243,25 @@ fn a_window_a_writer_latched_reports_its_reason() {
     );
 }
 
-/// **The terminal term handed through the pool by reference still reads back intact.**
+/// **The driver's terminal term is a write-back slot, never a copy of one.**
 ///
-/// The exit-site store move used to be reached by this shape — three large `lists:seq/2` results
-/// written to the store, one kept as the value — but since commit `c45f9a5c5b` those container
-/// results are handed through **by reference** to the pooled BIF heap (`Rehomed::KeepPool`), and
-/// `element/2`'s return is one of them. The store therefore stays empty and the move has nothing
-/// to compact. The write-back-slot safety the move exists for is pinned separately in
-/// `src/runtime/reclaim/tests.rs` (its `a_refc_binary_value_survives_the_exit_site_move_byte_exactly`
-/// and the compaction suite assert `store_compactions == 1` against real store words).
+/// The exit-site pass hands the store move its corpus as *writable slots*, so the word a move
+/// rewrites is the word the caller hands back. For the `-eval` driver the caller's half of that
+/// corpus is the evaluator's environment **plus the terminal flow the driver is about to return**
+/// (`Ok(value)`, or a raise's `reason`/`head`) — and the flow is the one holder that lives in a
+/// Rust local no runtime family can reach, so the driver lends its own fields (`&mut outcome`).
 ///
-/// Both halves here: the store really is bypassed (`store_compactions == 0`, `used == 0`), and the
-/// handed-through list still renders byte-identically.
+/// Lending a *copy* instead is invisible until a region the word stands in is evacuated: the pass
+/// rewrites the copy, `finish` hands back the original word, and that word names a region the move
+/// has just dropped — a dangling term, which any reader answers as `badarg` (the shape a
+/// `filelib:wildcard/1` result took on the `-eval` route).
+///
+/// One top-level statement, so the pass runs only at the exit (the boundary before it has an empty
+/// window): the expression builds three large lists, keeps one as its value, and leaves the store
+/// with far more dead words than live ones — the shape the move fires on. Both halves are asserted:
+/// the move really ran (`store_compactions`), and the returned list still reads.
 #[test]
-fn the_handed_through_terminal_term_survives_and_bypasses_the_store() {
+fn the_drivers_terminal_term_is_rewritten_by_a_store_move_rather_than_a_copy_of_it() {
     let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
     let expr = format!(
         "element(2, {{lists:seq(1,{ELEMENTS}), lists:seq(1,{ELEMENTS}), \
@@ -249,16 +269,15 @@ fn the_handed_through_terminal_term_survives_and_bypasses_the_store() {
     );
     let value = eval(&mut runtime, &expr).expect("the expression evaluates");
     let stats = runtime.eval_region_stats();
-    assert_eq!(
-        stats.reclaim.store_compactions, 0,
-        "the store must be bypassed for this shape, so no exit-site move may run: used={} \
-         retired={} move_declines={} last_decline={:?}",
+    assert!(
+        stats.reclaim.store_compactions > 0,
+        "the exit-site pass must move the store for this shape, else the pin proves nothing: \
+         used={} retired={} move_declines={} last_decline={:?}",
         stats.used,
         stats.retired_regions,
         stats.reclaim.store_move_declines,
         stats.reclaim.store_move_last_decline,
     );
-    assert_eq!(stats.used, 0, "the store must stay empty (the lists live on the pool)");
     let expected = format!(
         "[{}]",
         (1..=ELEMENTS)
@@ -268,7 +287,7 @@ fn the_handed_through_terminal_term_survives_and_bypasses_the_store() {
     );
     let rendered = runtime
         .format_term(value, None)
-        .expect("the returned term is readable");
+        .expect("the returned term is readable after the move");
     // `~p` breaks a list past the printer's line width onto continuation lines; only the layout is
     // dropped, never an element (the same comparison `tests/a9_native_floor.rs` makes).
     let rendered: String = rendered.lines().map(str::trim_start).collect();
@@ -280,8 +299,8 @@ fn the_handed_through_terminal_term_survives_and_bypasses_the_store() {
 ///
 /// `#[ignore]`d because it prints rather than asserts: it is a *measurement*, run by hand
 /// (`--ignored --nocapture`) and recorded in `PERF.md`. The asserting pins are
-/// [`pure_container_results_bypass_the_store`] and
-/// [`the_store_is_bypassed_with_the_window_switched_off_too`], which bracket the same two shapes.
+/// [`the_store_does_not_grow_with_the_statement_count`] and
+/// [`switching_the_window_off_restores_the_linear_growth`], which bracket the same two shapes.
 ///
 /// The host is shared, so `/proc/loadavg` is printed with the figures: every number here is a
 /// **word count**, a deterministic consequence of the expression, never a timing.

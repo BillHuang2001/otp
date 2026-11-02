@@ -74,7 +74,7 @@
 
 use beam_term::Eterm;
 
-use super::calls::{copy_result_fresh, copy_shortfall_words, Rehomed};
+use super::calls::{copy_result_fresh, copy_shortfall_words};
 use super::runtime_context::RuntimeContext;
 use crate::runtime::EVAL_STORE_GROWTH_FLOOR;
 impl RuntimeContext<'_> {
@@ -106,7 +106,7 @@ impl RuntimeContext<'_> {
         &mut self,
         term: Eterm,
         pool: Option<&beam_alloc::Heap>,
-    ) -> Rehomed {
+    ) -> Option<Eterm> {
         let RuntimeContext { runtime, .. } = self;
         // THE SHORT-CIRCUIT (store arm, [`super::calls::dest`]): the copy has exactly one job —
         // move the result **off** the pooled region the call allocated from, because the tail
@@ -121,24 +121,15 @@ impl RuntimeContext<'_> {
         //   `-eval`/`-s`/`-run` route (`erts_debug:same(maps:put(a,V,M), M)` ⇒ `true`), where the
         //   evaluator's own containers stand on the engine **arena**, not on this store.
         //
-        // A **third** answer — the root standing on a pooled region — is now handed through too,
-        // **by reference**, as `KeepPool`: the graph is pointer-stable (see the gate below), so the
-        //   caller keeps the term exactly where the BIF built it and skips the rewind. Its words
-        //   are never recycled: the next call's `mark` sits above them, and a region that the
-        //   frontier later retires keeps its `used` and is never allocated over (see
-        //   `super::calls::frontier` / `Runtime::put_bif_heap`). This is the arm that removes the
-        //   unconditional deep-copy on the khepri keep-while fan-out (a ~2500-node state map
-        //   rebuilt ~2500 times by `maps:put/3`-style path copying).
-        //
         // `pool == None` is the caller saying it cannot vouch for the region the result came from
         // (the aliased-ETS `TermStore`, the `system_info` scratch region): then only the store half
         // can answer, and the copy runs as it always did.
         //
-        // A hand-through on any answer is **not** enough on its own: the store, the pool and the
-        // arena are pointer-stable but never-scanned, so a container whose root stands there but
-        // whose children live on a scanned young heap would be relocated out from under itself by
-        // that process's next collection (the copier hands such a root `Target::Foreign` and does
-        // not descend). The guard below descends the whole reachable graph instead
+        // A hand-through on either answer is **not** enough on its own: the store and the arena are
+        // pointer-stable but never-scanned, so a container whose root stands there but whose
+        // children live on a scanned young heap would be relocated out from under itself by that
+        // process's next collection (the copier hands such a root `Target::Foreign` and does not
+        // descend). The guard below descends the whole reachable graph instead
         // ([`super::calls::dest::graph_reaches_scanned_heap`]): a graph that names **any** scanned
         // word falls through to the deep copy (which re-roots it on this never-reset store), while
         // a fully self-contained graph is handed through unchanged — which is what keeps a no-op
@@ -146,23 +137,19 @@ impl RuntimeContext<'_> {
         // copy path below: the store is outside every process's scanned heap, so a handed-through
         // container must keep the over-approximate "an escaped store may hold roots" latch set just
         // the same.
-        let on_store = super::calls::dest::store_holds(runtime, term);
-        let on_pool = match pool {
-            Some(pool) => super::calls::dest::pool_holds(runtime, pool, term),
-            None => false,
+        let nothing_to_move = match pool {
+            // Known region: hand through what the store already holds, and anything that is not on
+            // a pooled region.
+            Some(pool) => {
+                super::calls::dest::store_holds(runtime, term)
+                    || !super::calls::dest::pool_holds(runtime, pool, term)
+            }
+            // Unknown origin: only the store half can answer.
+            None => super::calls::dest::store_holds(runtime, term),
         };
-        // Known region: hand through what the store already holds (`RewindSafe`), anything that is
-        // not on a pooled region (`RewindSafe`, nothing to move), and a fully pointer-stable graph
-        // that IS on a pooled region (`KeepPool`, skip the rewind). Unknown origin: only the store
-        // half can answer.
-        let hand_through = on_store || (pool.is_some() && !on_pool) || on_pool;
-        if hand_through && !super::calls::dest::graph_reaches_scanned_heap(runtime, term) {
+        if nothing_to_move && !super::calls::dest::graph_reaches_scanned_heap(runtime, term) {
             runtime.note_escaped_store_roots(term);
-            return if on_pool {
-                Rehomed::KeepPool(term)
-            } else {
-                Rehomed::RewindSafe(term)
-            };
+            return Some(term);
         }
         // One source-payload snapshot for both attempts, built once and borrowed at each call site
         // (`SourcePayloads` is not `Copy`): the BIF-built refc-binary handles now held in
@@ -177,34 +164,29 @@ impl RuntimeContext<'_> {
         ) {
             Ok(copied) => {
                 runtime.note_escaped_store_roots(copied);
-                return Rehomed::RewindSafe(copied);
+                return Some(copied);
             }
             Err(error) if !beam_message::is_message_heap_exhaustion(&error) => {
                 // Not a capacity refusal — above all the copier's malformed-graph `badarg` or an
                 // unresolvable off-heap container. Growing cannot fix it, so a retry would walk
                 // the graph again and fail with the very same reason: leave the result (and the
                 // pool) untouched.
-                return Rehomed::Failed;
+                return None;
             }
             Err(error) => copy_shortfall_words(&error),
         };
-        if runtime
+        runtime
             .grow_eval_heap(needed.max(EVAL_STORE_GROWTH_FLOOR))
-            .is_err()
-        {
-            return Rehomed::Failed;
-        }
-        let copied = match copy_result_fresh(
+            .ok()?;
+        let copied = copy_result_fresh(
             &mut runtime.eval_heap,
             &mut runtime.eval_off_heap,
             term,
             &payloads,
-        ) {
-            Ok(copied) => copied,
-            Err(_) => return Rehomed::Failed,
-        };
+        )
+        .ok()?;
         runtime.note_escaped_store_roots(copied);
-        Rehomed::RewindSafe(copied)
+        Some(copied)
     }
 }
 

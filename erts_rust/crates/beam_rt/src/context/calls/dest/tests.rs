@@ -26,7 +26,6 @@
 //! negative arm is the guard against "the copy silently became a no-op".
 use beam_term::Eterm;
 use beam_term::make_small;
-use crate::context::Rehomed;
 use crate::context::RuntimeContext;
 use crate::context::calls::notes;
 use crate::context::calls::tests::process_table;
@@ -137,7 +136,7 @@ fn the_store_arm_hands_through_what_it_already_holds_and_copies_what_it_does_not
         let mut ctx = RuntimeContext::new(&mut rt);
         assert_eq!(
             ctx.move_result_into_runtime_store(held, None),
-            Rehomed::RewindSafe(held),
+            Some(held),
             "a result the store already holds is handed through as the same word"
         );
     }
@@ -148,10 +147,8 @@ fn the_store_arm_hands_through_what_it_already_holds_and_copies_what_it_does_not
     );
     let copied = {
         let mut ctx = RuntimeContext::new(&mut rt);
-        match ctx.move_result_into_runtime_store(elsewhere, None) {
-            Rehomed::RewindSafe(copied) => copied,
-            other => panic!("expected a foreign container to be copied into the store, got {other:?}"),
-        }
+        ctx.move_result_into_runtime_store(elsewhere, None)
+            .expect("a foreign container is copied into the store")
     };
     assert_ne!(
         copied, elsewhere,
@@ -171,9 +168,7 @@ fn the_store_arm_hands_through_what_it_already_holds_and_copies_what_it_does_not
 /// The hand-through arm is what keeps a no-op container BIF's term identity observable on the
 /// `-eval`/`-s`/`-run` route: the evaluator's own containers stand on the engine **arena**, which is
 /// pointer-stable and never reset, so `erts_debug:same(maps:put(a,V,M), M)` answers `true` there
-/// exactly as on the oracle. A root that still stands on the call's own pooled region is likewise
-/// handed through by reference (`Rehomed::KeepPool`) rather than copied, because the pool is
-/// pointer-stable and the next call's mark sits above its words — see [`super::move_result_into_runtime_store`].
+/// exactly as on the oracle.
 #[test]
 fn the_store_arm_hands_through_a_result_that_is_on_no_pooled_region() {
     let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
@@ -186,25 +181,21 @@ fn the_store_arm_hands_through_a_result_that_is_on_no_pooled_region() {
     let mut stable = beam_alloc::Heap::new(32).expect("a stable region");
     let elsewhere = int_list(&mut stable, 4).expect("four cells fit");
     let store_used = rt.eval_heap.used();
-    let kept = {
+    let copied = {
         let mut ctx = RuntimeContext::new(&mut rt);
-        match ctx.move_result_into_runtime_store(on_pool, Some(&pool)) {
-            Rehomed::KeepPool(kept) => kept,
-            other => panic!("expected a pool-resident result to be handed through, got {other:?}"),
-        }
+        ctx.move_result_into_runtime_store(on_pool, Some(&pool))
+            .expect("a result on the pool is moved into the store")
     };
-    assert_eq!(kept, on_pool, "a result on the pool is handed through by reference, never copied");
+    assert_ne!(copied, on_pool, "a result on the pool is copied, never handed through");
     assert_eq!(
         rt.eval_heap.used(),
-        store_used,
-        "the hand-through wrote no store word for a result the pool owns"
+        store_used + 8,
+        "the four cells (eight words) landed in the store"
     );
     let handed = {
         let mut ctx = RuntimeContext::new(&mut rt);
-        match ctx.move_result_into_runtime_store(elsewhere, Some(&pool)) {
-            Rehomed::RewindSafe(handed) => handed,
-            other => panic!("expected a stable-region result to be handed through, got {other:?}"),
-        }
+        ctx.move_result_into_runtime_store(elsewhere, Some(&pool))
+            .expect("the hand-through arm answers a term")
     };
     assert_eq!(
         handed, elsewhere,
@@ -212,7 +203,7 @@ fn the_store_arm_hands_through_a_result_that_is_on_no_pooled_region() {
     );
     assert_eq!(
         rt.eval_heap.used(),
-        store_used,
+        store_used + 8,
         "the hand-through arm wrote no store word"
     );
     // The pool's own words must still be recognisable as being on the pool, i.e. the predicate is
@@ -265,10 +256,8 @@ fn a_store_root_with_scanned_heap_children_is_deep_copied_and_survives_a_forced_
     );
     let copied = {
         let mut ctx = RuntimeContext::new(&mut rt);
-        match ctx.move_result_into_runtime_store(outer, None) {
-            Rehomed::RewindSafe(copied) => copied,
-            other => panic!("expected a mixed-heap graph to be re-homed, got {other:?}"),
-        }
+        ctx.move_result_into_runtime_store(outer, None)
+            .expect("a mixed-heap graph is re-homed")
     };
     assert_ne!(
         copied, outer,

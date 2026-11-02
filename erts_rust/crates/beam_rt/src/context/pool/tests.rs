@@ -18,10 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! Units for the **table-less** route's BIF-result store (see [`super`]): the hand-through by
-//! reference that replaced the copy onto [`Runtime::eval_heap`] and the pool rewind it licensed,
-//! the region-replacement growth of the store when a copy *is* still needed, and the cases in which
-//! the pool must stay exactly where the call left it.
+//! Units for the **table-less** route's BIF-result store (see [`super`]): the copy onto
+//! [`Runtime::eval_heap`], the pool rewind it licenses, the region-replacement growth of the
+//! store, and the cases in which the pool must stay exactly where the call left it.
 //!
 //! # Why nothing here asks for a tiny region
 //!
@@ -121,16 +120,15 @@ fn lies_in_the_pool(rt: &Runtime, term: Eterm) -> bool {
     })
 }
 
-/// **A container result is handed through by reference: it stays on the pool, and nothing is copied.**
+/// **A container result is copied off the pool and the pool is rewound to the call's mark.**
 ///
-/// On the table-less route there is no process heap to move a result onto, so the result the BIF
-/// built is handed to the caller **where it stands** on the pooled region — the pool's frontier keeps
-/// the words, and the long-lived store receives none of them. This is the hand-through the fix
-/// introduces: the deep copy and the rewind it licensed are gone, so the caller reads the BIF's own
-/// words instead of a structural twin. The invariant under test is that the handed-through word is
-/// still the whole, correct container.
+/// On the table-less route there is no process heap to move a result onto, so before the store
+/// existed nothing rewound the pool: `lists:seq/2`'s 200 words (and every later container) stayed
+/// on the frontier region for the run's whole life. Now the result is copied onto
+/// [`Runtime::eval_heap`], the caller is handed the *copy*, and the frontier returns to its mark —
+/// the words the call handed out are given back, while the value stays readable.
 #[test]
-fn a_container_result_is_handed_through_by_reference_and_stays_on_the_pool() {
+fn a_container_result_is_copied_off_the_pool_and_the_pool_is_rewound() {
     let mut rt = small_region_runtime();
     assert_eq!(frontier_used(&rt), 0, "the pool starts clean");
     let result = {
@@ -140,29 +138,29 @@ fn a_container_result_is_handed_through_by_reference_and_stays_on_the_pool() {
     };
     assert_eq!(
         frontier_used(&rt),
-        200,
-        "the 100 cons cells (200 words) the call handed out stay on the pool, handed through by reference"
+        0,
+        "every word the call handed out of the pool is given back"
     );
     assert_eq!(
         rt.eval_heap.used(),
-        0,
-        "no copy ran: the long-lived store received nothing"
+        200,
+        "the copy — and only the copy — is on the long-lived store (100 cons cells)"
     );
     assert_eq!(
         rt.eval_heap_retired.len(),
         0,
-        "a hand-through replaces no store region"
+        "a copy that fits the store replaces no region"
     );
     assert!(
-        lies_in_the_pool(&rt, result),
-        "the returned value is the pool's own word, not a copy off it"
+        !lies_in_the_pool(&rt, result),
+        "the returned value must not point into the pool the caller just rewound"
     );
     // `format_term_w` is `~w~n`, so the rendering carries the format's trailing newline.
-    let rendered = rt.format_term_w(result, None).expect("the handed-through word renders");
+    let rendered = rt.format_term_w(result, None).expect("the copy renders");
     let rendered = rendered.trim_end();
     assert!(
         rendered.starts_with("[1,2,3,4,5,") && rendered.ends_with(",97,98,99,100]"),
-        "the handed-through word is the whole list, not a recycled one: {rendered}"
+        "the copy is the whole list, not a recycled word: {rendered}"
     );
     assert_eq!(
         rendered.matches(',').count(),
@@ -210,16 +208,17 @@ fn an_immediate_result_rewinds_the_pool_without_a_copy() {
     );
 }
 
-/// **A result kept in the evaluator's environment survives many later calls, each of which allocates
-/// above it.**
+/// **A result kept in the evaluator's environment survives many later calls, each of which rewinds
+/// the pool past it.**
 ///
-/// This is the test the hand-through has to pass: the kept list was built *on the pool* and handed to
-/// the caller by reference, so the next call's mark sits **above** its words. A pool that rewound
-/// (re-bumped) below a live result would overwrite its words with the next calls' results. It also
-/// pins the fix's whole point on this route: 500 container calls copy nothing onto the store, and the
-/// frontier only ever advances — the kept list's 600 words stay exactly where they were built.
+/// This is the test the rewind has to pass: the kept list was built *on the pool*, so a rewind
+/// that recycled a live result would overwrite its words with the next calls' results. It also
+/// pins the fix's whole point on this route: 500 container calls leave the pool at **one** region
+/// whose first-touch high-water is exactly the kept list's own 600 words — the calls added
+/// nothing, where before the store existed the frontier marched 2 words per call past them (and
+/// would have crossed into a second region at ~700 calls).
 #[test]
-fn a_handed_through_result_survives_later_calls_that_allocate_above_it() {
+fn a_kept_result_survives_later_calls_that_rewind_the_pool() {
     let mut rt = small_region_runtime();
     let kept = {
         let mut ctx = RuntimeContext::new(&mut rt);
@@ -228,19 +227,9 @@ fn a_handed_through_result_survives_later_calls_that_allocate_above_it() {
     };
     assert_eq!(
         rt.eval_heap.used(),
-        0,
-        "the kept 300-element list is handed through: no store words"
-    );
-    assert_eq!(
-        frontier_used(&rt),
         600,
-        "the kept list's own 600 words stay on the pool"
+        "the kept 300-element list is 600 store words"
     );
-    assert!(
-        lies_in_the_pool(&rt, kept),
-        "the kept list is the pool's own word"
-    );
-    let before = rt.format_term_w(kept, None).expect("the kept list renders");
     {
         let mut ctx = RuntimeContext::new(&mut rt);
         for round in 0..500 {
@@ -249,40 +238,49 @@ fn a_handed_through_result_survives_later_calls_that_allocate_above_it() {
                 .call_bif("erlang", "list_to_tuple", 1, &[args])
                 .expect("list_to_tuple/1");
             assert!(
-                lies_in_the_pool(ctx.runtime, tuple),
-                "round {round}: the result is handed through, not a copy"
+                !lies_in_the_pool(ctx.runtime, tuple),
+                "round {round}: the result is a copy, not a pool word"
             );
             assert_eq!(
-                terms::tuple_arity(tuple).expect("the BIF built a tuple"),
-                1,
-                "round {round}: a one-element tuple"
+                ctx.runtime
+                    .bif_heaps
+                    .last()
+                    .expect("the pool keeps a region")
+                    .used(),
+                0,
+                "round {round}: the frontier returned to the call's mark"
             );
         }
     }
-    // The kept list must still read byte-identically: its 600 words were never overwritten, even
-    // after the later calls' results marched the frontier (and possibly retired the first region).
-    let after = rt.format_term_w(kept, None).expect("the kept list still renders");
     assert_eq!(
-        before, after,
-        "the kept list is byte-identical after 500 later handed-through calls"
+        rt.bif_heaps.len(),
+        1,
+        "the pool never needed a second region: every call gave its own words back"
     );
-    let trimmed = before.trim_end();
+    assert_eq!(
+        pool_words_touched(&rt),
+        600,
+        "the pool's first-touch high-water is the kept list's own 600 words — the 500 container \
+         calls that followed added not one word to it"
+    );
+    let rendered = rt.format_term_w(kept, None).expect("the kept list renders");
+    let rendered = rendered.trim_end();
     assert!(
-        trimmed.starts_with("[1,2,3,") && trimmed.ends_with(",298,299,300]"),
-        "the kept list is intact: {trimmed}"
+        rendered.starts_with("[1,2,3,") && rendered.ends_with(",298,299,300]"),
+        "the kept list is intact after 500 rewinds: {rendered}"
     );
 }
 
-/// **A store region too small for a result is never replaced now: the hand-through fires instead.**
+/// **A store region too small for a result is *replaced* (never moved), and everything the earlier
+/// region holds stays valid** — [`Runtime::grow_eval_heap`]'s documented contract, reached the way
+/// the copy reaches it.
 ///
 /// Both results here are legal BIF calls on a [`REGION_WORDS`] pool; the second one is larger than
-/// the store's remaining headroom, which is exactly the shape that used to force a store region
-/// replacement. The hand-through removes the copy, so the store grows **nothing** and retires
-/// **nothing** — while the pool retires its own region to hold both results, and both keep their
-/// words valid (a retired pool region is kept alive, never moved or re-bumped below its offset).
-/// The first result — whose words are in the now-retired pool region — still renders.
+/// what the store has left, so the copier refuses it once, its own reported shortfall grows the
+/// store by region replacement, and the retry lands in the fresh region. The first result — whose
+/// words are in the now-retired region — still renders.
 #[test]
-fn a_handed_through_result_needs_no_store_region_and_earlier_pool_terms_stay_valid() {
+fn the_store_grows_by_region_replacement_and_earlier_terms_stay_valid() {
     let mut rt = small_region_runtime();
     assert_eq!(
         rt.eval_heap.capacity(),
@@ -291,54 +289,126 @@ fn a_handed_through_result_needs_no_store_region_and_earlier_pool_terms_stay_val
     );
     assert_eq!(rt.eval_heap_retired.len(), 0);
 
-    // 900 elements is 1800 words: it fits the 2048-word pool, and would previously have been copied
-    // onto the store. Now it is handed through — the store receives nothing.
+    // 900 elements is 1800 store words: it fits, so no region is replaced — and it leaves only
+    // 248 words of headroom.
     let first = {
         let mut ctx = RuntimeContext::new(&mut rt);
         ctx.call_bif("lists", "seq", 2, &[make_small(1), make_small(900)])
             .expect("lists:seq(1, 900)")
     };
-    assert_eq!(rt.eval_heap.used(), 0, "the hand-through copies nothing onto the store");
-    assert_eq!(rt.eval_heap_retired.len(), 0, "a hand-through retires no store region");
-    assert!(lies_in_the_pool(&rt, first), "the 900-element list is handed through on the pool");
+    assert_eq!(rt.eval_heap.used(), 1_800, "the copy fits the starting region");
+    assert_eq!(
+        rt.eval_heap_retired.len(),
+        0,
+        "a copy that fits retires nothing"
+    );
 
-    // 700 elements is 1400 more words: the pool's own region cannot hold both, so the pool retires
-    // its first region and continues on a wider one. The store is still untouched.
+    // 700 elements is 1400 store words: more than the headroom, but still a legal BIF call on the
+    // 2048-word pool. That is exactly the trade the growth step exists for — the copy is refused
+    // once, the copier's own reported shortfall replaces the store region, the retry lands.
     let second = {
         let mut ctx = RuntimeContext::new(&mut rt);
         ctx.call_bif("lists", "seq", 2, &[make_small(1), make_small(700)])
             .expect("lists:seq(1, 700)")
     };
-    assert_eq!(rt.eval_heap.used(), 0, "still no store words after the second hand-through");
-    assert_eq!(rt.eval_heap_retired.len(), 0, "still no store region retired");
-    assert!(lies_in_the_pool(&rt, second), "the 700-element list is handed through on the pool");
+    assert_eq!(
+        rt.eval_heap_retired.len(),
+        1,
+        "the oversized result replaced exactly one region"
+    );
+    assert!(
+        rt.eval_heap.capacity() >= 1_400,
+        "the fresh region is at least the copier's own shortfall ({} words)",
+        rt.eval_heap.capacity()
+    );
+    assert_eq!(
+        rt.eval_heap.used(),
+        1_400,
+        "the retry landed in the fresh region"
+    );
+    assert_eq!(
+        rt.eval_heap_retired
+            .last()
+            .expect("a retired region")
+            .capacity(),
+        REGION_WORDS,
+        "the region that was replaced is the small one, kept alive rather than freed"
+    );
+
+    // A permit to grow is not a command to: a request the fresh region already satisfies retires
+    // nothing and replaces nothing.
+    let (capacity, retired) = (rt.eval_heap.capacity(), rt.eval_heap_retired.len());
+    rt.grow_eval_heap(1_024).expect("a legal growth request");
+    assert_eq!(
+        (rt.eval_heap.capacity(), rt.eval_heap_retired.len()),
+        (capacity, retired),
+        "grow_eval_heap is a no-op while the region has room"
+    );
 
     for (term, last) in [(first, "900"), (second, "700")] {
-        let rendered = rt.format_term_w(term, None).expect("a handed-through term renders");
+        let rendered = rt.format_term_w(term, None).expect("a stored term renders");
         let rendered = rendered.trim_end();
         assert!(
             rendered.starts_with("[1,2,3,") && rendered.ends_with(&format!(",{last}]")),
-            "a handed-through term stays intact across later pool activity: {rendered}"
+            "a term in a retired region is still intact: {rendered}"
         );
     }
 }
 
-/// **A table-less container result is handed through by reference, and the pool keeps each result.**
+/// The shape the `-eval`/single-pass **store** must have after `calls` container copies of
+/// `words` words each, given a starting region of `region` words.
+///
+/// `(frontier_used, capacity, retired)`: what [`Runtime::eval_heap`]'s `used()` and `capacity()`
+/// must read (a replacement starts a fresh region, so the offset restarts at `0`), and the widths
+/// of the replaced regions in order. The model is [`Runtime::grow_eval_heap`]'s documented policy
+/// and nothing more: a copy that fits the remaining room lands as it is, one that does not replaces
+/// the region with one **twice as wide** (`needed.max(EVAL_STORE_GROWTH_FLOOR)` only matters below
+/// 256 words, which `MIN_HEAP_WORDS` rules out) and lands at offset `0` of the fresh one — which is
+/// kept for the rest of the run, so its words stay readable. A retired region is released only by
+/// the region-reclaim pass at its two non-running sites (the `-eval` statement boundary and the
+/// driver exit, `src/runtime/reclaim.rs`), and a bare `RuntimeContext::call_bif` here reaches
+/// neither.
+fn expected_store_shape(calls: usize, words: usize, region: usize) -> (usize, usize, Vec<usize>) {
+    let mut frontier = 0;
+    let mut capacity = region;
+    let mut retired = Vec::new();
+    for _ in 0..calls {
+        if frontier + words > capacity {
+            retired.push(capacity);
+            capacity *= 2;
+            frontier = 0;
+        }
+        frontier += words;
+    }
+    (frontier, capacity, retired)
+}
+
+/// **A table-less container result is re-homed to the store, and the pooled BIF region is rewound
+/// to the call's mark.**
 ///
 /// The `-eval`/single-pass route has no scheduled process, so
-/// [`RuntimeContext::call_registered`]'s copy-out takes the **store** arm — and now, for a result
-/// whose whole graph is pointer-stable on the pool, hands it through as `Rehomed::KeepPool` rather
-/// than deep-copying it. Three consequences, all pinned here per round:
+/// [`RuntimeContext::call_registered`]'s copy-out takes the **store** arm
+/// ([`RuntimeContext::move_result_into_runtime_store`]) instead of the process-heap one: the
+/// result is deep-copied onto the runtime's long-lived `-eval` store ([`Runtime::eval_heap`], its
+/// off-heap payloads adopted into [`Runtime::eval_off_heap`]) and only *then* is the pool rewound.
+/// Three consequences, all pinned here per round:
 ///
-/// * the caller gets a **correct, readable** container back — the load-bearing half, since a
-///   hand-through that lost a word shows up here;
-/// * the pooled region is **not** rewound: the frontier advances by the tuple's own words each
-///   round, and the store receives **nothing**;
-/// * every surviving result word stays readable at its original address — the first round's tuple is
-///   read back at the end, out of a region the pool may since have retired (a retired pool region is
-///   kept alive, never moved or re-bumped below its offset).
+/// * the caller gets a **correct, readable** container back — the load-bearing half, since a copy
+///   that lost a word or a rewind that recycled one shows up here;
+/// * the pooled region is **not** retained: one region, `used() == 0`, capacity unchanged. The
+///   accumulation the pool's growth path used to exist for — every result staying on the region it
+///   was built on for the run's whole life — no longer happens on this route;
+/// * the surviving result words are owned by the **store**, exactly: each call adds the tuple's own
+///   101 words (a header plus 100 elements) and the store's region replacements follow
+///   [`expected_store_shape`] — here one, at the eleventh copy.
+///
+/// The first round's tuple is read back at the end, out of the region that replacement *retired*
+/// (a retired store region is kept alive, never moved), so a store that merely forgot its earlier
+/// words fails too.
 #[test]
-fn a_table_less_container_result_is_handed_through_and_the_pool_keeps_each_result() {
+fn a_table_less_container_result_is_stored_and_the_pool_rewound_to_the_call_mark() {
+    // The smallest region a runtime accepts (`MIN_HEAP_WORDS`), which sizes **both** the pooled BIF
+    // heap and the store; 100 elements is a 101-word tuple, built from immediates alone.
     const REGION_WORDS: usize = 1024;
     const ELEMENTS: usize = 100;
     const TUPLE_WORDS: usize = ELEMENTS + 1;
@@ -370,53 +440,73 @@ fn a_table_less_container_result_is_handed_through_and_the_pool_keeps_each_resul
             if round == 0 {
                 kept = tuple;
             }
-            assert!(
-                lies_in_the_pool(ctx.runtime, tuple),
-                "round {round}: handed through, not copied"
-            );
+            // The pool gave every word this call handed out back, in one region, at its mark.
+            let pool = ctx
+                .runtime
+                .bif_heaps
+                .last()
+                .expect("the pool keeps a region");
             assert_eq!(
-                ctx.runtime.eval_heap.used(),
-                0,
-                "round {round}: the store receives nothing"
+                (ctx.runtime.bif_heaps.len(), pool.used(), pool.capacity()),
+                (1, 0, REGION_WORDS),
+                "round {round}: one region, at the call's mark, never grown"
+            );
+            // The store owns one result per completed call, in its own growth policy's shape.
+            let (frontier, capacity, retired) =
+                expected_store_shape(round + 1, TUPLE_WORDS, REGION_WORDS);
+            assert_eq!(
+                (
+                    ctx.runtime.eval_heap.used(),
+                    ctx.runtime.eval_heap.capacity(),
+                    ctx.runtime.eval_heap_retired.len(),
+                ),
+                (frontier, capacity, retired.len()),
+                "round {round}: the store owns every surviving result word"
             );
         }
     }
-    // The store never grew: no copy ran, so no store region was replaced.
-    assert_eq!(rt.eval_heap.used(), 0, "the store holds no result word");
-    assert_eq!(rt.eval_heap_retired.len(), 0, "no store region was retired");
-    // The pool accumulated each result in place: ROUNDS × TUPLE_WORDS words, never rewound.
+
+    let (_, capacity, retired) = expected_store_shape(ROUNDS, TUPLE_WORDS, REGION_WORDS);
     assert_eq!(
-        pool_words_touched(&rt),
-        ROUNDS * TUPLE_WORDS,
-        "the pool's high-water is every result's own words, never rewound"
+        rt.eval_heap.capacity(),
+        capacity,
+        "{ROUNDS} calls × {TUPLE_WORDS} words, ending on a {capacity}-word region"
     );
-    // The first round's tuple — possibly in a region the pool retired — still reads.
+    assert_eq!(
+        rt.eval_heap_retired
+            .iter()
+            .map(|heap| heap.capacity())
+            .collect::<Vec<_>>(),
+        retired,
+        "the region the first ten copies landed in is retired, not freed: {retired:?}"
+    );
     assert_eq!(
         (
             terms::tuple_arity(kept).expect("the first round's container is intact"),
             terms::tuple_element(kept, ELEMENTS - 1).expect("in range"),
         ),
         (ELEMENTS, make_small(0)),
-        "a result whose words live in a retired pool region still reads"
+        "a result whose words live in the retired region still reads"
     );
-    assert!(lies_in_the_pool(&rt, kept), "the kept result is still the pool's own word");
 }
 
-/// **A table-less container workload keeps each result in the pool, so a `+hmax`-capped region is
-/// eventually exhausted.**
+/// **Capacity independence: a table-less container workload that would exhaust a fixed pooled
+/// region completes.**
 ///
-/// This is the honest memory half of the hand-through: because the result is kept by reference and
-/// the pool is **not** rewound, a run of fresh-container calls accumulates one result's words per
-/// call in the pool. Without a cap the pool grows by region replacement to hold them all (see
-/// [`a_table_less_container_result_is_handed_through_and_the_pool_keeps_each_result`]); with a
-/// `+hmax` cap the pool cannot grow, so the accumulation ends in `error:system_limit` — a configured
-/// limit, never a wrong result. Every result that *did* complete is still whole and readable.
-///
-/// The exhaustion point is arithmetic, not luck: each call hands out [`TUPLE_WORDS`] words and never
-/// gives them back, so exactly `REGION_WORDS / TUPLE_WORDS` calls fit the capped region before the
-/// next one overflows it.
+/// The pool's own growth path ([`RuntimeContext::take_bif_frontier`]) is **pre-call** and
+/// `+hmax`-capped: it retires a region *already* nearly exhausted when a call starts — exactly the
+/// accumulation the store made unnecessary — and it does not rescue a call whose own result
+/// exceeds the region (measured: `make_tuple(2000, 0)` on a 1024-word region is
+/// `error:system_limit` with and without a `+hmax`). Pinning `+hmax` to the region's own size
+/// therefore disables the branch outright (`grown = min(2 × capacity, cap) <= capacity`) and makes
+/// this case's arithmetic a proof: [`ROUNDS`] × [`TUPLE_WORDS`] is 10 100 words against 1024, nearly
+/// ten times its capacity, so a frontier that kept each result where it was built would raise
+/// `error:system_limit` at the eleventh call. Every call succeeding is the rewind — and only the
+/// rewind — at work. `tests/eval_pool_result.rs` drives the same discriminator end to end through
+/// the CLI (a 1000-container `-eval` expression needed `+hmax 16384` before the store and completes
+/// at `+hmax 4096` with it); this is the cheap in-node form.
 #[test]
-fn a_table_less_container_workload_keeps_each_result_and_exhausts_a_capped_pool() {
+fn a_table_less_container_workload_that_would_exhaust_a_fixed_pool_now_completes() {
     const REGION_WORDS: usize = 1024;
     const ELEMENTS: usize = 100;
     const TUPLE_WORDS: usize = ELEMENTS + 1;
@@ -430,61 +520,63 @@ fn a_table_less_container_workload_keeps_each_result_and_exhausts_a_capped_pool(
         rt.bif_heap_words, REGION_WORDS,
         "`+hmax` both sizes and caps the pooled region"
     );
-    let mut successes = 0usize;
-    let mut exhaustion: Option<beam_common::BeamError> = None;
     {
         let mut ctx = RuntimeContext::new(&mut rt);
         for round in 0..ROUNDS {
-            match ctx.call_bif(
-                "erlang",
-                "make_tuple",
-                2,
-                &[make_small(ELEMENTS as i64), make_small(0)],
-            ) {
-                Ok(tuple) => {
-                    assert_eq!(
-                        terms::tuple_arity(tuple).expect("the BIF built a tuple"),
-                        ELEMENTS,
-                        "round {round}: a complete container, not a truncated one"
-                    );
-                    assert!(
-                        lies_in_the_pool(ctx.runtime, tuple),
-                        "round {round}: handed through, kept in the pool"
-                    );
-                    assert_eq!(
-                        ctx.runtime.eval_heap.used(),
-                        0,
-                        "round {round}: the store receives nothing"
-                    );
-                    successes += 1;
-                }
-                Err(error) => {
-                    exhaustion = Some(error);
-                    break;
-                }
-            }
+            let tuple = ctx
+                .call_bif(
+                    "erlang",
+                    "make_tuple",
+                    2,
+                    &[make_small(ELEMENTS as i64), make_small(0)],
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "round {round}: the accumulated frontier would have exhausted the capped \
+                         region here, the rewind is what keeps it legal: {e}"
+                    )
+                });
+            assert_eq!(
+                terms::tuple_arity(tuple).expect("the BIF built a tuple"),
+                ELEMENTS,
+                "round {round}: a complete container, not a truncated one"
+            );
+            let pool = ctx
+                .runtime
+                .bif_heaps
+                .last()
+                .expect("the pool keeps a region");
+            assert_eq!(
+                (pool.used(), pool.capacity()),
+                (0, REGION_WORDS),
+                "round {round}: one capped region, rewound to the call's mark"
+            );
         }
+        assert_eq!(
+            ctx.runtime.bif_heaps.len(),
+            1,
+            "the capped pool never needed — nor could have got — a second region"
+        );
     }
-    // The pool accumulated one result per successful call and never gave a word back.
+
+    // The store, not the pool, absorbed the workload, in its own growth policy's shape.
+    let (frontier, capacity, retired) = expected_store_shape(ROUNDS, TUPLE_WORDS, REGION_WORDS);
+    assert_eq!(
+        (rt.eval_heap.used(), rt.eval_heap.capacity()),
+        (frontier, capacity),
+        "the store absorbed all {ROUNDS} results ({TUPLE_WORDS} words each)"
+    );
+    assert_eq!(
+        rt.eval_heap_retired
+            .iter()
+            .map(|heap| heap.capacity())
+            .collect::<Vec<_>>(),
+        retired,
+        "its region replacements are what pay for the bounded pool: {retired:?}"
+    );
     assert!(
-        pool_words_touched(&rt) >= successes * TUPLE_WORDS,
-        "the pool's high-water is at least every successful result's own words — the accumulation \
-         the hand-through introduces"
-    );
-    assert_eq!(rt.eval_heap.used(), 0, "the store held nothing the whole time");
-    // The exhaustion is the arithmetic the test is built on, and it is a configured-limit refusal,
-    // not a corruption.
-    let expected_successes = REGION_WORDS / TUPLE_WORDS;
-    assert_eq!(
-        successes, expected_successes,
-        "exactly floor({REGION_WORDS} / {TUPLE_WORDS}) fresh containers fit the capped pool before \
-         the next overflows it"
-    );
-    let error = exhaustion.expect("the capped pool really did exhaust");
-    assert_eq!(
-        error.as_atom(),
-        Some("system_limit"),
-        "the overflow is the emulator's system_limit, never a wrong result"
+        retired.len() >= 3,
+        "the workload really crossed several store regions: {retired:?}"
     );
 }
 
@@ -713,35 +805,50 @@ fn a_non_rewindable_table_less_call_is_not_moved_and_the_store_stays_empty() {
     }
 }
 
-/// **The one host-memory mechanism the table-less route now leaves open is the engine arena.**
+/// **The two host-memory mechanisms the table-less route leaves open, pinned to their rule.**
 ///
-/// A long in-process `compile:file/2` (`-eval`, i.e. no scheduled process) used to retain host
-/// memory in exactly two places — the engine arena and the `-eval` store's copy-out volume. The
-/// hand-through closes the second: a container result the pool owns is handed through by reference,
-/// so the store receives **nothing** and retires **no** region, however many container results a
-/// single statement builds.
+/// A long in-process `compile:file/2` (`-eval`, i.e. no scheduled process) retains host memory in
+/// exactly two places, and neither can be reclaimed without a collection:
 ///
-/// This case pins the one remaining rule with a fixture whose demand is arithmetic rather than luck
-/// — no wall-clock, no compile, no allocation policy involved:
+/// 1. the **engine arena** ([`Runtime::arena`], the `MinimalContext`'s `ContextHeap`) — the heap
+///    every term-build reservation lands on when there is no process heap to serve it. Its regions
+///    are never moved, so the words a build already handed out stay at their addresses; the region
+///    above the region-reclaim pass's recorded mark is rewound when nothing reachable stands in it,
+///    so what the arena retains is its **peak** requested words, not its total;
+/// 2. the **`-eval` store** ([`Runtime::eval_heap`]) — the destination of the copy-out this module
+///    owns. A copy that does not fit replaces the region with a doubled one and **retires** the old
+///    one, so what the store retains is **the copy-out volume since the runtime started**: every
+///    region it ever installed is still alive, because a retired region is ~full and never
+///    rewritable.
+///
+/// This case pins both rules with a fixture whose demand is arithmetic rather than luck — no
+/// wall-clock, no compile, no allocation policy involved:
 ///
 /// * arena: 1 word reserves the first region, `unit − 1` words fill it, and the next word pushes a
 ///   fresh **doubled** region. `used_words` is then exactly the words requested, `reserved_words`
 ///   is the geometric ladder (`unit · (2^regions − 1)`), and the mark taken in the first region no
 ///   longer matches — the arena has no state it can be rewound to;
-/// * store: [`COPIES`] fresh container results are handed through by reference, so the store's
-///   retention counters stay `0` — the copy-out volume that used to be the second term of the bound
-///   is gone, and the store route still adds **not one** arena word.
+/// * store: [`COPIES`] container results ([`COPY_WORDS`] store words each) cross a [`REGION_WORDS`]
+///   region twice, so the store's shape is [`expected_store_shape`]'s and its retention is the
+///   geometric sum of **every** region that ever existed, which a later copy that fits cannot
+///   reduce.
+///
+/// The store route must also add **not one** arena word: the reservation volume and the copy-out
+/// volume are independent, which is what makes their sum the honest bound.
 #[test]
-fn the_open_host_memory_bound_is_the_arena_demand_with_no_store_copy_out() {
-    /// 900 cons cells: a legal `lists:seq/2` result on a [`REGION_WORDS`] pool.
+fn the_open_host_memory_bound_is_the_copy_out_volume_plus_the_arena_demand() {
+    /// 900 cons cells: a legal `lists:seq/2` result on a [`REGION_WORDS`] pool that is also more
+    /// than half the store's region, so a replacement is arithmetic.
     const ELEMENTS: usize = 900;
-    /// Enough handed-through results to prove the store never accumulates.
+    /// The store words one copy of [`ELEMENTS`] costs.
+    const COPY_WORDS: usize = 2 * ELEMENTS;
+    /// Enough copies to cross two store regions ([`expected_store_shape`] is the model).
     const COPIES: usize = 4;
 
     let mut rt = small_region_runtime();
     assert_eq!(
         REGION_WORDS, 2_048,
-        "this case's arena arithmetic assumes the suite's region"
+        "this case's store arithmetic assumes the suite's region"
     );
 
     let (unit, demand, arena) = {
@@ -815,14 +922,14 @@ fn the_open_host_memory_bound_is_the_arena_demand_with_no_store_copy_out() {
             "the retention counter and the census are one quantity, not two estimates"
         );
 
-        // ---- (b) the store: the hand-through writes nothing, so there is no copy-out volume ----
+        // ---- (b) the store: the copy-out volume, region after region ----
         assert_eq!(
             ctx.runtime.retention_stats().eval_heap_retired_regions,
             0,
             "no copy has happened yet"
         );
         for round in 0..COPIES {
-            let handed = ctx
+            let copied = ctx
                 .call_bif(
                     "lists",
                     "seq",
@@ -831,38 +938,64 @@ fn the_open_host_memory_bound_is_the_arena_demand_with_no_store_copy_out() {
                 )
                 .unwrap_or_else(|error| panic!("round {round}: lists:seq(1, {ELEMENTS}): {error}"));
             assert_eq!(
-                terms::cons_head(handed).expect("a cons cell"),
+                terms::cons_head(copied).expect("a cons cell"),
                 make_small(1),
-                "round {round}: every result is a complete list"
-            );
-            assert!(
-                lies_in_the_pool(ctx.runtime, handed),
-                "round {round}: handed through, not copied"
+                "round {round}: every copy is a complete list"
             );
         }
+        let (frontier, capacity, retired) = expected_store_shape(COPIES, COPY_WORDS, REGION_WORDS);
+        assert_eq!(
+            retired.len(),
+            2,
+            "the case's own arithmetic: {COPIES} × {COPY_WORDS} words crosses two regions"
+        );
         let stats = ctx.runtime.retention_stats();
         assert_eq!(
             stats.eval_heap_retired_regions,
-            0,
-            "the store retires no region for a hand-through"
-        );
-        assert_eq!(
-            stats.eval_heap_retired_words,
-            0,
-            "no store region was ever retired"
+            retired.len(),
+            "the store retires exactly the regions the copy volume outgrew"
         );
         assert_eq!(
             (stats.eval_heap_words, ctx.runtime.eval_heap.used()),
-            (REGION_WORDS as u64, 0),
-            "the store keeps its one configured, empty region"
+            (capacity as u64, frontier),
+            "the store's current region is the doubled one, holding the last copy"
+        );
+        assert_eq!(
+            stats.eval_heap_retired_words,
+            retired.iter().sum::<usize>() as u64,
+            "the retired figure is the summed capacity of the replaced regions {retired:?}"
+        );
+        // THE RULE: retention is every region that ever existed — it does not shrink.
+        let ladder = REGION_WORDS as u64 * ((1 << (retired.len() + 1)) - 1);
+        assert_eq!(
+            stats.eval_heap_words + stats.eval_heap_retired_words,
+            ladder,
+            "the store's total retention is the geometric sum of every region it ever installed \
+             ({REGION_WORDS} · (2^{} − 1)) — the copy-out volume, not the live one",
+            retired.len() + 1
         );
 
-        // The store route adds not one arena word, and its copy-out volume is now zero: the peak is
-        // the arena demand alone.
+        // A copy that fits changes none of it: a retired region is full and is never made the
+        // frontier again, so the bound can only grow or hold.
+        let _ = ctx
+            .call_bif("lists", "seq", 2, &[make_small(1), make_small(10)])
+            .expect("lists:seq(1, 10) fits the current region");
+        let after = ctx.runtime.retention_stats();
+        assert_eq!(
+            (
+                after.eval_heap_retired_regions,
+                after.eval_heap_words,
+                after.eval_heap_words + after.eval_heap_retired_words,
+            ),
+            (retired.len(), capacity as u64, ladder),
+            "a copy that fits retires nothing and rewrites no retired region"
+        );
+
+        // The two mechanisms are independent: the copy-out route allocates nothing on the arena.
         assert_eq!(
             ctx.runtime.arena.heap_stats(),
             grown,
-            "the store route adds not one arena word"
+            "the store route adds not one arena word, so the peak is their SUM"
         );
         (unit, demand, grown)
     };
@@ -870,7 +1003,7 @@ fn the_open_host_memory_bound_is_the_arena_demand_with_no_store_copy_out() {
     let stats = rt.retention_stats();
     eprintln!(
         "bound pin: arena unit={unit} demand={demand} regions={} reserved={} used={} | store \
-         retired_regions={} retained={}",
+         per-copy={COPY_WORDS} copies={COPIES} retired_regions={} retained={}",
         arena.regions,
         arena.reserved_words,
         arena.used_words,
