@@ -278,7 +278,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 
 ## Known Issues
 - khepri `keep_while_fanout_probe` is correct (`deleted_count=2502` both sides); the residual is NOT fun application — it is `beam_rt`'s result-move path, not `beam_ets`.
-- After hoisting a merged `ScannedBounds` fast-reject in `beam_rt::context::calls::dest::graph_reaches_scanned_heap` (the per-node `ProcessTable::pids()` scan is gone), `delete_us_per_dependent` ≈ 720 us vs the oracle ≈ 10 us (~70×), now dominated by the unconditional `copy_result_fresh` deep-copy of every `khepri_machine:apply/3` result (fix seam (a) in `beam_rt/src/context/IMPLEMENTATION.md`).
+- After hoisting a merged `ScannedBounds` fast-reject in `beam_rt::context::calls::dest::graph_reaches_scanned_heap` (the per-node `ProcessTable::pids()` scan is gone), `delete_us_per_dependent` ≈ 720 us vs the oracle ≈ 10 us (~70×), now dominated by the unconditional **process-route** copy-out (`rehome_container_result` → `move_result_into_process_heap`) of every `khepri_machine:apply/3` result onto the caller's scanned young heap.
+- The table-less-route store (`Runtime::eval_heap`) is NOT the lever for this residual: khepri runs on the scheduled/process route, so handing table-less results through the store by reference (skipping the copy+rewind) neither reaches khepri nor is memory-safe — it leaks the pool frontier and `eval_off_heap` unboundedly. The lever is bounding/eliding the process-route copy-out itself (its `shallow_unshared` + `memmove` per `khepri_machine:apply/3`).
 - The differential gate corpus does not pin `binary:referenced_byte_size/1` (bitbin) or khepri `projections`; those shapes are pinned instead by `beam_rt` workspace tests (`binary_part_refc_window`, `binary_part_refc_window_eval`) and the `tools/suites` harness probes (`error_info_abort_probe`, `keep_while_fanout_probe`).
 
 ## Future workstreams
