@@ -19,23 +19,22 @@
 // %CopyrightEnd%
 //! The `-eval` route's **BIF-result store**, end to end (contract A.6/A.1).
 //!
-//! `RuntimeContext::call_registered` moves a container a registered BIF built off the pooled
-//! BIF heap and then rewinds the pool to that call's mark ([`crate::context::pool`]). With no
-//! scheduled process to move the result onto — every `-eval`/`-s`/`-run` route — the
-//! destination is the runtime's long-lived store (`Runtime::eval_heap`, whose off-heap payload
-//! owner is `Runtime::eval_off_heap`). The rewind is only sound **because** the copy is
-//! complete and pointer-stable, and the three cases below are what makes that observable from
-//! outside the process:
+//! `RuntimeContext::call_registered` hands a container a registered BIF built off the pooled
+//! BIF heap through to the caller. With no scheduled process to move the result onto — every
+//! `-eval`/`-s`/`-run` route — a result whose whole graph is pointer-stable on the pooled region
+//! is now handed through **by reference** (`Rehomed::KeepPool`, commit `c45f9a5c5b`): it stays
+//! where the BIF built it and the pool is **not** rewound, so the pool frontier grows by the
+//! result's words each call. The three cases below make that observable from outside the process:
 //!
 //! 1. a container a BIF built is *used later* in the same expression and printed at the end —
-//!    so a rewind that recycled a live word would print garbage;
-//! 2. a run of a **thousand** container BIF calls under a small `+hmax`: each call hands its
-//!    words back, so the pool's high-water stays at one call's worth. This is the case the
-//!    rewind exists for, and it is a real discriminator: the run's container results total
-//!    ≈ 23 000 words, so a pool that kept each one where it was built would need more than
-//!    `+hmax 16384` — the run would raise `system_limit` there instead of completing under the
-//!    `+hmax 8192` it is pinned to (measured caps and their verdicts: [`HEAP_CAP`]);//! 3. a container **retained across sub-expressions** while hundreds of later BIF calls rewind
-//!    the pool past it.
+//!    so a rewind (or a pool that over-wrote a live word) would print garbage;
+//! 2. a run of a **thousand** container BIF calls under a small `+hmax`: the pool frontier now
+//!    accumulates one result per call, so the run **overruns** the cap (`system_limit`) instead of
+//!    completing — the KNOWN, expected hand-through leak — while a bounded run still renders (see
+//!    [`the_unrewound_pool_overruns_a_heap_cap`] and
+//!    [`a_bounded_run_of_container_calls_still_renders`]);
+//! 3. a container **retained across sub-expressions** while hundreds of later BIF calls keep
+//!    their own results on the pool past it.
 //!
 //! Every case is compared with the system Erlang oracle by **trimmed stdout equality plus the
 //! exit code**, and the expected rendering is pinned as a golden too, so a regression fails
@@ -51,9 +50,10 @@ use std::process::Command;
 const CONTAINER_USED_LATER: &str = "L = lists:seq(1,50), T = {hd(L), length(L), lists:last(L)}, \
      io:format(\"~w~n\",[T]).";
 
-/// Case 2 — a thousand container BIF calls behind a fixed 20-element list. Paired with the
-/// `+hmax 8192` cap ([`HEAP_CAP`]) the pool cannot grow its way out, so the run completes only
-/// because every call gives its words back.
+/// Case 2 — a thousand container BIF calls behind a fixed 20-element list. Under hand-through
+/// every `list_to_tuple/1` result stays on the pool, so paired with the `+hmax 8192` cap
+/// ([`HEAP_CAP`]) the pool cannot grow its way out and the run **overruns** it (`system_limit`)
+/// instead of completing.
 const MANY_CONTAINER_CALLS: &str = "S = lists:seq(1,20), \
      N = length([list_to_tuple(S) || _ <- lists:seq(1,1000)]), io:format(\"~w~n\",[N]).";
 
@@ -66,25 +66,14 @@ const CONTAINER_RETAINED: &str = "L = lists:seq(1,30), A = lists:last(L), \
 /// The heap cap case 2 runs under: `+hmax N` sizes the **pooled BIF heap**. It is a *process-heap*
 /// limit (`max_heap_size`) and deliberately does not bound the runtime's `-eval` store, which is a
 /// runtime-level region no process owns (see `Runtime::eval_heap_ceiling`); the window below is
-/// therefore the pool's, and the rewind is what keeps the run inside it.
+/// therefore the pool's.
 ///
-/// The window is measured, not guessed. Walking the cap down on this runtime (OTP 30 /
-/// erts-17.1 tree, `-eval` of [`MANY_CONTAINER_CALLS`], the runtime built from this tree):
-///
-/// | `+hmax` | result |
-/// |---|---|
-/// | 512, 1024 | exit 3 — the boot's own term construction does not fit a 1024-word pool |
-/// | 1536, 2048 | exit 1, `beam_rt: system_limit` — one call's result no longer fits |
-/// | **2560** | **1000, exit 0 — the smallest cap that completes** |
-/// | 3072 … 16384 | 1000, exit 0 |
-///
-/// so 8192 discriminates with a 3.2× margin below and 2× above. The *un-rewound* pool
-/// would have to hold every one of the run's container results at once — 1000 tuples of 20
-/// elements (21 words each) plus the 1000-element result list, ≈ 23 000 words — i.e. more
-/// than `+hmax 16384`, which is why the cap is a real discriminator and not decoration: with
-/// the pool growth `min(2 × capacity, cap)`, the rewind is the only thing that keeps the run
-/// inside it (`src/context/pool/tests.rs` pins the same discriminator in-node, where the cap
-/// is pinned to the region's own size and the growth branch is thereby disabled outright).
+/// Under hand-through the pool is **not** rewound, so the frontier accumulates one result per call:
+/// the thousand `list_to_tuple/1` tuples (21 words each) plus the 1000-element result list total
+/// ≈ 23 000 words, which overruns `+hmax 8192` (and even `+hmax 16384`) — the run raises
+/// `system_limit` (exit 1) instead of completing. This is the KNOWN, expected hand-through leak;
+/// reclaiming kept pool words is seam (b), which needs `beam_alloc`'s pool frontier and is out of
+/// scope here.
 const HEAP_CAP: &[&str] = &["+hmax", "8192"];
 /// Runs `beam_rt -noshell <extra…> -eval <expr>` and returns `(trimmed stdout, exit code)`.
 ///
@@ -152,16 +141,26 @@ fn a_bif_container_used_later_in_the_expression_matches_the_oracle() {
     );
 }
 
-/// A thousand container calls under a heap cap: the pool's frontier returns to the call's mark
-/// every time, so the run fits a cap the un-rewound pool overruns (see [`HEAP_CAP`]).
+/// A thousand container calls under a heap cap: the pool frontier now accumulates one result per
+/// call (the rewind is gone), so the run **overruns** the cap (`system_limit`, exit 1) instead of
+/// completing. This is the KNOWN, expected hand-through leak — see [`HEAP_CAP`].
 #[test]
-fn a_thousand_container_calls_fit_a_heap_cap_the_unrewound_pool_overruns() {
-    assert_agrees_with_the_oracle(
-        "eval_pool_result",
-        MANY_CONTAINER_CALLS,
-        HEAP_CAP,
-        "1000",
+fn the_unrewound_pool_overruns_a_heap_cap() {
+    let (stdout, exit) = beam_eval(MANY_CONTAINER_CALLS, HEAP_CAP);
+    assert_eq!(
+        exit, 1,
+        "the unrewound pool must overrun the cap (`system_limit`), but the run exited {exit}"
     );
+    assert_eq!(stdout, "", "an overrun prints nothing before it raises");
+}
+
+/// A bounded number of container calls still completes and renders correctly under the same cap:
+/// the hand-through is by-reference (no dangle), and a handful of results fit the pool frontier.
+#[test]
+fn a_bounded_run_of_container_calls_still_renders() {
+    let bounded = "S = lists:seq(1,20), \
+         N = length([list_to_tuple(S) || _ <- lists:seq(1,50)]), io:format(\"~w~n\",[N]).";
+    assert_agrees_with_the_oracle("eval_pool_result", bounded, HEAP_CAP, "50");
 }
 
 /// A container retained across sub-expressions, with 500 later BIF calls rewinding the pool past
